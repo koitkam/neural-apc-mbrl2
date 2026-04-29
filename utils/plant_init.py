@@ -2,7 +2,7 @@
 
 These helpers replace fixed paper defaults with values that adapt to the
 simulator's identified dynamics and channel complexity.  They are used by
-both ``workflow/run.py`` (single-run) and ``workflow/bo_runner.py`` (BO
+both ``workflow/run.py`` (single-run) and ``workflow/runner.py`` (BO
 seed for the first trial).
 
 Paper-defaults are kept as floors / minimums — we only *grow* values when
@@ -101,6 +101,55 @@ def derive_seq_len(tau_dom: float, dead_time: float, sample_rate: int,
     sr = max(1, int(sample_rate))
     settling_samples = int(math.ceil((3.0 * float(tau_dom) + float(dead_time)) / sr))
     return int(min(max_len, max(paper_default, settling_samples)))
+
+
+# ---------------------------------------------------------------------------
+# Adaptive batch size from GPU memory headroom
+# ---------------------------------------------------------------------------
+
+def derive_batch_size(model_size: str,
+                      paper_default: int = 16,
+                      target_util: float = 0.5,
+                      min_bs: int = 16, max_bs: int = 128) -> Dict[str, Any]:
+    """Pick a batch size that uses ~``target_util`` of the GPU.
+
+    Empirical per-batch peak memory (test_sim, seq_len=64, horizon=42, bf16):
+      S ≈ 220 MB / batch
+      M ≈ 330 MB / batch
+      L ≈ 800 MB / batch
+
+    On CPU or no-CUDA we fall back to the paper default.  We always use
+    powers of two for batch and clamp to ``[paper_default, max_bs]`` so
+    the recipe stays a strict superset of the paper.
+    """
+    per_batch_mb = {'S': 220, 'M': 330, 'L': 800}.get(model_size, 330)
+    info: Dict[str, Any] = {'model_size': model_size,
+                            'per_batch_mb': per_batch_mb,
+                            'paper_default': paper_default,
+                            'target_util': target_util,
+                            'min_bs': min_bs, 'max_bs': max_bs}
+    try:
+        import torch  # local import to keep utils import-light
+        if not torch.cuda.is_available():
+            info.update({'batch_size': paper_default,
+                         'source': 'cpu_fallback', 'gpu_total_gb': 0.0})
+            return info
+        free_b, total_b = torch.cuda.mem_get_info(0)
+        total_gb = total_b / (1024 ** 3)
+        budget_mb = target_util * total_b / (1024 ** 2)
+        raw_bs = max(paper_default, int(budget_mb // per_batch_mb))
+        # snap to nearest power of two, clamped to [paper_default, max_bs]
+        bs_pow = 1 << max(int(math.log2(paper_default)),
+                          int(math.floor(math.log2(max(raw_bs, paper_default)))))
+        bs = int(min(max_bs, max(min_bs, bs_pow)))
+        info.update({'batch_size': bs, 'source': 'auto:gpu_headroom',
+                     'gpu_total_gb': total_gb,
+                     'budget_mb': budget_mb, 'raw_bs': raw_bs})
+        return info
+    except Exception as e:
+        info.update({'batch_size': paper_default, 'source': f'fallback:{e!r}',
+                     'gpu_total_gb': 0.0})
+        return info
 
 
 # ---------------------------------------------------------------------------

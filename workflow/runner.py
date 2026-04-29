@@ -252,7 +252,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     # from complexity, seq_len ≥ settling time).  Env-supplied values take
     # precedence so this stays simulator-agnostic.
     from utils.sim_factory import create_sim, resolve_sim_metadata
-    from utils.plant_init import derive_all, derive_step_budgets
+    from utils.plant_init import derive_all, derive_step_budgets, derive_batch_size
     sr_override = int(sr_env) if sr_env else 0
     tmp_sim = create_sim(episode_length=10,
                          sample_rate=max(1, sr_override or base.sample_rate))
@@ -268,6 +268,23 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     print(f"[BO] derived: sample_rate={sr} ({derived['sample_rate_source']}) "
           f"seq_len={base.seq_len} model_size_seed={derived_model_size} "
           f"complexity={derived['complexity_score']:.2f}", flush=True)
+
+    # Adaptive batch size from GPU headroom (paper default is the floor).
+    # OBJ_BATCH_SIZE env var overrides.
+    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
+    if bs_env:
+        try:
+            base.batch_size = max(1, int(bs_env))
+            bs_info = {'batch_size': base.batch_size, 'source': 'env_override'}
+        except Exception:
+            bs_info = derive_batch_size(derived_model_size)
+            base.batch_size = int(bs_info['batch_size'])
+    else:
+        bs_info = derive_batch_size(derived_model_size)
+        base.batch_size = int(bs_info['batch_size'])
+    print(f"[BO] batch_size={base.batch_size} ({bs_info['source']}; "
+          f"per_batch≈{bs_info.get('per_batch_mb','?')}MB, "
+          f"gpu={bs_info.get('gpu_total_gb',0):.1f}GB)", flush=True)
 
     # Plant-tied step budgets (trial_steps / final_steps).  CLI / caller
     # values > 0 take precedence so power users can still override.
@@ -288,7 +305,8 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
           f"final_eps_target={budgets['final_episodes_target']})", flush=True)
 
     with open(out_dir / 'plant_id.json', 'w') as f:
-        json.dump({**plant, 'derived': derived, 'step_budgets': budgets},
+        json.dump({**plant, 'derived': derived, 'step_budgets': budgets,
+                   'batch_size': bs_info},
                   f, indent=2, default=str)
     print(f"[BO] plant: tau={plant['tau']:.2f}  dead_time={plant['dead_time']:.2f}  "
           f"lookback={plant['lookback']}  H_init="
@@ -341,13 +359,50 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
 
 if __name__ == '__main__':
     import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument('--out', required=True, help='workflow output directory')
+    import time as _time
+    p = argparse.ArgumentParser(
+        description='Full DreamerV4 workflow: plant identification → '
+                    'Optuna BO over (lookback, model_size, horizon) → '
+                    'final retrain → ONNX export.')
+    p.add_argument('--simulation-dir', '-s', default=None,
+                   help='Simulation directory (e.g. simulation/test_sim). '
+                        'Required unless --out is given (legacy mode where '
+                        'CONTROL_SETUP_JSON / SIMULATION_DIR are set externally).')
+    p.add_argument('--out', '-o', default=None,
+                   help='Workflow output directory. Default: '
+                        '<repo>/output/<sim>/bo_<timestamp>/')
     p.add_argument('--n_trials', type=int, default=8)
     p.add_argument('--trial_steps', type=int, default=0,
                    help='per-trial training steps (0 = plant-tied auto)')
     p.add_argument('--final_steps', type=int, default=0,
                    help='final retrain steps (0 = plant-tied auto)')
+    p.add_argument('--seed', type=int, default=0)
     args = p.parse_args()
-    run_bo(args.out, n_trials=args.n_trials,
+
+    repo = Path(__file__).resolve().parent.parent
+    if args.simulation_dir is not None:
+        from workflow.run import _resolve_sim_dir
+        sim_dir = _resolve_sim_dir(args.simulation_dir)
+        setup_path = sim_dir / 'control_setup.json'
+        obj_path = sim_dir / 'control_objective.json'
+        if not setup_path.exists():
+            raise FileNotFoundError(f'Missing {setup_path}')
+        if not obj_path.exists():
+            raise FileNotFoundError(f'Missing {obj_path}')
+        os.environ['CONTROL_SETUP_JSON'] = str(setup_path)
+        os.environ['CONTROL_OBJECTIVE_JSON'] = str(obj_path)
+        os.environ['SIMULATION_DIR'] = str(sim_dir)
+        os.environ.setdefault('SEED', str(args.seed))
+        sim_name = sim_dir.name
+    else:
+        sim_name = Path(os.environ.get('SIMULATION_DIR', 'unknown')).name
+
+    if args.out:
+        out_dir = args.out
+    else:
+        ts = _time.strftime('%Y%m%d_%H%M%S')
+        out_dir = str(repo / 'output' / sim_name / f'bo_{ts}')
+
+    print(f'[runner] sim={sim_name}  out_dir={out_dir}', flush=True)
+    run_bo(out_dir, n_trials=args.n_trials,
            trial_steps=args.trial_steps, final_steps=args.final_steps)

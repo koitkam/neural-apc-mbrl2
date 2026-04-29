@@ -86,7 +86,7 @@ def main() -> int:
                              'simulation/test_sim, distillation, or absolute path).')
     parser.add_argument('--out-dir', '-o', default=None,
                         help='Output directory. Default: '
-                             '<repo>/_runs/<sim>_<timestamp>/')
+                             '<repo>/output/<sim>/run_<timestamp>/')
     parser.add_argument('--steps', type=int, default=200_000,
                         help='Total environment steps (default 200 000).')
     parser.add_argument('--model-size', choices=['S', 'M', 'L'], default=None,
@@ -109,7 +109,7 @@ def main() -> int:
         out_dir = Path(args.out_dir)
     else:
         ts = time.strftime('%Y%m%d_%H%M%S')
-        out_dir = repo / '_runs' / f'{sim_name}_{ts}'
+        out_dir = repo / 'output' / sim_name / f'run_{ts}'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Set the env vars our utilities expect — these MUST be set before
@@ -186,7 +186,7 @@ def main() -> int:
 
     # Episode length & horizon from plant.
     from utils.auto_episode_length import derive_episode_length
-    from workflow.bo_runner import horizon_init, MODEL_SIZE_PRESETS
+    from workflow.runner import horizon_init, MODEL_SIZE_PRESETS
     episode_length, ep_source = derive_episode_length()
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
     horizon = horizon_init(tau, dead, sample_rate)
@@ -195,6 +195,21 @@ def main() -> int:
 
     # Build TrainConfig — every value either plant-tied or paper-faithful default.
     from training.train import TrainConfig, train as run_training
+    from utils.plant_init import derive_batch_size
+    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
+    if bs_env:
+        try:
+            batch_size = max(1, int(bs_env))
+            bs_info = {'batch_size': batch_size, 'source': 'env_override'}
+        except Exception:
+            bs_info = derive_batch_size(model_size)
+            batch_size = int(bs_info['batch_size'])
+    else:
+        bs_info = derive_batch_size(model_size)
+        batch_size = int(bs_info['batch_size'])
+    print(f"[run] batch_size={batch_size} ({bs_info['source']}; "
+          f"per_batch≈{bs_info.get('per_batch_mb','?')}MB, "
+          f"gpu={bs_info.get('gpu_total_gb',0):.1f}GB)", flush=True)
     cfg = TrainConfig(
         deter_dim=arch['deter_dim'],
         embed_dim=arch['embed_dim'],
@@ -207,6 +222,7 @@ def main() -> int:
         total_steps=int(args.steps),
         horizon=horizon,
         seq_len=seq_len,
+        batch_size=batch_size,
         out_dir=str(out_dir),
     )
 
@@ -229,6 +245,8 @@ def main() -> int:
         'model_size_source': model_size_source,
         'complexity_score': derived['complexity_score'],
         'complexity_inputs': derived['inputs'],
+        'batch_size': batch_size,
+        'batch_size_source': bs_info['source'],
         'seed': int(args.seed),
         'total_steps': int(args.steps),
         'config': asdict(cfg),

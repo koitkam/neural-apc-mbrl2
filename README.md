@@ -39,7 +39,7 @@ utils/                      # plant-side modules (carried from neural-apc-pytorc
 simulation/                 # plant simulators
   test_sim/                 # toy tau/dead-time plant for smoke testing
 inference/export_onnx.py    # single-graph deterministic ONNX export
-workflow/bo_runner.py       # Optuna 3-axis BO
+workflow/runner.py          # Optuna 3-axis BO + final retrain (full pipeline entry)
 evaluation/                 # validation harness
 tools/                      # diagnostics
 docs/                       # design notes
