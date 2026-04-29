@@ -709,6 +709,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     last_log_steps = 0
     ema_return = None
 
+    # Per-phase timing accumulators (reset every log_every iters).
+    t_collect_acc = 0.0
+    t_sample_acc = 0.0
+    t_wm_acc = 0.0
+    t_ac_acc = 0.0
+
     # Header line in the .log so we can correlate with absolute time.
     print(f"# train start: {time.strftime('%Y-%m-%d %H:%M:%S')} "
           f"device={device.type} cfg.batch_size={cfg.batch_size} "
@@ -726,6 +732,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     while total_env_steps < cfg.total_steps:
         # ----- 1. Collect episodes -----
+        _t = time.time()
         for _ in range(cfg.ep_per_iter):
             is_explore = rng.uniform() < cfg.explore_episode_ratio
             ep = collect_episode(env, model, device, cfg, random_action=is_explore)
@@ -734,6 +741,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             total_env_steps += cfg.episode_length
             ret = float(ep['rew'].sum())
             ema_return = ret if ema_return is None else 0.95 * ema_return + 0.05 * ret
+        t_collect_acc += time.time() - _t
 
         if policy_buf.filled == 0:
             # Until we have at least one policy episode, draw the WM mix from
@@ -744,6 +752,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
         # ----- 2. Train -----
         for _ in range(cfg.train_steps_per_iter):
+            _t = time.time()
             n_explore = int(round(mix_explore * cfg.batch_size))
             n_policy = cfg.batch_size - n_explore
             parts = []
@@ -760,8 +769,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 else:
                     t = t.to(device)
                 batch[k] = t
+            t_sample_acc += time.time() - _t
 
             # World model
+            _t = time.time()
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=(device.type == 'cuda')):
                 wm_losses, h_seq, z_seq = world_model_step(model, batch, cfg)
@@ -770,26 +781,32 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             wm_grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters_world(), cfg.grad_clip)
             opt_world.step()
+            t_wm_acc += time.time() - _t
 
             # Actor-critic in latent imagination, starting from posterior states.
+            _t = time.time()
             B, T = h_seq.shape[:2]
             h0 = h_seq.reshape(B * T, -1)
             z0 = z_seq.reshape(B * T, -1)
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=(device.type == 'cuda')):
                 ac_losses = actor_critic_step(model, h0, z0, cfg)
+            # Combined backward: actor & critic share the imagined-trajectory
+            # graph, so a single backward pass is sufficient.  Optimizer
+            # steps stay separated (paper-faithful: distinct lr / grad clip
+            # per head).
             opt_actor.zero_grad(set_to_none=True)
-            ac_losses['actor_loss'].backward(retain_graph=True)
+            opt_critic.zero_grad(set_to_none=True)
+            (ac_losses['actor_loss'] + ac_losses['critic_loss']).backward()
             actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters_actor(), cfg.grad_clip)
-            opt_actor.step()
-            opt_critic.zero_grad(set_to_none=True)
-            ac_losses['critic_loss'].backward()
             critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters_critic(), cfg.grad_clip)
+            opt_actor.step()
             opt_critic.step()
 
             model.update_target(cfg.target_critic_tau)
+            t_ac_acc += time.time() - _t
 
         total_iters += 1
         if total_iters % cfg.log_every == 0:
@@ -825,6 +842,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                           if torch.is_tensor(critic_grad_norm) else critic_grad_norm),
                 'gpu_mem_mb': gpu_mem_mb,
                 'gpu_mem_peak_mb': gpu_mem_peak_mb,
+                't_collect_s': t_collect_acc,
+                't_sample_s': t_sample_acc,
+                't_wm_s': t_wm_acc,
+                't_ac_s': t_ac_acc,
+                't_other_s': max(0.0, iter_dt - (t_collect_acc + t_sample_acc
+                                                  + t_wm_acc + t_ac_acc)),
             }
             for k, v in wm_losses.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
@@ -841,10 +864,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"adv_std {row.get('adv_std_mean', 0.0):.3f} "
                   f"gn(w/a/c) {row['wm_grad_norm']:.2f}/"
                   f"{row['actor_grad_norm']:.3f}/{row['critic_grad_norm']:.2f} "
-                  f"img_ret {row.get('imagined_return_mean', 0.0):+.3f}",
+                  f"img_ret {row.get('imagined_return_mean', 0.0):+.3f} "
+                  f"t(col/wm/ac) {t_collect_acc:.1f}/{t_wm_acc:.1f}/{t_ac_acc:.1f}",
                   flush=True)
             last_log_time = now
             last_log_steps = total_env_steps
+            t_collect_acc = 0.0
+            t_sample_acc = 0.0
+            t_wm_acc = 0.0
+            t_ac_acc = 0.0
 
         if on_iter_end is not None:
             try:
