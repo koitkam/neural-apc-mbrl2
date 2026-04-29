@@ -42,6 +42,44 @@ import torch
 
 
 # ---------------------------------------------------------------------------
+# Tee stdout/stderr to <out_dir>/workflow.log
+# ---------------------------------------------------------------------------
+
+class _Tee:
+    """Duplicate writes to multiple streams.  Used to mirror stdout/stderr
+    into ``workflow.log`` so the run directory is self-contained."""
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, s):
+        for st in self._streams:
+            try:
+                st.write(s)
+            except Exception:
+                pass
+    def flush(self):
+        for st in self._streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+    def isatty(self):
+        return False
+
+
+def _install_workflow_log(out_dir: Path) -> None:
+    """Mirror stdout + stderr into ``<out_dir>/workflow.log``.
+
+    Idempotent: subsequent calls overwrite the previous Tee target so the
+    log always tracks the current run directory.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / 'workflow.log'
+    f = open(log_path, 'a', buffering=1)  # line-buffered
+    sys.stdout = _Tee(sys.__stdout__, f)
+    sys.stderr = _Tee(sys.__stderr__, f)
+
+
+# ---------------------------------------------------------------------------
 # Model size presets (paper §C scales)
 # ---------------------------------------------------------------------------
 
@@ -94,6 +132,12 @@ def initialize_from_plant(out_dir: Path) -> Dict:
         per_pair_estimates=pair_est,
     )
     lookback = int(lb.get('identified_lookback', lb.get('lookback', max(min_lb, 32))))
+
+    # Export identified dynamics so downstream helpers (auto_episode_length,
+    # objective_runtime, etc.) see the same plant numbers as workflow/run.py.
+    os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
+    os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'
+    os.environ['IDENTIFIED_LOOKBACK_SEED'] = str(lookback)
 
     return {
         'tau': tau,
@@ -238,12 +282,14 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     """Run BO.  ``trial_steps`` / ``final_steps`` ≤ 0 → plant-tied auto."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _install_workflow_log(out_dir)
+    print(f'[runner] workflow log: {out_dir}/workflow.log', flush=True)
 
     base = TrainConfig()
-    # Allow env-driven overrides for sample_rate / episode_length so the BO
-    # itself stays simulator-agnostic.
+    # Sample-rate env override is supported here for sims that hard-code their
+    # scan rate.  Episode length is auto-derived from identification (or from
+    # SIM_EPISODE_LENGTH env via derive_episode_length).
     sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
-    ep_env = os.environ.get('SIM_EPISODE_LENGTH', '').strip()
 
     print('[BO] Phase 1: plant identification', flush=True)
     plant = initialize_from_plant(out_dir / 'plant_id')
@@ -262,8 +308,14 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     sr = derived['sample_rate']
     base.sample_rate = sr
     base.seq_len = derived['seq_len']
-    if ep_env:
-        base.episode_length = int(ep_env)
+
+    # Episode length: env override > auto-derived from settling time > paper.
+    from utils.auto_episode_length import derive_episode_length
+    ep_len, ep_source = derive_episode_length()
+    base.episode_length = int(ep_len)
+    os.environ['SIM_EPISODE_LENGTH'] = str(base.episode_length)
+    print(f"[BO] episode_length={base.episode_length} ({ep_source})", flush=True)
+
     derived_model_size = derived['model_size']
     print(f"[BO] derived: sample_rate={sr} ({derived['sample_rate_source']}) "
           f"seq_len={base.seq_len} model_size_seed={derived_model_size} "
@@ -308,6 +360,35 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         json.dump({**plant, 'derived': derived, 'step_budgets': budgets,
                    'batch_size': bs_info},
                   f, indent=2, default=str)
+
+    # Workflow-level run_plan.json — single source of truth for everything
+    # downstream (trials, validation, ONNX export) reads from.
+    plan = {
+        'mode': 'bo',
+        'simulation_dir': os.environ.get('SIMULATION_DIR'),
+        'simulation_name': Path(os.environ.get('SIMULATION_DIR', 'unknown')).name,
+        'out_dir': str(out_dir),
+        'sample_rate': sr,
+        'sample_rate_source': derived['sample_rate_source'],
+        'tau': plant['tau'], 'dead_time': plant['dead_time'],
+        'tau_fast': plant['tau_fast'], 'dead_time_fast': plant['dead_time_fast'],
+        'lookback': plant['lookback'],
+        'episode_length': base.episode_length,
+        'episode_length_source': ep_source,
+        'seq_len': base.seq_len,
+        'model_size_seed': derived_model_size,
+        'model_size_source': 'auto:complexity',
+        'complexity_score': derived['complexity_score'],
+        'complexity_inputs': derived['inputs'],
+        'batch_size': base.batch_size,
+        'batch_size_source': bs_info['source'],
+        'trial_steps': trial_steps, 'final_steps': final_steps,
+        'step_budget_source': budgets['source'],
+        'n_trials': int(n_trials),
+        'seed': int(os.environ.get('SEED', '0')),
+    }
+    with open(out_dir / 'run_plan.json', 'w') as f:
+        json.dump(plan, f, indent=2, default=str)
     print(f"[BO] plant: tau={plant['tau']:.2f}  dead_time={plant['dead_time']:.2f}  "
           f"lookback={plant['lookback']}  H_init="
           f"{horizon_init(plant['tau'], plant['dead_time'], sr)}", flush=True)

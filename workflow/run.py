@@ -112,6 +112,11 @@ def main() -> int:
         out_dir = repo / 'output' / sim_name / f'run_{ts}'
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Mirror stdout/stderr to <out_dir>/workflow.log so the run is self-contained.
+    from workflow.runner import _install_workflow_log
+    _install_workflow_log(out_dir)
+    print(f'[run] workflow log: {out_dir}/workflow.log', flush=True)
+
     # Set the env vars our utilities expect — these MUST be set before
     # importing training.train (it reads them at config-build time).
     os.environ['CONTROL_SETUP_JSON'] = str(setup_path)
