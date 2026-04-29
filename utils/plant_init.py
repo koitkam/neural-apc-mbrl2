@@ -110,21 +110,30 @@ def derive_seq_len(tau_dom: float, dead_time: float, sample_rate: int,
 def derive_batch_size(model_size: str,
                       paper_default: int = 16,
                       target_util: float = 0.5,
-                      min_bs: int = 16, max_bs: int = 128) -> Dict[str, Any]:
+                      min_bs: int = 16, max_bs: int = 128,
+                      horizon: int = 42,
+                      horizon_ref: int = 42) -> Dict[str, Any]:
     """Pick a batch size that uses ~``target_util`` of the GPU.
 
     Empirical per-batch peak memory (test_sim, seq_len=64, horizon=42, bf16):
       S ≈ 220 MB / batch
       M ≈ 330 MB / batch
-      L ≈ 800 MB / batch
+      L ≈ 640 MB / batch
+
+    Per-batch memory grows linearly with horizon (the imagined-trajectory
+    graph dominates AC memory), so ``per_batch`` is scaled by
+    ``horizon / horizon_ref``.
 
     On CPU or no-CUDA we fall back to the paper default.  We always use
     powers of two for batch and clamp to ``[paper_default, max_bs]`` so
     the recipe stays a strict superset of the paper.
     """
-    per_batch_mb = {'S': 220, 'M': 330, 'L': 800}.get(model_size, 330)
+    base_per_batch_mb = {'S': 220, 'M': 330, 'L': 640}.get(model_size, 330)
+    per_batch_mb = float(base_per_batch_mb) * max(1, int(horizon)) / max(1, int(horizon_ref))
     info: Dict[str, Any] = {'model_size': model_size,
                             'per_batch_mb': per_batch_mb,
+                            'per_batch_base_mb': base_per_batch_mb,
+                            'horizon': horizon, 'horizon_ref': horizon_ref,
                             'paper_default': paper_default,
                             'target_util': target_util,
                             'min_bs': min_bs, 'max_bs': max_bs}

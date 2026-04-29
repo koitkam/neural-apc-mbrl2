@@ -181,7 +181,7 @@ early via the `on_iter_end` callback in the trainer.
 
 | Knob | Floor (paper) | Auto rule | Override |
 |---|---|---|---|
-| `batch_size` | 16 | nearest power of two filling ~50 % of GPU memory | `OBJ_BATCH_SIZE` |
+| `batch_size` | 16 | nearest power of two filling ~50 % of GPU memory; per-batch cost = `{S:220, M:330, L:640} MB × horizon/42`; re-derived per BO trial | `OBJ_BATCH_SIZE` |
 | `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `OBJ_REWARD_SCALE` |
 | `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `SIM_EPISODE_LENGTH` |
 | `sample_rate` | 5 | `min(τ_fast / 10, θ_fast / 2)` | `SIM_SAMPLE_RATE` |

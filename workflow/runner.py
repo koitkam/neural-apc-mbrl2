@@ -170,30 +170,53 @@ def lookback_grid(plant_lookback: int) -> List[int]:
 
 def make_trial_config(base: TrainConfig, *, lookback: int,
                       model_size: str, horizon: int,
-                      total_steps: int, out_dir: Path) -> TrainConfig:
+                      total_steps: int, out_dir: Path,
+                      batch_size: int | None = None) -> TrainConfig:
     preset = MODEL_SIZE_PRESETS[model_size]
-    cfg = TrainConfig(**{**asdict(base),
-                          'lookback': int(lookback),
-                          'horizon': int(horizon),
-                          'total_steps': int(total_steps),
-                          'out_dir': str(out_dir),
-                          **preset})
+    overrides: Dict[str, object] = {
+        'lookback': int(lookback),
+        'horizon': int(horizon),
+        'total_steps': int(total_steps),
+        'out_dir': str(out_dir),
+        **preset,
+    }
+    if batch_size is not None:
+        overrides['batch_size'] = int(batch_size)
+    cfg = TrainConfig(**{**asdict(base), **overrides})
     return cfg
 
 
 def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
               study_dir: Path, trial_steps: int) -> float:
+    from utils.plant_init import derive_batch_size
     lookback = trial.suggest_categorical('lookback', lookback_grid(plant['lookback']))
     model_size = trial.suggest_categorical('model_size', list(MODEL_SIZE_PRESETS))
     horizon_mult = trial.suggest_categorical('horizon_mult', HORIZON_BAND)
     H_init = horizon_init(plant['tau'], plant['dead_time'], base.sample_rate)
     horizon = max(3, int(round(horizon_mult * H_init)))
 
+    # Per-trial batch size: re-derive from the trial's actual model_size +
+    # horizon so OOM-prone (L, large horizon) trials use a smaller batch.
+    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
+    if bs_env:
+        try:
+            bs = max(1, int(bs_env))
+            bs_info = {'batch_size': bs, 'source': 'env_override'}
+        except Exception:
+            bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
+            bs = int(bs_info['batch_size'])
+    else:
+        bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
+        bs = int(bs_info['batch_size'])
+
     trial_dir = study_dir / f'trial_{trial.number:04d}'
     trial_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[trial {trial.number}] lookback={lookback} model={model_size} "
+          f"horizon={horizon} batch={bs} ({bs_info['source']}; "
+          f"per_batch≈{bs_info.get('per_batch_mb',0):.0f}MB)", flush=True)
     cfg = make_trial_config(base, lookback=lookback, model_size=model_size,
                             horizon=horizon, total_steps=trial_steps,
-                            out_dir=trial_dir)
+                            out_dir=trial_dir, batch_size=bs)
 
     # Pruning hook: report the running EMA return after each log iter so the
     # MedianPruner can stop visibly-bad trials early.
@@ -228,16 +251,30 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
 
 def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
                            out_dir: Path, total_steps: int) -> Dict:
+    from utils.plant_init import derive_batch_size
     lookback = int(best_params['lookback'])
     model_size = str(best_params['model_size'])
     H_init = horizon_init(plant['tau'], plant['dead_time'], base.sample_rate)
     horizon = max(3, int(round(float(best_params['horizon_mult']) * H_init)))
 
+    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
+    if bs_env:
+        try:
+            bs = max(1, int(bs_env))
+        except Exception:
+            bs = int(derive_batch_size(model_size, horizon=horizon,
+                                        horizon_ref=H_init)['batch_size'])
+    else:
+        bs = int(derive_batch_size(model_size, horizon=horizon,
+                                    horizon_ref=H_init)['batch_size'])
+    print(f'[final] model={model_size} lookback={lookback} horizon={horizon} '
+          f'batch={bs}', flush=True)
+
     final_dir = out_dir / 'final'
     final_dir.mkdir(parents=True, exist_ok=True)
     cfg = make_trial_config(base, lookback=lookback, model_size=model_size,
                             horizon=horizon, total_steps=total_steps,
-                            out_dir=final_dir)
+                            out_dir=final_dir, batch_size=bs)
     summary = run_training(cfg)
 
     # Reload model from final.pt and export ONNX.
@@ -321,8 +358,9 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
           f"seq_len={base.seq_len} model_size_seed={derived_model_size} "
           f"complexity={derived['complexity_score']:.2f}", flush=True)
 
-    # Adaptive batch size from GPU headroom (paper default is the floor).
-    # OBJ_BATCH_SIZE env var overrides.
+    # Adaptive batch size SEED (per-trial batch is re-derived in run_trial
+    # from the trial's actual model_size + horizon).  This block only
+    # records the seed-config batch in run_plan.json.
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
@@ -334,9 +372,10 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     else:
         bs_info = derive_batch_size(derived_model_size)
         base.batch_size = int(bs_info['batch_size'])
-    print(f"[BO] batch_size={base.batch_size} ({bs_info['source']}; "
-          f"per_batch≈{bs_info.get('per_batch_mb','?')}MB, "
-          f"gpu={bs_info.get('gpu_total_gb',0):.1f}GB)", flush=True)
+    print(f"[BO] batch_size_seed={base.batch_size} ({bs_info['source']}; "
+          f"per_batch≈{bs_info.get('per_batch_mb',0):.0f}MB, "
+          f"gpu={bs_info.get('gpu_total_gb',0):.1f}GB; "
+          f"per-trial batch re-derived from trial config)", flush=True)
 
     # Plant-tied step budgets (trial_steps / final_steps).  CLI / caller
     # values > 0 take precedence so power users can still override.
