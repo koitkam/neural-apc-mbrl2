@@ -233,8 +233,9 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
 # ---------------------------------------------------------------------------
 
 def run_bo(out_dir: str | Path, n_trials: int = 8,
-           trial_steps: int = 50_000, final_steps: int = 200_000,
+           trial_steps: int = 0, final_steps: int = 0,
            study_name: str = 'dreamer_v4_bo') -> Dict:
+    """Run BO.  ``trial_steps`` / ``final_steps`` ≤ 0 → plant-tied auto."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -251,7 +252,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     # from complexity, seq_len ≥ settling time).  Env-supplied values take
     # precedence so this stays simulator-agnostic.
     from utils.sim_factory import create_sim, resolve_sim_metadata
-    from utils.plant_init import derive_all
+    from utils.plant_init import derive_all, derive_step_budgets
     sr_override = int(sr_env) if sr_env else 0
     tmp_sim = create_sim(episode_length=10,
                          sample_rate=max(1, sr_override or base.sample_rate))
@@ -268,8 +269,27 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
           f"seq_len={base.seq_len} model_size_seed={derived_model_size} "
           f"complexity={derived['complexity_score']:.2f}", flush=True)
 
+    # Plant-tied step budgets (trial_steps / final_steps).  CLI / caller
+    # values > 0 take precedence so power users can still override.
+    budgets = derive_step_budgets(
+        episode_length=base.episode_length,
+        complexity_score=derived['complexity_score'],
+    )
+    if int(trial_steps) > 0:
+        budgets['trial_steps'] = int(trial_steps)
+        budgets['source'] = 'override'
+    if int(final_steps) > 0:
+        budgets['final_steps'] = int(final_steps)
+        budgets['source'] = 'override'
+    trial_steps = int(budgets['trial_steps'])
+    final_steps = int(budgets['final_steps'])
+    print(f"[BO] step budgets: trial={trial_steps} final={final_steps} "
+          f"({budgets['source']}; trial_eps_target={budgets['trial_episodes_target']}, "
+          f"final_eps_target={budgets['final_episodes_target']})", flush=True)
+
     with open(out_dir / 'plant_id.json', 'w') as f:
-        json.dump({**plant, 'derived': derived}, f, indent=2, default=str)
+        json.dump({**plant, 'derived': derived, 'step_budgets': budgets},
+                  f, indent=2, default=str)
     print(f"[BO] plant: tau={plant['tau']:.2f}  dead_time={plant['dead_time']:.2f}  "
           f"lookback={plant['lookback']}  H_init="
           f"{horizon_init(plant['tau'], plant['dead_time'], sr)}", flush=True)
@@ -324,8 +344,10 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--out', required=True, help='workflow output directory')
     p.add_argument('--n_trials', type=int, default=8)
-    p.add_argument('--trial_steps', type=int, default=50_000)
-    p.add_argument('--final_steps', type=int, default=200_000)
+    p.add_argument('--trial_steps', type=int, default=0,
+                   help='per-trial training steps (0 = plant-tied auto)')
+    p.add_argument('--final_steps', type=int, default=0,
+                   help='final retrain steps (0 = plant-tied auto)')
     args = p.parse_args()
     run_bo(args.out, n_trials=args.n_trials,
            trial_steps=args.trial_steps, final_steps=args.final_steps)

@@ -656,6 +656,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 json.dump(cal, f, indent=2)
         except Exception:
             pass
+        # Also fold the calibration summary into run_plan.json so downstream
+        # consumers (BO, validation, audits) can see it without an extra read.
+        try:
+            plan_path = out_dir_pre / 'run_plan.json'
+            if plan_path.exists():
+                with open(plan_path) as f:
+                    plan = json.load(f)
+                plan['reward_calibration'] = cal
+                with open(plan_path, 'w') as f:
+                    json.dump(plan, f, indent=2)
+        except Exception:
+            pass
     elif obj_scale_env in ('off', '0', 'none', 'false'):
         env.reward_scale = 1.0
         print('[reward-scale] disabled (raw rewards passed through)', flush=True)

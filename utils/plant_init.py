@@ -104,6 +104,54 @@ def derive_seq_len(tau_dom: float, dead_time: float, sample_rate: int,
 
 
 # ---------------------------------------------------------------------------
+# Step budgets (BO trial / final retrain)
+# ---------------------------------------------------------------------------
+
+def derive_step_budgets(*, episode_length: int, complexity_score: float,
+                        trial_eps_base: int = 40,
+                        final_eps_multiplier: int = 10,
+                        trial_floor: int = 50_000,
+                        trial_cap: int = 250_000,
+                        final_floor: int = 200_000,
+                        final_cap: int = 2_000_000) -> Dict[str, Any]:
+    """Plant-tied trial / final step budgets for BO.
+
+    Unit of work is *episodes*, scaled by complexity:
+
+        trial_eps = trial_eps_base * max(1.0, complexity_score / 4)
+        final_eps = final_eps_multiplier * trial_eps
+
+    then converted to steps via ``episode_length`` and clamped to the
+    floor / cap envelope.  Floors guarantee enough buffer fill + actor
+    settling on simple plants; caps protect against runaway budgets on
+    very long episodes.
+    """
+    ep_len = max(1, int(episode_length))
+    factor = max(1.0, float(complexity_score) / 4.0)
+    trial_eps = int(round(trial_eps_base * factor))
+    final_eps = int(round(final_eps_multiplier * trial_eps))
+    trial_steps_raw = trial_eps * ep_len
+    final_steps_raw = final_eps * ep_len
+    trial_steps = int(max(trial_floor, min(trial_cap, trial_steps_raw)))
+    final_steps = int(max(final_floor, min(final_cap, final_steps_raw)))
+    return {
+        'trial_steps': trial_steps,
+        'final_steps': final_steps,
+        'trial_episodes_target': trial_eps,
+        'final_episodes_target': final_eps,
+        'episode_length': ep_len,
+        'complexity_factor': factor,
+        'trial_steps_raw': trial_steps_raw,
+        'final_steps_raw': final_steps_raw,
+        'source': 'auto:plant_tied',
+        'envelope': {
+            'trial_floor': trial_floor, 'trial_cap': trial_cap,
+            'final_floor': final_floor, 'final_cap': final_cap,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Convenience: full derivation block from dynamics report + sim metadata
 # ---------------------------------------------------------------------------
 
