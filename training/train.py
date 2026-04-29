@@ -350,14 +350,16 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     for t in range(T):
         obs_buf[t] = obs_window
         ow = torch.from_numpy(obs_window).to(device).unsqueeze(0)
-        h, z, _, _ = model.rssm.observe_step(ow, prev_action, h, z)
-        if random_action:
-            a = (env.rng.uniform(-1.0, 1.0, size=(env.action_dim,))).astype('float32')
-            action_t = torch.from_numpy(a).to(device).unsqueeze(0)
-        else:
-            latent = torch.cat([h, z], dim=-1)
-            action_t, _, _ = model.actor(latent, deterministic=deterministic)
-        a_np = action_t.squeeze(0).cpu().numpy().astype('float32')
+        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                enabled=(device.type == 'cuda')):
+            h, z, _, _ = model.rssm.observe_step(ow, prev_action, h, z)
+            if random_action:
+                a = (env.rng.uniform(-1.0, 1.0, size=(env.action_dim,))).astype('float32')
+                action_t = torch.from_numpy(a).to(device).unsqueeze(0)
+            else:
+                latent = torch.cat([h, z], dim=-1)
+                action_t, _, _ = model.actor(latent, deterministic=deterministic)
+        a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
         next_window, reward, done, _ = env.step(a_np)
         act_buf[t] = a_np
         rew_buf[t] = reward
@@ -550,6 +552,16 @@ def train(cfg: TrainConfig) -> Dict:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # GPU performance knobs (A10 / Ampere+).  These are no-ops on CPU.
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
     # Build env first so we know obs_dim/action_dim.
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim
@@ -617,10 +629,19 @@ def train(cfg: TrainConfig) -> Dict:
             if n_explore > 0 and explore_buf.filled > 0:
                 parts.append(explore_buf.sample(n_explore, cfg.seq_len, rng))
             batch_np = {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]}
-            batch = {k: torch.from_numpy(v).to(device) for k, v in batch_np.items()}
+            batch = {}
+            for k, v in batch_np.items():
+                t = torch.from_numpy(v)
+                if device.type == 'cuda':
+                    t = t.pin_memory().to(device, non_blocking=True)
+                else:
+                    t = t.to(device)
+                batch[k] = t
 
             # World model
-            wm_losses, h_seq, z_seq = world_model_step(model, batch, cfg)
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=(device.type == 'cuda')):
+                wm_losses, h_seq, z_seq = world_model_step(model, batch, cfg)
             opt_world.zero_grad(set_to_none=True)
             wm_losses['wm_total'].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters_world(), cfg.grad_clip)
@@ -630,7 +651,9 @@ def train(cfg: TrainConfig) -> Dict:
             B, T = h_seq.shape[:2]
             h0 = h_seq.reshape(B * T, -1)
             z0 = z_seq.reshape(B * T, -1)
-            ac_losses = actor_critic_step(model, h0, z0, cfg)
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=(device.type == 'cuda')):
+                ac_losses = actor_critic_step(model, h0, z0, cfg)
             opt_actor.zero_grad(set_to_none=True)
             ac_losses['actor_loss'].backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(model.parameters_actor(), cfg.grad_clip)
