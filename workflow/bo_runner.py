@@ -98,9 +98,12 @@ def initialize_from_plant(out_dir: Path) -> Dict:
     return {
         'tau': tau,
         'dead_time': dead,
+        'tau_fast': float(tau_fast) if tau_fast else float(tau),
+        'dead_time_fast': float(dt_fast) if dt_fast else float(dead),
         'lookback': lookback,
         'dynamics_report': str(dyn_path),
         'lookback_report': str(lb_path),
+        'dynamics_raw': dyn,
     }
 
 
@@ -221,15 +224,35 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     base = TrainConfig()
     # Allow env-driven overrides for sample_rate / episode_length so the BO
     # itself stays simulator-agnostic.
-    sr = int(os.environ.get('SIM_SAMPLE_RATE', base.sample_rate))
-    ep = int(os.environ.get('SIM_EPISODE_LENGTH', base.episode_length))
-    base.sample_rate = sr
-    base.episode_length = ep
+    sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
+    ep_env = os.environ.get('SIM_EPISODE_LENGTH', '').strip()
 
     print('[BO] Phase 1: plant identification', flush=True)
     plant = initialize_from_plant(out_dir / 'plant_id')
+
+    # Plant-tied derivations (sample_rate from fastest dynamics, model_size
+    # from complexity, seq_len ≥ settling time).  Env-supplied values take
+    # precedence so this stays simulator-agnostic.
+    from utils.sim_factory import create_sim, resolve_sim_metadata
+    from utils.plant_init import derive_all
+    sr_override = int(sr_env) if sr_env else 0
+    tmp_sim = create_sim(episode_length=10,
+                         sample_rate=max(1, sr_override or base.sample_rate))
+    sim_meta = resolve_sim_metadata(tmp_sim)
+    derived = derive_all(plant.get('dynamics_raw') or {}, sim_meta,
+                         sample_rate_override=sr_override)
+    sr = derived['sample_rate']
+    base.sample_rate = sr
+    base.seq_len = derived['seq_len']
+    if ep_env:
+        base.episode_length = int(ep_env)
+    derived_model_size = derived['model_size']
+    print(f"[BO] derived: sample_rate={sr} ({derived['sample_rate_source']}) "
+          f"seq_len={base.seq_len} model_size_seed={derived_model_size} "
+          f"complexity={derived['complexity_score']:.2f}", flush=True)
+
     with open(out_dir / 'plant_id.json', 'w') as f:
-        json.dump(plant, f, indent=2)
+        json.dump({**plant, 'derived': derived}, f, indent=2, default=str)
     print(f"[BO] plant: tau={plant['tau']:.2f}  dead_time={plant['dead_time']:.2f}  "
           f"lookback={plant['lookback']}  H_init="
           f"{horizon_init(plant['tau'], plant['dead_time'], sr)}", flush=True)
@@ -241,6 +264,16 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     )
     study_dir = out_dir / 'trials'
     study_dir.mkdir(parents=True, exist_ok=True)
+    # Seed the first trial at the plant-derived configuration (lookback from
+    # lookback_identifier, model_size from complexity, horizon at the centre
+    # of the plant band).  Optuna explores the rest from there.
+    seed_lookback = min(lookback_grid(plant['lookback']),
+                        key=lambda v: abs(v - plant['lookback']))
+    study.enqueue_trial({
+        'lookback': seed_lookback,
+        'model_size': derived_model_size,
+        'horizon_mult': 1.0,
+    })
     study.optimize(lambda t: run_trial(t, base, plant, study_dir, trial_steps),
                    n_trials=n_trials, show_progress_bar=False)
 

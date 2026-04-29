@@ -89,8 +89,9 @@ def main() -> int:
                              '<repo>/_runs/<sim>_<timestamp>/')
     parser.add_argument('--steps', type=int, default=200_000,
                         help='Total environment steps (default 200 000).')
-    parser.add_argument('--model-size', choices=['S', 'M', 'L'], default='M',
-                        help='Architecture preset from BO; paper default M.')
+    parser.add_argument('--model-size', choices=['S', 'M', 'L'], default=None,
+                        help='Architecture preset. Default: auto-derived from '
+                             'plant complexity (channels + multiscale + state_dim).')
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
@@ -118,38 +119,81 @@ def main() -> int:
     os.environ['SIMULATION_DIR'] = str(sim_dir)
     os.environ.setdefault('SEED', str(args.seed))
 
-    sample_rate = int(os.environ.get('SIM_SAMPLE_RATE') or
-                      _read_setup_sample_rate(setup_path, default=5))
-    os.environ['SIM_SAMPLE_RATE'] = str(sample_rate)
-
     sys.path.insert(0, str(repo))
 
-    # Plant identification (tau, dead_time, lookback).
+    # ── Phase 1a: Dynamics identification (no lookback yet — needs sr) ────
     print(f'[run] simulation: {sim_dir}', flush=True)
-    print('[run] phase 1: plant identification', flush=True)
-    from workflow.bo_runner import initialize_from_plant, horizon_init
-    plant = initialize_from_plant(out_dir / 'plant_id')
-    with open(out_dir / 'plant_id.json', 'w') as f:
-        json.dump(plant, f, indent=2)
+    print('[run] phase 1a: dynamics identification', flush=True)
+    from utils.dynamics_identifier import identify_and_save_dynamics
+    plant_dir = out_dir / 'plant_id'
+    plant_dir.mkdir(parents=True, exist_ok=True)
+    dyn_path = plant_dir / 'dynamics_identification.json'
+    dyn = identify_and_save_dynamics(output_path=str(dyn_path))
+    tau = float(dyn.get('tau_dominant_identified', dyn.get('tau_dominant', 50.0)) or 50.0)
+    dead = float(dyn.get('dead_time_identified', dyn.get('dead_time', 5.0)) or 5.0)
+    tau_fast = float(dyn.get('tau_fastest_identified', tau) or tau)
+    dead_fast = float(dyn.get('dead_time_fastest_identified', dead) or dead)
 
-    tau = float(plant['tau'])
-    dead = float(plant['dead_time'])
-    lookback = int(plant['lookback'])
-    horizon = horizon_init(tau, dead, sample_rate)
-
+    # ── Phase 1b: Plant-tied derivations (sample rate, model size, seq_len) ─
+    # Sample rate from the *fastest* identified channel.  An explicit
+    # SIM_SAMPLE_RATE in env or in the setup file overrides the derivation.
+    from utils.sim_factory import create_sim, resolve_sim_metadata
+    from utils.plant_init import derive_all
+    sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
+    sr_setup = _read_setup_sample_rate(setup_path, default=0)
+    sr_override = int(sr_env) if sr_env else int(sr_setup)
+    # Build a temporary sim instance so we can read mv/cv/dv counts + state_dim.
+    tmp_sim = create_sim(episode_length=10, sample_rate=max(1, sr_override or 5))
+    sim_meta = resolve_sim_metadata(tmp_sim)
+    derived = derive_all(dyn, sim_meta, sample_rate_override=sr_override)
+    sample_rate = derived['sample_rate']
+    if args.model_size:
+        model_size = args.model_size
+        model_size_source = 'cli'
+    else:
+        model_size = derived['model_size']
+        model_size_source = 'auto:complexity'
+    os.environ['SIM_SAMPLE_RATE'] = str(sample_rate)
     os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
     os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'
 
-    # Episode length: auto-derived (≈ 20 × (τ+θ), clamped 500–4000).
+    # ── Phase 1c: Lookback identification (uses derived sample_rate) ──────
+    print('[run] phase 1c: lookback identification', flush=True)
+    from utils.lookback_identifier import identify_and_save_lookback
+    lb_path = plant_dir / 'lookback_identification.json'
+    seed = int(os.environ.get('SEED', '0'))
+    min_lb = max(8, int(round(tau / max(1, sample_rate))))
+    max_lb = max(min_lb + 8, int(round(4.0 * tau / max(1, sample_rate))))
+    lb = identify_and_save_lookback(
+        seed=seed, min_lb=min_lb, max_lb=max_lb,
+        output_path=str(lb_path),
+        tau_dominant=tau, dead_time=dead,
+        tau_fastest=tau_fast, dead_time_fastest=dead_fast,
+        per_pair_estimates=dyn.get('per_pair_estimates')
+                           or dyn.get('pair_estimates') or [],
+    )
+    lookback = int(lb.get('identified_lookback', lb.get('lookback', max(min_lb, 32))))
+
+    plant = {
+        'tau': tau, 'dead_time': dead,
+        'tau_fast': tau_fast, 'dead_time_fast': dead_fast,
+        'lookback': lookback,
+        'dynamics_report': str(dyn_path),
+        'lookback_report': str(lb_path),
+    }
+    with open(out_dir / 'plant_id.json', 'w') as f:
+        json.dump(plant, f, indent=2)
+
+    # Episode length & horizon from plant.
     from utils.auto_episode_length import derive_episode_length
+    from workflow.bo_runner import horizon_init, MODEL_SIZE_PRESETS
     episode_length, ep_source = derive_episode_length()
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
+    horizon = horizon_init(tau, dead, sample_rate)
+    seq_len = derived['seq_len']
+    arch = MODEL_SIZE_PRESETS[model_size]
 
-    # Architecture preset (paper §C).
-    from workflow.bo_runner import MODEL_SIZE_PRESETS
-    arch = MODEL_SIZE_PRESETS[args.model_size]
-
-    # Build TrainConfig with paper-faithful defaults.
+    # Build TrainConfig — every value either plant-tied or paper-faithful default.
     from training.train import TrainConfig, train as run_training
     cfg = TrainConfig(
         deter_dim=arch['deter_dim'],
@@ -162,6 +206,7 @@ def main() -> int:
         episode_length=episode_length,
         total_steps=int(args.steps),
         horizon=horizon,
+        seq_len=seq_len,
         out_dir=str(out_dir),
     )
 
@@ -170,13 +215,20 @@ def main() -> int:
         'simulation_name': sim_name,
         'out_dir': str(out_dir),
         'sample_rate': sample_rate,
+        'sample_rate_source': derived['sample_rate_source'],
         'tau': tau,
         'dead_time': dead,
+        'tau_fast': tau_fast,
+        'dead_time_fast': dead_fast,
         'lookback': lookback,
         'horizon': horizon,
+        'seq_len': seq_len,
         'episode_length': episode_length,
         'episode_length_source': ep_source,
-        'model_size': args.model_size,
+        'model_size': model_size,
+        'model_size_source': model_size_source,
+        'complexity_score': derived['complexity_score'],
+        'complexity_inputs': derived['inputs'],
         'seed': int(args.seed),
         'total_steps': int(args.steps),
         'config': asdict(cfg),
