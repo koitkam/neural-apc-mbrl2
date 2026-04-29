@@ -194,6 +194,8 @@ class APCEnv:
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
         self._schedule: List[Dict] = []
+        # Reward scale (auto-calibrated in train(); see calibrate_reward_scale).
+        self.reward_scale: float = 1.0
 
     # ---- helpers ----
     def _build_obs_vec(self, state: np.ndarray) -> np.ndarray:
@@ -262,14 +264,16 @@ class APCEnv:
             setpoint_manager=self.setpoint_mgr,
             objective_spec=self.obj_spec,
         )
-        reward = float(comps['reward'])
+        raw_reward = float(comps['reward'])
+        reward = raw_reward * float(self.reward_scale)
         self._prev_control = np.asarray(control, dtype='float32')
         self._t += 1
         done = self._t >= self.cfg.episode_length
         # Roll the window: drop oldest, append newest.
         obs_vec = self._build_obs_vec(next_state)
         self._window = np.concatenate([self._window[1:], obs_vec[None, :]], axis=0)
-        info = {'reward_components': comps, 't': self._t}
+        info = {'reward_components': comps, 't': self._t,
+                'raw_reward': raw_reward}
         return self._window.copy(), reward, done, info
 
 
@@ -549,6 +553,54 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
     return DreamerV4(model_cfg)
 
 
+def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
+                            n_steps: int = 1500,
+                            target_std: float = 1.0,
+                            min_scale: float = 1.0,
+                            max_scale: float = 1000.0) -> Dict[str, float]:
+    """Empirically choose a per-step reward scale.
+
+    Runs a short rollout under uniform-random actions and the same training
+    disturbance schedule, measures the std of raw per-step rewards, and
+    returns ``target_std / std``.  Floored at 1.0 so plants whose natural
+    rewards already span O(1) are left untouched.
+
+    The ``[-20, +20]`` symlog twohot support of the reward head (paper §B)
+    represents per-step rewards with the highest resolution near 0; with
+    target_std≈1.0, ~95% of returns fall inside |r|<2 → ~64 of the 255 bins
+    carry meaningful probability.  This is the regime the paper is
+    calibrated for.
+    """
+    if env.reward_scale != 1.0:
+        env.reward_scale = 1.0  # measure raw magnitudes
+    raw_rewards: List[float] = []
+    env.reset(exploration=True)
+    for _ in range(int(n_steps)):
+        a = rng.uniform(-1.0, 1.0, size=(env.action_dim,)).astype('float32')
+        _, _, done, info = env.step(a)
+        raw_rewards.append(float(info.get('raw_reward', 0.0)))
+        if done:
+            env.reset(exploration=True)
+    arr = np.asarray(raw_rewards, dtype='float64')
+    std = float(arr.std())
+    mean = float(arr.mean())
+    if std < 1e-8:
+        scale = 1.0
+    else:
+        scale = float(target_std / std)
+    scale = float(np.clip(scale, min_scale, max_scale))
+    env.reward_scale = scale
+    return {
+        'reward_scale': scale,
+        'raw_std': std,
+        'raw_mean': mean,
+        'raw_min': float(arr.min()),
+        'raw_max': float(arr.max()),
+        'target_std': float(target_std),
+        'n_steps': int(n_steps),
+    }
+
+
 def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     """Train DreamerV4.
 
@@ -580,6 +632,42 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     cfg.state_dim = env.state_dim
     cfg.aug_obs_dim = env.aug_obs_dim
     cfg.obs_dim = env.obs_dim
+
+    # Reward scaling: paper §B's symlog-twohot reward head is calibrated for
+    # per-step rewards spanning O(1).  APC objectives often produce O(0.01),
+    # which leaves the head pinned at the uniform-prior loss.  Either:
+    #   • OBJ_REWARD_SCALE=<float>  — explicit override (no calibration)
+    #   • OBJ_REWARD_SCALE=auto / unset — short calibration rollout to
+    #     match a target raw-reward std of 1.0 (clamped ≥1.0).
+    obj_scale_env = os.environ.get('OBJ_REWARD_SCALE', 'auto').strip().lower()
+    if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
+        if obj_scale_env in ('1', 'on', 'true'):
+            # legacy boolean ON → still calibrate adaptively
+            pass
+        cal = calibrate_reward_scale(env, rng)
+        print(f"[reward-scale] auto-calibrated: scale={cal['reward_scale']:.3f}  "
+              f"raw_std={cal['raw_std']:.5f} raw_range=[{cal['raw_min']:.4f},"
+              f"{cal['raw_max']:.4f}]  target_std={cal['target_std']:.2f}",
+              flush=True)
+        out_dir_pre = Path(cfg.out_dir or '.')
+        out_dir_pre.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(out_dir_pre / 'reward_calibration.json', 'w') as f:
+                json.dump(cal, f, indent=2)
+        except Exception:
+            pass
+    elif obj_scale_env in ('off', '0', 'none', 'false'):
+        env.reward_scale = 1.0
+        print('[reward-scale] disabled (raw rewards passed through)', flush=True)
+    else:
+        try:
+            env.reward_scale = float(obj_scale_env)
+            print(f'[reward-scale] explicit override: scale={env.reward_scale:.3f}',
+                  flush=True)
+        except Exception:
+            env.reward_scale = 1.0
+            print(f'[reward-scale] could not parse OBJ_REWARD_SCALE={obj_scale_env!r}, '
+                  f'defaulting to 1.0', flush=True)
 
     model = build_model(cfg).to(device)
 
