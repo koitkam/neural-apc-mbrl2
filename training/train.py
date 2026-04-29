@@ -595,7 +595,18 @@ def train(cfg: TrainConfig) -> Dict:
     total_env_steps = 0
     total_iters = 0
     start_time = time.time()
+    last_log_time = start_time
+    last_log_steps = 0
     ema_return = None
+
+    # Header line in the .log so we can correlate with absolute time.
+    print(f"# train start: {time.strftime('%Y-%m-%d %H:%M:%S')} "
+          f"device={device.type} cfg.batch_size={cfg.batch_size} "
+          f"seq_len={cfg.seq_len} horizon={cfg.horizon} "
+          f"deter={cfg.deter_dim} embed={cfg.embed_dim} hidden={cfg.hidden_dim} "
+          f"K={cfg.n_categoricals} C={cfg.n_classes} "
+          f"lookback={cfg.lookback} ep_len={cfg.episode_length}",
+          flush=True)
 
     # Seed buffers: collect a few exploration episodes first so WM can train.
     for _ in range(2):
@@ -646,7 +657,8 @@ def train(cfg: TrainConfig) -> Dict:
                 wm_losses, h_seq, z_seq = world_model_step(model, batch, cfg)
             opt_world.zero_grad(set_to_none=True)
             wm_losses['wm_total'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters_world(), cfg.grad_clip)
+            wm_grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters_world(), cfg.grad_clip)
             opt_world.step()
 
             # Actor-critic in latent imagination, starting from posterior states.
@@ -658,25 +670,51 @@ def train(cfg: TrainConfig) -> Dict:
                 ac_losses = actor_critic_step(model, h0, z0, cfg)
             opt_actor.zero_grad(set_to_none=True)
             ac_losses['actor_loss'].backward(retain_graph=True)
-            torch.nn.utils.clip_grad_norm_(model.parameters_actor(), cfg.grad_clip)
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters_actor(), cfg.grad_clip)
             opt_actor.step()
             opt_critic.zero_grad(set_to_none=True)
             ac_losses['critic_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters_critic(), cfg.grad_clip)
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters_critic(), cfg.grad_clip)
             opt_critic.step()
 
             model.update_target(cfg.target_critic_tau)
 
         total_iters += 1
         if total_iters % cfg.log_every == 0:
+            now = time.time()
+            iter_dt = now - last_log_time
+            steps_dt = total_env_steps - last_log_steps
+            sps = (steps_dt / iter_dt) if iter_dt > 0 else 0.0
+            gpu_mem_mb = None
+            gpu_mem_peak_mb = None
+            if device.type == 'cuda':
+                try:
+                    gpu_mem_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+                    gpu_mem_peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                    torch.cuda.reset_peak_memory_stats(device)
+                except Exception:
+                    pass
             row = {
                 'iter': total_iters,
                 'env_steps': total_env_steps,
-                'wallclock_s': time.time() - start_time,
+                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'wallclock_s': now - start_time,
+                'iter_time_s': iter_dt,
+                'env_steps_per_s': sps,
                 'ema_return': float(ema_return) if ema_return is not None else None,
                 'mix_explore': float(mix_explore),
                 'policy_eps': policy_buf.filled,
                 'explore_eps': explore_buf.filled,
+                'wm_grad_norm': float(wm_grad_norm.detach().item()
+                                      if torch.is_tensor(wm_grad_norm) else wm_grad_norm),
+                'actor_grad_norm': float(actor_grad_norm.detach().item()
+                                         if torch.is_tensor(actor_grad_norm) else actor_grad_norm),
+                'critic_grad_norm': float(critic_grad_norm.detach().item()
+                                          if torch.is_tensor(critic_grad_norm) else critic_grad_norm),
+                'gpu_mem_mb': gpu_mem_mb,
+                'gpu_mem_peak_mb': gpu_mem_peak_mb,
             }
             for k, v in wm_losses.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
@@ -684,11 +722,19 @@ def train(cfg: TrainConfig) -> Dict:
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
             log_f.write(json.dumps(row) + '\n')
             log_f.flush()
-            print(f"iter {total_iters:4d} steps {total_env_steps:6d} "
+            print(f"[{row['timestamp']}] iter {total_iters:4d} "
+                  f"steps {total_env_steps:6d} sps {sps:5.1f} "
                   f"ret_ema {row['ema_return']:.2f} "
                   f"recon {row['wm_recon']:.4f} kl {row['wm_kl']:.4f} "
-                  f"actor {row['actor_loss']:.4f} critic {row['critic_loss']:.4f}",
+                  f"actor {row['actor_loss']:+.4f} critic {row['critic_loss']:.4f} "
+                  f"ent {row.get('entropy_mean', 0.0):.3f} "
+                  f"adv_std {row.get('adv_std_mean', 0.0):.3f} "
+                  f"gn(w/a/c) {row['wm_grad_norm']:.2f}/"
+                  f"{row['actor_grad_norm']:.3f}/{row['critic_grad_norm']:.2f} "
+                  f"img_ret {row.get('imagined_return_mean', 0.0):+.3f}",
                   flush=True)
+            last_log_time = now
+            last_log_steps = total_env_steps
 
         if total_iters % cfg.save_every_iters == 0:
             torch.save({'model': model.state_dict(),
