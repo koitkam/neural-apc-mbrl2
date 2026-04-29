@@ -1,0 +1,8 @@
+{
+    "simulator": {
+        "module": "simulation.distillation.distillation_sim",
+        "class": "DistillationTower",
+        "kwargs": {}
+    }
+}
+

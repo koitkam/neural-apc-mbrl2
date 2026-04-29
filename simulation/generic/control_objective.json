@@ -1,0 +1,52 @@
+{
+    "model": "generic_control_example",
+    "description": "Generic objective template for any simulator using MV/CV index mappings from CONTROL_SETUP_JSON. Violation/move weights are auto-derived.",
+    "control_speed": "normal",
+    "objective_use_normalized": 1,
+    "bounds": {
+        "mvs": {
+            "mv_0": [
+                0.0,
+                100.0
+            ],
+            "mv_1": [
+                0.0,
+                100.0
+            ],
+            "mv_2": [
+                0.0,
+                100.0
+            ]
+        },
+        "outputs": {
+            "cv_0": [
+                0.0,
+                100.0
+            ],
+            "cv_1": [
+                0.0,
+                100.0
+            ],
+            "cv_2": [
+                0.0,
+                100.0
+            ]
+        }
+    },
+    "cv_priority": [
+        "cv_0",
+        "cv_1",
+        "cv_2"
+    ],
+    "weights": {
+        "mv_economic": {
+            "mv_0": 0.0,
+            "mv_1": 1.0,
+            "mv_2": 0.0
+        },
+        "cv_economic": {}
+    },
+    "runtime_setpoints": {
+        "targets_enabled": [false, false, false]
+    }
+}

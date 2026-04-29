@@ -1,0 +1,46 @@
+{
+    "meta": {
+        "steps": 200,
+        "policy": "random",
+        "objective_path": "/home/koitkam/NMP/control_workflow_standalone/simulation/distillation/control_objective.json",
+        "setup_path": "/home/koitkam/NMP/control_workflow_standalone/simulation/distillation/control_setup.json"
+    },
+    "mean_reward": -0.28307240456342697,
+    "mean_penalties": {
+        "mv_violation_penalty": 0.0,
+        "cv_violation_penalty": 1.7654997861385346,
+        "mv_economic_penalty": -1.4824273815751077,
+        "cv_economic_penalty": 0.0,
+        "mv_move_penalty": 0.0
+    },
+    "mean_terms_by_channel": {
+        "mv_violation_per_channel": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ],
+        "cv_violation_per_channel": [
+            0.003167387330904603,
+            0.03795742243528366,
+            0.0033474306110292673
+        ],
+        "mv_economic_terms": [
+            0.5578623414039612,
+            0.5680627226829529,
+            0.5577136874198914,
+            1.6614032983779907
+        ],
+        "cv_economic_terms": [
+            2.3525094985961914,
+            2.2872793674468994,
+            1.4024269580841064
+        ],
+        "mv_move_terms": [
+            0.30412057042121887,
+            0.3039734363555908,
+            0.33072352409362793,
+            0.32676276564598083
+        ]
+    }
+}

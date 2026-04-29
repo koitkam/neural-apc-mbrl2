@@ -1,0 +1,19 @@
+{
+    "simulator": {
+        "module": "simulation.softsensor_lab.softsensor_lab_sim",
+        "class": "SoftSensorLabSim",
+        "kwargs": {
+            "lab_target": 33.0,
+            "lookback_steps": 45,
+            "dv_tau": 40.0
+        }
+    },
+    "noise_and_randomization": {
+        "dv_mean_shift_pct": 0.05
+    },
+    "workflow": {
+        "quick_cycle_polish_agent_total_steps": 393216,
+        "polish_agent_total_steps": 524288
+    }
+}
+
