@@ -1,0 +1,11 @@
+{
+    "simulator": {
+        "module": "simulation.test_sim.test_sim",
+        "class": "TestSimTower",
+        "kwargs": {}
+    },
+    "workflow": {
+        "polish_agent_total_steps": 262144
+    }
+}
+

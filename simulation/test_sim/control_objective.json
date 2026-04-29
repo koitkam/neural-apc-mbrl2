@@ -1,0 +1,34 @@
+{
+    "model": "test_sim_single_loop",
+    "description": "Objective for fast single-loop distillation-like reflux control: hold control temperature in spec while minimizing reflux usage and movement. Violation/move weights are auto-derived from cv_priority + control_speed + identified dynamics.",
+    "control_speed": "normal",
+    "objective_use_normalized": 1,
+    "bounds": {
+        "mvs": {
+            "mv_0": [
+                20.0,
+                80.0
+            ]
+        },
+        "outputs": {
+            "cv_0": [
+                78.5,
+                85.5
+            ]
+        }
+    },
+    "cv_priority": [
+        "cv_0"
+    ],
+    "weights": {
+        "mv_economic": {
+            "mv_0": 5.0
+        },
+        "cv_economic": {
+            "cv_0": 0.0
+        }
+    },
+    "runtime_setpoints": {
+        "targets_enabled": [false]
+    }
+}

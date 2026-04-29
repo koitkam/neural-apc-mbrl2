@@ -1,0 +1,31 @@
+# Virtualenvs (kept outside repo, but guard anyway)
+neural-apc-dreamerV4-env/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Torch / Inductor caches
+_inductor_cache/
+*.pt
+*.pth
+
+# ONNX / model artifacts
+*.onnx
+
+# Training outputs
+logs/
+output/
+experiment_runs/
+experiment_runs_*/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

@@ -1,0 +1,21 @@
+# Dreamer-V4 — minimal dependencies
+# Reference: Hafner et al. 2024, arXiv:2407.04693
+
+# PyTorch + CUDA
+torch>=2.5.0
+
+# ONNX export
+onnx>=1.16.0
+onnxruntime-gpu>=1.18.0
+
+# Bayesian optimization (BO over 3 axes only)
+optuna>=4.0.0
+
+# Scientific
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
