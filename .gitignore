@@ -29,3 +29,4 @@ experiment_runs_*/
 .idea/
 .DS_Store
 *.swp
+_smoke_*

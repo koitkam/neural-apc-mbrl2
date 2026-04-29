@@ -393,10 +393,11 @@ def world_model_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     h, z = model.rssm.initial_state(B, device)
     h_list, z_list = [], []
     post_logits_list, prior_logits_list = [], []
-    decoded_list, reward_logits_list, cont_logits_list = [], [], []
 
     # Use act[:, t-1] as the action that drove transition into step t.
     # For t=0 we use a zero action.
+    # Sequential rollout: only the recurrent observe_step stays per-step;
+    # all decode/reward/cont head forwards are batched once after.
     for t in range(T):
         prev_a = act[:, t - 1] if t > 0 else torch.zeros_like(act[:, 0])
         h, z, post, prior = model.rssm.observe_step(obs[:, t], prev_a, h, z)
@@ -404,17 +405,18 @@ def world_model_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         z_list.append(z)
         post_logits_list.append(post)
         prior_logits_list.append(prior)
-        decoded_list.append(model.rssm.decode(h, z))
-        reward_logits_list.append(model.rssm.predict_reward(h, z))
-        cont_logits_list.append(model.rssm.predict_cont(h, z))
 
     h_seq = torch.stack(h_list, dim=1)               # (B, T, deter)
     z_seq = torch.stack(z_list, dim=1)               # (B, T, stoch)
     post_seq = torch.stack(post_logits_list, dim=1)  # (B, T, stoch)
     prior_seq = torch.stack(prior_logits_list, dim=1)
-    decoded = torch.stack(decoded_list, dim=1)        # (B, T, D)
-    reward_logits = torch.stack(reward_logits_list, dim=1)  # (B, T, n_bins)
-    cont_logits = torch.stack(cont_logits_list, dim=1).squeeze(-1)  # (B, T)
+
+    # Batched head forwards across (B*T) — one CUDA kernel per head instead of T.
+    h_flat = h_seq.reshape(B * T, -1)
+    z_flat = z_seq.reshape(B * T, -1)
+    decoded = model.rssm.decode(h_flat, z_flat).view(B, T, -1)
+    reward_logits = model.rssm.predict_reward(h_flat, z_flat).view(B, T, -1)
+    cont_logits = model.rssm.predict_cont(h_flat, z_flat).view(B, T, -1).squeeze(-1)
 
     # --- Reconstruction loss (symlog MSE on the latest frame of each window) ---
     target_obs = obs[:, :, -1, :]   # (B, T, D) — predicted-step observation
