@@ -360,11 +360,34 @@ class DreamerV4(nn.Module):
         self.target_critic.load_state_dict(self.critic.state_dict())
         for p in self.target_critic.parameters():
             p.requires_grad_(False)
+        # Return-scale EMA (paper §C "Actor learning"): tracks the
+        # 5th/95th percentile spread of imagined λ-returns to normalize
+        # advantages globally instead of per-trajectory.
+        self.register_buffer('ret_scale', torch.ones(1))
 
     def update_target(self, tau: float = 0.02) -> None:
         with torch.no_grad():
             for p, t in zip(self.critic.parameters(), self.target_critic.parameters()):
                 t.data.mul_(1.0 - tau).add_(tau * p.data)
+
+    def update_return_scale(self, returns: torch.Tensor,
+                             ema: float = 0.99) -> torch.Tensor:
+        """EMA-update the return scale and return its current (clamped) value.
+
+        ``returns`` is a flat tensor of imagined λ-returns over the batch.
+        Scale = ``max(1.0, P95 - P5)`` (paper §C).  Clamped at 1.0 so small
+        returns do not amplify gradient noise.
+        """
+        with torch.no_grad():
+            r = returns.detach().reshape(-1).float()
+            if r.numel() < 2:
+                spread = torch.tensor(1.0, device=r.device)
+            else:
+                p05 = torch.quantile(r, 0.05)
+                p95 = torch.quantile(r, 0.95)
+                spread = torch.clamp(p95 - p05, min=1.0)
+            self.ret_scale.mul_(ema).add_((1.0 - ema) * spread)
+        return self.ret_scale.clamp_min(1.0)
 
     # Convenience parameter groups
     def parameters_world(self):

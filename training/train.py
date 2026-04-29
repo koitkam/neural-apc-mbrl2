@@ -509,14 +509,14 @@ def actor_critic_step(model: DreamerV4, h0: torch.Tensor, z0: torch.Tensor,
     critic_loss = model.critic.head.loss(critic_logits,
                                          target_returns.reshape(-1)).mean()
 
-    # Actor: per-trajectory advantage normalization (paper canonical).
+    # Actor: paper §C global return normalization.
+    # advantage = (R^lambda - v(z)) / max(1, EMA(P95 - P5))
+    # — global across the imagined batch, EMA-tracked across updates.
     with torch.no_grad():
         baseline = model.critic.value(flat_latents_for_critic).view(BT, H)
-        adv = target_returns - baseline
-        # per-trajectory normalize: subtract row-mean, divide by row-std
-        adv_mean = adv.mean(dim=1, keepdim=True)
-        adv_std = adv.std(dim=1, keepdim=True).clamp_min(1e-6)
-        adv_norm = (adv - adv_mean) / adv_std
+        adv_raw = target_returns - baseline
+        scale = model.update_return_scale(target_returns).clamp_min(1.0)
+        adv_norm = adv_raw / scale
 
     actor_loss = -(log_probs * adv_norm).mean() \
                  - cfg.actor_entropy_scale * entropies.mean()
@@ -527,7 +527,8 @@ def actor_critic_step(model: DreamerV4, h0: torch.Tensor, z0: torch.Tensor,
         'imagined_return_mean': target_returns.mean().detach(),
         'imagined_reward_mean': rewards[:, 1:].mean().detach(),
         'entropy_mean': entropies.mean().detach(),
-        'adv_std_mean': adv.std(dim=1).mean().detach(),
+        'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
+        'return_scale': scale.detach().squeeze(),
     }
 
 
@@ -548,7 +549,16 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
     return DreamerV4(model_cfg)
 
 
-def train(cfg: TrainConfig) -> Dict:
+def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
+    """Train DreamerV4.
+
+    Parameters
+    ----------
+    cfg : TrainConfig
+    on_iter_end : optional callable ``(iter:int, env_steps:int, ema_return:float)
+                  -> bool``.  If it returns True, training stops early — used
+                  by the Optuna BO runner to support trial pruning.
+    """
     rng = np.random.default_rng(int(os.environ.get('SEED', '0')))
     torch.manual_seed(int(os.environ.get('SEED', '0')))
 
@@ -736,6 +746,17 @@ def train(cfg: TrainConfig) -> Dict:
             last_log_time = now
             last_log_steps = total_env_steps
 
+        if on_iter_end is not None:
+            try:
+                stop = bool(on_iter_end(int(total_iters),
+                                         int(total_env_steps),
+                                         float(ema_return) if ema_return is not None else 0.0))
+            except Exception:
+                stop = False
+            if stop:
+                print(f'[train] early-stop requested by callback at iter {total_iters}',
+                      flush=True)
+                break
         if total_iters % cfg.save_every_iters == 0:
             torch.save({'model': model.state_dict(),
                         'cfg': asdict(cfg)},

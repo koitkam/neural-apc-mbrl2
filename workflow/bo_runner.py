@@ -150,7 +150,24 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     cfg = make_trial_config(base, lookback=lookback, model_size=model_size,
                             horizon=horizon, total_steps=trial_steps,
                             out_dir=trial_dir)
-    summary = run_training(cfg)
+
+    # Pruning hook: report the running EMA return after each log iter so the
+    # MedianPruner can stop visibly-bad trials early.
+    def _on_iter(it: int, steps: int, ema: float) -> bool:
+        try:
+            trial.report(float(ema), step=int(steps))
+        except Exception:
+            pass
+        return bool(trial.should_prune())
+
+    try:
+        summary = run_training(cfg, on_iter_end=_on_iter)
+    except optuna.TrialPruned:
+        with open(trial_dir / 'trial_summary.json', 'w') as f:
+            json.dump({'params': trial.params, 'horizon_concrete': horizon,
+                       'H_init': H_init, 'pruned': True}, f, indent=2)
+        raise
+
     score = summary.get('final_ema_return')
     if score is None or not np.isfinite(score):
         score = float('-inf')
@@ -261,6 +278,11 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     study = optuna.create_study(
         study_name=study_name, direction='maximize',
         sampler=optuna.samplers.TPESampler(seed=int(os.environ.get('SEED', '0'))),
+        # Prune trials whose intermediate EMA return is below the median of
+        # completed trials at the same step, after the first 3 trials have
+        # finished and ≥ 5 reports have come in.
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=3, n_warmup_steps=5, interval_steps=1),
     )
     study_dir = out_dir / 'trials'
     study_dir.mkdir(parents=True, exist_ok=True)
