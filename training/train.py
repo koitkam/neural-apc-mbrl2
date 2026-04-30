@@ -19,6 +19,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -196,6 +197,10 @@ class APCEnv:
         self._schedule: List[Dict] = []
         # Reward scale (auto-calibrated in train(); see calibrate_reward_scale).
         self.reward_scale: float = 1.0
+        # Per-episode aggregates (reset on each reset(); read by training
+        # loop via collect_episode for diagnostic logging).
+        self._last_cv_violation_sum: float = 0.0
+        self._last_mv_violation_sum: float = 0.0
 
     # ---- helpers ----
     def _build_obs_vec(self, state: np.ndarray) -> np.ndarray:
@@ -210,6 +215,8 @@ class APCEnv:
         state = np.asarray(state, dtype='float32').reshape(-1)
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
+        self._last_cv_violation_sum = 0.0
+        self._last_mv_violation_sum = 0.0
         # Curriculum fraction is the global progress; pass 1.0 for now and
         # let the BO/outer loop tune episode length. This keeps the trainer
         # paper-aligned (no auto-tuning band-aids inside the loop).
@@ -272,6 +279,9 @@ class APCEnv:
         # Roll the window: drop oldest, append newest.
         obs_vec = self._build_obs_vec(next_state)
         self._window = np.concatenate([self._window[1:], obs_vec[None, :]], axis=0)
+        # Per-episode violation accumulators (training-loop diagnostics).
+        self._last_cv_violation_sum += float(comps.get('cv_violation_penalty', 0.0))
+        self._last_mv_violation_sum += float(comps.get('mv_violation_penalty', 0.0))
         info = {'reward_components': comps, 't': self._t,
                 'raw_reward': raw_reward}
         return self._window.copy(), reward, done, info
@@ -601,6 +611,89 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     }
 
 
+def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
+    """Plot a 2x3 diagnostic grid from train_log.jsonl.
+
+    Panels: (1) ema_return + return_window_mean, (2) WM losses (recon/kl/reward/cont),
+    (3) actor/critic loss, (4) entropy & adv_std, (5) grad norms (w/a/c) +
+    skip count, (6) violations (cv/mv per-iter mean).
+    """
+    import matplotlib
+    matplotlib.use('Agg')  # type: ignore
+    import matplotlib.pyplot as plt
+
+    rows = []
+    with open(log_path, 'r') as f:
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    if not rows:
+        return
+    steps = [r.get('env_steps', 0) for r in rows]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
+
+    ax = axes[0, 0]
+    ax.plot(steps, [r.get('ema_return') for r in rows], label='ema_return', lw=1.0)
+    rw = [r.get('return_window_mean') for r in rows]
+    if any(v is not None for v in rw):
+        ax.plot(steps, rw, label='return_window_mean (last 10)', lw=1.2, color='C3')
+    ax.axhline(0, color='gray', lw=0.5)
+    ax.set_ylabel('return'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    ax.set_title('Returns')
+
+    ax = axes[0, 1]
+    for k, c in [('wm_recon', 'C0'), ('wm_kl', 'C1'),
+                  ('wm_reward', 'C2'), ('wm_cont', 'C3')]:
+        vals = [r.get(k) for r in rows]
+        if any(v is not None for v in vals):
+            ax.plot(steps, vals, label=k, lw=1.0, color=c)
+    ax.set_yscale('symlog', linthresh=1e-3)
+    ax.set_ylabel('WM losses'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    ax.set_title('World model losses')
+
+    ax = axes[0, 2]
+    ax.plot(steps, [r.get('actor_loss') for r in rows], label='actor', lw=1.0)
+    ax.plot(steps, [r.get('critic_loss') for r in rows], label='critic', lw=1.0)
+    ax.set_ylabel('AC loss'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    ax.set_title('Actor / Critic loss')
+
+    ax = axes[1, 0]
+    ax.plot(steps, [r.get('entropy_mean') for r in rows], label='entropy_mean', lw=1.0)
+    ax2 = ax.twinx()
+    ax2.plot(steps, [r.get('adv_std_mean') for r in rows], color='C3',
+              label='adv_std_mean', lw=1.0)
+    ax.set_ylabel('entropy'); ax2.set_ylabel('adv_std', color='C3')
+    ax.legend(loc='upper left', fontsize=8); ax.grid(alpha=0.3)
+    ax.set_title('Policy entropy / advantage std')
+
+    ax = axes[1, 1]
+    for k, c in [('wm_grad_norm', 'C0'), ('actor_grad_norm', 'C1'),
+                  ('critic_grad_norm', 'C2')]:
+        ax.plot(steps, [r.get(k) for r in rows], label=k, lw=1.0, color=c)
+    ax.set_yscale('symlog', linthresh=1e-2)
+    ax.set_ylabel('grad norm'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    skips = [r.get('n_grad_skip', 0) for r in rows]
+    ax.set_title(f'Grad norms (skip total={skips[-1] if skips else 0})')
+
+    ax = axes[1, 2]
+    cv = [r.get('iter_cv_violation_mean') for r in rows]
+    mv = [r.get('iter_mv_violation_mean') for r in rows]
+    if any(v is not None for v in cv):
+        ax.plot(steps, cv, label='cv_v', lw=1.0, color='C3')
+    if any(v is not None for v in mv):
+        ax.plot(steps, mv, label='mv_v', lw=1.0, color='C1')
+    ax.set_ylabel('mean violation per iter'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    ax.set_title('Violations (per-iter mean)')
+
+    for ax in axes[1, :]:
+        ax.set_xlabel('env_steps')
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
 def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     """Train DreamerV4.
 
@@ -715,6 +808,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     t_wm_acc = 0.0
     t_ac_acc = 0.0
 
+    # Diagnostics: rolling window of last 10 episode returns + per-iter
+    # collected-episode return aggregates (reset every log_every iters)
+    # + global NaN-grad skip counter.
+    return_window: 'deque[float]' = deque(maxlen=10)
+    iter_returns: List[float] = []
+    iter_cv_violations: List[float] = []
+    iter_mv_violations: List[float] = []
+    iter_raw_returns: List[float] = []
+    n_grad_skip = 0
+
     # Header line in the .log so we can correlate with absolute time.
     print(f"# train start: {time.strftime('%Y-%m-%d %H:%M:%S')} "
           f"device={device.type} cfg.batch_size={cfg.batch_size} "
@@ -741,6 +844,25 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             total_env_steps += cfg.episode_length
             ret = float(ep['rew'].sum())
             ema_return = ret if ema_return is None else 0.95 * ema_return + 0.05 * ret
+            # Diagnostics: only count POLICY episodes in the window
+            # (exploration episodes are random-action, not informative).
+            if not is_explore:
+                return_window.append(ret)
+                iter_returns.append(ret)
+                # Aggregate raw-reward + violation totals stashed by env.step
+                # via the last collected info dict.  We need to walk the
+                # rewards array; raw rewards aren't stored, but we can
+                # recover them from the scaled rewards if reward_scale != 0.
+                rs = float(env.reward_scale) if env.reward_scale else 1.0
+                iter_raw_returns.append(ret / rs if rs else ret)
+                # Violation totals come from the last episode's component
+                # accumulator: walk env.sim once more is too costly, so we
+                # rely on the env's internal _last_ep_components list if
+                # exposed.  Otherwise leave at 0 (kept simple).
+                cv_v = float(getattr(env, '_last_cv_violation_sum', 0.0))
+                mv_v = float(getattr(env, '_last_mv_violation_sum', 0.0))
+                iter_cv_violations.append(cv_v)
+                iter_mv_violations.append(mv_v)
         t_collect_acc += time.time() - _t
 
         if policy_buf.filled == 0:
@@ -780,7 +902,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             wm_losses['wm_total'].backward()
             wm_grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters_world(), cfg.grad_clip)
-            opt_world.step()
+            if not torch.isfinite(wm_grad_norm):
+                n_grad_skip += 1
+                opt_world.zero_grad(set_to_none=True)
+            else:
+                opt_world.step()
             t_wm_acc += time.time() - _t
 
             # Actor-critic in latent imagination, starting from posterior states.
@@ -802,8 +928,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 model.parameters_actor(), cfg.grad_clip)
             critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters_critic(), cfg.grad_clip)
-            opt_actor.step()
-            opt_critic.step()
+            if (not torch.isfinite(actor_grad_norm)) or (not torch.isfinite(critic_grad_norm)):
+                n_grad_skip += 1
+                opt_actor.zero_grad(set_to_none=True)
+                opt_critic.zero_grad(set_to_none=True)
+            else:
+                opt_actor.step()
+                opt_critic.step()
 
             model.update_target(cfg.target_critic_tau)
             t_ac_acc += time.time() - _t
@@ -848,6 +979,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 't_ac_s': t_ac_acc,
                 't_other_s': max(0.0, iter_dt - (t_collect_acc + t_sample_acc
                                                   + t_wm_acc + t_ac_acc)),
+                # Diagnostics (rolling window + per-iter aggregates).
+                'return_window_mean': float(np.mean(return_window)) if return_window else None,
+                'return_window_std': float(np.std(return_window)) if len(return_window) > 1 else None,
+                'return_window_n': int(len(return_window)),
+                'iter_return_min': float(np.min(iter_returns)) if iter_returns else None,
+                'iter_return_max': float(np.max(iter_returns)) if iter_returns else None,
+                'iter_return_mean': float(np.mean(iter_returns)) if iter_returns else None,
+                'iter_raw_return_mean': float(np.mean(iter_raw_returns)) if iter_raw_returns else None,
+                'iter_cv_violation_mean': float(np.mean(iter_cv_violations)) if iter_cv_violations else None,
+                'iter_mv_violation_mean': float(np.mean(iter_mv_violations)) if iter_mv_violations else None,
+                'n_grad_skip': int(n_grad_skip),
+                'policy_buf_fill_pct': (
+                    float(policy_buf.filled) / max(1, policy_buf.capacity_eps)),
+                'explore_buf_fill_pct': (
+                    float(explore_buf.filled) / max(1, explore_buf.capacity_eps)),
             }
             for k, v in wm_losses.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
@@ -855,9 +1001,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
             log_f.write(json.dumps(row) + '\n')
             log_f.flush()
+            rwm = row.get('return_window_mean')
+            rwm_str = f"{rwm:+.2f}" if rwm is not None else 'n/a'
             print(f"[{row['timestamp']}] iter {total_iters:4d} "
                   f"steps {total_env_steps:6d} sps {sps:5.1f} "
-                  f"ret_ema {row['ema_return']:.2f} "
+                  f"ret_ema {row['ema_return']:.2f} ret_w {rwm_str} "
                   f"recon {row['wm_recon']:.4f} kl {row['wm_kl']:.4f} "
                   f"actor {row['actor_loss']:+.4f} critic {row['critic_loss']:.4f} "
                   f"ent {row.get('entropy_mean', 0.0):.3f} "
@@ -865,6 +1013,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"gn(w/a/c) {row['wm_grad_norm']:.2f}/"
                   f"{row['actor_grad_norm']:.3f}/{row['critic_grad_norm']:.2f} "
                   f"img_ret {row.get('imagined_return_mean', 0.0):+.3f} "
+                  f"skip {row.get('n_grad_skip', 0)} "
                   f"t(col/wm/ac) {t_collect_acc:.1f}/{t_wm_acc:.1f}/{t_ac_acc:.1f}",
                   flush=True)
             last_log_time = now
@@ -873,6 +1022,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             t_sample_acc = 0.0
             t_wm_acc = 0.0
             t_ac_acc = 0.0
+            iter_returns = []
+            iter_cv_violations = []
+            iter_mv_violations = []
+            iter_raw_returns = []
 
         if on_iter_end is not None:
             try:
@@ -893,9 +1046,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     log_f.close()
     final_path = out_dir / 'final.pt'
     torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, final_path)
+
+    # End-of-run diagnostics figure (best-effort; doesn't fail training).
+    try:
+        _save_training_diagnostics_plot(log_path, out_dir / 'training_diagnostics.png')
+    except Exception as e:
+        print(f'[train] training_diagnostics.png skipped: {e!r}', flush=True)
+
     return {'final_ckpt': str(final_path), 'iters': total_iters,
             'env_steps': total_env_steps,
-            'final_ema_return': float(ema_return) if ema_return is not None else None}
+            'final_ema_return': float(ema_return) if ema_return is not None else None,
+            'final_return_window_mean': (
+                float(np.mean(return_window)) if return_window else None),
+            'final_return_window_std': (
+                float(np.std(return_window)) if len(return_window) > 1 else None),
+            'final_return_window_n': int(len(return_window)),
+            'n_grad_skip': int(n_grad_skip)}
 
 
 # ---------------------------------------------------------------------------

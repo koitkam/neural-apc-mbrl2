@@ -110,6 +110,80 @@ def _bin_index_from_action(action_t: torch.Tensor, n_action_bins: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Scripted disturbance schedule (deterministic, for rejection plots)
+# ---------------------------------------------------------------------------
+
+def build_scripted_disturbance_schedule(env, *, n_events: int = 3,
+                                         magnitude_frac: float = 0.10
+                                         ) -> List[Dict]:
+    """Build a small, deterministic step-disturbance schedule.
+
+    Mirrors the ``neural-apc-pytorch`` validator's disturbance-rejection
+    test: a handful of equally-spaced step changes on the first available
+    DV (or the first CV when no DV exists).  Each step is held for the
+    rest of the episode (``shape='step'``) so the controller's settling
+    behaviour is visible.  Magnitudes are a fraction of channel span
+    with alternating sign to exercise both directions.
+
+    The returned list slots directly into ``env._schedule`` (overwrite
+    after ``env.reset()`` and the env's ``_apply_disturbance`` will pick
+    them up).
+    """
+    T = int(env.cfg.episode_length)
+    # Reserve a settle window equal to ~one tau before the first step and
+    # at the end so the response is fully visible.
+    first = max(int(0.20 * T), 1)
+    last = max(first + 1, int(0.85 * T))
+    starts = np.linspace(first, last, n_events).round().astype(int).tolist()
+
+    # Pick a target channel: prefer DV-classified state index (states
+    # outside cv_indices), fall back to the first CV.
+    sim = env.sim
+    meta = env.meta
+    state_dim = int(meta.get('state_dim', env.state_dim))
+    cv_idx = set(env.cv_indices)
+    # Heuristic: any state index not a CV is treated as DV-like.
+    dv_candidates = [i for i in range(state_dim) if i not in cv_idx]
+    if dv_candidates:
+        target_pos = int(dv_candidates[0])
+        target_group = 'dv'
+    else:
+        target_pos = int(env.cv_indices[0]) if env.cv_indices else 0
+        target_group = 'cv'
+
+    # Magnitude: fraction of normalisation span (or fall back to 1.0).
+    norm_ranges = (env.mv_norm_ranges if target_group == 'mv'
+                    else env.cv_norm_ranges)
+    span = 1.0
+    if target_group == 'cv' and env.cv_norm_ranges:
+        lo, hi = env.cv_norm_ranges[0]
+        span = max(1e-6, float(hi - lo))
+    elif target_group == 'dv' and env.cv_norm_ranges:
+        # No DV norm ranges in metadata; use CV span as a proxy.
+        lo, hi = env.cv_norm_ranges[0]
+        span = max(1e-6, float(hi - lo))
+
+    schedule: List[Dict] = []
+    for i, s in enumerate(starts):
+        sign = 1.0 if (i % 2 == 0) else -1.0
+        delta = float(sign * magnitude_frac * span)
+        schedule.append({
+            'name': f'scripted_step_{i + 1}',
+            'target_group': target_group,
+            'target_pos': target_pos,
+            'start': int(s),
+            'duration': int(T - int(s)),
+            'shape': 'step',
+            'period': float(max(2.0, T)),
+            'source': 'scripted',
+            'delta': delta,
+            '_applied': False,
+            '_is_violation': False,
+        })
+    return schedule
+
+
+# ---------------------------------------------------------------------------
 # Episode runner
 # ---------------------------------------------------------------------------
 
@@ -121,7 +195,27 @@ def run_episode(env, model, device, *, deterministic: bool, seed_offset: int = 0
     """
     obs_window = env.reset(exploration=False)
     schedule = list(env._schedule)
+    return _run_episode_with_window(env, model, device, obs_window, schedule,
+                                     deterministic=deterministic)
 
+
+def run_scripted_episode(env, model, device, *, deterministic: bool,
+                          schedule: List[Dict]) -> Dict:
+    """Run an episode where the disturbance schedule is replaced by
+    ``schedule`` (typically the deterministic one from
+    ``build_scripted_disturbance_schedule``).  Used for the
+    disturbance-rejection plot.
+    """
+    obs_window = env.reset(exploration=False)
+    # Override the schedule the env built in reset() with our scripted one.
+    env._schedule = list(schedule)
+    return _run_episode_with_window(env, model, device, obs_window,
+                                     env._schedule,
+                                     deterministic=deterministic)
+
+
+def _run_episode_with_window(env, model, device, obs_window, schedule, *,
+                              deterministic: bool) -> Dict:
     T = env.cfg.episode_length
     state_dim = env.state_dim
     action_dim = env.action_dim
@@ -273,6 +367,122 @@ def plot_episode(ep: Dict, out_path: Path, title: str = '') -> None:
     plt.close(fig)
 
 
+def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> None:
+    """Disturbance-rejection plot: scripted DV/CV step events with
+    response settling time + overshoot annotated per CV/MV.
+
+    Mirrors the ``disturbance_reaction_plot.png`` produced by the
+    ``neural-apc-pytorch`` validator: the operator-perspective view of
+    how the controller absorbs known step changes.
+    """
+    states = ep['states']
+    controls = ep['controls']
+    cv_idx = ep['cv_indices']
+    cv_norm = ep['cv_norm_ranges']
+    mv_norm = ep['mv_norm_ranges']
+    schedule = ep['schedule']
+    T = ep['episode_length']
+    t_arr = np.arange(T)
+
+    n_cv = max(1, len(cv_idx))
+    n_mv = controls.shape[1]
+    n_rows = n_cv + n_mv + 1  # +reward
+    fig, axes = plt.subplots(n_rows, 1, figsize=(13, 2.0 * n_rows), sharex=True)
+    if n_rows == 1:
+        axes = [axes]
+
+    # Pre-compute per-event annotations: for each scheduled step on a CV,
+    # find the post-step max-deviation and the time to return to within
+    # 5% of the pre-event mean ("settle time").
+    annotations: List[Dict] = []
+    for ev in schedule:
+        st = int(ev.get('start', 0))
+        if st >= T - 5:
+            continue
+        for j, cidx in enumerate(cv_idx):
+            if cidx >= states.shape[1]:
+                continue
+            pre = states[max(0, st - 20):st, cidx]
+            post = states[st:min(T, st + 200), cidx]
+            if pre.size == 0 or post.size == 0:
+                continue
+            base = float(np.mean(pre))
+            dev = post - base
+            if dev.size == 0:
+                continue
+            ovr = float(dev[np.argmax(np.abs(dev))])
+            band = max(1e-6, 0.05 * (np.max(np.abs(pre)) if pre.size else 1.0))
+            settled = np.where(np.abs(dev) <= band)[0]
+            settle_t = int(settled[0]) if settled.size else int(post.size)
+            annotations.append({
+                'cv_row': j, 'start': st,
+                'overshoot': ovr, 'settle_steps': settle_t,
+                'name': ev.get('name', 'step'),
+            })
+
+    row = 0
+    for j, cidx in enumerate(cv_idx):
+        ax = axes[row]; row += 1
+        if cidx < states.shape[1]:
+            ax.plot(t_arr, states[:, cidx], color='C0', lw=1.1,
+                    label=f'CV[{cidx}]')
+        if j < len(cv_norm):
+            lo, hi = cv_norm[j]
+            ax.axhline(lo, color='gray', lw=0.6, ls=':')
+            ax.axhline(hi, color='gray', lw=0.6, ls=':')
+            ax.fill_between(t_arr, lo, hi, color='gray', alpha=0.05)
+        for ev in schedule:
+            st = int(ev.get('start', 0))
+            ax.axvline(st, color='red', linestyle='--', lw=1.0, alpha=0.6)
+            ax.text(st, ax.get_ylim()[1], f" Δ={ev.get('delta', 0):+.2f}",
+                    color='red', fontsize=7, va='top')
+        # Annotate this CV's settle/overshoot.
+        for a in [a for a in annotations if a['cv_row'] == j]:
+            ax.annotate(
+                f"ovr={a['overshoot']:+.2f}\nsettle={a['settle_steps']}",
+                xy=(a['start'], states[a['start'], cidx] if cidx < states.shape[1] else 0),
+                xytext=(a['start'] + 5, ax.get_ylim()[0]),
+                fontsize=7, color='darkred',
+                arrowprops={'arrowstyle': '->', 'color': 'darkred', 'lw': 0.6},
+            )
+        ax.set_ylabel(f'CV[{cidx}]')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    for j in range(n_mv):
+        ax = axes[row]; row += 1
+        ax.plot(t_arr, controls[:, j], color='C1', lw=1.0, label=f'MV[{j}]')
+        if j < len(mv_norm):
+            lo, hi = mv_norm[j]
+            ax.axhline(lo, color='gray', lw=0.6, ls=':')
+            ax.axhline(hi, color='gray', lw=0.6, ls=':')
+            ax.fill_between(t_arr, lo, hi, color='gray', alpha=0.05)
+        for ev in schedule:
+            ax.axvline(int(ev.get('start', 0)), color='red',
+                        linestyle='--', lw=1.0, alpha=0.6)
+        ax.set_ylabel(f'MV[{j}]')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    ax = axes[row]; row += 1
+    ax.plot(t_arr, np.cumsum(ep['raw_rewards']), color='C2', lw=1.0,
+            label=f"raw cum (final={ep['cum_raw_reward']:+.1f})")
+    for ev in schedule:
+        ax.axvline(int(ev.get('start', 0)), color='red',
+                    linestyle='--', lw=1.0, alpha=0.4)
+    ax.set_ylabel('cum reward')
+    ax.set_xlabel('step')
+    ax.legend(loc='upper left', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+    return annotations  # caller stashes into summary metrics
+
+
 def plot_summary(seed_results: List[List[Dict]], out_path: Path,
                   title: str = '') -> None:
     """Cross-seed summary: cum-reward distribution + violation rates."""
@@ -381,6 +591,7 @@ def run_validation(*,
 
     seed_results: List[List[Dict]] = []
     metrics_records: List[Dict] = []
+    disturbance_records: List[Dict] = []
     for s in range(int(seeds)):
         seed = 10_000 + s  # held-out from training (which used SEED=0..N).
         rng = np.random.default_rng(seed)
@@ -415,6 +626,31 @@ def run_validation(*,
                 'episode_length': ep['episode_length'],
                 'n_disturbance_events': len(ep['schedule']),
             })
+
+        # ---- Disturbance-rejection plot (scripted, deterministic schedule) ----
+        try:
+            scripted = build_scripted_disturbance_schedule(env, n_events=3,
+                                                            magnitude_frac=0.10)
+            ep_d = run_scripted_episode(env, model, device,
+                                         deterministic=deterministic,
+                                         schedule=scripted)
+            d_title = (f'seed={seed}  scripted disturbance rejection  '
+                       f'cum_raw={ep_d["cum_raw_reward"]:+.2f}  '
+                       f'mean_cv_v={ep_d["mean_cv_violation"]:.4f}')
+            ann = plot_disturbance_rejection(
+                ep_d, per_seed_dir / 'disturbance_rejection.png', title=d_title)
+            disturbance_records.append({
+                'seed': seed,
+                'cum_raw_reward': ep_d['cum_raw_reward'],
+                'mean_cv_violation': ep_d['mean_cv_violation'],
+                'mean_mv_violation': ep_d['mean_mv_violation'],
+                'event_annotations': ann or [],
+                'schedule': ep_d['schedule'],
+            })
+        except Exception as e:
+            print(f'[val] scripted-disturbance episode skipped (seed {seed}): {e!r}',
+                  flush=True)
+
         seed_results.append(eps)
         print(f'[val] seed {seed}: {len(eps)} episodes done', flush=True)
 
@@ -440,6 +676,7 @@ def run_validation(*,
         'mean_cv_violation_mean': float(cv_v.mean()),
         'mean_mv_violation_mean': float(mv_v.mean()),
         'episodes': metrics_records,
+        'disturbance_rejection': disturbance_records,
     }
     with open(out_dir / 'validation_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)

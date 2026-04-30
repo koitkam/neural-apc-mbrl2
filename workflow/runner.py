@@ -195,25 +195,27 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     H_init = horizon_init(plant['tau'], plant['dead_time'], base.sample_rate)
     horizon = max(3, int(round(horizon_mult * H_init)))
 
-    # Per-trial batch size: re-derive from the trial's actual model_size +
-    # horizon so OOM-prone (L, large horizon) trials use a smaller batch.
+    # BO trials always use the paper-faithful batch=16 (verified-stable
+    # baseline regime).  Larger batches change optimization dynamics and
+    # add seed-variance to the short trial-fitness signal; we only let the
+    # GPU-headroom-derived batch size kick in at the *final* retrain.
+    # ``OBJ_BATCH_SIZE`` env still overrides for power users.
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
             bs = max(1, int(bs_env))
             bs_info = {'batch_size': bs, 'source': 'env_override'}
         except Exception:
-            bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
-            bs = int(bs_info['batch_size'])
+            bs = 16
+            bs_info = {'batch_size': 16, 'source': 'bo_paper_default'}
     else:
-        bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
-        bs = int(bs_info['batch_size'])
+        bs = 16
+        bs_info = {'batch_size': 16, 'source': 'bo_paper_default'}
 
     trial_dir = study_dir / f'trial_{trial.number:04d}'
     trial_dir.mkdir(parents=True, exist_ok=True)
     print(f"[trial {trial.number}] lookback={lookback} model={model_size} "
-          f"horizon={horizon} batch={bs} ({bs_info['source']}; "
-          f"per_batch≈{bs_info.get('per_batch_mb',0):.0f}MB)", flush=True)
+          f"horizon={horizon} batch={bs} ({bs_info['source']})", flush=True)
     cfg = make_trial_config(base, lookback=lookback, model_size=model_size,
                             horizon=horizon, total_steps=trial_steps,
                             out_dir=trial_dir, batch_size=bs)
@@ -235,13 +237,22 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
                        'H_init': H_init, 'pruned': True}, f, indent=2)
         raise
 
-    score = summary.get('final_ema_return')
+    # Score by the rolling-window mean of the last 10 *policy* episode
+    # returns, not the single final EMA value.  This dampens the
+    # seed-variance that previously caused identical configs to disagree
+    # by hundreds of points (e.g. trial #1 +60.85 vs trial #5 −127.50 in
+    # the bo_20260429_184201 run).  Falls back to final_ema_return when
+    # the window is empty (very short trials).
+    score = summary.get('final_return_window_mean')
+    if score is None or not np.isfinite(score):
+        score = summary.get('final_ema_return')
     if score is None or not np.isfinite(score):
         score = float('-inf')
     with open(trial_dir / 'trial_summary.json', 'w') as f:
         json.dump({'params': trial.params, 'horizon_concrete': horizon,
                    'H_init': H_init, 'summary': summary,
-                   'score': float(score)}, f, indent=2)
+                   'score': float(score),
+                   'score_metric': 'final_return_window_mean'}, f, indent=2)
     return float(score)
 
 
