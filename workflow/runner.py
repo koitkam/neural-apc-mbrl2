@@ -4,7 +4,7 @@ Three axes (the only knobs we tune):
 
   - lookback : grid centred on plant-identified lookback.
   - model_size_preset : {S, M, L} — coordinated triples
-                       ``(deter_dim, hidden_dim, embed_dim, n_classes)``.
+                       ``(d_model, n_layers, n_heads, z_dim, n_register)``.
   - horizon : 5-point band ``{0.5, 0.75, 1.0, 1.5, 2.0} * H_init`` with
               ``H_init = ceil((dead_time + 3 * tau) / sample_rate)``.
 
@@ -37,7 +37,7 @@ import optuna
 
 from training.train import TrainConfig, train as run_training
 from inference.export_onnx import export_dreamer_v4_onnx
-from models.dreamer_v4 import DreamerV4, DreamerV4Config, RSSMConfig
+from models.dreamer_v4 import DreamerV4, DreamerV4Config
 import torch
 
 
@@ -83,13 +83,28 @@ def _install_workflow_log(out_dir: Path) -> None:
 # Model size presets (paper §C scales)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Model size presets — V4 transformer dims (paper-adapted to vector APC obs)
+# ---------------------------------------------------------------------------
+# Mapping from the plant-derived complexity score → S/M/L label
+# (see ``utils.plant_init.derive_model_size``) → transformer dimensions.
+# Used as the BO seed and as the discrete model-size axis for BO.
+#
+# Note: V4 paper (arXiv:2509.24527) targets billion-parameter video models;
+# we scale these way down for low-D APC vector observations on a single GPU.
+# Dimensions: ``d_model``, ``n_layers``, ``n_heads``, ``z_dim`` (tokenizer
+# bottleneck), ``n_register``, plus tokenizer + head hidden width.
+
 MODEL_SIZE_PRESETS: Dict[str, Dict[str, int]] = {
-    'S': {'deter_dim': 256, 'embed_dim': 256, 'hidden_dim': 256,
-          'n_categoricals': 16, 'n_classes': 16},
-    'M': {'deter_dim': 512, 'embed_dim': 512, 'hidden_dim': 512,
-          'n_categoricals': 32, 'n_classes': 32},
-    'L': {'deter_dim': 1024, 'embed_dim': 1024, 'hidden_dim': 1024,
-          'n_categoricals': 32, 'n_classes': 64},
+    'S': {'d_model': 128, 'n_layers': 4, 'n_heads': 4,
+          'z_dim': 16, 'n_register': 2,
+          'tok_hidden': 128, 'head_hidden': 128},
+    'M': {'d_model': 256, 'n_layers': 6, 'n_heads': 8,
+          'z_dim': 24, 'n_register': 4,
+          'tok_hidden': 256, 'head_hidden': 256},
+    'L': {'d_model': 384, 'n_layers': 8, 'n_heads': 8,
+          'z_dim': 32, 'n_register': 4,
+          'tok_hidden': 384, 'head_hidden': 384},
 }
 
 HORIZON_BAND = (0.5, 0.75, 1.0, 1.5, 2.0)
@@ -189,33 +204,38 @@ def make_trial_config(base: TrainConfig, *, lookback: int,
 def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
               study_dir: Path, trial_steps: int) -> float:
     from utils.plant_init import derive_batch_size
-    lookback = trial.suggest_categorical('lookback', lookback_grid(plant['lookback']))
+    # ``lookback`` is no longer a BO axis: with the per-frame encoder
+    # (paper-faithful Dreamer-V4) the GRU provides temporal memory and
+    # the lookback window only controls the env's initial-state warmup.
+    # We pin it to the plant-identified value so all trials share the
+    # same buffer shape.
+    lookback = int(plant['lookback'])
     model_size = trial.suggest_categorical('model_size', list(MODEL_SIZE_PRESETS))
     horizon_mult = trial.suggest_categorical('horizon_mult', HORIZON_BAND)
     H_init = horizon_init(plant['tau'], plant['dead_time'], base.sample_rate)
     horizon = max(3, int(round(horizon_mult * H_init)))
 
-    # BO trials always use the paper-faithful batch=16 (verified-stable
-    # baseline regime).  Larger batches change optimization dynamics and
-    # add seed-variance to the short trial-fitness signal; we only let the
-    # GPU-headroom-derived batch size kick in at the *final* retrain.
-    # ``OBJ_BATCH_SIZE`` env still overrides for power users.
+    # Adaptive per-trial batch size: re-derive from the trial's actual
+    # model_size + horizon so OOM-prone (L, large horizon) trials use a
+    # smaller batch.  Paired with sqrt-LR scaling in train() so the
+    # effective gradient step size stays comparable to batch=16.
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
             bs = max(1, int(bs_env))
             bs_info = {'batch_size': bs, 'source': 'env_override'}
         except Exception:
-            bs = 16
-            bs_info = {'batch_size': 16, 'source': 'bo_paper_default'}
+            bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
+            bs = int(bs_info['batch_size'])
     else:
-        bs = 16
-        bs_info = {'batch_size': 16, 'source': 'bo_paper_default'}
+        bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
+        bs = int(bs_info['batch_size'])
 
     trial_dir = study_dir / f'trial_{trial.number:04d}'
     trial_dir.mkdir(parents=True, exist_ok=True)
     print(f"[trial {trial.number}] lookback={lookback} model={model_size} "
-          f"horizon={horizon} batch={bs} ({bs_info['source']})", flush=True)
+          f"horizon={horizon} batch={bs} ({bs_info['source']}; "
+          f"per_batch≈{bs_info.get('per_batch_mb',0):.0f}MB)", flush=True)
     cfg = make_trial_config(base, lookback=lookback, model_size=model_size,
                             horizon=horizon, total_steps=trial_steps,
                             out_dir=trial_dir, batch_size=bs)
@@ -263,7 +283,10 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
 def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
                            out_dir: Path, total_steps: int) -> Dict:
     from utils.plant_init import derive_batch_size
-    lookback = int(best_params['lookback'])
+    # ``lookback`` is no longer a BO axis (see ``run_trial``); read it from
+    # the plant identification, falling back to ``best_params`` for
+    # backward-compat with older study summaries that still recorded it.
+    lookback = int(best_params.get('lookback', plant['lookback']))
     model_size = str(best_params['model_size'])
     H_init = horizon_init(plant['tau'], plant['dead_time'], base.sample_rate)
     horizon = max(3, int(round(float(best_params['horizon_mult']) * H_init)))
@@ -292,19 +315,21 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
     ckpt = torch.load(final_dir / 'final.pt', map_location='cpu', weights_only=False)
     cfg_loaded = TrainConfig(**{k: v for k, v in ckpt['cfg'].items()
                                  if k in {f for f in TrainConfig.__dataclass_fields__}})
-    rssm_cfg = RSSMConfig(
+    model_cfg = DreamerV4Config(
         obs_dim=cfg_loaded.obs_dim, action_dim=cfg_loaded.action_dim,
         lookback=cfg_loaded.lookback,
-        deter_dim=cfg_loaded.deter_dim, embed_dim=cfg_loaded.embed_dim,
-        hidden_dim=cfg_loaded.hidden_dim,
-        n_categoricals=cfg_loaded.n_categoricals,
-        n_classes=cfg_loaded.n_classes,
-        free_nats=cfg_loaded.free_nats,
+        tok_hidden=cfg_loaded.tok_hidden, z_dim=cfg_loaded.z_dim,
+        mae_p_max=cfg_loaded.mae_p_max,
+        d_model=cfg_loaded.d_model, n_layers=cfg_loaded.n_layers,
+        n_heads=cfg_loaded.n_heads, ff_mult=cfg_loaded.ff_mult,
+        n_register=cfg_loaded.n_register,
+        k_max=cfg_loaded.k_max, tau_n_bins=cfg_loaded.tau_n_bins,
+        soft_cap=cfg_loaded.soft_cap,
+        n_action_bins=cfg_loaded.n_action_bins,
+        head_hidden=cfg_loaded.head_hidden,
+        head_n_layers=cfg_loaded.head_n_layers,
+        mtp_length=max(1, int(getattr(cfg_loaded, 'mtp_length', 1))),
     )
-    model_cfg = DreamerV4Config(rssm=rssm_cfg,
-                                n_action_bins=cfg_loaded.n_action_bins,
-                                actor_hidden=cfg_loaded.hidden_dim,
-                                critic_hidden=cfg_loaded.hidden_dim)
     model = DreamerV4(model_cfg)
     model.load_state_dict(ckpt['model'])
     onnx_path = out_dir / 'dreamer_v4.onnx'
@@ -470,13 +495,10 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     )
     study_dir = out_dir / 'trials'
     study_dir.mkdir(parents=True, exist_ok=True)
-    # Seed the first trial at the plant-derived configuration (lookback from
-    # lookback_identifier, model_size from complexity, horizon at the centre
-    # of the plant band).  Optuna explores the rest from there.
-    seed_lookback = min(lookback_grid(plant['lookback']),
-                        key=lambda v: abs(v - plant['lookback']))
+    # Seed the first trial at the plant-derived configuration (model_size
+    # from complexity, horizon at the centre of the plant band).  Optuna
+    # explores the rest from there.
     study.enqueue_trial({
-        'lookback': seed_lookback,
         'model_size': derived_model_size,
         'horizon_mult': 1.0,
     })

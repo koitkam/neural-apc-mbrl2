@@ -228,18 +228,33 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     cv_violations = np.zeros(T, dtype='float32')
     mv_violations = np.zeros(T, dtype='float32')
 
-    h, z = model.rssm.initial_state(1, device)
-    prev_action = torch.zeros(1, action_dim, device=device)
+    # V4 streaming inference: maintain a rolling action history alongside
+    # the env-provided observation window. At each step we encode the
+    # window through the tokenizer, run the dynamics transformer with
+    # context-noise corruption (τ = 1 − τ_ctx), and read the agent-register
+    # hidden state at the latest position to feed the policy head.
+    cfg = env.cfg
+    L = cfg.lookback
+    a_history = np.zeros((L, action_dim), dtype='float32')
+    d_min = 1.0 / cfg.k_max
+    tau_ctx_val = 1.0 - cfg.tau_ctx
 
     for t in range(T):
-        ow = torch.from_numpy(obs_window).to(device).unsqueeze(0)
+        ow = torch.from_numpy(obs_window).to(device)
+        a_ctx = torch.from_numpy(a_history).to(device)
         with torch.no_grad():
             with torch.amp.autocast(device_type=device.type,
                                      dtype=torch.bfloat16,
                                      enabled=(device.type == 'cuda')):
-                h, z, _, _ = model.rssm.observe_step(ow, prev_action, h, z)
-                latent = torch.cat([h, z], dim=-1)
-                action_t, _, _ = model.actor(latent, deterministic=deterministic)
+                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]
+                action_t, _, _ = model.policy(agent_hid,
+                                                deterministic=deterministic)
         a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
         next_window, scaled_r, done, info = env.step(a_np)
         comps = info.get('reward_components', {}) or {}
@@ -250,7 +265,7 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         scaled_rewards[t] = float(scaled_r)
         cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
         mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
-        prev_action = action_t.detach()
+        a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
         obs_window = next_window
         if done:
             break
@@ -563,7 +578,7 @@ def run_validation(*,
         os.environ['IDENTIFIED_DEAD_TIME'] = f"{run_plan['dead_time']:g}"
 
     from training.train import TrainConfig, APCEnv
-    from models.dreamer_v4 import DreamerV4, DreamerV4Config, RSSMConfig
+    from models.dreamer_v4 import DreamerV4, DreamerV4Config
 
     print(f'[val] controller: {controller_dir}', flush=True)
     print(f'[val] simulation: {sim_dir}', flush=True)
@@ -574,16 +589,16 @@ def run_validation(*,
     valid_keys = set(TrainConfig.__dataclass_fields__.keys())
     cfg = TrainConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 
-    rssm_cfg = RSSMConfig(
+    model_cfg = DreamerV4Config(
         obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
-        deter_dim=cfg.deter_dim, embed_dim=cfg.embed_dim,
-        hidden_dim=cfg.hidden_dim,
-        n_categoricals=cfg.n_categoricals, n_classes=cfg.n_classes,
-        free_nats=cfg.free_nats,
+        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
+        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
+        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
+        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
+        n_action_bins=cfg.n_action_bins,
+        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
+        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
     )
-    model_cfg = DreamerV4Config(rssm=rssm_cfg, n_action_bins=cfg.n_action_bins,
-                                actor_hidden=cfg.hidden_dim,
-                                critic_hidden=cfg.hidden_dim)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = DreamerV4(model_cfg).to(device)
     model.load_state_dict(ckpt_obj['model'])

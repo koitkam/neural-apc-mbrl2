@@ -1,26 +1,47 @@
 # neural-apc-dreamerV4
 
-Paper-faithful DreamerV4 controller for Advanced Process Control (APC).
+Paper-faithful **Dreamer 4** controller for Advanced Process Control (APC).
 
-Reference: Hafner et al. (2024), "Mastering Diverse Domains through World
-Models" (DreamerV4), [arXiv:2407.04693](https://arxiv.org/abs/2407.04693).
+Reference: Hafner, Yan, Lillicrap (2025), "Training Agents Inside of Scalable
+World Models" (Dreamer 4), [arXiv:2509.24527](https://arxiv.org/abs/2509.24527).
 
 ## Goals
 
-- Single algorithm (DreamerV4) — no TD3/PPO/SAC/Transformer scaffolding.
-- Stay close to the paper.  Add adaptive knobs only when they remain a strict
+- Single algorithm (Dreamer 4) — no TD3/PPO/SAC scaffolding.
+- Stay close to the paper. Add adaptive knobs only when they remain a strict
   superset of the paper recipe (paper defaults as floors / minimums).
-- Simulator-agnostic via small, focused Bayesian Optimization on three axes
-  only: `lookback`, `model_size`, `horizon` (initialized from plant ID).
+- Simulator-agnostic via small, focused Bayesian Optimization on two axes
+  only: `model_size`, `horizon` (initialized from plant ID; lookback is
+  pinned to the identified value).
 - One ONNX artifact per workflow: a single integrated graph
-  `(prev_h, prev_z, prev_action, obs_window) → (next_h, next_z, action)`.
-  No separate observer model — the RSSM *is* the observer.
+  `(obs_window, prev_actions) → action`. No separate observer model — the
+  causal tokenizer + dynamics transformer *is* the observer.
+
+## Architecture (paper-faithful, adapted to vector APC observations)
+
+- **Causal Tokenizer** (`models/dreamer_v4.py:Tokenizer`): MLP encoder +
+  linear+tanh bottleneck + MLP decoder. MAE-style channel dropout during
+  training. MSE reconstruction loss (paper eq. 5; LPIPS dropped — not
+  applicable to scalar observations).
+- **Interactive Dynamics** (`models/dreamer_v4.py:DynamicsTransformer`):
+  block-causal-in-time transformer with pre-RMSNorm, RoPE, SwiGLU, QKNorm
+  and attention soft-cap (paper §3.4). Per timestep we feed `n_register`
+  register tokens + 1 action token + 1 (τ, d) token + 1 z̃ token. Trained
+  with **shortcut forcing** (paper eq. 7) using x-prediction; bootstrap
+  distillation handles d > d_min. K = 4 sampling steps per inference frame.
+- **Three explicit phases** (paper Algorithm 1, adapted to single-task online APC):
+  - Phase 1 — pretrain world model: tokenizer recon + dynamics shortcut forcing.
+  - Phase 2 — agent finetune: keep WM losses live; add policy + reward MTP heads (eq. 9).
+  - Phase 3 — imagination training: freeze WM transformer, train policy via PMPO (eq. 11) and value via TD-λ (eq. 10) on K=4 imagined rollouts.
+- **Heads** — carried over from Dreamer 3 (paper still uses these in V4):
+  - Policy: per-action-dim categorical over 21 uniform bins in [−1, 1].
+  - Reward + Value: symexp twohot (255 bins on [−20, 20]).
 
 ## Layout
 
 ```
-models/dreamer_v4.py        # RSSM (encoder + GRU + categorical posterior) + actor + critic
-training/train.py           # single trainer (RSSM + actor-critic with paper §C global return scale)
+models/dreamer_v4.py        # Causal tokenizer + dynamics transformer + heads (V4 paper-faithful)
+training/train.py           # Three-phase trainer (Phase 1 WM pretrain / Phase 2 agent finetune / Phase 3 imagination RL)
 utils/
   plant_init.py             # sample_rate / model_size / seq_len / batch_size / step-budget derivations
   runtime_setpoints.py      # packed per-CV (lo, hi, target, active) augmentation
@@ -169,7 +190,8 @@ Only three axes; each initialized from plant identification:
 
 - `lookback` — 3-point grid around the `lookback_identifier` value.
 - `model_size` — `{S, M, L}` presets for coordinated
-  `(deter_dim, hidden_dim, embed_dim, n_classes)` triples (paper §C).
+  `(d_model, n_layers, n_heads, z_dim, n_register)` tuples adapted from
+  paper §3.4 to vector-observation APC scale.
 - `horizon` — 5-point band `{0.5, 0.75, 1.0, 1.5, 2.0} × H_init`,
   where `H_init = ⌈(θ + 3τ) / sample_rate⌉`.
 

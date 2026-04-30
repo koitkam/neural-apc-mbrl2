@@ -1,33 +1,63 @@
-"""Paper-faithful DreamerV4 implementation for APC.
+"""Paper-faithful Dreamer 4 implementation, adapted to vector-state APC.
 
-Reference: Hafner et al. (2024), "Mastering Diverse Domains through World
-Models" (DreamerV4), arXiv:2407.04693.
+Reference: Hafner, Yan, Lillicrap (2025), "Training Agents Inside of Scalable
+World Models" — arXiv:2509.24527.
 
-This module provides:
+Architecture
+------------
+Two components, both built on the same efficient transformer trunk:
 
-- ``RSSM``: encoder + GRU + categorical posterior/prior + decoder + reward
-  head + continuation head.
-- ``Actor``: per-action-dim categorical over ``n_action_bins`` uniform bins
-  in [-1, 1] (V4 paper default for continuous control).
-- ``Critic``: twohot symlog distribution head (paper §B).
-- ``DreamerV4``: top-level container that holds all submodules and exposes
-  ``.parameters_world()``, ``.parameters_actor()``, ``.parameters_critic()``.
+1. **Causal Tokenizer** (``Tokenizer``): encoder + low-D linear+tanh
+   bottleneck + decoder. For the original paper's video setting it
+   processes image patches; for APC we feed the per-step observation
+   vector directly. Trained with MAE-style channel dropout + MSE
+   reconstruction (LPIPS dropped — does not apply to scalar features).
 
-All shapes use the convention ``(B, T, ...)`` for batched sequences.
+2. **Interactive Dynamics** (``DynamicsTransformer``): block-causal-in-time
+   transformer that operates on the interleaved sequence
 
-Naming follows the paper:
+       [ register_1, …, register_S_r,
+         action_token,
+         (τ, d)_token,
+         observation_token z̃ ]   per timestep
 
-- ``h``  : deterministic GRU state                  shape (B, deter_dim)
-- ``z``  : stochastic categorical state             shape (B, n_categoricals * n_classes)
-- ``e``  : encoder embedding of an observation      shape (B, embed_dim)
-- ``a``  : action vector (continuous, in [-1, 1])   shape (B, action_dim)
+   It is trained with the **shortcut forcing** objective
+   (paper §3.2, eq. 7) using x-prediction. At inference time the model
+   denoises observations via K=4 forward passes per timestep.
+
+Heads
+-----
+- ``policy``  : per-action-dim categorical over uniform bins in [-1, 1].
+- ``reward``  : symexp-twohot (255 bins on [-20, 20]).
+- ``value``   : symexp-twohot (255 bins on [-20, 20]).
+- ``target_value`` : EMA copy of ``value`` for TD-λ bootstrap stability.
+
+The per-action-dim categorical and symexp-twohot heads carry over from
+Dreamer 3 (paper still uses these in V4, see §3.3 "Behavior cloning and
+reward model"). The crucial change vs. V3 is that the *world model* is
+no longer an RSSM — it is the transformer + shortcut-forcing pair.
+
+Three-phase training (paper Algorithm 1)
+----------------------------------------
+- Phase 1 (pretrain world model)  : tokenizer recon (eq. 5) + dynamics
+                                    shortcut forcing (eq. 7)
+- Phase 2 (agent finetune)        : add policy + reward MTP heads (eq. 9),
+                                    keep eq. 5 + eq. 7 live
+- Phase 3 (imagination training)  : freeze tokenizer + dynamics + reward,
+                                    train policy via PMPO (eq. 11) and
+                                    value via TD-λ (eq. 10) on imagined
+                                    rollouts (one rollout per dataset
+                                    context). Transformer frozen.
+
+This module supplies the building blocks; the trainer in
+``training/train.py`` orchestrates the three phases.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -35,7 +65,7 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Symlog / twohot utilities (paper §B)
+# Symlog / symexp / twohot (carried over from V3 — paper §B)
 # ---------------------------------------------------------------------------
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -47,42 +77,161 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
 
 
 def twohot_encode(values: torch.Tensor, bin_edges: torch.Tensor) -> torch.Tensor:
-    """Encode scalar targets into a two-hot distribution over ``bin_edges``.
-
-    ``values`` shape ``(...)``; ``bin_edges`` shape ``(n_bins,)`` (monotonic).
-    Returns ``(..., n_bins)`` with mass concentrated on the two bins that
-    bracket each value (linear interpolation).
-    """
+    """Encode scalar targets into a two-hot distribution over ``bin_edges``."""
     values = values.unsqueeze(-1)
     n_bins = bin_edges.shape[0]
-    # Find right bin index per value
     bins = bin_edges.view(*([1] * (values.dim() - 1)), n_bins)
-    diff = values - bins                    # (..., n_bins)
-    # right index = first bin >= value (clamped)
-    right = (diff <= 0).float().cumsum(-1)  # 0..1 transition at right edge
+    diff = values - bins
+    right = (diff <= 0).float().cumsum(-1)
     right = (right == 1).float().argmax(-1).clamp_(1, n_bins - 1)
     left = (right - 1).clamp_min_(0)
-    # Linear weights
     bl = bin_edges[left]
     br = bin_edges[right]
     span = (br - bl).clamp_min_(1e-8)
     w_right = ((values.squeeze(-1) - bl) / span).clamp_(0.0, 1.0)
     w_left = 1.0 - w_right
-    out = torch.zeros(*values.shape[:-1], n_bins, device=values.device, dtype=values.dtype)
+    out = torch.zeros(*values.shape[:-1], n_bins, device=values.device,
+                      dtype=values.dtype)
     out.scatter_(-1, left.unsqueeze(-1), w_left.unsqueeze(-1))
     out.scatter_add_(-1, right.unsqueeze(-1), w_right.unsqueeze(-1))
     return out
 
 
 # ---------------------------------------------------------------------------
-# MLP block (paper uses LayerNorm + SiLU)
+# Building blocks: RMSNorm, SwiGLU, RoPE, attention with QKNorm + soft-cap
+# ---------------------------------------------------------------------------
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * rms).to(x.dtype) * self.weight
+
+
+class SwiGLU(nn.Module):
+    """Standard SwiGLU MLP block (paper §3.4)."""
+
+    def __init__(self, dim: int, ff_mult: int = 4):
+        super().__init__()
+        ff = ff_mult * dim
+        self.w1 = nn.Linear(dim, ff, bias=False)
+        self.w2 = nn.Linear(dim, ff, bias=False)
+        self.w3 = nn.Linear(ff, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
+
+def _rope_cache(seq_len: int, dim: int, device: torch.device,
+                base: float = 10_000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute (cos, sin) for RoPE over ``seq_len`` time positions.
+
+    ``dim`` must be even (per-head dim). Returns shape ``(seq_len, dim)``.
+    """
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.einsum('i,j->ij', t, inv_freq)        # (seq_len, dim/2)
+    emb = torch.cat([freqs, freqs], dim=-1)             # (seq_len, dim)
+    return emb.cos(), emb.sin()
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+                ) -> torch.Tensor:
+    """Apply RoPE to ``x`` of shape ``(B, n_heads, L, head_dim)``.
+
+    ``cos`` and ``sin`` are of shape ``(L, head_dim)``.
+    """
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    x1, x2 = x.chunk(2, dim=-1)
+    rot = torch.cat([-x2, x1], dim=-1)
+    return (x * cos) + (rot * sin)
+
+
+class CausalAttention(nn.Module):
+    """Causal multi-head attention with QKNorm + attention logit soft-cap.
+
+    Paper §3.4: pre-RMSNorm transformer, RoPE on **time positions**, QKNorm
+    and attention soft-cap for stability. We use a precomputed block-causal
+    mask supplied by the caller via the ``attn_mask`` argument so that the
+    same module can serve both intra-step full attention and inter-step
+    causal attention in a single 1-D sequence.
+    """
+
+    def __init__(self, dim: int, n_heads: int, soft_cap: float = 50.0):
+        super().__init__()
+        assert dim % n_heads == 0, f'dim {dim} must be divisible by n_heads {n_heads}'
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        # QKNorm: separate RMSNorm on Q and K (paper §3.4).
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.soft_cap = soft_cap
+
+    def forward(self, x: torch.Tensor,
+                cos: torch.Tensor, sin: torch.Tensor,
+                attn_mask: torch.Tensor) -> torch.Tensor:
+        """``x`` (B, L, D); ``cos/sin`` (L, head_dim); ``attn_mask`` (L, L) bool.
+
+        ``attn_mask[i, j] = True`` means token i is allowed to attend to j.
+        """
+        B, L, D = x.shape
+        qkv = self.qkv(x).view(B, L, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)                # each (B, L, H, head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # Reshape to (B, H, L, head_dim) for attention.
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        q = _apply_rope(q, cos, sin)
+        k = _apply_rope(k, cos, sin)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if self.soft_cap and self.soft_cap > 0:
+            logits = self.soft_cap * torch.tanh(logits / self.soft_cap)
+        # attn_mask: True where allowed; convert to additive mask.
+        mask = (~attn_mask).to(logits.dtype) * torch.finfo(logits.dtype).min
+        logits = logits + mask
+        attn = F.softmax(logits.float(), dim=-1).to(v.dtype)
+        out = torch.matmul(attn, v)                # (B, H, L, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, L, D)
+        return self.proj(out)
+
+
+class TransformerBlock(nn.Module):
+    """Pre-RMSNorm + causal attention + SwiGLU (paper §3.4)."""
+
+    def __init__(self, dim: int, n_heads: int, ff_mult: int = 4,
+                 soft_cap: float = 50.0):
+        super().__init__()
+        self.norm_attn = RMSNorm(dim)
+        self.attn = CausalAttention(dim, n_heads, soft_cap=soft_cap)
+        self.norm_ff = RMSNorm(dim)
+        self.ff = SwiGLU(dim, ff_mult=ff_mult)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                attn_mask: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm_attn(x), cos, sin, attn_mask)
+        x = x + self.ff(self.norm_ff(x))
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Small MLP used by tokenizer encoder/decoder and the heads
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int,
                  n_layers: int = 2, zero_init_last: bool = False):
         super().__init__()
-        layers = []
+        layers: List[nn.Module] = []
         d = in_dim
         for _ in range(n_layers):
             layers.append(nn.Linear(d, hidden_dim))
@@ -101,158 +250,334 @@ class MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# RSSM — recurrent state space model
+# Causal Tokenizer (paper §3.1, adapted to vector observations)
+# ---------------------------------------------------------------------------
+
+class Tokenizer(nn.Module):
+    """Vector-observation tokenizer with low-D tanh bottleneck.
+
+    Encoder: MLP(obs_dim → hidden) → linear projection to z_dim → tanh.
+    Decoder: linear projection back to model dim → MLP → obs_dim.
+
+    MAE-style training (paper §3.1): we randomly replace input channels
+    with a learned mask embedding at probability ``p ~ U(0, p_max)``.
+    For raw images the paper masks 2-D patches; for our 1-D observation
+    vector we mask individual feature channels instead (the same regularization
+    pressure on the encoder's representations, applied at the resolution
+    natural to APC observations).
+    """
+
+    def __init__(self, obs_dim: int, hidden_dim: int, z_dim: int,
+                 mae_p_max: float = 0.5):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        self.mae_p_max = float(mae_p_max)
+        self.encoder = MLP(obs_dim, hidden_dim, hidden_dim, n_layers=2)
+        self.bottleneck = nn.Linear(hidden_dim, z_dim)
+        self.decoder_in = nn.Linear(z_dim, hidden_dim)
+        self.decoder = MLP(hidden_dim, hidden_dim, obs_dim, n_layers=2)
+        # Learned per-channel mask embedding (broadcast across batch).
+        self.mask_embed = nn.Parameter(torch.zeros(obs_dim))
+
+    def encode(self, obs: torch.Tensor) -> torch.Tensor:
+        """``obs`` of shape ``(..., obs_dim)`` → ``z`` of shape ``(..., z_dim)``.
+
+        z lives in [-1, 1] thanks to the tanh bottleneck.
+        """
+        h = self.encoder(obs)
+        return torch.tanh(self.bottleneck(h))
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self.decoder_in(z))
+
+    def forward_with_mae(self, obs: torch.Tensor
+                          ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply MAE channel dropout, encode, decode. Returns ``(z, recon)``.
+
+        Mask probability is sampled per-example.
+        """
+        if not self.training or self.mae_p_max <= 0.0:
+            z = self.encode(obs)
+            recon = self.decode(z)
+            return z, recon
+        # Sample per-example mask probability in [0, p_max].
+        shape = obs.shape[:-1]
+        p = torch.empty(shape + (1,), device=obs.device, dtype=obs.dtype
+                        ).uniform_(0.0, self.mae_p_max)
+        mask = (torch.rand_like(obs) < p).to(obs.dtype)
+        obs_masked = obs * (1.0 - mask) + self.mask_embed * mask
+        z = self.encode(obs_masked)
+        recon = self.decode(z)
+        return z, recon
+
+    def recon_loss(self, obs: torch.Tensor, recon: torch.Tensor
+                    ) -> torch.Tensor:
+        """MSE on symlog-encoded observations (paper §B-style robustness)."""
+        return F.mse_loss(symlog(recon), symlog(obs))
+
+
+# ---------------------------------------------------------------------------
+# Shortcut forcing utilities (paper §2 + §3.2)
+# ---------------------------------------------------------------------------
+
+def sample_tau_d(shape: Tuple[int, ...], k_max: int,
+                 device: torch.device, dtype: torch.dtype = torch.float32
+                 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample (τ, d) per the paper's grid (eq. 4).
+
+    ``d ~ 1/U({1, 2, 4, …, k_max})``  → smallest is ``d_min = 1/k_max``.
+    ``τ ~ U({0, 1/d, …, 1 − 1/d})`` (noise level, 0 = full noise, 1 = clean).
+    Returns float tensors of shape ``shape``.
+    """
+    # Number of available step sizes: log2(k_max) + 1 (e.g. k_max=4 → {1,2,4}).
+    n = int(math.log2(k_max)) + 1
+    k_choices = torch.tensor([2 ** i for i in range(n)], device=device,
+                             dtype=dtype)
+    idx = torch.randint(0, n, shape, device=device)
+    k = k_choices[idx]
+    d = 1.0 / k                                       # in {1/k_max, …, 1}
+    # τ uniform on {0, 1/k, …, (k-1)/k}.
+    j = torch.randint(0, 2 ** 30, shape, device=device).to(dtype)
+    j = (j % k).floor()
+    tau = j / k
+    return tau, d
+
+
+def shortcut_corrupt(z1: torch.Tensor, tau: torch.Tensor,
+                     z0: Optional[torch.Tensor] = None
+                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build the corrupted ``z̃ = (1−τ) z₀ + τ z₁`` and return ``(z̃, z₀)``.
+
+    ``z1`` shape ``(..., z_dim)``; ``tau`` shape ``(...)`` (broadcast).
+    """
+    if z0 is None:
+        z0 = torch.randn_like(z1)
+    tau_b = tau.unsqueeze(-1)
+    z_tilde = (1.0 - tau_b) * z0 + tau_b * z1
+    return z_tilde, z0
+
+
+def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
+    """Eq. 8: ``w(τ) = 0.9 τ + 0.1`` (linear ramp giving more weight to clean)."""
+    return 0.9 * tau + 0.1
+
+
+# ---------------------------------------------------------------------------
+# Interactive Dynamics Transformer (paper §3.2)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class RSSMConfig:
-    obs_dim: int                 # per-step observation dimension (state + aug)
-    action_dim: int              # continuous action dim (pre-discretization)
-    lookback: int                # observation window length fed to encoder
-    deter_dim: int = 512         # GRU hidden size
-    embed_dim: int = 512         # encoder output size
-    hidden_dim: int = 512        # MLP width
-    n_categoricals: int = 32     # paper default
-    n_classes: int = 32          # paper default
-    n_layers: int = 2
-    free_nats: float = 1.0       # summed-K free bits target (V4 KL clamp)
+class DynamicsConfig:
+    z_dim: int                      # tokenizer bottleneck dim
+    action_dim: int                 # continuous action dim (pre-discretization)
+    n_action_bins: int              # for action embedding lookup (categorical)
+    d_model: int = 256
+    n_layers: int = 6
+    n_heads: int = 8
+    ff_mult: int = 4
+    n_register: int = 4             # learned register tokens per timestep
+    k_max: int = 4                  # finest step size = 1/k_max
+    tau_n_bins: int = 32            # discrete embedding lookup for τ
+    soft_cap: float = 50.0
+    rope_base: float = 10_000.0
+    # n_tokens_per_step is computed internally:
+    #   1 (z̃) + 1 (action) + 1 (τ,d) + n_register
 
 
-class RSSM(nn.Module):
-    """Encoder + GRU + categorical posterior/prior + decoder + heads.
+class DynamicsTransformer(nn.Module):
+    """Block-causal-in-time 1-D transformer that denoises z via shortcut forcing.
 
-    Forward conventions:
+    Per timestep we feed ``n_tokens_per_step = n_register + 3`` tokens in this
+    fixed order:
 
-        observe(obs_window, prev_action, prev_h, prev_z) -> (h, z, post_logits, prior_logits)
-            for online step ingestion (used in env loop and training).
+        [ register_1, …, register_S_r,
+          action_token,
+          (τ, d)_token,
+          z̃_token ]
 
-        imagine_step(prev_h, prev_z, action) -> (h, z, prior_logits)
-            for actor-critic rollout in latent space (no observation).
+    Attention is causal in time (token at step t can attend to all tokens at
+    steps ≤ t) and full within a step. The clean-z prediction ẑ₁ is read out
+    from the z̃-token's hidden state. The agent / reward heads (added in
+    Phase 2 by the trainer) read out from a *separate* register slot — see
+    ``hidden_for_agent``.
     """
 
-    def __init__(self, cfg: RSSMConfig):
+    def __init__(self, cfg: DynamicsConfig):
         super().__init__()
         self.cfg = cfg
-        self.stoch_dim = cfg.n_categoricals * cfg.n_classes
+        D = cfg.d_model
+        self.n_per_step = cfg.n_register + 3
+        self.AGENT_REGISTER_INDEX = 0   # first register reserved for agent head
 
-        # Encoder: flattens (lookback * obs_dim) -> embed.
-        self.encoder = MLP(cfg.lookback * cfg.obs_dim, cfg.hidden_dim,
-                           cfg.embed_dim, n_layers=cfg.n_layers)
+        # Per-modality input projections (paper §3.2).
+        self.z_proj = nn.Linear(cfg.z_dim, D)
+        self.act_cont_proj = nn.Linear(cfg.action_dim, D)
+        # Discrete action embedding (per bin per dim) — supplements continuous
+        # projection so the network can leverage the categorical structure.
+        self.act_disc_embed = nn.Embedding(cfg.n_action_bins * cfg.action_dim, D)
+        # τ and d are discrete grid points; embed each then add channels.
+        self.tau_embed = nn.Embedding(cfg.tau_n_bins, D // 2)
+        self.d_embed = nn.Embedding(int(math.log2(cfg.k_max)) + 1, D // 2)
+        # Learned register tokens (shared across timesteps).
+        self.register_tokens = nn.Parameter(torch.zeros(cfg.n_register, D))
+        nn.init.normal_(self.register_tokens, std=0.02)
 
-        # GRU cell: input = (z + action), state = h
-        self.gru = nn.GRUCell(self.stoch_dim + cfg.action_dim, cfg.deter_dim)
-        # Initial state parameters (learned).
-        self.init_h = nn.Parameter(torch.zeros(cfg.deter_dim))
-        self.init_z = nn.Parameter(torch.zeros(self.stoch_dim))
+        # Stack of transformer blocks.
+        self.blocks = nn.ModuleList([
+            TransformerBlock(D, cfg.n_heads, ff_mult=cfg.ff_mult,
+                             soft_cap=cfg.soft_cap)
+            for _ in range(cfg.n_layers)
+        ])
+        self.norm_out = RMSNorm(D)
+        # x-prediction head: ẑ₁ from z̃-token's hidden state.
+        self.z1_head = nn.Linear(D, cfg.z_dim)
 
-        # Posterior head: q(z | h, e)
-        self.posterior_head = MLP(cfg.deter_dim + cfg.embed_dim, cfg.hidden_dim,
-                                  self.stoch_dim, n_layers=cfg.n_layers)
-        # Prior head: p(z | h)
-        self.prior_head = MLP(cfg.deter_dim, cfg.hidden_dim, self.stoch_dim,
-                              n_layers=cfg.n_layers)
+        # Cached attention mask & rope — built lazily per (T_ctx, device).
+        self._mask_cache: Dict[Tuple[int, torch.device], torch.Tensor] = {}
+        self._rope_cache: Dict[Tuple[int, torch.device], Tuple[torch.Tensor,
+                                                                torch.Tensor]] = {}
 
-        # Reconstruction decoder: predicts the next observation (latest frame
-        # of the lookback window — i.e. the current step's obs).
-        self.decoder = MLP(cfg.deter_dim + self.stoch_dim, cfg.hidden_dim,
-                           cfg.obs_dim, n_layers=cfg.n_layers)
+    # ----------------------------------------------------- attention scaffolding
+    def _block_causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        """``(L, L)`` boolean mask — True means *allowed*.
 
-        # Reward head — twohot symlog logits handled by Critic-style head.
-        self.reward_head = TwohotHead(cfg.deter_dim + self.stoch_dim,
-                                      cfg.hidden_dim, cfg.n_layers)
-        # Continuation (1 - done) head — bernoulli logit.
-        self.cont_head = MLP(cfg.deter_dim + self.stoch_dim, cfg.hidden_dim,
-                             1, n_layers=cfg.n_layers)
-
-    # ------------------------------------------------------------------ utils
-    def initial_state(self, batch_size: int, device: torch.device
-                      ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.init_h.unsqueeze(0).expand(batch_size, -1).contiguous()
-        z = self.init_z.unsqueeze(0).expand(batch_size, -1).contiguous()
-        return h, z
-
-    def _sample_z(self, logits: torch.Tensor) -> torch.Tensor:
-        """Sample categorical z with straight-through gradient.
-
-        ``logits`` shape (B, n_categoricals * n_classes).  Returns one-hot
-        tensor flattened back to (B, n_categoricals * n_classes).
+        Block-causal: token at (t, k) attends to all (t', k') with t' < t,
+        plus all k' at t' = t.
         """
-        cfg = self.cfg
-        B = logits.shape[0]
-        logits = logits.view(B, cfg.n_categoricals, cfg.n_classes)
-        # Unimix (paper §C.2): mix 1% uniform into the categorical.
-        probs = F.softmax(logits, dim=-1)
-        unimix = 0.01
-        probs = (1.0 - unimix) * probs + unimix / cfg.n_classes
-        logits = torch.log(probs + 1e-8)
-        # Straight-through one-hot sample.
-        sample = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
-        return sample.view(B, self.stoch_dim)
+        key = (T, device)
+        if key in self._mask_cache:
+            return self._mask_cache[key]
+        L = T * self.n_per_step
+        # Time index for each position.
+        t_idx = torch.arange(L, device=device) // self.n_per_step
+        mask = t_idx.unsqueeze(0) <= t_idx.unsqueeze(1)
+        self._mask_cache[key] = mask
+        return mask
 
-    # ----------------------------------------------------- single online step
-    def observe_step(self,
-                     obs_window: torch.Tensor,    # (B, lookback, obs_dim)
-                     prev_action: torch.Tensor,   # (B, action_dim)
-                     prev_h: torch.Tensor,        # (B, deter_dim)
-                     prev_z: torch.Tensor,        # (B, stoch_dim)
-                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        B = obs_window.shape[0]
-        flat = obs_window.reshape(B, -1)
-        e = self.encoder(flat)
-        # GRU advances h with previous (z, a).
-        gru_in = torch.cat([prev_z, prev_action], dim=-1)
-        h = self.gru(gru_in, prev_h)
-        # Posterior and prior over z_t.
-        post_logits = self.posterior_head(torch.cat([h, e], dim=-1))
-        prior_logits = self.prior_head(h)
-        z = self._sample_z(post_logits)
-        return h, z, post_logits, prior_logits
+    def _rope(self, T: int, device: torch.device
+              ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """RoPE applied to **time** positions, repeated per intra-step token.
 
-    # ---------------------------------------------- imagined rollout (latent)
-    def imagine_step(self,
-                     prev_h: torch.Tensor,
-                     prev_z: torch.Tensor,
-                     action: torch.Tensor,
-                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        gru_in = torch.cat([prev_z, action], dim=-1)
-        h = self.gru(gru_in, prev_h)
-        prior_logits = self.prior_head(h)
-        z = self._sample_z(prior_logits)
-        return h, z, prior_logits
+        Length L = T * n_per_step.
+        """
+        key = (T, device)
+        if key in self._rope_cache:
+            return self._rope_cache[key]
+        head_dim = self.cfg.d_model // self.cfg.n_heads
+        cos_t, sin_t = _rope_cache(T, head_dim, device, base=self.cfg.rope_base)
+        cos = cos_t.repeat_interleave(self.n_per_step, dim=0)
+        sin = sin_t.repeat_interleave(self.n_per_step, dim=0)
+        self._rope_cache[key] = (cos, sin)
+        return cos, sin
 
-    # ---------------------------------------------------------- decoder/heads
-    def decode(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        return self.decoder(torch.cat([h, z], dim=-1))
+    # --------------------------------------------------- per-step input assembly
+    def _action_token(self, action: torch.Tensor) -> torch.Tensor:
+        """Combine continuous projection + discrete embedding for action.
 
-    def predict_reward(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        return self.reward_head(torch.cat([h, z], dim=-1))
+        ``action`` shape ``(B, T, A)`` (continuous in [-1, 1]).
+        Returns ``(B, T, D)``.
+        """
+        B, T, A = action.shape
+        a_cont = self.act_cont_proj(action)
+        # Map continuous → bin index per dim, then sum embeddings.
+        bin_idx = ((action + 1.0) * 0.5 * (self.cfg.n_action_bins - 1)
+                   ).long().clamp_(0, self.cfg.n_action_bins - 1)  # (B,T,A)
+        offsets = (torch.arange(A, device=action.device)
+                   * self.cfg.n_action_bins).view(1, 1, A)
+        a_disc = self.act_disc_embed(bin_idx + offsets).sum(dim=2)  # (B,T,D)
+        return a_cont + a_disc
 
-    def predict_cont(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        return self.cont_head(torch.cat([h, z], dim=-1))
+    def _tau_d_token(self, tau: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        """``tau`` and ``d`` shape ``(B, T)`` floats → ``(B, T, D)``."""
+        # Discretize τ to ``tau_n_bins`` grid (paper uses discrete embeddings).
+        tau_idx = (tau.clamp(0.0, 1.0) * (self.cfg.tau_n_bins - 1)
+                   ).long().clamp_(0, self.cfg.tau_n_bins - 1)
+        # d ∈ {1, 1/2, …, 1/k_max}; map to integer log2(1/d) ∈ {0, …, log2(k_max)}.
+        d_idx = (-torch.log2(d.clamp_min(1e-6))).round().long()
+        d_idx = d_idx.clamp_(0, int(math.log2(self.cfg.k_max)))
+        return torch.cat([self.tau_embed(tau_idx), self.d_embed(d_idx)], dim=-1)
+
+    def assemble_tokens(self, z_tilde: torch.Tensor, tau: torch.Tensor,
+                        d: torch.Tensor, action: torch.Tensor
+                        ) -> torch.Tensor:
+        """Build the per-step token sequence.
+
+        Inputs (all batched ``(B, T, …)``):
+          ``z_tilde`` (B, T, z_dim) — corrupted observation latents
+          ``tau``      (B, T)       — per-step signal level
+          ``d``        (B, T)       — per-step step size
+          ``action``   (B, T, A)    — continuous actions
+
+        Returns ``(B, T * n_per_step, D)``.
+        """
+        B, T = z_tilde.shape[:2]
+        regs = self.register_tokens.view(1, 1, self.cfg.n_register, -1
+                                          ).expand(B, T, -1, -1)
+        a_tok = self._action_token(action).unsqueeze(2)              # (B,T,1,D)
+        td_tok = self._tau_d_token(tau, d).unsqueeze(2)              # (B,T,1,D)
+        z_tok = self.z_proj(z_tilde).unsqueeze(2)                    # (B,T,1,D)
+        # Order: registers, action, (τ,d), z̃.
+        seq = torch.cat([regs, a_tok, td_tok, z_tok], dim=2)         # (B,T,K,D)
+        return seq.reshape(B, T * self.n_per_step, -1)
+
+    # ------------------------------------------------------------------ forward
+    def forward(self, z_tilde: torch.Tensor, tau: torch.Tensor,
+                d: torch.Tensor, action: torch.Tensor
+                ) -> Dict[str, torch.Tensor]:
+        """Run the trunk; return predicted ẑ₁ + per-step agent hidden state.
+
+        Returns dict with:
+          ``z1_hat``     : ``(B, T, z_dim)``   — clean-z prediction (x-prediction)
+          ``agent_hid``  : ``(B, T, D)``       — agent register hidden state
+                                                 (used by Phase-2 BC heads
+                                                 and Phase-3 RL heads)
+        """
+        B, T = z_tilde.shape[:2]
+        x = self.assemble_tokens(z_tilde, tau, d, action)
+        cos, sin = self._rope(T, x.device)
+        mask = self._block_causal_mask(T, x.device)
+        for blk in self.blocks:
+            x = blk(x, cos, sin, mask)
+        x = self.norm_out(x)
+        x = x.view(B, T, self.n_per_step, -1)
+        # z̃ token is at the last intra-step slot.
+        z1_hat = self.z1_head(x[:, :, -1, :])
+        agent_hid = x[:, :, self.AGENT_REGISTER_INDEX, :]
+        return {'z1_hat': z1_hat, 'agent_hid': agent_hid, 'all_hidden': x}
 
 
 # ---------------------------------------------------------------------------
-# Twohot symlog head (paper §B)
+# Heads: TwohotHead (reward + value), PolicyHead (per-dim categorical)
 # ---------------------------------------------------------------------------
 
 class TwohotHead(nn.Module):
-    """MLP head that outputs logits over a fixed twohot symlog support.
+    """MLP head outputting logits over a fixed twohot symlog support.
 
-    Support: ``n_bins`` evenly spaced bin centres in symlog space across
-    [-low, +high].  Defaults from paper: 255 bins on [-20, 20].
+    With ``mtp_length > 1`` the head produces ``L`` parallel logit vectors
+    (paper §3.2 multi-token-prediction). ``forward`` returns offset-0 logits
+    so existing single-step call sites keep working; ``forward_mtp`` returns
+    all ``L`` offsets.
     """
 
     def __init__(self, in_dim: int, hidden_dim: int, n_layers: int = 2,
-                 n_bins: int = 255, low: float = -20.0, high: float = 20.0):
+                 n_bins: int = 255, low: float = -20.0, high: float = 20.0,
+                 mtp_length: int = 1):
         super().__init__()
         self.n_bins = n_bins
-        self.register_buffer('bin_edges',
-                             torch.linspace(low, high, n_bins))
-        self.head = MLP(in_dim, hidden_dim, n_bins, n_layers=n_layers,
-                        zero_init_last=True)
+        self.mtp_length = max(1, int(mtp_length))
+        self.register_buffer('bin_edges', torch.linspace(low, high, n_bins))
+        self.head = MLP(in_dim, hidden_dim, self.mtp_length * n_bins,
+                        n_layers=n_layers, zero_init_last=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(x)            # logits over symlog bins
+        # offset-0 logits (used for value / current-step reward).
+        return self.head(x)[..., : self.n_bins]
+
+    def forward_mtp(self, x: torch.Tensor) -> torch.Tensor:
+        """All-offset logits, shape ``(..., L, n_bins)``."""
+        out = self.head(x)
+        return out.view(*x.shape[:-1], self.mtp_length, self.n_bins)
 
     @torch.no_grad()
     def expectation(self, logits: torch.Tensor) -> torch.Tensor:
@@ -266,118 +591,176 @@ class TwohotHead(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         return -(twohot * log_probs).sum(dim=-1)
 
+    def loss_mtp(self, logits_all: torch.Tensor,
+                  targets_all: torch.Tensor) -> torch.Tensor:
+        """L-step twohot CE loss.
 
-# ---------------------------------------------------------------------------
-# Actor — per-action-dim categorical over uniform bins in [-1, 1]
-# ---------------------------------------------------------------------------
+        ``logits_all`` shape ``(..., L, n_bins)``; ``targets_all`` ``(..., L)``.
+        Returns per-element loss summed over L (caller can mean / weight).
+        """
+        sym = symlog(targets_all)
+        twohot = twohot_encode(sym, self.bin_edges)              # (...,L,K)
+        log_probs = F.log_softmax(logits_all, dim=-1)
+        return -(twohot * log_probs).sum(dim=-1)                  # (...,L)
 
-class Actor(nn.Module):
-    """V4-paper categorical actor for continuous control.
 
-    Each action dimension is discretized into ``n_action_bins`` uniform bins
-    in [-1, 1].  At training time we sample a bin per dim and receive the
-    bin centre as the continuous action; at inference we take argmax for a
-    deterministic policy.
+class PolicyHead(nn.Module):
+    """Per-action-dim categorical over uniform bins in [-1, 1].
+
+    Used by the actor in all three phases. Phase 2 trains via
+    cross-entropy (BC) on dataset actions; Phase 3 trains via PMPO.
     """
 
     def __init__(self, in_dim: int, hidden_dim: int, action_dim: int,
-                 n_action_bins: int = 21, n_layers: int = 2):
+                 n_action_bins: int = 21, n_layers: int = 2,
+                 mtp_length: int = 1):
         super().__init__()
         self.action_dim = action_dim
         self.n_bins = n_action_bins
-        self.head = MLP(in_dim, hidden_dim, action_dim * n_action_bins,
+        self.mtp_length = max(1, int(mtp_length))
+        self.head = MLP(in_dim, hidden_dim,
+                        self.mtp_length * action_dim * n_action_bins,
                         n_layers=n_layers, zero_init_last=True)
         self.register_buffer('bin_centres',
                              torch.linspace(-1.0, 1.0, n_action_bins))
 
-    def _logits(self, latent: torch.Tensor) -> torch.Tensor:
+    def logits(self, latent: torch.Tensor) -> torch.Tensor:
         B = latent.shape[0]
-        return self.head(latent).view(B, self.action_dim, self.n_bins)
+        out = self.head(latent)[..., : self.action_dim * self.n_bins]
+        return out.view(B, self.action_dim, self.n_bins)
 
-    def forward(self, latent: torch.Tensor, *, deterministic: bool = False
+    def logits_mtp(self, latent: torch.Tensor) -> torch.Tensor:
+        """All-offset action logits, shape ``(B, L, action_dim, n_bins)``."""
+        B = latent.shape[0]
+        return self.head(latent).view(B, self.mtp_length,
+                                       self.action_dim, self.n_bins)
+
+    def forward(self, latent: torch.Tensor, *,
+                deterministic: bool = False
                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (action, log_prob, entropy).
-
-        ``action`` shape (B, action_dim) in [-1, 1].
-        ``log_prob`` shape (B,)  — sum across action dims.
-        ``entropy``  shape (B,)  — sum across action dims.
-        """
-        logits = self._logits(latent)
+        logits = self.logits(latent)
         if deterministic:
             idx = logits.argmax(dim=-1)
         else:
             probs = F.softmax(logits, dim=-1)
             idx = torch.distributions.Categorical(probs=probs).sample()
-        action = self.bin_centres[idx]  # (B, action_dim)
+        action = self.bin_centres[idx]
         log_probs = F.log_softmax(logits, dim=-1)
-        log_prob = log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
-        entropy = -(F.softmax(logits, dim=-1) * log_probs).sum(dim=-1).sum(dim=-1)
+        log_prob = log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1)
+        entropy = -(F.softmax(logits, dim=-1) * log_probs).sum(-1).sum(-1)
         return action, log_prob, entropy
 
+    def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor
+                     ) -> torch.Tensor:
+        """Log-prob of a discretized continuous action (for BC + PMPO)."""
+        logits = self.logits(latent)
+        # Map continuous action ∈ [-1, 1] back to nearest bin index.
+        idx = ((action + 1.0) * 0.5 * (self.n_bins - 1)
+               ).round().long().clamp_(0, self.n_bins - 1)   # (B, action_dim)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1)
+
+    def log_prob_of_mtp(self, latent: torch.Tensor,
+                         actions: torch.Tensor) -> torch.Tensor:
+        """Log-prob of ``L`` future discretized actions.
+
+        ``actions`` shape: ``(B, L, action_dim)`` in [-1, 1].
+        Returns ``(B, L)`` summed over action dims (per offset).
+        """
+        logits = self.logits_mtp(latent)                          # (B,L,A,K)
+        idx = ((actions + 1.0) * 0.5 * (self.n_bins - 1)
+               ).round().long().clamp_(0, self.n_bins - 1)         # (B,L,A)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1)
+
 
 # ---------------------------------------------------------------------------
-# Critic — twohot symlog over lambda returns
-# ---------------------------------------------------------------------------
-
-class Critic(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, n_layers: int = 2):
-        super().__init__()
-        self.head = TwohotHead(in_dim, hidden_dim, n_layers=n_layers)
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.head(latent)             # logits
-
-    def value(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.head.expectation(self.head(latent))
-
-    def loss(self, latent: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return self.head.loss(self.head(latent), target)
-
-
-# ---------------------------------------------------------------------------
-# Top-level container
+# Top-level Dreamer 4 container
 # ---------------------------------------------------------------------------
 
 @dataclass
 class DreamerV4Config:
-    rssm: RSSMConfig
+    obs_dim: int
+    action_dim: int
+    lookback: int                          # transformer context length T_ctx
+    # Tokenizer
+    tok_hidden: int = 256
+    z_dim: int = 24
+    mae_p_max: float = 0.5
+    # Dynamics
+    d_model: int = 256
+    n_layers: int = 6
+    n_heads: int = 8
+    ff_mult: int = 4
+    n_register: int = 4
+    k_max: int = 4
+    tau_n_bins: int = 32
+    soft_cap: float = 50.0
+    # Heads
     n_action_bins: int = 21
-    actor_hidden: int = 512
-    critic_hidden: int = 512
+    head_hidden: int = 256
+    head_n_layers: int = 2
+    mtp_length: int = 1                    # paper L=8 (Phase-2 MTP)
 
 
 class DreamerV4(nn.Module):
     def __init__(self, cfg: DreamerV4Config):
         super().__init__()
         self.cfg = cfg
-        self.rssm = RSSM(cfg.rssm)
-        latent_dim = cfg.rssm.deter_dim + cfg.rssm.n_categoricals * cfg.rssm.n_classes
-        self.actor = Actor(latent_dim, cfg.actor_hidden,
-                           cfg.rssm.action_dim, n_action_bins=cfg.n_action_bins)
-        self.critic = Critic(latent_dim, cfg.critic_hidden)
-        # EMA target critic for stability (paper §C).
-        self.target_critic = Critic(latent_dim, cfg.critic_hidden)
-        self.target_critic.load_state_dict(self.critic.state_dict())
-        for p in self.target_critic.parameters():
+        self.tokenizer = Tokenizer(cfg.obs_dim, cfg.tok_hidden, cfg.z_dim,
+                                    mae_p_max=cfg.mae_p_max)
+        dyn_cfg = DynamicsConfig(
+            z_dim=cfg.z_dim, action_dim=cfg.action_dim,
+            n_action_bins=cfg.n_action_bins,
+            d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
+            ff_mult=cfg.ff_mult, n_register=cfg.n_register,
+            k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins,
+            soft_cap=cfg.soft_cap,
+        )
+        self.dynamics = DynamicsTransformer(dyn_cfg)
+        # Heads read from the agent-register hidden state (dim = d_model).
+        D = cfg.d_model
+        self.policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
+                                  n_action_bins=cfg.n_action_bins,
+                                  n_layers=cfg.head_n_layers,
+                                  mtp_length=cfg.mtp_length)
+        self.reward = TwohotHead(D, cfg.head_hidden,
+                                  n_layers=cfg.head_n_layers,
+                                  mtp_length=cfg.mtp_length)
+        self.value = TwohotHead(D, cfg.head_hidden,
+                                 n_layers=cfg.head_n_layers)
+        # EMA target for value (TD-λ stability, paper §3.3).
+        self.target_value = TwohotHead(D, cfg.head_hidden,
+                                         n_layers=cfg.head_n_layers)
+        self.target_value.load_state_dict(self.value.state_dict())
+        for p in self.target_value.parameters():
             p.requires_grad_(False)
-        # Return-scale EMA (paper §C "Actor learning"): tracks the
-        # 5th/95th percentile spread of imagined λ-returns to normalize
-        # advantages globally instead of per-trajectory.
+        # Frozen prior policy snapshot (PMPO behavioural prior, paper eq. 11).
+        self.prior_policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
+                                        n_action_bins=cfg.n_action_bins,
+                                        n_layers=cfg.head_n_layers,
+                                        mtp_length=cfg.mtp_length)
+        self.prior_policy.load_state_dict(self.policy.state_dict())
+        for p in self.prior_policy.parameters():
+            p.requires_grad_(False)
+        # Return-scale EMA (used for diagnostic logging; PMPO does not need it).
         self.register_buffer('ret_scale', torch.ones(1))
 
+    # ---------------------------------------------------------- target / prior
     def update_target(self, tau: float = 0.02) -> None:
         with torch.no_grad():
-            for p, t in zip(self.critic.parameters(), self.target_critic.parameters()):
+            for p, t in zip(self.value.parameters(),
+                            self.target_value.parameters()):
                 t.data.mul_(1.0 - tau).add_(tau * p.data)
+
+    def snapshot_prior_policy(self) -> None:
+        """Capture the current policy as the frozen PMPO prior (start of Phase 3)."""
+        self.prior_policy.load_state_dict(self.policy.state_dict())
+        for p in self.prior_policy.parameters():
+            p.requires_grad_(False)
 
     def update_return_scale(self, returns: torch.Tensor,
                              ema: float = 0.99) -> torch.Tensor:
-        """EMA-update the return scale and return its current (clamped) value.
-
-        ``returns`` is a flat tensor of imagined λ-returns over the batch.
-        Scale = ``max(1.0, P95 - P5)`` (paper §C).  Clamped at 1.0 so small
-        returns do not amplify gradient noise.
-        """
         with torch.no_grad():
             r = returns.detach().reshape(-1).float()
             if r.numel() < 2:
@@ -389,40 +772,197 @@ class DreamerV4(nn.Module):
             self.ret_scale.mul_(ema).add_((1.0 - ema) * spread)
         return self.ret_scale.clamp_min(1.0)
 
-    # Convenience parameter groups
+    # ------------------------------------------------------- parameter groups
     def parameters_world(self):
-        return list(self.rssm.parameters())
+        """Tokenizer + dynamics + reward head — trained in Phases 1 & 2."""
+        return (list(self.tokenizer.parameters())
+                + list(self.dynamics.parameters())
+                + list(self.reward.parameters()))
 
     def parameters_actor(self):
-        return list(self.actor.parameters())
+        """Policy head — trained in Phases 2 (BC) & 3 (PMPO)."""
+        return list(self.policy.parameters())
 
     def parameters_critic(self):
-        return list(self.critic.parameters())
+        """Value head — trained in Phase 3 only."""
+        return list(self.value.parameters())
+
+    # --------------------------------------------------- inference: latent step
+    @torch.no_grad()
+    def imagine_next_z(self, z_history: torch.Tensor, action: torch.Tensor,
+                       k_steps: int = None, tau_ctx: float = 0.1
+                       ) -> torch.Tensor:
+        """Sample the next z given a history of clean z's and an action.
+
+        ``z_history``: ``(B, T_ctx, z_dim)``  — clean past latents.
+        ``action``   : ``(B, action_dim)``    — action taken at the next step.
+
+        Returns ``z_next`` of shape ``(B, z_dim)``.
+
+        Uses paper-faithful K=4 shortcut sampling at d=1/k_max with a
+        small ``tau_ctx`` corruption applied to past frames for robustness.
+        """
+        cfg = self.cfg
+        K = int(k_steps if k_steps is not None else cfg.k_max)
+        B, T_ctx, _ = z_history.shape
+        device = z_history.device
+        # Pad with one dummy step at the end to denoise.
+        z0 = torch.randn(B, 1, cfg.z_dim, device=device, dtype=z_history.dtype)
+        # τ for past = 1 - tau_ctx (slight corruption); for current = 0 (full noise).
+        z_past_corr = (1.0 - tau_ctx) * z_history + tau_ctx * torch.randn_like(z_history)
+        z_seq = torch.cat([z_past_corr, z0], dim=1)                       # (B, T_ctx+1, z)
+        # Action: replicate past actions placeholder (zeros) + supplied current action.
+        act_seq = torch.zeros(B, T_ctx + 1, cfg.action_dim, device=device,
+                              dtype=action.dtype)
+        act_seq[:, -1] = action
+        # τ / d sequences: past = (1 - tau_ctx, d_min), current = (0 → 1, d_min).
+        d_min = 1.0 / cfg.k_max
+        tau_seq = torch.full((B, T_ctx + 1), 1.0 - tau_ctx, device=device,
+                             dtype=z_history.dtype)
+        d_seq = torch.full((B, T_ctx + 1), d_min, device=device,
+                           dtype=z_history.dtype)
+        # K shortcut steps on the *last* timestep only.
+        for k in range(K):
+            tau_now = float(k) / K
+            tau_seq[:, -1] = tau_now
+            out = self.dynamics(z_seq, tau_seq, d_seq, act_seq)
+            z1_hat = out['z1_hat'][:, -1]                                 # (B, z)
+            # Advance via x-prediction: take a step of size d_min toward ẑ₁.
+            z_cur = z_seq[:, -1]
+            v_hat = (z1_hat - z_cur) / max(1e-6, 1.0 - tau_now)
+            z_seq[:, -1] = z_cur + v_hat * d_min
+        return z_seq[:, -1]
+
+    @torch.no_grad()
+    def policy_action(self, agent_hid: torch.Tensor, *,
+                       deterministic: bool = True) -> torch.Tensor:
+        """Sample an action from ``policy`` given an agent-register hidden state."""
+        action, _, _ = self.policy(agent_hid, deterministic=deterministic)
+        return action
 
 
 # ---------------------------------------------------------------------------
-# KL helpers (free-bits, summed across categoricals — paper recommendation)
+# PMPO loss (paper eq. 11)
 # ---------------------------------------------------------------------------
 
-def categorical_kl(post_logits: torch.Tensor, prior_logits: torch.Tensor,
-                   n_categoricals: int, n_classes: int) -> torch.Tensor:
-    """KL[ post || prior ] summed across the K categoricals.
+def pmpo_loss(policy: PolicyHead, prior_policy: PolicyHead,
+              latent: torch.Tensor, action: torch.Tensor,
+              advantage: torch.Tensor,
+              alpha: float = 0.5, beta: float = 0.1
+              ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Policy Maximum Likelihood Optimization loss (Dreamer 4 eq. 11).
 
-    Shapes: ``(B, n_categoricals * n_classes)`` -> ``(B,)``.
+    Splits states by sign of advantage:
+      - D⁺ = {s | A ≥ 0} → upweight chosen action
+      - D⁻ = {s | A < 0} → downweight chosen action
+    Plus a KL term to a frozen prior policy.
+
+    All tensors are flat ``(N, …)``.
     """
-    B = post_logits.shape[0]
-    p = post_logits.view(B, n_categoricals, n_classes)
-    q = prior_logits.view(B, n_categoricals, n_classes)
-    p_log = F.log_softmax(p, dim=-1)
-    q_log = F.log_softmax(q, dim=-1)
-    p_prob = p_log.exp()
-    kl_per_cat = (p_prob * (p_log - q_log)).sum(dim=-1)   # (B, K)
-    return kl_per_cat.sum(dim=-1)                         # (B,)
+    log_prob = policy.log_prob_of(latent, action)               # (N,)
+    with torch.no_grad():
+        prior_logits = prior_policy.logits(latent)              # (N, A, B)
+        prior_logp_full = F.log_softmax(prior_logits, dim=-1)
+    cur_logits = policy.logits(latent)
+    cur_logp_full = F.log_softmax(cur_logits, dim=-1)
+    cur_p_full = cur_logp_full.exp()
+    kl = (cur_p_full * (cur_logp_full - prior_logp_full)).sum(-1).sum(-1)  # (N,)
+
+    pos_mask = (advantage >= 0).float()
+    neg_mask = 1.0 - pos_mask
+    n_pos = pos_mask.sum().clamp_min(1.0)
+    n_neg = neg_mask.sum().clamp_min(1.0)
+    loss_pos = -(alpha * (log_prob * pos_mask).sum() / n_pos)
+    loss_neg = -((1.0 - alpha) * (-(log_prob) * neg_mask).sum() / n_neg)
+    loss_kl = beta * kl.mean()
+    total = loss_pos + loss_neg + loss_kl
+    diag = {
+        'pmpo_loss': total.detach(),
+        'pmpo_pos_frac': (n_pos / (n_pos + n_neg)).detach(),
+        'pmpo_kl': kl.mean().detach(),
+        'pmpo_logp_mean': log_prob.mean().detach(),
+    }
+    return total, diag
 
 
-def free_bits_kl(post_logits: torch.Tensor, prior_logits: torch.Tensor,
-                 n_categoricals: int, n_classes: int,
-                 free_nats: float) -> torch.Tensor:
-    """Summed-K KL clamped at ``free_nats`` (V4 spec)."""
-    kl = categorical_kl(post_logits, prior_logits, n_categoricals, n_classes)
-    return torch.clamp(kl, min=free_nats).mean()
+# ---------------------------------------------------------------------------
+# Shortcut forcing world-model loss (paper eq. 7)
+# ---------------------------------------------------------------------------
+
+def shortcut_forcing_loss(dynamics: DynamicsTransformer,
+                           z_clean: torch.Tensor, action: torch.Tensor,
+                           ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute the per-step shortcut forcing loss with bootstrap targets.
+
+    ``z_clean`` (B, T, z_dim)  — frozen tokenizer outputs (target z₁'s).
+    ``action``  (B, T, A)      — actions taken before each step.
+
+    Returns (loss, diag).
+    """
+    cfg = dynamics.cfg
+    B, T, Z = z_clean.shape
+    device = z_clean.device
+    dtype = z_clean.dtype
+    d_min = 1.0 / cfg.k_max
+
+    # Per-(B, T) sample of (τ, d).
+    tau, d = sample_tau_d((B, T), cfg.k_max, device, dtype)
+
+    # Build corrupted z̃.
+    z0 = torch.randn_like(z_clean)
+    tau_b = tau.unsqueeze(-1)
+    z_tilde = (1.0 - tau_b) * z0 + tau_b * z_clean
+
+    # Main forward — all timesteps, all batches at once.
+    out = dynamics(z_tilde, tau, d, action)
+    z1_hat = out['z1_hat']                                       # (B, T, Z)
+
+    # Flow-matching loss term (only where d == d_min) — x-space MSE.
+    is_min = (d <= (d_min + 1e-6))
+    loss_flow = (z1_hat - z_clean).pow(2).sum(-1)                # (B, T)
+
+    # Bootstrap loss term (where d > d_min).
+    # We need 2 extra forward passes with stop-gradient targets.
+    half_d = d * 0.5
+    with torch.no_grad():
+        out_b1 = dynamics(z_tilde, tau, half_d, action)
+        z1_b1 = out_b1['z1_hat']
+        b1 = (z1_b1 - z_tilde) / (1.0 - tau_b).clamp_min(1e-6)
+        z_prime = z_tilde + b1 * half_d.unsqueeze(-1)
+        out_b2 = dynamics(z_prime, tau + half_d, half_d, action)
+        z1_b2 = out_b2['z1_hat']
+        b2 = (z1_b2 - z_prime) / (1.0 - (tau_b + half_d.unsqueeze(-1))
+                                   ).clamp_min(1e-6)
+        target_v = ((b1 + b2) * 0.5).detach()
+
+    # Convert main output to v-space and apply (1-τ)² scaling per paper.
+    one_m_tau = (1.0 - tau_b).clamp_min(1e-6)
+    v_hat = (z1_hat - z_tilde) / one_m_tau
+    loss_boot = (one_m_tau.squeeze(-1).pow(2)
+                  * (v_hat - target_v).pow(2).sum(-1))           # (B, T)
+
+    # Per-step ramp weight (eq. 8).
+    w = ramp_weight(tau)
+    loss_per_step = torch.where(is_min, loss_flow, loss_boot)
+    loss = (w * loss_per_step).mean()
+
+    diag = {
+        'sf_loss': loss.detach(),
+        'sf_loss_flow': (w * loss_flow).where(is_min,
+                            torch.zeros_like(loss_flow)).mean().detach(),
+        'sf_loss_boot': (w * loss_boot).where(~is_min,
+                            torch.zeros_like(loss_boot)).mean().detach(),
+        'sf_d_min_frac': is_min.float().mean().detach(),
+    }
+    return loss, diag
+
+
+__all__ = [
+    'symlog', 'symexp', 'twohot_encode',
+    'MLP', 'RMSNorm', 'SwiGLU', 'CausalAttention', 'TransformerBlock',
+    'Tokenizer', 'DynamicsConfig', 'DynamicsTransformer',
+    'TwohotHead', 'PolicyHead',
+    'DreamerV4Config', 'DreamerV4',
+    'sample_tau_d', 'shortcut_corrupt', 'ramp_weight',
+    'shortcut_forcing_loss', 'pmpo_loss',
+]

@@ -216,11 +216,13 @@ def main() -> int:
           f"per_batch≈{bs_info.get('per_batch_mb','?')}MB, "
           f"gpu={bs_info.get('gpu_total_gb',0):.1f}GB)", flush=True)
     cfg = TrainConfig(
-        deter_dim=arch['deter_dim'],
-        embed_dim=arch['embed_dim'],
-        hidden_dim=arch['hidden_dim'],
-        n_categoricals=arch['n_categoricals'],
-        n_classes=arch['n_classes'],
+        d_model=arch['d_model'],
+        n_layers=arch['n_layers'],
+        n_heads=arch['n_heads'],
+        z_dim=arch['z_dim'],
+        n_register=arch['n_register'],
+        tok_hidden=arch['tok_hidden'],
+        head_hidden=arch['head_hidden'],
         lookback=lookback,
         sample_rate=sample_rate,
         episode_length=episode_length,
