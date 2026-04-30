@@ -299,6 +299,20 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
     onnx_path = out_dir / 'dreamer_v4.onnx'
     export_dreamer_v4_onnx(model, onnx_path)
 
+    # Auto-validation on held-out seeds (paper-faithful "test set" gate).
+    val_summary: Dict = {}
+    try:
+        from evaluation.validate import run_validation
+        print('[final] phase 4: validation on held-out seeds', flush=True)
+        val_summary = run_validation(controller_dir=final_dir,
+                                     episodes=3, seeds=3)
+        print(f"[final] validation cum_raw_reward "
+              f"mean={val_summary.get('cum_raw_reward_mean', float('nan')):.2f} "
+              f"std={val_summary.get('cum_raw_reward_std', float('nan')):.2f} "
+              f"-> {final_dir}/validation/", flush=True)
+    except Exception as e:
+        print(f'[final] validation skipped: {e!r}', flush=True)
+
     return {
         'final_summary': summary,
         'best_params': best_params,
@@ -306,6 +320,7 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         'H_init': H_init,
         'onnx_path': str(onnx_path),
         'final_ckpt': str(final_dir / 'final.pt'),
+        'validation': val_summary,
     }
 
 

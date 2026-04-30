@@ -50,10 +50,19 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 def _load_run_plan(controller_dir: Path) -> Dict:
-    plan_path = controller_dir / 'run_plan.json'
-    if plan_path.exists():
-        with open(plan_path, 'r') as f:
-            return json.load(f)
+    """Look up run_plan.json: in the controller dir, then walk parents.
+
+    The BO workflow writes run_plan.json at the workflow root, while
+    controller_dir is typically a per-trial or final/ subfolder.
+    """
+    for d in [controller_dir, *controller_dir.parents]:
+        plan_path = d / 'run_plan.json'
+        if plan_path.exists():
+            with open(plan_path, 'r') as f:
+                return json.load(f)
+        # stop at repo root or filesystem root
+        if d.name in ('output', '') or d == d.parent:
+            break
     return {}
 
 
@@ -301,49 +310,35 @@ def plot_summary(seed_results: List[List[Dict]], out_path: Path,
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description='Validate a trained DreamerV4 controller against held-out '
-                    'episodes drawn from the training disturbance distribution.')
-    parser.add_argument('--controller-dir', '-c', required=True,
-                        help='Output directory of a training run (contains '
-                             'final.pt, run_plan.json).')
-    parser.add_argument('--simulation-dir', '-s', default=None,
-                        help='Override the simulation directory '
-                             '(default: read from run_plan.json).')
-    parser.add_argument('--ckpt', default='final.pt',
-                        help='Checkpoint filename within --controller-dir.')
-    parser.add_argument('--episodes', type=int, default=3,
-                        help='Episodes per seed.')
-    parser.add_argument('--seeds', type=int, default=3,
-                        help='Number of validation seeds.')
-    parser.add_argument('--out', default=None,
-                        help='Validation output dir (default: '
-                             '<controller-dir>/validation).')
-    parser.add_argument('--deterministic', action='store_true',
-                        help='Use deterministic actor (argmax bin); default ON. '
-                             'Pass --stochastic to sample instead.')
-    parser.add_argument('--stochastic', action='store_true',
-                        help='Sample actions stochastically.')
-    args = parser.parse_args()
+def run_validation(*,
+                   controller_dir: Path | str,
+                   simulation_dir: Path | str | None = None,
+                   ckpt: str = 'final.pt',
+                   episodes: int = 3, seeds: int = 3,
+                   out: Path | str | None = None,
+                   deterministic: bool = True) -> Dict:
+    """Validate ``controller_dir/<ckpt>`` and write plots + summary.json.
 
-    deterministic = not args.stochastic
-
-    controller_dir = Path(args.controller_dir).resolve()
+    This is the programmatic entry point used by the workflow runner; the
+    CLI ``main()`` simply parses argv and calls this.
+    """
+    controller_dir = Path(controller_dir).resolve()
     if not controller_dir.exists():
         raise FileNotFoundError(controller_dir)
-    ckpt_path = controller_dir / args.ckpt
+    ckpt_path = controller_dir / ckpt
     if not ckpt_path.exists():
         raise FileNotFoundError(ckpt_path)
 
-    out_dir = Path(args.out).resolve() if args.out else controller_dir / 'validation'
+    out_dir = Path(out).resolve() if out else controller_dir / 'validation'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     repo = Path(__file__).resolve().parent.parent
-    sys.path.insert(0, str(repo))
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
 
     run_plan = _load_run_plan(controller_dir)
-    sim_dir = _resolve_sim_dir(args.simulation_dir, controller_dir, run_plan)
+    sim_dir = _resolve_sim_dir(str(simulation_dir) if simulation_dir else None,
+                                controller_dir, run_plan)
 
     os.environ['CONTROL_SETUP_JSON'] = str(sim_dir / 'control_setup.json')
     os.environ['CONTROL_OBJECTIVE_JSON'] = str(sim_dir / 'control_objective.json')
@@ -364,8 +359,8 @@ def main() -> int:
     print(f'[val] simulation: {sim_dir}', flush=True)
     print(f'[val] ckpt: {ckpt_path}  deterministic={deterministic}', flush=True)
 
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    cfg_dict = ckpt.get('cfg') or {}
+    ckpt_obj = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    cfg_dict = ckpt_obj.get('cfg') or {}
     valid_keys = set(TrainConfig.__dataclass_fields__.keys())
     cfg = TrainConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 
@@ -381,12 +376,12 @@ def main() -> int:
                                 critic_hidden=cfg.hidden_dim)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = DreamerV4(model_cfg).to(device)
-    model.load_state_dict(ckpt['model'])
+    model.load_state_dict(ckpt_obj['model'])
     model.eval()
 
     seed_results: List[List[Dict]] = []
     metrics_records: List[Dict] = []
-    for s in range(int(args.seeds)):
+    for s in range(int(seeds)):
         seed = 10_000 + s  # held-out from training (which used SEED=0..N).
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
@@ -403,7 +398,7 @@ def main() -> int:
         per_seed_dir.mkdir(parents=True, exist_ok=True)
 
         eps = []
-        for e in range(int(args.episodes)):
+        for e in range(int(episodes)):
             ep = run_episode(env, model, device, deterministic=deterministic)
             title = (f'seed={seed} ep={e}  T={ep["episode_length"]}  '
                      f'cum_raw={ep["cum_raw_reward"]:+.2f}  '
@@ -425,9 +420,8 @@ def main() -> int:
 
     plot_summary(seed_results, out_dir / 'summary.png',
                   title=f'{controller_dir.name}  validation summary  '
-                        f'({args.seeds} seeds × {args.episodes} eps)')
+                        f'({seeds} seeds × {episodes} eps)')
 
-    # Per-episode metrics + aggregate.
     cum = np.array([m['cum_raw_reward'] for m in metrics_records])
     cv_v = np.array([m['mean_cv_violation'] for m in metrics_records])
     mv_v = np.array([m['mean_mv_violation'] for m in metrics_records])
@@ -436,8 +430,8 @@ def main() -> int:
         'simulation_dir': str(sim_dir),
         'ckpt': str(ckpt_path),
         'deterministic': deterministic,
-        'n_seeds': int(args.seeds),
-        'episodes_per_seed': int(args.episodes),
+        'n_seeds': int(seeds),
+        'episodes_per_seed': int(episodes),
         'n_episodes_total': int(len(metrics_records)),
         'cum_raw_reward_mean': float(cum.mean()),
         'cum_raw_reward_std': float(cum.std()),
@@ -451,6 +445,38 @@ def main() -> int:
         json.dump(summary, f, indent=2)
 
     print('[val] done.', flush=True)
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description='Validate a trained DreamerV4 controller against held-out '
+                    'episodes drawn from the training disturbance distribution.')
+    parser.add_argument('--controller-dir', '-c', required=True,
+                        help='Output directory of a training run (contains '
+                             'final.pt, run_plan.json).')
+    parser.add_argument('--simulation-dir', '-s', default=None,
+                        help='Override the simulation directory '
+                             '(default: read from run_plan.json).')
+    parser.add_argument('--ckpt', default='final.pt',
+                        help='Checkpoint filename within --controller-dir.')
+    parser.add_argument('--episodes', type=int, default=3,
+                        help='Episodes per seed.')
+    parser.add_argument('--seeds', type=int, default=3,
+                        help='Number of validation seeds.')
+    parser.add_argument('--out', default=None,
+                        help='Validation output dir (default: '
+                             '<controller-dir>/validation).')
+    parser.add_argument('--stochastic', action='store_true',
+                        help='Sample actions stochastically '
+                             '(default: deterministic argmax).')
+    args = parser.parse_args()
+    summary = run_validation(controller_dir=args.controller_dir,
+                             simulation_dir=args.simulation_dir,
+                             ckpt=args.ckpt,
+                             episodes=args.episodes, seeds=args.seeds,
+                             out=args.out,
+                             deterministic=not args.stochastic)
     print(json.dumps({k: v for k, v in summary.items() if k != 'episodes'},
                      indent=2), flush=True)
     return 0
