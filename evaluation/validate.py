@@ -598,6 +598,7 @@ def run_validation(*,
         n_action_bins=cfg.n_action_bins,
         head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
         mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
+        attn_impl=getattr(cfg, 'attn_impl', 'auto'),
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = DreamerV4(model_cfg).to(device)

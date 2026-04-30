@@ -122,6 +122,7 @@ if __name__ == '__main__':
         n_action_bins=cfg.n_action_bins,
         head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
         mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
+        attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)
     model.load_state_dict(state['model'])

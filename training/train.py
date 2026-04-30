@@ -137,6 +137,10 @@ class TrainConfig:
     log_every: int = 1
     save_every_iters: int = 20
 
+    # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1) -----
+    attn_impl: str = 'auto'          # 'auto'|'manual'|'sdpa'
+    compile_mode: str = ''           # '' (off) | 'default' | 'reduce-overhead' | 'max-autotune'
+
     # ----- Resolved at build-time -----
     obs_dim: int = 0
     action_dim: int = 0
@@ -668,11 +672,23 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
         ff_mult=cfg.ff_mult, n_register=cfg.n_register,
         k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
+        attn_impl=cfg.attn_impl,
         n_action_bins=cfg.n_action_bins,
         head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
         mtp_length=max(1, int(cfg.mtp_length)),
     )
-    return DreamerV4(model_cfg)
+    model = DreamerV4(model_cfg)
+    # Optional torch.compile (set via TrainConfig.compile_mode or env var).
+    cm = (cfg.compile_mode or '').strip()
+    if not cm:
+        env_cm = os.environ.get('DREAMER_COMPILE', '').strip()
+        if env_cm in ('1', 'true', 'True'):
+            cm = 'default'
+        elif env_cm:
+            cm = env_cm
+    if cm:
+        model.maybe_compile(mode=cm)
+    return model
 
 
 def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
@@ -1212,6 +1228,8 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_PMPO_BETA', 'pmpo_beta', float),
         ('DREAMER_MAE_PMAX', 'mae_p_max', float),
         ('DREAMER_MTP_LENGTH', 'mtp_length', int),
+        ('DREAMER_ATTN_IMPL', 'attn_impl', str),
+        ('DREAMER_COMPILE_MODE', 'compile_mode', str),
         ('AGENT_TOTAL_STEPS', 'total_steps', int),
         ('SIM_EPISODE_LENGTH', 'episode_length', int),
         ('SIM_SAMPLE_RATE', 'sample_rate', int),

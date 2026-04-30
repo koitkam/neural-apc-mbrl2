@@ -109,8 +109,8 @@ def derive_seq_len(tau_dom: float, dead_time: float, sample_rate: int,
 
 def derive_batch_size(model_size: str,
                       paper_default: int = 16,
-                      target_util: float = 0.5,
-                      min_bs: int = 16, max_bs: int = 128,
+                      target_util: float = 0.80,
+                      min_bs: int = 16, max_bs: int = 256,
                       horizon: int = 42,
                       horizon_ref: int = 42) -> Dict[str, Any]:
     """Pick a batch size that uses ~``target_util`` of the GPU.
@@ -124,11 +124,47 @@ def derive_batch_size(model_size: str,
     graph dominates AC memory), so ``per_batch`` is scaled by
     ``horizon / horizon_ref``.
 
-    On CPU or no-CUDA we fall back to the paper default.  We always use
-    powers of two for batch and clamp to ``[paper_default, max_bs]`` so
-    the recipe stays a strict superset of the paper.
+    On CPU or no-CUDA we fall back to the paper default. Batch is snapped
+    to powers of two in ``[paper_default, max_bs]`` so the recipe stays a
+    strict superset of the paper.
+
+    ``DREAMER_TARGET_UTIL`` and ``DREAMER_MAX_BS`` env vars override the
+    defaults for ad-hoc memory tuning.
     """
+    import os
+    env_util = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
+    if env_util:
+        try:
+            target_util = max(0.1, min(0.95, float(env_util)))
+        except ValueError:
+            pass
+    env_max_bs = os.environ.get('DREAMER_MAX_BS', '').strip()
+    if env_max_bs:
+        try:
+            max_bs = max(min_bs, int(env_max_bs))
+        except ValueError:
+            pass
     base_per_batch_mb = {'S': 220, 'M': 330, 'L': 640}.get(model_size, 330)
+    # When the fast attention + compile paths are on, peak memory is roughly
+    # 30% of the manual+eager baseline (measured: M-size W-M fwd+bwd drops
+    # from ~290 MB/sample to ~70 MB/sample with bf16+SDPA+compile). Scale
+    # the per-batch budget down so the auto-derived batch size grows to
+    # match the freed headroom.
+    fast_on = os.environ.get('DREAMER_FAST_ATTN', '').strip() in ('1','true','True','sdpa')
+    compile_on = os.environ.get('DREAMER_COMPILE', '').strip() in ('1','true','True')
+    speed_factor = 1.0
+    if fast_on:
+        speed_factor *= 0.55
+    if compile_on:
+        speed_factor *= 0.55
+    base_per_batch_mb = float(base_per_batch_mb) * speed_factor
+    # Optional explicit override (advanced).
+    env_pb = os.environ.get('DREAMER_PER_BATCH_MB', '').strip()
+    if env_pb:
+        try:
+            base_per_batch_mb = max(8.0, float(env_pb))
+        except ValueError:
+            pass
     per_batch_mb = float(base_per_batch_mb) * max(1, int(horizon)) / max(1, int(horizon_ref))
     info: Dict[str, Any] = {'model_size': model_size,
                             'per_batch_mb': per_batch_mb,

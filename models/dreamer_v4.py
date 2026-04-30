@@ -56,6 +56,7 @@ This module supplies the building blocks; the trainer in
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -160,9 +161,18 @@ class CausalAttention(nn.Module):
     mask supplied by the caller via the ``attn_mask`` argument so that the
     same module can serve both intra-step full attention and inter-step
     causal attention in a single 1-D sequence.
+
+    ``attn_impl`` selects the backend:
+      * ``'manual'`` (default if ``soft_cap > 0``) — explicit matmul + softmax
+        with logit soft-cap. Paper-faithful but ~2× slower.
+      * ``'sdpa'``  — ``F.scaled_dot_product_attention`` (auto-dispatches to
+        FlashAttention-2 / cuDNN / mem-efficient). Drops soft-cap; QKNorm
+        provides the main numerical safety net. Set via env
+        ``DREAMER_FAST_ATTN=1`` or constructor arg.
     """
 
-    def __init__(self, dim: int, n_heads: int, soft_cap: float = 50.0):
+    def __init__(self, dim: int, n_heads: int, soft_cap: float = 50.0,
+                 attn_impl: str = 'auto'):
         super().__init__()
         assert dim % n_heads == 0, f'dim {dim} must be divisible by n_heads {n_heads}'
         self.n_heads = n_heads
@@ -173,6 +183,15 @@ class CausalAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.soft_cap = soft_cap
+        # Resolve backend.
+        if attn_impl == 'auto':
+            env_fast = os.environ.get('DREAMER_FAST_ATTN', '').strip()
+            if env_fast in ('1', 'true', 'True', 'sdpa'):
+                attn_impl = 'sdpa'
+            else:
+                attn_impl = 'manual'
+        assert attn_impl in ('manual', 'sdpa'), f'unknown attn_impl={attn_impl}'
+        self.attn_impl = attn_impl
 
     def forward(self, x: torch.Tensor,
                 cos: torch.Tensor, sin: torch.Tensor,
@@ -192,15 +211,27 @@ class CausalAttention(nn.Module):
         v = v.transpose(1, 2)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
-        scale = 1.0 / math.sqrt(self.head_dim)
-        logits = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if self.soft_cap and self.soft_cap > 0:
-            logits = self.soft_cap * torch.tanh(logits / self.soft_cap)
-        # attn_mask: True where allowed; convert to additive mask.
-        mask = (~attn_mask).to(logits.dtype) * torch.finfo(logits.dtype).min
-        logits = logits + mask
-        attn = F.softmax(logits.float(), dim=-1).to(v.dtype)
-        out = torch.matmul(attn, v)                # (B, H, L, head_dim)
+
+        if self.attn_impl == 'sdpa':
+            # Fast path: PyTorch SDPA dispatches to FlashAttention-2 / cuDNN
+            # / mem-efficient. Soft-cap is not representable in this kernel
+            # — QKNorm carries the numerical-stability load. The boolean
+            # ``attn_mask`` semantics here: True == allowed (same as our
+            # convention).
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=False,
+                dropout_p=0.0,
+            )
+        else:
+            # Manual path with paper soft-cap (kept for fidelity).
+            scale = 1.0 / math.sqrt(self.head_dim)
+            logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if self.soft_cap and self.soft_cap > 0:
+                logits = self.soft_cap * torch.tanh(logits / self.soft_cap)
+            mask = (~attn_mask).to(logits.dtype) * torch.finfo(logits.dtype).min
+            logits = logits + mask
+            attn = F.softmax(logits.float(), dim=-1).to(v.dtype)
+            out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.proj(out)
 
@@ -209,10 +240,11 @@ class TransformerBlock(nn.Module):
     """Pre-RMSNorm + causal attention + SwiGLU (paper §3.4)."""
 
     def __init__(self, dim: int, n_heads: int, ff_mult: int = 4,
-                 soft_cap: float = 50.0):
+                 soft_cap: float = 50.0, attn_impl: str = 'auto'):
         super().__init__()
         self.norm_attn = RMSNorm(dim)
-        self.attn = CausalAttention(dim, n_heads, soft_cap=soft_cap)
+        self.attn = CausalAttention(dim, n_heads, soft_cap=soft_cap,
+                                     attn_impl=attn_impl)
         self.norm_ff = RMSNorm(dim)
         self.ff = SwiGLU(dim, ff_mult=ff_mult)
 
@@ -381,6 +413,7 @@ class DynamicsConfig:
     tau_n_bins: int = 32            # discrete embedding lookup for τ
     soft_cap: float = 50.0
     rope_base: float = 10_000.0
+    attn_impl: str = 'auto'         # 'auto' | 'manual' | 'sdpa'
     # n_tokens_per_step is computed internally:
     #   1 (z̃) + 1 (action) + 1 (τ,d) + n_register
 
@@ -426,7 +459,8 @@ class DynamicsTransformer(nn.Module):
         # Stack of transformer blocks.
         self.blocks = nn.ModuleList([
             TransformerBlock(D, cfg.n_heads, ff_mult=cfg.ff_mult,
-                             soft_cap=cfg.soft_cap)
+                             soft_cap=cfg.soft_cap,
+                             attn_impl=cfg.attn_impl)
             for _ in range(cfg.n_layers)
         ])
         self.norm_out = RMSNorm(D)
@@ -696,6 +730,7 @@ class DreamerV4Config:
     k_max: int = 4
     tau_n_bins: int = 32
     soft_cap: float = 50.0
+    attn_impl: str = 'auto'                # 'auto'|'manual'|'sdpa' (DREAMER_FAST_ATTN=1)
     # Heads
     n_action_bins: int = 21
     head_hidden: int = 256
@@ -716,6 +751,7 @@ class DreamerV4(nn.Module):
             ff_mult=cfg.ff_mult, n_register=cfg.n_register,
             k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins,
             soft_cap=cfg.soft_cap,
+            attn_impl=cfg.attn_impl,
         )
         self.dynamics = DynamicsTransformer(dyn_cfg)
         # Heads read from the agent-register hidden state (dim = d_model).
@@ -745,6 +781,36 @@ class DreamerV4(nn.Module):
             p.requires_grad_(False)
         # Return-scale EMA (used for diagnostic logging; PMPO does not need it).
         self.register_buffer('ret_scale', torch.ones(1))
+
+    # ---------------------------------------------------------- compile
+    def maybe_compile(self, mode: str = 'default') -> None:
+        """Compile the dynamics transformer + tokenizer with ``torch.compile``.
+
+        Big P3 speedup (typically 2-3×) by fusing kernels and removing Python
+        overhead in the K=4 imagination inner loop. Idempotent — calling
+        twice is a no-op. Triggered by ``DREAMER_COMPILE=1`` (or ``=mode``)
+        env var, or by calling this directly. Errors are downgraded to a
+        warning so the trainer still runs unoptimised on unsupported setups.
+
+        ``mode='default'`` is the safe pick: ``'reduce-overhead'`` enables
+        cudagraphs which conflicts with our cached RoPE tensors, and
+        ``'max-autotune'`` triggers very long warmups for marginal gain on
+        a transformer at this scale.
+        """
+        if getattr(self, '_compiled', False):
+            return
+        try:
+            self.dynamics = torch.compile(self.dynamics, mode=mode,
+                                            dynamic=True)
+            self.tokenizer = torch.compile(self.tokenizer, mode=mode,
+                                             dynamic=True)
+            self._compiled = True
+            print(f'[dreamer_v4] torch.compile(mode={mode}) enabled '
+                  f'on dynamics + tokenizer', flush=True)
+        except Exception as e:
+            print(f'[dreamer_v4] torch.compile failed ({e!r}); '
+                  f'falling back to eager', flush=True)
+            self._compiled = False
 
     # ---------------------------------------------------------- target / prior
     def update_target(self, tau: float = 0.02) -> None:

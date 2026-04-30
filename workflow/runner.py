@@ -329,6 +329,7 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         head_hidden=cfg_loaded.head_hidden,
         head_n_layers=cfg_loaded.head_n_layers,
         mtp_length=max(1, int(getattr(cfg_loaded, 'mtp_length', 1))),
+        attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)
     model.load_state_dict(ckpt['model'])
