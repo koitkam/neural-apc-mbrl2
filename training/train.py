@@ -35,7 +35,10 @@ from models.dreamer_v4 import (
 from utils.sim_factory import create_sim, resolve_sim_metadata
 from utils.objective_runtime import compute_objective_components
 from utils.runtime_setpoints import RuntimeSetpointManager, RuntimeSetpointConfig
-from utils.training_disturbance import build_training_disturbance_schedule
+from utils.training_disturbance import (
+    build_training_disturbance_schedule,
+    apply_disturbance_schedule,
+)
 from utils.agent_utils import (
     load_objective_weights, load_objective_bounds, load_full_objective_spec,
     action_to_control,
@@ -236,34 +239,35 @@ class APCEnv:
         return self._window.copy()
 
     def _apply_disturbance(self) -> None:
-        """Apply scheduled disturbance events at current step.
+        """Deprecated shim: kept for backwards compatibility.
 
-        Many simulators expose ``set_disturbance(channel, value)`` or accept
-        DV via reset; here we keep the trainer simulator-agnostic by calling
-        ``sim.apply_disturbance(t, schedule)`` if available.  Otherwise the
-        schedule is informational only (the SimNoiseWrapper handles
-        measurement / actuator noise).
+        Disturbance application now happens in ``step()`` via
+        ``apply_disturbance_schedule(next_state, self.sim, self._schedule)``
+        which uses the simulator's ``set_disturbance_offset`` interface.
         """
-        fn = getattr(self.sim, 'apply_disturbance', None)
-        if callable(fn):
-            try:
-                fn(self._t, self._schedule)
-            except Exception:
-                pass
+        return
 
     def step(self, action_norm: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         action_norm = np.asarray(action_norm, dtype='float32').reshape(self.action_dim)
         # V4 actor emits actions in [-1, 1]; action_to_control expects [0, 1].
         action_01 = 0.5 * (np.clip(action_norm, -1.0, 1.0) + 1.0)
         control = action_to_control(action_01, self.bounds, self.setpoint_mgr)
-        self._apply_disturbance()
-        # Also update setpoint manager schedule (limit/target changes).
+        # Update setpoint manager schedule (limit/target changes).
         self.setpoint_mgr.step(self._t)
         next_state = self.sim.step(control)
         if isinstance(next_state, tuple):
             # Some sims return (state, reward, done, info) — discard sim's reward.
             next_state = next_state[0]
         next_state = np.asarray(next_state, dtype='float32').reshape(-1)
+        # Apply pending disturbance schedule events at their trigger time.
+        # Mutates ``next_state`` in place via ``sim.set_disturbance_offset``
+        # so DV/CV step changes actually affect downstream dynamics.  Without
+        # this call, the schedule is informational only and the agent never
+        # sees the disturbances it is supposed to learn to reject.
+        try:
+            apply_disturbance_schedule(next_state, self.sim, self._schedule)
+        except Exception:
+            pass
         comps = compute_objective_components(
             state=next_state, sim=self.sim,
             control=control, prev_control=self._prev_control,
