@@ -23,11 +23,14 @@ After the study, we re-train the best config for the full
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
 import shutil
+import subprocess
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -180,6 +183,122 @@ def lookback_grid(plant_lookback: int) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Async per-trial validation
+# ---------------------------------------------------------------------------
+#
+# After each BO trial finishes training we kick off ``evaluation.validate``
+# in a *CPU-only* background subprocess.  This lets the next trial start
+# training on the GPU immediately while validation data (plots, summary
+# json, scripted-disturbance episode) is generated and written into the
+# trial folder in parallel.
+#
+# Knobs (env vars):
+#   BO_TRIAL_VALIDATION          : '0' to disable.       Default: enabled.
+#   BO_TRIAL_VALIDATION_SEEDS    : seeds per trial.       Default: 2.
+#   BO_TRIAL_VALIDATION_EPISODES : episodes per seed.     Default: 2.
+#   BO_TRIAL_VALIDATION_MAXJOBS  : max in-flight jobs.    Default: 2.
+#
+# CPU-only is enforced by clearing CUDA_VISIBLE_DEVICES in the child env;
+# this is critical because the next trial is GPU-bound and we don't want
+# validation contending for VRAM.
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_pending_validations: List[Tuple[subprocess.Popen, Path]] = []
+
+
+def _validation_enabled() -> bool:
+    return os.environ.get('BO_TRIAL_VALIDATION', '1').strip().lower() not in (
+        '0', 'false', 'no', '')
+
+
+def _drain_validations(timeout: float | None = None,
+                        max_in_flight: int = 0) -> None:
+    """Reap finished validation subprocesses.
+
+    ``max_in_flight``: if > 0, block until at most this many remain
+    running.  ``timeout``: hard deadline in seconds (None = no deadline).
+    """
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
+    while _pending_validations:
+        # Reap any that have finished.
+        for i in range(len(_pending_validations) - 1, -1, -1):
+            proc, tdir = _pending_validations[i]
+            rc = proc.poll()
+            if rc is not None:
+                if rc == 0:
+                    print(f'[trial-val] {tdir.name}: ok', flush=True)
+                else:
+                    print(f'[trial-val] {tdir.name}: failed rc={rc} '
+                          f'(see {tdir}/validation.log)', flush=True)
+                _pending_validations.pop(i)
+        if len(_pending_validations) <= max_in_flight:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f'[trial-val] drain timeout: '
+                  f'{len(_pending_validations)} still running', flush=True)
+            return
+        time.sleep(1.0)
+
+
+def _launch_trial_validation(trial_dir: Path) -> None:
+    """Spawn a CPU-only ``evaluation.validate`` subprocess for ``trial_dir``."""
+    if not _validation_enabled():
+        return
+    final_pt = trial_dir / 'final.pt'
+    if not final_pt.exists():
+        print(f'[trial-val] skip {trial_dir.name}: no final.pt', flush=True)
+        return
+
+    seeds = int(os.environ.get('BO_TRIAL_VALIDATION_SEEDS', '2') or 2)
+    episodes = int(os.environ.get('BO_TRIAL_VALIDATION_EPISODES', '2') or 2)
+    max_jobs = max(1, int(os.environ.get('BO_TRIAL_VALIDATION_MAXJOBS', '2') or 2))
+
+    # Throttle: keep at most ``max_jobs - 1`` in flight before launching one
+    # more, so the queue cannot grow unbounded if validation is slower than
+    # training (shouldn't happen, but be defensive).
+    _drain_validations(max_in_flight=max_jobs - 1)
+
+    env = os.environ.copy()
+    # Force CPU: validation must NOT compete with the next trial for VRAM.
+    env['CUDA_VISIBLE_DEVICES'] = ''
+    # Validation doesn't need compile / SDPA tweaks.
+    env.pop('DREAMER_COMPILE', None)
+    env.pop('DREAMER_FAST_ATTN', None)
+
+    log_path = trial_dir / 'validation.log'
+    log_f = open(log_path, 'w', buffering=1)
+    cmd = [sys.executable, '-m', 'evaluation.validate',
+           '--controller-dir', str(trial_dir),
+           '--episodes', str(episodes),
+           '--seeds', str(seeds)]
+    try:
+        proc = subprocess.Popen(cmd, env=env, cwd=str(_REPO_ROOT),
+                                 stdout=log_f, stderr=subprocess.STDOUT)
+    except Exception as e:
+        print(f'[trial-val] spawn failed for {trial_dir.name}: {e!r}',
+              flush=True)
+        log_f.close()
+        return
+    _pending_validations.append((proc, trial_dir))
+    print(f'[trial-val] launched (cpu) for {trial_dir.name} '
+          f'pid={proc.pid} seeds={seeds} episodes={episodes} '
+          f'-> {log_path.name}', flush=True)
+
+
+def _atexit_cleanup() -> None:
+    for proc, tdir in list(_pending_validations):
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+atexit.register(_atexit_cleanup)
+
+
+# ---------------------------------------------------------------------------
 # Trial runner
 # ---------------------------------------------------------------------------
 
@@ -273,6 +392,9 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
                    'H_init': H_init, 'summary': summary,
                    'score': float(score),
                    'score_metric': 'final_return_window_mean'}, f, indent=2)
+    # Spawn CPU-only validation for this trial; it runs in parallel with the
+    # next trial's GPU training.  Drained before final retrain.
+    _launch_trial_validation(trial_dir)
     return float(score)
 
 
@@ -517,6 +639,12 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
                                   for t in study.trials]}, f, indent=2)
 
     print('[BO] Phase 3: retrain best config and export ONNX', flush=True)
+    # Make sure all per-trial validations have completed before we hand
+    # the GPU back to the final retrain.  CPU-only, so this should be a
+    # no-op in steady state, but a safety net is cheap.
+    print(f'[BO] draining {len(_pending_validations)} async trial '
+          f'validations…', flush=True)
+    _drain_validations(max_in_flight=0)
     final = train_final_and_export(base, plant, best.params, out_dir, final_steps)
     with open(out_dir / 'workflow_summary.json', 'w') as f:
         json.dump({'plant': plant, 'study_best': best.params,
