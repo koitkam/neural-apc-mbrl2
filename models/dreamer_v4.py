@@ -800,6 +800,21 @@ class DreamerV4(nn.Module):
         if getattr(self, '_compiled', False):
             return
         try:
+            # P3 imagination calls dynamics with context lengths T=seq_len..
+            # seq_len+H (≈43 distinct shapes). The default recompile_limit=8
+            # would bail to eager after 8 shapes despite dynamic=True. Bump
+            # to a comfortable margin so every shape stays compiled.
+            import torch._dynamo as _dynamo
+            try:
+                _dynamo.config.recompile_limit = max(
+                    int(getattr(_dynamo.config, 'recompile_limit', 8)), 128)
+            except Exception:
+                pass
+            try:
+                _dynamo.config.cache_size_limit = max(
+                    int(getattr(_dynamo.config, 'cache_size_limit', 8)), 128)
+            except Exception:
+                pass
             self.dynamics = torch.compile(self.dynamics, mode=mode,
                                             dynamic=True)
             self.tokenizer = torch.compile(self.tokenizer, mode=mode,
