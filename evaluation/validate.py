@@ -286,8 +286,17 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         'episode_length': int(t + 1),
         'sample_rate': int(env.cfg.sample_rate),
         'cv_indices': list(env.cv_indices),
+        'mv_indices': [int(x) for x in (env.meta.get('mv_indices') or [])],
+        'dv_indices': [int(x) for x in (env.meta.get('dv_indices') or [])],
+        'state_variables': list(env.meta.get('state_variables') or []),
         'mv_norm_ranges': [list(b) for b in env.mv_norm_ranges],
         'cv_norm_ranges': [list(b) for b in env.cv_norm_ranges],
+        'mv_bounds': [list(b) for b in
+                       getattr(env.setpoint_mgr, 'base_mv_bounds', np.zeros((0, 2)))],
+        'cv_bounds': [list(b) for b in
+                       getattr(env.setpoint_mgr, 'base_cv_bounds', np.zeros((0, 2)))],
+        'cv_targets': [float(x) for x in
+                        getattr(env.setpoint_mgr, 'base_cv_targets', [])],
         'reward_scale': float(env.reward_scale),
     }
 
@@ -383,32 +392,69 @@ def plot_episode(ep: Dict, out_path: Path, title: str = '') -> None:
 
 
 def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> None:
-    """Disturbance-rejection plot: scripted DV/CV step events with
-    response settling time + overshoot annotated per CV/MV.
+    """Plant-style disturbance-rejection plot.
 
-    Mirrors the ``disturbance_reaction_plot.png`` produced by the
-    ``neural-apc-pytorch`` validator: the operator-perspective view of
-    how the controller absorbs known step changes.
+    Mirrors ``plot_channels`` from ``neural-apc-pytorch/evaluation/
+    validate_latent.py`` so the operator sees a real plant view:
+      - one row per channel (MV, DV, CV) with semantic state names,
+      - CV bound band shaded orange + red dashed low/high lines,
+      - MV red dashed low/high lines + gray dotted normalization range,
+      - dark-green dash-dot CV target setpoint,
+      - vertical disturbance markers with ▲/▼ direction arrow at top,
+      - cum-reward subplot at the bottom.
     """
     states = ep['states']
     controls = ep['controls']
     cv_idx = ep['cv_indices']
+    mv_idx = ep.get('mv_indices') or []
+    dv_idx = ep.get('dv_indices') or []
+    state_names = ep.get('state_variables') or []
     cv_norm = ep['cv_norm_ranges']
     mv_norm = ep['mv_norm_ranges']
+    cv_bounds = ep.get('cv_bounds') or []
+    mv_bounds = ep.get('mv_bounds') or []
+    cv_targets = ep.get('cv_targets') or []
     schedule = ep['schedule']
     T = ep['episode_length']
     t_arr = np.arange(T)
 
-    n_cv = max(1, len(cv_idx))
-    n_mv = controls.shape[1]
-    n_rows = n_cv + n_mv + 1  # +reward
-    fig, axes = plt.subplots(n_rows, 1, figsize=(13, 2.0 * n_rows), sharex=True)
+    def _name(i: int, default: str) -> str:
+        return state_names[i] if 0 <= i < len(state_names) and state_names[i] else default
+
+    # Build channel rows: MVs first (operator manipulated), then DVs
+    # (uncontrolled drivers — what the disturbance actually injects), then
+    # CVs (controlled outputs).  Same order/grouping as the legacy plot.
+    channels: List[Dict] = []
+    for k, i in enumerate(mv_idx):
+        bounds = mv_bounds[k] if k < len(mv_bounds) else None
+        norm = mv_norm[k] if k < len(mv_norm) else None
+        channels.append({'group': 'mv', 'series': controls[:, k] if k < controls.shape[1] else None,
+                         'label': _name(i, f'MV[{i}]'), 'bounds': bounds,
+                         'norm': norm, 'target': None, 'color': '#1f77b4'})
+    for i in dv_idx:
+        if i >= states.shape[1]:
+            continue
+        channels.append({'group': 'dv', 'series': states[:, i],
+                         'label': _name(i, f'DV[{i}]'), 'bounds': None,
+                         'norm': None, 'target': None, 'color': '#9467bd'})
+    for k, i in enumerate(cv_idx):
+        if i >= states.shape[1]:
+            continue
+        bounds = cv_bounds[k] if k < len(cv_bounds) else None
+        norm = cv_norm[k] if k < len(cv_norm) else None
+        target = cv_targets[k] if k < len(cv_targets) else None
+        channels.append({'group': 'cv', 'series': states[:, i],
+                         'label': _name(i, f'CV[{i}]'), 'bounds': bounds,
+                         'norm': norm, 'target': target, 'color': '#2ca02c'})
+
+    n_rows = max(1, len(channels)) + 1  # +reward
+    fig, axes = plt.subplots(n_rows, 1,
+                              figsize=(13, max(4.0, 2.0 * n_rows)),
+                              sharex=True)
     if n_rows == 1:
         axes = [axes]
 
-    # Pre-compute per-event annotations: for each scheduled step on a CV,
-    # find the post-step max-deviation and the time to return to within
-    # 5% of the pre-event mean ("settle time").
+    # Per-event annotations (CV settle/overshoot) for the summary record.
     annotations: List[Dict] = []
     for ev in schedule:
         st = int(ev.get('start', 0))
@@ -423,76 +469,100 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
                 continue
             base = float(np.mean(pre))
             dev = post - base
-            if dev.size == 0:
-                continue
-            ovr = float(dev[np.argmax(np.abs(dev))])
+            ovr = float(dev[np.argmax(np.abs(dev))]) if dev.size else 0.0
             band = max(1e-6, 0.05 * (np.max(np.abs(pre)) if pre.size else 1.0))
             settled = np.where(np.abs(dev) <= band)[0]
             settle_t = int(settled[0]) if settled.size else int(post.size)
-            annotations.append({
-                'cv_row': j, 'start': st,
-                'overshoot': ovr, 'settle_steps': settle_t,
-                'name': ev.get('name', 'step'),
-            })
+            annotations.append({'cv_row': j, 'start': st,
+                                 'overshoot': ovr, 'settle_steps': settle_t,
+                                 'name': ev.get('name', 'step')})
 
-    row = 0
-    for j, cidx in enumerate(cv_idx):
-        ax = axes[row]; row += 1
-        if cidx < states.shape[1]:
-            ax.plot(t_arr, states[:, cidx], color='C0', lw=1.1,
-                    label=f'CV[{cidx}]')
-        if j < len(cv_norm):
-            lo, hi = cv_norm[j]
-            ax.axhline(lo, color='gray', lw=0.6, ls=':')
-            ax.axhline(hi, color='gray', lw=0.6, ls=':')
-            ax.fill_between(t_arr, lo, hi, color='gray', alpha=0.05)
+    def _draw_disturbance_markers(ax) -> None:
+        ylo, yhi = ax.get_ylim()
+        y_top = yhi - 0.04 * (yhi - ylo)
         for ev in schedule:
             st = int(ev.get('start', 0))
-            ax.axvline(st, color='red', linestyle='--', lw=1.0, alpha=0.6)
-            ax.text(st, ax.get_ylim()[1], f" Δ={ev.get('delta', 0):+.2f}",
-                    color='red', fontsize=7, va='top')
-        # Annotate this CV's settle/overshoot.
-        for a in [a for a in annotations if a['cv_row'] == j]:
-            ax.annotate(
-                f"ovr={a['overshoot']:+.2f}\nsettle={a['settle_steps']}",
-                xy=(a['start'], states[a['start'], cidx] if cidx < states.shape[1] else 0),
-                xytext=(a['start'] + 5, ax.get_ylim()[0]),
-                fontsize=7, color='darkred',
-                arrowprops={'arrowstyle': '->', 'color': 'darkred', 'lw': 0.6},
-            )
-        ax.set_ylabel(f'CV[{cidx}]')
-        ax.legend(loc='upper right', fontsize=8)
+            color = ev.get('color') or (
+                '#ff7f0e' if 'violation' in str(ev.get('intent', '')).lower()
+                else '#17a2b8')
+            ax.axvline(st, color=color, alpha=0.50, linewidth=1.2,
+                        linestyle='--')
+            delta = float(ev.get('delta', 0.0))
+            label = '\u25B2' if delta > 0 else '\u25BC'
+            ax.text(st, y_top, label, color=color, fontsize=8, ha='center',
+                     va='top', fontweight='bold', clip_on=True)
+
+    for r, ch in enumerate(channels):
+        ax = axes[r]
+        series = ch['series']
+        if series is None or len(series) == 0:
+            ax.set_ylabel(ch['label'])
+            continue
+        ax.plot(t_arr[:len(series)], series, color=ch['color'], lw=1.2,
+                label=ch['label'])
+
+        bounds = ch.get('bounds')
+        if bounds is not None and len(bounds) >= 2 and \
+           np.isfinite(bounds[0]) and np.isfinite(bounds[1]) and \
+           bounds[1] > bounds[0] and abs(bounds[0]) < 1e9 and abs(bounds[1]) < 1e9:
+            lo_b, hi_b = float(bounds[0]), float(bounds[1])
+            if ch['group'] == 'cv':
+                ax.axhspan(lo_b, hi_b, color='#ffcc80', alpha=0.18,
+                            label='CV bound band')
+                ax.axhline(lo_b, color='#d32f2f', linestyle='--', linewidth=1.4,
+                            label='CV low bound')
+                ax.axhline(hi_b, color='#d32f2f', linestyle='--', linewidth=1.4,
+                            label='CV high bound')
+            else:
+                ax.axhline(lo_b, color='r', linestyle='--', linewidth=1.0,
+                            label='Low bound')
+                ax.axhline(hi_b, color='r', linestyle='--', linewidth=1.0,
+                            label='High bound')
+
+        norm = ch.get('norm')
+        if norm is not None and len(norm) >= 2 and \
+           np.isfinite(norm[0]) and np.isfinite(norm[1]):
+            ax.axhline(float(norm[0]), color='#6c757d', linestyle=':',
+                        linewidth=1.0, label='Norm low')
+            ax.axhline(float(norm[1]), color='#6c757d', linestyle=':',
+                        linewidth=1.0, label='Norm high')
+
+        target = ch.get('target')
+        if target is not None and np.isfinite(target):
+            ax.axhline(float(target), color='#1b5e20', linestyle='-.',
+                        linewidth=1.4, label=f'Target ({float(target):g})')
+
+        # Pad y-limits to include bounds + norm so steps stay visible.
+        finite = series[np.isfinite(series)] if isinstance(series, np.ndarray) else None
+        lo = float(np.min(finite)) if finite is not None and finite.size else None
+        hi = float(np.max(finite)) if finite is not None and finite.size else None
+        for ref in (bounds, norm):
+            if ref is not None and len(ref) >= 2 and np.isfinite(ref[0]) and np.isfinite(ref[1]):
+                rlo, rhi = float(ref[0]), float(ref[1])
+                if abs(rlo) < 1e9 and abs(rhi) < 1e9:
+                    lo = rlo if lo is None else min(lo, rlo)
+                    hi = rhi if hi is None else max(hi, rhi)
+        if lo is not None and hi is not None and hi > lo:
+            pad = 0.06 * (hi - lo)
+            ax.set_ylim(lo - pad, hi + pad)
+
+        _draw_disturbance_markers(ax)
+        ax.set_ylabel(ch['label'])
+        ax.legend(loc='best', fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    for j in range(n_mv):
-        ax = axes[row]; row += 1
-        ax.plot(t_arr, controls[:, j], color='C1', lw=1.0, label=f'MV[{j}]')
-        if j < len(mv_norm):
-            lo, hi = mv_norm[j]
-            ax.axhline(lo, color='gray', lw=0.6, ls=':')
-            ax.axhline(hi, color='gray', lw=0.6, ls=':')
-            ax.fill_between(t_arr, lo, hi, color='gray', alpha=0.05)
-        for ev in schedule:
-            ax.axvline(int(ev.get('start', 0)), color='red',
-                        linestyle='--', lw=1.0, alpha=0.6)
-        ax.set_ylabel(f'MV[{j}]')
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    ax = axes[row]; row += 1
+    ax = axes[-1]
     ax.plot(t_arr, np.cumsum(ep['raw_rewards']), color='C2', lw=1.0,
             label=f"raw cum (final={ep['cum_raw_reward']:+.1f})")
-    for ev in schedule:
-        ax.axvline(int(ev.get('start', 0)), color='red',
-                    linestyle='--', lw=1.0, alpha=0.4)
+    _draw_disturbance_markers(ax)
     ax.set_ylabel('cum reward')
-    ax.set_xlabel('step')
+    ax.set_xlabel('time step')
     ax.legend(loc='upper left', fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    fig.suptitle(title, fontsize=11)
+    fig.suptitle(title, fontsize=11, y=0.995)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
-    fig.savefig(out_path, dpi=110)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
 
     return annotations  # caller stashes into summary metrics
