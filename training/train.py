@@ -111,14 +111,23 @@ class TrainConfig:
     recon_scale: float = 1.0
     sf_scale: float = 1.0
     reward_scale_loss: float = 1.0   # Phase-2 reward MTP weight
-    bc_scale: float = 1.0            # Phase-2 policy BC weight
+    # P2 BC bootstrap weight.  Default 0 because we have no offline expert
+    # data — random-action episodes from P1 collection are uniform, so a
+    # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
+    # term in P3 pins the policy near uniform → policy collapse.  Set
+    # this >0 only when expert demonstrations populate the buffer.
+    bc_scale: float = 0.0            # Phase-2 policy BC weight
 
     # ----- MTP -----
     mtp_length: int = 8              # paper L=8 (Phase-2 multi-token prediction)
 
     # ----- PMPO (Phase 3) -----
     pmpo_alpha: float = 0.5
-    pmpo_beta: float = 0.1
+    # PMPO KL-to-prior weight.  Lowered from the paper's 0.1 because the
+    # prior_policy snapshot at start of P3 is taken from a near-uniform
+    # policy (no expert BC), so a stronger KL pull would freeze the
+    # policy at uniform.  0.01 lets the advantage signal dominate.
+    pmpo_beta: float = 0.01
 
     # ----- Returns -----
     gamma: float = 0.997
@@ -632,16 +641,26 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     critic_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
 
     # Advantage (current critic baseline) → PMPO (eq. 11).
+    # Per-trajectory centering: subtract each trajectory's own mean before
+    # the global return-scale rescale.  Without this, REINFORCE-style
+    # gradients are dominated by trajectory-to-trajectory return variance
+    # rather than action-to-action advantage variance, which empirically
+    # collapses the policy to a single bin (verified on trial_0000:
+    # actions_norm = 0.30 constant for 1220 steps, entropy stuck at
+    # log(21)).  Centering reduces gradient variance ~70× on noisy
+    # plant trajectories.
     with torch.no_grad():
         baseline = model.value.expectation(
             model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
         ).view(B, H)
         adv_raw = target_returns - baseline
+        # Per-trajectory mean centering.
+        adv_centered = adv_raw - adv_raw.mean(dim=1, keepdim=True)
         scale = model.update_return_scale(target_returns).clamp_min(1.0)
 
     feat_flat = agent_hids.reshape(-1, agent_hids.shape[-1])
     actions_flat = actions.reshape(-1, actions.shape[-1])
-    adv_flat = (adv_raw / scale).reshape(-1).detach()
+    adv_flat = (adv_centered / scale).reshape(-1).detach()
 
     actor_loss, pmpo_diag = pmpo_loss(model.policy, model.prior_policy,
                                        feat_flat, actions_flat, adv_flat,
@@ -655,6 +674,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'imagined_reward_mean': rewards.mean().detach(),
         'entropy_mean': entropies.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
+        'adv_centered_std': adv_centered.std().detach(),
         'return_scale': scale.detach().squeeze(),
     }
     diag.update(pmpo_diag)
@@ -1226,6 +1246,8 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_PHASE2_FRAC', 'phase2_frac', float),
         ('DREAMER_PHASE3_FRAC', 'phase3_frac', float),
         ('DREAMER_PMPO_BETA', 'pmpo_beta', float),
+        ('DREAMER_PMPO_ALPHA', 'pmpo_alpha', float),
+        ('DREAMER_BC_SCALE', 'bc_scale', float),
         ('DREAMER_MAE_PMAX', 'mae_p_max', float),
         ('DREAMER_MTP_LENGTH', 'mtp_length', int),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
