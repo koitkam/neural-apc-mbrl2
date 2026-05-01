@@ -113,73 +113,188 @@ def _bin_index_from_action(action_t: torch.Tensor, n_action_bins: int) -> int:
 # Scripted disturbance schedule (deterministic, for rejection plots)
 # ---------------------------------------------------------------------------
 
-def build_scripted_disturbance_schedule(env, *, n_events: int = 3,
-                                         magnitude_frac: float = 0.10
+def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
+                                         magnitude_frac: float = 0.0,
+                                         profile: str = 'holdout_a',
+                                         seed: int = 2026,
                                          ) -> List[Dict]:
-    """Build a small, deterministic step-disturbance schedule.
+    """Build a plant-aware validation disturbance schedule.
 
-    Mirrors the ``neural-apc-pytorch`` validator's disturbance-rejection
-    test: a handful of equally-spaced step changes on the first available
-    DV (or the first CV when no DV exists).  Each step is held for the
-    rest of the episode (``shape='step'``) so the controller's settling
-    behaviour is visible.  Magnitudes are a fraction of channel span
-    with alternating sign to exercise both directions.
+    Mirrors ``neural-apc-pytorch``'s ``build_output_disturbance_schedule``
+    (single ``holdout_a`` profile) but simplified for V4: no profile
+    branching, no extra knobs.  The schedule is realistic — magnitudes
+    auto-adapt to channel spans, identified plant dynamics (τ, dead-time,
+    DV→CV gains) and the MV→CV authority budget — so the controller is
+    asked to reject only physically-rejectable disturbances.
 
-    The returned list slots directly into ``env._schedule`` (overwrite
-    after ``env.reset()`` and the env's ``_apply_disturbance`` will pick
-    them up).
+    Mix of event types:
+      * **measured DV**  — first event guaranteed; sized to deliver a
+        target CV impact via the identified DV→CV gain.
+      * **unmeasured CV** — second event guaranteed; pushes a CV directly,
+        with violation events allowed outside the bound band so the
+        controller must drive recovery.
+
+    Each event is a one-shot step held for the rest of the episode.
+    Output is a list of dicts compatible with ``env._schedule`` and
+    ``utils.training_disturbance.apply_disturbance_schedule``.
+
+    The ``n_events``/``magnitude_frac`` arguments are accepted for
+    backward compatibility only — they are ignored in favour of the
+    plant-aware draw.
     """
-    T = int(env.cfg.episode_length)
-    # Reserve a settle window equal to ~one tau before the first step and
-    # at the end so the response is fully visible.
-    first = max(int(0.20 * T), 1)
-    last = max(first + 1, int(0.85 * T))
-    starts = np.linspace(first, last, n_events).round().astype(int).tolist()
+    from utils.training_disturbance import (
+        _channel_catalog, _load_identifier_context,
+        compute_mv_authority_to_cv, get_authority_target_frac,
+        clamp_event_to_authority_budget,
+    )
+    rng = np.random.default_rng(int(seed))
 
-    # Pick a target channel: prefer DV-classified state index (states
-    # outside cv_indices), fall back to the first CV.
-    sim = env.sim
-    meta = env.meta
-    state_dim = int(meta.get('state_dim', env.state_dim))
-    cv_idx = set(env.cv_indices)
-    # Heuristic: any state index not a CV is treated as DV-like.
-    dv_candidates = [i for i in range(state_dim) if i not in cv_idx]
-    if dv_candidates:
-        target_pos = int(dv_candidates[0])
-        target_group = 'dv'
-    else:
-        target_pos = int(env.cv_indices[0]) if env.cv_indices else 0
-        target_group = 'cv'
+    catalog = _channel_catalog(env.sim)
+    dv_targets = list(catalog.get('dv', []))
+    cv_targets = list(catalog.get('cv', []))
+    if not dv_targets and not cv_targets:
+        return []
 
-    # Magnitude: fraction of normalisation span (or fall back to 1.0).
-    norm_ranges = (env.mv_norm_ranges if target_group == 'mv'
-                    else env.cv_norm_ranges)
-    span = 1.0
-    if target_group == 'cv' and env.cv_norm_ranges:
-        lo, hi = env.cv_norm_ranges[0]
-        span = max(1e-6, float(hi - lo))
-    elif target_group == 'dv' and env.cv_norm_ranges:
-        # No DV norm ranges in metadata; use CV span as a proxy.
-        lo, hi = env.cv_norm_ranges[0]
-        span = max(1e-6, float(hi - lo))
+    id_ctx = _load_identifier_context()
+    lookback = int((id_ctx.get('lookback', {}) or {}).get('identified_lookback', 0) or 0)
+    tau_dom = float((id_ctx.get('dynamics', {}) or {}).get('tau_dominant_identified', 0.0) or 0.0)
+    dead_time = float((id_ctx.get('dynamics', {}) or {}).get('dead_time_identified', 0.0) or 0.0)
+    dv_gain = id_ctx.get('dv_gain_to_cv', {}) if isinstance(id_ctx, dict) else {}
+
+    ep_len = int(env.cfg.episode_length)
+    dyn_horizon = max(1.0, dead_time + tau_dom)
+    settle = int(max(40.0, round(max(0.6 * float(lookback), 1.25 * dyn_horizon))))
+    min_gap = max(14, int(0.95 * settle))
+
+    # holdout_a profile (validation default).  Single profile — keep it
+    # simple: number of events scales with episode length, half violation,
+    # 40% of CV-class events go to unmeasured-CV.
+    n_total = int(max(3, min(14, ep_len // max(36, settle))))
+    p_violation = 0.45
+    p_cv_unmeasured = 0.40
+
+    earliest = max(8, int(0.06 * ep_len))
+    latest = max(earliest + 1, int(0.92 * ep_len))
+    starts: List[int] = []
+    for _ in range(max(50, 15 * n_total)):
+        if len(starts) >= n_total:
+            break
+        s = int(rng.integers(earliest, latest + 1))
+        if all(abs(s - s0) >= min_gap for s0 in starts):
+            starts.append(s)
+    starts.sort()
+    if not starts:
+        starts = [earliest]
+
+    cv_widths = []
+    for ch in cv_targets:
+        b = ch.get('bounds')
+        if isinstance(b, list) and len(b) >= 2:
+            cv_widths.append(max(1e-6, float(b[1]) - float(b[0])))
+    cv_span_ref = (float(np.median(np.asarray(cv_widths, dtype='float64')))
+                    if cv_widths else 10.0)
+
+    mv_authority_cv = compute_mv_authority_to_cv(env.sim, id_ctx)
+    authority_frac = get_authority_target_frac()
+    cumulative_offset: Dict[str, float] = {}
+    cumulative_cv_impact = 0.0
 
     schedule: List[Dict] = []
-    for i, s in enumerate(starts):
-        sign = 1.0 if (i % 2 == 0) else -1.0
-        delta = float(sign * magnitude_frac * span)
+    for i, start in enumerate(starts):
+        # Force a useful diagnostic mix on the first two events:
+        # i=0 → measured DV, i=1 → unmeasured CV.
+        if dv_targets and cv_targets and i == 0:
+            target = dv_targets[int(rng.integers(0, len(dv_targets)))]
+            source, target_group = 'measured_dv', 'dv'
+        elif dv_targets and cv_targets and i == 1:
+            target = cv_targets[int(rng.integers(0, len(cv_targets)))]
+            source, target_group = 'unmeasured_cv', 'cv'
+        else:
+            use_cv = bool(cv_targets) and (rng.uniform() < p_cv_unmeasured)
+            if use_cv or not dv_targets:
+                target = cv_targets[int(rng.integers(0, len(cv_targets)))]
+                source, target_group = 'unmeasured_cv', 'cv'
+            else:
+                target = dv_targets[int(rng.integers(0, len(dv_targets)))]
+                source, target_group = 'measured_dv', 'dv'
+
+        is_violation = bool(rng.uniform() < p_violation)
+        intent = 'violation' if is_violation else 'economic'
+
+        # Direction: anti-drift bias when this channel has accumulated
+        # > 15% of its span in one direction.
+        ch_key = f"{target_group}_{int(target.get('pos', 0))}"
+        cum = cumulative_offset.get(ch_key, 0.0)
+        b_ref = target.get('bounds')
+        ch_span = (max(1e-6, float(b_ref[1]) - float(b_ref[0]))
+                   if isinstance(b_ref, list) and len(b_ref) >= 2 else 1.0)
+        if abs(cum) / ch_span > 0.15 and abs(cum) > 1e-9:
+            sign = -1.0 if cum > 0 else 1.0
+            if rng.uniform() < 0.20:
+                sign = -sign
+        else:
+            sign = -1.0 if rng.uniform() < 0.5 else 1.0
+
+        span = ch_span
+        if source == 'measured_dv':
+            frac = float(rng.uniform(0.05, 0.16) if not is_violation
+                         else rng.uniform(0.18, 0.38))
+            mag = sign * frac * span
+            gain = float(dv_gain.get(str(target.get('name', '')),
+                                      dv_gain.get(f"dv_{int(target.get('pos', 0))}", 0.0))
+                          or 0.0)
+            if gain > 1e-8:
+                desired_cv = float(rng.uniform(0.08, 0.18) if not is_violation
+                                    else rng.uniform(0.30, 0.55)) * cv_span_ref
+                needed = desired_cv / gain
+                mag = sign * max(abs(mag), abs(needed))
+            allow_oob = False
+            cv_per_unit = abs(gain) if gain > 1e-8 else 0.0
+        else:  # unmeasured_cv
+            frac = float(rng.uniform(0.08, 0.18) if not is_violation
+                         else rng.uniform(0.30, 0.60))
+            mag = sign * frac * span
+            allow_oob = True
+            cv_per_unit = 1.0
+
+        # Authority-budget clip (shared with training).
+        if cv_per_unit > 0.0 and mv_authority_cv > 1e-9 and authority_frac > 0.0:
+            new_delta, achieved = clamp_event_to_authority_budget(
+                proposed_delta=float(mag),
+                cv_impact_per_unit=float(cv_per_unit),
+                cumulative_cv_impact=float(cumulative_cv_impact),
+                mv_authority_cv=float(mv_authority_cv),
+                target_frac=float(authority_frac),
+            )
+            mag = float(new_delta)
+            cumulative_cv_impact += float(achieved)
+
+        if abs(mag) < 1e-6:
+            continue
+
+        color = '#e76f51' if is_violation else '#2a9d8f'
+        ch_name = str(target.get('name', f'{target_group}_{int(target.get("pos", 0))}'))
         schedule.append({
-            'name': f'scripted_step_{i + 1}',
+            'name': f'{source}_{ch_name}_{intent}_{i + 1}',
+            'start': int(start),
             'target_group': target_group,
-            'target_pos': target_pos,
-            'start': int(s),
-            'duration': int(T - int(s)),
+            'target_pos': int(target.get('pos', 0)),
+            'target_state_index': int(target.get('state_index', 0)),
+            'target_name': ch_name,
+            'source': source,
+            'intent': intent,
+            'delta': float(mag),
+            'allow_out_of_bounds': bool(allow_oob),
+            'color': color,
+            'duration': int(ep_len - int(start)),
             'shape': 'step',
-            'period': float(max(2.0, T)),
-            'source': 'scripted',
-            'delta': delta,
+            'period': float(max(2.0, ep_len)),
             '_applied': False,
-            '_is_violation': False,
+            '_is_violation': bool(is_violation),
         })
+        cumulative_offset[ch_key] = cum + float(mag)
+
+    schedule.sort(key=lambda x: int(x.get('start', 0)))
     return schedule
 
 
@@ -720,10 +835,9 @@ def run_validation(*,
                 'n_disturbance_events': len(ep['schedule']),
             })
 
-        # ---- Disturbance-rejection plot (scripted, deterministic schedule) ----
+        # ---- Disturbance-rejection plot (plant-aware holdout_a profile) ----
         try:
-            scripted = build_scripted_disturbance_schedule(env, n_events=3,
-                                                            magnitude_frac=0.10)
+            scripted = build_scripted_disturbance_schedule(env, seed=seed)
             ep_d = run_scripted_episode(env, model, device,
                                          deterministic=deterministic,
                                          schedule=scripted)
