@@ -543,6 +543,45 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     print('[BO] Phase 1: plant identification', flush=True)
     plant = initialize_from_plant(out_dir / 'plant_id')
 
+    # Plant-aware noise config.  ``build_noise_config`` produces dynamics-
+    # derived OU process noise (CV + DV), measurement noise, and domain-
+    # randomization % from the identified plant.  We persist it to
+    # <out_dir>/noise_config.json and export ``SIM_NOISE_CONFIG_JSON`` so
+    # every downstream subprocess (training, validation) loads the same
+    # noise profile via SimNoiseWrapper.  Without this step the wrapper
+    # falls back to an empty config and the agent sees zero process /
+    # measurement / DV-drift noise — which makes "the plant" deterministic
+    # except for discrete disturbance steps.
+    try:
+        from utils.sim_factory import create_sim as _create_sim
+        from utils.noise_config import (
+            build_noise_config_from_sim, save_noise_config,
+        )
+        _probe_sim = _create_sim(episode_length=10,
+                                 sample_rate=max(1, base.sample_rate))
+        # Unwrap SimNoiseWrapper / sanity wrapper to get to the bare sim
+        # whose metadata attributes we need.
+        bare = _probe_sim
+        for _ in range(4):
+            inner = getattr(bare, '_sim', None)
+            if inner is None:
+                break
+            bare = inner
+        noise_cfg = build_noise_config_from_sim(
+            bare,
+            dynamics_json=plant.get('dynamics_raw') or {},
+            lookback_json={'identified_lookback': int(plant.get('lookback', 0))},
+        )
+        noise_cfg_path = out_dir / 'noise_config.json'
+        save_noise_config(noise_cfg, str(noise_cfg_path))
+        print(f"[BO] noise_config: {noise_cfg_path} "
+              f"(OU={len(noise_cfg.get('ou_noise', []))} "
+              f"meas={len(noise_cfg.get('measurement_noise', []))})",
+              flush=True)
+    except Exception as exc:
+        print(f"[BO] noise_config: SKIPPED ({exc!r}) — running with no "
+              "process / measurement noise", flush=True)
+
     # Plant-tied derivations (sample_rate from fastest dynamics, model_size
     # from complexity, seq_len ≥ settling time).  Env-supplied values take
     # precedence so this stays simulator-agnostic.

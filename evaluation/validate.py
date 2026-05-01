@@ -562,7 +562,7 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
                          'label': _name(i, f'CV[{i}]'), 'bounds': bounds,
                          'norm': norm, 'target': target, 'color': '#2ca02c'})
 
-    n_rows = max(1, len(channels)) + 1  # +reward
+    n_rows = max(1, len(channels)) + 2  # + cum reward + reward/violation companion
     fig, axes = plt.subplots(n_rows, 1,
                               figsize=(13, max(4.0, 2.0 * n_rows)),
                               sharex=True)
@@ -666,14 +666,40 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
         ax.legend(loc='best', fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    ax = axes[-1]
+    ax = axes[-2]
     ax.plot(t_arr, np.cumsum(ep['raw_rewards']), color='C2', lw=1.0,
             label=f"raw cum (final={ep['cum_raw_reward']:+.1f})")
     _draw_disturbance_markers(ax)
     ax.set_ylabel('cum reward')
-    ax.set_xlabel('time step')
     ax.legend(loc='upper left', fontsize=8)
     ax.grid(True, alpha=0.3)
+
+    # Reward / violation companion: instantaneous raw reward (left axis) +
+    # cumulative CV-violation count (right axis).  Frames the cum-reward
+    # subplot above by exposing where penalties are coming from.
+    ax = axes[-1]
+    ax.plot(t_arr, ep['raw_rewards'], color='#555555', lw=0.8, alpha=0.85,
+            label='raw reward (per step)')
+    ax.axhline(0.0, color='#888888', linestyle=':', linewidth=0.8)
+    ax.set_ylabel('raw r/step')
+    ax.grid(True, alpha=0.3)
+    cv_v = np.asarray(ep.get('cv_violations') or np.zeros_like(t_arr),
+                       dtype='float64')
+    if cv_v.size == t_arr.size and cv_v.size > 0:
+        cv_count = np.cumsum((cv_v > 1e-9).astype('float64'))
+        ax2 = ax.twinx()
+        ax2.plot(t_arr, cv_count, color='#d32f2f', lw=1.2,
+                  label=f'cum CV viol (final={int(cv_count[-1])})')
+        ax2.set_ylabel('cum CV viol', color='#d32f2f')
+        ax2.tick_params(axis='y', labelcolor='#d32f2f')
+        # Combined legend
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=8)
+    else:
+        ax.legend(loc='upper left', fontsize=8)
+    _draw_disturbance_markers(ax)
+    ax.set_xlabel('time step')
 
     fig.suptitle(title, fontsize=11, y=0.995)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
