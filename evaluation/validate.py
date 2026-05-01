@@ -683,8 +683,10 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
     ax.axhline(0.0, color='#888888', linestyle=':', linewidth=0.8)
     ax.set_ylabel('raw r/step')
     ax.grid(True, alpha=0.3)
-    cv_v = np.asarray(ep.get('cv_violations') or np.zeros_like(t_arr),
-                       dtype='float64')
+    cv_v_raw = ep.get('cv_violations')
+    cv_v = (np.asarray(cv_v_raw, dtype='float64')
+            if cv_v_raw is not None and len(cv_v_raw) > 0
+            else np.zeros_like(t_arr, dtype='float64'))
     if cv_v.size == t_arr.size and cv_v.size > 0:
         cv_count = np.cumsum((cv_v > 1e-9).astype('float64'))
         ax2 = ax.twinx()
