@@ -375,6 +375,26 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
             json.dump({'params': trial.params, 'horizon_concrete': horizon,
                        'H_init': H_init, 'pruned': True}, f, indent=2)
         raise
+    except torch.cuda.OutOfMemoryError as e:
+        # Don't kill the whole BO study on a single OOM trial.  Free GPU
+        # memory, mark this trial as failed in Optuna (worst score), and
+        # let the next trial run with a clean slate.
+        try:
+            import gc
+            import torch._dynamo
+            gc.collect()
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        print(f'[trial {trial.number}] OOM: {e!r}; marking failed',
+              flush=True)
+        with open(trial_dir / 'trial_summary.json', 'w') as f:
+            json.dump({'params': trial.params, 'horizon_concrete': horizon,
+                       'H_init': H_init, 'oom': True,
+                       'error': str(e)[:500]}, f, indent=2)
+        return float('-inf')
 
     # Score by the rolling-window mean of the last 10 *policy* episode
     # returns, not the single final EMA value.  This dampens the
@@ -395,6 +415,21 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     # Spawn CPU-only validation for this trial; it runs in parallel with the
     # next trial's GPU training.  Drained before final retrain.
     _launch_trial_validation(trial_dir)
+
+    # Inter-trial GPU cleanup: torch.compile / inductor cache stale kernels
+    # for previous trials' shapes (different model_size / horizon / batch),
+    # which accumulate across trials and eventually OOM.  Reset dynamo state
+    # and free CUDA memory to give the next trial a clean slate.
+    try:
+        import gc
+        import torch._dynamo
+        gc.collect()
+        torch._dynamo.reset()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception as e:
+        print(f'[trial-gc] cleanup skipped: {e!r}', flush=True)
     return float(score)
 
 
@@ -454,7 +489,10 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)
-    model.load_state_dict(ckpt['model'])
+    sd = ckpt['model']
+    if any('._orig_mod.' in k for k in sd):
+        sd = {k.replace('._orig_mod.', '.'): v for k, v in sd.items()}
+    model.load_state_dict(sd)
     onnx_path = out_dir / 'dreamer_v4.onnx'
     export_dreamer_v4_onnx(model, onnx_path)
 

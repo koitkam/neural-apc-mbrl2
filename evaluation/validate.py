@@ -602,7 +602,14 @@ def run_validation(*,
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = DreamerV4(model_cfg).to(device)
-    model.load_state_dict(ckpt_obj['model'])
+    # Checkpoints saved while ``torch.compile`` was active have keys
+    # prefixed with ``_orig_mod.`` (e.g. ``tokenizer._orig_mod.encoder...``)
+    # because ``torch.compile`` wraps the module in ``OptimizedModule``.
+    # Strip the prefix so the bare DreamerV4 can load.
+    sd = ckpt_obj['model']
+    if any('._orig_mod.' in k for k in sd):
+        sd = {k.replace('._orig_mod.', '.'): v for k, v in sd.items()}
+    model.load_state_dict(sd)
     model.eval()
 
     seed_results: List[List[Dict]] = []
