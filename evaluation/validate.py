@@ -342,6 +342,16 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     scaled_rewards = np.zeros(T, dtype='float32')
     cv_violations = np.zeros(T, dtype='float32')
     mv_violations = np.zeros(T, dtype='float32')
+    # Per-step active MV/CV bounds and CV targets so the plot can
+    # render the bound-change schedule the operator/agent saw.  The
+    # base bounds (constant) are recorded separately in the rollout
+    # dict; these are the *current* values that vary across the
+    # episode whenever ``RuntimeSetpointManager`` schedules a change.
+    n_mv_aux = int(getattr(env.setpoint_mgr, 'n_mv', 0))
+    n_cv_aux = int(getattr(env.setpoint_mgr, 'n_cv', 0))
+    current_mv_bounds_t = np.zeros((T, n_mv_aux, 2), dtype='float32')
+    current_cv_bounds_t = np.zeros((T, n_cv_aux, 2), dtype='float32')
+    current_cv_targets_t = np.zeros((T, n_cv_aux), dtype='float32')
 
     # V4 streaming inference: maintain a rolling action history alongside
     # the env-provided observation window. At each step we encode the
@@ -389,6 +399,14 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         scaled_rewards[t] = float(scaled_r)
         cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
         mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
+        if n_mv_aux > 0:
+            current_mv_bounds_t[t] = np.asarray(
+                env.setpoint_mgr.current_mv_bounds, dtype='float32')
+        if n_cv_aux > 0:
+            current_cv_bounds_t[t] = np.asarray(
+                env.setpoint_mgr.current_cv_bounds, dtype='float32')
+            current_cv_targets_t[t] = np.asarray(
+                env.setpoint_mgr.current_cv_targets, dtype='float32')
         a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
         obs_window = next_window
         if done:
@@ -424,6 +442,9 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         'cv_target_enabled': [bool(x) for x in
                                 getattr(env.setpoint_mgr,
                                           'cv_target_enabled', [])],
+        'current_mv_bounds_t': current_mv_bounds_t[:t + 1],
+        'current_cv_bounds_t': current_cv_bounds_t[:t + 1],
+        'current_cv_targets_t': current_cv_targets_t[:t + 1],
         'reward_scale': float(env.reward_scale),
     }
 
@@ -542,6 +563,16 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
     mv_bounds = ep.get('mv_bounds') or []
     cv_targets = ep.get('cv_targets') or []
     cv_target_enabled = ep.get('cv_target_enabled') or []
+    # Per-step (T, n_ch[, 2]) traces of the operator-active bounds /
+    # targets.  Empty / shape-(T, 0, 2) when the setpoint manager did
+    # not run, in which case the plot falls back to the constant base
+    # bounds only.
+    cur_mv_b_t = np.asarray(ep.get('current_mv_bounds_t') or [],
+                              dtype='float32')
+    cur_cv_b_t = np.asarray(ep.get('current_cv_bounds_t') or [],
+                              dtype='float32')
+    cur_cv_tgt_t = np.asarray(ep.get('current_cv_targets_t') or [],
+                                dtype='float32')
     schedule = ep['schedule']
     T = ep['episode_length']
     t_arr = np.arange(T)
@@ -556,33 +587,44 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
     for k, i in enumerate(mv_idx):
         bounds = mv_bounds[k] if k < len(mv_bounds) else None
         norm = mv_norm[k] if k < len(mv_norm) else None
+        bounds_t = (cur_mv_b_t[:, k] if (cur_mv_b_t.ndim == 3
+                                          and k < cur_mv_b_t.shape[1])
+                     else None)
         channels.append({'group': 'mv', 'series': controls[:, k] if k < controls.shape[1] else None,
                          'label': _name(i, f'MV[{i}]'), 'bounds': bounds,
-                         'norm': norm, 'target': None, 'color': '#1f77b4'})
+                         'bounds_t': bounds_t,
+                         'norm': norm, 'target': None, 'target_t': None,
+                         'color': '#1f77b4'})
     for i in dv_idx:
         if i >= states.shape[1]:
             continue
         channels.append({'group': 'dv', 'series': states[:, i],
                          'label': _name(i, f'DV[{i}]'), 'bounds': None,
-                         'norm': None, 'target': None, 'color': '#9467bd'})
+                         'bounds_t': None,
+                         'norm': None, 'target': None, 'target_t': None,
+                         'color': '#9467bd'})
     for k, i in enumerate(cv_idx):
         if i >= states.shape[1]:
             continue
         bounds = cv_bounds[k] if k < len(cv_bounds) else None
         norm = cv_norm[k] if k < len(cv_norm) else None
-        # Only show the target line if this CV explicitly has
-        # ``cv_target_enabled[k] == True``.  When targets are globally
-        # disabled (``runtime_setpoints.targets_enabled = [false]``)
-        # ``base_cv_targets`` may be NaN (already filtered by
-        # ``np.isfinite`` below) or — defensively — a finite
-        # placeholder; the enabled flag is the authoritative gate.
         tgt_enabled = (k < len(cv_target_enabled)
                         and bool(cv_target_enabled[k]))
         target = (cv_targets[k] if (tgt_enabled and k < len(cv_targets))
                    else None)
+        bounds_t = (cur_cv_b_t[:, k] if (cur_cv_b_t.ndim == 3
+                                          and k < cur_cv_b_t.shape[1])
+                     else None)
+        target_t = (cur_cv_tgt_t[:, k] if (tgt_enabled
+                                            and cur_cv_tgt_t.ndim == 2
+                                            and k < cur_cv_tgt_t.shape[1])
+                     else None)
         channels.append({'group': 'cv', 'series': states[:, i],
                          'label': _name(i, f'CV[{i}]'), 'bounds': bounds,
-                         'norm': norm, 'target': target, 'color': '#2ca02c'})
+                         'bounds_t': bounds_t,
+                         'norm': norm, 'target': target,
+                         'target_t': target_t,
+                         'color': '#2ca02c'})
 
     n_rows = max(1, len(channels)) + 2  # + cum reward + reward/violation companion
     fig, axes = plt.subplots(n_rows, 1,
@@ -645,16 +687,43 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
             lo_b, hi_b = float(bounds[0]), float(bounds[1])
             if ch['group'] == 'cv':
                 ax.axhspan(lo_b, hi_b, color='#ffcc80', alpha=0.18,
-                            label='CV bound band')
-                ax.axhline(lo_b, color='#d32f2f', linestyle='--', linewidth=1.4,
-                            label='CV low bound')
-                ax.axhline(hi_b, color='#d32f2f', linestyle='--', linewidth=1.4,
-                            label='CV high bound')
+                            label='CV base band')
+                ax.axhline(lo_b, color='#d32f2f', linestyle='--', linewidth=1.0,
+                            label='CV base low')
+                ax.axhline(hi_b, color='#d32f2f', linestyle='--', linewidth=1.0,
+                            label='CV base high')
             else:
                 ax.axhline(lo_b, color='r', linestyle='--', linewidth=1.0,
-                            label='Low bound')
+                            label='Base low')
                 ax.axhline(hi_b, color='r', linestyle='--', linewidth=1.0,
-                            label='High bound')
+                            label='Base high')
+
+        # Per-step active bounds (operator schedule) — overlays the
+        # base bound box.  Shown as a step trace (post-step semantics)
+        # so the operator can see exactly when each bound moved.
+        bounds_t = ch.get('bounds_t')
+        if (bounds_t is not None
+                and isinstance(bounds_t, np.ndarray)
+                and bounds_t.ndim == 2
+                and bounds_t.shape[1] >= 2
+                and bounds_t.shape[0] >= 1):
+            n = min(bounds_t.shape[0], len(t_arr))
+            lo_arr = np.asarray(bounds_t[:n, 0], dtype='float32')
+            hi_arr = np.asarray(bounds_t[:n, 1], dtype='float32')
+            t_seg = t_arr[:n]
+            if ch['group'] == 'cv':
+                ax.fill_between(t_seg, lo_arr, hi_arr,
+                                  step='post', color='#fb8c00', alpha=0.10,
+                                  label='CV active band')
+                ax.step(t_seg, lo_arr, where='post', color='#b71c1c',
+                         linewidth=1.6, label='CV active low')
+                ax.step(t_seg, hi_arr, where='post', color='#b71c1c',
+                         linewidth=1.6, label='CV active high')
+            else:
+                ax.step(t_seg, lo_arr, where='post', color='#c62828',
+                         linewidth=1.4, label='MV active low')
+                ax.step(t_seg, hi_arr, where='post', color='#c62828',
+                         linewidth=1.4, label='MV active high')
 
         norm = ch.get('norm')
         if norm is not None and len(norm) >= 2 and \
@@ -665,7 +734,17 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
                         linewidth=1.0, label='Norm high')
 
         target = ch.get('target')
-        if target is not None and np.isfinite(target):
+        target_t = ch.get('target_t')
+        if (target_t is not None
+                and isinstance(target_t, np.ndarray)
+                and target_t.ndim == 1
+                and target_t.size >= 1
+                and np.any(np.isfinite(target_t))):
+            n = min(target_t.size, len(t_arr))
+            ax.step(t_arr[:n], np.asarray(target_t[:n], dtype='float32'),
+                     where='post', color='#1b5e20', linewidth=1.6,
+                     linestyle='-.', label='Target (active)')
+        elif target is not None and np.isfinite(target):
             ax.axhline(float(target), color='#1b5e20', linestyle='-.',
                         linewidth=1.4, label=f'Target ({float(target):g})')
 
@@ -947,6 +1026,15 @@ def run_validation(*,
                                             dtype='float32'),
                     cv_target_enabled=np.asarray(
                         ep_d.get('cv_target_enabled', []), dtype=bool),
+                    current_mv_bounds_t=np.asarray(
+                        ep_d.get('current_mv_bounds_t',
+                                   np.zeros((0, 0, 2))), dtype='float32'),
+                    current_cv_bounds_t=np.asarray(
+                        ep_d.get('current_cv_bounds_t',
+                                   np.zeros((0, 0, 2))), dtype='float32'),
+                    current_cv_targets_t=np.asarray(
+                        ep_d.get('current_cv_targets_t',
+                                   np.zeros((0, 0))), dtype='float32'),
                     sample_rate=np.asarray([int(ep_d.get('sample_rate', 1))],
                                              dtype='int64'),
                     episode_length=np.asarray([int(ep_d.get('episode_length',

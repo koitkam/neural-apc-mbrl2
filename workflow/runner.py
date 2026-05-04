@@ -360,10 +360,19 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
                             out_dir=trial_dir, batch_size=bs)
 
     # Pruning hook: report the running EMA return after each log iter so the
-    # MedianPruner can stop visibly-bad trials early.
+    # MedianPruner can stop visibly-bad trials early.  We track the last
+    # ``step`` value we reported because in P3 we collect a fresh
+    # on-policy episode only every K iters (``phase3_collect_every_iters``)
+    # while we still log every iter — this used to spam Optuna with
+    # duplicate-step warnings (``UserWarning: The reported value is
+    # ignored because this `step` X is already reported``).
+    last_reported_step = {'v': -1}
+
     def _on_iter(it: int, steps: int, ema: float) -> bool:
         try:
-            trial.report(float(ema), step=int(steps))
+            if int(steps) > last_reported_step['v']:
+                trial.report(float(ema), step=int(steps))
+                last_reported_step['v'] = int(steps)
         except Exception:
             pass
         return bool(trial.should_prune())
