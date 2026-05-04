@@ -743,20 +743,25 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     critic_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
 
     # Advantage (current critic baseline) → PMPO (eq. 11).
+    # Paper-faithful: A_t = R_t - V(s_t), then divide by EMA return scale
+    # (model.update_return_scale).  Per-trajectory mean centering was
+    # used previously as a workaround when the upstream tokenizer
+    # collapse dominated within-trajectory advantage variance with
+    # value-function noise.  With the May-2026 architecture fix the
+    # within-trajectory advantage signal is real, so global centering
+    # is correct again — it preserves the "this trajectory was overall
+    # better than that one" signal that PMPO needs to upweight good
+    # trajectories.
     with torch.no_grad():
         baseline = model.value.expectation(
             model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
         ).view(B, H)
         adv_raw = target_returns - baseline
-        # Per-trajectory mean centering reduces gradient variance from
-        # trajectory-to-trajectory return scale, isolating the
-        # action-to-action advantage signal.
-        adv_centered = adv_raw - adv_raw.mean(dim=1, keepdim=True)
         scale = model.update_return_scale(target_returns).clamp_min(1.0)
 
     feat_flat = agent_hids.reshape(-1, agent_hids.shape[-1])
     actions_flat = actions.reshape(-1, actions.shape[-1])
-    adv_flat = (adv_centered / scale).reshape(-1).detach()
+    adv_flat = (adv_raw / scale).reshape(-1).detach()
 
     actor_loss, pmpo_diag = pmpo_loss(model.policy, model.prior_policy,
                                        feat_flat, actions_flat, adv_flat,
@@ -771,7 +776,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'imagined_reward_std': rewards.std().detach(),
         'entropy_mean': entropies.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
-        'adv_centered_std': adv_centered.std().detach(),
+        'adv_global_std': adv_raw.std().detach(),
         'return_scale': scale.detach().squeeze(),
     }
     diag.update(pmpo_diag)
@@ -1079,7 +1084,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
         # ----- Collection -----
         # Phases 1 & 2: random-action episodes append to the buffer.
-        # Phase 3: only periodic deterministic eval episodes (no buffer write).
+        # Phase 3: collect on-policy episodes (stochastic actor) and
+        # append to the buffer so the world model + reward head keep
+        # adapting to the actor's actual trajectory distribution
+        # (paper Algorithm 1 line 22 — "collect").  Periodic
+        # deterministic eval episodes are still produced separately
+        # to score the policy (no buffer write, no extra env-step
+        # accounting beyond budget pacing).
         _t = time.time()
         if current_phase in (1, 2):
             for _ in range(cfg.ep_per_iter):
@@ -1092,24 +1103,32 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 ema_return = (ret if ema_return is None
                                 else 0.95 * ema_return + 0.05 * ret)
         else:
-            # Phase 3: optional eval episode every N iters (deterministic policy).
+            # Phase 3: on-policy collection (stochastic actor) every iter.
+            # The trainer also keeps the world-model heads (tokenizer +
+            # dynamics + reward) alive on these batches via the P3 WM
+            # update below, so the WM remains aligned with the actor's
+            # current state-visit distribution.
+            ep = collect_episode(env, model, device, cfg,
+                                   random_action=False, deterministic=False)
+            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            total_env_steps += cfg.episode_length
+            ret = float(ep['rew'].sum())
+            ema_return = (ret if ema_return is None
+                            else 0.95 * ema_return + 0.05 * ret)
+            # Periodic deterministic eval (for the BO score window).
             if (total_iters % max(1, cfg.phase3_eval_every_iters)) == 0:
-                ep = collect_episode(env, model, device, cfg,
-                                       random_action=False, deterministic=True)
-                total_env_steps += cfg.episode_length
-                ret = float(ep['rew'].sum())
-                ema_return = (ret if ema_return is None
-                                else 0.95 * ema_return + 0.05 * ret)
-                return_window.append(ret)
-                iter_returns.append(ret)
+                ep_eval = collect_episode(env, model, device, cfg,
+                                            random_action=False,
+                                            deterministic=True)
+                ret_eval = float(ep_eval['rew'].sum())
+                return_window.append(ret_eval)
+                iter_returns.append(ret_eval)
                 rs = float(env.reward_scale) if env.reward_scale else 1.0
-                iter_raw_returns.append(ret / rs if rs else ret)
+                iter_raw_returns.append(ret_eval / rs if rs else ret_eval)
                 iter_cv_violations.append(float(getattr(env,
                                             '_last_cv_violation_sum', 0.0)))
                 iter_mv_violations.append(float(getattr(env,
                                             '_last_mv_violation_sum', 0.0)))
-            else:
-                total_env_steps += cfg.episode_length  # stay paced with budget
         t_collect_acc += time.time() - _t
 
         # ----- Train -----
@@ -1171,8 +1190,40 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         opt_actor.step()
                 t_wm_acc += time.time() - _t
 
-            else:  # Phase 3 — imagination RL
+            else:  # Phase 3 — imagination RL + continuous WM update
+                # Paper Algorithm 1: tokenizer + dynamics + reward head
+                # keep training in P3 alongside the actor / critic so the
+                # world model tracks the on-policy state-visit
+                # distribution.  We split the gradient steps: each P3
+                # iter does (a) one WM step on a fresh buffer batch
+                # (recon/sf + reward MTP), (b) one actor/critic step
+                # via imagination from a possibly different batch.
                 _t = time.time()
+                # ---- (a) WM + reward-head update -----------------
+                with torch.amp.autocast(device_type=device.type,
+                                          dtype=torch.bfloat16,
+                                          enabled=(device.type == 'cuda')):
+                    wm_losses, _, agent_hid = world_model_loss(model, batch, cfg)
+                    ag_losses = agent_finetune_loss(model, batch,
+                                                      agent_hid, cfg)
+                    # Drop BC term in P3 (the actor is now driven by
+                    # imagination/PMPO; BC against random-action data
+                    # would just pull it back toward uniform).  Keep
+                    # reward MTP because that head is what the actor's
+                    # value target depends on.
+                    p3_total_world = (wm_losses['wm_total']
+                                       + cfg.reward_scale_loss
+                                         * ag_losses['reward_mtp_loss'])
+                opt_world.zero_grad(set_to_none=True)
+                p3_total_world.backward()
+                wm_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters_world(), cfg.grad_clip)
+                if torch.isfinite(wm_grad_norm):
+                    opt_world.step()
+                else:
+                    n_grad_skip += 1
+
+                # ---- (b) Actor + Critic via imagination ----------
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
