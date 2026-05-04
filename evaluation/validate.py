@@ -1066,6 +1066,35 @@ def run_validation(*,
                   title=f'{controller_dir.name}  validation summary  '
                         f'({seeds} seeds × {episodes} eps)')
 
+    # ---- Training-stage + WM-fidelity diagnostics ------------------------
+    # Run once per validation invocation on a fresh env so we don't pay
+    # per-seed cost.  Tells the operator which training stage (P1 WM,
+    # P2 reward MTP / BC, P3 PMPO) is the bottleneck.
+    try:
+        from evaluation.diagnostics import compute_training_diagnostics
+        diag_env = APCEnv(cfg, np.random.default_rng(99_999))
+        if obs_norm_state is not None:
+            try:
+                diag_env.set_obs_norm_stats(obs_norm_state)
+            except Exception:
+                pass
+        diag = compute_training_diagnostics(
+            controller_dir=controller_dir,
+            env=diag_env,
+            model=model,
+            device=device,
+            out_dir=out_dir,
+            k_max=int(getattr(cfg, 'horizon', 32)),
+            gamma=float(getattr(cfg, 'gamma', 0.997)),
+        )
+        flags = (diag.get('stage_metrics') or {}).get('flags') or []
+        if flags:
+            print('[val] training-stage flags:', flush=True)
+            for fl in flags:
+                print(f'        - {fl}', flush=True)
+    except Exception as e:
+        print(f'[val] diagnostics skipped: {e}', flush=True)
+
     cum = np.array([m['cum_raw_reward'] for m in metrics_records])
     cv_v = np.array([m['mean_cv_violation'] for m in metrics_records])
     mv_v = np.array([m['mean_mv_violation'] for m in metrics_records])
