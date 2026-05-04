@@ -828,10 +828,28 @@ def run_validation(*,
     seed_results: List[List[Dict]] = []
     metrics_records: List[Dict] = []
     disturbance_records: List[Dict] = []
+    # Restore the env-side obs normalizer stats saved with the checkpoint
+    # (added 2026-05-03 — the trainer applies running standardization to
+    # obs before the tokenizer; evaluation must use the same stats with
+    # learning frozen so the model sees the distribution it was trained
+    # against).  Older checkpoints without 'obs_norm' fall back to the
+    # default (mean=0, var=1) stats — which is also what those models
+    # were effectively trained with.
+    obs_norm_state = ckpt_obj.get('obs_norm') if isinstance(ckpt_obj, dict) else None
     for s in range(int(seeds)):
         seed = 10_000 + s  # held-out from training (which used SEED=0..N).
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
+        if obs_norm_state is not None:
+            try:
+                env.set_obs_norm_stats(
+                    mean=np.asarray(obs_norm_state.get('mean')),
+                    var=np.asarray(obs_norm_state.get('var')),
+                    count=float(obs_norm_state.get('count', 1.0)),
+                    learn=False,
+                )
+            except Exception as e:
+                print(f'[val] obs_norm restore skipped: {e!r}', flush=True)
         # Use the calibrated reward scale from training when available.
         cal_path = controller_dir / 'reward_calibration.json'
         if cal_path.exists():
@@ -874,6 +892,45 @@ def run_validation(*,
                        f'mean_cv_v={ep_d["mean_cv_violation"]:.4f}')
             ann = plot_disturbance_rejection(
                 ep_d, per_seed_dir / 'disturbance_rejection.png', title=d_title)
+            # Persist the raw trajectory for offline analysis (added
+            # 2026-05-03 — diagnosing constant-action collapse required
+            # re-running the eval rollouts because the PNG is the only
+            # artefact, which is wasteful and lossy).
+            try:
+                npz_path = per_seed_dir / 'disturbance_rejection.npz'
+                # Convert lists/dicts in the schedule to a JSON blob so
+                # np.savez doesn't choke on object arrays.
+                sched_json = json.dumps(ep_d.get('schedule', []), default=str)
+                np.savez(
+                    npz_path,
+                    states=np.asarray(ep_d['states'], dtype='float32'),
+                    actions_norm=np.asarray(ep_d['actions_norm'], dtype='float32'),
+                    controls=np.asarray(ep_d['controls'], dtype='float32'),
+                    raw_rewards=np.asarray(ep_d['raw_rewards'], dtype='float32'),
+                    scaled_rewards=np.asarray(ep_d['scaled_rewards'], dtype='float32'),
+                    cv_violations=np.asarray(ep_d['cv_violations'], dtype='float32'),
+                    mv_violations=np.asarray(ep_d['mv_violations'], dtype='float32'),
+                    cv_indices=np.asarray(ep_d.get('cv_indices', []), dtype='int64'),
+                    mv_indices=np.asarray(ep_d.get('mv_indices', []), dtype='int64'),
+                    dv_indices=np.asarray(ep_d.get('dv_indices', []), dtype='int64'),
+                    mv_norm_ranges=np.asarray(ep_d.get('mv_norm_ranges', []),
+                                                dtype='float32'),
+                    cv_norm_ranges=np.asarray(ep_d.get('cv_norm_ranges', []),
+                                                dtype='float32'),
+                    mv_bounds=np.asarray(ep_d.get('mv_bounds', []),
+                                           dtype='float32'),
+                    sample_rate=np.asarray([int(ep_d.get('sample_rate', 1))],
+                                             dtype='int64'),
+                    episode_length=np.asarray([int(ep_d.get('episode_length',
+                                                              len(ep_d['raw_rewards'])))],
+                                                dtype='int64'),
+                    state_variables=np.asarray(
+                        ep_d.get('state_variables', []), dtype=object),
+                    schedule_json=np.asarray([sched_json], dtype=object),
+                )
+            except Exception as ee:
+                print(f'[val] disturbance_rejection.npz skipped '
+                      f'(seed {seed}): {ee!r}', flush=True)
             disturbance_records.append({
                 'seed': seed,
                 'cum_raw_reward': ep_d['cum_raw_reward'],

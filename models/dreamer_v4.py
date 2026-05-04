@@ -286,42 +286,52 @@ class MLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Tokenizer(nn.Module):
-    """Vector-observation tokenizer with low-D tanh bottleneck.
+    """Thin vector-observation tokenizer (no compression bottleneck).
 
-    Encoder: MLP(obs_dim → hidden) → linear projection to z_dim → tanh.
-    Decoder: linear projection back to model dim → MLP → obs_dim.
+    Architectural note (deviation from paper §3.1): the V4 paper's
+    tokenizer is designed for image observations, where compressing
+    2-D patches to discrete latents is essential and a tanh / VQ
+    bottleneck plus MAE reconstruction prevents shortcut learning.
+    For our low-D vector obs (n ≈ 10), forcing the encoder through an
+    MLP+tanh+recon-MAE pipeline empirically collapses the encoder to a
+    near-constant function (the recon MAE is trivially solved by
+    memorizing the marginal mean when most channels are constant
+    within an episode).  Diagnosed 2026-05-03: pre-tanh per-dim std
+    < 4e-3 for all 24 dims while obs varied with std up to 10.
 
-    MAE-style training (paper §3.1): we randomly replace input channels
-    with a learned mask embedding at probability ``p ~ U(0, p_max)``.
-    For raw images the paper masks 2-D patches; for our 1-D observation
-    vector we mask individual feature channels instead (the same regularization
-    pressure on the encoder's representations, applied at the resolution
-    natural to APC observations).
+    We therefore use a thin learned **linear projection + LayerNorm**
+    as encode (no compression — actually a learned lift from obs_dim
+    to z_dim ≥ obs_dim — which preserves all state information by
+    construction) and a symmetric linear decode.  Recon loss is kept
+    for compat but ``recon_scale=0`` is the default; the dynamics's
+    shortcut-forcing loss carries the world-model training.
     """
 
     def __init__(self, obs_dim: int, hidden_dim: int, z_dim: int,
-                 mae_p_max: float = 0.5):
+                 mae_p_max: float = 0.0):
         super().__init__()
         self.obs_dim = obs_dim
         self.z_dim = z_dim
         self.mae_p_max = float(mae_p_max)
-        self.encoder = MLP(obs_dim, hidden_dim, hidden_dim, n_layers=2)
-        self.bottleneck = nn.Linear(hidden_dim, z_dim)
-        self.decoder_in = nn.Linear(z_dim, hidden_dim)
-        self.decoder = MLP(hidden_dim, hidden_dim, obs_dim, n_layers=2)
+        # Thin linear projection + LayerNorm — no MLP, no tanh bottleneck.
+        self.encode_proj = nn.Linear(obs_dim, z_dim)
+        self.encode_norm = nn.LayerNorm(z_dim)
+        self.decode_proj = nn.Linear(z_dim, obs_dim)
         # Learned per-channel mask embedding (broadcast across batch).
+        # Kept for forward_with_mae compat; only used when mae_p_max > 0.
         self.mask_embed = nn.Parameter(torch.zeros(obs_dim))
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
         """``obs`` of shape ``(..., obs_dim)`` → ``z`` of shape ``(..., z_dim)``.
 
-        z lives in [-1, 1] thanks to the tanh bottleneck.
+        Linear lift + LayerNorm.  No compression, no saturating
+        nonlinearity.  Empirically this preserves state-dependence
+        through the dynamics transformer.
         """
-        h = self.encoder(obs)
-        return torch.tanh(self.bottleneck(h))
+        return self.encode_norm(self.encode_proj(obs))
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        return self.decoder(self.decoder_in(z))
+        return self.decode_proj(z)
 
     def forward_with_mae(self, obs: torch.Tensor
                           ) -> Tuple[torch.Tensor, torch.Tensor]:

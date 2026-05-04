@@ -66,7 +66,7 @@ class TrainConfig:
     # ----- Tokenizer -----
     tok_hidden: int = 256
     z_dim: int = 24
-    mae_p_max: float = 0.5
+    mae_p_max: float = 0.0   # disabled — see Tokenizer docstring (recon collapse)
 
     # ----- Dynamics transformer -----
     d_model: int = 256
@@ -103,12 +103,18 @@ class TrainConfig:
 
     # ----- Optimizers -----
     lr_world: float = 1e-4
-    lr_actor: float = 3e-5
+    lr_actor: float = 1e-4   # was 3e-5; insufficient for short BO trials.
     lr_critic: float = 3e-5
     grad_clip: float = 1000.0
 
     # ----- Loss weights -----
-    recon_scale: float = 1.0
+    # recon_scale=0 by default: with the thin linear tokenizer, recon-MAE
+    # on mostly-constant obs vectors empirically *causes* encoder
+    # collapse (the head reaches recon ≈ 0 by emitting the marginal mean
+    # — see 2026-05-03 root-cause analysis).  Shortcut-forcing alone
+    # carries the world model.  Keep the head present for compat /
+    # optional revival, just zero the weight.
+    recon_scale: float = 0.0
     sf_scale: float = 1.0
     reward_scale_loss: float = 1.0   # Phase-2 reward MTP weight
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
@@ -122,7 +128,11 @@ class TrainConfig:
     mtp_length: int = 8              # paper L=8 (Phase-2 multi-token prediction)
 
     # ----- PMPO (Phase 3) -----
-    pmpo_alpha: float = 0.5
+    # alpha=0.7 (paper default).  alpha=0.5 caused near-perfect
+    # cancellation between positive and negative-advantage gradient
+    # branches whenever the actor sampled the same action repeatedly
+    # within a trajectory (which is the failure mode we observed).
+    pmpo_alpha: float = 0.7
     # PMPO KL-to-prior weight.  Lowered from the paper's 0.1 because the
     # prior_policy snapshot at start of P3 is taken from a near-uniform
     # policy (no expert BC), so a stronger KL pull would freeze the
@@ -249,10 +259,69 @@ class APCEnv:
         self._last_cv_violation_sum: float = 0.0
         self._last_mv_violation_sum: float = 0.0
 
+        # ---- Per-dim observation standardizer ---------------------------
+        # Running mean/std updated from every raw obs vector seen by the
+        # env.  Applied in ``_build_obs_vec`` before the obs is exposed to
+        # the world model so the tokenizer sees zero-mean unit-std inputs
+        # regardless of physical units (CV ~50, setpoint ~50, MV ~25).
+        # Diagnosed 2026-05-03: without this, channels of std=10 saturate
+        # the encoder while constant channels (std=0) carry no info,
+        # collapsing the latent.  ``learn`` flag controls whether new
+        # samples update the stats — set False at validation/eval time so
+        # the tokenizer sees the same statistics it was trained against.
+        self._obs_mean: np.ndarray = np.zeros(self.obs_dim, dtype='float64')
+        self._obs_var: np.ndarray = np.ones(self.obs_dim, dtype='float64')
+        self._obs_count: float = 1e-4
+        self._obs_norm_learn: bool = True
+
+    # ---------- observation normalizer (load/save/apply) -----------------
+    def set_obs_norm_stats(self, mean: np.ndarray, var: np.ndarray,
+                            count: float = 1.0, *, learn: bool = False) -> None:
+        m = np.asarray(mean, dtype='float64').reshape(-1)
+        v = np.asarray(var, dtype='float64').reshape(-1)
+        if m.shape[0] != self.obs_dim or v.shape[0] != self.obs_dim:
+            raise ValueError(f'obs_norm shape mismatch: got {m.shape}/{v.shape}, '
+                             f'expected ({self.obs_dim},)')
+        self._obs_mean = m.copy()
+        self._obs_var = np.maximum(v.copy(), 1e-6)
+        self._obs_count = float(count)
+        self._obs_norm_learn = bool(learn)
+
+    def get_obs_norm_stats(self) -> Dict[str, np.ndarray]:
+        return {
+            'mean': self._obs_mean.astype('float64'),
+            'var':  self._obs_var.astype('float64'),
+            'count': float(self._obs_count),
+        }
+
+    def _update_obs_norm(self, raw_obs: np.ndarray) -> None:
+        # Welford-style running mean/var update on a single sample.
+        x = np.asarray(raw_obs, dtype='float64').reshape(-1)
+        self._obs_count += 1.0
+        delta = x - self._obs_mean
+        self._obs_mean += delta / self._obs_count
+        delta2 = x - self._obs_mean
+        # Running variance (uncorrected, fine for scale stats).
+        self._obs_var = self._obs_var + (delta * delta2 - self._obs_var) / self._obs_count
+
+    def _normalize_obs(self, raw_obs: np.ndarray) -> np.ndarray:
+        std = np.sqrt(np.maximum(self._obs_var, 1e-6))
+        # Clamp std lower bound: dims that are constant within an episode
+        # would otherwise divide by ~0 and amplify noise; treat them as
+        # "zero info, identity scale".
+        std = np.clip(std, 1e-3, None)
+        out = (np.asarray(raw_obs, dtype='float32') -
+               self._obs_mean.astype('float32')) / std.astype('float32')
+        # Guard against pathological values (numerical edge cases).
+        return np.clip(out.astype('float32'), -10.0, 10.0)
+
     def _build_obs_vec(self, state: np.ndarray) -> np.ndarray:
         aug = self.setpoint_mgr.get_augmented_obs_channels()
-        return np.concatenate([np.asarray(state, dtype='float32').reshape(-1),
-                                aug], axis=0)
+        raw = np.concatenate([np.asarray(state, dtype='float32').reshape(-1),
+                                aug], axis=0).astype('float32')
+        if self._obs_norm_learn:
+            self._update_obs_norm(raw)
+        return self._normalize_obs(raw)
 
     def reset(self, *, exploration: bool = False) -> np.ndarray:
         state = self.sim.reset()
@@ -502,11 +571,18 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # Build (B, T_ctx, L, A) future-action and (B, T_ctx, L) future-reward
     # tensors via a strided slice — no Python loop, fully vectorised.
+    # BC predicts a_{t+1..t+L} (FUTURE actions; agent_hid[t] doesn't see them).
     fut_act = torch.stack(
         [act[:, 1 + l : 1 + l + T_ctx] for l in range(L_mtp_eff)], dim=2
     )                                                       # (B, T_ctx, L, A)
+    # Reward prediction at offset l predicts r_{t+l} (CURRENT-step reward at
+    # offset 0).  agent_hid[t] sees both s_t and a_t (within-step block-causal
+    # attention), so r_t is conditional on the action that produced it — this
+    # is what makes the predicted reward action-sensitive in P3 imagination.
+    # Note shift vs. fut_act: BC predicts future actions, reward predicts the
+    # reward of the just-taken action (offset 0 = current step).
     fut_rew = torch.stack(
-        [rew[:, 1 + l : 1 + l + T_ctx] for l in range(L_mtp_eff)], dim=2
+        [rew[:, l : l + T_ctx] for l in range(L_mtp_eff)], dim=2
     )                                                       # (B, T_ctx, L)
     fut_act = fut_act.reshape(B * T_ctx, L_mtp_eff, A)
     fut_rew = fut_rew.reshape(B * T_ctx, L_mtp_eff)
@@ -550,6 +626,18 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     Transformer + tokenizer + reward head are kept frozen here (callers
     only pass ``parameters_actor()`` and ``parameters_critic()`` to the
     optimizer in Phase 3). Imagination uses the V4 K=4 shortcut sampler.
+
+    **Action-conditioned reward read** (fix 2026-05-03): the original
+    loop sampled ``a_t = π(agent_hid_t)`` and then read
+    ``r_t = reward(agent_hid_t)``, where ``agent_hid_t`` was computed
+    *before* ``a_t`` was placed into the action history.  This made the
+    predicted reward bit-identical across all 21 candidate action bins
+    (verified by sweep) — the actor had no signal on which action was
+    good in a given state.  We now sample ``a_t`` from the post-action
+    agent_hid of the previous step (which already saw ``a_{t-1}``),
+    then re-run dynamics with the new ``(z_t, a_t)`` appended, and read
+    ``r_t``, ``v_t``, ``v_target_t`` from *that* agent_hid — which
+    therefore depends on the chosen action.
     """
     obs = batch['obs']                       # (B, T, L, D)
     act = batch['act']                       # (B, T, A)
@@ -563,13 +651,24 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         z_ctx = model.tokenizer.encode(obs_cur)              # (B, T, z)
     a_ctx = act
 
-    # Sliding history.
     z_history = z_ctx
     a_history = a_ctx
     d_min_v = 1.0 / cfg.k_max
 
+    # Initial agent_hid at the buffer's last position — already sees the
+    # last buffered (z_{T-1}, a_{T-1}) thanks to within-step bidirectional
+    # block-causal attention.  This is the "post-action" hidden state we
+    # feed to the policy to sample the first imagined action.
+    with torch.no_grad():
+        tau_clean = torch.full((B, T), 1.0, device=device,
+                                 dtype=z_history.dtype)
+        d_min_t = torch.full((B, T), d_min_v, device=device,
+                              dtype=z_history.dtype)
+        out0 = model.dynamics(z_history, tau_clean, d_min_t, a_history)
+        agent_hid_post = out0['agent_hid'][:, -1]            # (B, D)
+
     imagined_rewards: List[torch.Tensor] = []
-    imagined_logp: List[torch.Tensor] = []      # currently informational only
+    imagined_logp: List[torch.Tensor] = []
     imagined_entropy: List[torch.Tensor] = []
     imagined_actions: List[torch.Tensor] = []
     imagined_values: List[torch.Tensor] = []
@@ -577,38 +676,41 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     imagined_agent_hid: List[torch.Tensor] = []
 
     for h in range(H):
+        # 1. Sample action conditioned on post-action agent_hid of the
+        #    previous step (or the buffer's last step at h=0).
+        action_t, logp_t, ent_t = model.policy(agent_hid_post)
+
+        # 2. Imagine the next z under that action (K=4 shortcut sampler).
+        with torch.no_grad():
+            z_next = model.imagine_next_z(z_history, action_t,
+                                           k_steps=cfg.k_max,
+                                           tau_ctx=cfg.tau_ctx)      # (B, z)
+
+        # 3. Slide histories: append (z_t, a_t).
+        z_history = torch.cat([z_history[:, -(T - 1):],
+                                 z_next.unsqueeze(1)], dim=1)
+        a_history = torch.cat([a_history[:, -(T - 1):],
+                                 action_t.unsqueeze(1)], dim=1)
+
+        # 4. Re-run dynamics so agent_hid at the new last-position sees
+        #    the freshly-sampled a_t.  This is the key change vs. before.
         T_now = z_history.shape[1]
-        # 1. Clean dynamics pass to obtain agent_hid at the latest position.
         with torch.no_grad():
             tau_clean = torch.full((B, T_now), 1.0, device=device,
                                      dtype=z_history.dtype)
             d_min_t = torch.full((B, T_now), d_min_v, device=device,
                                   dtype=z_history.dtype)
             out = model.dynamics(z_history, tau_clean, d_min_t, a_history)
-            agent_hid_t = out['agent_hid'][:, -1]            # (B, D)
+            agent_hid_post = out['agent_hid'][:, -1]          # (B, D)
 
-        # 2. Policy sample (gradients flow through this).
-        action_t, logp_t, ent_t = model.policy(agent_hid_t)
-        # 3. Frozen reward + target value.
+        # 5. Frozen reward + target-value heads — now action-aware.
         with torch.no_grad():
-            r_logits = model.reward(agent_hid_t)
-            reward_pred = model.reward.expectation(r_logits)        # (B,)
-            tv_logits = model.target_value(agent_hid_t)
+            r_logits = model.reward(agent_hid_post)
+            reward_pred = model.reward.expectation(r_logits)
+            tv_logits = model.target_value(agent_hid_post)
             target_v_pred = model.target_value.expectation(tv_logits)
-        # 4. Current value head (with grad).
-        value_logits = model.value(agent_hid_t)              # (B, n_bins)
-
-        # 5. Sample next z via K=4 shortcut forcing.
-        with torch.no_grad():
-            z_next = model.imagine_next_z(z_history, action_t,
-                                            k_steps=cfg.k_max,
-                                            tau_ctx=cfg.tau_ctx)     # (B, z)
-
-        # 6. Slide history (keep at most T tokens).
-        z_history = torch.cat([z_history[:, -(T - 1):],
-                                 z_next.unsqueeze(1)], dim=1)
-        a_history = torch.cat([a_history[:, -(T - 1):],
-                                 action_t.unsqueeze(1)], dim=1)
+        # 6. Current value head (with grad).
+        value_logits = model.value(agent_hid_post)
 
         imagined_rewards.append(reward_pred)
         imagined_logp.append(logp_t)
@@ -616,7 +718,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         imagined_actions.append(action_t)
         imagined_values.append(value_logits)
         imagined_target_v.append(target_v_pred)
-        imagined_agent_hid.append(agent_hid_t)
+        imagined_agent_hid.append(agent_hid_post)
 
     rewards = torch.stack(imagined_rewards, dim=1)            # (B, H)
     target_values = torch.stack(imagined_target_v, dim=1)     # (B, H)
@@ -641,20 +743,14 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     critic_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
 
     # Advantage (current critic baseline) → PMPO (eq. 11).
-    # Per-trajectory centering: subtract each trajectory's own mean before
-    # the global return-scale rescale.  Without this, REINFORCE-style
-    # gradients are dominated by trajectory-to-trajectory return variance
-    # rather than action-to-action advantage variance, which empirically
-    # collapses the policy to a single bin (verified on trial_0000:
-    # actions_norm = 0.30 constant for 1220 steps, entropy stuck at
-    # log(21)).  Centering reduces gradient variance ~70× on noisy
-    # plant trajectories.
     with torch.no_grad():
         baseline = model.value.expectation(
             model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
         ).view(B, H)
         adv_raw = target_returns - baseline
-        # Per-trajectory mean centering.
+        # Per-trajectory mean centering reduces gradient variance from
+        # trajectory-to-trajectory return scale, isolating the
+        # action-to-action advantage signal.
         adv_centered = adv_raw - adv_raw.mean(dim=1, keepdim=True)
         scale = model.update_return_scale(target_returns).clamp_min(1.0)
 
@@ -672,6 +768,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_loss': critic_loss,
         'imagined_return_mean': target_returns.mean().detach(),
         'imagined_reward_mean': rewards.mean().detach(),
+        'imagined_reward_std': rewards.std().detach(),
         'entropy_mean': entropies.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
         'adv_centered_std': adv_centered.std().detach(),
@@ -1196,12 +1293,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                       flush=True)
                 break
         if total_iters % cfg.save_every_iters == 0:
-            torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)},
+            torch.save({'model': model.state_dict(), 'cfg': asdict(cfg),
+                        'obs_norm': env.get_obs_norm_stats()},
                        out_dir / f'ckpt_iter_{total_iters:05d}.pt')
 
     log_f.close()
     final_path = out_dir / 'final.pt'
-    torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, final_path)
+    torch.save({'model': model.state_dict(), 'cfg': asdict(cfg),
+                'obs_norm': env.get_obs_norm_stats()}, final_path)
 
     try:
         _save_training_diagnostics_plot(log_path, out_dir / 'training_diagnostics.png')
