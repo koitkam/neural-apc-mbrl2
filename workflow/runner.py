@@ -381,7 +381,6 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
         # let the next trial run with a clean slate.
         try:
             import gc
-            import torch._dynamo
             gc.collect()
             torch._dynamo.reset()
             torch.cuda.empty_cache()
@@ -422,7 +421,6 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     # and free CUDA memory to give the next trial a clean slate.
     try:
         import gc
-        import torch._dynamo
         gc.collect()
         torch._dynamo.reset()
         if torch.cuda.is_available():
