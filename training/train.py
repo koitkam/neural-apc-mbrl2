@@ -150,6 +150,21 @@ class TrainConfig:
 
     # ----- Phase-3 evaluation cadence -----
     phase3_eval_every_iters: int = 5
+    # Collect a fresh on-policy episode every K P3 iters (paper
+    # Algorithm 1 line 22 calls for every iter, but every-iter
+    # collection on a CPU plant simulator burns ~50% of wall-clock
+    # without changing the on-policy distribution meaningfully on the
+    # short BO horizons we use; K=4 keeps the actor data within ≤4
+    # gradient steps of the policy snapshot used to collect it).
+    phase3_collect_every_iters: int = 4
+    # Reduce inner train steps in P3 so more iters happen per fixed
+    # env-step budget — Optuna's pruner gets more samples and we get
+    # finer-grained logs of actor / entropy progression.
+    phase3_train_steps_per_iter: int = 25
+    # P3 warmup before reporting EMA to pruner (avoid pruning trials on
+    # the first few P3 returns which are dominated by the snapshot
+    # actor that hasn't been updated by imagination yet).
+    phase3_pruner_warmup_iters: int = 8
 
     # ----- I/O -----
     out_dir: str = ''
@@ -375,7 +390,8 @@ class APCEnv:
         self._last_cv_violation_sum += float(comps.get('cv_violation_penalty', 0.0))
         self._last_mv_violation_sum += float(comps.get('mv_violation_penalty', 0.0))
         info = {'reward_components': comps, 't': self._t,
-                'raw_reward': raw_reward}
+                'raw_reward': raw_reward,
+                'raw_state': np.asarray(next_state, dtype='float32').copy()}
         return self._window.copy(), reward, done, info
 
 
@@ -1042,6 +1058,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     total_env_steps = 0
     total_iters = 0
+    p3_iters = 0
     start_time = time.time()
     last_log_time = start_time
     last_log_steps = 0
@@ -1103,18 +1120,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 ema_return = (ret if ema_return is None
                                 else 0.95 * ema_return + 0.05 * ret)
         else:
-            # Phase 3: on-policy collection (stochastic actor) every iter.
-            # The trainer also keeps the world-model heads (tokenizer +
+            # Phase 3: on-policy collection (stochastic actor) every
+            # ``phase3_collect_every_iters`` P3 iters (default 4).  The
+            # trainer also keeps the world-model heads (tokenizer +
             # dynamics + reward) alive on these batches via the P3 WM
             # update below, so the WM remains aligned with the actor's
             # current state-visit distribution.
-            ep = collect_episode(env, model, device, cfg,
-                                   random_action=False, deterministic=False)
-            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-            total_env_steps += cfg.episode_length
-            ret = float(ep['rew'].sum())
-            ema_return = (ret if ema_return is None
-                            else 0.95 * ema_return + 0.05 * ret)
+            collect_every = max(1, int(cfg.phase3_collect_every_iters))
+            if (total_iters % collect_every) == 0:
+                ep = collect_episode(env, model, device, cfg,
+                                       random_action=False,
+                                       deterministic=False)
+                buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+                total_env_steps += cfg.episode_length
+                ret = float(ep['rew'].sum())
+                ema_return = (ret if ema_return is None
+                                else 0.95 * ema_return + 0.05 * ret)
             # Periodic deterministic eval (for the BO score window).
             if (total_iters % max(1, cfg.phase3_eval_every_iters)) == 0:
                 ep_eval = collect_episode(env, model, device, cfg,
@@ -1139,7 +1160,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         ag_losses: Dict[str, torch.Tensor] = {}
         ac_losses: Dict[str, torch.Tensor] = {}
 
-        for _ in range(cfg.train_steps_per_iter):
+        for _ in range(cfg.train_steps_per_iter
+                          if current_phase != 3
+                          else max(1, int(cfg.phase3_train_steps_per_iter))):
             _t = time.time()
             batch_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
             batch: Dict[str, torch.Tensor] = {}
@@ -1247,6 +1270,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 t_ac_acc += time.time() - _t
 
         total_iters += 1
+        if current_phase == 3:
+            p3_iters += 1
 
         if total_iters % cfg.log_every == 0:
             now = time.time()
@@ -1332,17 +1357,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             iter_raw_returns = []
 
         if on_iter_end is not None:
-            try:
-                stop = bool(on_iter_end(int(total_iters),
-                                          int(total_env_steps),
-                                          float(ema_return)
-                                          if ema_return is not None else 0.0))
-            except Exception:
-                stop = False
-            if stop:
-                print(f'[train] early-stop requested at iter {total_iters}',
-                      flush=True)
-                break
+            # Gate the BO pruner to *post-warmup P3 only*.  Reporting
+            # P1/P2 random-action EMAs (or early P3 EMAs dominated by
+            # the snapshot actor) makes the pruner kill trials on
+            # pre-learning noise, not on actual learning quality.
+            warmup = max(0, int(getattr(cfg, 'phase3_pruner_warmup_iters', 0)))
+            if current_phase == 3 and p3_iters > warmup:
+                try:
+                    stop = bool(on_iter_end(int(total_iters),
+                                              int(total_env_steps),
+                                              float(ema_return)
+                                              if ema_return is not None else 0.0))
+                except Exception:
+                    stop = False
+                if stop:
+                    print(f'[train] early-stop requested at iter {total_iters}',
+                          flush=True)
+                    break
         if total_iters % cfg.save_every_iters == 0:
             torch.save({'model': model.state_dict(), 'cfg': asdict(cfg),
                         'obs_norm': env.get_obs_norm_stats()},

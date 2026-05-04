@@ -373,7 +373,16 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
         next_window, scaled_r, done, info = env.step(a_np)
         comps = info.get('reward_components', {}) or {}
-        states[t] = next_window[-1, :state_dim]
+        # Record the *raw* (physical-units) state so plots/npz read true
+        # plant values, not the post-standardizer z-scores that the
+        # tokenizer sees.  Falls back to the normalized obs slice if the
+        # env did not expose ``raw_state`` for back-compat.
+        raw_st = info.get('raw_state')
+        if raw_st is None:
+            states[t] = next_window[-1, :state_dim]
+        else:
+            arr = np.asarray(raw_st, dtype='float32').reshape(-1)
+            states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
         actions_norm[t] = a_np
         controls[t] = np.asarray(env._prev_control, dtype='float32')
         raw_rewards[t] = float(info.get('raw_reward', 0.0))
@@ -412,6 +421,9 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                        getattr(env.setpoint_mgr, 'base_cv_bounds', np.zeros((0, 2)))],
         'cv_targets': [float(x) for x in
                         getattr(env.setpoint_mgr, 'base_cv_targets', [])],
+        'cv_target_enabled': [bool(x) for x in
+                                getattr(env.setpoint_mgr,
+                                          'cv_target_enabled', [])],
         'reward_scale': float(env.reward_scale),
     }
 
@@ -529,6 +541,7 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
     cv_bounds = ep.get('cv_bounds') or []
     mv_bounds = ep.get('mv_bounds') or []
     cv_targets = ep.get('cv_targets') or []
+    cv_target_enabled = ep.get('cv_target_enabled') or []
     schedule = ep['schedule']
     T = ep['episode_length']
     t_arr = np.arange(T)
@@ -557,7 +570,16 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '') -> Non
             continue
         bounds = cv_bounds[k] if k < len(cv_bounds) else None
         norm = cv_norm[k] if k < len(cv_norm) else None
-        target = cv_targets[k] if k < len(cv_targets) else None
+        # Only show the target line if this CV explicitly has
+        # ``cv_target_enabled[k] == True``.  When targets are globally
+        # disabled (``runtime_setpoints.targets_enabled = [false]``)
+        # ``base_cv_targets`` may be NaN (already filtered by
+        # ``np.isfinite`` below) or — defensively — a finite
+        # placeholder; the enabled flag is the authoritative gate.
+        tgt_enabled = (k < len(cv_target_enabled)
+                        and bool(cv_target_enabled[k]))
+        target = (cv_targets[k] if (tgt_enabled and k < len(cv_targets))
+                   else None)
         channels.append({'group': 'cv', 'series': states[:, i],
                          'label': _name(i, f'CV[{i}]'), 'bounds': bounds,
                          'norm': norm, 'target': target, 'color': '#2ca02c'})
@@ -919,6 +941,12 @@ def run_validation(*,
                                                 dtype='float32'),
                     mv_bounds=np.asarray(ep_d.get('mv_bounds', []),
                                            dtype='float32'),
+                    cv_bounds=np.asarray(ep_d.get('cv_bounds', []),
+                                           dtype='float32'),
+                    cv_targets=np.asarray(ep_d.get('cv_targets', []),
+                                            dtype='float32'),
+                    cv_target_enabled=np.asarray(
+                        ep_d.get('cv_target_enabled', []), dtype=bool),
                     sample_rate=np.asarray([int(ep_d.get('sample_rate', 1))],
                                              dtype='int64'),
                     episode_length=np.asarray([int(ep_d.get('episode_length',
