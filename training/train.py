@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import time
 from collections import deque
 from dataclasses import dataclass, field, asdict
@@ -165,6 +166,44 @@ class TrainConfig:
     # the first few P3 returns which are dominated by the snapshot
     # actor that hasn't been updated by imagination yet).
     phase3_pruner_warmup_iters: int = 8
+
+    # ----- Early stopping (within a single trial) -----
+    # Master switch.  All sub-criteria are gated on this.
+    early_stop_enable: bool = True
+    # P3 plateau: stop when no new best ``ema_return`` for this many P3
+    # iters AND we are past ``phase3_pruner_warmup_iters``.  The trainer
+    # writes ``best.pt`` whenever a new best is reached and copies it to
+    # ``final.pt`` on plateau-stop so validation auto-picks the best
+    # state without needing runner / validate.py changes.
+    early_stop_p3_patience_iters: int = 200
+    # Minimum relative improvement (vs current best) that counts as
+    # "new best" (avoids ratcheting on noise).
+    early_stop_p3_min_improvement: float = 0.01
+    # Entropy-collapse trip: ``entropy_mean < frac * log(n_action_bins)``
+    # for ``patience`` consecutive P3 logs → stop (policy committed to
+    # near-deterministic argmax; PMPO can't recover without re-warming).
+    early_stop_entropy_collapse_frac: float = 0.10
+    early_stop_entropy_collapse_patience_iters: int = 50
+    # Critic-divergence trip: critic_loss above ``factor`` ×
+    # rolling-median (window 200 P3 iters) for ``patience`` consecutive
+    # logs → stop.
+    early_stop_critic_divergence_factor: float = 5.0
+    early_stop_critic_divergence_patience_iters: int = 20
+    # Grad-skip storm: more than ``max_skips`` skipped optimizer steps
+    # within ``window_iters`` consecutive iters → stop (NaN/Inf in
+    # actor or critic gradient is unrecoverable in this run).
+    early_stop_grad_skip_window_iters: int = 100
+    early_stop_grad_skip_max: int = 5
+    # P1 mid-check: at the P1→P2 transition, require ``sf_loss`` to have
+    # dropped at least ``min_drop_frac`` from its initial value.  If not,
+    # WM never learned dynamics; flag the trial so the BO score reflects
+    # this (we still let it run — P3 plateau will catch it).  Set to 0.0
+    # to disable.
+    early_stop_p1_min_sf_drop_frac: float = 0.10
+    # P2 mid-check: at the P2→P3 transition, require ``reward_mtp_loss``
+    # to be below this absolute value (random-baseline ≈ log(255) ≈ 5.5
+    # for default twohot 255-bin head; 4.5 is "started learning").
+    early_stop_p2_max_reward_mtp_loss: float = 4.5
 
     # ----- I/O -----
     out_dir: str = ''
@@ -1075,6 +1114,28 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     t_wm_acc = 0.0
     t_ac_acc = 0.0
 
+    # ----- Early-stop bookkeeping -----
+    es_enable = bool(getattr(cfg, 'early_stop_enable', True))
+    best_p3_ema: Optional[float] = None
+    best_p3_iter: int = -1
+    best_ckpt_path: Optional[Path] = None
+    iters_since_best: int = 0
+    ent_collapse_streak: int = 0
+    critic_div_streak: int = 0
+    critic_loss_window: 'deque[float]' = deque(maxlen=200)
+    grad_skip_history: 'deque[Tuple[int, int]]' = deque(maxlen=512)  # (iter, skip_count)
+    grad_skip_prev_total: int = 0
+    early_stop_reason: Optional[str] = None
+    p1_initial_sf: Optional[float] = None
+    p2_final_reward_mtp: Optional[float] = None
+    mid_check_flags: List[str] = []
+    n_action_bins_log = math.log(max(2, int(getattr(cfg, 'n_action_bins', 21))))
+    # Pre-initialize loss dicts so the phase-transition mid-checks can
+    # read them safely even when the prior phase produced no log iter.
+    wm_losses: Dict = {}
+    ag_losses: Dict = {}
+    ac_losses: Dict = {}
+
     def _phase_for(env_steps: int) -> int:
         if env_steps < p1:
             return 1
@@ -1094,6 +1155,34 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         if new_phase != current_phase:
             print(f'[phase] transition {current_phase} -> {new_phase} '
                   f'at env_steps={total_env_steps}', flush=True)
+            # Phase mid-checks: emit a flag in the trial summary if the
+            # *previous* phase did not meet its convergence floor.  We
+            # do not abort here — the trial still runs — but the flag
+            # surfaces in summary and is also re-detected in
+            # ``evaluation/diagnostics.py``.
+            if es_enable and current_phase == 1 and new_phase == 2:
+                # End of P1: did sf_loss drop?
+                min_drop = float(getattr(cfg, 'early_stop_p1_min_sf_drop_frac', 0.0))
+                if (min_drop > 0 and p1_initial_sf is not None):
+                    last_sf = float(wm_losses.get('sf_loss', p1_initial_sf))
+                    drop = (p1_initial_sf - last_sf) / max(1e-8, abs(p1_initial_sf))
+                    if drop < min_drop:
+                        msg = (f'P1: sf_loss drop {drop*100:.1f}% < '
+                                f'{min_drop*100:.1f}% (initial={p1_initial_sf:.3f} '
+                                f'final={last_sf:.3f}) — WM may not have learned')
+                        print(f'[early-stop-flag] {msg}', flush=True)
+                        mid_check_flags.append(msg)
+            if es_enable and current_phase == 2 and new_phase == 3:
+                # End of P2: is reward MTP head learning?
+                max_rmtp = float(getattr(cfg, 'early_stop_p2_max_reward_mtp_loss',
+                                            float('inf')))
+                last_rmtp = float(ag_losses.get('reward_mtp_loss', float('inf')))
+                p2_final_reward_mtp = last_rmtp
+                if last_rmtp > max_rmtp:
+                    msg = (f'P2: reward_mtp_loss={last_rmtp:.3f} > '
+                            f'{max_rmtp:.3f} — reward head not learning')
+                    print(f'[early-stop-flag] {msg}', flush=True)
+                    mid_check_flags.append(msg)
             current_phase = new_phase
             if current_phase == 3:
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
@@ -1356,6 +1445,115 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             iter_mv_violations = []
             iter_raw_returns = []
 
+            # ----- Early-stop detection (per log iter) -----
+            if es_enable:
+                # Capture P1 initial sf_loss on the first P1 log iter that has
+                # sf_loss available (the very first iter often has 0.0 dummy).
+                if (current_phase == 1 and p1_initial_sf is None
+                        and 'sf_loss' in row and row['sf_loss'] > 1e-6):
+                    p1_initial_sf = float(row['sf_loss'])
+
+                # --- Hard fails ---
+                # Grad-skip storm.
+                cur_total_skip = int(row.get('n_grad_skip', 0))
+                d_skip = cur_total_skip - grad_skip_prev_total
+                grad_skip_prev_total = cur_total_skip
+                grad_skip_history.append((total_iters, d_skip))
+                window_iters = max(1, int(getattr(cfg,
+                            'early_stop_grad_skip_window_iters', 100)))
+                window_max = int(getattr(cfg, 'early_stop_grad_skip_max', 5))
+                # Count skips within the last ``window_iters`` iters.
+                window_skips = sum(s for (it_, s) in grad_skip_history
+                                    if it_ > total_iters - window_iters)
+                if window_skips > window_max:
+                    early_stop_reason = (
+                        f'grad_skip_storm: {window_skips} skips in last '
+                        f'{window_iters} iters (>{window_max})')
+
+                # P3-only hard fails.
+                if early_stop_reason is None and current_phase == 3:
+                    ent = row.get('entropy_mean')
+                    if ent is not None:
+                        thr = (float(getattr(cfg,
+                                'early_stop_entropy_collapse_frac', 0.10))
+                               * n_action_bins_log)
+                        if ent < thr:
+                            ent_collapse_streak += 1
+                        else:
+                            ent_collapse_streak = 0
+                        if ent_collapse_streak >= int(getattr(cfg,
+                                'early_stop_entropy_collapse_patience_iters', 50)):
+                            early_stop_reason = (
+                                f'entropy_collapse: ent={ent:.3f} < '
+                                f'{thr:.3f} for {ent_collapse_streak} iters')
+
+                    cl = row.get('critic_loss')
+                    if cl is not None and cl > 0:
+                        if len(critic_loss_window) >= 20:
+                            med = float(np.median(critic_loss_window))
+                            factor = float(getattr(cfg,
+                                    'early_stop_critic_divergence_factor', 5.0))
+                            if med > 1e-8 and cl > factor * med:
+                                critic_div_streak += 1
+                            else:
+                                critic_div_streak = 0
+                            if critic_div_streak >= int(getattr(cfg,
+                                    'early_stop_critic_divergence_patience_iters',
+                                    20)):
+                                early_stop_reason = (
+                                    f'critic_divergence: critic_loss={cl:.3f} > '
+                                    f'{factor:.1f}× median={med:.3f} for '
+                                    f'{critic_div_streak} iters')
+                        critic_loss_window.append(float(cl))
+
+                # --- Soft fail: P3 plateau on best ema_return ---
+                if (early_stop_reason is None and current_phase == 3
+                        and ema_return is not None and np.isfinite(ema_return)):
+                    min_imp = float(getattr(cfg,
+                            'early_stop_p3_min_improvement', 0.01))
+                    if best_p3_ema is None:
+                        best_p3_ema = float(ema_return)
+                        best_p3_iter = total_iters
+                        iters_since_best = 0
+                    else:
+                        # Relative improvement against |best| with floor 1.0
+                        # so trials hovering near 0 don't ratchet on noise.
+                        denom = max(1.0, abs(best_p3_ema))
+                        improvement = (ema_return - best_p3_ema) / denom
+                        if improvement >= min_imp:
+                            best_p3_ema = float(ema_return)
+                            best_p3_iter = total_iters
+                            iters_since_best = 0
+                            # Persist best ckpt for plateau-stop recovery.
+                            try:
+                                best_ckpt_path = out_dir / 'best.pt'
+                                torch.save({'model': model.state_dict(),
+                                            'cfg': asdict(cfg),
+                                            'obs_norm': env.get_obs_norm_stats(),
+                                            'best_ema_return': best_p3_ema,
+                                            'best_iter': best_p3_iter},
+                                           best_ckpt_path)
+                            except Exception as _e:
+                                print(f'[early-stop] best-ckpt save failed: '
+                                       f'{_e!r}', flush=True)
+                        else:
+                            iters_since_best += 1
+                    p3_patience = int(getattr(cfg,
+                            'early_stop_p3_patience_iters', 200))
+                    warmup = int(getattr(cfg,
+                            'phase3_pruner_warmup_iters', 8))
+                    if (iters_since_best >= p3_patience
+                            and p3_iters > warmup):
+                        early_stop_reason = (
+                            f'p3_plateau: no >+{min_imp*100:.1f}% improvement '
+                            f'over best={best_p3_ema:.3f} for '
+                            f'{iters_since_best} iters')
+
+                if early_stop_reason is not None:
+                    print(f'[early-stop] tripped: {early_stop_reason}',
+                           flush=True)
+                    break
+
         if on_iter_end is not None:
             # Gate the BO pruner to *post-warmup P3 only*.  Reporting
             # P1/P2 random-action EMAs (or early P3 EMAs dominated by
@@ -1384,6 +1582,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     torch.save({'model': model.state_dict(), 'cfg': asdict(cfg),
                 'obs_norm': env.get_obs_norm_stats()}, final_path)
 
+    # Early-stop checkpoint promotion: when training stopped on a P3
+    # plateau, the *current* model state has been the same (or worse)
+    # as the snapshot at ``best_p3_iter``.  Hard-fail trips
+    # (entropy_collapse, critic_divergence, grad_skip_storm) usually
+    # corrupt the current state, so the saved best.pt is a more
+    # trustworthy controller.  Promote it to final.pt so validation +
+    # ONNX export pick it up automatically.
+    if (early_stop_reason is not None and best_ckpt_path is not None
+            and Path(best_ckpt_path).exists()):
+        try:
+            shutil.copy2(str(best_ckpt_path), str(final_path))
+            print(f'[early-stop] promoted best.pt (iter={best_p3_iter}, '
+                  f'ema={best_p3_ema:.3f}) -> final.pt', flush=True)
+        except Exception as _e:
+            print(f'[early-stop] best->final promotion failed: {_e!r}',
+                   flush=True)
+
     try:
         _save_training_diagnostics_plot(log_path, out_dir / 'training_diagnostics.png')
     except Exception as e:
@@ -1400,6 +1615,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                       if len(return_window) > 1 else None),
         'final_return_window_n': int(len(return_window)),
         'n_grad_skip': int(n_grad_skip),
+        'early_stop_reason': early_stop_reason,
+        'best_p3_ema_return': (float(best_p3_ema)
+                                if best_p3_ema is not None else None),
+        'best_p3_iter': int(best_p3_iter) if best_p3_iter >= 0 else None,
+        'best_ckpt': (str(best_ckpt_path)
+                       if best_ckpt_path is not None else None),
+        'mid_check_flags': list(mid_check_flags),
     }
 
 
@@ -1437,6 +1659,26 @@ def _cfg_from_env() -> TrainConfig:
         ('SIM_EPISODE_LENGTH', 'episode_length', int),
         ('SIM_SAMPLE_RATE', 'sample_rate', int),
         ('CONTROLLER_OUT_DIR', 'out_dir', str),
+        # ----- Early-stop overrides -----
+        ('DREAMER_EARLY_STOP', 'early_stop_enable',
+            lambda v: bool(int(v))),
+        ('DREAMER_ES_P3_PATIENCE', 'early_stop_p3_patience_iters', int),
+        ('DREAMER_ES_P3_MIN_IMPROVEMENT',
+            'early_stop_p3_min_improvement', float),
+        ('DREAMER_ES_ENT_FRAC', 'early_stop_entropy_collapse_frac', float),
+        ('DREAMER_ES_ENT_PATIENCE',
+            'early_stop_entropy_collapse_patience_iters', int),
+        ('DREAMER_ES_CRITIC_FACTOR',
+            'early_stop_critic_divergence_factor', float),
+        ('DREAMER_ES_CRITIC_PATIENCE',
+            'early_stop_critic_divergence_patience_iters', int),
+        ('DREAMER_ES_GRADSKIP_WINDOW',
+            'early_stop_grad_skip_window_iters', int),
+        ('DREAMER_ES_GRADSKIP_MAX', 'early_stop_grad_skip_max', int),
+        ('DREAMER_ES_P1_MIN_SF_DROP',
+            'early_stop_p1_min_sf_drop_frac', float),
+        ('DREAMER_ES_P2_MAX_RMTP',
+            'early_stop_p2_max_reward_mtp_loss', float),
     ]:
         v = os.environ.get(name)
         if v is not None and v != '':
