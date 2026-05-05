@@ -410,8 +410,17 @@ class APCEnv:
         next_state = np.asarray(next_state, dtype='float32').reshape(-1)
         try:
             apply_disturbance_schedule(next_state, self.sim, self._schedule)
-        except Exception:
-            pass
+        except Exception as _de:
+            # Don't crash training on schedule errors, but no longer swallow
+            # them silently — the previous ``except: pass`` masked a numpy
+            # array-truth bug that caused validation's scripted-disturbance
+            # episode to skip without explanation.  Log once per env.
+            if not getattr(self, '_disturbance_err_logged', False):
+                import traceback
+                print(f'[env.step] apply_disturbance_schedule error '
+                      f'(further occurrences silenced): {_de!r}', flush=True)
+                traceback.print_exc()
+                self._disturbance_err_logged = True
         comps = compute_objective_components(
             state=next_state, sim=self.sim,
             control=control, prev_control=self._prev_control,

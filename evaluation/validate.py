@@ -1056,8 +1056,10 @@ def run_validation(*,
                 'schedule': ep_d['schedule'],
             })
         except Exception as e:
+            import traceback
             print(f'[val] scripted-disturbance episode skipped (seed {seed}): {e!r}',
                   flush=True)
+            traceback.print_exc()
 
         seed_results.append(eps)
         print(f'[val] seed {seed}: {len(eps)} episodes done', flush=True)
@@ -1075,7 +1077,12 @@ def run_validation(*,
         diag_env = APCEnv(cfg, np.random.default_rng(99_999))
         if obs_norm_state is not None:
             try:
-                diag_env.set_obs_norm_stats(obs_norm_state)
+                diag_env.set_obs_norm_stats(
+                    mean=np.asarray(obs_norm_state.get('mean')),
+                    var=np.asarray(obs_norm_state.get('var')),
+                    count=float(obs_norm_state.get('count', 1.0)),
+                    learn=False,
+                )
             except Exception:
                 pass
         diag = compute_training_diagnostics(
