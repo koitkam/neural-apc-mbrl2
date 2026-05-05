@@ -179,11 +179,21 @@ class TrainConfig:
     # Minimum relative improvement (vs current best) that counts as
     # "new best" (avoids ratcheting on noise).
     early_stop_p3_min_improvement: float = 0.01
-    # Entropy-collapse trip: ``entropy_mean < frac * log(n_action_bins)``
-    # for ``patience`` consecutive P3 logs → stop (policy committed to
-    # near-deterministic argmax; PMPO can't recover without re-warming).
-    early_stop_entropy_collapse_frac: float = 0.10
-    early_stop_entropy_collapse_patience_iters: int = 50
+    # Entropy-collapse trip: detect a *sustained* low-entropy regime, not
+    # just a single dip.  We maintain a sliding window of the last
+    # ``window_iters`` P3 entropy values and trip when at least
+    # ``min_frac_below * window_iters`` of them are below
+    # ``frac * log(n_action_bins)``.  Empirically (run_20260505_095652)
+    # the policy entropy bounces 0.1–1.5 around the threshold during
+    # collapse and never accumulates a long enough consecutive streak,
+    # so the legacy patience-based detector never trips.
+    early_stop_entropy_collapse_frac: float = 0.20
+    early_stop_entropy_collapse_window_iters: int = 30
+    early_stop_entropy_collapse_min_frac_below: float = 0.70
+    # Legacy: kept for backward compat with env-var overrides.  Set to
+    # the same value as ``window_iters`` so single-streak users still get
+    # a sensible default; the sliding-window check usually trips first.
+    early_stop_entropy_collapse_patience_iters: int = 30
     # Critic-divergence trip: critic_loss above ``factor`` ×
     # rolling-median (window 200 P3 iters) for ``patience`` consecutive
     # logs → stop.
@@ -1130,6 +1140,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     best_ckpt_path: Optional[Path] = None
     iters_since_best: int = 0
     ent_collapse_streak: int = 0
+    ent_window: List[float] = []
     critic_div_streak: int = 0
     critic_loss_window: 'deque[float]' = deque(maxlen=200)
     grad_skip_history: 'deque[Tuple[int, int]]' = deque(maxlen=512)  # (iter, skip_count)
@@ -1484,14 +1495,40 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     ent = row.get('entropy_mean')
                     if ent is not None:
                         thr = (float(getattr(cfg,
-                                'early_stop_entropy_collapse_frac', 0.10))
+                                'early_stop_entropy_collapse_frac', 0.20))
                                * n_action_bins_log)
+                        # Maintain sliding window of P3 entropy values.
+                        ent_window.append(float(ent))
+                        win_n = max(2, int(getattr(cfg,
+                                'early_stop_entropy_collapse_window_iters',
+                                30)))
+                        if len(ent_window) > win_n:
+                            ent_window.pop(0)
+                        # Sliding-window detector: trip when a sufficient
+                        # fraction of the last ``win_n`` entropies is
+                        # below ``thr``.
+                        if len(ent_window) >= win_n:
+                            n_below = sum(1 for e in ent_window if e < thr)
+                            min_below = (float(getattr(cfg,
+                                    'early_stop_entropy_collapse_min_frac_below',
+                                    0.70))
+                                          * win_n)
+                            if n_below >= min_below:
+                                early_stop_reason = (
+                                    f'entropy_collapse_window: '
+                                    f'{n_below}/{win_n} iters below '
+                                    f'thr={thr:.3f} '
+                                    f'(latest={ent:.3f})')
+                        # Legacy consecutive-streak detector (kept as a
+                        # fallback for very long sustained collapse).
                         if ent < thr:
                             ent_collapse_streak += 1
                         else:
                             ent_collapse_streak = 0
-                        if ent_collapse_streak >= int(getattr(cfg,
-                                'early_stop_entropy_collapse_patience_iters', 50)):
+                        if (early_stop_reason is None
+                                and ent_collapse_streak >= int(getattr(cfg,
+                                'early_stop_entropy_collapse_patience_iters',
+                                30))):
                             early_stop_reason = (
                                 f'entropy_collapse: ent={ent:.3f} < '
                                 f'{thr:.3f} for {ent_collapse_streak} iters')
@@ -1677,6 +1714,10 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_ES_ENT_FRAC', 'early_stop_entropy_collapse_frac', float),
         ('DREAMER_ES_ENT_PATIENCE',
             'early_stop_entropy_collapse_patience_iters', int),
+        ('DREAMER_ES_ENT_WINDOW',
+            'early_stop_entropy_collapse_window_iters', int),
+        ('DREAMER_ES_ENT_MIN_BELOW',
+            'early_stop_entropy_collapse_min_frac_below', float),
         ('DREAMER_ES_CRITIC_FACTOR',
             'early_stop_critic_divergence_factor', float),
         ('DREAMER_ES_CRITIC_PATIENCE',
