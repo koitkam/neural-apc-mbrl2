@@ -87,12 +87,19 @@ def main() -> int:
     parser.add_argument('--out-dir', '-o', default=None,
                         help='Output directory. Default: '
                              '<repo>/output/<sim>/run_<timestamp>/')
-    parser.add_argument('--steps', type=int, default=200_000,
-                        help='Total environment steps (default 200 000).')
+    parser.add_argument('--steps', type=int, default=0,
+                        help='Total environment steps. 0 = plant-tied auto '
+                             '(derive_step_budgets.trial_steps).')
     parser.add_argument('--model-size', choices=['S', 'M', 'L'], default=None,
                         help='Architecture preset. Default: auto-derived from '
                              'plant complexity (channels + multiscale + state_dim).')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--no-noise', action='store_true',
+                        help='Skip plant-aware noise config (debug mode).')
+    parser.add_argument('--no-validate', action='store_true',
+                        help='Skip post-training validation.')
+    parser.add_argument('--val-episodes', type=int, default=3)
+    parser.add_argument('--val-seeds', type=int, default=3)
     args = parser.parse_args()
 
     sim_dir = _resolve_sim_dir(args.simulation_dir)
@@ -162,6 +169,43 @@ def main() -> int:
     os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
     os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'
 
+    # ── Phase 1b½: Plant-aware noise config (parity with workflow.runner) ──
+    # Builds OU process + measurement noise from identified plant dynamics
+    # and exports SIM_NOISE_CONFIG_JSON so SimNoiseWrapper picks it up in
+    # both training and validation subprocesses.  Skip with --no-noise for
+    # debugging without stochastic confounders.
+    if not args.no_noise:
+        try:
+            from utils.sim_factory import create_sim as _create_sim
+            from utils.noise_config import (
+                build_noise_config_from_sim, save_noise_config,
+            )
+            _probe_sim = _create_sim(episode_length=10,
+                                      sample_rate=max(1, sample_rate))
+            bare = _probe_sim
+            for _ in range(4):
+                inner = getattr(bare, '_sim', None)
+                if inner is None:
+                    break
+                bare = inner
+            # lookback not yet identified at this point; pass 0 (only used
+            # for record-keeping inside noise_config).
+            noise_cfg = build_noise_config_from_sim(
+                bare, dynamics_json=dyn,
+                lookback_json={'identified_lookback': 0},
+            )
+            noise_cfg_path = out_dir / 'noise_config.json'
+            save_noise_config(noise_cfg, str(noise_cfg_path))
+            print(f"[run] noise_config: {noise_cfg_path} "
+                  f"(OU={len(noise_cfg.get('ou_noise', []))} "
+                  f"meas={len(noise_cfg.get('measurement_noise', []))})",
+                  flush=True)
+        except Exception as exc:
+            print(f"[run] noise_config: SKIPPED ({exc!r}) — running with no "
+                  "process / measurement noise", flush=True)
+    else:
+        print('[run] noise_config: DISABLED (--no-noise)', flush=True)
+
     # ── Phase 1c: Lookback identification (uses derived sample_rate) ──────
     print('[run] phase 1c: lookback identification', flush=True)
     from utils.lookback_identifier import identify_and_save_lookback
@@ -198,19 +242,37 @@ def main() -> int:
     seq_len = derived['seq_len']
     arch = MODEL_SIZE_PRESETS[model_size]
 
+    # Plant-tied step budget (parity with workflow.runner).  CLI > 0 wins;
+    # otherwise derive trial_steps from episode_length + complexity.
+    from utils.plant_init import derive_step_budgets
+    if int(args.steps) > 0:
+        total_steps = int(args.steps)
+        steps_source = 'cli'
+    else:
+        budgets = derive_step_budgets(
+            episode_length=episode_length,
+            complexity_score=derived['complexity_score'],
+        )
+        total_steps = int(budgets['trial_steps'])
+        steps_source = f"plant-tied:{budgets['source']}"
+    print(f'[run] total_steps={total_steps} ({steps_source})', flush=True)
+
     # Build TrainConfig — every value either plant-tied or paper-faithful default.
     from training.train import TrainConfig, train as run_training
     from utils.plant_init import derive_batch_size
+    # Horizon-adaptive batch size (parity with workflow.runner.run_trial).
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
             batch_size = max(1, int(bs_env))
             bs_info = {'batch_size': batch_size, 'source': 'env_override'}
         except Exception:
-            bs_info = derive_batch_size(model_size)
+            bs_info = derive_batch_size(model_size, horizon=horizon,
+                                         horizon_ref=horizon)
             batch_size = int(bs_info['batch_size'])
     else:
-        bs_info = derive_batch_size(model_size)
+        bs_info = derive_batch_size(model_size, horizon=horizon,
+                                     horizon_ref=horizon)
         batch_size = int(bs_info['batch_size'])
     print(f"[run] batch_size={batch_size} ({bs_info['source']}; "
           f"per_batch≈{bs_info.get('per_batch_mb','?')}MB, "
@@ -226,7 +288,7 @@ def main() -> int:
         lookback=lookback,
         sample_rate=sample_rate,
         episode_length=episode_length,
-        total_steps=int(args.steps),
+        total_steps=total_steps,
         horizon=horizon,
         seq_len=seq_len,
         batch_size=batch_size,
@@ -255,7 +317,8 @@ def main() -> int:
         'batch_size': batch_size,
         'batch_size_source': bs_info['source'],
         'seed': int(args.seed),
-        'total_steps': int(args.steps),
+        'total_steps': total_steps,
+        'total_steps_source': steps_source,
         'config': asdict(cfg),
     }
     with open(out_dir / 'run_plan.json', 'w') as f:
@@ -269,6 +332,28 @@ def main() -> int:
     summary = run_training(cfg)
     with open(out_dir / 'run_summary.json', 'w') as f:
         json.dump({'plan': plan, 'summary': summary}, f, indent=2)
+
+    # ── Phase 3: validation (parity with workflow.runner final retrain) ──
+    val_summary: Dict = {}
+    if not args.no_validate:
+        print('[run] phase 3: validation', flush=True)
+        try:
+            from evaluation.validate import run_validation
+            val_summary = run_validation(controller_dir=out_dir,
+                                          episodes=int(args.val_episodes),
+                                          seeds=int(args.val_seeds))
+            with open(out_dir / 'validation_summary.json', 'w') as f:
+                json.dump(val_summary, f, indent=2, default=str)
+            print(f"[run] validation cum_raw_reward "
+                  f"mean={val_summary.get('cum_raw_reward_mean', float('nan')):.2f} "
+                  f"std={val_summary.get('cum_raw_reward_std', float('nan')):.2f} "
+                  f"-> {out_dir}/validation/", flush=True)
+        except Exception as e:
+            import traceback
+            print(f'[run] validation FAILED: {e!r}', flush=True)
+            traceback.print_exc()
+    else:
+        print('[run] validation: DISABLED (--no-validate)', flush=True)
 
     print('[run] done.', flush=True)
     print(json.dumps(summary, indent=2), flush=True)

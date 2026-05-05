@@ -117,56 +117,85 @@ HORIZON_BAND = (0.5, 0.75, 1.0, 1.5, 2.0)
 # Plant initialization
 # ---------------------------------------------------------------------------
 
-def initialize_from_plant(out_dir: Path) -> Dict:
-    """Run dynamics + lookback identification, save reports.
-
-    Returns a dict with at least ``tau``, ``dead_time``, ``lookback``.
-    """
+def identify_dynamics_from_plant(out_dir: Path) -> Dict:
+    """Run dynamics identification only.  Lookback is identified later
+    once the derived sample_rate is known (see ``identify_lookback``)."""
     from utils.dynamics_identifier import identify_and_save_dynamics
-    from utils.lookback_identifier import identify_and_save_lookback
 
-    dyn_path = out_dir / 'dynamics_identification.json'
-    lb_path = out_dir / 'lookback_identification.json'
     out_dir.mkdir(parents=True, exist_ok=True)
-
+    dyn_path = out_dir / 'dynamics_identification.json'
     dyn = identify_and_save_dynamics(output_path=str(dyn_path))
     tau = float(dyn.get('tau_dominant_identified', dyn.get('tau_dominant', 50.0)) or 50.0)
     dead = float(dyn.get('dead_time_identified', dyn.get('dead_time', 5.0)) or 5.0)
     tau_fast = dyn.get('tau_fastest_identified', tau)
     dt_fast = dyn.get('dead_time_fastest_identified', dead)
-    pair_est = dyn.get('per_pair_estimates') or dyn.get('pair_estimates') or []
 
-    seed = int(os.environ.get('SEED', '0'))
-    # Default scan range: ~lookback expected to be within [round(tau/sr), round(4*tau/sr)].
-    sr = int(os.environ.get('SIM_SAMPLE_RATE', '5'))
-    min_lb = max(8, int(round(tau / max(1, sr))))
-    max_lb = max(min_lb + 8, int(round(4.0 * tau / max(1, sr))))
-
-    lb = identify_and_save_lookback(
-        seed=seed, min_lb=min_lb, max_lb=max_lb,
-        output_path=str(lb_path),
-        tau_dominant=tau, dead_time=dead,
-        tau_fastest=tau_fast, dead_time_fastest=dt_fast,
-        per_pair_estimates=pair_est,
-    )
-    lookback = int(lb.get('identified_lookback', lb.get('lookback', max(min_lb, 32))))
-
-    # Export identified dynamics so downstream helpers (auto_episode_length,
-    # objective_runtime, etc.) see the same plant numbers as workflow/run.py.
     os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
     os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'
-    os.environ['IDENTIFIED_LOOKBACK_SEED'] = str(lookback)
 
     return {
         'tau': tau,
         'dead_time': dead,
         'tau_fast': float(tau_fast) if tau_fast else float(tau),
         'dead_time_fast': float(dt_fast) if dt_fast else float(dead),
-        'lookback': lookback,
         'dynamics_report': str(dyn_path),
-        'lookback_report': str(lb_path),
         'dynamics_raw': dyn,
     }
+
+
+def identify_lookback(out_dir: Path, *, tau: float, dead_time: float,
+                       sample_rate: int, dynamics_raw: Dict,
+                       tau_fast: float | None = None,
+                       dead_time_fast: float | None = None) -> Dict:
+    """Lookback identification using the *derived* ``sample_rate``.
+
+    Must be called after dynamics identification + sample-rate derivation
+    so ``min_lb``/``max_lb`` reflect the actual scan rate the agent will
+    see (parity with ``workflow/run.py``).
+    """
+    from utils.lookback_identifier import identify_and_save_lookback
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lb_path = out_dir / 'lookback_identification.json'
+    seed = int(os.environ.get('SEED', '0'))
+    sr = int(max(1, sample_rate))
+    min_lb = max(8, int(round(tau / sr)))
+    max_lb = max(min_lb + 8, int(round(4.0 * tau / sr)))
+    pair_est = (dynamics_raw.get('per_pair_estimates')
+                or dynamics_raw.get('pair_estimates') or [])
+
+    lb = identify_and_save_lookback(
+        seed=seed, min_lb=min_lb, max_lb=max_lb,
+        output_path=str(lb_path),
+        tau_dominant=tau, dead_time=dead_time,
+        tau_fastest=tau_fast if tau_fast is not None else tau,
+        dead_time_fastest=(dead_time_fast if dead_time_fast is not None
+                           else dead_time),
+        per_pair_estimates=pair_est,
+    )
+    lookback = int(lb.get('identified_lookback',
+                           lb.get('lookback', max(min_lb, 32))))
+    os.environ['IDENTIFIED_LOOKBACK_SEED'] = str(lookback)
+    return {'lookback': lookback, 'lookback_report': str(lb_path)}
+
+
+def initialize_from_plant(out_dir: Path) -> Dict:
+    """Backward-compat wrapper: dynamics + lookback identification using
+    the env-provided ``SIM_SAMPLE_RATE`` (defaults to 5).
+
+    New callers should use ``identify_dynamics_from_plant`` then
+    ``identify_lookback`` after the sample_rate is derived so the
+    lookback scan range reflects the actual agent timestep.
+    """
+    plant = identify_dynamics_from_plant(out_dir)
+    sr = int(os.environ.get('SIM_SAMPLE_RATE', '5'))
+    lb = identify_lookback(out_dir, tau=plant['tau'],
+                           dead_time=plant['dead_time'], sample_rate=sr,
+                           dynamics_raw=plant['dynamics_raw'],
+                           tau_fast=plant.get('tau_fast'),
+                           dead_time_fast=plant.get('dead_time_fast'))
+    plant.update(lb)
+    return plant
 
 
 def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
@@ -547,8 +576,8 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     # SIM_EPISODE_LENGTH env via derive_episode_length).
     sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
 
-    print('[BO] Phase 1: plant identification', flush=True)
-    plant = initialize_from_plant(out_dir / 'plant_id')
+    print('[BO] Phase 1a: dynamics identification', flush=True)
+    plant = identify_dynamics_from_plant(out_dir / 'plant_id')
 
     # Plant-aware noise config.  ``build_noise_config`` produces dynamics-
     # derived OU process noise (CV + DV), measurement noise, and domain-
@@ -577,7 +606,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         noise_cfg = build_noise_config_from_sim(
             bare,
             dynamics_json=plant.get('dynamics_raw') or {},
-            lookback_json={'identified_lookback': int(plant.get('lookback', 0))},
+            lookback_json={'identified_lookback': 0},
         )
         noise_cfg_path = out_dir / 'noise_config.json'
         save_noise_config(noise_cfg, str(noise_cfg_path))
@@ -603,6 +632,21 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     sr = derived['sample_rate']
     base.sample_rate = sr
     base.seq_len = derived['seq_len']
+    os.environ['SIM_SAMPLE_RATE'] = str(sr)
+
+    # Phase 1b: Lookback identification using the *derived* sample_rate
+    # (parity with workflow/run.py — must come AFTER sr is known so the
+    # min_lb/max_lb scan range matches the actual agent timestep).
+    print('[BO] Phase 1b: lookback identification', flush=True)
+    lb_info = identify_lookback(out_dir / 'plant_id',
+                                 tau=plant['tau'],
+                                 dead_time=plant['dead_time'],
+                                 sample_rate=sr,
+                                 dynamics_raw=plant.get('dynamics_raw') or {},
+                                 tau_fast=plant.get('tau_fast'),
+                                 dead_time_fast=plant.get('dead_time_fast'))
+    plant.update(lb_info)
+    print(f"[BO] lookback={plant['lookback']} (from sr={sr})", flush=True)
 
     # Episode length: env override > auto-derived from settling time > paper.
     from utils.auto_episode_length import derive_episode_length
