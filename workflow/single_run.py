@@ -141,6 +141,7 @@ def main() -> int:
     plant_dir.mkdir(parents=True, exist_ok=True)
     dyn_path = plant_dir / 'dynamics_identification.json'
     dyn = identify_and_save_dynamics(output_path=str(dyn_path))
+    os.environ['DYNAMICS_IDENTIFICATION_JSON'] = str(dyn_path)
     tau = float(dyn.get('tau_dominant_identified', dyn.get('tau_dominant', 50.0)) or 50.0)
     dead = float(dyn.get('dead_time_identified', dyn.get('dead_time', 5.0)) or 5.0)
     tau_fast = float(dyn.get('tau_fastest_identified', tau) or tau)

@@ -912,6 +912,8 @@ def run_validation(*,
         n_action_bins=cfg.n_action_bins,
         head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
         mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
+        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
+        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
         attn_impl=getattr(cfg, 'attn_impl', 'auto'),
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

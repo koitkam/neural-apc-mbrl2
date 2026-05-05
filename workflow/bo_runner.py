@@ -125,6 +125,7 @@ def identify_dynamics_from_plant(out_dir: Path) -> Dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     dyn_path = out_dir / 'dynamics_identification.json'
     dyn = identify_and_save_dynamics(output_path=str(dyn_path))
+    os.environ['DYNAMICS_IDENTIFICATION_JSON'] = str(dyn_path)
     tau = float(dyn.get('tau_dominant_identified', dyn.get('tau_dominant', 50.0)) or 50.0)
     dead = float(dyn.get('dead_time_identified', dyn.get('dead_time', 5.0)) or 5.0)
     tau_fast = dyn.get('tau_fastest_identified', tau)
@@ -522,6 +523,9 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         head_hidden=cfg_loaded.head_hidden,
         head_n_layers=cfg_loaded.head_n_layers,
         mtp_length=max(1, int(getattr(cfg_loaded, 'mtp_length', 1))),
+        policy_type=str(getattr(cfg_loaded, 'policy_type', 'continuous')),
+        policy_init_log_std=float(
+            getattr(cfg_loaded, 'policy_init_log_std', -0.5)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)

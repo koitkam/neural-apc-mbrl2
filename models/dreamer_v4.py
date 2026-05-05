@@ -717,6 +717,183 @@ class PolicyHead(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         return log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1)
 
+    # -- shared interface (used by pmpo_loss + early-stop entropy threshold) --
+
+    def kl_to(self, other: 'PolicyHead', latent: torch.Tensor) -> torch.Tensor:
+        """KL(self || other) at ``latent``.  Analytic for categoricals."""
+        cur_logp = F.log_softmax(self.logits(latent), dim=-1)     # (B,A,K)
+        with torch.no_grad():
+            prior_logp = F.log_softmax(other.logits(latent), dim=-1)
+        cur_p = cur_logp.exp()
+        return (cur_p * (cur_logp - prior_logp)).sum(-1).sum(-1)  # (B,)
+
+    @staticmethod
+    def reference_entropy(action_dim: int, n_action_bins: int) -> float:
+        """Max-entropy reference: uniform over all bins per dim."""
+        return float(action_dim) * math.log(max(2, int(n_action_bins)))
+
+
+class ContinuousPolicyHead(nn.Module):
+    """Tanh-squashed-Gaussian (TanhNormal) actor for continuous APC actions.
+
+    Outputs per-action-dim ``(mu, log_std)``; samples via the reparam trick
+    ``a = tanh(mu + sigma * eps)`` with ``eps ~ N(0, I)``.  This is the
+    standard continuous-control distribution (SAC, DreamerV3-continuous):
+    bounded to ``[-1, 1]`` by construction with no boundary singularity, and
+    the underlying Gaussian gives well-behaved gradients & analytic KL for
+    PMPO.
+
+    Replaces the discrete-bin ``PolicyHead`` for chemistry / process control
+    where 6%-of-range bin steps (n_bins=21 over [-1,1] → 0.1) are too coarse
+    to track tight setpoints — a major contributor to actor collapse on
+    test_sim diagnosed 2026-05-05.
+
+    Interface mirrors ``PolicyHead`` (forward / log_prob_of /
+    log_prob_of_mtp / kl_to / reference_entropy) so the trainer + PMPO loss
+    code is policy-type agnostic.
+    """
+
+    LOG_STD_MIN: float = -5.0          # σ ≥ ~0.0067 (numerical floor)
+    LOG_STD_MAX: float = 2.0           # σ ≤ ~7.39  (rarely useful but capped)
+
+    def __init__(self, in_dim: int, hidden_dim: int, action_dim: int,
+                 n_layers: int = 2, mtp_length: int = 1,
+                 init_log_std: float = -0.5):
+        super().__init__()
+        self.action_dim = action_dim
+        self.mtp_length = max(1, int(mtp_length))
+        # Output 2 * action_dim per offset (mu, log_std).
+        self.head = MLP(in_dim, hidden_dim,
+                        self.mtp_length * action_dim * 2,
+                        n_layers=n_layers, zero_init_last=False)
+        # Bias the log_std output toward ``init_log_std`` so the policy
+        # starts with a usable exploration spread (σ≈0.6) rather than
+        # whatever zero-init gives.  We add a learned per-dim log_std bias
+        # since zero_init_last=False already gave the head normal-init
+        # weights; the offset just shifts the starting point.
+        self.register_buffer('log_std_init',
+                              torch.full((action_dim,), float(init_log_std)))
+
+    # ---- raw (mu, log_std) extraction --------------------------------
+
+    def _params_offset(self, latent: torch.Tensor, L: int
+                        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(mu, log_std)`` for offsets ``[0, L)`` shape (B, L, A)."""
+        B = latent.shape[0]
+        out = self.head(latent).view(B, self.mtp_length, self.action_dim, 2)
+        out = out[:, :L]
+        # ``mu`` is the pre-tanh mean (unbounded); the action is bounded to
+        # ``[-1, 1]`` by the tanh squash applied at sample time.  Squashing
+        # ``mu`` here would clip the deterministic action range.  We do
+        # however soft-cap ``mu`` to keep gradients well-behaved when the
+        # head is overconfident — same idea as the dynamics ``soft_cap``.
+        cap = 8.0
+        mu = cap * torch.tanh(out[..., 0] / cap)                  # (B,L,A)
+        log_std = out[..., 1] + self.log_std_init.view(1, 1, -1)
+        log_std = log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        return mu, log_std
+
+    def dist_params(self, latent: torch.Tensor
+                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Distribution params at offset 0.  Returns ``(mu, log_std)``
+        each shape ``(B, action_dim)``."""
+        mu, log_std = self._params_offset(latent, L=1)
+        return mu[:, 0], log_std[:, 0]
+
+    # ---- sampling + log-prob ------------------------------------------
+
+    @staticmethod
+    def _tanh_log_prob(mu: torch.Tensor, log_std: torch.Tensor,
+                        u: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """log p(a) under TanhNormal where ``u`` is the pre-tanh sample.
+
+        Returns shape matching ``mu`` (per-dim, before sum)."""
+        std = log_std.exp()
+        # Underlying Gaussian log-prob.
+        log_prob_u = -0.5 * (((u - mu) / std) ** 2
+                              + 2.0 * log_std
+                              + math.log(2.0 * math.pi))
+        # Tanh squash Jacobian: log|da/du| = log(1 - tanh(u)^2).
+        # Numerically stable form: 2 * (log(2) - u - softplus(-2u)).
+        log_det = 2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))
+        return log_prob_u - log_det
+
+    def forward(self, latent: torch.Tensor, *,
+                deterministic: bool = False
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, log_std = self.dist_params(latent)
+        std = log_std.exp()
+        if deterministic:
+            u = mu                                   # tanh(mu) is the deterministic action
+            action = torch.tanh(u)
+            # log_prob is undefined for deterministic; return zeros.
+            log_prob = torch.zeros(latent.shape[0], device=latent.device,
+                                    dtype=latent.dtype)
+        else:
+            eps = torch.randn_like(mu)
+            u = mu + std * eps
+            action = torch.tanh(u)
+            log_prob = self._tanh_log_prob(mu, log_std, u, action).sum(-1)
+        # Differential-entropy of the underlying Gaussian
+        # H(N(mu, std)) = 0.5 * log(2 * pi * e * sigma^2), summed over dims.
+        # The tanh squash lowers this by E[log(1 - a^2)] which is hard to
+        # estimate cheaply; we report the Gaussian entropy as the reference
+        # signal (matches SAC convention).  This drives the early-stop
+        # collapse trip too.
+        entropy = (0.5 * (math.log(2.0 * math.pi * math.e)
+                           + 2.0 * log_std)).sum(-1)
+        return action, log_prob, entropy
+
+    def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor
+                     ) -> torch.Tensor:
+        """Log-prob of a continuous action ``(B, action_dim)`` ∈ [-1, 1]."""
+        mu, log_std = self.dist_params(latent)
+        # Invert tanh: u = atanh(action), clamped for numerical stability
+        # near ±1 (atanh(±1) is ±inf).
+        a_clamped = action.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        u = 0.5 * torch.log1p(2.0 * a_clamped / (1.0 - a_clamped))
+        return self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
+
+    def log_prob_of_mtp(self, latent: torch.Tensor,
+                         actions: torch.Tensor) -> torch.Tensor:
+        """``actions`` shape ``(B, L, A)``; returns ``(B, L)``."""
+        L = actions.shape[1]
+        mu, log_std = self._params_offset(latent, L=L)            # (B,L,A)
+        a_clamped = actions.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        u = 0.5 * torch.log1p(2.0 * a_clamped / (1.0 - a_clamped))
+        return self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
+
+    # ---- shared interface (matches PolicyHead) ------------------------
+
+    def kl_to(self, other: 'ContinuousPolicyHead',
+               latent: torch.Tensor) -> torch.Tensor:
+        """Analytic KL(self || other) using the underlying Gaussians.
+
+        The tanh squash is identical for both, so the KL of the
+        squashed distributions equals the KL of the underlying Gaussians.
+        """
+        mu1, log_std1 = self.dist_params(latent)
+        with torch.no_grad():
+            mu2, log_std2 = other.dist_params(latent)
+        var1 = (2.0 * log_std1).exp()
+        var2 = (2.0 * log_std2).exp()
+        kl_per_dim = (log_std2 - log_std1
+                       + (var1 + (mu1 - mu2) ** 2) / (2.0 * var2)
+                       - 0.5)
+        return kl_per_dim.sum(-1)                                # (B,)
+
+    @staticmethod
+    def reference_entropy(action_dim: int, n_action_bins: int = 0) -> float:
+        """Reference entropy for the early-stop trip threshold.
+
+        Uses a Gaussian at σ=1 per dim (≈ 1.4189 nats) — interpreted as
+        "the policy retains a unit-std spread around its mean".  When the
+        actual entropy drops to ``frac * reference_entropy``, σ has
+        collapsed by roughly ``exp(frac - 1)``.
+        """
+        unit_gaussian_entropy = 0.5 * math.log(2.0 * math.pi * math.e)
+        return float(action_dim) * unit_gaussian_entropy
+
 
 # ---------------------------------------------------------------------------
 # Top-level Dreamer 4 container
@@ -746,6 +923,11 @@ class DreamerV4Config:
     head_hidden: int = 256
     head_n_layers: int = 2
     mtp_length: int = 1                    # paper L=8 (Phase-2 MTP)
+    # Policy distribution.  ``'continuous'`` (default) uses TanhNormal;
+    # ``'discrete'`` uses the legacy categorical-bin head from the
+    # paper.  See ``ContinuousPolicyHead`` docstring for rationale.
+    policy_type: str = 'continuous'
+    policy_init_log_std: float = -0.5      # σ ≈ 0.6 at init
 
 
 class DreamerV4(nn.Module):
@@ -766,10 +948,17 @@ class DreamerV4(nn.Module):
         self.dynamics = DynamicsTransformer(dyn_cfg)
         # Heads read from the agent-register hidden state (dim = d_model).
         D = cfg.d_model
-        self.policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
-                                  n_action_bins=cfg.n_action_bins,
-                                  n_layers=cfg.head_n_layers,
-                                  mtp_length=cfg.mtp_length)
+        self.policy_type = str(getattr(cfg, 'policy_type', 'continuous')).lower()
+        if self.policy_type == 'continuous':
+            self.policy = ContinuousPolicyHead(
+                D, cfg.head_hidden, cfg.action_dim,
+                n_layers=cfg.head_n_layers, mtp_length=cfg.mtp_length,
+                init_log_std=getattr(cfg, 'policy_init_log_std', -0.5))
+        else:
+            self.policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
+                                      n_action_bins=cfg.n_action_bins,
+                                      n_layers=cfg.head_n_layers,
+                                      mtp_length=cfg.mtp_length)
         self.reward = TwohotHead(D, cfg.head_hidden,
                                   n_layers=cfg.head_n_layers,
                                   mtp_length=cfg.mtp_length)
@@ -782,10 +971,16 @@ class DreamerV4(nn.Module):
         for p in self.target_value.parameters():
             p.requires_grad_(False)
         # Frozen prior policy snapshot (PMPO behavioural prior, paper eq. 11).
-        self.prior_policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
-                                        n_action_bins=cfg.n_action_bins,
-                                        n_layers=cfg.head_n_layers,
-                                        mtp_length=cfg.mtp_length)
+        if self.policy_type == 'continuous':
+            self.prior_policy = ContinuousPolicyHead(
+                D, cfg.head_hidden, cfg.action_dim,
+                n_layers=cfg.head_n_layers, mtp_length=cfg.mtp_length,
+                init_log_std=getattr(cfg, 'policy_init_log_std', -0.5))
+        else:
+            self.prior_policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
+                                            n_action_bins=cfg.n_action_bins,
+                                            n_layers=cfg.head_n_layers,
+                                            mtp_length=cfg.mtp_length)
         self.prior_policy.load_state_dict(self.policy.state_dict())
         for p in self.prior_policy.parameters():
             p.requires_grad_(False)
@@ -936,7 +1131,7 @@ class DreamerV4(nn.Module):
 # PMPO loss (paper eq. 11)
 # ---------------------------------------------------------------------------
 
-def pmpo_loss(policy: PolicyHead, prior_policy: PolicyHead,
+def pmpo_loss(policy, prior_policy,
               latent: torch.Tensor, action: torch.Tensor,
               advantage: torch.Tensor,
               alpha: float = 0.5, beta: float = 0.1
@@ -948,16 +1143,12 @@ def pmpo_loss(policy: PolicyHead, prior_policy: PolicyHead,
       - D⁻ = {s | A < 0} → downweight chosen action
     Plus a KL term to a frozen prior policy.
 
-    All tensors are flat ``(N, …)``.
+    All tensors are flat ``(N, …)``.  Polymorphic in policy class — both
+    ``PolicyHead`` (categorical) and ``ContinuousPolicyHead`` (TanhNormal)
+    expose ``log_prob_of`` and ``kl_to`` with the required semantics.
     """
     log_prob = policy.log_prob_of(latent, action)               # (N,)
-    with torch.no_grad():
-        prior_logits = prior_policy.logits(latent)              # (N, A, B)
-        prior_logp_full = F.log_softmax(prior_logits, dim=-1)
-    cur_logits = policy.logits(latent)
-    cur_logp_full = F.log_softmax(cur_logits, dim=-1)
-    cur_p_full = cur_logp_full.exp()
-    kl = (cur_p_full * (cur_logp_full - prior_logp_full)).sum(-1).sum(-1)  # (N,)
+    kl = policy.kl_to(prior_policy, latent)                     # (N,)
 
     pos_mask = (advantage >= 0).float()
     neg_mask = 1.0 - pos_mask
@@ -1052,7 +1243,7 @@ __all__ = [
     'symlog', 'symexp', 'twohot_encode',
     'MLP', 'RMSNorm', 'SwiGLU', 'CausalAttention', 'TransformerBlock',
     'Tokenizer', 'DynamicsConfig', 'DynamicsTransformer',
-    'TwohotHead', 'PolicyHead',
+    'TwohotHead', 'PolicyHead', 'ContinuousPolicyHead',
     'DreamerV4Config', 'DreamerV4',
     'sample_tau_d', 'shortcut_corrupt', 'ramp_weight',
     'shortcut_forcing_loss', 'pmpo_loss',

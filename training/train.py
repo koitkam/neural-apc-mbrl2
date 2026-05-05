@@ -83,6 +83,14 @@ class TrainConfig:
     n_action_bins: int = 21
     head_hidden: int = 256
     head_n_layers: int = 2
+    # Policy distribution type.  ``'continuous'`` (default) uses a
+    # tanh-squashed Gaussian (TanhNormal) actor — appropriate for chemical
+    # / process control where the action is a continuous valve / setpoint
+    # in [-1, 1] and discrete-bin actors collapse to corner-bins for
+    # fine-grained tracking tasks.  ``'discrete'`` retains the paper's
+    # categorical-bin head for back-compat / Atari-style sims.
+    policy_type: str = 'continuous'
+    policy_init_log_std: float = -0.5
 
     # ----- Plant / windowing -----
     lookback: int = 32        # transformer context length T_ctx
@@ -872,6 +880,8 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         n_action_bins=cfg.n_action_bins,
         head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
         mtp_length=max(1, int(cfg.mtp_length)),
+        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
+        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
     )
     model = DreamerV4(model_cfg)
     # Optional torch.compile (set via TrainConfig.compile_mode or env var).
@@ -1149,7 +1159,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_initial_sf: Optional[float] = None
     p2_final_reward_mtp: Optional[float] = None
     mid_check_flags: List[str] = []
-    n_action_bins_log = math.log(max(2, int(getattr(cfg, 'n_action_bins', 21))))
+    # Reference entropy used for the entropy-collapse early-stop trip.
+    # For the discrete categorical actor this is the max-entropy uniform
+    # baseline (``log K``) per action dim.  For the continuous TanhNormal
+    # actor we use a unit-Gaussian baseline (``0.5 * log(2*pi*e)`` per
+    # dim ≈ 1.4189 nats); when the policy's reported Gaussian entropy
+    # falls below ``frac * reference``, σ has collapsed and exploration
+    # has effectively stopped — same trip semantics as for the discrete
+    # head, just calibrated for the continuous distribution.
+    if str(getattr(cfg, 'policy_type', 'continuous')).lower() == 'continuous':
+        from models.dreamer_v4 import ContinuousPolicyHead as _ContPH
+        n_action_bins_log = _ContPH.reference_entropy(int(cfg.action_dim))
+    else:
+        # Per-dim reference (legacy behaviour for the discrete head).
+        n_action_bins_log = math.log(
+            max(2, int(getattr(cfg, 'n_action_bins', 21))))
     # Pre-initialize loss dicts so the phase-transition mid-checks can
     # read them safely even when the prior phase produced no log iter.
     wm_losses: Dict = {}
@@ -1699,6 +1723,8 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_BC_SCALE', 'bc_scale', float),
         ('DREAMER_MAE_PMAX', 'mae_p_max', float),
         ('DREAMER_MTP_LENGTH', 'mtp_length', int),
+        ('DREAMER_POLICY_TYPE', 'policy_type', str),
+        ('DREAMER_POLICY_INIT_LOG_STD', 'policy_init_log_std', float),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
         ('DREAMER_COMPILE_MODE', 'compile_mode', str),
         ('AGENT_TOTAL_STEPS', 'total_steps', int),

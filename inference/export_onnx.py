@@ -60,10 +60,9 @@ class DeterministicController(nn.Module):
                         device=obs_window.device, dtype=z_ctx.dtype)
         out = self.dynamics(z_ctx, tau, d, prev_actions)
         agent_hid = out['agent_hid'][:, -1]                   # (B, d_model)
-        # Deterministic argmax per action dim.
-        logits = self.policy.logits(agent_hid)                # (B, A, n_bins)
-        idx = logits.argmax(dim=-1)
-        action = self.policy.bin_centres[idx]                 # (B, A) in [-1, 1]
+        # Deterministic action — works for both PolicyHead (argmax bin)
+        # and ContinuousPolicyHead (tanh(mu)).
+        action, _, _ = self.policy(agent_hid, deterministic=True)
         return action
 
 
@@ -122,6 +121,8 @@ if __name__ == '__main__':
         n_action_bins=cfg.n_action_bins,
         head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
         mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
+        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
+        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)
