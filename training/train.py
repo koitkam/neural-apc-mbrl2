@@ -779,6 +779,11 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     imagined_logp: List[torch.Tensor] = []
     imagined_entropy: List[torch.Tensor] = []
     imagined_actions: List[torch.Tensor] = []
+    # Canonical sample representation for log_prob recomputation in the
+    # actor loss — pre-tanh ``u`` for the continuous head, bin index
+    # for the discrete head.  See ContinuousPolicyHead.sample_with_raw
+    # docstring for the bfloat16 precision rationale.
+    imagined_raws: List[torch.Tensor] = []
     imagined_values: List[torch.Tensor] = []
     imagined_target_v: List[torch.Tensor] = []
     imagined_agent_hid: List[torch.Tensor] = []
@@ -786,7 +791,8 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     for h in range(H):
         # 1. Sample action conditioned on post-action agent_hid of the
         #    previous step (or the buffer's last step at h=0).
-        action_t, logp_t, ent_t = model.policy(agent_hid_post)
+        action_t, logp_t, ent_t, raw_t = model.policy.sample_with_raw(
+            agent_hid_post)
 
         # 2. Imagine the next z under that action (K=4 shortcut sampler).
         with torch.no_grad():
@@ -824,6 +830,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         imagined_logp.append(logp_t)
         imagined_entropy.append(ent_t)
         imagined_actions.append(action_t)
+        imagined_raws.append(raw_t)
         imagined_values.append(value_logits)
         imagined_target_v.append(target_v_pred)
         imagined_agent_hid.append(agent_hid_post)
@@ -831,6 +838,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     rewards = torch.stack(imagined_rewards, dim=1)            # (B, H)
     target_values = torch.stack(imagined_target_v, dim=1)     # (B, H)
     actions = torch.stack(imagined_actions, dim=1)            # (B, H, A)
+    raws = torch.stack(imagined_raws, dim=1)                  # (B, H, ...)
     entropies = torch.stack(imagined_entropy, dim=1)          # (B, H)
     agent_hids = torch.stack(imagined_agent_hid, dim=1)       # (B, H, D)
     value_logits_seq = torch.stack(imagined_values, dim=1)    # (B, H, n_bins)
@@ -869,13 +877,18 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     feat_flat = agent_hids.reshape(-1, agent_hids.shape[-1])
     actions_flat = actions.reshape(-1, actions.shape[-1])
+    # ``raws`` may be either pre-tanh ``u`` (continuous, shape (B,H,A))
+    # or bin index (discrete, shape (B,H,A) of int64).  Flatten while
+    # preserving last-dim layout.
+    raws_flat = raws.reshape(-1, raws.shape[-1]) if raws.dim() > 2 \
+                  else raws.reshape(-1)
     adv_flat = (adv_raw / scale).reshape(-1).detach()
 
     actor_loss_type = str(getattr(cfg, 'actor_loss_type', 'reinforce')).lower()
     if actor_loss_type == 'pmpo':
         actor_loss, pmpo_diag = pmpo_loss(
             model.policy, model.prior_policy,
-            feat_flat, actions_flat, adv_flat,
+            feat_flat, raws_flat, adv_flat,
             alpha=cfg.pmpo_alpha, beta=cfg.pmpo_beta,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 0.0)))
     else:
@@ -884,7 +897,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         # REINFORCE surrogate plus entropy bonus is sufficient anchor.
         actor_loss, pmpo_diag = reinforce_actor_loss(
             model.policy, model.prior_policy,
-            feat_flat, actions_flat, adv_flat,
+            feat_flat, raws_flat, adv_flat,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 3e-4)),
             kl_coef=0.0)
 

@@ -682,6 +682,22 @@ class PolicyHead(nn.Module):
     def forward(self, latent: torch.Tensor, *,
                 deterministic: bool = False
                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action, log_prob, entropy, _ = self.sample_with_raw(
+            latent, deterministic=deterministic)
+        return action, log_prob, entropy
+
+    def sample_with_raw(self, latent: torch.Tensor, *,
+                         deterministic: bool = False
+                         ) -> Tuple[torch.Tensor, torch.Tensor,
+                                     torch.Tensor, torch.Tensor]:
+        """Sample and return ``(action, log_prob, entropy, raw)``.
+
+        ``raw`` is the **canonical sample representation** that should
+        be stored when the caller needs to recompute log_prob later
+        (e.g. RL actor losses).  For the discrete head this is the bin
+        index.  Using ``raw`` instead of ``action`` for log_prob
+        recomputation avoids any quantization-or-precision round-trip.
+        """
         logits = self.logits(latent)
         if deterministic:
             idx = logits.argmax(dim=-1)
@@ -692,7 +708,15 @@ class PolicyHead(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         log_prob = log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1)
         entropy = -(F.softmax(logits, dim=-1) * log_probs).sum(-1).sum(-1)
-        return action, log_prob, entropy
+        return action, log_prob, entropy, idx
+
+    def log_prob_of_raw(self, latent: torch.Tensor,
+                         raw: torch.Tensor) -> torch.Tensor:
+        """Log-prob of a stored bin index ``raw`` shape ``(B, action_dim)``."""
+        logits = self.logits(latent)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return log_probs.gather(-1, raw.long().unsqueeze(-1)
+                                  ).squeeze(-1).sum(-1)
 
     def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor
                      ) -> torch.Tensor:
@@ -846,12 +870,30 @@ class ContinuousPolicyHead(nn.Module):
     def forward(self, latent: torch.Tensor, *,
                 deterministic: bool = False
                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action, log_prob, entropy, _ = self.sample_with_raw(
+            latent, deterministic=deterministic)
+        return action, log_prob, entropy
+
+    def sample_with_raw(self, latent: torch.Tensor, *,
+                         deterministic: bool = False
+                         ) -> Tuple[torch.Tensor, torch.Tensor,
+                                     torch.Tensor, torch.Tensor]:
+        """Sample and return ``(action, log_prob, entropy, raw)``.
+
+        ``raw`` is the **pre-tanh** sample ``u``.  Using ``u`` directly
+        when later recomputing log_prob (instead of going through
+        ``action = tanh(u) → atanh(action)``) avoids a serious bfloat16
+        precision pitfall: at moderate ``|u| ≳ 3``, ``tanh(u)`` rounds
+        to exactly ±1.0 in bfloat16, after which ``atanh`` returns a
+        completely wrong ``u`` (clamped at ±7.6).  In a typical training
+        run this corrupts the actor gradient by orders of magnitude and
+        manifests as ``log_prob`` values around −1500 with std ≋ 2750.
+        """
         mu, log_std = self.dist_params(latent)
         std = log_std.exp()
         if deterministic:
-            u = mu                                   # tanh(mu) is the deterministic action
+            u = mu
             action = torch.tanh(u)
-            # log_prob is undefined for deterministic; return zeros.
             log_prob = torch.zeros(latent.shape[0], device=latent.device,
                                     dtype=latent.dtype)
         else:
@@ -859,15 +901,24 @@ class ContinuousPolicyHead(nn.Module):
             u = mu + std * eps
             action = torch.tanh(u)
             log_prob = self._tanh_log_prob(mu, log_std, u, action).sum(-1)
-        # Differential-entropy of the underlying Gaussian
-        # H(N(mu, std)) = 0.5 * log(2 * pi * e * sigma^2), summed over dims.
-        # The tanh squash lowers this by E[log(1 - a^2)] which is hard to
-        # estimate cheaply; we report the Gaussian entropy as the reference
-        # signal (matches SAC convention).  This drives the early-stop
-        # collapse trip too.
+        # Differential-entropy of the underlying Gaussian.  See class
+        # docstring for why we ignore the (intractable) tanh correction.
         entropy = (0.5 * (math.log(2.0 * math.pi * math.e)
                            + 2.0 * log_std)).sum(-1)
-        return action, log_prob, entropy
+        return action, log_prob, entropy, u
+
+    def log_prob_of_raw(self, latent: torch.Tensor,
+                         raw: torch.Tensor) -> torch.Tensor:
+        """Log-prob given the **pre-tanh** sample ``u`` (shape (B, A)).
+
+        This is the numerically-correct path for RL actor losses: the
+        caller stores ``u`` returned by :meth:`sample_with_raw` rather
+        than the post-tanh action, so we can skip the lossy ``atanh``
+        round-trip and evaluate the Gaussian density directly on ``u``.
+        """
+        mu, log_std = self.dist_params(latent)
+        action = torch.tanh(raw)
+        return self._tanh_log_prob(mu, log_std, raw, action).sum(-1)
 
     def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor
                      ) -> torch.Tensor:
@@ -1181,7 +1232,7 @@ class DreamerV4(nn.Module):
 # ---------------------------------------------------------------------------
 
 def pmpo_loss(policy, prior_policy,
-              latent: torch.Tensor, action: torch.Tensor,
+              latent: torch.Tensor, raw_action: torch.Tensor,
               advantage: torch.Tensor,
               alpha: float = 0.5, beta: float = 0.1,
               entropy_coef: float = 0.0
@@ -1198,13 +1249,16 @@ def pmpo_loss(policy, prior_policy,
     both are essential for stability when the advantage signal is
     heavy-tailed (e.g. process-control violation penalties).
 
-    All tensors are flat ``(N, …)``.  Polymorphic in policy class — both
-    ``PolicyHead`` (categorical) and ``ContinuousPolicyHead`` (TanhNormal)
-    expose ``log_prob_of`` / ``kl_to`` / ``entropy`` with the required
-    semantics.
+    All tensors are flat ``(N, …)``.  ``raw_action`` is the canonical
+    sample representation produced by ``policy.sample_with_raw`` (bin
+    index for discrete, pre-tanh ``u`` for continuous) — see those
+    methods for why this is required for numerical correctness in
+    bfloat16 training.  Polymorphic in policy class — both
+    ``PolicyHead`` and ``ContinuousPolicyHead`` expose
+    ``log_prob_of_raw`` / ``kl_to`` / ``entropy``.
     """
-    log_prob = policy.log_prob_of(latent, action)               # (N,)
-    kl = policy.kl_to(prior_policy, latent)                     # (N,)
+    log_prob = policy.log_prob_of_raw(latent, raw_action)        # (N,)
+    kl = policy.kl_to(prior_policy, latent)                      # (N,)
 
     pos_mask = (advantage >= 0).float()
     neg_mask = 1.0 - pos_mask
@@ -1238,7 +1292,7 @@ def pmpo_loss(policy, prior_policy,
 # ---------------------------------------------------------------------------
 
 def reinforce_actor_loss(policy, prior_policy,
-                          latent: torch.Tensor, action: torch.Tensor,
+                          latent: torch.Tensor, raw_action: torch.Tensor,
                           advantage: torch.Tensor,
                           entropy_coef: float = 3e-4,
                           kl_coef: float = 0.0,
@@ -1249,36 +1303,15 @@ def reinforce_actor_loss(policy, prior_policy,
 
         L = -E[A · log π(a|s)] - η · H[π] + β · KL(π || π_prior)
 
-    The advantage ``A`` is assumed already normalised by the percentile
-    return scale (see ``DreamerV4.update_return_scale``).
-
-    Why this rather than PMPO for continuous actions?
-    --------------------------------------------------
-    PMPO's negative-advantage branch has the form ``+(1-α)·log π``,
-    which is **unbounded below** for continuous distributions: log π can
-    drift to -∞ either by σ → 0 or by the action moving into the tail
-    of the policy.  Combined with our σ-clamp at the V3 floor, this
-    drives the actor to collapse against σ_min and oscillate around
-    saturating actions \u2014 exactly what we observed on test_sim.
-
-    V3's REINFORCE surrogate is bounded: the gradient magnitude is
-    proportional to ``|A|·|∇log π|``, both of which are bounded by the
-    percentile return scale and the σ-floor respectively.  V3 used this
-    objective to solve 150+ tasks with a single hyperparameter set,
-    which is the empirical definition of "robust across simulators".
-
-    Hyperparameter defaults (V3 §3, validated on 150+ tasks):
-      * ``entropy_coef = 3e-4``
-      * ``kl_coef     = 0.0`` (V3 has no behavioural-prior KL).  V4's
-        PMPO uses ``β = 0.1``; we keep this optional as a safety
-        anchor when it helps but do **not** turn it on by default
-        because the reinforce surrogate is already stable on its own.
-
-    Polymorphic in policy class \u2014 both ``PolicyHead`` (categorical) and
-    ``ContinuousPolicyHead`` (TanhNormal) expose ``log_prob_of`` /
-    ``entropy`` / ``kl_to`` with the required semantics.
+    ``raw_action`` is the canonical sample produced by
+    ``policy.sample_with_raw`` (pre-tanh ``u`` for continuous, bin
+    index for discrete).  Using ``raw_action`` instead of the
+    post-squash action is **required** for numerically-correct log_prob
+    recomputation under bfloat16 autocast — at moderate ``|u|``,
+    ``tanh(u)`` rounds to ±1 in bfloat16 and ``atanh`` returns the wrong
+    pre-image (manifests as ``log_prob`` ~ -1500 with std ~ 2750).
     """
-    log_prob = policy.log_prob_of(latent, action)               # (N,)
+    log_prob = policy.log_prob_of_raw(latent, raw_action)       # (N,)
     entropy = policy.entropy(latent)                            # (N,)
 
     # Reinforce surrogate. ``advantage`` is detached so the actor only
