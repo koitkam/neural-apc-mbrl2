@@ -727,6 +727,16 @@ class PolicyHead(nn.Module):
         cur_p = cur_logp.exp()
         return (cur_p * (cur_logp - prior_logp)).sum(-1).sum(-1)  # (B,)
 
+    def entropy(self, latent: torch.Tensor) -> torch.Tensor:
+        """Per-state entropy H[π(·|latent)] summed over action dims.
+
+        Used by the PMPO entropy bonus (DreamerV3 §3, η = 3e-4).
+        """
+        logits = self.logits(latent)                              # (B,A,K)
+        log_p = F.log_softmax(logits, dim=-1)
+        p = log_p.exp()
+        return -(p * log_p).sum(-1).sum(-1)                       # (B,)
+
     @staticmethod
     def reference_entropy(action_dim: int, n_action_bins: int) -> float:
         """Max-entropy reference: uniform over all bins per dim."""
@@ -753,15 +763,30 @@ class ContinuousPolicyHead(nn.Module):
     code is policy-type agnostic.
     """
 
-    LOG_STD_MIN: float = -5.0          # σ ≥ ~0.0067 (numerical floor)
-    LOG_STD_MAX: float = 2.0           # σ ≤ ~7.39  (rarely useful but capped)
+    # Default log‐std bounds follow DreamerV3 §3 (σ ∈ [0.1, 1.0]).
+    # The bounds were a key stability fix that allowed V3's single
+    # hyperparameter set to work across 150+ tasks. They can be widened
+    # per-simulator via the constructor / TrainConfig if a particular
+    # plant needs broader exploration.
+    LOG_STD_MIN: float = -2.3          # σ ≥ 0.10
+    LOG_STD_MAX: float = 0.0           # σ ≤ 1.00
 
     def __init__(self, in_dim: int, hidden_dim: int, action_dim: int,
                  n_layers: int = 2, mtp_length: int = 1,
-                 init_log_std: float = -0.5):
+                 init_log_std: float = -0.5,
+                 log_std_min: Optional[float] = None,
+                 log_std_max: Optional[float] = None):
         super().__init__()
         self.action_dim = action_dim
         self.mtp_length = max(1, int(mtp_length))
+        # Per-instance overrides (fall back to V3 defaults if None).
+        self.log_std_min = (float(log_std_min) if log_std_min is not None
+                             else self.LOG_STD_MIN)
+        self.log_std_max = (float(log_std_max) if log_std_max is not None
+                             else self.LOG_STD_MAX)
+        # Clamp init within bounds so the starting σ is always realisable.
+        init_log_std = float(min(max(init_log_std, self.log_std_min),
+                                   self.log_std_max))
         # Output 2 * action_dim per offset (mu, log_std).
         self.head = MLP(in_dim, hidden_dim,
                         self.mtp_length * action_dim * 2,
@@ -790,7 +815,7 @@ class ContinuousPolicyHead(nn.Module):
         cap = 8.0
         mu = cap * torch.tanh(out[..., 0] / cap)                  # (B,L,A)
         log_std = out[..., 1] + self.log_std_init.view(1, 1, -1)
-        log_std = log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        log_std = log_std.clamp(self.log_std_min, self.log_std_max)
         return mu, log_std
 
     def dist_params(self, latent: torch.Tensor
@@ -882,6 +907,20 @@ class ContinuousPolicyHead(nn.Module):
                        - 0.5)
         return kl_per_dim.sum(-1)                                # (B,)
 
+    def entropy(self, latent: torch.Tensor) -> torch.Tensor:
+        """Per-state Gaussian entropy summed over action dims.
+
+        We report the entropy of the underlying Gaussian (pre-tanh)
+        rather than the squashed distribution — the tanh correction
+        ``E[log(1 - tanh(u)²)]`` is intractable in closed form and
+        roughly state-independent, so it does not affect gradient
+        directions for the entropy bonus / collapse trip.  Matches the
+        SAC convention.
+        """
+        _, log_std = self.dist_params(latent)
+        return (0.5 * (math.log(2.0 * math.pi * math.e)
+                        + 2.0 * log_std)).sum(-1)
+
     @staticmethod
     def reference_entropy(action_dim: int, n_action_bins: int = 0) -> float:
         """Reference entropy for the early-stop trip threshold.
@@ -928,6 +967,12 @@ class DreamerV4Config:
     # paper.  See ``ContinuousPolicyHead`` docstring for rationale.
     policy_type: str = 'continuous'
     policy_init_log_std: float = -0.5      # σ ≈ 0.6 at init
+    # DreamerV3 §3 prescribes σ ∈ [0.1, 1.0] (⇔ log_std ∈ [-2.3, 0])
+    # for the continuous actor.  Bounds can be widened per-simulator
+    # via ``TrainConfig`` if a particular plant needs broader
+    # exploration; defaults are chosen for stable adaptive operation.
+    policy_log_std_min: float = -2.3
+    policy_log_std_max: float = 0.0
 
 
 class DreamerV4(nn.Module):
@@ -953,7 +998,9 @@ class DreamerV4(nn.Module):
             self.policy = ContinuousPolicyHead(
                 D, cfg.head_hidden, cfg.action_dim,
                 n_layers=cfg.head_n_layers, mtp_length=cfg.mtp_length,
-                init_log_std=getattr(cfg, 'policy_init_log_std', -0.5))
+                init_log_std=getattr(cfg, 'policy_init_log_std', -0.5),
+                log_std_min=getattr(cfg, 'policy_log_std_min', None),
+                log_std_max=getattr(cfg, 'policy_log_std_max', None))
         else:
             self.policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
                                       n_action_bins=cfg.n_action_bins,
@@ -975,7 +1022,9 @@ class DreamerV4(nn.Module):
             self.prior_policy = ContinuousPolicyHead(
                 D, cfg.head_hidden, cfg.action_dim,
                 n_layers=cfg.head_n_layers, mtp_length=cfg.mtp_length,
-                init_log_std=getattr(cfg, 'policy_init_log_std', -0.5))
+                init_log_std=getattr(cfg, 'policy_init_log_std', -0.5),
+                log_std_min=getattr(cfg, 'policy_log_std_min', None),
+                log_std_max=getattr(cfg, 'policy_log_std_max', None))
         else:
             self.prior_policy = PolicyHead(D, cfg.head_hidden, cfg.action_dim,
                                             n_action_bins=cfg.n_action_bins,
@@ -1134,18 +1183,25 @@ class DreamerV4(nn.Module):
 def pmpo_loss(policy, prior_policy,
               latent: torch.Tensor, action: torch.Tensor,
               advantage: torch.Tensor,
-              alpha: float = 0.5, beta: float = 0.1
+              alpha: float = 0.5, beta: float = 0.1,
+              entropy_coef: float = 0.0
               ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Policy Maximum Likelihood Optimization loss (Dreamer 4 eq. 11).
 
     Splits states by sign of advantage:
       - D⁺ = {s | A ≥ 0} → upweight chosen action
       - D⁻ = {s | A < 0} → downweight chosen action
-    Plus a KL term to a frozen prior policy.
+    Plus a KL term to a frozen prior policy and (optionally) an entropy
+    bonus following DreamerV3 §3 (``η = 3e-4`` by default in V3).  The
+    entropy bonus acts as a soft σ-floor for the continuous TanhNormal
+    head and a uniform-prior pull for the discrete categorical head;
+    both are essential for stability when the advantage signal is
+    heavy-tailed (e.g. process-control violation penalties).
 
     All tensors are flat ``(N, …)``.  Polymorphic in policy class — both
     ``PolicyHead`` (categorical) and ``ContinuousPolicyHead`` (TanhNormal)
-    expose ``log_prob_of`` and ``kl_to`` with the required semantics.
+    expose ``log_prob_of`` / ``kl_to`` / ``entropy`` with the required
+    semantics.
     """
     log_prob = policy.log_prob_of(latent, action)               # (N,)
     kl = policy.kl_to(prior_policy, latent)                     # (N,)
@@ -1157,12 +1213,22 @@ def pmpo_loss(policy, prior_policy,
     loss_pos = -(alpha * (log_prob * pos_mask).sum() / n_pos)
     loss_neg = -((1.0 - alpha) * (-(log_prob) * neg_mask).sum() / n_neg)
     loss_kl = beta * kl.mean()
-    total = loss_pos + loss_neg + loss_kl
+    if entropy_coef and entropy_coef > 0.0:
+        ent = policy.entropy(latent)                            # (N,)
+        loss_ent = -float(entropy_coef) * ent.mean()
+        ent_mean_diag = ent.mean().detach()
+    else:
+        loss_ent = torch.zeros((), device=log_prob.device,
+                                dtype=log_prob.dtype)
+        ent_mean_diag = torch.zeros((), device=log_prob.device,
+                                     dtype=log_prob.dtype)
+    total = loss_pos + loss_neg + loss_kl + loss_ent
     diag = {
         'pmpo_loss': total.detach(),
         'pmpo_pos_frac': (n_pos / (n_pos + n_neg)).detach(),
         'pmpo_kl': kl.mean().detach(),
         'pmpo_logp_mean': log_prob.mean().detach(),
+        'pmpo_entropy_bonus': ent_mean_diag,
     }
     return total, diag
 

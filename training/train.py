@@ -91,6 +91,18 @@ class TrainConfig:
     # categorical-bin head for back-compat / Atari-style sims.
     policy_type: str = 'continuous'
     policy_init_log_std: float = -0.5
+    # DreamerV3 §3 stable defaults: σ ∈ [0.1, 1.0] (log_std ∈ [-2.3, 0]).
+    # Override per-simulator only if a plant genuinely needs broader
+    # exploration; the V3 prescription works generically across 150+
+    # tasks and is the right starting point for any adaptive APC.
+    policy_log_std_min: float = -2.3
+    policy_log_std_max: float = 0.0
+    # PMPO entropy bonus (DreamerV3 § actor loss, η = 3e-4).  Acts as a
+    # soft σ-floor for the continuous actor / uniform-prior pull for the
+    # discrete actor; essential for stability when the advantage signal
+    # is heavy-tailed (process-control violation penalties).  Set to 0
+    # to disable.
+    pmpo_entropy_coef: float = 3e-4
 
     # ----- Plant / windowing -----
     lookback: int = 32        # transformer context length T_ctx
@@ -112,9 +124,13 @@ class TrainConfig:
 
     # ----- Optimizers -----
     lr_world: float = 1e-4
-    lr_actor: float = 1e-4   # was 3e-5; insufficient for short BO trials.
+    lr_actor: float = 3e-5    # DreamerV3 §3; auto-bumped to 1e-4 for
+                              # discrete heads (back-compat).  See
+                              # build_optimizers in this module.
     lr_critic: float = 3e-5
-    grad_clip: float = 1000.0
+    grad_clip: float = 100.0  # DreamerV3 default; was 1000 (too loose,
+                              # let the actor explode at the BC→PMPO
+                              # transition).
 
     # ----- Loss weights -----
     # recon_scale=0 by default: with the thin linear tokenizer, recon-MAE
@@ -848,7 +864,10 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     actor_loss, pmpo_diag = pmpo_loss(model.policy, model.prior_policy,
                                        feat_flat, actions_flat, adv_flat,
                                        alpha=cfg.pmpo_alpha,
-                                       beta=cfg.pmpo_beta)
+                                       beta=cfg.pmpo_beta,
+                                       entropy_coef=float(
+                                           getattr(cfg, 'pmpo_entropy_coef',
+                                                    0.0)))
 
     diag = {
         'actor_loss': actor_loss,
@@ -882,6 +901,8 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         mtp_length=max(1, int(cfg.mtp_length)),
         policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
         policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
+        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
+        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
     )
     model = DreamerV4(model_cfg)
     # Optional torch.compile (set via TrainConfig.compile_mode or env var).
@@ -1088,8 +1109,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     bs_ref = 16
     lr_scale = math.sqrt(max(1, cfg.batch_size) / float(bs_ref)) \
                 if cfg.batch_size > bs_ref else 1.0
+    # DreamerV3 §3 prescribes lr_actor=3e-5 for the continuous actor.
+    # The discrete categorical head historically used 1e-4 (faster
+    # convergence on Atari-style sims).  Auto-pick the discrete default
+    # only when ``lr_actor`` is at the V3 default — user / BO overrides
+    # are respected.
+    cont_default_actor_lr = 3e-5
+    disc_default_actor_lr = 1e-4
+    if (str(getattr(cfg, 'policy_type', 'continuous')).lower() == 'discrete'
+            and abs(cfg.lr_actor - cont_default_actor_lr) < 1e-12):
+        eff_lr_actor_base = disc_default_actor_lr
+        print(f'[lr-actor] policy_type=discrete → auto lr_actor=' 
+              f'{disc_default_actor_lr:.0e} (V3 default for categorical)',
+              flush=True)
+    else:
+        eff_lr_actor_base = cfg.lr_actor
     eff_lr_world = cfg.lr_world * lr_scale
-    eff_lr_actor = cfg.lr_actor * lr_scale
+    eff_lr_actor = eff_lr_actor_base * lr_scale
     eff_lr_critic = cfg.lr_critic * lr_scale
     if abs(lr_scale - 1.0) > 1e-9:
         print(f'[lr-scale] batch_size={cfg.batch_size} ref={bs_ref} '
@@ -1725,6 +1761,13 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_MTP_LENGTH', 'mtp_length', int),
         ('DREAMER_POLICY_TYPE', 'policy_type', str),
         ('DREAMER_POLICY_INIT_LOG_STD', 'policy_init_log_std', float),
+        ('DREAMER_POLICY_LOG_STD_MIN', 'policy_log_std_min', float),
+        ('DREAMER_POLICY_LOG_STD_MAX', 'policy_log_std_max', float),
+        ('DREAMER_PMPO_ENTROPY_COEF', 'pmpo_entropy_coef', float),
+        ('DREAMER_GRAD_CLIP', 'grad_clip', float),
+        ('DREAMER_LR_ACTOR', 'lr_actor', float),
+        ('DREAMER_LR_CRITIC', 'lr_critic', float),
+        ('DREAMER_LR_WORLD', 'lr_world', float),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
         ('DREAMER_COMPILE_MODE', 'compile_mode', str),
         ('AGENT_TOTAL_STEPS', 'total_steps', int),

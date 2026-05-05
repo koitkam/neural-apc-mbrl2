@@ -526,6 +526,10 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         policy_type=str(getattr(cfg_loaded, 'policy_type', 'continuous')),
         policy_init_log_std=float(
             getattr(cfg_loaded, 'policy_init_log_std', -0.5)),
+        policy_log_std_min=float(
+            getattr(cfg_loaded, 'policy_log_std_min', -2.3)),
+        policy_log_std_max=float(
+            getattr(cfg_loaded, 'policy_log_std_max', 0.0)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)
