@@ -41,9 +41,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models.dreamer_v4 import (
+from models.dreamer_v4 import (  # noqa: F401
     DreamerV4, DreamerV4Config,
-    shortcut_forcing_loss, pmpo_loss,
+    shortcut_forcing_loss, pmpo_loss, reinforce_actor_loss,
 )
 from utils.sim_factory import create_sim, resolve_sim_metadata
 from utils.objective_runtime import compute_objective_components
@@ -103,6 +103,16 @@ class TrainConfig:
     # is heavy-tailed (process-control violation penalties).  Set to 0
     # to disable.
     pmpo_entropy_coef: float = 3e-4
+    # Actor loss type. ``'reinforce'`` (DreamerV3 §3) is robust across
+    # simulators — V3 used this single recipe across 150+ tasks. The
+    # ``'pmpo'`` option uses V4's eq. 11 advantage-sign-split loss; this
+    # is the paper-faithful V4 actor for **discrete** actions, but it is
+    # numerically unstable for continuous TanhNormal actors because its
+    # negative-advantage branch is unbounded below.  We default to V3
+    # REINFORCE which has bounded gradients and proven cross-task
+    # robustness; switch to PMPO only for discrete-action sims if
+    # desired (env: DREAMER_ACTOR_LOSS=pmpo).
+    actor_loss_type: str = 'reinforce'
 
     # ----- Plant / windowing -----
     lookback: int = 32        # transformer context length T_ctx
@@ -861,13 +871,22 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     actions_flat = actions.reshape(-1, actions.shape[-1])
     adv_flat = (adv_raw / scale).reshape(-1).detach()
 
-    actor_loss, pmpo_diag = pmpo_loss(model.policy, model.prior_policy,
-                                       feat_flat, actions_flat, adv_flat,
-                                       alpha=cfg.pmpo_alpha,
-                                       beta=cfg.pmpo_beta,
-                                       entropy_coef=float(
-                                           getattr(cfg, 'pmpo_entropy_coef',
-                                                    0.0)))
+    actor_loss_type = str(getattr(cfg, 'actor_loss_type', 'reinforce')).lower()
+    if actor_loss_type == 'pmpo':
+        actor_loss, pmpo_diag = pmpo_loss(
+            model.policy, model.prior_policy,
+            feat_flat, actions_flat, adv_flat,
+            alpha=cfg.pmpo_alpha, beta=cfg.pmpo_beta,
+            entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 0.0)))
+    else:
+        # DreamerV3 REINFORCE — robust default, no per-sim retuning.
+        # The V4 KL-to-prior is left off (kl_coef=0); the bounded
+        # REINFORCE surrogate plus entropy bonus is sufficient anchor.
+        actor_loss, pmpo_diag = reinforce_actor_loss(
+            model.policy, model.prior_policy,
+            feat_flat, actions_flat, adv_flat,
+            entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 3e-4)),
+            kl_coef=0.0)
 
     diag = {
         'actor_loss': actor_loss,
@@ -1764,6 +1783,7 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_POLICY_LOG_STD_MIN', 'policy_log_std_min', float),
         ('DREAMER_POLICY_LOG_STD_MAX', 'policy_log_std_max', float),
         ('DREAMER_PMPO_ENTROPY_COEF', 'pmpo_entropy_coef', float),
+        ('DREAMER_ACTOR_LOSS', 'actor_loss_type', str),
         ('DREAMER_GRAD_CLIP', 'grad_clip', float),
         ('DREAMER_LR_ACTOR', 'lr_actor', float),
         ('DREAMER_LR_CRITIC', 'lr_critic', float),

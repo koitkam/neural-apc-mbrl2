@@ -1234,6 +1234,84 @@ def pmpo_loss(policy, prior_policy,
 
 
 # ---------------------------------------------------------------------------
+# DreamerV3 REINFORCE actor loss (V3 §3, eq. 3) — robust alternative
+# ---------------------------------------------------------------------------
+
+def reinforce_actor_loss(policy, prior_policy,
+                          latent: torch.Tensor, action: torch.Tensor,
+                          advantage: torch.Tensor,
+                          entropy_coef: float = 3e-4,
+                          kl_coef: float = 0.0,
+                          ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """DreamerV3-style REINFORCE actor loss.
+
+    Replaces V4's PMPO advantage-sign-split (eq. 11) with the V3 surrogate:
+
+        L = -E[A · log π(a|s)] - η · H[π] + β · KL(π || π_prior)
+
+    The advantage ``A`` is assumed already normalised by the percentile
+    return scale (see ``DreamerV4.update_return_scale``).
+
+    Why this rather than PMPO for continuous actions?
+    --------------------------------------------------
+    PMPO's negative-advantage branch has the form ``+(1-α)·log π``,
+    which is **unbounded below** for continuous distributions: log π can
+    drift to -∞ either by σ → 0 or by the action moving into the tail
+    of the policy.  Combined with our σ-clamp at the V3 floor, this
+    drives the actor to collapse against σ_min and oscillate around
+    saturating actions \u2014 exactly what we observed on test_sim.
+
+    V3's REINFORCE surrogate is bounded: the gradient magnitude is
+    proportional to ``|A|·|∇log π|``, both of which are bounded by the
+    percentile return scale and the σ-floor respectively.  V3 used this
+    objective to solve 150+ tasks with a single hyperparameter set,
+    which is the empirical definition of "robust across simulators".
+
+    Hyperparameter defaults (V3 §3, validated on 150+ tasks):
+      * ``entropy_coef = 3e-4``
+      * ``kl_coef     = 0.0`` (V3 has no behavioural-prior KL).  V4's
+        PMPO uses ``β = 0.1``; we keep this optional as a safety
+        anchor when it helps but do **not** turn it on by default
+        because the reinforce surrogate is already stable on its own.
+
+    Polymorphic in policy class \u2014 both ``PolicyHead`` (categorical) and
+    ``ContinuousPolicyHead`` (TanhNormal) expose ``log_prob_of`` /
+    ``entropy`` / ``kl_to`` with the required semantics.
+    """
+    log_prob = policy.log_prob_of(latent, action)               # (N,)
+    entropy = policy.entropy(latent)                            # (N,)
+
+    # Reinforce surrogate. ``advantage`` is detached so the actor only
+    # backprops through the policy, not the critic baseline.
+    pg_loss = -(advantage.detach() * log_prob).mean()
+    ent_loss = -float(entropy_coef) * entropy.mean()
+    if kl_coef and kl_coef > 0.0:
+        kl = policy.kl_to(prior_policy, latent)                 # (N,)
+        kl_loss = float(kl_coef) * kl.mean()
+        kl_diag = kl.mean().detach()
+    else:
+        kl_loss = torch.zeros((), device=log_prob.device,
+                                dtype=log_prob.dtype)
+        kl_diag = torch.zeros((), device=log_prob.device,
+                                dtype=log_prob.dtype)
+    total = pg_loss + ent_loss + kl_loss
+    diag = {
+        'actor_pg_loss': pg_loss.detach(),
+        'actor_entropy_bonus': entropy.mean().detach(),
+        'actor_kl_pen': kl_diag,
+        'actor_logp_mean': log_prob.mean().detach(),
+        'actor_logp_std': log_prob.std().detach(),
+        # Mirror PMPO diag keys so existing logging / plotting works.
+        'pmpo_loss': total.detach(),
+        'pmpo_pos_frac': (advantage >= 0).float().mean().detach(),
+        'pmpo_kl': kl_diag,
+        'pmpo_logp_mean': log_prob.mean().detach(),
+        'pmpo_entropy_bonus': entropy.mean().detach(),
+    }
+    return total, diag
+
+
+# ---------------------------------------------------------------------------
 # Shortcut forcing world-model loss (paper eq. 7)
 # ---------------------------------------------------------------------------
 
@@ -1312,5 +1390,5 @@ __all__ = [
     'TwohotHead', 'PolicyHead', 'ContinuousPolicyHead',
     'DreamerV4Config', 'DreamerV4',
     'sample_tau_d', 'shortcut_corrupt', 'ramp_weight',
-    'shortcut_forcing_loss', 'pmpo_loss',
+    'shortcut_forcing_loss', 'pmpo_loss', 'reinforce_actor_loss',
 ]
