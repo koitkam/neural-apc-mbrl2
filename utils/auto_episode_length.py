@@ -10,7 +10,7 @@ wasting training time on padded tails.  Resolution order:
 
 All numbers come from :mod:`utils.dynamics_identifier` via the
 ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME`` environment variables
-that :mod:`workflow.runner` sets after identification.
+that :mod:`workflow.bo_runner` sets after identification.
 """
 
 from __future__ import annotations

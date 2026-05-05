@@ -151,7 +151,7 @@ def identify_lookback(out_dir: Path, *, tau: float, dead_time: float,
 
     Must be called after dynamics identification + sample-rate derivation
     so ``min_lb``/``max_lb`` reflect the actual scan rate the agent will
-    see (parity with ``workflow/run.py``).
+    see (parity with ``workflow/single_run.py``).
     """
     from utils.lookback_identifier import identify_and_save_lookback
 
@@ -635,7 +635,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     os.environ['SIM_SAMPLE_RATE'] = str(sr)
 
     # Phase 1b: Lookback identification using the *derived* sample_rate
-    # (parity with workflow/run.py — must come AFTER sr is known so the
+    # (parity with workflow/single_run.py — must come AFTER sr is known so the
     # min_lb/max_lb scan range matches the actual agent timestep).
     print('[BO] Phase 1b: lookback identification', flush=True)
     lb_info = identify_lookback(out_dir / 'plant_id',
@@ -806,7 +806,7 @@ if __name__ == '__main__':
 
     repo = Path(__file__).resolve().parent.parent
     if args.simulation_dir is not None:
-        from workflow.run import _resolve_sim_dir
+        from workflow.single_run import _resolve_sim_dir
         sim_dir = _resolve_sim_dir(args.simulation_dir)
         setup_path = sim_dir / 'control_setup.json'
         obj_path = sim_dir / 'control_objective.json'

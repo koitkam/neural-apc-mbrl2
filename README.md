@@ -81,7 +81,7 @@ Both share the same plant-derivation chain:
 6. `plant_init.derive_step_budgets` (BO only)  → trial / final step budgets
    from episode length × complexity factor.
 
-| | `workflow/run.py` | `workflow/runner.py` |
+| | `workflow/single_run.py` | `workflow/bo_runner.py` |
 |---|---|---|
 | Purpose | one fixed-config training run | full BO + final retrain + ONNX |
 | Plant ID | yes (full chain above) | yes (full chain above, identical) |
@@ -97,7 +97,7 @@ Both share the same plant-derivation chain:
 
 ```bash
 source ../neural-apc-dreamerV4-env/bin/activate
-python -m workflow.runner --simulation-dir simulation/test_sim
+python -m workflow.bo_runner --simulation-dir simulation/test_sim
 ```
 
 That's the whole command.  Everything is auto-derived:
@@ -127,7 +127,7 @@ output/test_sim/bo_<timestamp>/
 ### Common flags
 
 ```bash
-python -m workflow.runner --simulation-dir simulation/test_sim \
+python -m workflow.bo_runner --simulation-dir simulation/test_sim \
   --n_trials 8 \
   --trial_steps 0 \    # 0 = plant-tied auto
   --final_steps 0 \    # 0 = plant-tied auto
@@ -148,7 +148,7 @@ python -m workflow.runner --simulation-dir simulation/test_sim \
 ## Single training run (no BO)
 
 ```bash
-python -m workflow.run --simulation-dir simulation/test_sim --steps 500000
+python -m workflow.single_run --simulation-dir simulation/test_sim --steps 500000
 ```
 
 Same plant-derivation chain; output goes to `output/<sim>/run_<ts>/`.
@@ -224,7 +224,7 @@ pip install -r requirements.txt
 
 - DreamerV4 paper-faithful trainer + RSSM + categorical actor + twohot critic.
 - Adaptive batch / reward / episode-length / step-budget knobs (paper-superset).
-- Single-arg workflow entry (`workflow/runner.py`).
+- Single-arg workflow entry (`workflow/bo_runner.py`).
 - Validation harness with timeseries plots.
 - ONNX export of integrated `(rssm + actor)` graph.
 

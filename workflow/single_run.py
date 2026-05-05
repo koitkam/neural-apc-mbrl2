@@ -2,7 +2,7 @@
 
 Usage::
 
-    python -m workflow.run --simulation-dir simulation/test_sim
+    python -m workflow.single_run --simulation-dir simulation/test_sim
 
 Everything else is auto-derived (paper-faithful defaults + plant
 identification).  The user only needs to pick the simulation.
@@ -22,7 +22,7 @@ What is auto-derived (in order):
 CLI flags allow targeted overrides for advanced usage; everything has a
 sensible default so the typical command is:
 
-    python -m workflow.run --simulation-dir simulation/distillation
+    python -m workflow.single_run --simulation-dir simulation/distillation
 """
 
 from __future__ import annotations
@@ -120,7 +120,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Mirror stdout/stderr to <out_dir>/workflow.log so the run is self-contained.
-    from workflow.runner import _install_workflow_log
+    from workflow.bo_runner import _install_workflow_log
     _install_workflow_log(out_dir)
     print(f'[run] workflow log: {out_dir}/workflow.log', flush=True)
 
@@ -169,7 +169,7 @@ def main() -> int:
     os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
     os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'
 
-    # ── Phase 1b½: Plant-aware noise config (parity with workflow.runner) ──
+    # ── Phase 1b½: Plant-aware noise config (parity with workflow.bo_runner) ──
     # Builds OU process + measurement noise from identified plant dynamics
     # and exports SIM_NOISE_CONFIG_JSON so SimNoiseWrapper picks it up in
     # both training and validation subprocesses.  Skip with --no-noise for
@@ -235,14 +235,14 @@ def main() -> int:
 
     # Episode length & horizon from plant.
     from utils.auto_episode_length import derive_episode_length
-    from workflow.runner import horizon_init, MODEL_SIZE_PRESETS
+    from workflow.bo_runner import horizon_init, MODEL_SIZE_PRESETS
     episode_length, ep_source = derive_episode_length()
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
     horizon = horizon_init(tau, dead, sample_rate)
     seq_len = derived['seq_len']
     arch = MODEL_SIZE_PRESETS[model_size]
 
-    # Plant-tied step budget (parity with workflow.runner).  CLI > 0 wins;
+    # Plant-tied step budget (parity with workflow.bo_runner).  CLI > 0 wins;
     # otherwise derive trial_steps from episode_length + complexity.
     from utils.plant_init import derive_step_budgets
     if int(args.steps) > 0:
@@ -260,7 +260,7 @@ def main() -> int:
     # Build TrainConfig — every value either plant-tied or paper-faithful default.
     from training.train import TrainConfig, train as run_training
     from utils.plant_init import derive_batch_size
-    # Horizon-adaptive batch size (parity with workflow.runner.run_trial).
+    # Horizon-adaptive batch size (parity with workflow.bo_runner.run_trial).
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
@@ -333,7 +333,7 @@ def main() -> int:
     with open(out_dir / 'run_summary.json', 'w') as f:
         json.dump({'plan': plan, 'summary': summary}, f, indent=2)
 
-    # ── Phase 3: validation (parity with workflow.runner final retrain) ──
+    # ── Phase 3: validation (parity with workflow.bo_runner final retrain) ──
     val_summary: Dict = {}
     if not args.no_validate:
         print('[run] phase 3: validation', flush=True)

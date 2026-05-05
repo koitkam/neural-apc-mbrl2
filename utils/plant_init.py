@@ -2,7 +2,7 @@
 
 These helpers replace fixed paper defaults with values that adapt to the
 simulator's identified dynamics and channel complexity.  They are used by
-both ``workflow/run.py`` (single-run) and ``workflow/runner.py`` (BO
+both ``workflow/single_run.py`` (single-run) and ``workflow/bo_runner.py`` (BO
 seed for the first trial).
 
 Paper-defaults are kept as floors / minimums — we only *grow* values when
