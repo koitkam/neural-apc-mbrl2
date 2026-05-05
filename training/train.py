@@ -787,12 +787,21 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     imagined_values: List[torch.Tensor] = []
     imagined_target_v: List[torch.Tensor] = []
     imagined_agent_hid: List[torch.Tensor] = []
+    # Pre-rollout latent (the one the policy was actually conditioned
+    # on when it produced ``raw_t``).  Required for the actor loss to
+    # recompute log_prob on the SAME (μ, σ) that produced the sample;
+    # using the post-rollout latent here is a silent bug because the
+    # dynamics roll changes ``agent_hid_post`` between sample-time and
+    # loss-time, so log_prob_of_raw(s_{h+1}, u_h) evaluates the Gaussian
+    # at a completely different (μ, σ) and ``((u-μ)/σ)²`` blows up.
+    imagined_agent_hid_pre: List[torch.Tensor] = []
 
     for h in range(H):
         # 1. Sample action conditioned on post-action agent_hid of the
         #    previous step (or the buffer's last step at h=0).
+        agent_hid_for_policy = agent_hid_post
         action_t, logp_t, ent_t, raw_t = model.policy.sample_with_raw(
-            agent_hid_post)
+            agent_hid_for_policy)
 
         # 2. Imagine the next z under that action (K=4 shortcut sampler).
         with torch.no_grad():
@@ -834,6 +843,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         imagined_values.append(value_logits)
         imagined_target_v.append(target_v_pred)
         imagined_agent_hid.append(agent_hid_post)
+        imagined_agent_hid_pre.append(agent_hid_for_policy)
 
     rewards = torch.stack(imagined_rewards, dim=1)            # (B, H)
     target_values = torch.stack(imagined_target_v, dim=1)     # (B, H)
@@ -841,6 +851,11 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     raws = torch.stack(imagined_raws, dim=1)                  # (B, H, ...)
     entropies = torch.stack(imagined_entropy, dim=1)          # (B, H)
     agent_hids = torch.stack(imagined_agent_hid, dim=1)       # (B, H, D)
+    # Pre-rollout latents: the (B, H, D) tensor whose [b, h] entry is
+    # exactly the latent that the policy was conditioned on when it
+    # produced ``raws[b, h]``.  This is what the actor loss must use
+    # to recompute log_prob — see imagined_agent_hid_pre comment.
+    agent_hids_pre = torch.stack(imagined_agent_hid_pre, dim=1)  # (B, H, D)
     value_logits_seq = torch.stack(imagined_values, dim=1)    # (B, H, n_bins)
 
     # λ-returns (eq. 10).
@@ -876,6 +891,14 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         scale = model.update_return_scale(target_returns).clamp_min(1.0)
 
     feat_flat = agent_hids.reshape(-1, agent_hids.shape[-1])
+    # Actor recomputes log_prob_of_raw on the SAME latent the policy
+    # was conditioned on at sample time (= pre-rollout latent).  Mixing
+    # in the post-rollout latent here is the silent bug that caused
+    # the May-2026 actor_logp = -2400 explosion: under bf16 the dynamics
+    # roll changes ``agent_hid_post`` enough that ``μ(s_{h+1})`` differs
+    # from ``μ(s_h)`` by many σ-units, and the resulting Gaussian
+    # density on ``u_h`` is astronomically small.
+    feat_flat_for_policy = agent_hids_pre.reshape(-1, agent_hids_pre.shape[-1])
     actions_flat = actions.reshape(-1, actions.shape[-1])
     # ``raws`` may be either pre-tanh ``u`` (continuous, shape (B,H,A))
     # or bin index (discrete, shape (B,H,A) of int64).  Flatten while
@@ -888,7 +911,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     if actor_loss_type == 'pmpo':
         actor_loss, pmpo_diag = pmpo_loss(
             model.policy, model.prior_policy,
-            feat_flat, raws_flat, adv_flat,
+            feat_flat_for_policy, raws_flat, adv_flat,
             alpha=cfg.pmpo_alpha, beta=cfg.pmpo_beta,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 0.0)))
     else:
@@ -897,7 +920,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         # REINFORCE surrogate plus entropy bonus is sufficient anchor.
         actor_loss, pmpo_diag = reinforce_actor_loss(
             model.policy, model.prior_policy,
-            feat_flat, raws_flat, adv_flat,
+            feat_flat_for_policy, raws_flat, adv_flat,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 3e-4)),
             kl_coef=0.0)
 
