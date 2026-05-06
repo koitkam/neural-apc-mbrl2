@@ -1023,6 +1023,139 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
     return model
 
 
+def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
+                            ) -> Dict[str, Dict[str, object]]:
+    """Derive plant-adaptive defaults for the cold-start seed buffer.
+
+    Three knobs are computed; each is returned with a ``source`` so the
+    caller can tell which were truly auto-derived vs. fallback constants:
+
+    * ``baseline_seed_action_std`` — std of N(0, σ) actions used to drive
+      the env during seed-buffer pre-fill and reward calibration.
+      Solved so one MV step at ±σ produces an *expected steady-state CV
+      swing* below ``target_cv_frac`` of the average CV bound width:
+
+          σ = clip(target_cv_frac * mean(cv_bound_width)
+                    / mv_authority_to_cv,  0.01, 0.10)
+
+      Falls back to ``0.05`` when the identifier produced no usable
+      MV→CV gain (or when running on a sim that hasn't been identified).
+
+    * ``baseline_seed_episodes`` — number of small-noise seed episodes.
+      Targets ~5 %% of the replay buffer, scaled by complexity:
+
+          n = clip(buffer_capacity_steps * 0.05 / episode_length
+                    * max(1, complexity_factor),  4, 24)
+
+      Falls back to ``max(4, buffer_capacity / (20 * episode_length))``
+      when complexity isn't computable.
+
+    * ``policy_init_log_std`` — universal generic default of ``-2.0``
+      (σ ≈ 0.135 in pre-tanh space).  Not made plant-adaptive: this
+      already produces small-amplitude initial actions across all
+      simulators we've tested, and tying it to the action space adds
+      coupling without measurable benefit.
+    """
+    out: Dict[str, Dict[str, object]] = {}
+
+    # ---- baseline_seed_action_std --------------------------------------
+    sigma = 0.05
+    sigma_source = 'default'
+    try:
+        from utils.training_disturbance import compute_mv_authority_to_cv
+        mv_auth = float(compute_mv_authority_to_cv(env.sim))
+    except Exception:
+        mv_auth = 0.0
+    # Fallback: V4 plant-id writes dynamics_identification.json (no
+    # underscore-suffix) which the legacy identifier glob misses.  Read
+    # the file directly from the run's plant_id dir so the auto-tune is
+    # plant-aware in both V3 and V4 layouts.  V4's file lacks the
+    # ``mv_gain_to_cv`` summary; synthesize it from ``per_pair_estimates``
+    # by averaging |amplitude / delta| across valid MV-step trials per MV
+    # name.  Falls back to legacy loader output if the V4 file is absent.
+    if mv_auth <= 1e-6:
+        try:
+            from utils.training_disturbance import compute_mv_authority_to_cv as _auth_fn
+            out_dir = Path(getattr(cfg, 'out_dir', '.') or '.')
+            for cand in [out_dir / 'plant_id' / 'dynamics_identification.json',
+                          out_dir / 'dynamics_identification.json']:
+                if not cand.exists():
+                    continue
+                with open(cand) as _f:
+                    raw = json.load(_f) or {}
+                ctx = dict(raw)
+                if 'mv_gain_to_cv' not in ctx or not ctx.get('mv_gain_to_cv'):
+                    gain_acc: Dict[str, List[float]] = {}
+                    for est in raw.get('per_pair_estimates', []) or []:
+                        if (not est.get('valid')) or est.get('input_type') != 'mv':
+                            continue
+                        try:
+                            delta = float(est.get('delta', 0.0))
+                            amp = float(est.get('amplitude', 0.0))
+                        except (TypeError, ValueError):
+                            continue
+                        if abs(delta) < 1e-9 or not np.isfinite(amp):
+                            continue
+                        name = str(est.get('mv') or est.get('input') or '')
+                        if not name:
+                            continue
+                        gain_acc.setdefault(name, []).append(abs(amp / delta))
+                    if gain_acc:
+                        ctx['mv_gain_to_cv'] = {
+                            k: float(np.mean(v)) for k, v in gain_acc.items()
+                        }
+                mv_auth = float(_auth_fn(env.sim, identifier_ctx=ctx))
+                if mv_auth > 1e-6:
+                    break
+        except Exception:
+            pass
+    cv_widths = []
+    try:
+        for lo, hi in (env.cv_norm_ranges or []):
+            w = float(hi) - float(lo)
+            if np.isfinite(w) and w > 0:
+                cv_widths.append(w)
+    except Exception:
+        pass
+    if mv_auth > 1e-6 and cv_widths:
+        target_frac = 0.10
+        cv_w = float(np.mean(cv_widths))
+        sigma = float(np.clip(target_frac * cv_w / mv_auth, 0.01, 0.10))
+        sigma_source = (f'mv_authority(target_cv_frac={target_frac:.2f}, '
+                          f'cv_w={cv_w:.3f}, mv_auth={mv_auth:.3f})')
+    out['baseline_seed_action_std'] = {
+        'value': float(sigma), 'source': sigma_source,
+    }
+
+    # ---- baseline_seed_episodes ----------------------------------------
+    buf_cap = int(getattr(cfg, 'buffer_capacity_steps', 200_000) or 0)
+    ep_len = max(1, int(getattr(cfg, 'episode_length', 1)))
+    base = max(4, int(round(buf_cap * 0.05 / ep_len))) if buf_cap > 0 else 8
+    n_eps = int(np.clip(base, 4, 24))
+    n_source = (f'buffer_5pct({buf_cap}/{ep_len}={base})'
+                  if buf_cap > 0 else 'default')
+    out['baseline_seed_episodes'] = {
+        'value': int(n_eps), 'source': n_source,
+    }
+
+    # ---- policy_init_log_std (universal default) -----------------------
+    out['policy_init_log_std'] = {
+        'value': -2.0,
+        'source': 'universal_default(σ≈0.135)',
+    }
+    return out
+
+
+# Dataclass defaults captured for sentinel detection in ``train``.  When
+# a cfg field still equals its dataclass default after env-var injection,
+# auto-tune is allowed to overwrite it; user/env overrides survive.
+_AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
+    'baseline_seed_action_std': TrainConfig().baseline_seed_action_std,
+    'baseline_seed_episodes':   TrainConfig().baseline_seed_episodes,
+    'policy_init_log_std':      TrainConfig().policy_init_log_std,
+}
+
+
 def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
                             n_steps: int = 1500,
                             target_std: float = 1.0,
@@ -1198,12 +1331,48 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     cfg.aug_obs_dim = env.aug_obs_dim
     cfg.obs_dim = env.obs_dim
 
+    # ---- Adaptive cold-start seed-buffer knobs (P0, 2026-05-05) ----
+    # Derive plant-aware defaults for the seed buffer so a fresh sim
+    # works without operator intervention.  User / env-var overrides
+    # take precedence (detected via dataclass-default sentinel).
+    auto = auto_tune_seed_buffer(env, cfg)
+    auto_summary: Dict[str, Dict[str, object]] = {}
+    for field, info in auto.items():
+        cur = getattr(cfg, field)
+        default = _AUTO_TUNE_FIELD_DEFAULTS.get(field)
+        if cur == default:
+            setattr(cfg, field, info['value'])
+            auto_summary[field] = {**info, 'applied': True}
+            print(f'[auto-tune] {field}={info["value"]} '
+                  f'(source: {info["source"]})', flush=True)
+        else:
+            auto_summary[field] = {
+                'value': cur, 'source': 'user_override', 'applied': False,
+            }
+    try:
+        out_dir_pre = Path(cfg.out_dir or '.')
+        out_dir_pre.mkdir(parents=True, exist_ok=True)
+        with open(out_dir_pre / 'auto_tune_seed_buffer.json', 'w') as f:
+            json.dump(auto_summary, f, indent=2)
+        plan_path = out_dir_pre / 'run_plan.json'
+        if plan_path.exists():
+            with open(plan_path) as f:
+                plan = json.load(f)
+            plan['auto_tune_seed_buffer'] = auto_summary
+            with open(plan_path, 'w') as f:
+                json.dump(plan, f, indent=2)
+    except Exception:
+        pass
+
     # ---- Reward calibration (V4 reward head expects O(1) per-step rewards) ----
     obj_scale_env = os.environ.get('OBJ_REWARD_SCALE', 'auto').strip().lower()
     if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
         cal_mode = os.environ.get('DREAMER_REWARD_CAL_MODE',
                                     'baseline').strip().lower() or 'baseline'
-        cal = calibrate_reward_scale(env, rng, mode=cal_mode)
+        cal = calibrate_reward_scale(
+            env, rng, mode=cal_mode,
+            baseline_action_std=float(cfg.baseline_seed_action_std),
+        )
         print(f"[reward-scale] auto-calibrated ({cal['mode']}): "
               f"scale={cal['reward_scale']:.3f}  "
               f"raw_std={cal['raw_std']:.5f} raw_range=[{cal['raw_min']:.4f},"
