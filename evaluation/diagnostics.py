@@ -61,12 +61,19 @@ import torch
 # Stage metrics from train_log.jsonl
 # ---------------------------------------------------------------------------
 
-def _parse_train_log(jsonl_path: Path) -> Tuple[List[Dict], Dict]:
+def _parse_train_log(jsonl_path: Path,
+                       policy_type: str = 'continuous',
+                       n_action_bins: int = 21,
+                       actor_loss_type: str = 'reinforce',
+                       ) -> Tuple[List[Dict], Dict]:
     """Parse ``train_log.jsonl`` and bucket rows by phase.
 
     Returns ``(rows, summary)`` where ``rows`` is the parsed list and
     ``summary`` is a dict ``{ 'p1': {...}, 'p2': {...}, 'p3': {...} }``
     with first/last/min/max of each loss-like column per phase.
+    Flags adapt to ``policy_type`` (continuous / discrete) and
+    ``actor_loss_type`` (reinforce / pmpo) so labels match the
+    actually-trained policy.
     """
     rows: List[Dict] = []
     if not jsonl_path.exists():
@@ -104,11 +111,16 @@ def _parse_train_log(jsonl_path: Path) -> Tuple[List[Dict], Dict]:
         }
 
     summary = {'n_iters_total': len(rows),
+                'policy_type': str(policy_type),
+                'actor_loss_type': str(actor_loss_type),
                 'p1': {}, 'p2': {}, 'p3': {}}
     keys = ['recon_loss', 'sf_loss', 'reward_mtp_loss', 'bc_loss',
             'actor_loss', 'critic_loss', 'entropy_mean',
             'imagined_return_mean', 'imagined_reward_mean',
-            'pmpo_kl', 'pmpo_pos_frac', 'n_grad_skip',
+            # Both naming schemes are emitted by the trainer:
+            # ``actor_*`` from ``reinforce_actor_loss`` and ``pmpo_*``
+            # as back-compat aliases.  Keep both so old/new logs work.
+            'actor_kl_pen', 'pmpo_kl', 'pmpo_pos_frac', 'n_grad_skip',
             'ema_return', 'return_window_mean']
     for ph_id, ph_key in ((1, 'p1'), (2, 'p2'), (3, 'p3')):
         rs = by_phase[ph_id]
@@ -135,17 +147,48 @@ def _parse_train_log(jsonl_path: Path) -> Tuple[List[Dict], Dict]:
     p3 = summary['p3']
     if p3.get('n_iters', 0) > 0:
         if 'entropy_mean' in p3:
+            ent_first = p3['entropy_mean']['first']
             ent_last = p3['entropy_mean']['last']
-            # log(21) ≈ 3.04 for default n_action_bins=21.
-            if ent_last >= 2.95:
-                flags.append(f'P3: policy entropy stayed near uniform '
-                              f'(last={ent_last:.3f} ~ log(n_bins))')
+            if str(policy_type).lower() == 'discrete':
+                # log(n_bins) is the uniform-entropy upper bound for
+                # discrete policies; flag if we never moved off it.
+                ent_uniform = float(np.log(max(2, int(n_action_bins))))
+                if ent_last >= 0.97 * ent_uniform:
+                    flags.append(f'P3: discrete policy entropy stayed near uniform '
+                                  f'(last={ent_last:.3f} ~ log({n_action_bins})='
+                                  f'{ent_uniform:.3f})')
+            else:
+                # Continuous TanhNormal: flag (a) collapse to near-zero
+                # std and (b) failure to drop below init by end of P3.
+                if ent_last <= ent_first - 1.5:
+                    flags.append(f'P3: continuous policy entropy collapsed '
+                                  f'(first={ent_first:.3f} → last={ent_last:.3f}; '
+                                  f'std → 0)')
+                elif ent_last >= ent_first + 0.1:
+                    flags.append(f'P3: continuous policy entropy did not drop '
+                                  f'(first={ent_first:.3f} → last={ent_last:.3f}; '
+                                  f'no exploration narrowing)')
         if 'critic_loss' in p3:
             if p3['critic_loss']['last'] >= 0.85 * p3['critic_loss']['first']:
                 flags.append('P3: critic loss did not drop')
         if 'n_grad_skip' in p3 and p3['n_grad_skip']['max'] > 0:
             flags.append(f'P3: {int(p3["n_grad_skip"]["max"])} grad-clip '
                           f'skips (NaN/Inf in actor or critic gradient)')
+        # Advantage-sign skew: ``pmpo_pos_frac`` (alias under REINFORCE)
+        # is the fraction of imagined transitions with adv >= 0.  Both
+        # extremes indicate trouble: ~0 means critic baseline above all
+        # returns (over-optimistic value), ~1 means below all returns.
+        if 'pmpo_pos_frac' in p3:
+            pf_last = p3['pmpo_pos_frac']['last']
+            pf_med = p3['pmpo_pos_frac'].get('median', pf_last)
+            if pf_med <= 0.1:
+                flags.append(f'P3: advantage-positive fraction near zero '
+                              f'(median={pf_med:.3f}); critic baseline '
+                              f'over-optimistic vs imagined returns')
+            elif pf_med >= 0.9:
+                flags.append(f'P3: advantage-positive fraction near one '
+                              f'(median={pf_med:.3f}); critic baseline '
+                              f'under-pessimistic vs imagined returns')
     summary['flags'] = flags
     return rows, summary
 
@@ -530,7 +573,13 @@ def compute_training_diagnostics(*,
                    'gamma': float(gamma)}
 
     # 1. Stage metrics.
-    rows, stage = _parse_train_log(Path(controller_dir) / 'train_log.jsonl')
+    cfg = getattr(env, 'cfg', None)
+    rows, stage = _parse_train_log(
+        Path(controller_dir) / 'train_log.jsonl',
+        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
+        n_action_bins=int(getattr(cfg, 'n_action_bins', 21)),
+        actor_loss_type=str(getattr(cfg, 'actor_loss_type', 'reinforce')),
+    )
     diag['stage_metrics'] = stage
 
     # 2. WM fidelity.

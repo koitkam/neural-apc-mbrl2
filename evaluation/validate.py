@@ -102,13 +102,6 @@ def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
     return out
 
 
-def _bin_index_from_action(action_t: torch.Tensor, n_action_bins: int) -> int:
-    """Recover the discrete bin index from a continuous action ∈ [-1, 1]."""
-    a = float(np.clip(np.asarray(action_t.detach().cpu()).ravel()[0], -1.0, 1.0))
-    bin_centres = np.linspace(-1.0, 1.0, n_action_bins)
-    return int(np.argmin(np.abs(bin_centres - a)))
-
-
 # ---------------------------------------------------------------------------
 # Scripted disturbance schedule (deterministic, for rejection plots)
 # ---------------------------------------------------------------------------
@@ -1694,7 +1687,7 @@ def run_validation(*,
     # ---- Training-stage + WM-fidelity diagnostics ------------------------
     # Run once per validation invocation on a fresh env so we don't pay
     # per-seed cost.  Tells the operator which training stage (P1 WM,
-    # P2 reward MTP / BC, P3 PMPO) is the bottleneck.
+    # P2 reward MTP / BC, P3 actor-critic) is the bottleneck.
     try:
         from evaluation.diagnostics import compute_training_diagnostics
         diag_env = APCEnv(cfg, np.random.default_rng(99_999))
@@ -1733,6 +1726,9 @@ def run_validation(*,
         'simulation_dir': str(sim_dir),
         'ckpt': str(ckpt_path),
         'deterministic': deterministic,
+        'policy_type': str(getattr(cfg, 'policy_type', 'continuous')),
+        'actor_loss_type': str(getattr(cfg, 'actor_loss_type', 'reinforce')),
+        'policy_init_log_std': float(getattr(cfg, 'policy_init_log_std', -0.5)),
         'n_seeds': int(seeds),
         'episodes_per_seed': int(episodes),
         'n_episodes_total': int(len(metrics_records)),
