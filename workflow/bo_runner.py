@@ -200,8 +200,27 @@ def initialize_from_plant(out_dir: Path) -> Dict:
 
 
 def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
-    """Plant-derived horizon initial value: ceil((θ + 3τ) / sr)."""
-    return max(3, int(math.ceil((dead_time + 3.0 * tau) / max(1, sample_rate))))
+    """Plant-derived horizon initial value, capped at the V3 paper default.
+
+    DreamerV3 §3 prescribes ``H = 15`` universally across 150+ control
+    tasks (proven robust by their hyperparameter ablation).  V4 inherits
+    this default for continuous control (see ``docs/papers/README.md``).
+
+    Empirically (validate-iter80 RCA, 2026-05-06): the previous formula
+    ``ceil((θ + 3τ)/sr)`` produced H = 42 on test_sim, which compounds
+    reward-head error by 42 steps in imagination.  Even with reward
+    head Pearson r = 0.16, after H steps the imagined return is noise,
+    so REINFORCE advantages collapse to ≈ 0 and the actor saturates
+    against the σ clamp.  Capping at the paper-default H = 15 limits
+    error compounding and matches the prescription.
+
+    The plant time constant should govern *lookback* (transformer
+    context length) — which observation history the encoder sees —
+    NOT the imagination horizon, which is a learning-stability
+    parameter that the paper holds constant across plants.
+    """
+    raw = max(3, int(math.ceil((dead_time + 3.0 * tau) / max(1, sample_rate))))
+    return int(min(15, raw))
 
 
 def lookback_grid(plant_lookback: int) -> List[int]:

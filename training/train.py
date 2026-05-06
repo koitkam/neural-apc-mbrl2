@@ -226,6 +226,14 @@ class TrainConfig:
     # the first few P3 returns which are dominated by the snapshot
     # actor that hasn't been updated by imagination yet).
     phase3_pruner_warmup_iters: int = 8
+    # Critic warm-up: freeze the actor for the first N P3 iters so the
+    # value head sees real imagined returns before REINFORCE reacts to
+    # its baseline.  Prevents the entropy-saturation trap where a
+    # freshly-initialised critic produces noisy advantages → REINFORCE
+    # pushes σ to the clamp ceiling within 1–2 batches (validate-iter80
+    # RCA, 2026-05-06).  V3-aligned in spirit (§3.3 EMA-target).  Set
+    # to 0 to disable.
+    p3_critic_warmup_iters: int = 8
 
     # ----- Early stopping (within a single trial) -----
     # Master switch.  All sub-criteria are gated on this.
@@ -1179,6 +1187,34 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         'value': -2.0,
         'source': 'universal_default(σ≈0.135)',
     }
+
+    # ---- policy_log_std_max (plant-adaptive σ ceiling) -----------------
+    # DreamerV3 §3 prescribes σ ∈ [0.1, 1.0] (⇒ log_std ∈ [-2.3, 0]).
+    # The dataclass default (log_std_max = 0.0) sits at the upper end of
+    # that band, which lets REINFORCE+critic-over-optimism push the
+    # actor's σ all the way to ≈ 1.0 → policy ≈ uniform random across
+    # the MV bound range.  Observed in run_p0adapt and run_p1: entropy
+    # locked at the clamp ceiling for 100+ P3 iters.
+    #
+    # Narrow the ceiling to ``log(2 × baseline_seed_action_std)`` so σ
+    # cannot exceed roughly 2× the operating-region scale.  This stays
+    # *inside* the V3 band [-2.3, 0] (we never widen, only tighten the
+    # upper bound) while preventing the saturation trap on plants
+    # whose useful σ is much smaller than 1.0.
+    sigma_seed = float(out.get('baseline_seed_action_std',
+                                {}).get('value', 0.05))
+    # Floor at σ_max = 0.30 so we always preserve ≥ 3× headroom over
+    # the V3 paper σ_min = 0.1 (otherwise small operating-region σ
+    # collapses σ_max onto σ_min and freezes exploration).  Cap at 1.0
+    # (V3 paper upper).  For test_sim (σ_seed=0.05): σ_max=0.30
+    # ⇒ log_std_max ≈ -1.20.
+    target_sigma_max = float(np.clip(2.0 * sigma_seed, 0.30, 1.0))
+    log_std_max_val = float(np.log(target_sigma_max))
+    out['policy_log_std_max'] = {
+        'value': log_std_max_val,
+        'source': f'log(2*baseline_seed_action_std)='
+                  f'log(2*{sigma_seed:.3f})={log_std_max_val:+.3f}',
+    }
     return out
 
 
@@ -1190,6 +1226,7 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'baseline_seed_episodes':   TrainConfig().baseline_seed_episodes,
     'random_seed_episodes':     TrainConfig().random_seed_episodes,
     'policy_init_log_std':      TrainConfig().policy_init_log_std,
+    'policy_log_std_max':       TrainConfig().policy_log_std_max,
 }
 
 
@@ -1704,6 +1741,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
                     wm_losses, _, agent_hid = world_model_loss(model, batch, cfg)
+                    # P1 + P2 both train the reward MTP head (paper
+                    # Algorithm 1: tokenizer + dynamics + reward + value
+                    # are co-trained throughout WM pretraining).
+                    # Previously P1 used only ``recon + sf``, leaving
+                    # the reward head untrained until P2 (~10 iters of
+                    # reward gradient at our default budget).
+                    # validate-iter80 RCA (2026-05-06): reward head
+                    # Pearson r = 0.16 with pred_std=2.8 vs real_std=80
+                    # — under-trained.  Adding reward MTP to P1 gives
+                    # ~3× more reward-head gradient updates over the
+                    # full schedule.  BC loss is *not* added in P1
+                    # because random-action episodes carry no expert
+                    # signal; cloning them collapses the actor prior
+                    # to uniform (preserves the existing P2-only BC
+                    # rationale documented at TrainConfig.bc_scale).
+                    if current_phase == 1:
+                        ag_losses = agent_finetune_loss(model, batch,
+                                                          agent_hid, cfg)
                 # Phase 2: also update reward + policy via MTP (eq. 9).
                 if current_phase == 2:
                     with torch.amp.autocast(device_type=device.type,
@@ -1712,6 +1767,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         ag_losses = agent_finetune_loss(model, batch,
                                                           agent_hid, cfg)
                     total_loss = wm_losses['wm_total'] + ag_losses['agent_total']
+                elif current_phase == 1:
+                    # P1: WM losses + reward-head MTP only (no BC).
+                    total_loss = (wm_losses['wm_total']
+                                   + cfg.reward_scale_loss
+                                     * ag_losses['reward_mtp_loss'])
                 else:
                     total_loss = wm_losses['wm_total']
 
@@ -1775,7 +1835,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     ac_losses = imagination_step(model, batch, cfg)
                 opt_actor.zero_grad(set_to_none=True)
                 opt_critic.zero_grad(set_to_none=True)
-                (ac_losses['actor_loss'] + ac_losses['critic_loss']).backward()
+                # Critic warm-up (2026-05-06): for the first
+                # ``p3_critic_warmup_iters`` P3 iters, only step the
+                # critic; freeze the actor.  This prevents a freshly
+                # initialised value head from feeding noisy advantages
+                # into REINFORCE — under-trained-critic + negative-
+                # advantage noise reliably saturates ``log_std`` against
+                # the σ clamp ceiling within 1–2 batches.  Letting the
+                # critic see real imagined returns first (TD-λ
+                # bootstrap) before the actor reacts to its baseline
+                # mirrors the actor-critic warm-up convention from
+                # DreamerV3 community implementations.  Paper-aligned
+                # in spirit (V3 §3.3 EMA-target stabilisation has the
+                # same goal); the explicit iteration cap is a stronger
+                # version that helps when the P3 budget is short
+                # relative to the WM/critic settling time.
+                p3_warmup = int(getattr(cfg, 'p3_critic_warmup_iters', 0))
+                actor_frozen = (p3_warmup > 0 and p3_iters < p3_warmup)
+                if actor_frozen:
+                    # Backprop only the critic loss to keep the actor
+                    # graph frozen (actor params receive no gradient).
+                    ac_losses['critic_loss'].backward()
+                else:
+                    (ac_losses['actor_loss']
+                     + ac_losses['critic_loss']).backward()
                 actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters_actor(), cfg.grad_clip)
                 critic_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1786,7 +1869,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     opt_actor.zero_grad(set_to_none=True)
                     opt_critic.zero_grad(set_to_none=True)
                 else:
-                    opt_actor.step()
+                    if not actor_frozen:
+                        opt_actor.step()
                     opt_critic.step()
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
@@ -2125,6 +2209,7 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
         ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
         ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
+        ('DREAMER_P3_CRITIC_WARMUP_ITERS', 'p3_critic_warmup_iters', int),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
         ('DREAMER_COMPILE_MODE', 'compile_mode', str),
         ('AGENT_TOTAL_STEPS', 'total_steps', int),
