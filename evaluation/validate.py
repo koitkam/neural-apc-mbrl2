@@ -35,7 +35,7 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -705,13 +705,29 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
 # ---------------------------------------------------------------------------
 
 def run_constant_mv_episode(env, *, schedule: List[Dict],
-                              mv_norm: float = 0.0) -> Dict:
+                              mv_norm: float = 0.0,
+                              dv_override: Optional[np.ndarray] = None) -> Dict:
     """Replay ``schedule`` with a frozen MV at ``mv_norm`` (default = mid).
 
     Used as the lower baseline on the disturbance-rejection plot — shows
     what the plant does with no control intervention.  Reuses the same
     APCEnv so noise/setpoint/objective code paths are identical to the
     agent rollout (only the action source differs).
+
+    Parameters
+    ----------
+    dv_override : (T, n_dv) array, optional
+        If provided, overwrites the simulator's DV channel(s) after each
+        step with ``dv_override[t]``.  Used by the disturbance-rejection
+        plot so the baseline experiences the *exact same* uncontrolled
+        external disturbance trace as the agent run, making the
+        baseline-vs-agent CV overlay an apples-to-apples comparison
+        (DV is external by definition; the agent has no influence over
+        it, so any divergence between the two runs' DV streams is
+        purely noise-RNG drift between the two SimNoiseWrapper
+        instances).  Without this override the user sees subtly
+        different DV curves and can't tell whether the CV difference
+        is due to the controller or due to a different disturbance.
     """
     obs_window = env.reset(exploration=False)
     env._schedule = list(schedule)
@@ -730,15 +746,64 @@ def run_constant_mv_episode(env, *, schedule: List[Dict],
     cur_cv_t = np.zeros((T, n_cv_aux), dtype='float32')
 
     a = np.full(action_dim, float(mv_norm), dtype='float32')
+    # Resolve the underlying sim object so we can write back into its
+    # state buffer when a DV override is provided.  ``env.sim`` is the
+    # SimNoiseWrapper; its ``_sim`` is the raw simulator class instance
+    # which holds ``episode_array`` and the live state.
+    bare_sim = env.sim
+    for _ in range(4):
+        inner = getattr(bare_sim, '_sim', None)
+        if inner is None:
+            break
+        bare_sim = inner
+    dv_idx_list = list(env.meta.get('dv_indices') or [])
+    use_dv_override = (dv_override is not None
+                        and len(dv_idx_list) > 0
+                        and len(dv_override) >= T)
     for t in range(T):
         next_window, _, done, info = env.step(a)
         comps = info.get('reward_components', {}) or {}
+        # If a DV override is provided, force the underlying sim's
+        # state to carry the agent's recorded DV trajectory at this
+        # step *before* the next step uses it for dynamics.  This makes
+        # the baseline experience the identical external disturbance
+        # the agent saw, so the CV overlay is an apples-to-apples
+        # comparison.
+        if use_dv_override:
+            try:
+                ep_arr = getattr(bare_sim, 'episode_array', None)
+                # After env.step() returns, the underlying sim has
+                # advanced ``episode_counter`` and written the new row.
+                # The *next* step reads ``prev = episode_array[
+                # episode_counter]`` — so overwrite that exact row.
+                idx = int(getattr(bare_sim, 'episode_counter', t + 1))
+                if ep_arr is not None:
+                    idx = max(0, min(idx, ep_arr.shape[0] - 1))
+                ov = np.asarray(dv_override[t], dtype='float32').reshape(-1)
+                for j, di in enumerate(dv_idx_list):
+                    if j >= ov.shape[0]:
+                        break
+                    val = float(ov[j])
+                    if ep_arr is not None and idx >= 0 and di < ep_arr.shape[1]:
+                        ep_arr[idx, di] = val
+            except Exception:
+                pass
         raw_st = info.get('raw_state')
         if raw_st is None:
             states[t] = next_window[-1, :state_dim]
         else:
             arr = np.asarray(raw_st, dtype='float32').reshape(-1)
             states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
+        # Mirror the DV override into the recorded state so plots /
+        # CSV report the agent-aligned DV (must come AFTER the
+        # raw_st recording, which would otherwise clobber it).
+        if use_dv_override:
+            ov = np.asarray(dv_override[t], dtype='float32').reshape(-1)
+            for j, di in enumerate(dv_idx_list):
+                if j >= ov.shape[0]:
+                    break
+                if di < states.shape[1]:
+                    states[t, di] = float(ov[j])
         controls[t] = np.asarray(env._prev_control, dtype='float32')
         raw_rewards[t] = float(info.get('raw_reward', 0.0))
         cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
@@ -1568,17 +1633,6 @@ def run_validation(*,
             # midpoint.  Makes "is the agent doing anything?" a one-glance
             # answer on the rejection plot.
             try:
-                env_b = APCEnv(cfg, np.random.default_rng(seed + 1))
-                if obs_norm_state is not None:
-                    try:
-                        env_b.set_obs_norm_stats(
-                            mean=np.asarray(obs_norm_state.get('mean')),
-                            var=np.asarray(obs_norm_state.get('var')),
-                            count=float(obs_norm_state.get('count', 1.0)),
-                            learn=False)
-                    except Exception:
-                        pass
-                env_b.reward_scale = env.reward_scale
                 # Reset per-event bookkeeping flags so the baseline run
                 # actually re-applies the disturbance schedule.  The
                 # agent run mutates ``_applied`` / ``_hold_until`` /
@@ -1593,8 +1647,34 @@ def run_validation(*,
                     ev.pop('_hold_until', None)
                     ev.pop('_hold_state_idx', None)
                     ev.pop('_hold_value_raw', None)
+                env_b = APCEnv(cfg, np.random.default_rng(seed + 1))
+                if obs_norm_state is not None:
+                    try:
+                        env_b.set_obs_norm_stats(
+                            mean=np.asarray(obs_norm_state.get('mean')),
+                            var=np.asarray(obs_norm_state.get('var')),
+                            count=float(obs_norm_state.get('count', 1.0)),
+                            learn=False)
+                    except Exception:
+                        pass
+                env_b.reward_scale = env.reward_scale
+                # DV is by definition an external disturbance the agent
+                # can't influence.  Force the baseline simulator to
+                # follow the *agent's* recorded DV trajectory so the
+                # baseline-vs-agent CV overlay isolates "what would
+                # happen with no control under the same external
+                # disturbance" — the only meaningful comparison.
+                # Without the override, the baseline's noise wrapper
+                # produces an independent OU+measurement-noise stream
+                # on the DV channel, so the two runs see different
+                # external disturbances and the overlay is misleading.
+                _dv_idx = list(env.meta.get('dv_indices') or [])
+                _agent_dv = (ep_d['states'][:, _dv_idx]
+                              if (_dv_idx and ep_d['states'].size)
+                              else None)
                 ep_b = run_constant_mv_episode(env_b, schedule=scripted,
-                                                  mv_norm=0.0)
+                                                  mv_norm=0.0,
+                                                  dv_override=_agent_dv)
             except Exception as _be:
                 print(f'[val] baseline replay skipped (seed {seed}): {_be!r}',
                       flush=True)
