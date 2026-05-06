@@ -1426,6 +1426,21 @@ def run_validation(*,
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
 
+    # Ensure validation uses the same noise config the model was trained
+    # against.  ``single_run`` writes ``noise_config.json`` to the
+    # controller dir and exports ``SIM_NOISE_CONFIG_JSON`` for the
+    # in-process train+validate flow, but standalone ``python -m
+    # evaluation.validate`` invocations (and the workflow runner) start
+    # without that env var set.  Falling back to "no noise" silently
+    # produces flat baseline traces that don't match the training
+    # distribution (diagnosed 2026-05-06).  Load the file explicitly.
+    if not os.environ.get('SIM_NOISE_CONFIG_JSON', '').strip():
+        nc_path = controller_dir / 'noise_config.json'
+        if nc_path.exists():
+            os.environ['SIM_NOISE_CONFIG_JSON'] = str(nc_path.resolve())
+            print(f'[val] noise_config: loaded {nc_path} '
+                  '(SIM_NOISE_CONFIG_JSON was unset)', flush=True)
+
     run_plan = _load_run_plan(controller_dir)
     sim_dir = _resolve_sim_dir(str(simulation_dir) if simulation_dir else None,
                                 controller_dir, run_plan)
@@ -1564,6 +1579,20 @@ def run_validation(*,
                     except Exception:
                         pass
                 env_b.reward_scale = env.reward_scale
+                # Reset per-event bookkeeping flags so the baseline run
+                # actually re-applies the disturbance schedule.  The
+                # agent run mutates ``_applied`` / ``_hold_until`` /
+                # ``_hold_state_idx`` / ``_hold_value_raw`` in-place;
+                # without this reset the baseline sees zero disturbances
+                # → flat DV → CV at steady state with only measurement
+                # noise → "is the agent doing anything?" plot shows a
+                # near-flat baseline that misleads the operator (mirrors
+                # the legacy V3 fix at validate_latent.py:2299).
+                for ev in scripted:
+                    ev['_applied'] = False
+                    ev.pop('_hold_until', None)
+                    ev.pop('_hold_state_idx', None)
+                    ev.pop('_hold_value_raw', None)
                 ep_b = run_constant_mv_episode(env_b, schedule=scripted,
                                                   mv_norm=0.0)
             except Exception as _be:
@@ -1715,6 +1744,58 @@ def run_validation(*,
             print('[val] training-stage flags:', flush=True)
             for fl in flags:
                 print(f'        - {fl}', flush=True)
+
+        # Internal-fidelity gates (2026-05-06).  Independent of the
+        # economic / disturbance-rejection plots, these flag whether the
+        # *world model itself* is usable.  Thresholds chosen from the
+        # validate-iter140 RCA: a healthy WM should yield at least
+        # weak positive correlation between predictions and real
+        # next-state / next-reward / Monte-Carlo return.  Anything
+        # below these floors means downstream actor learning is
+        # mathematically guaranteed to fail.
+        try:
+            wm = diag.get('wm_fidelity', {}) or {}
+            rw = diag.get('reward_fidelity', {}) or {}
+            cc = diag.get('critic_calib', {}) or {}
+            wm_r1 = float(((wm.get('per_offset') or {}).get('1') or {}).get('r_mean', 0.0))
+            rw_r0 = float(((rw.get('per_offset') or {}).get('0') or {}).get('r', 0.0))
+            critic_r = float(cc.get('r_pearson', 0.0))
+            fidelity_gates = {
+                'wm_next_state_r_min': 0.5,
+                'reward_head_r_min': 0.3,
+                'critic_r_min': 0.3,
+                'wm_next_state_r_observed': wm_r1,
+                'reward_head_r_observed': rw_r0,
+                'critic_r_observed': critic_r,
+                'wm_pass': bool(wm_r1 >= 0.5),
+                'reward_pass': bool(rw_r0 >= 0.3),
+                'critic_pass': bool(critic_r >= 0.3),
+            }
+            fidelity_gates['all_pass'] = bool(
+                fidelity_gates['wm_pass']
+                and fidelity_gates['reward_pass']
+                and fidelity_gates['critic_pass']
+            )
+            diag['fidelity_gates'] = fidelity_gates
+            if not fidelity_gates['all_pass']:
+                print('[val] internal-fidelity gates FAILED:', flush=True)
+                if not fidelity_gates['wm_pass']:
+                    print(f'        - WM next-state r={wm_r1:+.3f} < 0.5'
+                          ' (encoder/dynamics not learning plant)', flush=True)
+                if not fidelity_gates['reward_pass']:
+                    print(f'        - reward head r={rw_r0:+.3f} < 0.3'
+                          ' (reward MTP uncorrelated with truth)', flush=True)
+                if not fidelity_gates['critic_pass']:
+                    print(f'        - critic V vs MC r={critic_r:+.3f} < 0.3'
+                          ' (value head uncorrelated with returns)', flush=True)
+            else:
+                print(f'[val] internal-fidelity gates PASSED '
+                      f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '
+                      f'critic_r={critic_r:+.3f})', flush=True)
+        except Exception as _ge:
+            print(f'[val] fidelity-gate computation skipped: {_ge!r}',
+                  flush=True)
+            diag['fidelity_gates'] = {'error': repr(_ge)}
     except Exception as e:
         print(f'[val] diagnostics skipped: {e}', flush=True)
 
@@ -1738,6 +1819,7 @@ def run_validation(*,
         'cum_raw_reward_max': float(cum.max()),
         'mean_cv_violation_mean': float(cv_v.mean()),
         'mean_mv_violation_mean': float(mv_v.mean()),
+        'fidelity_gates': locals().get('fidelity_gates', None),
         'episodes': metrics_records,
         'disturbance_rejection': disturbance_records,
     }

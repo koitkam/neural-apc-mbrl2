@@ -149,23 +149,35 @@ class TrainConfig:
                               # transition).
 
     # ----- Loss weights -----
-    # recon_scale=0 by default: with the thin linear tokenizer, recon-MAE
-    # on mostly-constant obs vectors empirically *causes* encoder
-    # collapse (the head reaches recon ≈ 0 by emitting the marginal mean
-    # — see 2026-05-03 root-cause analysis).  Shortcut-forcing alone
-    # carries the world model.  Keep the head present for compat /
-    # optional revival, just zero the weight.
-    recon_scale: float = 0.0
+    # recon_scale: Phase-1 tokenizer reconstruction weight on **z-scored**
+    # observations (running stats from ``_build_obs_vec``).
+    #
+    # History (2026-05-06 RCA): with recon_scale=0 the tokenizer received
+    # no direct supervision on the observation channels and shortcut-
+    # forcing alone failed to anchor the encoder to plant state — WM
+    # next-state correlation r≈0, reward head r≈-0.4, critic r≈-0.05
+    # (validate diag against ckpt 140 of run_p0adapt).  The 2026-05-03
+    # "encoder collapse on raw obs" risk that motivated recon_scale=0
+    # does not apply once obs is z-scored (marginal mean = 0, std = 1
+    # per channel ⇒ no shortcut to "predict the mean").  We re-enable
+    # recon at a small weight (0.1) so SF + recon jointly anchor the
+    # latent.  This matches DreamerV4 §3.1 "tokenizer trained jointly
+    # with reconstruction loss" in spirit (we deviate only in using a
+    # thin linear projection without VQ for low-D vector obs).
+    recon_scale: float = 0.1
     sf_scale: float = 1.0
     reward_scale_loss: float = 1.0   # Phase-2 reward MTP weight
-    # Buffer seeding (P0 cold-start fix, 2026-05-05).
+    # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
     # reward landscapes so the buffer carries some positive-advantage
-    # transitions before the actor has trained.
-    baseline_seed_episodes: int = 8
+    # transitions before the actor has trained.  Defaults bumped from
+    # 8/2 → 16/6 (Option 3 in 2026-05-06 RCA): more state-space coverage
+    # for the WM pretrain phase, addressing the under-trained dynamics
+    # diagnosed in run_p0adapt.
+    baseline_seed_episodes: int = 16
     baseline_seed_action_std: float = 0.05
-    random_seed_episodes: int = 2
+    random_seed_episodes: int = 6
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -1140,14 +1152,26 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     }
 
     # ---- baseline_seed_episodes ----------------------------------------
+    # Scale with buffer capacity; floor 8, cap 32 (was 24 pre-2026-05-06;
+    # raised to give the WM more diverse pretrain transitions).
     buf_cap = int(getattr(cfg, 'buffer_capacity_steps', 200_000) or 0)
     ep_len = max(1, int(getattr(cfg, 'episode_length', 1)))
-    base = max(4, int(round(buf_cap * 0.05 / ep_len))) if buf_cap > 0 else 8
-    n_eps = int(np.clip(base, 4, 24))
-    n_source = (f'buffer_5pct({buf_cap}/{ep_len}={base})'
+    base = max(8, int(round(buf_cap * 0.08 / ep_len))) if buf_cap > 0 else 16
+    n_eps = int(np.clip(base, 8, 32))
+    n_source = (f'buffer_8pct({buf_cap}/{ep_len}={base})'
                   if buf_cap > 0 else 'default')
     out['baseline_seed_episodes'] = {
         'value': int(n_eps), 'source': n_source,
+    }
+
+    # ---- random_seed_episodes ------------------------------------------
+    # Random-action episodes drive state-space coverage breadth (off-
+    # policy / extreme-action transitions the WM needs to generalise).
+    # Scale at ~1/3 of baseline_seed_episodes; floor 4, cap 12.
+    n_rand = int(np.clip(round(n_eps / 3.0), 4, 12))
+    out['random_seed_episodes'] = {
+        'value': int(n_rand),
+        'source': f'baseline_seed_episodes/3 (={n_eps}/3)',
     }
 
     # ---- policy_init_log_std (universal default) -----------------------
@@ -1164,6 +1188,7 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
 _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'baseline_seed_action_std': TrainConfig().baseline_seed_action_std,
     'baseline_seed_episodes':   TrainConfig().baseline_seed_episodes,
+    'random_seed_episodes':     TrainConfig().random_seed_episodes,
     'policy_init_log_std':      TrainConfig().policy_init_log_std,
 }
 

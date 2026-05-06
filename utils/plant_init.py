@@ -67,23 +67,39 @@ def complexity_score(*, n_mv: int, n_cv: int, n_dv: int, state_dim: int,
 
 
 def derive_model_size(*, n_mv: int, n_cv: int, n_dv: int, state_dim: int,
-                      tau_dom: float, tau_fast: float) -> str:
+                      tau_dom: float, tau_fast: float,
+                      sample_rate: int = 1) -> str:
     """Map complexity score to {S, M, L}.
 
     Thresholds chosen so:
       - 1×1 SISO plants with state_dim ≤ 4 → S
       - moderate MIMO (≤ 4×4, single-scale) → M
       - large MIMO or strongly multi-scale → L
+
+    Long-τ escalation (2026-05-06): plants whose normalized settling
+    time (``3τ + θ ≈ 3·tau_dom``) covers many sample steps need more
+    transformer capacity to model the long-range dependency, even
+    when the channel count is small.  We escalate one tier when
+    ``settling_samples ≥ 25`` (e.g. test_sim: τ=53, sr=4 ⇒ 40 samples
+    ⇒ S→M).  This covers the under-capacity case diagnosed in
+    run_p0adapt where SISO test_sim was assigned S despite τ=53.
     """
     score = complexity_score(
         n_mv=n_mv, n_cv=n_cv, n_dv=n_dv, state_dim=state_dim,
         tau_dom=tau_dom, tau_fast=tau_fast,
     )
     if score <= 4.0:
-        return 'S'
-    if score <= 12.0:
-        return 'M'
-    return 'L'
+        size = 'S'
+    elif score <= 12.0:
+        size = 'M'
+    else:
+        size = 'L'
+
+    sr = max(1, int(sample_rate))
+    settling_samples = (3.0 * float(max(0.0, tau_dom))) / sr
+    if settling_samples >= 25.0:
+        size = {'S': 'M', 'M': 'L', 'L': 'L'}[size]
+    return size
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +295,7 @@ def derive_all(dyn_report: Dict[str, Any], sim_meta: Dict[str, Any],
     model_size = derive_model_size(
         n_mv=n_mv, n_cv=n_cv, n_dv=n_dv, state_dim=state_dim,
         tau_dom=tau_dom, tau_fast=tau_fast,
+        sample_rate=sr,
     )
     score = complexity_score(
         n_mv=n_mv, n_cv=n_cv, n_dv=n_dv, state_dim=state_dim,
