@@ -166,7 +166,12 @@ class TrainConfig:
     # thin linear projection without VQ for low-D vector obs).
     recon_scale: float = 0.1
     sf_scale: float = 1.0
-    reward_scale_loss: float = 1.0   # Phase-2 reward MTP weight
+    reward_scale_loss: float = 2.0   # P1+P2+P3 reward MTP weight (was 1.0;
+    # bumped 2026-05-06 after run_p2 RCA showed reward head pred_std=5.2 vs
+    # real_std=44.9 — head learned ranking r=0.62 but not scale.  2× weight
+    # on the symlog/2-hot reward loss drives the head toward fitting the
+    # full distribution width rather than collapsing onto the mean.
+    # Stays well within stable WM-loss balance (recon+sf already O(1)).
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -233,7 +238,14 @@ class TrainConfig:
     # pushes σ to the clamp ceiling within 1–2 batches (validate-iter80
     # RCA, 2026-05-06).  V3-aligned in spirit (§3.3 EMA-target).  Set
     # to 0 to disable.
-    p3_critic_warmup_iters: int = 8
+    #
+    # Bumped 8 → 16 (2026-05-06): run_p2 RCA showed critic_loss only
+    # dropped 5.2 → 4.0 in 8 iters (= 24% drop); actor was unfrozen
+    # while critic was still 4× its eventual saturation level (~1.5).
+    # 16 iters lets critic reach ~2.5 (~50% of P3 saturation) before
+    # actor reacts, which materially reduces the over-optimism that
+    # produced pmpo_pos_frac = 6% on run_p2.
+    p3_critic_warmup_iters: int = 16
 
     # ----- Early stopping (within a single trial) -----
     # Master switch.  All sub-criteria are gated on this.
@@ -1203,12 +1215,18 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # whose useful σ is much smaller than 1.0.
     sigma_seed = float(out.get('baseline_seed_action_std',
                                 {}).get('value', 0.05))
-    # Floor at σ_max = 0.30 so we always preserve ≥ 3× headroom over
-    # the V3 paper σ_min = 0.1 (otherwise small operating-region σ
-    # collapses σ_max onto σ_min and freezes exploration).  Cap at 1.0
-    # (V3 paper upper).  For test_sim (σ_seed=0.05): σ_max=0.30
-    # ⇒ log_std_max ≈ -1.20.
-    target_sigma_max = float(np.clip(2.0 * sigma_seed, 0.30, 1.0))
+    # Floor at σ_max = 0.50 so we always preserve ≥ 5× headroom over
+    # the V3 paper σ_min = 0.1.  Cap at 1.0 (V3 paper upper).  For
+    # test_sim (σ_seed=0.10): σ_max=0.50 ⇒ log_std_max ≈ -0.69.
+    #
+    # Tuned 2026-05-06: previous floor of 0.30 left only 0.219 nats of
+    # entropy headroom (= max H of σ=0.30 policy), which collided with
+    # the entropy-collapse early-stop threshold (0.284 nats).  σ_max
+    # = 0.50 gives H_max = 0.708 nats, well above the trip floor and
+    # plenty of room for REINFORCE to explore action-dependent μ
+    # without saturating against the ceiling on the first noisy
+    # negative-advantage batch.
+    target_sigma_max = float(np.clip(2.0 * sigma_seed, 0.50, 1.0))
     log_std_max_val = float(np.log(target_sigma_max))
     out['policy_log_std_max'] = {
         'value': log_std_max_val,
@@ -1994,6 +2012,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         thr = (float(getattr(cfg,
                                 'early_stop_entropy_collapse_frac', 0.20))
                                * n_action_bins_log)
+                        # Clamp-aware floor (2026-05-06): the continuous
+                        # policy's entropy is upper-bounded by
+                        #   H_max(σ_max) = log_std_max + 0.5·log(2πe)
+                        # When auto-tune sets a tight σ_max (e.g. 0.30 →
+                        # H_max ≈ 0.22), a fixed ``thr`` calibrated to
+                        # σ=1 (≈ 0.28) is *above* the maximum attainable
+                        # entropy → false-positive "collapse" trip on
+                        # every healthy run that hits the clamp.  Move
+                        # the trip floor below H_max by a fixed margin
+                        # (default 0.10 nats ≈ 10% σ shrink from clamp).
+                        if str(getattr(cfg, 'policy_type', 'continuous')
+                                ).lower() == 'continuous':
+                            log_std_max = float(getattr(cfg,
+                                    'policy_log_std_max', 0.0))
+                            unit_g = 0.5 * math.log(2.0 * math.pi * math.e)
+                            h_max_at_clamp = (
+                                float(cfg.action_dim)
+                                * (log_std_max + unit_g))
+                            margin = float(getattr(cfg,
+                                    'early_stop_entropy_collapse_clamp_margin',
+                                    0.10))
+                            clamp_aware_thr = h_max_at_clamp - margin
+                            if clamp_aware_thr < thr:
+                                thr = clamp_aware_thr
                         # Maintain sliding window of P3 entropy values.
                         ent_window.append(float(ent))
                         win_n = max(2, int(getattr(cfg,
