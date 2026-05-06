@@ -110,7 +110,15 @@ MODEL_SIZE_PRESETS: Dict[str, Dict[str, int]] = {
           'tok_hidden': 384, 'head_hidden': 384},
 }
 
-HORIZON_BAND = (0.5, 0.75, 1.0, 1.5, 2.0)
+HORIZON_BAND = (0.5, 0.75, 1.0, 1.25)
+# Narrow search band around the V3 paper default (H_init = 15, capped
+# in ``horizon_init``).  Maps to H ∈ {8, 11, 15, 19} on plants where
+# the cap binds — covers the immediate neighbourhood of V3's
+# universally-optimal horizon without re-introducing the long-horizon
+# failure mode (H ≥ 30 compounded reward-head error catastrophically
+# on test_sim, validate-iter80 RCA 2026-05-06).  V3 ablation
+# (Hafner 2023, Fig. 8) shows monotonic degradation past H=15 on
+# 150-task average; we restrict BO to the safe regime.
 
 
 # ---------------------------------------------------------------------------
