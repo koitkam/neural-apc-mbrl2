@@ -90,7 +90,13 @@ class TrainConfig:
     # fine-grained tracking tasks.  ``'discrete'`` retains the paper's
     # categorical-bin head for back-compat / Atari-style sims.
     policy_type: str = 'continuous'
-    policy_init_log_std: float = -0.5
+    # ``policy_init_log_std=-2.0`` (σ ≈ 0.135 in pre-tanh space) gives
+    # initial actions near mid-MV → first episodes stay in-bounds → the
+    # buffer contains some non-catastrophic transitions before the
+    # actor has learned anything.  Old default (-0.5 / σ ≈ 0.6)
+    # produced uniform-violation rollouts that left REINFORCE with no
+    # positive advantage to amplify (see 2026-05-05 root-cause).
+    policy_init_log_std: float = -2.0
     # DreamerV3 §3 stable defaults: σ ∈ [0.1, 1.0] (log_std ∈ [-2.3, 0]).
     # Override per-simulator only if a plant genuinely needs broader
     # exploration; the V3 prescription works generically across 150+
@@ -152,6 +158,14 @@ class TrainConfig:
     recon_scale: float = 0.0
     sf_scale: float = 1.0
     reward_scale_loss: float = 1.0   # Phase-2 reward MTP weight
+    # Buffer seeding (P0 cold-start fix, 2026-05-05).
+    # Replace the two random-action seed episodes with ``baseline_seed_episodes``
+    # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
+    # reward landscapes so the buffer carries some positive-advantage
+    # transitions before the actor has trained.
+    baseline_seed_episodes: int = 8
+    baseline_seed_action_std: float = 0.05
+    random_seed_episodes: int = 2
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -606,6 +620,42 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
 
+def collect_baseline_episode(env: APCEnv, cfg: TrainConfig, *,
+                              action_std: float = 0.05,
+                              ) -> Dict[str, np.ndarray]:
+    """Collect one episode driven by small-noise actions around mid-MV.
+
+    Used to **seed** the replay buffer with non-catastrophic transitions
+    before the actor has learned anything (P0 cold-start fix,
+    2026-05-05).  Actions are drawn from ``N(0, action_std)`` clipped to
+    ``[-1, 1]`` in the env's normalized action space (``0.0`` is
+    mid-bound for an MV channel).  No model inference is needed, so this
+    runs on CPU regardless of device.
+
+    Returns the same dict shape as ``collect_episode`` so the result can
+    be passed straight to ``buf.add_episode``.
+    """
+    obs_window = env.reset(exploration=True)
+    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    obs_buf = np.zeros((T, L, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window
+        a_np = env.rng.normal(0.0, float(action_std),
+                                size=(env.action_dim,)).astype('float32')
+        np.clip(a_np, -1.0, 1.0, out=a_np)
+        next_window, reward, done, _ = env.step(a_np)
+        act_buf[t] = a_np
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 / 2 — World model loss (tokenizer recon + shortcut forcing)
 # ---------------------------------------------------------------------------
@@ -977,14 +1027,36 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
                             n_steps: int = 1500,
                             target_std: float = 1.0,
                             min_scale: float = 1.0,
-                            max_scale: float = 1000.0) -> Dict[str, float]:
-    """Empirically choose a per-step reward scale to match V4's twohot range."""
+                            max_scale: float = 1000.0,
+                            mode: str = 'baseline',
+                            baseline_action_std: float = 0.05,
+                            ) -> Dict[str, float]:
+    """Empirically choose a per-step reward scale to match V4's twohot range.
+
+    ``mode='baseline'`` (default, P0 fix): drive the env with small-noise
+    actions around mid-MV (``a ~ N(0, baseline_action_std)`` clipped to
+    ``[-1, 1]``).  This produces the *operating-region* reward distribution
+    that the agent will actually see once it has learned to stay near
+    safe set-points, instead of the violation-saturated distribution
+    produced by uniform-random actions.  Avoids baking the ``raw_min ~
+    -250`` cliff into ``reward_scale``.
+
+    ``mode='random'``: legacy behaviour (uniform on ``[-1, 1]``); kept
+    for back-compat / debugging.
+    """
     if env.reward_scale != 1.0:
         env.reward_scale = 1.0
     raw_rewards: List[float] = []
     env.reset(exploration=True)
+    mode = str(mode).lower()
     for _ in range(int(n_steps)):
-        a = rng.uniform(-1.0, 1.0, size=(env.action_dim,)).astype('float32')
+        if mode == 'random':
+            a = rng.uniform(-1.0, 1.0,
+                              size=(env.action_dim,)).astype('float32')
+        else:  # 'baseline'
+            a = rng.normal(0.0, float(baseline_action_std),
+                            size=(env.action_dim,)).astype('float32')
+            np.clip(a, -1.0, 1.0, out=a)
         _, _, done, info = env.step(a)
         raw_rewards.append(float(info.get('raw_reward', 0.0)))
         if done:
@@ -1002,6 +1074,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
         'reward_scale': scale, 'raw_std': std, 'raw_mean': mean,
         'raw_min': float(arr.min()), 'raw_max': float(arr.max()),
         'target_std': float(target_std), 'n_steps': int(n_steps),
+        'mode': mode, 'baseline_action_std': float(baseline_action_std),
     }
 
 
@@ -1128,8 +1201,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # ---- Reward calibration (V4 reward head expects O(1) per-step rewards) ----
     obj_scale_env = os.environ.get('OBJ_REWARD_SCALE', 'auto').strip().lower()
     if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
-        cal = calibrate_reward_scale(env, rng)
-        print(f"[reward-scale] auto-calibrated: scale={cal['reward_scale']:.3f}  "
+        cal_mode = os.environ.get('DREAMER_REWARD_CAL_MODE',
+                                    'baseline').strip().lower() or 'baseline'
+        cal = calibrate_reward_scale(env, rng, mode=cal_mode)
+        print(f"[reward-scale] auto-calibrated ({cal['mode']}): "
+              f"scale={cal['reward_scale']:.3f}  "
               f"raw_std={cal['raw_std']:.5f} raw_range=[{cal['raw_min']:.4f},"
               f"{cal['raw_max']:.4f}]  target_std={cal['target_std']:.2f}",
               flush=True)
@@ -1278,8 +1354,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             return 2
         return 3
 
-    # Seed buffer (always with random actions; needed before any training step).
-    for _ in range(2):
+    # Seed buffer.  P0 (2026-05-05): instead of two uniform-random episodes
+    # — which on cliff-shaped reward landscapes (this plant: raw_min=-250,
+    # raw_max=+0.1) produce nothing but violation transitions and leave
+    # REINFORCE with no positive-advantage seed — prepend a few
+    # ``baseline_seed_episodes`` driven by small-noise actions around
+    # mid-MV.  Operator analogue: "don't move the valves while the
+    # buffer is empty".  Falls back to all-random if the user explicitly
+    # opts out.
+    n_baseline_seed = int(getattr(cfg, 'baseline_seed_episodes', 8))
+    baseline_seed_std = float(getattr(cfg, 'baseline_seed_action_std', 0.05))
+    n_random_seed = int(getattr(cfg, 'random_seed_episodes', 2))
+    if n_baseline_seed > 0:
+        for _ in range(n_baseline_seed):
+            ep = collect_baseline_episode(env, cfg,
+                                            action_std=baseline_seed_std)
+            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            total_env_steps += cfg.episode_length
+    for _ in range(max(0, n_random_seed)):
         ep = collect_episode(env, model, device, cfg, random_action=True)
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
@@ -1824,6 +1916,9 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_LR_ACTOR', 'lr_actor', float),
         ('DREAMER_LR_CRITIC', 'lr_critic', float),
         ('DREAMER_LR_WORLD', 'lr_world', float),
+        ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
+        ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
+        ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
         ('DREAMER_COMPILE_MODE', 'compile_mode', str),
         ('AGENT_TOTAL_STEPS', 'total_steps', int),
