@@ -730,6 +730,19 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'sf_loss': sf_loss,
         'wm_total': cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss,
     }
+    # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
+    # to observation variance.  An encoder that "throws away
+    # information" by averaging-out the noise will show var(z) <<
+    # var(obs); a healthy encoder preserves at least the meaningful
+    # signal variance.  Computed per-batch (cheap), logged every
+    # ``log_every`` iters.  Heuristic interpretation:
+    #   - var_ratio ≪ 0.1 → encoder is collapsing (low-rank latent)
+    #   - var_ratio ≈ 0.5–2.0 → healthy bottleneck
+    #   - var_ratio ≫ 5     → encoder is over-amplifying (rare)
+    with torch.no_grad():
+        obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
+        z_var = z_clean.float().var(dim=(0, 1)).mean()
+        losses['encoder_var_ratio'] = (z_var / obs_var).detach()
     losses.update({k: v for k, v in sf_diag.items()})
     return losses, z_clean.detach(), agent_hid
 
@@ -1272,6 +1285,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     if env.reward_scale != 1.0:
         env.reward_scale = 1.0
     raw_rewards: List[float] = []
+    obs_trace: List[np.ndarray] = []
     env.reset(exploration=True)
     mode = str(mode).lower()
     for _ in range(int(n_steps)):
@@ -1282,8 +1296,12 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
             a = rng.normal(0.0, float(baseline_action_std),
                             size=(env.action_dim,)).astype('float32')
             np.clip(a, -1.0, 1.0, out=a)
-        _, _, done, info = env.step(a)
+        obs, _, done, info = env.step(a)
         raw_rewards.append(float(info.get('raw_reward', 0.0)))
+        try:
+            obs_trace.append(np.asarray(obs, dtype='float32').copy())
+        except Exception:
+            pass
         if done:
             env.reset(exploration=True)
     arr = np.asarray(raw_rewards, dtype='float64')
@@ -1300,6 +1318,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
         'raw_min': float(arr.min()), 'raw_max': float(arr.max()),
         'target_std': float(target_std), 'n_steps': int(n_steps),
         'mode': mode, 'baseline_action_std': float(baseline_action_std),
+        '_obs_trace': obs_trace,
     }
 
 
@@ -1465,6 +1484,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             env, rng, mode=cal_mode,
             baseline_action_std=float(cfg.baseline_seed_action_std),
         )
+        # Pop the obs trace before serialising — kept on the dict only
+        # to feed the SNR diagnostic below; np.ndarray is not JSON-safe.
+        cal_obs = cal.pop('_obs_trace', [])
         print(f"[reward-scale] auto-calibrated ({cal['mode']}): "
               f"scale={cal['reward_scale']:.3f}  "
               f"raw_std={cal['raw_std']:.5f} raw_range=[{cal['raw_min']:.4f},"
@@ -1494,6 +1516,77 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             env.reward_scale = float(obj_scale_env)
         except Exception:
             env.reward_scale = 1.0
+
+    # ---- Channel-level SNR diagnostic (2026-05-06) ----
+    # Use the obs_trace from baseline reward calibration (no extra compute).
+    # SNR_per_channel ≈ var(low-freq trend = signal) / var(high-freq detail
+    # = noise).  Low-freq trend = moving average over τ_dom/sample_rate
+    # steps (≈ plant time-constant in agent steps).  Anything > 10× span
+    # is noise-dominated; < 0.1× span is signal-buried.  Logs to
+    # ``snr_diagnostic.json`` alongside reward_calibration.json.
+    if 'cal_obs' not in dir():
+        cal_obs = []
+    if cal_obs:
+        try:
+            arr = np.asarray(cal_obs, dtype='float64')   # (T, obs_dim)
+            sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
+            tau_dom = float(os.environ.get(
+                'SIM_IDENTIFIED_TAU_DOMINANT', '50') or 50)
+            window = max(3, int(round(tau_dom / sr)))
+            if arr.shape[0] > window + 2:
+                trend = np.array([
+                    np.convolve(arr[:, c],
+                                  np.ones(window) / window, mode='valid')
+                    for c in range(arr.shape[1])
+                ]).T  # (T-window+1, obs_dim)
+                # Align lengths so detail is per-step (signal_var vs
+                # high-freq residual).
+                aligned = arr[window - 1:, :]
+                detail = aligned - trend
+                signal_var = np.var(trend, axis=0)
+                noise_var = np.var(detail, axis=0)
+                snr_per_ch = signal_var / np.maximum(noise_var, 1e-12)
+                snr_db = 10.0 * np.log10(np.maximum(snr_per_ch, 1e-12))
+                # Channel names if available; otherwise just indices.
+                ch_names = list(getattr(env, 'obs_channel_names', []) or [])
+                snr_report = {
+                    'window_steps': int(window),
+                    'tau_dom': float(tau_dom),
+                    'sample_rate': int(sr),
+                    'per_channel': [
+                        {
+                            'index': int(i),
+                            'name': (ch_names[i] if i < len(ch_names)
+                                       else f'obs[{i}]'),
+                            'signal_std': float(np.sqrt(signal_var[i])),
+                            'noise_std': float(np.sqrt(noise_var[i])),
+                            'snr': float(snr_per_ch[i]),
+                            'snr_db': float(snr_db[i]),
+                        }
+                        for i in range(arr.shape[1])
+                    ],
+                    'snr_db_min': float(snr_db.min()),
+                    'snr_db_median': float(np.median(snr_db)),
+                    'snr_db_max': float(snr_db.max()),
+                }
+                low_ch = [
+                    p for p in snr_report['per_channel']
+                    if p['snr_db'] < 10.0
+                ]
+                summary = (f"SNR median={snr_report['snr_db_median']:+.1f}dB"
+                           f" min={snr_report['snr_db_min']:+.1f}dB"
+                           f" max={snr_report['snr_db_max']:+.1f}dB"
+                           f" window={window}step")
+                if low_ch:
+                    names = ','.join(p['name'] for p in low_ch[:3])
+                    summary += (f"  WARN: {len(low_ch)} ch <10dB "
+                                  f"({names})")
+                print(f"[snr] {summary}", flush=True)
+                out_dir_pre = Path(cfg.out_dir or '.')
+                with open(out_dir_pre / 'snr_diagnostic.json', 'w') as f:
+                    json.dump(snr_report, f, indent=2)
+        except Exception as exc:  # pragma: no cover — diagnostic only
+            print(f"[snr] SKIPPED ({exc!r})", flush=True)
 
     model = build_model(cfg).to(device)
 
