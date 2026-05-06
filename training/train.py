@@ -1077,8 +1077,20 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         try:
             from utils.training_disturbance import compute_mv_authority_to_cv as _auth_fn
             out_dir = Path(getattr(cfg, 'out_dir', '.') or '.')
-            for cand in [out_dir / 'plant_id' / 'dynamics_identification.json',
-                          out_dir / 'dynamics_identification.json']:
+            # Walk up a few levels so BO trials (cfg.out_dir =
+            # <study>/trial_NNNN/) find the shared <study>/plant_id/.
+            search_roots: List[Path] = [out_dir]
+            cur = out_dir
+            for _ in range(4):
+                if cur.parent == cur:
+                    break
+                cur = cur.parent
+                search_roots.append(cur)
+            cands: List[Path] = []
+            for root in search_roots:
+                cands.append(root / 'plant_id' / 'dynamics_identification.json')
+                cands.append(root / 'dynamics_identification.json')
+            for cand in cands:
                 if not cand.exists():
                     continue
                 with open(cand) as _f:
