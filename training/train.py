@@ -814,6 +814,13 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     return {
         'bc_loss': bc_loss.detach(),
         'reward_mtp_loss': reward_mtp_loss.detach(),
+        # Non-detached reward MTP for callers that compose their own
+        # total (e.g. P1 uses ``reward_mtp_total`` to add reward-head
+        # gradient WITHOUT the BC term).  Bug fix 2026-05-07: P1 was
+        # using the detached ``reward_mtp_loss`` key so the reward
+        # head got ZERO gradient in P1 — visible as
+        # reward_mtp_loss == constant 5.541 across all P1 iters.
+        'reward_mtp_total': reward_mtp_loss,
         'agent_total': total,
     }
 
@@ -1985,9 +1992,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     total_loss = wm_losses['wm_total'] + ag_losses['agent_total']
                 elif current_phase == 1:
                     # P1: WM losses + reward-head MTP only (no BC).
+                    # Use the *non-detached* ``reward_mtp_total`` key —
+                    # using ``reward_mtp_loss`` (which is .detach()'d for
+                    # diagnostics) silently zeros the reward-head gradient
+                    # in P1, leaving it untrained until P2 starts.
                     total_loss = (wm_losses['wm_total']
                                    + cfg.reward_scale_loss
-                                     * ag_losses['reward_mtp_loss'])
+                                     * ag_losses['reward_mtp_total'])
                 else:
                     total_loss = wm_losses['wm_total']
 
@@ -2032,9 +2043,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # would just pull it back toward uniform).  Keep
                     # reward MTP because that head is what the actor's
                     # value target depends on.
+                    # Use non-detached ``reward_mtp_total`` (see the
+                    # P1 comment above for the detach-bug rationale).
                     p3_total_world = (wm_losses['wm_total']
                                        + cfg.reward_scale_loss
-                                         * ag_losses['reward_mtp_loss'])
+                                         * ag_losses['reward_mtp_total'])
                 opt_world.zero_grad(set_to_none=True)
                 p3_total_world.backward()
                 wm_grad_norm = torch.nn.utils.clip_grad_norm_(
