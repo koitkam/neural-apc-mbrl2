@@ -195,7 +195,7 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # adaptive formula from producing reward magnitudes that saturate.
     reward_clip = _env_float('OBJECTIVE_REWARD_CLIP', 250.0)
     cap_frac = max(0.01, _env_float('OBJ_AUTO_CV_PENALTY_CAP_FRAC', 0.5))
-    typical_cv_viol_frac = max(1e-3, _env_float('OBJ_AUTO_TYPICAL_CV_VIOLATION', 0.05))
+    typical_cv_viol_frac = max(1e-3, _env_float('OBJ_AUTO_TYPICAL_CV_VIOLATION', 0.10))
     # Quadratic cap: cv_base * typical_violation² <= cap_frac * reward_clip
     cv_base_cap = (cap_frac * reward_clip) / (typical_cv_viol_frac * typical_cv_viol_frac)
     # Linear-equivalent floor conversion: a user-set "base=25" linear
@@ -207,10 +207,36 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # formulation, without requiring users to re-derive their overrides.
     cv_base_floor_quadratic = cv_base_env / tolerance
     mv_base_floor_quadratic = mv_base_env / tolerance
-    # Fix 4: move_base is set as a fixed fraction of the final cv_base so
-    # CV-priority and move-penalty scale together across simulators.
+    # Adaptive move-penalty derivation (paper-aligned, simulator-agnostic).
+    # Goal: at steady state the per-step move penalty incurred by actor
+    # exploration noise alone equals a small fixed fraction of the reward
+    # clip (default 0.5%). This keeps the move term invisible to
+    # corrective control while still applying a small pressure toward
+    # narrowing actor sigma at convergence. Formula:
+    #   move_base = (target_cost_frac * reward_clip) / E[|delta_a|_noise]
+    # where E[|delta_a|_noise] = sigma_ref * sqrt(2/pi) for a Gaussian
+    # action perturbation between consecutive steps.
+    # The legacy ``OBJ_AUTO_MOVE_OVER_CV_K`` env var is retained as a
+    # fallback floor (so users with overrides keep their behaviour) and
+    # ``OBJ_AUTO_MOVE_BASE`` becomes a hard absolute floor.
     move_cv_ratio_k = max(1.0, _env_float('OBJ_AUTO_MOVE_OVER_CV_K', 20.0))
     move_base_floor = _env_float('OBJ_AUTO_MOVE_BASE', 0.1)
+    move_target_cost_frac = max(
+        0.0, _env_float('OBJ_AUTO_MOVE_TARGET_COST_FRAC', 0.005)
+    )
+    move_sigma_ref = max(0.05, _env_float('OBJ_AUTO_MOVE_SIGMA_REF', 0.3))
+    # E[|x|] for x ~ N(0, sigma) is sigma * sqrt(2/pi). The relevant
+    # quantity is |a_t - a_{t-1}| where each is a noisy sample around the
+    # actor mean; if exploration is i.i.d. across steps the difference is
+    # sigma * sqrt(2), giving E[|delta|] = sigma * 2 / sqrt(pi). We use
+    # the conservative single-sigma estimate so the penalty is a soft
+    # floor rather than an upper bound.
+    expected_step_jitter = move_sigma_ref * float(np.sqrt(2.0 / np.pi))
+    move_base_adaptive = 0.0
+    if move_target_cost_frac > 0.0 and expected_step_jitter > 1e-6:
+        move_base_adaptive = (
+            move_target_cost_frac * reward_clip / expected_step_jitter
+        )
 
     # ----- Adaptive budget from spec weights + targets_enabled -----------
     # The CV violation penalty is now quadratic in the normalised
@@ -294,9 +320,13 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
 
     cv_weights = [float(cv_base * (rank_decay ** max(0, r - 1))) for r in ranks]
     mv_weights = [float(mv_base) for _ in range(n_mv)]
-    # move_base scales with cv_base so CV-priority and move-penalty
-    # co-adapt across simulators. Floor at OBJ_AUTO_MOVE_BASE.
-    move_base = float(max(move_base_floor, cv_base / move_cv_ratio_k))
+    # Adaptive move_base: target a fixed-fraction-of-reward-clip steady-
+    # state cost from actor jitter (sigma_ref). The legacy cv_base/K
+    # ratio is retained as a soft *upper* cap so move never exceeds the
+    # historical formula -- prevents pathological numbers if reward_clip
+    # or sigma_ref are mis-set. Hard floor at OBJ_AUTO_MOVE_BASE.
+    move_base_legacy_cap = float(cv_base / move_cv_ratio_k)
+    move_base = float(max(move_base_floor, min(move_base_adaptive, move_base_legacy_cap)))
     move_weights = [
         float(move_base * max(0.2, tau / median_tau) * factors.move_penalty_scale)
         for tau in taus
@@ -331,6 +361,12 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         'move_over_cv_k': float(move_cv_ratio_k),
         'cv_rank_decay': rank_decay,
         'move_base': move_base,
+        'move_base_adaptive': float(move_base_adaptive),
+        'move_base_legacy_cap': float(move_base_legacy_cap),
+        'move_base_floor': float(move_base_floor),
+        'move_target_cost_frac': float(move_target_cost_frac),
+        'move_sigma_ref': float(move_sigma_ref),
+        'move_expected_step_jitter': float(expected_step_jitter),
         'speed_move_scale': factors.move_penalty_scale,
         'mv_over_cv_ratio': mv_over_cv_ratio,
         'violation_tolerance': tolerance,

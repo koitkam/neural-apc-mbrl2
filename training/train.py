@@ -166,7 +166,13 @@ class TrainConfig:
     # thin linear projection without VQ for low-D vector obs).
     recon_scale: float = 0.1
     sf_scale: float = 1.0
-    reward_scale_loss: float = 2.0   # P1+P2+P3 reward MTP weight (was 1.0;
+    reward_scale_loss: float = 4.0   # P1+P2+P3 reward MTP weight (was 2.0;
+    # bumped 2026-05-07 after run_p5 RCA: reward gate passed (r=0.62) but
+    # critic gate failed (r=-0.25) due to reward-cliff bimodality.  After
+    # switching the reward saturator from hard-clip to tanh (smooth
+    # gradient everywhere), the head can finally fit the full violation
+    # tail; doubling the loss weight again accelerates that convergence
+    # so P3 critic learning sees stable targets sooner.
     # bumped 2026-05-06 after run_p2 RCA showed reward head pred_std=5.2 vs
     # real_std=44.9 — head learned ranking r=0.62 but not scale.  2× weight
     # on the symlog/2-hot reward loss drives the head toward fitting the

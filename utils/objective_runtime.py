@@ -57,6 +57,38 @@ def _clip(v: float, lo: float, hi: float) -> float:
     return float(np.clip(_finite(v, 0.0), float(lo), float(hi)))
 
 
+def _saturate_one_sided(v: float, cap: float, mode: str) -> float:
+    """Saturate a non-negative penalty at ``cap``.
+
+    ``mode='hard'`` reproduces ``np.clip(v, 0, cap)``.
+    ``mode='tanh'`` applies a smooth saturation ``cap * tanh(v / cap)`` so
+    the gradient never vanishes for large ``v``. The output is always in
+    ``[0, cap)`` for non-negative ``v`` and matches the linear region for
+    ``v << cap``.
+    """
+    val = max(0.0, _finite(v, 0.0))
+    cap = max(0.0, float(cap))
+    if cap <= 0.0:
+        return 0.0
+    if mode == 'tanh':
+        return float(cap * np.tanh(val / cap))
+    return float(min(val, cap))
+
+
+def _saturate_two_sided(v: float, cap: float, mode: str) -> float:
+    """Saturate a signed term at ``[-cap, +cap]``.
+
+    Symmetric counterpart of :func:`_saturate_one_sided`.
+    """
+    val = _finite(v, 0.0)
+    cap = max(0.0, float(cap))
+    if cap <= 0.0:
+        return 0.0
+    if mode == 'tanh':
+        return float(cap * np.tanh(val / cap))
+    return float(np.clip(val, -cap, cap))
+
+
 def _resolve_mv_bounds(bounds: Dict, action_dim: int,
                        setpoint_manager=None) -> List[List[float]]:
     if setpoint_manager is not None:
@@ -342,15 +374,18 @@ def compute_objective_components(
 
     penalty_clip = float(os.environ.get('OBJECTIVE_PENALTY_CLIP', '250.0'))
     reward_clip = float(os.environ.get('OBJECTIVE_REWARD_CLIP', '250.0'))
+    sat_mode = str(os.environ.get('OBJECTIVE_PENALTY_SAT_MODE', 'tanh')).strip().lower()
+    if sat_mode not in ('hard', 'tanh'):
+        sat_mode = 'tanh'
 
-    mv_violation_penalty = _clip(mv_violation_penalty, 0.0, penalty_clip)
-    cv_violation_penalty = _clip(cv_violation_penalty, 0.0, penalty_clip)
-    mv_economic_penalty = _clip(mv_economic_penalty, -penalty_clip, penalty_clip)
-    cv_economic_penalty = _clip(cv_economic_penalty, -penalty_clip, penalty_clip)
-    mv_target_penalty = _clip(mv_target_penalty, 0.0, penalty_clip)
-    cv_target_penalty = _clip(cv_target_penalty, 0.0, penalty_clip)
-    mv_move_penalty = _clip(mv_move_penalty, 0.0, penalty_clip)
-    movement_term = _clip(movement_term, -penalty_clip, penalty_clip)
+    mv_violation_penalty = _saturate_one_sided(mv_violation_penalty, penalty_clip, sat_mode)
+    cv_violation_penalty = _saturate_one_sided(cv_violation_penalty, penalty_clip, sat_mode)
+    mv_economic_penalty = _saturate_two_sided(mv_economic_penalty, penalty_clip, sat_mode)
+    cv_economic_penalty = _saturate_two_sided(cv_economic_penalty, penalty_clip, sat_mode)
+    mv_target_penalty = _saturate_one_sided(mv_target_penalty, penalty_clip, sat_mode)
+    cv_target_penalty = _saturate_one_sided(cv_target_penalty, penalty_clip, sat_mode)
+    mv_move_penalty = _saturate_one_sided(mv_move_penalty, penalty_clip, sat_mode)
+    movement_term = _saturate_two_sided(movement_term, penalty_clip, sat_mode)
 
     reward = 0.0
     reward -= mv_violation_penalty
@@ -362,8 +397,8 @@ def compute_objective_components(
     reward -= mv_move_penalty
     reward -= _safe_float(obj_w.get('movement', 0.0), 0.0) * movement_term
     if 'cv_violation' in obj_w:
-        reward -= _safe_float(obj_w.get('cv_violation', 0.0), 0.0) * _clip(cv_penalty, 0.0, penalty_clip)
-    reward = _clip(reward, -reward_clip, reward_clip)
+        reward -= _safe_float(obj_w.get('cv_violation', 0.0), 0.0) * _saturate_one_sided(cv_penalty, penalty_clip, sat_mode)
+    reward = _saturate_two_sided(reward, reward_clip, sat_mode)
 
     return {
         'prod_term': float(production_term),
