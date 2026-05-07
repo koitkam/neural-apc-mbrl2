@@ -1262,12 +1262,15 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
 
 
 def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
-                            n_steps: int = 1500,
+                            n_steps: int = 3000,
                             target_std: float = 1.0,
-                            min_scale: float = 1.0,
+                            min_scale: float = 1e-4,
                             max_scale: float = 1000.0,
                             mode: str = 'baseline',
                             baseline_action_std: float = 0.05,
+                            target_mode: str = 'percentile',
+                            target_percentile: float = 95.0,
+                            target_percentile_value: float = 1.0,
                             ) -> Dict[str, float]:
     """Empirically choose a per-step reward scale to match V4's twohot range.
 
@@ -1281,6 +1284,23 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
 
     ``mode='random'``: legacy behaviour (uniform on ``[-1, 1]``); kept
     for back-compat / debugging.
+
+    ``target_mode='percentile'`` (default, root-cause fix 2026-05-07):
+    pick scale so that the ``target_percentile``-th percentile of
+    ``|raw_reward|`` maps to ``target_percentile_value`` (default p95
+    → 1.0).  Robust to bimodal/long-tailed APC reward distributions
+    where ``std``-based calibration is dominated by the violation cliff
+    and yields a degenerate scale.  After scaling, the 'normal'
+    operating mass lands in ``[-1, +1]`` and the cliff lands at
+    ``raw_min/p95`` which symlog spreads safely inside the
+    ``[-20, +20]`` twohot support.
+
+    ``target_mode='std'``: legacy behaviour, ``scale = target_std/std``.
+
+    The historical ``min_scale=1.0`` clamp was a transposition bug that
+    *prevented scaling rewards down* — it has been fixed to ``1e-4``
+    so the calibrator can actually move into the V3/V4 design range
+    (rewards O(1) before symlog).
     """
     if env.reward_scale != 1.0:
         env.reward_scale = 1.0
@@ -1288,6 +1308,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     obs_trace: List[np.ndarray] = []
     env.reset(exploration=True)
     mode = str(mode).lower()
+    target_mode = str(target_mode).lower()
     for _ in range(int(n_steps)):
         if mode == 'random':
             a = rng.uniform(-1.0, 1.0,
@@ -1307,16 +1328,55 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     arr = np.asarray(raw_rewards, dtype='float64')
     std = float(arr.std())
     mean = float(arr.mean())
-    if std < 1e-8:
-        scale = 1.0
-    else:
-        scale = float(target_std / std)
+    abs_arr = np.abs(arr)
+    pct_q = float(np.clip(target_percentile, 50.0, 99.9))
+    p95_abs = float(np.percentile(abs_arr, pct_q)) if abs_arr.size else 0.0
+    if target_mode == 'std':
+        if std < 1e-8:
+            scale = 1.0
+        else:
+            scale = float(target_std / std)
+    else:  # 'percentile'
+        if p95_abs < 1e-8:
+            # Degenerate: fall back to std-based, then to identity.
+            scale = float(target_std / std) if std >= 1e-8 else 1.0
+        else:
+            scale = float(target_percentile_value / p95_abs)
+    scale_unclamped = scale
     scale = float(np.clip(scale, min_scale, max_scale))
     env.reward_scale = scale
+    # Saturation diagnostic: the V4 twohot support is symlog([-20,+20]).
+    # If even a single per-step scaled reward exceeds symlog's mid-band,
+    # the head will struggle.  symlog(x)≈18 when |x|≈6.6e7; symlog(x)≈10
+    # when |x|≈2.2e4.  Flag if scaled-cliff symlog magnitude > 5
+    # (already encroaching on the head's high-curvature region).
+    raw_min = float(arr.min())
+    raw_max = float(arr.max())
+    scaled_min = raw_min * scale
+    scaled_max = raw_max * scale
+    def _symlog(x: float) -> float:
+        return float(np.sign(x) * np.log1p(abs(x)))
+    sym_min = _symlog(scaled_min)
+    sym_max = _symlog(scaled_max)
+    sym_mag = max(abs(sym_min), abs(sym_max))
+    twohot_warn = sym_mag > 5.0
+    twohot_critical = sym_mag > 15.0
     return {
-        'reward_scale': scale, 'raw_std': std, 'raw_mean': mean,
-        'raw_min': float(arr.min()), 'raw_max': float(arr.max()),
-        'target_std': float(target_std), 'n_steps': int(n_steps),
+        'reward_scale': scale, 'reward_scale_unclamped': scale_unclamped,
+        'raw_std': std, 'raw_mean': mean,
+        'raw_min': raw_min, 'raw_max': raw_max,
+        'raw_abs_p95': p95_abs,
+        'target_std': float(target_std),
+        'target_mode': target_mode,
+        'target_percentile': pct_q,
+        'target_percentile_value': float(target_percentile_value),
+        'scaled_min': scaled_min, 'scaled_max': scaled_max,
+        'scaled_symlog_min': sym_min, 'scaled_symlog_max': sym_max,
+        'scaled_symlog_mag': sym_mag,
+        'twohot_support_warn': bool(twohot_warn),
+        'twohot_support_critical': bool(twohot_critical),
+        'min_scale': float(min_scale), 'max_scale': float(max_scale),
+        'n_steps': int(n_steps),
         'mode': mode, 'baseline_action_std': float(baseline_action_std),
         '_obs_trace': obs_trace,
     }
@@ -1480,18 +1540,63 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
         cal_mode = os.environ.get('DREAMER_REWARD_CAL_MODE',
                                     'baseline').strip().lower() or 'baseline'
+        cal_target_mode = os.environ.get(
+            'DREAMER_REWARD_CAL_TARGET',
+            'percentile').strip().lower() or 'percentile'
+        try:
+            cal_target_pct = float(os.environ.get(
+                'DREAMER_REWARD_CAL_PCT', '95') or 95.0)
+        except Exception:
+            cal_target_pct = 95.0
+        try:
+            cal_target_pct_value = float(os.environ.get(
+                'DREAMER_REWARD_CAL_PCT_VAL', '1.0') or 1.0)
+        except Exception:
+            cal_target_pct_value = 1.0
+        # Cover at least 2 episodes so the cohort is representative
+        # (paper-aligned: V3 calibrates on rolling buffer of full episodes).
+        ep_len = max(1, int(getattr(cfg, 'episode_length', 1500) or 1500))
+        cal_n_steps = max(3000, 2 * ep_len)
         cal = calibrate_reward_scale(
             env, rng, mode=cal_mode,
+            n_steps=cal_n_steps,
             baseline_action_std=float(cfg.baseline_seed_action_std),
+            target_mode=cal_target_mode,
+            target_percentile=cal_target_pct,
+            target_percentile_value=cal_target_pct_value,
         )
         # Pop the obs trace before serialising — kept on the dict only
         # to feed the SNR diagnostic below; np.ndarray is not JSON-safe.
         cal_obs = cal.pop('_obs_trace', [])
-        print(f"[reward-scale] auto-calibrated ({cal['mode']}): "
-              f"scale={cal['reward_scale']:.3f}  "
-              f"raw_std={cal['raw_std']:.5f} raw_range=[{cal['raw_min']:.4f},"
-              f"{cal['raw_max']:.4f}]  target_std={cal['target_std']:.2f}",
+        print(f"[reward-scale] auto-calibrated ({cal['mode']}, "
+              f"target={cal['target_mode']}): "
+              f"scale={cal['reward_scale']:.4g}  "
+              f"raw_std={cal['raw_std']:.4g} "
+              f"raw_p{cal['target_percentile']:.0f}_abs={cal['raw_abs_p95']:.4g} "
+              f"raw_range=[{cal['raw_min']:.4g},{cal['raw_max']:.4g}]  "
+              f"scaled_symlog_mag={cal['scaled_symlog_mag']:.3f}",
               flush=True)
+        if cal.get('reward_scale_unclamped') and \
+                abs(cal['reward_scale_unclamped'] - cal['reward_scale']) > \
+                1e-9 * max(1.0, abs(cal['reward_scale_unclamped'])):
+            print(f"[reward-scale] WARNING: scale was clamped "
+                  f"({cal['reward_scale_unclamped']:.4g} -> "
+                  f"{cal['reward_scale']:.4g}) by "
+                  f"[min_scale={cal['min_scale']:.4g}, "
+                  f"max_scale={cal['max_scale']:.4g}]; "
+                  f"twohot calibration may be sub-optimal.",
+                  flush=True)
+        if cal.get('twohot_support_critical'):
+            print(f"[reward-scale] CRITICAL: scaled symlog magnitude "
+                  f"{cal['scaled_symlog_mag']:.2f} > 15 — reward/critic "
+                  f"twohot support [-20, +20] is being saturated. "
+                  f"Reduce DREAMER_REWARD_CAL_PCT_VAL or smooth the "
+                  f"reward cliff.", flush=True)
+        elif cal.get('twohot_support_warn'):
+            print(f"[reward-scale] WARN: scaled symlog magnitude "
+                  f"{cal['scaled_symlog_mag']:.2f} > 5 — twohot head is "
+                  f"in the high-curvature region; consider reducing "
+                  f"DREAMER_REWARD_CAL_PCT_VAL.", flush=True)
         out_dir_pre = Path(cfg.out_dir or '.')
         out_dir_pre.mkdir(parents=True, exist_ok=True)
         try:
