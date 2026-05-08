@@ -103,15 +103,16 @@ class TrainConfig:
     # tasks and is the right starting point for any adaptive APC.
     policy_log_std_min: float = -2.3
     policy_log_std_max: float = 0.0
-    # PMPO entropy bonus.  DreamerV3 paper default is 3e-4; we use 1e-4
-    # for continuous actors on process-control plants because the
-    # advantage signal must be allowed to *win* over the entropy push.
-    # Tuned 2026-05-08 after run_p6 showed σ pegged at the σ_max ceiling
-    # for all of P3 (entropy_mean = H_max(σ=0.50) constant from iter 87
-    # onwards), starving the critic of state diversity and keeping it
-    # near-constant (V std=0.27 vs return std=10322).  Lowering η to
-    # 1e-4 lets a healthy advantage signal pull σ back inward without
-    # collapsing exploration entirely (still > V3 lower bound of 0).
+    # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
+    # ``auto_initialize_hyperparams`` as ``η = η_v3 × σ_max / σ_v3_ref``
+    # (V3 paper default 3e-4 anchored at σ=1.0). Recovers V3 exactly
+    # for paper-scale plants and shrinks linearly for tighter
+    # exploration bands typical of process control.
+    # The dataclass default below (1e-4) is the sentinel value used
+    # only when auto-tune is disabled or fails; it matches what the
+    # formula produces for σ_max ≈ 0.33. Set explicitly via env var
+    # PMPO_ENTROPY_COEF_BASELINE / PMPO_ENTROPY_SIGMA_REF or override
+    # the cfg field directly to bypass the auto-derivation.
     pmpo_entropy_coef: float = 1e-4
     # Actor loss type. ``'reinforce'`` (DreamerV3 §3) is robust across
     # simulators — V3 used this single recipe across 150+ tasks. The
@@ -1266,6 +1267,34 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         'source': f'log(2*baseline_seed_action_std)='
                   f'log(2*{sigma_seed:.3f})={log_std_max_val:+.3f}',
     }
+
+    # ---- pmpo_entropy_coef (action-scale-adaptive, V3-anchored) --------
+    # DreamerV3/V4 use η = 3e-4 across all 150+ benchmark tasks where
+    # the useful action σ is on the order of 1.0 (random-explore-and-
+    # find-the-target tasks). For process control the useful σ is
+    # 0.05-0.30, so a fixed η=3e-4 over-weights the entropy bonus and
+    # pegs the actor at the σ ceiling (root-cause of run_p6 failure).
+    #
+    # Re-anchor V3's default at its native action scale and scale
+    # linearly with the auto-tuned σ_max:
+    #
+    #     η = η_v3_baseline × σ_max / σ_v3_reference
+    #       = 3e-4         × σ_max / 1.0
+    #
+    # Recovers V3 paper exactly when σ_max=1.0 (Atari/DMC scale) and
+    # auto-shrinks for plants whose σ_max is tighter. For test_sim
+    # (σ_max=0.30) → η = 9e-5, matching the value found by manual
+    # tuning in run_p7.
+    eta_v3_baseline = float(os.environ.get('PMPO_ENTROPY_COEF_BASELINE', '3e-4'))
+    sigma_v3_ref = max(1e-3,
+        float(os.environ.get('PMPO_ENTROPY_SIGMA_REF', '1.0')))
+    eta_adaptive = eta_v3_baseline * (target_sigma_max / sigma_v3_ref)
+    out['pmpo_entropy_coef'] = {
+        'value': float(eta_adaptive),
+        'source': f'V3_eta * sigma_max / sigma_v3_ref = '
+                  f'{eta_v3_baseline:.1e} * {target_sigma_max:.3f} / '
+                  f'{sigma_v3_ref:.2f} = {eta_adaptive:.2e}',
+    }
     return out
 
 
@@ -1278,6 +1307,7 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'random_seed_episodes':     TrainConfig().random_seed_episodes,
     'policy_init_log_std':      TrainConfig().policy_init_log_std,
     'policy_log_std_max':       TrainConfig().policy_log_std_max,
+    'pmpo_entropy_coef':        TrainConfig().pmpo_entropy_coef,
 }
 
 
