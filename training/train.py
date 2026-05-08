@@ -103,12 +103,16 @@ class TrainConfig:
     # tasks and is the right starting point for any adaptive APC.
     policy_log_std_min: float = -2.3
     policy_log_std_max: float = 0.0
-    # PMPO entropy bonus (DreamerV3 § actor loss, η = 3e-4).  Acts as a
-    # soft σ-floor for the continuous actor / uniform-prior pull for the
-    # discrete actor; essential for stability when the advantage signal
-    # is heavy-tailed (process-control violation penalties).  Set to 0
-    # to disable.
-    pmpo_entropy_coef: float = 3e-4
+    # PMPO entropy bonus.  DreamerV3 paper default is 3e-4; we use 1e-4
+    # for continuous actors on process-control plants because the
+    # advantage signal must be allowed to *win* over the entropy push.
+    # Tuned 2026-05-08 after run_p6 showed σ pegged at the σ_max ceiling
+    # for all of P3 (entropy_mean = H_max(σ=0.50) constant from iter 87
+    # onwards), starving the critic of state diversity and keeping it
+    # near-constant (V std=0.27 vs return std=10322).  Lowering η to
+    # 1e-4 lets a healthy advantage signal pull σ back inward without
+    # collapsing exploration entirely (still > V3 lower bound of 0).
+    pmpo_entropy_coef: float = 1e-4
     # Actor loss type. ``'reinforce'`` (DreamerV3 §3) is robust across
     # simulators — V3 used this single recipe across 150+ tasks. The
     # ``'pmpo'`` option uses V4's eq. 11 advantage-sign-split loss; this
@@ -1241,18 +1245,21 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # whose useful σ is much smaller than 1.0.
     sigma_seed = float(out.get('baseline_seed_action_std',
                                 {}).get('value', 0.05))
-    # Floor at σ_max = 0.50 so we always preserve ≥ 5× headroom over
-    # the V3 paper σ_min = 0.1.  Cap at 1.0 (V3 paper upper).  For
-    # test_sim (σ_seed=0.10): σ_max=0.50 ⇒ log_std_max ≈ -0.69.
+    # Floor at σ_max = 0.30: tight enough that the policy must commit
+    # to a directional mean to make progress, while still preserving
+    # 3× headroom over the V3 paper σ_min = 0.1.  Cap at 1.0 (V3 paper
+    # upper).  For test_sim (σ_seed=0.10): σ_max=0.30 ⇒ log_std_max
+    # ≈ -1.20.
     #
-    # Tuned 2026-05-06: previous floor of 0.30 left only 0.219 nats of
-    # entropy headroom (= max H of σ=0.30 policy), which collided with
-    # the entropy-collapse early-stop threshold (0.284 nats).  σ_max
-    # = 0.50 gives H_max = 0.708 nats, well above the trip floor and
-    # plenty of room for REINFORCE to explore action-dependent μ
-    # without saturating against the ceiling on the first noisy
-    # negative-advantage batch.
-    target_sigma_max = float(np.clip(2.0 * sigma_seed, 0.50, 1.0))
+    # Tuned 2026-05-08: run_p6 showed σ_max=0.50 was wide enough that
+    # the entropy bonus (η=3e-4) plus a near-flat critic (V std=0.27)
+    # let the actor escape into pure-noise mode (σ pegged at ceiling
+    # for all of P3, mean MV barely moved from 50 in a [20,80] band).
+    # Combined with η→1e-4 and the clamp-aware entropy-collapse
+    # detector (which already prevents H_max(σ_max)-based false
+    # positives), σ_max=0.30 reinstates the tight-exploration regime
+    # that lets advantage gradients dominate.
+    target_sigma_max = float(np.clip(2.0 * sigma_seed, 0.30, 1.0))
     log_std_max_val = float(np.log(target_sigma_max))
     out['policy_log_std_max'] = {
         'value': log_std_max_val,
@@ -2384,21 +2391,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     torch.save({'model': model.state_dict(), 'cfg': asdict(cfg),
                 'obs_norm': env.get_obs_norm_stats()}, final_path)
 
-    # Early-stop checkpoint promotion: when training stopped on a P3
-    # plateau, the *current* model state has been the same (or worse)
-    # as the snapshot at ``best_p3_iter``.  Hard-fail trips
-    # (entropy_collapse, critic_divergence, grad_skip_storm) usually
-    # corrupt the current state, so the saved best.pt is a more
-    # trustworthy controller.  Promote it to final.pt so validation +
-    # ONNX export pick it up automatically.
-    if (early_stop_reason is not None and best_ckpt_path is not None
-            and Path(best_ckpt_path).exists()):
+    # Best-checkpoint promotion: regardless of early-stop status, the
+    # snapshot at ``best_p3_iter`` is a more trustworthy controller than
+    # the most recent state (which may have drifted past the best EMA
+    # return). Promote it to final.pt so validation + ONNX export +
+    # downstream BO trial comparison all pick the best policy
+    # automatically. Falls back to the most-recent-iter ``final.pt`` we
+    # just wrote if there is no best checkpoint (e.g. P3 produced no
+    # improvement at all).
+    if (best_ckpt_path is not None and Path(best_ckpt_path).exists()):
         try:
             shutil.copy2(str(best_ckpt_path), str(final_path))
-            print(f'[early-stop] promoted best.pt (iter={best_p3_iter}, '
+            tag = ('early-stop' if early_stop_reason is not None
+                    else 'completion')
+            print(f'[{tag}] promoted best.pt (iter={best_p3_iter}, '
                   f'ema={best_p3_ema:.3f}) -> final.pt', flush=True)
         except Exception as _e:
-            print(f'[early-stop] best->final promotion failed: {_e!r}',
+            print(f'[best->final] promotion failed: {_e!r}',
                    flush=True)
 
     try:
