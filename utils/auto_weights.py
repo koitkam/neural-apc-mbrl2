@@ -196,8 +196,15 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     reward_clip = _env_float('OBJECTIVE_REWARD_CLIP', 250.0)
     cap_frac = max(0.01, _env_float('OBJ_AUTO_CV_PENALTY_CAP_FRAC', 0.5))
     typical_cv_viol_frac = max(1e-3, _env_float('OBJ_AUTO_TYPICAL_CV_VIOLATION', 0.10))
-    # Quadratic cap: cv_base * typical_violation² <= cap_frac * reward_clip
-    cv_base_cap = (cap_frac * reward_clip) / (typical_cv_viol_frac * typical_cv_viol_frac)
+    # Soft saturation advisory threshold (no longer a hard cap).
+    # The reward signal uses tanh saturation in objective_runtime.py, so
+    # oversized cv_base values no longer create a flat-gradient cliff —
+    # they simply mean a typical-magnitude violation produces a reward
+    # near the clip. We log a notice when this happens so the user can
+    # raise reward_clip if they need linear differentiation between
+    # moderate and severe violations, but never override the hierarchy
+    # the user asked for.
+    cv_base_advisory = (cap_frac * reward_clip) / (typical_cv_viol_frac * typical_cv_viol_frac)
     # Linear-equivalent floor conversion: a user-set "base=25" linear
     # violation weight produced penalty = base * tolerance at tolerance.
     # For quadratic equivalence at the same tolerance, the quadratic base
@@ -239,17 +246,30 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         )
 
     # ----- Adaptive budget from spec weights + targets_enabled -----------
-    # The CV violation penalty is now quadratic in the normalised
-    # bound-violation magnitude. For the CV-limit priority to dominate
-    # economics AND targets, the per-step CV penalty at the tolerance
-    # violation magnitude must exceed the per-step economic + target
-    # budget by ``margin``:
+    # Strict priority hierarchy (highest-to-lowest, all measured at the
+    # *typical* violation/deviation magnitude in normalised space):
     #
-    #   cv_base * tolerance²  >=  margin * priority_budget
+    #     1. MV bound violations
+    #     2. CV bound violations, by ``cv_priority`` rank order
+    #        (rank-1 strongest; rank-N still beats targets+economics)
+    #     3. Target tracking (only for channels in ``targets_enabled``)
+    #     4. Economic weights (user-set in control_objective.json)
     #
-    # priority_budget is the max of econ_budget and target_budget; we
-    # then size target_base from econ_budget (if present) so the
-    # hierarchy econ > targets holds automatically.
+    # The hierarchy is enforced by construction:
+    #
+    #   target_base   = margin × max(econ_budget, target_floor)
+    #     → target tracking dominates economics by ``margin``
+    #
+    #   cv_base × tolerance² × rank_decay^(N-1)  ≥  margin × priority_budget
+    #     → even the *lowest-ranked* CV at a tolerance-magnitude violation
+    #       beats targets+economics by ``margin``. Higher-ranked CVs
+    #       stack on top via the geometric ``rank_decay`` ladder.
+    #
+    #   mv_base = mv_over_cv_ratio × cv_base
+    #     → MV-limit penalty dominates rank-1 CV by ``mv_over_cv_ratio``.
+    #
+    # All three margins (margin, mv_over_cv_ratio, rank_decay) keep their
+    # universal defaults; the user does not need to tune anything.
     weights_section: Dict = {}
     if isinstance(spec, dict):
         w = spec.get('weights')
@@ -268,44 +288,56 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     cv_target_active, mv_target_active = _active_targets(spec, n_cv=n_cv, n_mv=n_mv)
     n_active_targets = int(sum(1 for v in cv_target_active + mv_target_active if v))
 
-    # Derive target_base so econ dominates targets by ratio. If the user
-    # supplied no economic weights (pure target-tracking task), fall back
-    # to the floor so target tracking still has a usable penalty.
+    # Targets dominate economics: each active target's per-step linear
+    # penalty at the *typical* deviation (we use 1.0 = full normalised
+    # range as the worst-case sizing point) must exceed econ_budget by
+    # ``margin``. When the user supplied no economic weights, fall back
+    # to ``target_base_floor`` so pure target-tracking tasks still have
+    # a usable scale.
     if n_active_targets > 0:
-        if econ_budget > 0.0:
-            target_base_adaptive = econ_budget / (econ_over_target_ratio * n_active_targets)
-            target_base = max(target_base_adaptive, 0.0)
-        else:
-            target_base = target_base_floor
+        target_base_adaptive = margin * max(econ_budget, target_base_floor)
+        target_base = float(target_base_adaptive)
     else:
         target_base = 0.0
 
-    # Max per-step target penalty (linear L1). Deviation peaks at 1.0 in
-    # normalised space (channel at one extreme of norm range, target at
-    # the other).
+    # Per-step target budget (linear L1, deviation in [0, 1]).
     target_budget = float(n_active_targets) * target_base * 1.0
 
     priority_budget = float(max(econ_budget, target_budget))
 
+    # Tail-rank guard: the lowest-ranked CV must still beat the
+    # priority_budget by ``margin``. With geometric rank decay this
+    # means the rank-1 (highest-priority) base must be inflated by
+    # ``rank_decay^-(N-1)``.
+    n_cv_eff = max(1, int(n_cv))
+    tail_factor = float(rank_decay ** max(0, n_cv_eff - 1))
+    tail_factor = max(tail_factor, 1e-6)  # avoid div-by-zero for crazy N
+
     cv_base_adaptive = 0.0
     if priority_budget > 0.0:
-        cv_base_adaptive = (margin * priority_budget) / (tolerance * tolerance)
+        cv_base_adaptive = (margin * priority_budget) / (
+            tolerance * tolerance * tail_factor
+        )
     cv_base_raw = float(max(cv_base_floor_quadratic, cv_base_adaptive))
-    cv_base = float(min(cv_base_raw, cv_base_cap))
-    cv_base_capped = bool(cv_base < cv_base_raw - 1e-9)
-    if cv_base_capped:
+    # No hard cap: tanh saturation in the reward path means oversized
+    # cv_base no longer produces a flat-gradient cliff. The hierarchy
+    # (MV > CV(by rank) > targets > economics) takes precedence.
+    cv_base = cv_base_raw
+    cv_base_above_advisory = bool(cv_base > cv_base_advisory + 1e-9)
+    if cv_base_above_advisory:
         try:
             print(
-                f"[auto_weights] cv_violation_base capped: "
-                f"adaptive={cv_base_raw:.2f} -> {cv_base:.2f} "
-                f"(cap={cv_base_cap:.2f}, reward_clip={reward_clip:.1f}, "
-                f"cap_frac={cap_frac:.2f}, typical_viol={typical_cv_viol_frac:.3f}). "
-                f"Economic weights may exceed what the reward clip can express; "
-                f"raise OBJECTIVE_REWARD_CLIP or shrink mv/cv_economic to keep "
-                f"strict CV priority."
+                f"[auto_weights] cv_violation_base={cv_base:.0f} exceeds the "
+                f"advisory cap {cv_base_advisory:.0f} (=cap_frac*reward_clip/"
+                f"typ_viol²). This is expected when economics or n_cv are "
+                f"large; with tanh saturation the gradient is preserved and "
+                f"the priority hierarchy is maintained. Raise "
+                f"OBJECTIVE_REWARD_CLIP if you need linear differentiation "
+                f"between moderate and severe violations."
             )
         except Exception:
             pass
+    cv_base_capped = False  # legacy field, retained for diagnostics
     # Enforce priority #1: MV limits dominate CV limits by construction.
     mv_base = float(max(mv_base_floor_quadratic, mv_over_cv_ratio * cv_base))
 
@@ -353,8 +385,11 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         'mv_violation_base_adaptive': float(mv_over_cv_ratio * cv_base),
         'cv_violation_base_adaptive': float(cv_base_adaptive),
         'cv_violation_base_raw': float(cv_base_raw),
-        'cv_violation_base_cap': float(cv_base_cap),
+        'cv_violation_base_advisory': float(cv_base_advisory),
+        'cv_violation_base_above_advisory': bool(cv_base_above_advisory),
         'cv_violation_base_capped': bool(cv_base_capped),
+        'cv_tail_rank_factor': float(tail_factor),
+        'n_cv_for_tail_guard': int(n_cv_eff),
         'cv_penalty_cap_frac': float(cap_frac),
         'typical_cv_violation_frac': float(typical_cv_viol_frac),
         'reward_clip_used_for_cap': float(reward_clip),
