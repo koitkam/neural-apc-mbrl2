@@ -98,9 +98,11 @@ class TrainConfig:
     # positive advantage to amplify (see 2026-05-05 root-cause).
     policy_init_log_std: float = -2.0
     # DreamerV3 §3 stable defaults: σ ∈ [0.1, 1.0] (log_std ∈ [-2.3, 0]).
-    # Override per-simulator only if a plant genuinely needs broader
-    # exploration; the V3 prescription works generically across 150+
-    # tasks and is the right starting point for any adaptive APC.
+    # Both bounds are auto-derived in ``auto_tune_seed_buffer`` from the
+    # plant-aware ``baseline_seed_action_std`` (which itself flows from
+    # MV authority).  The dataclass values below are sentinels that
+    # mark "use the auto-derived value" — user / env-var overrides win
+    # via the ``_AUTO_TUNE_FIELD_DEFAULTS`` mechanism.
     policy_log_std_min: float = -2.3
     policy_log_std_max: float = 0.0
     # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
@@ -250,13 +252,44 @@ class TrainConfig:
     # RCA, 2026-05-06).  V3-aligned in spirit (§3.3 EMA-target).  Set
     # to 0 to disable.
     #
-    # Bumped 8 → 16 (2026-05-06): run_p2 RCA showed critic_loss only
-    # dropped 5.2 → 4.0 in 8 iters (= 24% drop); actor was unfrozen
-    # while critic was still 4× its eventual saturation level (~1.5).
-    # 16 iters lets critic reach ~2.5 (~50% of P3 saturation) before
-    # actor reacts, which materially reduces the over-optimism that
-    # produced pmpo_pos_frac = 6% on run_p2.
+    # Auto-derived in ``auto_tune_seed_buffer`` to scale with the
+    # adaptive imagination horizon (longer horizon → more compounded
+    # WM error → critic needs longer to stabilise).  Default below is
+    # a sentinel; auto-tune resolves to roughly
+    # ``max(16, round(horizon))`` for V3-paper-scale tasks and grows
+    # with the plant's settling time on slower process plants.
     p3_critic_warmup_iters: int = 16
+    # Critic stability gate (2026-05-08): in addition to the fixed
+    # iteration warm-up, also require the recent critic-loss to be
+    # *stable* before releasing the actor.  Computed as the coefficient
+    # of variation (std / |mean|) of ``critic_loss`` over the last
+    # ``p3_critic_stability_window_iters`` P3 iters.  Actor releases
+    # only when CV ≤ ``p3_critic_stability_max_cv`` AND the iter
+    # count has reached ``p3_critic_warmup_iters``.  A hard cap at
+    # ``p3_critic_stability_max_warmup_iters`` forces release even if
+    # the gate never trips, so a flat-but-still-noisy critic does not
+    # block training indefinitely.  Set
+    # ``p3_critic_stability_window_iters=0`` to disable the gate (use
+    # only the fixed iteration warm-up).
+    p3_critic_stability_window_iters: int = 10
+    p3_critic_stability_max_cv: float = 0.4
+    p3_critic_stability_max_warmup_iters: int = 60
+    # Adaptive entropy decay on σ-saturation (2026-05-08): if the
+    # actor's running entropy sits within
+    # ``pmpo_entropy_saturation_frac × H_max(σ_max)`` for
+    # ``pmpo_entropy_saturation_window_iters`` consecutive P3 iters,
+    # multiply the live ``pmpo_entropy_coef`` by
+    # ``pmpo_entropy_saturation_decay`` (per stuck-window event).
+    # Releases σ-pressure when the entropy bonus is the dominant
+    # gradient (root-cause of run_p7's frozen σ at clamp ceiling).
+    # Set ``pmpo_entropy_decay_on_saturation=False`` to disable.
+    pmpo_entropy_decay_on_saturation: bool = True
+    pmpo_entropy_saturation_frac: float = 0.95
+    pmpo_entropy_saturation_window_iters: int = 20
+    pmpo_entropy_saturation_decay: float = 0.5
+    # Floor on the live η so the decay can't drive entropy regularisation
+    # to zero (which would let σ collapse to log_std_min instantly).
+    pmpo_entropy_coef_min: float = 1e-6
 
     # ----- Early stopping (within a single trial) -----
     # Master switch.  All sub-criteria are gated on this.
@@ -1252,20 +1285,46 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # upper).  For test_sim (σ_seed=0.10): σ_max=0.30 ⇒ log_std_max
     # ≈ -1.20.
     #
-    # Tuned 2026-05-08: run_p6 showed σ_max=0.50 was wide enough that
-    # the entropy bonus (η=3e-4) plus a near-flat critic (V std=0.27)
-    # let the actor escape into pure-noise mode (σ pegged at ceiling
-    # for all of P3, mean MV barely moved from 50 in a [20,80] band).
-    # Combined with η→1e-4 and the clamp-aware entropy-collapse
-    # detector (which already prevents H_max(σ_max)-based false
-    # positives), σ_max=0.30 reinstates the tight-exploration regime
-    # that lets advantage gradients dominate.
-    target_sigma_max = float(np.clip(2.0 * sigma_seed, 0.30, 1.0))
+    # Tuned 2026-05-08 (run_p7 RCA): σ_max=0.30 was still too wide for
+    # rate-style (Δ-MV) action spaces — σ-noise (0.30) dwarfed the
+    # mean signal the actor outputs (μ ≈ 0.03), drowning PG and
+    # leaving the actor pinned at μ ≈ const, σ = ceiling.  Tighten
+    # the formula to σ_max = 1.0 × baseline_seed_action_std (was 2.0×)
+    # with floor 0.10 (was 0.30).  For test_sim (σ_seed=0.10) this
+    # gives σ_max = 0.10 (was 0.30), matching the noise scale the
+    # collector actually used during seeding so the actor's
+    # exploration band aligns with the WM's training distribution.
+    sigma_max_mult = float(os.environ.get('SIGMA_MAX_OVER_SEED', '1.0'))
+    sigma_max_floor = float(os.environ.get('SIGMA_MAX_FLOOR', '0.10'))
+    target_sigma_max = float(np.clip(sigma_max_mult * sigma_seed,
+                                       sigma_max_floor, 1.0))
     log_std_max_val = float(np.log(target_sigma_max))
     out['policy_log_std_max'] = {
         'value': log_std_max_val,
-        'source': f'log(2*baseline_seed_action_std)='
-                  f'log(2*{sigma_seed:.3f})={log_std_max_val:+.3f}',
+        'source': f'log({sigma_max_mult:.1f}*baseline_seed_action_std)='
+                  f'log({sigma_max_mult:.1f}*{sigma_seed:.3f})='
+                  f'{log_std_max_val:+.3f}',
+    }
+
+    # ---- policy_log_std_min (auto-derived from σ_max) ------------------
+    # When σ_max is tightened (e.g. 0.10 for rate-style controls), the
+    # dataclass default log_std_min = -2.3 (σ_min = 0.10) collides with
+    # σ_max — there's no room left for the actor to express a
+    # *confident* action.  Auto-derive log_std_min as
+    # ``log(σ_max / sigma_min_ratio)`` so the actor always has at
+    # least one decade of headroom to commit to a near-deterministic
+    # action when it has learned a good μ.  Defaults to 1/5 (matches
+    # V3 paper σ_min = 0.20 × σ_max ≈ 0.20 for σ_max = 1.0; for our
+    # σ_max = 0.10 this gives σ_min = 0.02, log_std_min = -3.91).
+    sigma_min_ratio = max(2.0,
+        float(os.environ.get('SIGMA_MIN_RATIO_OF_MAX', '5.0')))
+    target_sigma_min = target_sigma_max / sigma_min_ratio
+    log_std_min_val = float(np.log(target_sigma_min))
+    out['policy_log_std_min'] = {
+        'value': log_std_min_val,
+        'source': f'log(sigma_max/{sigma_min_ratio:.1f})='
+                  f'log({target_sigma_max:.3f}/{sigma_min_ratio:.1f})='
+                  f'{log_std_min_val:+.3f}',
     }
 
     # ---- pmpo_entropy_coef (action-scale-adaptive, V3-anchored) --------
@@ -1295,6 +1354,105 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                   f'{eta_v3_baseline:.1e} * {target_sigma_max:.3f} / '
                   f'{sigma_v3_ref:.2f} = {eta_adaptive:.2e}',
     }
+
+    # ---- horizon (plant-adaptive imagination depth) --------------------
+    # DreamerV3/V4 paper default H = 15 was calibrated for Atari/DMC
+    # tasks where each agent step ≈ one plant step and dynamics settle
+    # in ≲ 15 steps.  For process-control plants the dominant time
+    # constant τ + dead-time θ (in plant steps) often exceeds
+    # H × sample_rate so the actor's imagined consequence of a Δ-MV
+    # action only spans the initial transient and never sees the CV
+    # settle.  Critic learns to value the transient, not the outcome.
+    #
+    # Auto-derive H from identified plant timing:
+    #
+    #     H_auto = clip(round((θ + 2 × τ) / sample_rate),
+    #                    horizon_min=15, horizon_max=32)
+    #
+    # The 2τ + θ horizon spans ~95 % of a first-order step response
+    # (1 - e^-2 ≈ 0.86, plus dead-time prepended), enough for the
+    # critic to bootstrap on the settled CV value.  Floor at the V3
+    # paper default 15 so fast plants do not regress below the
+    # well-tested baseline.  Cap at 32 because WM next-state error
+    # compounds geometrically with H — past 2-3× the plant settling
+    # time we are mostly amplifying model error.
+    #
+    # Plant timing is read from ``run_plan.json`` (written by the
+    # workflow runner before training) or ``plant_id/dynamics_*.json``
+    # using the same dir-walk logic as MV-authority lookup above.  If
+    # neither is available, leaves the dataclass default (15) in place.
+    horizon_min = int(os.environ.get('DREAMER_HORIZON_MIN', '15'))
+    horizon_max = int(os.environ.get('DREAMER_HORIZON_MAX', '32'))
+    sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
+    tau_plant = 0.0
+    theta_plant = 0.0
+    horizon_src_detail = ''
+    try:
+        out_dir_h = Path(getattr(cfg, 'out_dir', '.') or '.')
+        roots: List[Path] = [out_dir_h]
+        cur_h = out_dir_h
+        for _ in range(4):
+            if cur_h.parent == cur_h:
+                break
+            cur_h = cur_h.parent
+            roots.append(cur_h)
+        cands_h: List[Path] = []
+        for root in roots:
+            cands_h.append(root / 'run_plan.json')
+            cands_h.append(root / 'plant_id' / 'dynamics_identification.json')
+            cands_h.append(root / 'dynamics_identification.json')
+        for cand in cands_h:
+            if not cand.exists():
+                continue
+            with open(cand) as _f:
+                raw = json.load(_f) or {}
+            payload = raw.get('plan', raw) if isinstance(raw, dict) else {}
+            t = payload.get('tau') or payload.get('tau_dom') \
+                or payload.get('tau_dominant') or 0.0
+            d = payload.get('dead_time') or payload.get('dead_dom') \
+                or payload.get('theta') or 0.0
+            try:
+                tau_plant = float(t or 0.0)
+                theta_plant = float(d or 0.0)
+            except (TypeError, ValueError):
+                tau_plant = 0.0
+                theta_plant = 0.0
+            if tau_plant > 0.0:
+                horizon_src_detail = cand.name
+                break
+    except Exception:
+        pass
+    if tau_plant > 0.0:
+        h_target = (theta_plant + 2.0 * tau_plant) / float(sr)
+        horizon_auto = int(np.clip(round(h_target), horizon_min, horizon_max))
+        out['horizon'] = {
+            'value': int(horizon_auto),
+            'source': (f'clip(round((theta+2*tau)/sample_rate),'
+                       f'{horizon_min},{horizon_max})='
+                       f'clip(round(({theta_plant:.1f}+2*{tau_plant:.1f})/'
+                       f'{sr}),{horizon_min},{horizon_max})={horizon_auto} '
+                       f'[from {horizon_src_detail}]'),
+        }
+    # else: skip; dataclass default 15 (V3 paper) survives.
+
+    # ---- p3_critic_warmup_iters (scale with horizon) -------------------
+    # Longer imagination horizons compound WM error → noisier critic
+    # targets → critic needs more warm-up iters before the actor can
+    # safely react to its baseline.  Scale linearly with H, with a
+    # floor at the historical default 16 (calibrated for H=15 on
+    # earlier runs).  Hard cap at 60 — beyond that the runtime
+    # stability gate (p3_critic_stability_*) handles release.
+    h_for_warmup = int(out.get('horizon', {}).get('value',
+                       int(getattr(cfg, 'horizon', 15))))
+    warmup_floor = int(os.environ.get('P3_CRITIC_WARMUP_FLOOR', '16'))
+    warmup_cap = int(os.environ.get('P3_CRITIC_WARMUP_CAP', '60'))
+    warmup_auto = int(np.clip(h_for_warmup, warmup_floor, warmup_cap))
+    out['p3_critic_warmup_iters'] = {
+        'value': int(warmup_auto),
+        'source': (f'clip(horizon,{warmup_floor},{warmup_cap})='
+                   f'clip({h_for_warmup},{warmup_floor},{warmup_cap})='
+                   f'{warmup_auto}'),
+    }
     return out
 
 
@@ -1307,7 +1465,10 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'random_seed_episodes':     TrainConfig().random_seed_episodes,
     'policy_init_log_std':      TrainConfig().policy_init_log_std,
     'policy_log_std_max':       TrainConfig().policy_log_std_max,
+    'policy_log_std_min':       TrainConfig().policy_log_std_min,
     'pmpo_entropy_coef':        TrainConfig().pmpo_entropy_coef,
+    'horizon':                  TrainConfig().horizon,
+    'p3_critic_warmup_iters':   TrainConfig().p3_critic_warmup_iters,
 }
 
 
@@ -1818,6 +1979,35 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     t_sample_acc = 0.0
     t_wm_acc = 0.0
     t_ac_acc = 0.0
+    # ---- Runtime gates (2026-05-08, run_p7 RCA) ----
+    # (1) Critic-stability gate: rolling window of P3 critic_loss to
+    # decide when the actor may unfreeze.  See cfg.p3_critic_stability_*.
+    crit_stab_win = max(0, int(getattr(
+        cfg, 'p3_critic_stability_window_iters', 0)))
+    critic_loss_window: 'deque[float]' = deque(maxlen=max(1, crit_stab_win))
+    actor_release_iter: Optional[int] = None
+    # (2) Entropy-decay-on-saturation: track consecutive iters where
+    # the actor's implied σ (= exp(H_diff) / sqrt(2πe)) is within
+    # ``pmpo_entropy_saturation_frac`` of σ_max.  We compare in
+    # σ-space rather than H-space because differential entropy goes
+    # negative for σ < 1/sqrt(2πe) ≈ 0.24 (which is exactly the
+    # tight-exploration regime we care about), making H/H_max
+    # fractions misbehave.
+    sat_window = max(0, int(getattr(
+        cfg, 'pmpo_entropy_saturation_window_iters', 0)))
+    sat_frac = float(getattr(cfg, 'pmpo_entropy_saturation_frac', 0.95))
+    sat_decay = float(getattr(cfg, 'pmpo_entropy_saturation_decay', 0.5))
+    eta_floor = float(getattr(cfg, 'pmpo_entropy_coef_min', 1e-6))
+    sat_enabled = bool(getattr(cfg, 'pmpo_entropy_decay_on_saturation', True))
+    sat_consec_iters = 0
+    sat_decay_events = 0
+    try:
+        sigma_max_live = float(np.exp(float(getattr(cfg,
+            'policy_log_std_max', 0.0))))
+    except Exception:
+        sigma_max_live = 1.0
+    sat_sigma_thresh = float(sat_frac) * float(sigma_max_live)
+    _sqrt_2pie = float(np.sqrt(2.0 * np.pi * np.e))
 
     # ----- Early-stop bookkeeping -----
     es_enable = bool(getattr(cfg, 'early_stop_enable', True))
@@ -2123,7 +2313,40 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # version that helps when the P3 budget is short
                 # relative to the WM/critic settling time.
                 p3_warmup = int(getattr(cfg, 'p3_critic_warmup_iters', 0))
-                actor_frozen = (p3_warmup > 0 and p3_iters < p3_warmup)
+                # Critic-stability gate (2026-05-08): if the recent
+                # critic_loss is still oscillating wildly (high CV),
+                # keep the actor frozen even past the fixed warm-up.
+                # Hard-cap at p3_critic_stability_max_warmup_iters so a
+                # flat-but-noisy critic cannot block training forever.
+                stab_cap = int(getattr(cfg,
+                    'p3_critic_stability_max_warmup_iters', 60))
+                stab_cv_thresh = float(getattr(cfg,
+                    'p3_critic_stability_max_cv', 0.5))
+                fixed_done = (p3_warmup <= 0) or (p3_iters >= p3_warmup)
+                stable = True
+                if (crit_stab_win > 0 and len(critic_loss_window) >=
+                        crit_stab_win):
+                    arr = np.asarray(critic_loss_window, dtype='float64')
+                    mu = float(np.mean(arr))
+                    sd = float(np.std(arr))
+                    cv = sd / max(1e-6, abs(mu))
+                    stable = (cv <= stab_cv_thresh)
+                # Once released, stay released (don't re-freeze).
+                if actor_release_iter is None:
+                    if p3_iters >= stab_cap:
+                        actor_release_iter = p3_iters
+                        if fixed_done and not stable:
+                            print(f'[critic-stab] p3_iter={p3_iters}: '
+                                  f'releasing actor at hard cap '
+                                  f'(critic_loss CV still > '
+                                  f'{stab_cv_thresh:.2f})', flush=True)
+                    elif fixed_done and stable:
+                        actor_release_iter = p3_iters
+                        if crit_stab_win > 0:
+                            print(f'[critic-stab] p3_iter={p3_iters}: '
+                                  f'releasing actor (critic_loss CV '
+                                  f'≤ {stab_cv_thresh:.2f})', flush=True)
+                actor_frozen = (actor_release_iter is None)
                 if actor_frozen:
                     # Backprop only the critic loss to keep the actor
                     # graph frozen (actor params receive no gradient).
@@ -2150,6 +2373,45 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         total_iters += 1
         if current_phase == 3:
             p3_iters += 1
+            # ---- Critic-stability gate book-keeping (run_p7 RCA) ----
+            try:
+                cl_t = ac_losses.get('critic_loss')
+                if cl_t is not None:
+                    critic_loss_window.append(float(cl_t.detach().item()))
+            except Exception:
+                pass
+            # ---- Adaptive entropy decay on σ-saturation ------------
+            # Detect when the actor's implied σ is pinned at the
+            # σ_max ceiling for sat_window consecutive iters → decay
+            # η so PG can pull σ down toward the learned mean.
+            if (sat_enabled and sat_window > 0 and sigma_max_live > 0.0):
+                try:
+                    H_now = float(ac_losses.get('actor_entropy_bonus',
+                        torch.tensor(0.0)).detach().item())
+                except Exception:
+                    H_now = 0.0
+                # σ_implied from differential entropy of N(μ, σ):
+                # H = 0.5 ln(2πe σ²) ⇒ σ = exp(H) / sqrt(2πe).
+                sigma_implied = float(np.exp(H_now)) / _sqrt_2pie
+                if sigma_implied >= sat_sigma_thresh:
+                    sat_consec_iters += 1
+                else:
+                    sat_consec_iters = 0
+                if sat_consec_iters >= sat_window:
+                    eta_old = float(getattr(cfg, 'pmpo_entropy_coef', 0.0))
+                    eta_new = max(eta_floor, eta_old * sat_decay)
+                    if eta_new < eta_old - 1e-12:
+                        cfg.pmpo_entropy_coef = float(eta_new)
+                        sat_decay_events += 1
+                        print(f'[entropy-decay] p3_iter={p3_iters}: '
+                              f'σ_implied={sigma_implied:.3f} ≥ '
+                              f'{sat_sigma_thresh:.3f} '
+                              f'(={sat_frac:.2f}×σ_max) for '
+                              f'{sat_consec_iters} iters; η: '
+                              f'{eta_old:.2e} → {eta_new:.2e} '
+                              f'(event #{sat_decay_events})',
+                              flush=True)
+                    sat_consec_iters = 0
 
         if total_iters % cfg.log_every == 0:
             now = time.time()
