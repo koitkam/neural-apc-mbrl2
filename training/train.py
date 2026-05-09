@@ -203,7 +203,21 @@ class TrainConfig:
     # Auto-derived in ``auto_tune_seed_buffer`` to ~⅓ × baseline_seed
     # episodes.  Set to 0 to disable.
     exploration_seed_episodes: int = 6
-    prbs_seed_op_band: float = 0.7
+    # PRBS target operating band as fraction of normalised action range.
+    # 0.95 covers MV ∈ [−0.95, +0.95] (i.e. 97.5 % of each side of the
+    # normalised range), so the WM sees plant behaviour all the way up
+    # to ~5 % from the hard bounds.  Critical for boundary accuracy:
+    # the controller will most often need to operate near MV bounds
+    # exactly when CV violations are imminent, and a WM trained only
+    # on the safe middle 70 % extrapolates badly there.
+    prbs_seed_op_band: float = 0.95
+    # Stratified-sampling guarantee: divide ``[-op_band, +op_band]``
+    # into N strata and ensure at least one PRBS center per stratum
+    # per episode (per action dim).  Prevents the boundary bins from
+    # being statistically empty on plants where #segments_per_episode
+    # is small (e.g. fast plants where T/(θ+4τ)/sr can be < 10).
+    # Set to 0 to disable stratification (pure uniform sampling).
+    prbs_seed_n_strata: int = 8
     # PRBS segment length (agent steps).  Auto-derived in
     # ``auto_tune_seed_buffer`` to ``(θ + 4τ) / sample_rate``, which
     # spans ~98 % of a first-order step response so the WM sees both
@@ -753,7 +767,8 @@ def collect_baseline_episode(env: APCEnv, cfg: TrainConfig, *,
 def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                           action_std: float = 0.05,
                           n_segments: Optional[int] = None,
-                          op_band: float = 0.7,
+                          op_band: float = 0.95,
+                          n_strata: Optional[int] = None,
                           ) -> Dict[str, np.ndarray]:
     """Collect one episode that PRBS-toggles MV across the operating band.
 
@@ -765,11 +780,13 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
 
     PRBS sweep produces a buffer whose state distribution covers the
     full ``[-op_band, +op_band]`` MV operating range.  Within a segment,
-    the action is held at a constant target (drawn uniformly from
-    ``[-op_band, +op_band]``) plus ``N(0, action_std)`` noise.  Segment
-    length ≈ ``(2 × τ) / sample_rate`` agent steps so the plant settles
-    at each operating point before toggling — gives the WM clean
-    step-response transitions to learn from across the full range.
+    the action is held at a constant target (drawn from a stratified
+    sample over ``[-op_band, +op_band]``) plus ``N(0, action_std)``
+    noise.  Segment length is auto-derived in ``auto_tune_seed_buffer``
+    to ``(θ + 4τ)/sr`` so the plant settles at each operating point
+    before toggling — gives the WM clean step-response transitions
+    across the full range, including near boundaries (which uniform
+    sampling under-covers when #segments per episode is small).
 
     Returns the same dict shape as ``collect_episode``.
     """
@@ -799,10 +816,45 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     if n_segments is None:
         n_segments = max(2, int(np.ceil(T / seg_len)))
     # Pre-roll PRBS targets per segment, per action dim.
+    # Use stratified sampling to guarantee boundary coverage even when
+    # #segments per episode is small: divide [-op, +op] into N strata
+    # and place at least one center per stratum, then fill the
+    # remaining segments with random draws.  Without stratification,
+    # the outer 10 % of the MV range is statistically under-covered
+    # — exactly the region where the controller most needs accurate
+    # WM predictions when defending against disturbances.
     op = float(np.clip(op_band, 0.05, 0.95))
-    targets = env.rng.uniform(-op, +op,
-                                size=(int(n_segments), env.action_dim)
-                                ).astype('float32')
+    n_seg_int = int(n_segments)
+    A = int(env.action_dim)
+    strata_n = (int(n_strata) if n_strata is not None
+                  else int(getattr(cfg, 'prbs_seed_n_strata', 8)))
+    strata_n = max(0, min(strata_n, n_seg_int))
+    targets = np.empty((n_seg_int, A), dtype='float32')
+    if strata_n > 0:
+        # Stratum centers: midpoints of equal-width bins over [-op, +op].
+        edges = np.linspace(-op, +op, strata_n + 1)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        for a in range(A):
+            order = env.rng.permutation(n_seg_int)
+            assigned = np.empty(n_seg_int, dtype='float32')
+            # First strata_n positions: one per stratum, jittered within
+            # the stratum to avoid identical center repeats.
+            half_w = (op / strata_n)
+            jitter = env.rng.uniform(-half_w, +half_w,
+                                        size=strata_n).astype('float32')
+            assigned[:strata_n] = (centers + jitter).astype('float32')
+            # Remaining positions: uniform random draws.
+            if n_seg_int > strata_n:
+                assigned[strata_n:] = env.rng.uniform(
+                    -op, +op, size=n_seg_int - strata_n
+                    ).astype('float32')
+            # Shuffle so stratum-anchored segments are not all up front
+            # (we want operating-point variety across episode time too).
+            targets[:, a] = assigned[order]
+    else:
+        targets = env.rng.uniform(-op, +op,
+                                    size=(n_seg_int, A)
+                                    ).astype('float32')
     for t in range(T):
         obs_buf[t] = obs_window
         seg_idx = min(int(n_segments) - 1, t // seg_len)
@@ -2215,7 +2267,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     baseline_seed_std = float(getattr(cfg, 'baseline_seed_action_std', 0.05))
     n_random_seed = int(getattr(cfg, 'random_seed_episodes', 2))
     n_prbs_seed = int(getattr(cfg, 'exploration_seed_episodes', 0))
-    prbs_op_band = float(getattr(cfg, 'prbs_seed_op_band', 0.7))
+    prbs_op_band = float(getattr(cfg, 'prbs_seed_op_band', 0.95))
     if n_baseline_seed > 0:
         for _ in range(n_baseline_seed):
             ep = collect_baseline_episode(env, cfg,
@@ -2229,7 +2281,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # PRBS-style operating-band sweep (run_p7 RCA): forces WM to see
     # step-response transitions across the full MV operating range so
     # next-state predictions don't degrade outside the mid-bound region
-    # the actor will eventually need to leave.
+    # the actor will eventually need to leave.  Stratified sampling
+    # (cfg.prbs_seed_n_strata) guarantees boundary-bin coverage even
+    # when #segments per episode is small.
     for _ in range(max(0, n_prbs_seed)):
         ep = collect_prbs_episode(env, cfg,
                                     action_std=baseline_seed_std,
