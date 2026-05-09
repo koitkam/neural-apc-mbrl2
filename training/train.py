@@ -204,6 +204,16 @@ class TrainConfig:
     # episodes.  Set to 0 to disable.
     exploration_seed_episodes: int = 6
     prbs_seed_op_band: float = 0.7
+    # PRBS segment length (agent steps).  Auto-derived in
+    # ``auto_tune_seed_buffer`` to ``(θ + 4τ) / sample_rate``, which
+    # spans ~98 % of a first-order step response so the WM sees both
+    # the transient and a clear settled steady-state at each operating
+    # point — necessary to learn the full transfer function (gain +
+    # time constant) rather than just the early transient slope.
+    # Floor 8, cap T/4 so each episode still contains ≥ 4 segments.
+    # Sentinel 0 means "use auto-derived" — any positive value
+    # overrides.
+    prbs_seed_segment_steps: int = 0
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -769,13 +779,23 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
-    # Auto-derive segment length from plant timing if available.
-    sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
-    tau_dom_env = float(os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
-    if tau_dom_env > 0:
-        seg_len = max(8, int(round(2.0 * tau_dom_env / sr)))
+    # Segment length: prefer cfg-supplied (auto-derived from plant
+    # timing in auto_tune_seed_buffer ⇒ (θ + 4τ)/sr ≈ 98% settling
+    # time).  Fall back to env-var SIM_IDENTIFIED_TAU_DOMINANT for
+    # back-compat (old runs) and finally to a generous T/12 default
+    # (only triggers when neither plant timing nor cfg is available).
+    seg_cfg = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
+    if seg_cfg > 0:
+        seg_len = max(8, min(seg_cfg, T // 4))
     else:
-        seg_len = max(8, T // 12)
+        sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
+        tau_dom_env = float(os.environ.get(
+            'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
+        if tau_dom_env > 0:
+            seg_len = max(8, int(round(4.0 * tau_dom_env / sr)))
+            seg_len = min(seg_len, T // 4)
+        else:
+            seg_len = max(8, T // 12)
     if n_segments is None:
         n_segments = max(2, int(np.ceil(T / seg_len)))
     # Pre-roll PRBS targets per segment, per action dim.
@@ -1552,6 +1572,35 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                    f'clip({h_for_warmup},{warmup_floor},{warmup_cap})='
                    f'{warmup_auto}'),
     }
+
+    # ---- prbs_seed_segment_steps (full transfer-function coverage) ----
+    # PRBS segment must be long enough that, after the dead-time delay
+    # θ, the plant reaches an *observable steady state* before the next
+    # MV step toggles.  For a first-order plant: 1τ = 63 %, 2τ = 86 %,
+    # 3τ = 95 %, 4τ = 98 %, 5τ = 99 %.  We use 4τ + θ so the WM sees
+    # both the transient and a clear settled value at every operating
+    # point — critical to learn the *gain* of the transfer function
+    # rather than just the early transient slope (which is dominated
+    # by the actuator τ_fast).
+    #
+    # Episode-length cap (T/4) ensures ≥ 4 segments per episode so
+    # the PRBS still toggles often enough to populate the buffer
+    # with diverse operating points within the episode budget.
+    if tau_plant > 0.0:
+        ep_len = max(1, int(getattr(cfg, 'episode_length', 1)))
+        seg_target = (theta_plant + 4.0 * tau_plant) / float(sr)
+        seg_min = int(os.environ.get('PRBS_SEG_MIN', '8'))
+        seg_cap = max(seg_min + 1, ep_len // 4)
+        seg_auto = int(np.clip(round(seg_target), seg_min, seg_cap))
+        n_seg_per_ep = max(1, int(round(ep_len / max(1, seg_auto))))
+        out['prbs_seed_segment_steps'] = {
+            'value': int(seg_auto),
+            'source': (f'clip(round((theta+4*tau)/sr),{seg_min},'
+                       f'episode_length/4)='
+                       f'clip(round(({theta_plant:.1f}+4*{tau_plant:.1f})/'
+                       f'{sr}),{seg_min},{seg_cap})={seg_auto} '
+                       f'(~{n_seg_per_ep} segments/episode)'),
+        }
     return out
 
 
@@ -1569,6 +1618,7 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'pmpo_entropy_coef':        TrainConfig().pmpo_entropy_coef,
     'horizon':                  TrainConfig().horizon,
     'p3_critic_warmup_iters':   TrainConfig().p3_critic_warmup_iters,
+    'prbs_seed_segment_steps':  TrainConfig().prbs_seed_segment_steps,
 }
 
 

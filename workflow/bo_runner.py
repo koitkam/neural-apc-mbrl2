@@ -208,27 +208,27 @@ def initialize_from_plant(out_dir: Path) -> Dict:
 
 
 def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
-    """Plant-derived horizon initial value, capped at the V3 paper default.
+    """Plant-derived imagination horizon (agent steps).
 
-    DreamerV3 §3 prescribes ``H = 15`` universally across 150+ control
-    tasks (proven robust by their hyperparameter ablation).  V4 inherits
-    this default for continuous control (see ``docs/papers/README.md``).
+    Formula matches ``training.train.auto_tune_seed_buffer`` so the
+    workflow plan, the printed config, and the trainer's effective
+    value all agree (run_p7 RCA: previously capped at V3 paper H=15
+    while the trainer's auto-tune overrode to (θ+2τ)/sr → confusing
+    log mismatch).
 
-    Empirically (validate-iter80 RCA, 2026-05-06): the previous formula
-    ``ceil((θ + 3τ)/sr)`` produced H = 42 on test_sim, which compounds
-    reward-head error by 42 steps in imagination.  Even with reward
-    head Pearson r = 0.16, after H steps the imagined return is noise,
-    so REINFORCE advantages collapse to ≈ 0 and the actor saturates
-    against the σ clamp.  Capping at the paper-default H = 15 limits
-    error compounding and matches the prescription.
+        H = clip(round((θ + 2τ) / sr), 15, 32)
 
-    The plant time constant should govern *lookback* (transformer
-    context length) — which observation history the encoder sees —
-    NOT the imagination horizon, which is a learning-stability
-    parameter that the paper holds constant across plants.
+    Floor at 15 = V3 paper default so fast-dynamics plants do not
+    regress; cap at 32 because WM next-state error compounds
+    geometrically with H beyond ~2× the plant settling time.
+
+    For BO trials the suggested ``horizon_mult ∈ HORIZON_BAND`` is
+    multiplied with this base value, so widening the base widens the
+    BO band proportionally (e.g. test_sim: H_init=28 →
+    H_band ∈ {14, 21, 28, 35}).
     """
-    raw = max(3, int(math.ceil((dead_time + 3.0 * tau) / max(1, sample_rate))))
-    return int(min(15, raw))
+    raw = max(3, int(round((dead_time + 2.0 * tau) / max(1, sample_rate))))
+    return int(min(32, max(15, raw)))
 
 
 def lookback_grid(plant_lookback: int) -> List[int]:
