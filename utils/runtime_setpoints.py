@@ -106,7 +106,23 @@ class RuntimeSetpointConfig:
     target_inside_margin_frac: float = 0.05
     change_style: str = 'step'
     ramp_duration_fraction: float = 0.10
-    curriculum_warmup_fraction: float = 0.25
+    # Fraction of total training over which NO setpoint changes are
+    # scheduled (the agent first stabilises against base bounds).  Was
+    # 0.25 — too long in 600 k-step runs (~150 k steps frozen-bounds),
+    # so the actor specialises on a static envelope and has to relearn
+    # later.  0.10 keeps a brief warm-up while exposing limit-tracking
+    # early enough that policy collapse on the static distribution is
+    # avoided.
+    curriculum_warmup_fraction: float = 0.10
+    # Number of magnitude strata for shift sampling.  When > 1 the
+    # per-event magnitude is drawn deterministically from one of N
+    # equally-spaced strata over ``[0.4*jitter, 1.0*jitter]``, cycled
+    # per (kind, channel) across episodes so every magnitude regime
+    # — small/mid/large — is exercised.  Without strata, repeated
+    # uniform sampling clusters near the mean (≈0.7*jitter) and the
+    # boundary regimes (smallest meaningful step, largest allowed step)
+    # are statistically rare.  Set 0/1 to disable.
+    n_magnitude_strata: int = 3
 
     @classmethod
     def auto_derive(cls,
@@ -156,7 +172,7 @@ class RuntimeSetpointConfig:
             target_jitter_fraction=target_jitter,
             change_style='step',
             ramp_duration_fraction=ramp_frac,
-            curriculum_warmup_fraction=0.25,
+            curriculum_warmup_fraction=0.10,
         )
 
     # Backward-compat: code that still reads .enabled treats it as "bounds on".
@@ -204,6 +220,12 @@ class RuntimeSetpointManager:
     _schedule: List[_ScheduledChange] = field(default_factory=list)
     _episode_length: int = 0
     _curriculum_fraction: float = 1.0
+    # Per-(kind, channel) magnitude-stratum counter for stratified shift
+    # sampling.  Cycles 0..N-1 across episodes so successive events on
+    # the same channel land in successive strata.  Initial offset is
+    # randomised at construction so seeds with different RNGs don't all
+    # start in the same stratum.
+    _mag_stratum_counter: Dict[Tuple[str, int], int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.base_mv_bounds = np.asarray(self.base_mv_bounds, dtype='float32').reshape(self.n_mv, 2)
@@ -408,6 +430,37 @@ class RuntimeSetpointManager:
     def _ramp_duration(self) -> int:
         return max(1, int(round(self._episode_length * self.cfg.ramp_duration_fraction)))
 
+    def _sample_magnitude_fraction(self, kind: str, ch: int, jitter: float) -> float:
+        """Stratified magnitude draw over ``[0.4*jitter, 1.0*jitter]``.
+
+        Cycles through ``cfg.n_magnitude_strata`` equally-spaced strata
+        per ``(kind, ch)`` so successive events on the same channel
+        rotate through small / mid / large magnitudes.  Within a stratum,
+        a small uniform jitter (±half the stratum width) is added so
+        repeated visits to the same stratum still vary slightly.
+
+        Set ``cfg.n_magnitude_strata <= 1`` to fall back to pure uniform
+        sampling (legacy behaviour).
+        """
+        n_strata = int(getattr(self.cfg, 'n_magnitude_strata', 0) or 0)
+        lo_frac = 0.4 * jitter
+        hi_frac = 1.0 * jitter
+        if n_strata <= 1:
+            return float(self._rng.uniform(lo_frac, hi_frac))
+        key = (kind, int(ch))
+        idx = int(self._mag_stratum_counter.get(key, int(self._rng.integers(0, n_strata))))
+        self._mag_stratum_counter[key] = (idx + 1) % n_strata
+        # Stratum centers evenly spaced across [lo_frac, hi_frac].
+        if n_strata == 1:
+            center = 0.5 * (lo_frac + hi_frac)
+            half_w = 0.5 * (hi_frac - lo_frac)
+        else:
+            step = (hi_frac - lo_frac) / float(n_strata)
+            center = lo_frac + (idx + 0.5) * step
+            half_w = 0.5 * step
+        return float(np.clip(self._rng.uniform(center - half_w, center + half_w),
+                              lo_frac, hi_frac))
+
     def _schedule_bounds_changes(self, n_events: int) -> None:
         """Schedule bounds-change events.
 
@@ -475,7 +528,7 @@ class RuntimeSetpointManager:
                 # moves by sign * uniform(0.4*jitter, 1.0*jitter) * span,
                 # which actually forces the agent to re-centre MV action.
                 sign = 1.0 if self._rng.random() < 0.5 else -1.0
-                mag_frac = float(self._rng.uniform(0.4 * jitter, 1.0 * jitter))
+                mag_frac = self._sample_magnitude_fraction(kind, ch, jitter)
                 center_shift = sign * mag_frac * span
 
                 # Adapt shift magnitude to MV-reachable CV envelope so the
@@ -589,7 +642,7 @@ class RuntimeSetpointManager:
             # ``uniform(-jitter, jitter) * span`` call averaged to zero and
             # made many episodes effectively target-static.
             sign = 1.0 if self._rng.random() < 0.5 else -1.0
-            mag_frac = float(self._rng.uniform(0.4 * jitter, 1.0 * jitter))
+            mag_frac = self._sample_magnitude_fraction('cv_target', ch, jitter)
             shift = sign * mag_frac * span
 
             # Gain-aware envelope: ensure the demanded target excursion is

@@ -329,10 +329,27 @@ def clamp_event_to_authority_budget(
         return float(proposed_delta), proposed_cv
     sign = 1.0 if proposed_cv >= 0.0 else -1.0
     allowed_cv = sign * budget - float(cumulative_cv_impact)
-    # If the cumulative is already over-budget on one side, clamp to 0
-    # rather than reverse direction (reversing tends to whip the agent).
+    # If the cumulative is already over-budget on one side, clamp to a
+    # small fraction of the original event in the *opposite* direction so
+    # the channel can begin returning toward the budget envelope rather
+    # than zeroing out (which previously starved late multi-event
+    # episodes on low-gain plants of any meaningful state movement).
+    # Cap at ``AGENT_DISTURBANCE_RECOVERY_FRAC`` (default 0.20) of the
+    # proposed magnitude.
+    try:
+        recovery_frac = float(os.environ.get(
+            'AGENT_DISTURBANCE_RECOVERY_FRAC', '0.20'))
+    except (TypeError, ValueError):
+        recovery_frac = 0.20
+    recovery_frac = float(np.clip(recovery_frac, 0.0, 1.0))
     if (allowed_cv == 0.0) or (np.sign(allowed_cv) != sign):
-        return 0.0, 0.0
+        if recovery_frac <= 0.0:
+            return 0.0, 0.0
+        # Reverse direction with a small magnitude (pull cumulative back
+        # toward zero).
+        recover_delta = -sign * recovery_frac * abs(float(proposed_delta))
+        recover_cv = recover_delta * float(cv_impact_per_unit)
+        return float(recover_delta), float(recover_cv)
     scale = abs(allowed_cv) / max(1e-12, abs(proposed_cv))
     scale = float(np.clip(scale, 0.0, 1.0))
     return float(proposed_delta) * scale, proposed_cv * scale
@@ -669,6 +686,99 @@ def apply_episode_init_offsets(
             state[mv_idx] = float(np.clip((mv_target - mv_lo) / mv_span, 0.0, 1.0))
         else:
             state[mv_idx] = float(np.clip(mv_target, mv_lo, mv_hi))
+
+    # --- CV offsets (init-only) --------------------------------------------
+    # Why: the agent previously only saw CVs at boundaries via dynamics
+    # (DV impact + MV pressure).  In ``extreme`` mode that produces only
+    # one boundary side per episode and never starts at a boundary.  Add
+    # a deliberate persistent CV offset on init so the policy trains
+    # episodes that begin near a CV bound and must recover.
+    #
+    # Anti-saturation safety: cap each CV offset by
+    # ``init_cv_offset_authority_frac`` (default 0.30) of the per-channel
+    # MV->CV recoverable authority, so the agent always has \u2265 70 % of
+    # MV travel free to defend against the offset.  Falls back to a span
+    # cap when no MV gain is available, and is opt-out via env-var
+    # ``AGENT_INIT_CV_OFFSET_FRAC=0``.
+    cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []) or [])]
+    cv_ranges = list(getattr(sim, 'cv_normalization_ranges', []) or [])
+    try:
+        init_cv_auth_frac = float(os.environ.get(
+            'AGENT_INIT_CV_OFFSET_FRAC', '0.30'))
+    except (TypeError, ValueError):
+        init_cv_auth_frac = 0.30
+    init_cv_auth_frac = float(np.clip(init_cv_auth_frac, 0.0, 1.0))
+    if cv_indices and cv_ranges and init_cv_auth_frac > 0.0:
+        # Per-CV recoverable authority in CV engineering units:
+        # sum_m |k_{m,c}| * 0.35 * mv_span_m  (35 % MV travel headroom).
+        try:
+            id_ctx = _load_identifier_context()
+        except Exception:
+            id_ctx = {}
+        mv_gain_map = (id_ctx or {}).get('mv_gain_to_cv', {}) or {}
+        state_vars = list(getattr(sim, 'state_variables', []) or [])
+        # mv_gain_map is collapsed across CVs in the identifier context,
+        # so we can only produce a single shared authority estimate.
+        # Divide evenly across CVs as a conservative per-CV cap.
+        total_auth = 0.0
+        for mv_pos, mv_idx in enumerate(mv_indices):
+            if mv_pos >= len(mv_ranges):
+                continue
+            mv_lo, mv_hi = float(mv_ranges[mv_pos][0]), float(mv_ranges[mv_pos][1])
+            mv_span = max(0.0, mv_hi - mv_lo)
+            mv_state_name = ''
+            if 0 <= mv_idx < len(state_vars):
+                try:
+                    mv_state_name = str(state_vars[mv_idx])
+                except Exception:
+                    mv_state_name = ''
+            try:
+                gain = float(
+                    mv_gain_map.get(mv_state_name, 0.0)
+                    or mv_gain_map.get(f'mv_{mv_pos}', 0.0)
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                gain = 0.0
+            total_auth += abs(gain) * 0.35 * mv_span
+        per_cv_auth = total_auth / max(1, len(cv_indices))
+        for cv_pos, cv_idx in enumerate(cv_indices):
+            if cv_pos >= len(cv_ranges):
+                continue
+            cv_lo, cv_hi = float(cv_ranges[cv_pos][0]), float(cv_ranges[cv_pos][1])
+            cv_center = (cv_lo + cv_hi) * 0.5
+            cv_span = max(1e-6, cv_hi - cv_lo)
+            # Magnitude budget: prefer the gain-based authority cap when
+            # available (keeps MV ~70 % free), else fall back to a small
+            # span cap so we never demand an excursion the actuator
+            # cannot recover from.
+            if per_cv_auth > 1e-9:
+                cap = init_cv_auth_frac * per_cv_auth
+            else:
+                cap = init_cv_auth_frac * 0.30 * cv_span  # ~9 % span at default
+            if mode == 'explore':
+                cv_offset = float(rng.uniform(-1.0, 1.0)) * 0.6 * cap
+            else:  # extreme
+                sign = -1.0 if rng.uniform() < 0.5 else 1.0
+                cv_offset = sign * float(rng.uniform(0.6, 1.0)) * cap
+            # Hard clip so the resulting CV stays inside the normalisation
+            # range with a small inward margin.
+            cv_target_eu = cv_center + cv_offset
+            inward = 0.05 * cv_span
+            cv_target_eu = float(np.clip(cv_target_eu, cv_lo + inward, cv_hi - inward))
+            cv_offset_clipped = cv_target_eu - cv_center
+            if hasattr(sim, 'set_disturbance_offset'):
+                # Persistent offset; sims that honor CV offsets observe
+                # a state change immediately, others see it only via the
+                # objective-side bounds delta.  Either way the agent
+                # learns a boundary-near initial condition.
+                sim.set_disturbance_offset('cv', cv_pos, float(cv_offset_clipped))
+            # Mirror into the observable state so the seed buffer / WM
+            # see the boundary-near initial CV right away.
+            if is_normalized:
+                state[cv_idx] = float(np.clip((cv_target_eu - cv_lo) / cv_span, 0.0, 1.0))
+            else:
+                state[cv_idx] = float(np.clip(cv_target_eu, cv_lo, cv_hi))
 
     return {'state': state, 'mv_values': mv_values, 'mode': mode}
 
