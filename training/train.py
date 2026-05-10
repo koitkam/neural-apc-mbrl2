@@ -1260,6 +1260,80 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
     return model
 
 
+def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
+                                         cfg: 'TrainConfig') -> None:
+    """Probe the WM at multiple horizons; clip ``cfg.horizon`` down.
+
+    2026-05-10 (run_p11 RCA): the critic head regresses to a near-
+    constant when imagined returns are dominated by WM compounding
+    error.  In run_p11 the WM next-state r dropped from 0.59 at H=1
+    to 0.08 at H=28 (the imagination horizon), the critic V std was
+    0.066 (vs return std 132), and the deterministic policy emitted a
+    near-constant action -> MV stuck at midpoint, CV violations 17 C
+    on a 7 C bound band.
+
+    Mitigation: at the P1->P2 transition, compute the open-loop k-step
+    next-state correlation at offsets 1, H/4, H/2, H and clip
+    ``cfg.horizon`` to the largest h where ``r_mean >= r_floor``
+    (default 0.4).  Floor below the natural V3 minimum of H=5 is
+    enforced so we never destroy temporal credit assignment entirely.
+
+    Disabled by setting env-var ``DREAMER_HORIZON_ADAPT=0``.
+    """
+    if int(os.environ.get('DREAMER_HORIZON_ADAPT', '1') or 0) == 0:
+        return
+    H = int(getattr(cfg, 'horizon', 15))
+    if H <= 5:
+        return
+    try:
+        from evaluation.diagnostics import _wm_kstep_rollout
+    except Exception as e:
+        print(f'[wm-fidelity-probe] import failed: {e!r}', flush=True)
+        return
+    r_floor = float(os.environ.get('DREAMER_HORIZON_R_FLOOR', '0.40'))
+    r_floor = float(np.clip(r_floor, 0.0, 0.95))
+    h_floor = int(os.environ.get('DREAMER_HORIZON_MIN_AFTER_ADAPT', '5'))
+    h_floor = max(3, min(h_floor, H))
+    try:
+        wm = _wm_kstep_rollout(model, env, device,
+                                k_max=H, n_starts=16, seed=20260510)
+    except Exception as e:
+        print(f'[wm-fidelity-probe] rollout failed: {e!r}', flush=True)
+        return
+    per = wm.get('per_offset') if isinstance(wm, dict) else None
+    if not per:
+        return
+    candidates = []
+    for k, v in per.items():
+        try:
+            off = int(k)
+            r = float(v.get('r_mean', float('nan')))
+            if np.isfinite(r):
+                candidates.append((off, r))
+        except Exception:
+            continue
+    if not candidates:
+        return
+    candidates.sort()
+    summary = ' '.join(f'H={o}:r={r:+.3f}' for o, r in candidates)
+    print(f'[wm-fidelity-probe] {summary} floor={r_floor:.2f}',
+          flush=True)
+    best_h = 0
+    for off, r in candidates:
+        if r >= r_floor:
+            best_h = max(best_h, off)
+    if best_h <= 0:
+        new_h = h_floor
+    else:
+        new_h = max(h_floor, min(H, best_h))
+    if new_h >= H:
+        return
+    print(f'[wm-fidelity-probe] clipping horizon {H} -> {new_h} '
+          f'(largest h with r_mean >= {r_floor:.2f} was {best_h})',
+          flush=True)
+    cfg.horizon = int(new_h)
+
+
 def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                             ) -> Dict[str, Dict[str, object]]:
     """Derive plant-adaptive defaults for the cold-start seed buffer.
@@ -1484,11 +1558,19 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # *confident* action.  Auto-derive log_std_min as
     # ``log(σ_max / sigma_min_ratio)`` so the actor always has at
     # least one decade of headroom to commit to a near-deterministic
-    # action when it has learned a good μ.  Defaults to 1/5 (matches
-    # V3 paper σ_min = 0.20 × σ_max ≈ 0.20 for σ_max = 1.0; for our
-    # σ_max = 0.10 this gives σ_min = 0.02, log_std_min = -3.91).
+    # action when it has learned a good μ.
+    #
+    # 2026-05-10 (run_p11 RCA): σ_min_ratio=5 → σ_min = σ_max / 5 was
+    # too aggressive on tight σ_max regimes: under noisy critic
+    # advantage the policy collapsed all the way to σ_min, killing
+    # exploration and producing a near-constant deterministic actor
+    # (validation policy_dist std = 0.015 across 1220 steps).  Tighten
+    # to ratio=2.5 → σ_min = σ_max / 2.5 ≈ 40 % of σ_max.  This keeps
+    # the actor confident-enough (still > 1 decade below the V3
+    # paper's σ_max=1.0 reference) while preventing total exploration
+    # collapse when the critic has not stabilised.
     sigma_min_ratio = max(2.0,
-        float(os.environ.get('SIGMA_MIN_RATIO_OF_MAX', '5.0')))
+        float(os.environ.get('SIGMA_MIN_RATIO_OF_MAX', '2.5')))
     target_sigma_min = target_sigma_max / sigma_min_ratio
     log_std_min_val = float(np.log(target_sigma_min))
     out['policy_log_std_min'] = {
@@ -2247,6 +2329,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_losses: Dict = {}
     ag_losses: Dict = {}
     ac_losses: Dict = {}
+    # P1 extension counter — incremented when WM fails the sf-loss gate
+    # and the trainer steals budget from P3 to give WM more time.
+    extra_p1_steps: int = 0
 
     def _phase_for(env_steps: int) -> int:
         if env_steps < p1:
@@ -2309,11 +2394,61 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     last_sf = float(wm_losses.get('sf_loss', p1_initial_sf))
                     drop = (p1_initial_sf - last_sf) / max(1e-8, abs(p1_initial_sf))
                     if drop < min_drop:
-                        msg = (f'P1: sf_loss drop {drop*100:.1f}% < '
-                                f'{min_drop*100:.1f}% (initial={p1_initial_sf:.3f} '
-                                f'final={last_sf:.3f}) — WM may not have learned')
-                        print(f'[early-stop-flag] {msg}', flush=True)
-                        mid_check_flags.append(msg)
+                        # 2026-05-10 (run_p11 RCA): when the WM didn't
+                        # learn, P2/P3 are guaranteed to fail (critic
+                        # regresses on noisy imagined returns →
+                        # do-nothing actor collapse).  Instead of just
+                        # flagging, extend P1 by stealing budget from
+                        # P3 — up to ``p1_extension_max_frac`` of the
+                        # total budget — and re-evaluate later.
+                        ext_frac = float(os.environ.get(
+                            'DREAMER_P1_EXTENSION_MAX_FRAC', '0.30'))
+                        ext_frac = float(np.clip(ext_frac, 0.0, 0.5))
+                        ext_used = int(extra_p1_steps)
+                        ext_budget = int(ext_frac * cfg.total_steps)
+                        if ext_used < ext_budget:
+                            step_chunk = max(
+                                int(cfg.episode_length),
+                                int(0.10 * cfg.total_steps))
+                            grant = min(step_chunk, ext_budget - ext_used)
+                            extra_p1_steps += grant
+                            new_p1 = p1 + extra_p1_steps
+                            new_p2 = p2  # keep P2 budget
+                            # Steal grant from P3 (recompute boundaries
+                            # inside _phase_for via the captured p1/p2).
+                            print(f'[p1-extension] sf_loss drop '
+                                  f'{drop*100:.1f}% < {min_drop*100:.1f}% '
+                                  f'(initial={p1_initial_sf:.3f} '
+                                  f'final={last_sf:.3f}); '
+                                  f'extending P1 by {grant} steps '
+                                  f'(total extension={extra_p1_steps}, '
+                                  f'cap={ext_budget})', flush=True)
+                            p1 = new_p1
+                            p3 = max(int(cfg.episode_length),
+                                     cfg.total_steps - p1 - p2)
+                            # Stay in P1; re-evaluate at next transition.
+                            new_phase = 1
+                        else:
+                            msg = (f'P1: sf_loss drop {drop*100:.1f}% < '
+                                    f'{min_drop*100:.1f}% (initial={p1_initial_sf:.3f} '
+                                    f'final={last_sf:.3f}) — WM may not have learned '
+                                    f'(extension budget {ext_budget} exhausted)')
+                            print(f'[early-stop-flag] {msg}', flush=True)
+                            mid_check_flags.append(msg)
+                # Adaptive imagination horizon based on WM fidelity.
+                # If we still transition to P2, probe the WM at
+                # multiple offsets and clip ``cfg.horizon`` to the
+                # deepest horizon where r_mean >= ``r_floor`` (default
+                # 0.4).  This prevents the critic from being trained
+                # against noise when the WM cannot predict 28 steps
+                # ahead (run_p11: H=28, r(H)=0.08, critic v_std=0.07).
+                if new_phase == 2:
+                    try:
+                        _maybe_clip_horizon_to_wm_fidelity(
+                            model, env, device, cfg)
+                    except Exception as e:
+                        print(f'[wm-fidelity-probe] error: {e!r}',
+                              flush=True)
             if es_enable and current_phase == 2 and new_phase == 3:
                 # End of P2: is reward MTP head learning?
                 max_rmtp = float(getattr(cfg, 'early_stop_p2_max_reward_mtp_loss',
