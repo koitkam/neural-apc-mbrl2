@@ -228,6 +228,17 @@ class TrainConfig:
     # Sentinel 0 means "use auto-derived" — any positive value
     # overrides.
     prbs_seed_segment_steps: int = 0
+    # PRBS segment-length MIN (agent steps).  When > 1 and
+    # < prbs_seed_segment_steps, each PRBS segment's hold time is
+    # sampled log-uniformly in [seg_min, seg_max] so the WM sees a
+    # MIX of fast (~τ/3) and slow (~4τ) excitation in the same
+    # episode.  Single fixed long-hold PRBS gives mostly steady-state
+    # data — WM learns gain but compounds error on transients
+    # (run_p12 P1 plateau: r(H=1)=0.65 but r(H=7)=0.19, never
+    # improved).  Multi-timescale GBN-style PRBS is the standard
+    # system-ID remedy.  Auto-derived in ``auto_tune_seed_buffer``
+    # to ``max(2, round(τ / (3 sr)))``.  Sentinel 0 = use auto.
+    prbs_seed_segment_steps_min: int = 0
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -803,18 +814,55 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # (only triggers when neither plant timing nor cfg is available).
     seg_cfg = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
     if seg_cfg > 0:
-        seg_len = max(8, min(seg_cfg, T // 4))
+        seg_max = max(8, min(seg_cfg, T // 4))
     else:
         sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
         tau_dom_env = float(os.environ.get(
             'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
         if tau_dom_env > 0:
-            seg_len = max(8, int(round(4.0 * tau_dom_env / sr)))
-            seg_len = min(seg_len, T // 4)
+            seg_max = max(8, int(round(4.0 * tau_dom_env / sr)))
+            seg_max = min(seg_max, T // 4)
         else:
-            seg_len = max(8, T // 12)
-    if n_segments is None:
-        n_segments = max(2, int(np.ceil(T / seg_len)))
+            seg_max = max(8, T // 12)
+    # Multi-timescale GBN (run_p12 RCA): when a fast-hold floor is
+    # configured, sample each segment's hold log-uniformly in
+    # [seg_min, seg_max] so the WM gets BOTH transient (~τ/3) and
+    # steady-state (~4τ) excitation.  Single-timescale long PRBS
+    # leaves the WM compounding-error blind.
+    seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
+    seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
+    multi_timescale = (seg_min < seg_max)
+    if multi_timescale:
+        # Pre-roll segment lengths log-uniformly; expand episode in
+        # ``draw_seg_lens`` so total covered steps >= T (last truncated).
+        log_lo = float(np.log(max(1, seg_min)))
+        log_hi = float(np.log(max(seg_min + 1, seg_max)))
+        seg_lens = []
+        covered = 0
+        # Generous upper bound on segment count.
+        max_segs_guess = int(np.ceil(T / max(1, seg_min))) + 4
+        draws = env.rng.uniform(log_lo, log_hi, size=max_segs_guess)
+        for u in draws:
+            sl = int(round(float(np.exp(u))))
+            sl = max(seg_min, min(seg_max, sl))
+            seg_lens.append(sl)
+            covered += sl
+            if covered >= T:
+                break
+        seg_lens = np.asarray(seg_lens, dtype='int32')
+        seg_starts = np.concatenate(([0], np.cumsum(seg_lens)[:-1])).astype('int32')
+        n_seg_int = int(len(seg_lens))
+        if n_segments is not None:
+            # Caller-supplied count overrides only the count semantics;
+            # we still keep the multi-timescale lengths.
+            pass
+    else:
+        seg_len_uniform = seg_max
+        if n_segments is None:
+            n_segments = max(2, int(np.ceil(T / seg_len_uniform)))
+        n_seg_int = int(n_segments)
+        seg_lens = np.full(n_seg_int, seg_len_uniform, dtype='int32')
+        seg_starts = (np.arange(n_seg_int) * seg_len_uniform).astype('int32')
     # Pre-roll PRBS targets per segment, per action dim.
     # Use stratified sampling to guarantee boundary coverage even when
     # #segments per episode is small: divide [-op, +op] into N strata
@@ -824,7 +872,6 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # — exactly the region where the controller most needs accurate
     # WM predictions when defending against disturbances.
     op = float(np.clip(op_band, 0.05, 0.95))
-    n_seg_int = int(n_segments)
     A = int(env.action_dim)
     strata_n = (int(n_strata) if n_strata is not None
                   else int(getattr(cfg, 'prbs_seed_n_strata', 8)))
@@ -855,9 +902,17 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
         targets = env.rng.uniform(-op, +op,
                                     size=(n_seg_int, A)
                                     ).astype('float32')
+    # Build per-step segment-index map from variable seg_lens.
+    seg_index_for_t = np.zeros(T, dtype='int32')
+    for k in range(n_seg_int):
+        s = int(seg_starts[k])
+        e = min(T, s + int(seg_lens[k]))
+        if s >= T:
+            break
+        seg_index_for_t[s:e] = k
     for t in range(T):
         obs_buf[t] = obs_window
-        seg_idx = min(int(n_segments) - 1, t // seg_len)
+        seg_idx = int(seg_index_for_t[t])
         center = targets[seg_idx]
         noise = env.rng.normal(0.0, float(action_std),
                                  size=(env.action_dim,)).astype('float32')
@@ -1755,6 +1810,23 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                        f'{sr}),{seg_min},{seg_cap})={seg_auto} '
                        f'(~{n_seg_per_ep} segments/episode)'),
         }
+        # Multi-timescale PRBS: fast hold ~ τ / 3 / sr.  This excites
+        # the WM at the dominant pole's natural frequency so it learns
+        # the *transient* dynamics (not just steady-state gain).
+        # Floor 2 (need at least 2 steps for a settled action).
+        seg_min_floor = int(os.environ.get('PRBS_SEG_MIN_FLOOR', '2'))
+        seg_min_target = (tau_plant / 3.0) / float(sr)
+        seg_min_auto = int(np.clip(
+            round(seg_min_target), seg_min_floor,
+            max(seg_min_floor + 1, seg_auto - 1)))
+        out['prbs_seed_segment_steps_min'] = {
+            'value': int(seg_min_auto),
+            'source': (f'clip(round(tau/(3*sr)),{seg_min_floor},'
+                       f'seg_max-1)='
+                       f'clip(round({tau_plant:.1f}/(3*{sr})),'
+                       f'{seg_min_floor},{seg_auto - 1})={seg_min_auto} '
+                       f'(fast-hold for transient excitation)'),
+        }
     return out
 
 
@@ -1773,6 +1845,7 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'horizon':                  TrainConfig().horizon,
     'p3_critic_warmup_iters':   TrainConfig().p3_critic_warmup_iters,
     'prbs_seed_segment_steps':  TrainConfig().prbs_seed_segment_steps,
+    'prbs_seed_segment_steps_min': TrainConfig().prbs_seed_segment_steps_min,
 }
 
 
