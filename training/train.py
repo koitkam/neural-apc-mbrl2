@@ -2241,7 +2241,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         cal_obs = []
     if cal_obs:
         try:
-            arr = np.asarray(cal_obs, dtype='float64')   # (T, obs_dim)
+            arr = np.asarray(cal_obs, dtype='float64')
+            # ``obs`` returned by env.step is a (lookback, obs_dim) window;
+            # collapse to per-step (T, obs_dim) by taking the latest frame.
+            if arr.ndim == 3:
+                arr = arr[:, -1, :]
+            elif arr.ndim != 2:
+                raise ValueError(f'unexpected obs_trace ndim={arr.ndim}')
             sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
             tau_dom = float(os.environ.get(
                 'SIM_IDENTIFIED_TAU_DOMINANT', '50') or 50)
