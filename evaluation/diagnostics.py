@@ -205,11 +205,23 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
     the action sequence is informative (not constant), then for each of
     ``n_starts`` start indices ``t``:
       1. Encode the lookback window ending at ``t`` through the
-         tokenizer, get ``z_ctx`` of length L.
-      2. Step the dynamics transformer forward ``k`` times appending the
-         *real* action ``a_{t}, ..., a_{t+k-1}`` to the action history,
-         decoding ``z_{t+1}, ..., z_{t+k}`` to predicted obs each step.
+         tokenizer, get ``z_ctx`` of length L (clean past latents).
+      2. Repeatedly call ``model.imagine_next_z`` to roll the WM forward
+         k steps using the *real* action sequence; decode each predicted
+         next-z to obs space.
       3. Compare predicted obs to real obs at offsets 1, k/4, k/2, k.
+
+    2026-05-10 (run_p13/p14 RCA): the previous implementation called
+    ``model.dynamics`` directly with the lookback z_ctx and read
+    ``z1_hat[:, -1]``.  That position is the dynamics' DENOISING of
+    ``z_clean[L-1]`` (current step) — not a prediction of the NEXT
+    step.  With ``tau_ctx=0.9`` the input is almost-clean, so the
+    model essentially round-trips the most recent obs back to itself.
+    The rollout then slid the window in such a way that every
+    "predicted" step was approximately ``obs[s-1]`` repeated, giving a
+    spurious decaying-correlation signature that looked like WM
+    failure.  Replaced with the proper iterative-denoising protocol
+    via ``imagine_next_z`` (paper-faithful K-step shortcut).
 
     Returns per-offset MAE + Pearson r averaged over channels and starts.
     """
@@ -242,44 +254,47 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
     # 2. Build start indices uniformly from [L, T - k_max - 1].
     starts = rng.integers(L, T - k_max - 1, size=int(n_starts))
 
-    # 3. For each start, do a closed-loop encode + open-loop dynamics roll.
-    d_min = 1.0 / cfg.k_max
-    tau_ctx_val = 1.0 - cfg.tau_ctx
+    # 3. For each start, do a closed-loop encode + open-loop dynamics roll
+    #    using the proper iterative-denoising protocol.
     pred_obs_all: List[np.ndarray] = []      # per start: (k, obs_dim)
     real_obs_all: List[np.ndarray] = []
     for s in starts:
         s = int(s)
-        # Initial lookback windows.
-        # Real obs at indices s-L .. s-1 (the lookback ending at t=s-1).
-        ow_window = real_obs[s - L:s]                    # (L, D)
-        a_window = real_act[s - L:s]                     # (L, A)
+        # Initial lookback ending at index s-1, so the first prediction
+        # is for index s (the action taken there is real_act[s-1]? no:
+        # in this env, real_obs[t] is the obs *after* taking real_act[t],
+        # so to predict real_obs[s] we condition on history ending at
+        # s-1 and use action real_act[s-1]... no wait, real_obs[s-1] is
+        # AFTER real_act[s-1]; to predict real_obs[s] we need real_act[s].
+        # We follow the env convention: predicted obs at offset kk
+        # corresponds to real_obs[s + kk], conditioning on real_act[s + kk].
+        ow_window = real_obs[s - L:s].copy()             # (L, D)
+        a_window = real_act[s - L:s].copy()              # (L, A)
+        z_history_list: List[np.ndarray] = []
+        # Encode the initial L windows once into clean z_history
+        # (kept on CPU as numpy, re-encoded later).
+        with torch.no_grad():
+            ow_t = torch.from_numpy(ow_window).to(device)
+            z_history = model.tokenizer.encode(ow_t)     # (L, z)
         pred_per_start = np.zeros((k_max, obs_dim), dtype='float32')
         for kk in range(k_max):
+            # Action that produces real_obs[s + kk] is real_act[s + kk]
+            # (env convention: step(a) returns obs_after_a).
+            a_step = real_act[s + kk]                     # (A,)
             with torch.no_grad():
-                ow_t = torch.from_numpy(ow_window).to(device)
-                a_t = torch.from_numpy(a_window).to(device)
-                z_ctx = model.tokenizer.encode(ow_t).unsqueeze(0)
-                tau = torch.full((1, L), tau_ctx_val, device=device,
-                                  dtype=z_ctx.dtype)
-                d = torch.full((1, L), d_min, device=device,
-                                dtype=z_ctx.dtype)
-                out = model.dynamics(z_ctx, tau, d, a_t.unsqueeze(0))
-                # ``z1_hat`` is the per-step predicted clean next-z.
-                # We take the last position which is the prediction for
-                # ``z_{t+1}`` given the lookback ending at ``t``.
-                z_next = out['z1_hat'][:, -1]                # (1, z)
+                a_t = torch.from_numpy(a_step).to(device).unsqueeze(0)  # (1, A)
+                # Iterative-denoising of the *next* step.  imagine_next_z
+                # appends a fresh noise slot, runs K shortcut steps with
+                # the action conditioning, and returns the denoised z.
+                z_next = model.imagine_next_z(
+                    z_history.unsqueeze(0), a_t,
+                    k_steps=cfg.k_max, tau_ctx=cfg.tau_ctx).squeeze(0)
                 obs_hat = model.tokenizer.decode(
-                    z_next).squeeze(0).float().cpu().numpy()
+                    z_next.unsqueeze(0)).squeeze(0).float().cpu().numpy()
             pred_per_start[kk] = obs_hat[:obs_dim]
-
-            # Slide windows: append predicted obs (open-loop) and real
-            # action (we are conditioning on the *real* action sequence
-            # so the WM is judged on its predictive capacity, not on
-            # action-distribution mismatch).
-            ow_window = np.concatenate(
-                [ow_window[1:], obs_hat[None, :obs_dim]], axis=0)
-            a_window = np.concatenate(
-                [a_window[1:], real_act[s + kk:s + kk + 1]], axis=0)
+            # Slide z_history: append predicted z, drop oldest.
+            z_history = torch.cat(
+                [z_history[1:], z_next.unsqueeze(0)], dim=0)
 
         real_seg = real_obs[s:s + k_max]
         pred_obs_all.append(pred_per_start)
