@@ -981,8 +981,23 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     #   - var_ratio ≫ 5     → encoder is over-amplifying (rare)
     with torch.no_grad():
         obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
-        z_var = z_clean.float().var(dim=(0, 1)).mean()
+        z_var_per_dim = z_clean.float().var(dim=(0, 1))           # (Z,)
+        z_var = z_var_per_dim.mean()
         losses['encoder_var_ratio'] = (z_var / obs_var).detach()
+        # Latent participation ratio (effective rank) — codebook health.
+        # If a handful of z-dims carry all the variance, the latent has
+        # collapsed and the dynamics module cannot express plant modes.
+        # PR = (sum var)^2 / sum(var^2);  PR == Z means all dims equal;
+        # PR == 1 means a single dim dominates.
+        s_var = z_var_per_dim.sum().clamp_min(1e-12)
+        s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
+        losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
+        losses['z_dim'] = torch.tensor(float(z_clean.shape[-1]),
+                                          device=z_clean.device)
+        # Count "alive" dims: variance > 1% of max-dim variance.
+        v_max = z_var_per_dim.max().clamp_min(1e-12)
+        losses['z_alive_dims'] = (
+            (z_var_per_dim > 0.01 * v_max).float().sum().detach())
     losses.update({k: v for k, v in sf_diag.items()})
     return losses, z_clean.detach(), agent_hid
 
@@ -2970,9 +2985,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"ret_ema {ema_str} ret_w {rwm_str} "
                   f"recon {row.get('recon_loss', 0.0):.4f} "
                   f"sf {row.get('sf_loss', 0.0):.4f} "
-                  f"bc {row.get('bc_loss', 0.0):.4f} "
-                  f"actor {row.get('actor_loss', 0.0):+.4f} "
-                  f"critic {row.get('critic_loss', 0.0):.4f} "
+                  f"(flow {row.get('sf_loss_flow', 0.0):.3f} "
+                  f"boot {row.get('sf_loss_boot', 0.0):.3f}) "
+                  f"encvar {row.get('encoder_var_ratio', 0.0):.2f} "
+                  f"zrank {row.get('z_eff_rank', 0.0):.1f}/{int(row.get('z_dim', 0))} "
+                  f"alive {int(row.get('z_alive_dims', 0))} "
+                  f"bc {row.get('bc_loss', 0.0):.3f} "
+                  f"actor {row.get('actor_loss', 0.0):+.3f} "
+                  f"critic {row.get('critic_loss', 0.0):.3f} "
                   f"ent {row.get('entropy_mean', 0.0):.3f} "
                   f"img_ret {row.get('imagined_return_mean', 0.0):+.3f} "
                   f"skip {row.get('n_grad_skip', 0)}",
@@ -2984,6 +3004,34 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             iter_cv_violations = []
             iter_mv_violations = []
             iter_raw_returns = []
+
+            # ----- Periodic WM-fidelity probe (P1 / P2 only) -----
+            # 2026-05-10 (run_p13): the sf_loss trace alone hides
+            # whether the WM is actually learning predictive dynamics.
+            # Periodically run the same probe used at the P1->P2 gate
+            # so we can watch r(H=1..H) trend during training rather
+            # than waiting for the phase transition.  Default every
+            # 10 log-iters; disable via DREAMER_WM_PROBE_EVERY_ITERS=0.
+            try:
+                _probe_every = int(os.environ.get(
+                    'DREAMER_WM_PROBE_EVERY_ITERS', '10') or 0)
+            except ValueError:
+                _probe_every = 0
+            if (_probe_every > 0
+                    and current_phase in (1, 2)
+                    and total_iters > 0
+                    and (total_iters % _probe_every) == 0):
+                try:
+                    _pbe = _probe_wm_fidelity(model, env, device, cfg)
+                    if _pbe is not None:
+                        print(f"[wm-fidelity-probe-iter{total_iters}] "
+                              f"{_pbe['summary']} "
+                              f"floor={_pbe['r_floor']:.2f} "
+                              f"best_h={_pbe['best_h']}/{_pbe['H']}",
+                              flush=True)
+                except Exception as _e:
+                    print(f"[wm-fidelity-probe-iter{total_iters}] "
+                          f"error: {_e!r}", flush=True)
 
             # ----- Early-stop detection (per log iter) -----
             if es_enable:
