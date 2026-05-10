@@ -216,27 +216,27 @@ def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
     while the trainer's auto-tune overrode to (θ+2τ)/sr → confusing
     log mismatch).
 
-        H = clip(round((θ + 3τ) / sr), 15, 48)
+        H = max(15, round((θ + 3τ) / sr))
 
     2026-05-10 (run_p13 horizon bump): formula updated from 2τ+θ to
     3τ+θ.  At 2τ the critic only sees ~86 % of the step response,
     under-weighting the settled disturbance-rejection outcome the
-    controller is graded on.  3τ spans ~95 % settling.  Cap raised
-    32 → 48 to accommodate slow plants (test_sim τ=53, sr=4 →
-    H_target ≈ 42).  WM compounding-error risk is now handled by
-    the runtime fidelity gate ``_probe_wm_fidelity`` which clips H
-    back if the WM cannot sustain it.
+    controller is graded on.  3τ spans ~95 % settling.
+
+    No upper cap: slow plants (large τ) legitimately need long
+    imagination horizons to bootstrap on settled values.  The
+    runtime fidelity gate ``_probe_wm_fidelity`` (training/train.py)
+    is the safety net — if the WM cannot sustain the requested H,
+    it gets clipped at the P1→P2 boundary or P1 is extended.
 
     Floor at 15 = V3 paper default so fast-dynamics plants do not
     regress.
 
     For BO trials the suggested ``horizon_mult ∈ HORIZON_BAND`` is
-    multiplied with this base value, so widening the base widens the
-    BO band proportionally (e.g. test_sim: H_init=42 →
-    H_band ∈ {21, 31, 42, 52}).
+    multiplied with this base value.
     """
-    raw = max(3, int(round((dead_time + 3.0 * tau) / max(1, sample_rate))))
-    return int(min(48, max(15, raw)))
+    raw = max(15, int(round((dead_time + 3.0 * tau) / max(1, sample_rate))))
+    return int(raw)
 
 
 def lookback_grid(plant_lookback: int) -> List[int]:

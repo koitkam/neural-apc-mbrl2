@@ -1694,8 +1694,7 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     #
     # Auto-derive H from identified plant timing:
     #
-    #     H_auto = clip(round((θ + 3 × τ) / sample_rate),
-    #                    horizon_min=15, horizon_max=48)
+    #     H_auto = max(15, round((θ + 3 × τ) / sample_rate))
     #
     # 2026-05-10 (run_p13): bumped from 2τ+θ to 3τ+θ.  At 2τ+θ the
     # critic only sees 1 - e^-2 ≈ 86 % of the step response, which
@@ -1704,18 +1703,24 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # e^-3 ≈ 95 % settling — the critic now bootstraps on a value
     # close to the true terminal state.
     #
-    # The horizon cap was raised 32 -> 48 to accommodate slow plants
-    # (test_sim τ=53, sr=4 → H_target ≈ 42).  WM compounding error
-    # is no longer a hard constraint here because the unified P1->P2
-    # gate (``_probe_wm_fidelity``) now CLIPS H back down at runtime
-    # when the WM cannot sustain the requested horizon.
+    # No upper cap: slow plants legitimately need long horizons.
+    # WM compounding error is no longer a hard constraint here
+    # because the unified P1->P2 gate (``_probe_wm_fidelity``) CLIPS
+    # H back down at runtime when the WM cannot sustain the
+    # requested horizon, and extends P1 first when budget remains.
+    #
+    # Floor at 15 = V3 paper default so fast-dynamics plants do not
+    # regress.  Env knob DREAMER_HORIZON_MIN overrides the floor;
+    # DREAMER_HORIZON_MAX (if set, default unset = no cap) overrides
+    # the cap if the user wants to constrain memory.
     #
     # Plant timing is read from ``run_plan.json`` (written by the
     # workflow runner before training) or ``plant_id/dynamics_*.json``
     # using the same dir-walk logic as MV-authority lookup above.  If
     # neither is available, leaves the dataclass default (15) in place.
     horizon_min = int(os.environ.get('DREAMER_HORIZON_MIN', '15'))
-    horizon_max = int(os.environ.get('DREAMER_HORIZON_MAX', '48'))
+    _hm_env = os.environ.get('DREAMER_HORIZON_MAX', '')
+    horizon_max = int(_hm_env) if _hm_env.strip() else 10**9
     sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
     tau_plant = 0.0
     theta_plant = 0.0
@@ -1758,12 +1763,13 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     if tau_plant > 0.0:
         h_target = (theta_plant + 3.0 * tau_plant) / float(sr)
         horizon_auto = int(np.clip(round(h_target), horizon_min, horizon_max))
+        cap_str = (str(horizon_max) if horizon_max < 10**9 else 'no-cap')
         out['horizon'] = {
             'value': int(horizon_auto),
             'source': (f'clip(round((theta+3*tau)/sample_rate),'
-                       f'{horizon_min},{horizon_max})='
+                       f'{horizon_min},{cap_str})='
                        f'clip(round(({theta_plant:.1f}+3*{tau_plant:.1f})/'
-                       f'{sr}),{horizon_min},{horizon_max})={horizon_auto} '
+                       f'{sr}),{horizon_min},{cap_str})={horizon_auto} '
                        f'[from {horizon_src_detail}]'),
         }
     # else: skip; dataclass default 15 (V3 paper) survives.
