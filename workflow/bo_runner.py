@@ -675,6 +675,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     sr = derived['sample_rate']
     base.sample_rate = sr
     base.seq_len = derived['seq_len']
+    base.k_max = derived['k_max']
     os.environ['SIM_SAMPLE_RATE'] = str(sr)
 
     # Phase 1b: Lookback identification using the *derived* sample_rate
@@ -700,7 +701,8 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
 
     derived_model_size = derived['model_size']
     print(f"[BO] derived: sample_rate={sr} ({derived['sample_rate_source']}) "
-          f"seq_len={base.seq_len} model_size_seed={derived_model_size} "
+          f"seq_len={base.seq_len} k_max={base.k_max} "
+          f"model_size_seed={derived_model_size} "
           f"complexity={derived['complexity_score']:.2f}", flush=True)
 
     # Adaptive batch size SEED (per-trial batch is re-derived in run_trial
@@ -760,6 +762,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         'episode_length': base.episode_length,
         'episode_length_source': ep_source,
         'seq_len': base.seq_len,
+        'k_max': base.k_max,
         'model_size_seed': derived_model_size,
         'model_size_source': 'auto:complexity',
         'complexity_score': derived['complexity_score'],

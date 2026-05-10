@@ -241,6 +241,7 @@ def main() -> int:
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
     horizon = horizon_init(tau, dead, sample_rate)
     seq_len = derived['seq_len']
+    k_max = derived['k_max']
     arch = MODEL_SIZE_PRESETS[model_size]
 
     # Plant-tied step budget (parity with workflow.bo_runner).  CLI > 0 wins;
@@ -292,6 +293,7 @@ def main() -> int:
         total_steps=total_steps,
         horizon=horizon,
         seq_len=seq_len,
+        k_max=k_max,
         batch_size=batch_size,
         out_dir=str(out_dir),
     )
@@ -309,6 +311,7 @@ def main() -> int:
         'lookback': lookback,
         'horizon': horizon,
         'seq_len': seq_len,
+        'k_max': k_max,
         'episode_length': episode_length,
         'episode_length_source': ep_source,
         'model_size': model_size,

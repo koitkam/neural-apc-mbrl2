@@ -111,12 +111,51 @@ def derive_seq_len(tau_dom: float, dead_time: float, sample_rate: int,
     """Sequence length for world-model training.
 
     Paper default is 64 (Hafner et al. 2024 §C).  We keep that as a floor
-    and only grow it to cover at least one full settling time
-    (``3τ + θ`` samples) when the plant is slow relative to the sample rate.
+    and grow it to cover ``≥2 × settling`` (i.e. enough room within a
+    single training sub-sequence for the WM to see *both* a transient
+    response *and* the relaxation back to a steady state).  Output is
+    snapped up to the next power of two (≥64) so GPU shapes stay clean,
+    capped at ``max_len`` to bound memory.
+
+    Rationale: with ``seq_len = settling``, the WM frequently trains on
+    windows that contain only the ramp-up half of a step response, never
+    seeing the gain converge.  Doubling to ``2 × settling`` guarantees
+    that every training window contains at least one full step
+    transient, which is what the dynamics transformer needs to learn
+    open-loop gain (not just slope).
     """
     sr = max(1, int(sample_rate))
     settling_samples = int(math.ceil((3.0 * float(tau_dom) + float(dead_time)) / sr))
-    return int(min(max_len, max(paper_default, settling_samples)))
+    target = 2 * max(1, settling_samples)
+    n = max(int(paper_default), target)
+    # snap up to next power of two (≥6 ⇒ ≥64) for clean attention shapes
+    pw = 1 << max(6, int(math.ceil(math.log2(max(2, n)))))
+    return int(min(max_len, pw))
+
+
+# ---------------------------------------------------------------------------
+# Denoising granularity (k_max) for the shortcut-forcing dynamics module
+# ---------------------------------------------------------------------------
+
+def derive_k_max(model_size: str, complexity_score: float,
+                 paper_default: int = 4) -> int:
+    """Number of shortcut-forcing denoising sub-steps (``d_min = 1/k_max``).
+
+    ``k_max`` controls how many iterative denoising steps the dynamics
+    transformer can take when ``imagine_next_z`` rolls out a future z.
+    Larger ``k_max`` = finer denoising trajectory = better latent
+    fidelity, at the cost of K× inference compute per imagined step.
+
+    No clean closed-form mapping exists from plant dynamics to optimal
+    ``k_max``; we tie it to model capacity (S/M → 4, L → 8) and bump it
+    one tier for very complex plants (``complexity_score ≥ 5``) where
+    the dynamics transformer is being asked to fit a richer manifold.
+    Hard cap at 16 to keep the imagination roll-out cost bounded.
+    """
+    base = {'S': 4, 'M': 4, 'L': 8}.get(model_size, int(paper_default))
+    if float(complexity_score) >= 5.0:
+        base = min(16, base * 2)
+    return int(max(1, base))
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +341,7 @@ def derive_all(dyn_report: Dict[str, Any], sim_meta: Dict[str, Any],
         tau_dom=tau_dom, tau_fast=tau_fast,
     )
     seq_len = derive_seq_len(tau_dom, dead_dom, sr)
+    k_max = derive_k_max(model_size, score)
 
     return {
         'sample_rate': int(sr),
@@ -309,6 +349,7 @@ def derive_all(dyn_report: Dict[str, Any], sim_meta: Dict[str, Any],
         'model_size': model_size,
         'complexity_score': float(score),
         'seq_len': int(seq_len),
+        'k_max': int(k_max),
         'inputs': {
             'tau_dom': tau_dom, 'dead_dom': dead_dom,
             'tau_fast': tau_fast, 'dead_fast': dead_fast,
