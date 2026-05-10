@@ -1260,49 +1260,36 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
     return model
 
 
-def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
-                                         cfg: 'TrainConfig') -> None:
-    """Probe the WM at multiple horizons; clip ``cfg.horizon`` down.
+def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
+    """Probe WM k-step fidelity.  Returns dict or ``None`` on failure.
 
-    2026-05-10 (run_p11 RCA): the critic head regresses to a near-
-    constant when imagined returns are dominated by WM compounding
-    error.  In run_p11 the WM next-state r dropped from 0.59 at H=1
-    to 0.08 at H=28 (the imagination horizon), the critic V std was
-    0.066 (vs return std 132), and the deterministic policy emitted a
-    near-constant action -> MV stuck at midpoint, CV violations 17 C
-    on a 7 C bound band.
-
-    Mitigation: at the P1->P2 transition, compute the open-loop k-step
-    next-state correlation at offsets 1, H/4, H/2, H and clip
-    ``cfg.horizon`` to the largest h where ``r_mean >= r_floor``
-    (default 0.4).  Floor below the natural V3 minimum of H=5 is
-    enforced so we never destroy temporal credit assignment entirely.
-
-    Disabled by setting env-var ``DREAMER_HORIZON_ADAPT=0``.
+    Output dict keys::
+        H            target imagination horizon
+        r_floor      threshold from DREAMER_HORIZON_R_FLOOR
+        per_offset   {offset: r_mean} (sorted ascending)
+        best_h       deepest offset with r_mean >= r_floor (0 if none)
+        summary      human-readable string for logs
+        passes_full  bool: best_h >= H (WM is reliable at full horizon)
     """
-    if int(os.environ.get('DREAMER_HORIZON_ADAPT', '1') or 0) == 0:
-        return
     H = int(getattr(cfg, 'horizon', 15))
-    if H <= 5:
-        return
+    if H <= 1:
+        return None
     try:
         from evaluation.diagnostics import _wm_kstep_rollout
     except Exception as e:
         print(f'[wm-fidelity-probe] import failed: {e!r}', flush=True)
-        return
+        return None
     r_floor = float(os.environ.get('DREAMER_HORIZON_R_FLOOR', '0.40'))
     r_floor = float(np.clip(r_floor, 0.0, 0.95))
-    h_floor = int(os.environ.get('DREAMER_HORIZON_MIN_AFTER_ADAPT', '5'))
-    h_floor = max(3, min(h_floor, H))
     try:
         wm = _wm_kstep_rollout(model, env, device,
                                 k_max=H, n_starts=16, seed=20260510)
     except Exception as e:
         print(f'[wm-fidelity-probe] rollout failed: {e!r}', flush=True)
-        return
+        return None
     per = wm.get('per_offset') if isinstance(wm, dict) else None
     if not per:
-        return
+        return None
     candidates = []
     for k, v in per.items():
         try:
@@ -1313,15 +1300,48 @@ def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
         except Exception:
             continue
     if not candidates:
-        return
+        return None
     candidates.sort()
-    summary = ' '.join(f'H={o}:r={r:+.3f}' for o, r in candidates)
-    print(f'[wm-fidelity-probe] {summary} floor={r_floor:.2f}',
-          flush=True)
     best_h = 0
     for off, r in candidates:
         if r >= r_floor:
             best_h = max(best_h, off)
+    summary = ' '.join(f'H={o}:r={r:+.3f}' for o, r in candidates)
+    return {
+        'H': H,
+        'r_floor': r_floor,
+        'per_offset': candidates,
+        'best_h': best_h,
+        'summary': summary,
+        'passes_full': best_h >= H,
+    }
+
+
+def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
+                                         cfg: 'TrainConfig') -> None:
+    """Clip ``cfg.horizon`` down based on a WM-fidelity probe.
+
+    Fallback path used only when the P1-extension budget has been
+    exhausted (see P1->P2 transition in ``train_dreamer``).  When the
+    WM is bad enough that even an extended P1 didn't help, this
+    shrinks the critic's imagination horizon to where the WM is
+    actually reliable so the critic doesn't train against noise.
+
+    Disabled by setting env-var ``DREAMER_HORIZON_ADAPT=0``.
+    """
+    if int(os.environ.get('DREAMER_HORIZON_ADAPT', '1') or 0) == 0:
+        return
+    H = int(getattr(cfg, 'horizon', 15))
+    if H <= 5:
+        return
+    probe = _probe_wm_fidelity(model, env, device, cfg)
+    if probe is None:
+        return
+    print(f"[wm-fidelity-probe] {probe['summary']} "
+          f"floor={probe['r_floor']:.2f}", flush=True)
+    h_floor = int(os.environ.get('DREAMER_HORIZON_MIN_AFTER_ADAPT', '5'))
+    h_floor = max(3, min(h_floor, H))
+    best_h = probe['best_h']
     if best_h <= 0:
         new_h = h_floor
     else:
@@ -1329,7 +1349,7 @@ def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
     if new_h >= H:
         return
     print(f'[wm-fidelity-probe] clipping horizon {H} -> {new_h} '
-          f'(largest h with r_mean >= {r_floor:.2f} was {best_h})',
+          f"(largest h with r_mean >= {probe['r_floor']:.2f} was {best_h})",
           flush=True)
     cfg.horizon = int(new_h)
 
@@ -2388,67 +2408,86 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # surfaces in summary and is also re-detected in
             # ``evaluation/diagnostics.py``.
             if es_enable and current_phase == 1 and new_phase == 2:
-                # End of P1: did sf_loss drop?
+                # ----- Unified P1->P2 gate (run_p11 RCA + 2026-05-10 unify) -----
+                # Primary signal: open-loop k-step WM fidelity (rollout-r).
+                # This is the quantity the critic actually depends on
+                # (the imagined H-step return).  ``sf_loss`` is kept as
+                # a secondary fallback signal because it can decrease
+                # while compounding-rollout r stays awful (run_p11:
+                # sf 1.00->0.94 but r(H=28)=0.08).
+                #
+                # Decision logic (in order):
+                #   1. If rollout-r passes at full horizon H -> proceed
+                #      to P2 with the original horizon.
+                #   2. Else if P1-extension budget remains -> EXTEND P1
+                #      (steal from P3) and stay in P1.  Re-probe at
+                #      the next boundary.
+                #   3. Else (extension exhausted) -> CLIP horizon to
+                #      the deepest reliable offset as a last resort.
+                #
+                # ``sf_loss`` is logged as a flag if it didn't drop,
+                # but no longer drives the extension decision on its
+                # own.
+                probe = _probe_wm_fidelity(model, env, device, cfg)
+                wm_passes = bool(probe and probe['passes_full'])
+                if probe is not None:
+                    print(f"[wm-fidelity-probe] {probe['summary']} "
+                          f"floor={probe['r_floor']:.2f} "
+                          f"best_h={probe['best_h']}/{probe['H']} "
+                          f"passes_full={wm_passes}", flush=True)
+                # secondary sf_loss diagnostic (informational)
                 min_drop = float(getattr(cfg, 'early_stop_p1_min_sf_drop_frac', 0.0))
+                sf_drop = None
                 if (min_drop > 0 and p1_initial_sf is not None):
                     last_sf = float(wm_losses.get('sf_loss', p1_initial_sf))
-                    drop = (p1_initial_sf - last_sf) / max(1e-8, abs(p1_initial_sf))
-                    if drop < min_drop:
-                        # 2026-05-10 (run_p11 RCA): when the WM didn't
-                        # learn, P2/P3 are guaranteed to fail (critic
-                        # regresses on noisy imagined returns →
-                        # do-nothing actor collapse).  Instead of just
-                        # flagging, extend P1 by stealing budget from
-                        # P3 — up to ``p1_extension_max_frac`` of the
-                        # total budget — and re-evaluate later.
-                        ext_frac = float(os.environ.get(
-                            'DREAMER_P1_EXTENSION_MAX_FRAC', '0.30'))
-                        ext_frac = float(np.clip(ext_frac, 0.0, 0.5))
-                        ext_used = int(extra_p1_steps)
-                        ext_budget = int(ext_frac * cfg.total_steps)
-                        if ext_used < ext_budget:
-                            step_chunk = max(
-                                int(cfg.episode_length),
-                                int(0.10 * cfg.total_steps))
-                            grant = min(step_chunk, ext_budget - ext_used)
-                            extra_p1_steps += grant
-                            new_p1 = p1 + extra_p1_steps
-                            new_p2 = p2  # keep P2 budget
-                            # Steal grant from P3 (recompute boundaries
-                            # inside _phase_for via the captured p1/p2).
-                            print(f'[p1-extension] sf_loss drop '
-                                  f'{drop*100:.1f}% < {min_drop*100:.1f}% '
-                                  f'(initial={p1_initial_sf:.3f} '
-                                  f'final={last_sf:.3f}); '
-                                  f'extending P1 by {grant} steps '
-                                  f'(total extension={extra_p1_steps}, '
-                                  f'cap={ext_budget})', flush=True)
-                            p1 = new_p1
-                            p3 = max(int(cfg.episode_length),
-                                     cfg.total_steps - p1 - p2)
-                            # Stay in P1; re-evaluate at next transition.
-                            new_phase = 1
-                        else:
-                            msg = (f'P1: sf_loss drop {drop*100:.1f}% < '
-                                    f'{min_drop*100:.1f}% (initial={p1_initial_sf:.3f} '
-                                    f'final={last_sf:.3f}) — WM may not have learned '
-                                    f'(extension budget {ext_budget} exhausted)')
-                            print(f'[early-stop-flag] {msg}', flush=True)
-                            mid_check_flags.append(msg)
-                # Adaptive imagination horizon based on WM fidelity.
-                # If we still transition to P2, probe the WM at
-                # multiple offsets and clip ``cfg.horizon`` to the
-                # deepest horizon where r_mean >= ``r_floor`` (default
-                # 0.4).  This prevents the critic from being trained
-                # against noise when the WM cannot predict 28 steps
-                # ahead (run_p11: H=28, r(H)=0.08, critic v_std=0.07).
-                if new_phase == 2:
+                    sf_drop = (p1_initial_sf - last_sf) / max(1e-8, abs(p1_initial_sf))
+                # extension budget bookkeeping
+                ext_frac = float(os.environ.get(
+                    'DREAMER_P1_EXTENSION_MAX_FRAC', '0.30'))
+                ext_frac = float(np.clip(ext_frac, 0.0, 0.5))
+                ext_used = int(extra_p1_steps)
+                ext_budget = int(ext_frac * cfg.total_steps)
+                ext_available = ext_used < ext_budget
+
+                if not wm_passes and ext_available and probe is not None:
+                    # CASE 2: extend P1
+                    step_chunk = max(
+                        int(cfg.episode_length),
+                        int(0.10 * cfg.total_steps))
+                    grant = min(step_chunk, ext_budget - ext_used)
+                    extra_p1_steps += grant
+                    print(f"[p1-extension] WM not reliable at H={probe['H']} "
+                          f"(best_h={probe['best_h']}, "
+                          f"r_floor={probe['r_floor']:.2f}); "
+                          f"extending P1 by {grant} steps "
+                          f"(total extension={extra_p1_steps}, "
+                          f"cap={ext_budget})"
+                          + (f"  sf_drop={sf_drop*100:.1f}%" if sf_drop is not None else ""),
+                          flush=True)
+                    p1 = p1 + grant
+                    p3 = max(int(cfg.episode_length),
+                             cfg.total_steps - p1 - p2)
+                    # Stay in P1; re-evaluate at next boundary.
+                    new_phase = 1
+                elif not wm_passes and not ext_available:
+                    # CASE 3: extension exhausted -> clip horizon
+                    msg = (f"P1: WM still not reliable at full horizon "
+                           f"after extension budget exhausted "
+                           f"(best_h={probe['best_h'] if probe else 'n/a'}); "
+                           f"falling back to horizon clip")
+                    print(f'[early-stop-flag] {msg}', flush=True)
+                    mid_check_flags.append(msg)
+                    if sf_drop is not None and sf_drop < min_drop:
+                        mid_check_flags.append(
+                            f"P1: sf_loss drop {sf_drop*100:.1f}% < "
+                            f"{min_drop*100:.1f}% (informational)")
                     try:
                         _maybe_clip_horizon_to_wm_fidelity(
                             model, env, device, cfg)
                     except Exception as e:
-                        print(f'[wm-fidelity-probe] error: {e!r}',
-                              flush=True)
+                        print(f'[wm-fidelity-probe] error: {e!r}', flush=True)
+                # CASE 1: wm_passes -> proceed to P2 with original horizon.
+                # (No clip, no extension.)
             if es_enable and current_phase == 2 and new_phase == 3:
                 # End of P2: is reward MTP head learning?
                 max_rmtp = float(getattr(cfg, 'early_stop_p2_max_reward_mtp_loss',
