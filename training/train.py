@@ -1694,23 +1694,28 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     #
     # Auto-derive H from identified plant timing:
     #
-    #     H_auto = clip(round((θ + 2 × τ) / sample_rate),
-    #                    horizon_min=15, horizon_max=32)
+    #     H_auto = clip(round((θ + 3 × τ) / sample_rate),
+    #                    horizon_min=15, horizon_max=48)
     #
-    # The 2τ + θ horizon spans ~95 % of a first-order step response
-    # (1 - e^-2 ≈ 0.86, plus dead-time prepended), enough for the
-    # critic to bootstrap on the settled CV value.  Floor at the V3
-    # paper default 15 so fast plants do not regress below the
-    # well-tested baseline.  Cap at 32 because WM next-state error
-    # compounds geometrically with H — past 2-3× the plant settling
-    # time we are mostly amplifying model error.
+    # 2026-05-10 (run_p13): bumped from 2τ+θ to 3τ+θ.  At 2τ+θ the
+    # critic only sees 1 - e^-2 ≈ 86 % of the step response, which
+    # under-weights the *settled* disturbance-rejection outcome that
+    # the controller is actually being graded on.  3τ+θ spans 1 -
+    # e^-3 ≈ 95 % settling — the critic now bootstraps on a value
+    # close to the true terminal state.
+    #
+    # The horizon cap was raised 32 -> 48 to accommodate slow plants
+    # (test_sim τ=53, sr=4 → H_target ≈ 42).  WM compounding error
+    # is no longer a hard constraint here because the unified P1->P2
+    # gate (``_probe_wm_fidelity``) now CLIPS H back down at runtime
+    # when the WM cannot sustain the requested horizon.
     #
     # Plant timing is read from ``run_plan.json`` (written by the
     # workflow runner before training) or ``plant_id/dynamics_*.json``
     # using the same dir-walk logic as MV-authority lookup above.  If
     # neither is available, leaves the dataclass default (15) in place.
     horizon_min = int(os.environ.get('DREAMER_HORIZON_MIN', '15'))
-    horizon_max = int(os.environ.get('DREAMER_HORIZON_MAX', '32'))
+    horizon_max = int(os.environ.get('DREAMER_HORIZON_MAX', '48'))
     sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
     tau_plant = 0.0
     theta_plant = 0.0
@@ -1751,13 +1756,13 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     except Exception:
         pass
     if tau_plant > 0.0:
-        h_target = (theta_plant + 2.0 * tau_plant) / float(sr)
+        h_target = (theta_plant + 3.0 * tau_plant) / float(sr)
         horizon_auto = int(np.clip(round(h_target), horizon_min, horizon_max))
         out['horizon'] = {
             'value': int(horizon_auto),
-            'source': (f'clip(round((theta+2*tau)/sample_rate),'
+            'source': (f'clip(round((theta+3*tau)/sample_rate),'
                        f'{horizon_min},{horizon_max})='
-                       f'clip(round(({theta_plant:.1f}+2*{tau_plant:.1f})/'
+                       f'clip(round(({theta_plant:.1f}+3*{tau_plant:.1f})/'
                        f'{sr}),{horizon_min},{horizon_max})={horizon_auto} '
                        f'[from {horizon_src_detail}]'),
         }
@@ -1798,18 +1803,9 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     if tau_plant > 0.0:
         ep_len = max(1, int(getattr(cfg, 'episode_length', 1)))
         seg_target = (theta_plant + 4.0 * tau_plant) / float(sr)
-        seg_min = int(os.environ.get('PRBS_SEG_MIN', '8'))
-        seg_cap = max(seg_min + 1, ep_len // 4)
-        seg_auto = int(np.clip(round(seg_target), seg_min, seg_cap))
-        n_seg_per_ep = max(1, int(round(ep_len / max(1, seg_auto))))
-        out['prbs_seed_segment_steps'] = {
-            'value': int(seg_auto),
-            'source': (f'clip(round((theta+4*tau)/sr),{seg_min},'
-                       f'episode_length/4)='
-                       f'clip(round(({theta_plant:.1f}+4*{tau_plant:.1f})/'
-                       f'{sr}),{seg_min},{seg_cap})={seg_auto} '
-                       f'(~{n_seg_per_ep} segments/episode)'),
-        }
+        seg_min_pgate = int(os.environ.get('PRBS_SEG_MIN', '8'))
+        seg_cap = max(seg_min_pgate + 1, ep_len // 4)
+        seg_auto = int(np.clip(round(seg_target), seg_min_pgate, seg_cap))
         # Multi-timescale PRBS: fast hold ~ τ / 3 / sr.  This excites
         # the WM at the dominant pole's natural frequency so it learns
         # the *transient* dynamics (not just steady-state gain).
@@ -1819,6 +1815,24 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         seg_min_auto = int(np.clip(
             round(seg_min_target), seg_min_floor,
             max(seg_min_floor + 1, seg_auto - 1)))
+        # Estimated # segments under log-uniform mix:
+        #   E[seg_len] = (seg_max - seg_min) / log(seg_max/seg_min)
+        if seg_min_auto < seg_auto:
+            mean_seg = max(1.0, (seg_auto - seg_min_auto) /
+                           max(1e-6, float(np.log(seg_auto / seg_min_auto))))
+        else:
+            mean_seg = float(seg_auto)
+        n_seg_per_ep = max(1, int(round(ep_len / mean_seg)))
+        out['prbs_seed_segment_steps'] = {
+            'value': int(seg_auto),
+            'source': (f'clip(round((theta+4*tau)/sr),{seg_min_pgate},'
+                       f'episode_length/4)='
+                       f'clip(round(({theta_plant:.1f}+4*{tau_plant:.1f})/'
+                       f'{sr}),{seg_min_pgate},{seg_cap})={seg_auto} '
+                       f'(slow hold; multi-timescale mix '
+                       f'[{seg_min_auto}..{seg_auto}] gives '
+                       f'~{n_seg_per_ep} segments/episode)'),
+        }
         out['prbs_seed_segment_steps_min'] = {
             'value': int(seg_min_auto),
             'source': (f'clip(round(tau/(3*sr)),{seg_min_floor},'
