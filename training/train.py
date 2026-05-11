@@ -3008,7 +3008,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"recon {row.get('recon_loss', 0.0):.4f} "
                   f"sf {row.get('sf_loss', 0.0):.4f} "
                   f"(flow {row.get('sf_loss_flow', 0.0):.3f} "
-                  f"boot {row.get('sf_loss_boot', 0.0):.3f}) "
+                  f"nsp {row.get('sf_loss_nsp', 0.0):.3f}) "
                   f"encvar {row.get('encoder_var_ratio', 0.0):.2f} "
                   f"zrank {row.get('z_eff_rank', 0.0):.1f}/{int(row.get('z_dim', 0))} "
                   f"alive {int(row.get('z_alive_dims', 0))} "

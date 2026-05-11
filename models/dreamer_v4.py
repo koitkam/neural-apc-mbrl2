@@ -424,6 +424,7 @@ class DynamicsConfig:
     soft_cap: float = 50.0
     rope_base: float = 10_000.0
     attn_impl: str = 'auto'         # 'auto' | 'manual' | 'sdpa'
+    nsp_scale: float = 0.5          # weight on next-step prediction term
     # n_tokens_per_step is computed internally:
     #   1 (z̃) + 1 (action) + 1 (τ,d) + n_register
 
@@ -517,20 +518,19 @@ class DynamicsTransformer(nn.Module):
 
     # --------------------------------------------------- per-step input assembly
     def _action_token(self, action: torch.Tensor) -> torch.Tensor:
-        """Combine continuous projection + discrete embedding for action.
+        """Continuous action projection (B, T, A) -> (B, T, D).
 
-        ``action`` shape ``(B, T, A)`` (continuous in [-1, 1]).
-        Returns ``(B, T, D)``.
+        2026-05-10 simplification: removed the discrete-bin embedding path.
+        Paper uses a discrete+continuous fusion because video games have
+        discrete action spaces; for continuous APC actions the binning is
+        a quantization bottleneck (21 bins on a [-1, 1] continuous knob
+        loses ~5 bits of precision and adds noise to gradient).  The
+        continuous projection alone is the cleaner interface.
+
+        ``act_disc_embed`` is still constructed in ``__init__`` for
+        checkpoint back-compat but is no longer in the forward path.
         """
-        B, T, A = action.shape
-        a_cont = self.act_cont_proj(action)
-        # Map continuous → bin index per dim, then sum embeddings.
-        bin_idx = ((action + 1.0) * 0.5 * (self.cfg.n_action_bins - 1)
-                   ).long().clamp_(0, self.cfg.n_action_bins - 1)  # (B,T,A)
-        offsets = (torch.arange(A, device=action.device)
-                   * self.cfg.n_action_bins).view(1, 1, A)
-        a_disc = self.act_disc_embed(bin_idx + offsets).sum(dim=2)  # (B,T,D)
-        return a_cont + a_disc
+        return self.act_cont_proj(action)
 
     def _tau_d_token(self, tau: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
         """``tau`` and ``d`` shape ``(B, T)`` floats → ``(B, T, D)``."""
@@ -1008,6 +1008,7 @@ class DreamerV4Config:
     tau_n_bins: int = 32
     soft_cap: float = 50.0
     attn_impl: str = 'auto'                # 'auto'|'manual'|'sdpa' (DREAMER_FAST_ATTN=1)
+    nsp_scale: float = 0.5                 # weight on next-step prediction term in shortcut_forcing_loss
     # Heads
     n_action_bins: int = 21
     head_hidden: int = 256
@@ -1040,6 +1041,7 @@ class DreamerV4(nn.Module):
             k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins,
             soft_cap=cfg.soft_cap,
             attn_impl=cfg.attn_impl,
+            nsp_scale=getattr(cfg, 'nsp_scale', 0.5),
         )
         self.dynamics = DynamicsTransformer(dyn_cfg)
         # Heads read from the agent-register hidden state (dim = d_model).
@@ -1378,12 +1380,36 @@ def reinforce_actor_loss(policy, prior_policy,
 def shortcut_forcing_loss(dynamics: DynamicsTransformer,
                            z_clean: torch.Tensor, action: torch.Tensor,
                            ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Compute the per-step shortcut forcing loss with bootstrap targets.
+    """Shortcut-forcing loss + explicit next-step prediction term.
 
     ``z_clean`` (B, T, z_dim)  — frozen tokenizer outputs (target z₁'s).
     ``action``  (B, T, A)      — actions taken before each step.
 
     Returns (loss, diag).
+
+    2026-05-10 redesign for continuous-control APC:
+
+    1. **Bootstrap term DISABLED** (no few-step inference distillation).
+       The paper's bootstrap loss enables generation in K' < K steps;
+       APC controllers always run K = k_max iterations at deployment
+       (one inference call per agent step), so the bootstrap gradient
+       is pure noise for our use-case and the d > d_min positions are
+       wasted compute.  Restrict (τ, d) sampling to d == d_min only.
+
+    2. **Next-step prediction loss ADDED** (`nsp` term).
+       The paper's standard SF loss trains "denoise z_tilde[t] in-place".
+       Inference at imagine_next_z appends a noise slot at position T+1
+       and asks the model to predict z_clean[T+1] from CLEAN past z[0..T]
+       and actions — a different distribution than what SF trains on.
+
+       We add a second forward pass per batch that builds exactly the
+       inference distribution: past positions at τ = (k_max-1)/k_max
+       (max trained, almost-clean), final position at τ = 0 (pure noise).
+       The loss requires z1_hat[:, -1] to match z_clean[:, -1].  This
+       trains the model on the literal task we use at inference time.
+
+       Weight (`nsp_scale=0.5`) keeps the standard SF term primary so
+       z-token recovery quality is preserved across all τ values.
     """
     cfg = dynamics.cfg
     B, T, Z = z_clean.shape
@@ -1391,54 +1417,50 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     dtype = z_clean.dtype
     d_min = 1.0 / cfg.k_max
 
-    # Per-(B, T) sample of (τ, d).
-    tau, d = sample_tau_d((B, T), cfg.k_max, device, dtype)
+    # ---- Standard SF (flow-only) ---------------------------------------
+    # Per-(B, T) sample of τ from the trained grid; FORCE d = d_min.
+    tau, _ = sample_tau_d((B, T), cfg.k_max, device, dtype)
+    d = torch.full_like(tau, d_min)
 
-    # Build corrupted z̃.
     z0 = torch.randn_like(z_clean)
     tau_b = tau.unsqueeze(-1)
     z_tilde = (1.0 - tau_b) * z0 + tau_b * z_clean
 
-    # Main forward — all timesteps, all batches at once.
     out = dynamics(z_tilde, tau, d, action)
     z1_hat = out['z1_hat']                                       # (B, T, Z)
-
-    # Flow-matching loss term (only where d == d_min) — x-space MSE.
-    is_min = (d <= (d_min + 1e-6))
     loss_flow = (z1_hat - z_clean).pow(2).sum(-1)                # (B, T)
 
-    # Bootstrap loss term (where d > d_min).
-    # We need 2 extra forward passes with stop-gradient targets.
-    half_d = d * 0.5
-    with torch.no_grad():
-        out_b1 = dynamics(z_tilde, tau, half_d, action)
-        z1_b1 = out_b1['z1_hat']
-        b1 = (z1_b1 - z_tilde) / (1.0 - tau_b).clamp_min(1e-6)
-        z_prime = z_tilde + b1 * half_d.unsqueeze(-1)
-        out_b2 = dynamics(z_prime, tau + half_d, half_d, action)
-        z1_b2 = out_b2['z1_hat']
-        b2 = (z1_b2 - z_prime) / (1.0 - (tau_b + half_d.unsqueeze(-1))
-                                   ).clamp_min(1e-6)
-        target_v = ((b1 + b2) * 0.5).detach()
-
-    # Convert main output to v-space and apply (1-τ)² scaling per paper.
-    one_m_tau = (1.0 - tau_b).clamp_min(1e-6)
-    v_hat = (z1_hat - z_tilde) / one_m_tau
-    loss_boot = (one_m_tau.squeeze(-1).pow(2)
-                  * (v_hat - target_v).pow(2).sum(-1))           # (B, T)
-
-    # Per-step ramp weight (eq. 8).
+    # Per-step ramp weight (eq. 8) — paper-faithful for the SF term.
     w = ramp_weight(tau)
-    loss_per_step = torch.where(is_min, loss_flow, loss_boot)
-    loss = (w * loss_per_step).mean()
+    loss_sf = (w * loss_flow).mean()
+
+    # ---- Next-step prediction (NSP) ------------------------------------
+    # Past positions: τ = (k_max-1)/k_max  ("clean" in trained grid).
+    # Last position : τ = 0                ("pure noise" — the inference slot).
+    # Loss only on the last position (B, 1).
+    if T >= 2:
+        tau_max = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
+        tau_n = torch.full((B, T), tau_max, device=device, dtype=dtype)
+        tau_n[:, -1] = 0.0
+        d_n = torch.full((B, T), d_min, device=device, dtype=dtype)
+        z0_n = torch.randn_like(z_clean)
+        tau_n_b = tau_n.unsqueeze(-1)
+        z_tilde_n = (1.0 - tau_n_b) * z0_n + tau_n_b * z_clean
+        out_n = dynamics(z_tilde_n, tau_n, d_n, action)
+        z1_hat_n = out_n['z1_hat'][:, -1]                        # (B, Z)
+        loss_nsp = (z1_hat_n - z_clean[:, -1]).pow(2).sum(-1).mean()
+    else:
+        loss_nsp = torch.zeros((), device=device, dtype=dtype)
+
+    nsp_scale = float(getattr(cfg, 'nsp_scale', 0.5))
+    loss = loss_sf + nsp_scale * loss_nsp
 
     diag = {
         'sf_loss': loss.detach(),
-        'sf_loss_flow': (w * loss_flow).where(is_min,
-                            torch.zeros_like(loss_flow)).mean().detach(),
-        'sf_loss_boot': (w * loss_boot).where(~is_min,
-                            torch.zeros_like(loss_boot)).mean().detach(),
-        'sf_d_min_frac': is_min.float().mean().detach(),
+        'sf_loss_flow': loss_sf.detach(),
+        'sf_loss_boot': torch.zeros((), device=device, dtype=dtype),
+        'sf_loss_nsp': loss_nsp.detach(),
+        'sf_d_min_frac': torch.ones((), device=device, dtype=dtype),
     }
     return loss, diag
 
