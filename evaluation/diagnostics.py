@@ -276,6 +276,7 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
         with torch.no_grad():
             ow_t = torch.from_numpy(ow_window).to(device)
             z_history = model.tokenizer.encode(ow_t)     # (L, z)
+            a_history = torch.from_numpy(a_window).to(device)  # (L, A)
         pred_per_start = np.zeros((k_max, obs_dim), dtype='float32')
         for kk in range(k_max):
             # Action that produces real_obs[s + kk] is real_act[s + kk]
@@ -286,15 +287,23 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
                 # Iterative-denoising of the *next* step.  imagine_next_z
                 # appends a fresh noise slot, runs K shortcut steps with
                 # the action conditioning, and returns the denoised z.
+                # MUST pass real action_history; without it the dynamics
+                # is queried with all-zero past actions, which is a
+                # train/inference distribution mismatch and produces
+                # garbage.
                 z_next = model.imagine_next_z(
                     z_history.unsqueeze(0), a_t,
-                    k_steps=cfg.k_max, tau_ctx=cfg.tau_ctx).squeeze(0)
+                    k_steps=cfg.k_max, tau_ctx=cfg.tau_ctx,
+                    action_history=a_history.unsqueeze(0)).squeeze(0)
                 obs_hat = model.tokenizer.decode(
                     z_next.unsqueeze(0)).squeeze(0).float().cpu().numpy()
             pred_per_start[kk] = obs_hat[:obs_dim]
             # Slide z_history: append predicted z, drop oldest.
             z_history = torch.cat(
                 [z_history[1:], z_next.unsqueeze(0)], dim=0)
+            # Slide a_history: append the action we just used.
+            a_history = torch.cat(
+                [a_history[1:], a_t.squeeze(0).unsqueeze(0)], dim=0)
 
         real_seg = real_obs[s:s + k_max]
         pred_obs_all.append(pred_per_start)

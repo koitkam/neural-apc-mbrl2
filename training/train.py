@@ -1161,10 +1161,14 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             agent_hid_for_policy)
 
         # 2. Imagine the next z under that action (K=4 shortcut sampler).
+        #    Pass the REAL action history that produced z_history; without
+        #    it imagine_next_z falls back to zeros and the dynamics is
+        #    queried in a distribution it was never trained on.
         with torch.no_grad():
             z_next = model.imagine_next_z(z_history, action_t,
                                            k_steps=cfg.k_max,
-                                           tau_ctx=cfg.tau_ctx)      # (B, z)
+                                           tau_ctx=cfg.tau_ctx,
+                                           action_history=a_history)      # (B, z)
 
         # 3. Slide histories: append (z_t, a_t).
         z_history = torch.cat([z_history[:, -(T - 1):],

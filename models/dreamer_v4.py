@@ -1176,12 +1176,20 @@ class DreamerV4(nn.Module):
     # --------------------------------------------------- inference: latent step
     @torch.no_grad()
     def imagine_next_z(self, z_history: torch.Tensor, action: torch.Tensor,
-                       k_steps: int = None, tau_ctx: float = 0.1
+                       k_steps: int = None, tau_ctx: float = 0.1,
+                       action_history: torch.Tensor = None
                        ) -> torch.Tensor:
         """Sample the next z given a history of clean z's and an action.
 
-        ``z_history``: ``(B, T_ctx, z_dim)``  — clean past latents.
-        ``action``   : ``(B, action_dim)``    — action taken at the next step.
+        ``z_history``     : ``(B, T_ctx, z_dim)``  — clean past latents.
+        ``action``        : ``(B, action_dim)``    — action taken at the next step.
+        ``action_history``: ``(B, T_ctx, action_dim)`` — REAL past actions
+            that produced ``z_history``.  REQUIRED for correctness: during
+            WM training the dynamics always sees real actions at every
+            position; passing zeros for the past creates a train/inference
+            distribution mismatch and the dynamics produces garbage.
+            (Defaults to zeros for back-compat with old callers; warn-loud
+            via ``DREAMER_ACT_HIST_REQUIRED=1`` to catch missing hookups.)
 
         Returns ``z_next`` of shape ``(B, z_dim)``.
 
@@ -1197,10 +1205,22 @@ class DreamerV4(nn.Module):
         # τ for past = 1 - tau_ctx (slight corruption); for current = 0 (full noise).
         z_past_corr = (1.0 - tau_ctx) * z_history + tau_ctx * torch.randn_like(z_history)
         z_seq = torch.cat([z_past_corr, z0], dim=1)                       # (B, T_ctx+1, z)
-        # Action: replicate past actions placeholder (zeros) + supplied current action.
-        act_seq = torch.zeros(B, T_ctx + 1, cfg.action_dim, device=device,
-                              dtype=action.dtype)
-        act_seq[:, -1] = action
+        # Action: real past actions + supplied current action.
+        if action_history is None:
+            import os as _os
+            if _os.environ.get('DREAMER_ACT_HIST_REQUIRED', '').strip() in ('1','true','True'):
+                raise ValueError(
+                    'imagine_next_z called without action_history; this is '
+                    'a train/inference distribution bug.  Pass the real '
+                    'past actions that produced z_history.')
+            act_past = torch.zeros(B, T_ctx, cfg.action_dim, device=device,
+                                    dtype=action.dtype)
+        else:
+            assert action_history.shape == (B, T_ctx, cfg.action_dim), (
+                f'action_history shape {tuple(action_history.shape)} != '
+                f'expected ({B}, {T_ctx}, {cfg.action_dim})')
+            act_past = action_history.to(device=device, dtype=action.dtype)
+        act_seq = torch.cat([act_past, action.unsqueeze(1)], dim=1)       # (B, T_ctx+1, A)
         # τ / d sequences: past = (1 - tau_ctx, d_min), current = (0 → 1, d_min).
         d_min = 1.0 / cfg.k_max
         tau_seq = torch.full((B, T_ctx + 1), 1.0 - tau_ctx, device=device,
