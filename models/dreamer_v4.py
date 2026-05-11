@@ -425,6 +425,8 @@ class DynamicsConfig:
     rope_base: float = 10_000.0
     attn_impl: str = 'auto'         # 'auto' | 'manual' | 'sdpa'
     nsp_scale: float = 0.5          # weight on next-step prediction term
+    nsp_batch_frac: float = 0.5     # batch fraction used for NSP forward pass
+    nsp_seq_len: int = 32           # NSP truncates to last N positions (mem budget)
     # n_tokens_per_step is computed internally:
     #   1 (z̃) + 1 (action) + 1 (τ,d) + n_register
 
@@ -1437,18 +1439,27 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     # ---- Next-step prediction (NSP) ------------------------------------
     # Past positions: τ = (k_max-1)/k_max  ("clean" in trained grid).
     # Last position : τ = 0                ("pure noise" — the inference slot).
-    # Loss only on the last position (B, 1).
+    # Loss only on the last position (B', 1).  Subsample batch AND truncate
+    # to the last ``nsp_seq_len`` positions so the second forward pass fits
+    # within the original WM mem budget; controlled via DynamicsConfig
+    # ``nsp_batch_frac`` (default 0.5) and ``nsp_seq_len`` (default 32).
+    nsp_batch_frac = float(getattr(cfg, 'nsp_batch_frac', 0.5))
+    nsp_seq_len = int(getattr(cfg, 'nsp_seq_len', 32))
+    B_n = max(1, int(round(B * nsp_batch_frac)))
+    T_n = min(T, max(2, nsp_seq_len))
     if T >= 2:
+        z_clean_n = z_clean[:B_n, -T_n:]
+        action_n = action[:B_n, -T_n:]
         tau_max = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
-        tau_n = torch.full((B, T), tau_max, device=device, dtype=dtype)
+        tau_n = torch.full((B_n, T_n), tau_max, device=device, dtype=dtype)
         tau_n[:, -1] = 0.0
-        d_n = torch.full((B, T), d_min, device=device, dtype=dtype)
-        z0_n = torch.randn_like(z_clean)
+        d_n = torch.full((B_n, T_n), d_min, device=device, dtype=dtype)
+        z0_n = torch.randn_like(z_clean_n)
         tau_n_b = tau_n.unsqueeze(-1)
-        z_tilde_n = (1.0 - tau_n_b) * z0_n + tau_n_b * z_clean
-        out_n = dynamics(z_tilde_n, tau_n, d_n, action)
-        z1_hat_n = out_n['z1_hat'][:, -1]                        # (B, Z)
-        loss_nsp = (z1_hat_n - z_clean[:, -1]).pow(2).sum(-1).mean()
+        z_tilde_n = (1.0 - tau_n_b) * z0_n + tau_n_b * z_clean_n
+        out_n = dynamics(z_tilde_n, tau_n, d_n, action_n)
+        z1_hat_n = out_n['z1_hat'][:, -1]                        # (B', Z)
+        loss_nsp = (z1_hat_n - z_clean_n[:, -1]).pow(2).sum(-1).mean()
     else:
         loss_nsp = torch.zeros((), device=device, dtype=dtype)
 
