@@ -937,7 +937,8 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
 # ---------------------------------------------------------------------------
 
 def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
-                      cfg: TrainConfig
+                      cfg: TrainConfig,
+                      disable_nsp: bool = False,
                       ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor,
                                   torch.Tensor]:
     """Eq. 5 + Eq. 7. Returns (losses, z_clean, agent_hid).
@@ -957,7 +958,8 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Shortcut forcing target = clean tokenizer output (no MAE).
     z_clean = model.tokenizer.encode(obs_cur)            # (B, T, z_dim)
     sf_loss, sf_diag = shortcut_forcing_loss(model.dynamics,
-                                                z_clean.detach(), act)
+                                                z_clean.detach(), act,
+                                                disable_nsp=disable_nsp)
 
     # Compute agent_hid from a near-clean dynamics pass (τ=tau_max, d=d_min).
     # Used by the Phase 2 BC + reward MTP heads.
@@ -2794,7 +2796,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
-                    wm_losses, _, agent_hid = world_model_loss(model, batch, cfg)
+                    # NSP extra forward is only needed during P1/P2 to teach
+                    # next-step prediction.  By P3 the gating probe has
+                    # already passed; rerunning NSP every P3 iter is a
+                    # ~50% memory tax that competes with the imagination
+                    # rollout buffer and triggers OOM on 22 GB GPUs.
+                    wm_losses, _, agent_hid = world_model_loss(model, batch,
+                                                                  cfg,
+                                                                  disable_nsp=True)
                     ag_losses = agent_finetune_loss(model, batch,
                                                       agent_hid, cfg)
                     # Drop BC term in P3 (the actor is now driven by

@@ -1381,6 +1381,7 @@ def reinforce_actor_loss(policy, prior_policy,
 
 def shortcut_forcing_loss(dynamics: DynamicsTransformer,
                            z_clean: torch.Tensor, action: torch.Tensor,
+                           disable_nsp: bool = False,
                            ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Shortcut-forcing loss + explicit next-step prediction term.
 
@@ -1447,7 +1448,7 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     nsp_seq_len = int(getattr(cfg, 'nsp_seq_len', 32))
     B_n = max(1, int(round(B * nsp_batch_frac)))
     T_n = min(T, max(2, nsp_seq_len))
-    if T >= 2:
+    if (T >= 2) and (not disable_nsp):
         z_clean_n = z_clean[:B_n, -T_n:]
         action_n = action[:B_n, -T_n:]
         tau_max = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
