@@ -293,7 +293,7 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
                 # garbage.
                 z_next = model.imagine_next_z(
                     z_history.unsqueeze(0), a_t,
-                    k_steps=cfg.k_max, tau_ctx=cfg.tau_ctx,
+                    k_steps=cfg.k_max, tau_ctx=None,
                     action_history=a_history.unsqueeze(0)).squeeze(0)
                 obs_hat = model.tokenizer.decode(
                     z_next.unsqueeze(0)).squeeze(0).float().cpu().numpy()

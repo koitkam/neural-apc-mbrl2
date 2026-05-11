@@ -705,7 +705,11 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
 
     a_history = np.zeros((L, env.action_dim), dtype='float32')
     d_min = 1.0 / cfg.k_max
-    tau_ctx_val = 1.0 - cfg.tau_ctx
+    # Past τ must land in the trained grid.  sample_tau_d emits
+    # τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max, so the maximum trained
+    # τ value is (k_max-1)/k_max.  Using cfg.tau_ctx=0.1 (τ=0.9) with
+    # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
+    tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
 
     for t in range(T):
         obs_buf[t] = obs_window
@@ -1164,10 +1168,12 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         #    Pass the REAL action history that produced z_history; without
         #    it imagine_next_z falls back to zeros and the dynamics is
         #    queried in a distribution it was never trained on.
+        #    tau_ctx=None lets imagine_next_z auto-pick 1/k_max so the
+        #    past τ lands at (k_max-1)/k_max (in-distribution).
         with torch.no_grad():
             z_next = model.imagine_next_z(z_history, action_t,
                                            k_steps=cfg.k_max,
-                                           tau_ctx=cfg.tau_ctx,
+                                           tau_ctx=None,
                                            action_history=a_history)      # (B, z)
 
         # 3. Slide histories: append (z_t, a_t).

@@ -1176,7 +1176,7 @@ class DreamerV4(nn.Module):
     # --------------------------------------------------- inference: latent step
     @torch.no_grad()
     def imagine_next_z(self, z_history: torch.Tensor, action: torch.Tensor,
-                       k_steps: int = None, tau_ctx: float = 0.1,
+                       k_steps: int = None, tau_ctx: float = None,
                        action_history: torch.Tensor = None
                        ) -> torch.Tensor:
         """Sample the next z given a history of clean z's and an action.
@@ -1190,14 +1190,21 @@ class DreamerV4(nn.Module):
             distribution mismatch and the dynamics produces garbage.
             (Defaults to zeros for back-compat with old callers; warn-loud
             via ``DREAMER_ACT_HIST_REQUIRED=1`` to catch missing hookups.)
+        ``tau_ctx``       : context noise level.  ``None`` (default) → auto
+            ``1.0 / k_max`` so the past τ lands at ``(k_max-1)/k_max`` which
+            is the MAX value in the training τ-grid (sample_tau_d only ever
+            samples τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max).  Using
+            tau_ctx=0.1 with k_max=4 puts past τ=0.9 which the model has
+            literally never seen during training.
 
         Returns ``z_next`` of shape ``(B, z_dim)``.
 
-        Uses paper-faithful K=4 shortcut sampling at d=1/k_max with a
-        small ``tau_ctx`` corruption applied to past frames for robustness.
+        Uses paper-faithful K=k_max shortcut sampling at d=1/k_max.
         """
         cfg = self.cfg
         K = int(k_steps if k_steps is not None else cfg.k_max)
+        if tau_ctx is None:
+            tau_ctx = 1.0 / float(cfg.k_max)
         B, T_ctx, _ = z_history.shape
         device = z_history.device
         # Pad with one dummy step at the end to denoise.
