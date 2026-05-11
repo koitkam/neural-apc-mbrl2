@@ -46,8 +46,10 @@ class DeterministicController(nn.Module):
         self.cfg = model.cfg
         self.lookback = model.cfg.lookback
         self.k_max = model.cfg.k_max
-        # τ_ctx default — match training-time inference.
-        self.tau_ctx = 0.1
+        # τ_ctx default — must land past tokens at (k_max-1)/k_max
+        # which is the MAX trained τ in the sample_tau_d grid.
+        # τ=0.9 (the historical default) is OOD for k_max=4 or 8.
+        self.tau_ctx = 1.0 / float(model.cfg.k_max)
 
     def forward(self, obs_window: torch.Tensor, prev_actions: torch.Tensor
                 ) -> torch.Tensor:

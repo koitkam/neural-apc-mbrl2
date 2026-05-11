@@ -959,11 +959,18 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     sf_loss, sf_diag = shortcut_forcing_loss(model.dynamics,
                                                 z_clean.detach(), act)
 
-    # Compute agent_hid from a clean dynamics pass (τ=1, d=d_min). Used by
-    # the Phase 2 BC + reward MTP heads.
+    # Compute agent_hid from a near-clean dynamics pass (τ=tau_max, d=d_min).
+    # Used by the Phase 2 BC + reward MTP heads.
+    # CRITICAL: τ=1.0 is OOD — sample_tau_d only emits τ ∈ {0, 1/k, ...,
+    # (k-1)/k} so the max trained τ is (k_max-1)/k_max.  At τ=1.0 the
+    # τ-embedding bucket is untrained and the transformer's agent_hid
+    # output is effectively random (transformer trained for τ ≤ τ_max).
+    # Use the highest in-grid value so the auxiliary heads see the
+    # cleanest TRAINED features.
     B, T = z_clean.shape[:2]
     device = z_clean.device
-    tau_clean = torch.full((B, T), 1.0, device=device, dtype=z_clean.dtype)
+    tau_max = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
+    tau_clean = torch.full((B, T), tau_max, device=device, dtype=z_clean.dtype)
     d_min = torch.full((B, T), 1.0 / cfg.k_max, device=device,
                         dtype=z_clean.dtype)
     out_clean = model.dynamics(z_clean, tau_clean, d_min, act)
@@ -1128,8 +1135,12 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # last buffered (z_{T-1}, a_{T-1}) thanks to within-step bidirectional
     # block-causal attention.  This is the "post-action" hidden state we
     # feed to the policy to sample the first imagined action.
+    # Use τ_max = (k_max-1)/k_max (the cleanest TRAINED τ) instead of
+    # 1.0 — τ=1.0 hits an untrained τ-embedding bin and agent_hid is
+    # garbage.  Same fix as in world_model_loss.
+    tau_max_v = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
     with torch.no_grad():
-        tau_clean = torch.full((B, T), 1.0, device=device,
+        tau_clean = torch.full((B, T), tau_max_v, device=device,
                                  dtype=z_history.dtype)
         d_min_t = torch.full((B, T), d_min_v, device=device,
                               dtype=z_history.dtype)
@@ -1184,9 +1195,10 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
         # 4. Re-run dynamics so agent_hid at the new last-position sees
         #    the freshly-sampled a_t.  This is the key change vs. before.
+        #    τ = τ_max (in-grid) per the same fix as above.
         T_now = z_history.shape[1]
         with torch.no_grad():
-            tau_clean = torch.full((B, T_now), 1.0, device=device,
+            tau_clean = torch.full((B, T_now), tau_max_v, device=device,
                                      dtype=z_history.dtype)
             d_min_t = torch.full((B, T_now), d_min_v, device=device,
                                   dtype=z_history.dtype)
