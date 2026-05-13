@@ -132,8 +132,36 @@ python -m workflow.bo_runner --simulation-dir simulation/test_sim \
   --trial_steps 0 \    # 0 = plant-tied auto
   --final_steps 0 \    # 0 = plant-tied auto
   --seed 0 \
+  --init-from-ckpt path/to/best.pt \   # optional warm-start (see below)
   --out output/my_custom_dir   # optional
 ```
+
+### Warm-starting from a previous checkpoint (`--init-from-ckpt`)
+
+Both `workflow/single_run.py` and `workflow/bo_runner.py` accept
+`--init-from-ckpt PATH` to load **model weights only** from a previous
+run's `best.pt` / `final.pt` (`strict=False`, so removed/renamed
+parameters are tolerated). Optimisers, replay buffer, phase counters,
+and auto-tuned hyperparameters all start fresh.
+
+For BO, the warm-start is applied to **every trial** (including the
+final retrain) via `TrainConfig.init_from_ckpt`, so each trial starts
+from the same pretrained weights and only the BO-tuned axes
+(`model_size`, `horizon`) vary.
+
+**Optuna study resume is *not* yet supported.** The Optuna study is
+created in-memory (no `storage=` arg), so `--init-from-ckpt` warm-starts
+*model weights* but does not preserve trial history across BO
+process restarts: relaunching `workflow/bo_runner.py` after a crash
+starts a brand-new study with no prior trial knowledge. Per-trial
+artefacts on disk (`trials/trial_XXXX/`) survive but are not
+automatically re-imported. If you need true Optuna resume, pass an
+RDB storage URL (e.g. `optuna.create_study(storage="sqlite:///"
++ str(out_dir / 'study.db'), load_if_exists=True)`) — easy to add but
+not done because per-trial GPU runs are long-lived enough that crash
+recovery has not been needed in practice. **Caveat:** if the BO
+process dies mid-trial, that trial's directory may also be stale
+(partial write); inspect before reusing.
 
 ### Environment overrides (all optional)
 
@@ -144,6 +172,12 @@ python -m workflow.bo_runner --simulation-dir simulation/test_sim \
 | `SIM_EPISODE_LENGTH` | force episode length (else auto from settling time) |
 | `SIM_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10`) |
 | `SEED` | RNG seed (default 0) |
+| `DREAMER_FAST_ATTN` | `1`/`sdpa` force SDPA, `0`/`manual` force the paper soft-cap path. **Default: SDPA whenever a CUDA device is available** (~6–9× faster than manual; QKNorm provides numerical safety). ONNX export always uses `manual`. |
+| `SEED_TARGET_CV_FRAC` | seed-PRBS amplitude as a fraction of avg CV-bound width (default 0.20). Lower → narrower exploration; raise for plants where the actor needs to learn large MV moves. |
+| `SIGMA_MAX_CAP` | upper bound on the auto-derived policy `σ_max` (default 0.30). Raise to allow wider directional MV swings; lower to keep exploration tight. |
+| `SIGMA_MAX_FLOOR` | lower bound on the auto-derived `σ_max` (default 0.10). |
+| `SIGMA_MAX_OVER_SEED` | multiplier of `baseline_seed_action_std` used to set `σ_max` (default 1.0). |
+| `SIGMA_MIN_RATIO_OF_MAX` | `σ_min = σ_max / ratio` (default 2.5, min 2.0). |
 
 ## Single training run (no BO)
 
@@ -153,6 +187,8 @@ python -m workflow.single_run --simulation-dir simulation/test_sim --steps 50000
 
 Same plant-derivation chain; output goes to `output/<sim>/run_<ts>/`.
 Useful for quick smoke tests or debugging without the BO overhead.
+Accepts `--init-from-ckpt PATH` for warm-starts (see *BO* section above
+for semantics; identical for single-run).
 
 ## Validation
 
@@ -203,7 +239,7 @@ early via the `on_iter_end` callback in the trainer.
 
 | Knob | Floor (paper) | Auto rule | Override |
 |---|---|---|---|
-| `batch_size` | 16 | nearest power of two filling ~50 % of GPU memory; per-batch cost = `{S:220, M:330, L:640} MB × horizon/42`; re-derived per BO trial | `OBJ_BATCH_SIZE` |
+| `batch_size` | 16 | nearest power of two filling ~50 % of GPU memory; per-batch cost = `{S:220, M:330, L:640} MB × horizon/42` and is scaled by ~0.55 when SDPA is on; re-derived per BO trial | `OBJ_BATCH_SIZE` |
 | `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `OBJ_REWARD_SCALE` |
 | `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `SIM_EPISODE_LENGTH` |
 | `sample_rate` | 5 | `min(τ_fast / 10, θ_fast / 2)` | `SIM_SAMPLE_RATE` |
@@ -211,6 +247,24 @@ early via the `on_iter_end` callback in the trainer.
 | `model_size` | M | `S/M/L` from complexity score | — |
 | `trial_steps` | 50 000 | `40 eps × max(1, complexity / 4) × ep_len`, clamped | `--trial_steps` |
 | `final_steps` | 200 000 | `10 × trial_steps`, clamped | `--final_steps` |
+| `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_FAST_ATTN` |
+| `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, SEED_SIGMA_CAP)` with `target_cv_frac=0.20` | `SEED_TARGET_CV_FRAC`, `SEED_SIGMA_CAP` |
+| `policy_log_std_max` | log(1.0) | `log(clip(SIGMA_MAX_OVER_SEED × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `SIGMA_MAX_CAP`, `SIGMA_MAX_FLOOR`, `SIGMA_MAX_OVER_SEED` |
+| `policy_log_std_min` | log(0.1) | `log(σ_max / SIGMA_MIN_RATIO_OF_MAX)` (default ratio 2.5) | `SIGMA_MIN_RATIO_OF_MAX` |
+
+## Performance notes
+
+- **SDPA attention** (FlashAttention-2 / cuDNN, auto-dispatched) is the
+  default on CUDA. Bench on test_sim (model L, B=16, T_ctx=128, K=8):
+  manual no-cache 1567 ms/call → manual + KV-cache 256 ms (6.1×) →
+  SDPA + KV-cache 180 ms (8.7×).
+- **KV-cache for `imagine_next_z`**: per-layer past-step keys/values are
+  built once at the start of each imagination rollout and only the
+  current step's tokens are re-projected through each block per K
+  iteration. Numerical equivalence vs the uncached path: max abs err
+  1.16e-6.
+- ONNX export still uses the manual soft-cap attention path for
+  exporter compatibility; only training inference uses SDPA.
 
 ## Setup
 
@@ -227,5 +281,10 @@ pip install -r requirements.txt
 - Single-arg workflow entry (`workflow/bo_runner.py`).
 - Validation harness with timeseries plots.
 - ONNX export of integrated `(rssm + actor)` graph.
+- SDPA attention + KV-cached imagination rollouts (default on CUDA;
+  6–9× faster Phase-3 iter).
+- Warm-start from previous checkpoint via `--init-from-ckpt`
+  (single-run *and* every BO trial; Optuna study itself does not yet
+  resume across process restarts — see warm-start section).
 
 See `docs/` for design notes.
