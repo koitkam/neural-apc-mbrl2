@@ -386,6 +386,13 @@ class TrainConfig:
     out_dir: str = ''
     log_every: int = 1
     save_every_iters: int = 20
+    # Path to a checkpoint (e.g. best.pt from a previous run) to load
+    # model weights from at startup.  Optimizers, env-step counter,
+    # phase tracking start fresh — only the model state_dict is
+    # restored.  Use to warm-start a new run when WM/critic/actor
+    # have already learned but you want to change params (σ clamp,
+    # warmup, etc.) without throwing away weights.  Empty = cold start.
+    init_from_ckpt: str = ''
 
     # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1) -----
     attn_impl: str = 'auto'          # 'auto'|'manual'|'sdpa'
@@ -1555,7 +1562,18 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     except Exception:
         pass
     if mv_auth > 1e-6 and cv_widths:
-        target_frac = 0.10
+        # ``target_cv_frac`` sets the seed-PRBS amplitude as a fraction of
+        # the average CV-bound width.  At 0.10 (legacy) the seed buffer
+        # only covered ~11 % of the MV operating band on test_sim
+        # (mv_auth=25.6, cv_w=28 ⇒ σ ≈ 0.11) — too narrow to teach the
+        # WM about big-swing rejection.  Bumped 2026-05-12 (run_p21
+        # RCA: validation showed mv_bound_usage=0.24, agent never used
+        # MV range) to 0.20: simulation-agnostic (still scales with the
+        # plant's identified gain & CV width) but covers 2× more of the
+        # MV range so the WM sees clean step-response transitions
+        # across most of the operating band.  Override via env
+        # ``SEED_TARGET_CV_FRAC``.
+        target_frac = float(os.environ.get('SEED_TARGET_CV_FRAC', '0.20'))
         cv_w = float(np.mean(cv_widths))
         # Bumped 2026-05-08 (run_p7 RCA): cap raised 0.10 → 0.30 to give
         # low-MV-authority plants enough seed-buffer coverage breadth.
@@ -1650,9 +1668,16 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     sigma_max_floor = float(os.environ.get('SIGMA_MAX_FLOOR', '0.10'))
     # Cap σ_max independently of the seed-σ cap so a wide seed-buffer
     # exploration band (now up to 0.30) does not propagate into a wide
-    # policy clamp.  0.20 keeps PG dominant over the entropy bonus
-    # while still preserving 2× headroom over the V3 σ_min = 0.10.
-    sigma_max_cap = float(os.environ.get('SIGMA_MAX_CAP', '0.20'))
+    # policy clamp.  Bumped 2026-05-12 (run_p21 RCA): 0.20 → 0.30 so the
+    # policy can express directional MV moves wide enough to reject
+    # large CV/DV disturbances (validation showed the policy pinned at
+    # σ_max=0.20 with mean magnitude ~0.05 — actor never broke out of
+    # the small-action basin because exploring μ ≈ 0.5 had σ ≈ 0.20 →
+    # noisy advantage).  Wider σ_max + a stable critic lets PG learn a
+    # confident large-magnitude μ when the disturbance demands it.
+    # σ_min is still auto-derived as σ_max/2.5 so confident actions
+    # remain reachable.
+    sigma_max_cap = float(os.environ.get('SIGMA_MAX_CAP', '0.30'))
     target_sigma_max = float(np.clip(sigma_max_mult * sigma_seed,
                                        sigma_max_floor, sigma_max_cap))
     log_std_max_val = float(np.log(target_sigma_max))
@@ -2347,6 +2372,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             print(f"[snr] SKIPPED ({exc!r})", flush=True)
 
     model = build_model(cfg).to(device)
+
+    # ---- Optional warm-start from a previous run's checkpoint ----------
+    init_path = str(getattr(cfg, 'init_from_ckpt', '') or '').strip()
+    if init_path:
+        if not os.path.exists(init_path):
+            raise FileNotFoundError(
+                f'init_from_ckpt={init_path!r} does not exist')
+        print(f'[init] loading model weights from {init_path}', flush=True)
+        ckpt = torch.load(init_path, map_location=device, weights_only=False)
+        sd = ckpt.get('model', ckpt)
+        # strict=False because we may have removed parameters since the
+        # checkpoint was saved (e.g. act_disc_embed in commit 1215bb3).
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing:
+            print(f'[init] {len(missing)} missing keys (e.g. {missing[:3]})',
+                   flush=True)
+        if unexpected:
+            print(f'[init] {len(unexpected)} unexpected keys '
+                   f'(e.g. {unexpected[:3]})', flush=True)
+        prev_iter = ckpt.get('best_iter')
+        prev_ema = ckpt.get('best_ema_return')
+        if prev_iter is not None:
+            print(f'[init] resumed from iter={prev_iter} '
+                   f'best_ema_return={prev_ema}', flush=True)
 
     # Square-root LR scaling for adaptive batch (kept from V3 trainer).
     bs_ref = 16

@@ -606,14 +606,29 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
 
 def run_bo(out_dir: str | Path, n_trials: int = 8,
            trial_steps: int = 0, final_steps: int = 0,
-           study_name: str = 'dreamer_v4_bo') -> Dict:
-    """Run BO.  ``trial_steps`` / ``final_steps`` ≤ 0 → plant-tied auto."""
+           study_name: str = 'dreamer_v4_bo',
+           init_from_ckpt: str = '') -> Dict:
+    """Run BO.  ``trial_steps`` / ``final_steps`` ≤ 0 → plant-tied auto.
+
+    ``init_from_ckpt``: optional path to a previous run's ``best.pt`` /
+    ``final.pt`` to warm-start *every* trial's model weights from.
+    Optimisers / replay buffer / counters still start fresh per trial;
+    only the network parameters are loaded (``strict=False``).
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     _install_workflow_log(out_dir)
     print(f'[runner] workflow log: {out_dir}/workflow.log', flush=True)
 
     base = TrainConfig()
+    if init_from_ckpt:
+        ckpt_path = str(init_from_ckpt).strip()
+        if not Path(ckpt_path).exists():
+            raise FileNotFoundError(
+                f'--init-from-ckpt path does not exist: {ckpt_path!r}')
+        base.init_from_ckpt = ckpt_path
+        print(f'[BO] init_from_ckpt={ckpt_path} '
+              f'(applied to every trial + final retrain)', flush=True)
     # Sample-rate env override is supported here for sims that hard-code their
     # scan rate.  Episode length is auto-derived from identification (or from
     # SIM_EPISODE_LENGTH env via derive_episode_length).
@@ -848,6 +863,11 @@ if __name__ == '__main__':
     p.add_argument('--final_steps', type=int, default=0,
                    help='final retrain steps (0 = plant-tied auto)')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--init-from-ckpt', type=str, default='',
+                   help="Optional path to a previous run's best.pt / "
+                        'final.pt to warm-start every trial (and the '
+                        'final retrain) from. Model weights only; '
+                        'optimisers/buffer/counters start fresh.')
     args = p.parse_args()
 
     repo = Path(__file__).resolve().parent.parent
@@ -876,4 +896,5 @@ if __name__ == '__main__':
 
     print(f'[runner] sim={sim_name}  out_dir={out_dir}', flush=True)
     run_bo(out_dir, n_trials=args.n_trials,
-           trial_steps=args.trial_steps, final_steps=args.final_steps)
+           trial_steps=args.trial_steps, final_steps=args.final_steps,
+           init_from_ckpt=args.init_from_ckpt)

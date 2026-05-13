@@ -205,7 +205,21 @@ def derive_batch_size(model_size: str,
     # from ~290 MB/sample to ~70 MB/sample with bf16+SDPA+compile). Scale
     # the per-batch budget down so the auto-derived batch size grows to
     # match the freed headroom.
-    fast_on = os.environ.get('DREAMER_FAST_ATTN', '').strip() in ('1','true','True','sdpa')
+    # The fast attention + compile paths drop peak memory to ~30% of the
+    # manual+eager baseline. Default policy (2026-05-12): SDPA is on
+    # whenever a CUDA device is available unless explicitly disabled via
+    # DREAMER_FAST_ATTN=0/manual.
+    _fast_env = os.environ.get('DREAMER_FAST_ATTN', '').strip().lower()
+    if _fast_env in ('0', 'false', 'manual', 'off'):
+        fast_on = False
+    elif _fast_env in ('1', 'true', 'sdpa', 'on'):
+        fast_on = True
+    else:
+        try:
+            import torch as _torch
+            fast_on = bool(_torch.cuda.is_available())
+        except Exception:
+            fast_on = False
     compile_on = os.environ.get('DREAMER_COMPILE', '').strip() in ('1','true','True')
     speed_factor = 1.0
     if fast_on:

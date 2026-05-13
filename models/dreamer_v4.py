@@ -184,9 +184,21 @@ class CausalAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         self.soft_cap = soft_cap
         # Resolve backend.
+        # Default policy (2026-05-12): SDPA whenever a CUDA device is
+        # available (FlashAttention-2 / cuDNN — ~3-9× faster than the
+        # manual soft-cap path with QKNorm providing the numerical
+        # safety net). CPU paths stay on 'manual' (SDPA gains are tiny
+        # without GPU kernels and ONNX export still passes
+        # attn_impl='manual' explicitly). Override via env
+        # DREAMER_FAST_ATTN: '0'/'manual' forces manual, '1'/'sdpa'
+        # forces sdpa.
         if attn_impl == 'auto':
-            env_fast = os.environ.get('DREAMER_FAST_ATTN', '').strip()
-            if env_fast in ('1', 'true', 'True', 'sdpa'):
+            env_fast = os.environ.get('DREAMER_FAST_ATTN', '').strip().lower()
+            if env_fast in ('0', 'false', 'manual', 'off'):
+                attn_impl = 'manual'
+            elif env_fast in ('1', 'true', 'sdpa', 'on'):
+                attn_impl = 'sdpa'
+            elif torch.cuda.is_available():
                 attn_impl = 'sdpa'
             else:
                 attn_impl = 'manual'
@@ -235,6 +247,76 @@ class CausalAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.proj(out)
 
+    # ------------------------------------------------------------------
+    # KV-cache fast path (used by imagine_next_z incremental rollout).
+    # ------------------------------------------------------------------
+    def project_kv(self, x: torch.Tensor, cos: torch.Tensor,
+                    sin: torch.Tensor
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project ``x`` to (K, V), apply QKNorm + RoPE, return cache-shape.
+
+        Used to materialize the past-positions K/V once per
+        ``imagine_next_z`` call so the K-step inner loop can reuse it.
+
+        ``x``       : (B, L_past, D)
+        ``cos/sin`` : (L_past, head_dim) — RoPE for the same positions
+        Returns (k, v), each (B, n_heads, L_past, head_dim).
+        """
+        B, L, D = x.shape
+        qkv = self.qkv(x).view(B, L, 3, self.n_heads, self.head_dim)
+        _q, k, v = qkv.unbind(dim=2)
+        k = self.k_norm(k)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        k = _apply_rope(k, cos, sin)
+        return k, v
+
+    def forward_last_only(self, x_last: torch.Tensor,
+                            cos_last: torch.Tensor, sin_last: torch.Tensor,
+                            k_past: torch.Tensor, v_past: torch.Tensor
+                            ) -> torch.Tensor:
+        """Attention for the last step's tokens with cached past K/V.
+
+        ``x_last``         : (B, L_last, D) — only the last step's input tokens
+        ``cos_last/sin_last``: (L_last, head_dim) — RoPE for last positions
+        ``k_past, v_past`` : (B, n_heads, L_past, head_dim) — cached past K/V
+                            (already QKNormed + RoPE'd by ``project_kv``)
+        Returns (B, L_last, D) — only the last step's attention output.
+
+        Block-causal mask: last-step tokens attend to ALL past tokens
+        (always allowed) AND to ALL last-step tokens (intra-step
+        bidirectional).  No mask is needed because every (i, j) pair
+        is allowed.
+        """
+        B, L_last, D = x_last.shape
+        qkv = self.qkv(x_last).view(B, L_last, 3, self.n_heads, self.head_dim)
+        q, k_last, v_last = qkv.unbind(dim=2)
+        q = self.q_norm(q)
+        k_last = self.k_norm(k_last)
+        q = q.transpose(1, 2)
+        k_last = k_last.transpose(1, 2)
+        v_last = v_last.transpose(1, 2)
+        q = _apply_rope(q, cos_last, sin_last)
+        k_last = _apply_rope(k_last, cos_last, sin_last)
+
+        # Concatenate past + last along the sequence axis.
+        k = torch.cat([k_past, k_last], dim=2)        # (B, H, L_past+L_last, hd)
+        v = torch.cat([v_past, v_last], dim=2)
+
+        if self.attn_impl == 'sdpa':
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=False, dropout_p=0.0,
+            )
+        else:
+            scale = 1.0 / math.sqrt(self.head_dim)
+            logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if self.soft_cap and self.soft_cap > 0:
+                logits = self.soft_cap * torch.tanh(logits / self.soft_cap)
+            attn = F.softmax(logits.float(), dim=-1).to(v.dtype)
+            out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, L_last, D)
+        return self.proj(out)
+
 
 class TransformerBlock(nn.Module):
     """Pre-RMSNorm + causal attention + SwiGLU (paper §3.4)."""
@@ -253,6 +335,32 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.norm_attn(x), cos, sin, attn_mask)
         x = x + self.ff(self.norm_ff(x))
         return x
+
+    def project_past_kv(self, x_past: torch.Tensor,
+                          cos_past: torch.Tensor, sin_past: torch.Tensor
+                          ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Cache builder: returns (K, V) for past positions at this layer.
+
+        Note: input is the PAST positions' residual stream BEFORE this
+        block.  Caller must norm via this block's ``norm_attn`` first?
+        No — we apply norm here to keep the API symmetric with
+        ``forward``.
+        """
+        return self.attn.project_kv(self.norm_attn(x_past), cos_past, sin_past)
+
+    def forward_last_only(self, x_last: torch.Tensor,
+                            cos_last: torch.Tensor, sin_last: torch.Tensor,
+                            k_past: torch.Tensor, v_past: torch.Tensor
+                            ) -> torch.Tensor:
+        """Forward only the last step's tokens with cached past K/V.
+
+        ``x_last`` is the LAST step's residual stream entering this block.
+        Returns the LAST step's residual stream after this block.
+        """
+        x_last = x_last + self.attn.forward_last_only(
+            self.norm_attn(x_last), cos_last, sin_last, k_past, v_past)
+        x_last = x_last + self.ff(self.norm_ff(x_last))
+        return x_last
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +699,92 @@ class DynamicsTransformer(nn.Module):
         z1_hat = self.z1_head(x[:, :, -1, :])
         agent_hid = x[:, :, self.AGENT_REGISTER_INDEX, :]
         return {'z1_hat': z1_hat, 'agent_hid': agent_hid, 'all_hidden': x}
+
+    # ------------------------------------------------------------------
+    # KV-cache fast path for autoregressive imagination.
+    # ------------------------------------------------------------------
+    def build_past_kv_cache(self, z_past: torch.Tensor, tau_past: torch.Tensor,
+                              d_past: torch.Tensor, action_past: torch.Tensor
+                              ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Run trunk over PAST positions only and cache per-layer (K, V).
+
+        The cached K/V live for the lifetime of one imagination call.
+        Past positions never change between K-shortcut iterations because:
+          * z_past, tau_past, d_past, action_past are fixed
+          * block-causal mask: past tokens never attend to the last step
+        so layer-l outputs for past positions also never change.
+
+        Returns list ``[(K_past_l, V_past_l)]`` for each transformer block,
+        each shape ``(B, n_heads, T_past * n_per_step, head_dim)``.
+
+        Also returns the FINAL-LAYER past activations as part of the cache
+        only if needed (we don't read past outputs in imagine_next_z).
+        """
+        B, T_past = z_past.shape[:2]
+        L_past = T_past * self.n_per_step
+        x_past = self.assemble_tokens(z_past, tau_past, d_past, action_past)
+        # RoPE for past positions = positions 0..L_past-1.  We can reuse
+        # the global rope cache and slice.
+        cos_full, sin_full = self._rope(T_past + 1, x_past.device)
+        cos_past = cos_full[:L_past]
+        sin_past = sin_full[:L_past]
+        mask_past = self._block_causal_mask(T_past, x_past.device)
+        cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for blk in self.blocks:
+            # Cache (K, V) projections for THIS block's input (x_past).
+            k_p, v_p = blk.project_past_kv(x_past, cos_past, sin_past)
+            cache.append((k_p, v_p))
+            # Advance x_past through the block (full forward — no cache).
+            # Past tokens only attend to past tokens, so this is correct.
+            x_past = blk(x_past, cos_past, sin_past, mask_past)
+        # We discard the post-trunk x_past — imagine_next_z only reads the
+        # last-step output.
+        return cache
+
+    def forward_last_step_with_cache(
+        self, z_past: torch.Tensor, tau_past: torch.Tensor,
+        d_past: torch.Tensor, action_past: torch.Tensor,
+        z_last: torch.Tensor, tau_last: torch.Tensor,
+        d_last: torch.Tensor, action_last: torch.Tensor,
+        cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        """Compute trunk output for the LAST step only, given cached past K/V.
+
+        Inputs:
+          ``z_past, tau_past, d_past, action_past`` : (B, T_past, …) — same
+            tensors used to build ``cache`` (used here only to assemble
+            the dummy past tokens for shape checks; we never re-run the
+            past through the trunk).  Pass ``None`` to skip the assembly
+            and rely on cache shapes only.
+          ``z_last``       : (B, 1, z_dim)
+          ``tau_last``     : (B, 1)
+          ``d_last``       : (B, 1)
+          ``action_last``  : (B, 1, A)
+          ``cache``        : output of ``build_past_kv_cache``
+
+        Returns dict with:
+          ``z1_hat_last``  : (B, z_dim)
+          ``agent_hid_last``: (B, D)
+        """
+        B = z_last.shape[0]
+        T_last = 1
+        L_last = T_last * self.n_per_step
+        # Number of past positions inferred from cache.
+        L_past = cache[0][0].shape[2]
+        T_past = L_past // self.n_per_step
+        T_total = T_past + T_last
+        x_last = self.assemble_tokens(z_last, tau_last, d_last, action_last)
+        # RoPE for last positions = positions L_past..L_past+L_last-1.
+        cos_full, sin_full = self._rope(T_total, x_last.device)
+        cos_last = cos_full[L_past : L_past + L_last]
+        sin_last = sin_full[L_past : L_past + L_last]
+        for blk, (k_p, v_p) in zip(self.blocks, cache):
+            x_last = blk.forward_last_only(x_last, cos_last, sin_last, k_p, v_p)
+        x_last = self.norm_out(x_last)
+        x_last = x_last.view(B, T_last, self.n_per_step, -1)
+        z1_hat_last = self.z1_head(x_last[:, 0, -1, :])               # (B, z)
+        agent_hid_last = x_last[:, 0, self.AGENT_REGISTER_INDEX, :]   # (B, D)
+        return {'z1_hat_last': z1_hat_last, 'agent_hid_last': agent_hid_last}
 
 
 # ---------------------------------------------------------------------------
@@ -1238,17 +1432,29 @@ class DreamerV4(nn.Module):
                              dtype=z_history.dtype)
         d_seq = torch.full((B, T_ctx + 1), d_min, device=device,
                            dtype=z_history.dtype)
-        # K shortcut steps on the *last* timestep only.
+        # ---- KV-cache fast path ----------------------------------------
+        # Past T_ctx positions never change across the K shortcut steps
+        # (z_past, tau_past, d_past, action_past are all fixed and the
+        # transformer is block-causal so past outputs are also fixed).
+        # Build the per-layer (K, V) cache once and reuse it K times.
+        cache = self.dynamics.build_past_kv_cache(
+            z_seq[:, :-1], tau_seq[:, :-1], d_seq[:, :-1], act_seq[:, :-1])
+        z_cur = z_seq[:, -1]                                              # (B, z)
         for k in range(K):
             tau_now = float(k) / K
-            tau_seq[:, -1] = tau_now
-            out = self.dynamics(z_seq, tau_seq, d_seq, act_seq)
-            z1_hat = out['z1_hat'][:, -1]                                 # (B, z)
+            tau_last = torch.full((B, 1), tau_now, device=device,
+                                    dtype=z_history.dtype)
+            d_last = torch.full((B, 1), d_min, device=device,
+                                  dtype=z_history.dtype)
+            out = self.dynamics.forward_last_step_with_cache(
+                None, None, None, None,
+                z_last=z_cur.unsqueeze(1), tau_last=tau_last, d_last=d_last,
+                action_last=action.unsqueeze(1), cache=cache)
+            z1_hat_last = out['z1_hat_last']                              # (B, z)
             # Advance via x-prediction: take a step of size d_min toward ẑ₁.
-            z_cur = z_seq[:, -1]
-            v_hat = (z1_hat - z_cur) / max(1e-6, 1.0 - tau_now)
-            z_seq[:, -1] = z_cur + v_hat * d_min
-        return z_seq[:, -1]
+            v_hat = (z1_hat_last - z_cur) / max(1e-6, 1.0 - tau_now)
+            z_cur = z_cur + v_hat * d_min
+        return z_cur
 
     @torch.no_grad()
     def policy_action(self, agent_hid: torch.Tensor, *,

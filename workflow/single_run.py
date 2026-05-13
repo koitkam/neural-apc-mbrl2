@@ -100,6 +100,10 @@ def main() -> int:
                         help='Skip post-training validation.')
     parser.add_argument('--val-episodes', type=int, default=3)
     parser.add_argument('--val-seeds', type=int, default=3)
+    parser.add_argument('--init-from-ckpt', type=str, default='',
+                        help='Path to a previous run\'s checkpoint (e.g. '
+                             'best.pt) to warm-start model weights from. '
+                             'Optimizers/counters/phase tracking start fresh.')
     args = parser.parse_args()
 
     sim_dir = _resolve_sim_dir(args.simulation_dir)
@@ -296,6 +300,7 @@ def main() -> int:
         k_max=k_max,
         batch_size=batch_size,
         out_dir=str(out_dir),
+        init_from_ckpt=str(args.init_from_ckpt or ''),
     )
 
     plan = {
