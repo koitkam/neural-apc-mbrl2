@@ -110,6 +110,7 @@ output/test_sim/bo_<timestamp>/
 │   ├── dynamics_identification.json
 │   └── lookback_identification.json
 ├── run_plan.json                # canonical config snapshot
+├── study.db                     # Optuna SQLite study (resume via load_if_exists)
 ├── trials/
 │   ├── trial_0000/
 │   │   ├── train_log.jsonl      # per-iter metrics (incl. per-phase timing)
@@ -149,19 +150,28 @@ final retrain) via `TrainConfig.init_from_ckpt`, so each trial starts
 from the same pretrained weights and only the BO-tuned axes
 (`model_size`, `horizon`) vary.
 
-**Optuna study resume is *not* yet supported.** The Optuna study is
-created in-memory (no `storage=` arg), so `--init-from-ckpt` warm-starts
-*model weights* but does not preserve trial history across BO
-process restarts: relaunching `workflow/bo_runner.py` after a crash
-starts a brand-new study with no prior trial knowledge. Per-trial
-artefacts on disk (`trials/trial_XXXX/`) survive but are not
-automatically re-imported. If you need true Optuna resume, pass an
-RDB storage URL (e.g. `optuna.create_study(storage="sqlite:///"
-+ str(out_dir / 'study.db'), load_if_exists=True)`) — easy to add but
-not done because per-trial GPU runs are long-lived enough that crash
-recovery has not been needed in practice. **Caveat:** if the BO
-process dies mid-trial, that trial's directory may also be stale
-(partial write); inspect before reusing.
+**Optuna study resume *is* supported.** The study is persisted to
+`<out_dir>/study.db` (SQLite) with `load_if_exists=True`, so re-running
+`workflow/bo_runner.py` against an existing `--out` directory reattaches
+to the same study with the full trial history (TPE prior +
+MedianPruner statistics intact). Behaviour on resume:
+
+- Completed + pruned trials are kept and counted toward `--n_trials`.
+  Only the *remaining* budget is run (`remaining = n_trials - prior_done`).
+  Pass a larger `--n_trials` to extend an existing study.
+- Stale `RUNNING` trials left over from a crashed/killed process are
+  auto-marked `FAIL` so Optuna's bookkeeping is consistent.
+- The plant-derived first trial (`model_size=auto, horizon_mult=1.0`)
+  is enqueued only on a fresh study; resumed studies skip it (it was
+  already run trial #0).
+- Per-trial directories on disk (`trials/trial_XXXX/`) survive but are
+  not re-validated. **Caveat:** if the BO process died mid-trial, that
+  trial's folder may be partially written; inspect / delete it before
+  restart if you care about the artefacts.
+
+To start a clean study, delete `<out_dir>/study.db` or pass a fresh
+`--out` directory. Combine with `--init-from-ckpt` to both resume the
+search *and* keep warm-starting model weights.
 
 ### Environment overrides (all optional)
 
@@ -284,7 +294,9 @@ pip install -r requirements.txt
 - SDPA attention + KV-cached imagination rollouts (default on CUDA;
   6–9× faster Phase-3 iter).
 - Warm-start from previous checkpoint via `--init-from-ckpt`
-  (single-run *and* every BO trial; Optuna study itself does not yet
-  resume across process restarts — see warm-start section).
+  (single-run *and* every BO trial).
+- Optuna BO study resume via persistent `<out_dir>/study.db` (SQLite,
+  `load_if_exists=True`); stale `RUNNING` trials auto-marked `FAIL`,
+  remaining budget = `n_trials − prior_done`.
 
 See `docs/` for design notes.

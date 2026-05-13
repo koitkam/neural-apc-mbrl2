@@ -796,8 +796,16 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
           f"{horizon_init(plant['tau'], plant['dead_time'], sr)}", flush=True)
 
     print('[BO] Phase 2: Optuna search', flush=True)
+    # Persistent SQLite study so BO can resume after a crash / SIGINT.
+    # ``load_if_exists=True`` reattaches to an existing study at the same
+    # path with all completed/pruned trial history (TPE prior +
+    # MedianPruner statistics intact). To start a clean study, delete
+    # ``out_dir/study.db`` or pass a fresh ``--out`` directory.
+    study_db = out_dir / 'study.db'
+    storage_url = f'sqlite:///{study_db}'
     study = optuna.create_study(
         study_name=study_name, direction='maximize',
+        storage=storage_url, load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=int(os.environ.get('SEED', '0'))),
         # Prune trials whose intermediate EMA return is below the median of
         # completed trials at the same step, after the first 3 trials have
@@ -807,15 +815,55 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     )
     study_dir = out_dir / 'trials'
     study_dir.mkdir(parents=True, exist_ok=True)
-    # Seed the first trial at the plant-derived configuration (model_size
-    # from complexity, horizon at the centre of the plant band).  Optuna
-    # explores the rest from there.
-    study.enqueue_trial({
-        'model_size': derived_model_size,
-        'horizon_mult': 1.0,
-    })
-    study.optimize(lambda t: run_trial(t, base, plant, study_dir, trial_steps),
-                   n_trials=n_trials, show_progress_bar=False)
+
+    # Resume bookkeeping: count COMPLETE/PRUNED trials and detect any
+    # in-flight RUNNING/FAIL state from a previous (crashed) process so
+    # we don't double-count the budget.
+    import optuna.trial as _otrial
+    prior_done = sum(1 for t in study.trials
+                     if t.state in (_otrial.TrialState.COMPLETE,
+                                    _otrial.TrialState.PRUNED))
+    prior_failed = sum(1 for t in study.trials
+                       if t.state == _otrial.TrialState.FAIL)
+    prior_running = [t for t in study.trials
+                     if t.state == _otrial.TrialState.RUNNING]
+    if prior_done or prior_failed or prior_running:
+        print(f'[BO] resuming study {study_name!r} from {study_db.name}: '
+              f'{prior_done} done, {prior_failed} failed, '
+              f'{len(prior_running)} stale-running '
+              f'({len(study.trials)} total in DB)', flush=True)
+        # Mark stale RUNNING trials (left over from a crashed process)
+        # as FAIL so Optuna's running-trial counter is consistent and
+        # the next attempt may reuse those param combinations.
+        for t in prior_running:
+            try:
+                study._storage.set_trial_state_values(
+                    t._trial_id, state=_otrial.TrialState.FAIL)
+                print(f'[BO]   marked stale-running trial #{t.number} as FAIL',
+                      flush=True)
+            except Exception as e:
+                print(f'[BO]   could not mark trial #{t.number} FAIL: {e!r}',
+                      flush=True)
+    remaining = max(0, int(n_trials) - prior_done)
+    if prior_done == 0:
+        # Fresh study: seed the first trial at the plant-derived
+        # configuration (model_size from complexity, horizon at the
+        # centre of the plant band). Optuna explores the rest from
+        # there. Skip on resume to avoid duplicating an already-run
+        # trial.
+        study.enqueue_trial({
+            'model_size': derived_model_size,
+            'horizon_mult': 1.0,
+        })
+    if remaining > 0:
+        print(f'[BO] running {remaining} more trial(s) '
+              f'(target n_trials={n_trials}, already done={prior_done})',
+              flush=True)
+        study.optimize(lambda t: run_trial(t, base, plant, study_dir, trial_steps),
+                       n_trials=remaining, show_progress_bar=False)
+    else:
+        print(f'[BO] target n_trials={n_trials} already reached '
+              f'({prior_done} done); skipping search', flush=True)
 
     best = study.best_trial
     print(f"[BO] best trial #{best.number}: score={best.value:.2f}  params={best.params}",
