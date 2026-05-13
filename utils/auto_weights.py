@@ -5,12 +5,24 @@ Replaces hand-tuned ``mv_violation_weights``, ``cv_violation_weights``,
 ``mv_move_weights``, and ``mv/cv_target_weights`` in
 ``control_objective.json``.
 
-Priority ordering (enforced by construction, April 2026 quadratic refactor):
+Priority ordering (enforced by construction, April 2026 quadratic refactor;
+move-cap added 2026-05-12):
 
     1. MV limits         (most important -- never violate)
     2. CV limits by rank (rank 1 highest, geometric decay per rank)
-    3. Economics         (mv/cv economic nudge)
-    4. Targets           (mv/cv target tracking, if targets_enabled)
+    3. Targets           (when targets_enabled)
+    4. Economics         (mv/cv economic nudge, user-supplied weights)
+    5. MV move           (steady-state actor-jitter cost)
+
+Each tier strictly dominates the one below it at the typical
+violation/deviation magnitude:
+- MV violation > CV rank-1 violation by ``OBJ_AUTO_MV_OVER_CV_RATIO``.
+- CV rank-N violation > targets+economics by ``OBJ_AUTO_VIOLATION_MARGIN``
+  (rank-1 inflated by ``rank_decay^-(N-1)`` so the ladder holds).
+- Target tracking > economics by ``OBJ_AUTO_VIOLATION_MARGIN``.
+- Economics > move penalty by ``OBJ_AUTO_ECON_OVER_MOVE_RATIO``
+  (NEW 2026-05-12 — symmetric with the CV>econ margin so move never
+  out-weighs the user's economic objective).
 
 MV/CV violation penalties are **quadratic** in the ReLU bound-violation
 magnitude (``(max(0, lo - x))^2 + (max(0, x - hi))^2``). Target penalties
@@ -42,7 +54,8 @@ All magnitudes can be overridden via env vars:
 - ``OBJ_AUTO_VIOLATION_MARGIN``       (default 2.0)
 - ``OBJ_AUTO_CV_PENALTY_CAP_FRAC``    (default 0.5; cv_base cap vs reward_clip)
 - ``OBJ_AUTO_TYPICAL_CV_VIOLATION``   (default 0.05; typical normalised violation)
-- ``OBJ_AUTO_MOVE_OVER_CV_K``         (default 20.0; move_base = cv_base / K)
+- ``OBJ_AUTO_MOVE_OVER_CV_K``         (default 20.0; move_base ≤ cv_base / K legacy cap)
+- ``OBJ_AUTO_ECON_OVER_MOVE_RATIO``   (default 2.0; econ_budget ≥ ratio × per-step move pen at typical jitter)
 - ``OBJ_AUTO_ECON_OVER_TARGET_RATIO`` (default 2.0; econ budget vs target budget)
 - ``OBJ_AUTO_TARGET_BASE``            (default 0.5; target_base floor if no econ)
 """
@@ -353,12 +366,34 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     cv_weights = [float(cv_base * (rank_decay ** max(0, r - 1))) for r in ranks]
     mv_weights = [float(mv_base) for _ in range(n_mv)]
     # Adaptive move_base: target a fixed-fraction-of-reward-clip steady-
-    # state cost from actor jitter (sigma_ref). The legacy cv_base/K
-    # ratio is retained as a soft *upper* cap so move never exceeds the
-    # historical formula -- prevents pathological numbers if reward_clip
-    # or sigma_ref are mis-set. Hard floor at OBJ_AUTO_MOVE_BASE.
+    # state cost from actor jitter (sigma_ref). Three competing ceilings:
+    #   1. ``move_base_adaptive``     — fixed cost-frac of reward_clip
+    #      (sim-agnostic; keeps move pressure bounded vs reward scale).
+    #   2. ``move_base_legacy_cap``   — cv_base / K (legacy historical cap).
+    #   3. ``move_base_econ_cap``     — economics-dominance cap (NEW
+    #      2026-05-12): the per-step move penalty incurred at the
+    #      *typical* actor jitter must stay below ``econ_budget /
+    #      OBJ_AUTO_ECON_OVER_MOVE_RATIO`` so the economics tier strictly
+    #      dominates the move tier — symmetric with how CV bounds
+    #      dominate economics by ``OBJ_AUTO_VIOLATION_MARGIN``. When
+    #      ``econ_budget = 0`` (no economic weights) this cap is
+    #      disabled and the legacy two-cap behaviour is preserved.
+    # The minimum of the three is taken, then floored at
+    # ``OBJ_AUTO_MOVE_BASE`` so move never goes to zero (preserves a
+    # baseline pressure toward narrowing actor sigma at convergence).
     move_base_legacy_cap = float(cv_base / move_cv_ratio_k)
-    move_base = float(max(move_base_floor, min(move_base_adaptive, move_base_legacy_cap)))
+    econ_over_move_ratio = max(1.0,
+        _env_float('OBJ_AUTO_ECON_OVER_MOVE_RATIO', 2.0))
+    if econ_budget > 0.0 and expected_step_jitter > 1e-6:
+        move_base_econ_cap = float(econ_budget / (
+            econ_over_move_ratio * expected_step_jitter * max(1, n_mv)
+        ))
+    else:
+        move_base_econ_cap = float('inf')
+    move_base_uncapped_min = float(min(move_base_adaptive,
+                                        move_base_legacy_cap,
+                                        move_base_econ_cap))
+    move_base = float(max(move_base_floor, move_base_uncapped_min))
     move_weights = [
         float(move_base * max(0.2, tau / median_tau) * factors.move_penalty_scale)
         for tau in taus
@@ -398,7 +433,17 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         'move_base': move_base,
         'move_base_adaptive': float(move_base_adaptive),
         'move_base_legacy_cap': float(move_base_legacy_cap),
+        'move_base_econ_cap': float(move_base_econ_cap),
         'move_base_floor': float(move_base_floor),
+        'move_base_active_cap': (
+            'econ' if (econ_budget > 0.0
+                       and move_base_econ_cap <= move_base_legacy_cap
+                       and move_base_econ_cap <= move_base_adaptive)
+            else 'adaptive' if move_base_adaptive <= move_base_legacy_cap
+            else 'legacy_cv_over_k'
+        ),
+        'econ_over_move_ratio': float(econ_over_move_ratio),
+        'econ_budget_per_step': float(econ_budget),
         'move_target_cost_frac': float(move_target_cost_frac),
         'move_sigma_ref': float(move_sigma_ref),
         'move_expected_step_jitter': float(expected_step_jitter),
