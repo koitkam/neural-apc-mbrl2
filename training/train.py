@@ -150,7 +150,14 @@ class TrainConfig:
     lr_actor: float = 3e-5    # DreamerV3 §3; auto-bumped to 1e-4 for
                               # discrete heads (back-compat).  See
                               # build_optimizers in this module.
-    lr_critic: float = 3e-5
+    # Bumped 2026-05-14 (run_p22 RCA: critic_r=-0.50 with wider σ_max,
+    # critic could not keep up with the broader experience distribution
+    # induced by SEED_TARGET_CV_FRAC=0.20 + SIGMA_MAX_CAP=0.30).
+    # Doubling lr_critic to 6e-5 stays well within DreamerV3's stable
+    # range (paper uses 8e-5 for some Atari tasks) while letting the
+    # value head fit the new return distribution faster.  Override via
+    # ``DREAMER_LR_CRITIC`` env var or TrainConfig field.
+    lr_critic: float = 6e-5
     grad_clip: float = 100.0  # DreamerV3 default; was 1000 (too loose,
                               # let the actor explode at the BC→PMPO
                               # transition).
@@ -315,8 +322,20 @@ class TrainConfig:
     # ``p3_critic_stability_window_iters=0`` to disable the gate (use
     # only the fixed iteration warm-up).
     p3_critic_stability_window_iters: int = 10
-    p3_critic_stability_max_cv: float = 0.4
-    p3_critic_stability_max_warmup_iters: int = 60
+    # Tightened 2026-05-14 (run_p22 RCA: critic_r_observed=-0.50 —
+    # value head was *anti-aligned* with true returns when actor was
+    # released too early, leading to the actor learning to do the
+    # opposite of what was good).  CV ≤ 0.30 forces the critic loss to
+    # be settled to within 30% std/mean before release; previous 0.40
+    # let through enough residual noise to flip the sign on small
+    # plants where the action distribution shifts during release.
+    p3_critic_stability_max_cv: float = 0.30
+    # Doubled 2026-05-14 (run_p22 RCA): hard-cap raised 60 → 120 P3
+    # iters so the wider σ_max=0.30 actor's experience distribution
+    # has enough budget to settle the critic before forced release.
+    # Auto-derived value (auto_tune block below) still scales with
+    # horizon so this cap is the *upper* bound, not the typical case.
+    p3_critic_stability_max_warmup_iters: int = 120
     # Adaptive entropy decay on σ-saturation (2026-05-08): if the
     # actor's running entropy sits within
     # ``pmpo_entropy_saturation_frac × H_max(σ_max)`` for
@@ -1843,12 +1862,14 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # targets → critic needs more warm-up iters before the actor can
     # safely react to its baseline.  Scale linearly with H, with a
     # floor at the historical default 16 (calibrated for H=15 on
-    # earlier runs).  Hard cap at 60 — beyond that the runtime
-    # stability gate (p3_critic_stability_*) handles release.
+    # earlier runs).  Hard cap raised 60→120 (2026-05-14, run_p22
+    # RCA) because the wider σ_max regime needs more critic budget;
+    # the runtime stability gate (p3_critic_stability_*) still
+    # release earlier when the loss is stable.
     h_for_warmup = int(out.get('horizon', {}).get('value',
                        int(getattr(cfg, 'horizon', 15))))
     warmup_floor = int(os.environ.get('P3_CRITIC_WARMUP_FLOOR', '16'))
-    warmup_cap = int(os.environ.get('P3_CRITIC_WARMUP_CAP', '60'))
+    warmup_cap = int(os.environ.get('P3_CRITIC_WARMUP_CAP', '120'))
     warmup_auto = int(np.clip(h_for_warmup, warmup_floor, warmup_cap))
     out['p3_critic_warmup_iters'] = {
         'value': int(warmup_auto),
@@ -3145,30 +3166,49 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         thr = (float(getattr(cfg,
                                 'early_stop_entropy_collapse_frac', 0.20))
                                * n_action_bins_log)
-                        # Clamp-aware floor (2026-05-06): the continuous
-                        # policy's entropy is upper-bounded by
-                        #   H_max(σ_max) = log_std_max + 0.5·log(2πe)
-                        # When auto-tune sets a tight σ_max (e.g. 0.30 →
-                        # H_max ≈ 0.22), a fixed ``thr`` calibrated to
-                        # σ=1 (≈ 0.28) is *above* the maximum attainable
-                        # entropy → false-positive "collapse" trip on
-                        # every healthy run that hits the clamp.  Move
-                        # the trip floor below H_max by a fixed margin
-                        # (default 0.10 nats ≈ 10% σ shrink from clamp).
+                        # Floor-relative collapse threshold
+                        # (2026-05-14, run_p22 RCA): the legacy
+                        # ceiling-relative formula
+                        #   thr = H_max(σ_max) − 0.10
+                        # tripped on every healthy run with a tight
+                        # σ_max because *any* shrink below the ceiling
+                        # (even down to σ_max/2) was flagged as
+                        # collapse.  σ legitimately moves below the
+                        # ceiling as the actor learns to commit;
+                        # collapse only matters when σ is approaching
+                        # σ_min (the floor) and exploration is dying.
+                        # Recompute thr from σ_min:
+                        #   H_floor(σ_min) = log_std_min + 0.5·log(2πe)
+                        #   thr = H_floor + margin
+                        # Trip only when entropy stays within ``margin``
+                        # nats of the floor (default 0.20 ≈ σ within
+                        # 22% of σ_min).  Keep the legacy ``thr`` as
+                        # the *upper* bound (still trip on truly
+                        # silent policies that fall below
+                        # 0.20·log(n_bins)), so the floor-relative
+                        # check only loosens the trip, never tightens
+                        # it past the legacy default.
                         if str(getattr(cfg, 'policy_type', 'continuous')
                                 ).lower() == 'continuous':
-                            log_std_max = float(getattr(cfg,
-                                    'policy_log_std_max', 0.0))
+                            log_std_min = float(getattr(cfg,
+                                    'policy_log_std_min', -2.3))
                             unit_g = 0.5 * math.log(2.0 * math.pi * math.e)
-                            h_max_at_clamp = (
+                            h_floor = (
                                 float(cfg.action_dim)
-                                * (log_std_max + unit_g))
+                                * (log_std_min + unit_g))
                             margin = float(getattr(cfg,
-                                    'early_stop_entropy_collapse_clamp_margin',
-                                    0.10))
-                            clamp_aware_thr = h_max_at_clamp - margin
-                            if clamp_aware_thr < thr:
-                                thr = clamp_aware_thr
+                                    'early_stop_entropy_collapse_floor_margin',
+                                    0.20))
+                            floor_aware_thr = h_floor + margin
+                            # Use the *lower* of the two: the heuristic
+                            # is "collapse when entropy is essentially
+                            # at the floor".  Floor-relative thr is
+                            # always ≤ legacy thr for any σ_min ≤ 1,
+                            # so this only loosens the trip on tight
+                            # σ_max regimes — never overrides a true
+                            # discrete-policy entropy crash.
+                            if floor_aware_thr < thr:
+                                thr = floor_aware_thr
                         # Maintain sliding window of P3 entropy values.
                         ent_window.append(float(ent))
                         win_n = max(2, int(getattr(cfg,

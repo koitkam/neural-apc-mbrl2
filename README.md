@@ -188,6 +188,7 @@ search *and* keep warm-starting model weights.
 | `SIGMA_MAX_FLOOR` | lower bound on the auto-derived `σ_max` (default 0.10). |
 | `SIGMA_MAX_OVER_SEED` | multiplier of `baseline_seed_action_std` used to set `σ_max` (default 1.0). |
 | `SIGMA_MIN_RATIO_OF_MAX` | `σ_min = σ_max / ratio` (default 2.5, min 2.0). |
+| `P3_CRITIC_WARMUP_FLOOR` / `P3_CRITIC_WARMUP_CAP` | clip range for auto-derived `p3_critic_warmup_iters = clip(horizon, FLOOR, CAP)`. Defaults `16 / 120` (was `60`; raised 2026-05-14 because wider σ_max regimes need more critic budget). |
 | `OBJ_AUTO_ECON_OVER_MOVE_RATIO` | minimum ratio of `econ_budget` to per-step MV move penalty at typical actor jitter (default 2.0). Caps `move_base` so the user's economics term always strictly dominates the move term. Set to 1.0 to disable the cap; set higher (e.g. 5.0) for plants where you want the actor to ignore move pressure entirely while economics is small. |
 
 ## Single training run (no BO)
