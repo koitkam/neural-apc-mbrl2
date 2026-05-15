@@ -302,11 +302,15 @@ def main() -> int:
         out_dir=str(out_dir),
         init_from_ckpt=str(args.init_from_ckpt or ''),
     )
-    # Optional env-var overrides for A/B experiments (e.g. phase budget).
-    # ``DREAMER_GAE_LAMBDA`` is handled inside training/train.py alongside
-    # the other DREAMER_* env bindings (so it beats both the dataclass
-    # default and the auto-tuned value).
+    # Optional env-var overrides for A/B experiments.  These apply
+    # *after* dataclass construction so auto-tune (which compares
+    # against the dataclass default to decide whether to overwrite)
+    # treats env-injected values as user overrides and skips them.
+    # Note: ``training/train.py``'s ``_cfg_from_env()`` only runs when
+    # train.py is invoked as a CLI; when ``single_run.py`` is the
+    # entry-point we must perform the binding ourselves.
     _env_overrides = {
+        'DREAMER_GAE_LAMBDA':     ('gae_lambda',     float),
         'DREAMER_PHASE1_FRAC':    ('phase1_frac',    float),
         'DREAMER_PHASE2_FRAC':    ('phase2_frac',    float),
         'DREAMER_PHASE3_FRAC':    ('phase3_frac',    float),
