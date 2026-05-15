@@ -302,6 +302,25 @@ def main() -> int:
         out_dir=str(out_dir),
         init_from_ckpt=str(args.init_from_ckpt or ''),
     )
+    # Optional env-var overrides for A/B experiments (e.g. phase budget).
+    # ``DREAMER_GAE_LAMBDA`` is handled inside training/train.py alongside
+    # the other DREAMER_* env bindings (so it beats both the dataclass
+    # default and the auto-tuned value).
+    _env_overrides = {
+        'DREAMER_PHASE1_FRAC':    ('phase1_frac',    float),
+        'DREAMER_PHASE2_FRAC':    ('phase2_frac',    float),
+        'DREAMER_PHASE3_FRAC':    ('phase3_frac',    float),
+    }
+    for _env_k, (_field, _cast) in _env_overrides.items():
+        _val = os.environ.get(_env_k, '').strip()
+        if _val:
+            try:
+                setattr(cfg, _field, _cast(_val))
+                print(f"[env-override] {_field}={_cast(_val)} "
+                      f"(from {_env_k})", flush=True)
+            except Exception as _e:
+                print(f"[env-override] {_env_k}={_val!r} ignored: {_e}",
+                      flush=True)
 
     plan = {
         'simulation_dir': str(sim_dir),

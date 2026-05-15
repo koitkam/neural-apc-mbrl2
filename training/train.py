@@ -1878,6 +1878,39 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                    f'{warmup_auto}'),
     }
 
+    # ---- gae_lambda (cap effective bootstrap depth) ---------------------
+    # DreamerV3/V4 paper default: λ=0.95 paired with H=15
+    # → effective bootstrap depth 1/(1-λ)=20 ≈ H (full-horizon trust).
+    #
+    # When the auto-tuned horizon is much longer than the paper's 15
+    # (slow plants with large τ), λ=0.95 lets WM error compound 1/(1-λ)
+    # steps deep into λ-returns regardless of H — this manifests as
+    # systematically pessimistic critic targets (run_p22/p23 RCA on
+    # test_sim: critic_r inverted, imagined_return drifted -5 → -69
+    # before actor σ-saturated at the ceiling).
+    #
+    # Adaptive rule: keep the effective bootstrap depth bounded by the
+    # paper's validated depth (default 15 steps) so the λ-tail decays
+    # within paper-validated range, even when H is auto-derived much
+    # longer.  At H=15 this gives λ=0.933 (slightly tighter than paper's
+    # 0.95 — small extra safety margin for non-Atari domains).
+    # At H=42 (test_sim) it gives the same λ=0.933 (cap kicks in).
+    # The DREAMER_LAMBDA_EFF_DEPTH env var (default 15) lets users
+    # restore paper-strict behaviour (=20) or tighten further (=10
+    # ≈ λ=0.90 for very long H or low-fidelity WM).  DREAMER_GAE_LAMBDA
+    # (bound in workflow/single_run.py) is the final override and wins.
+    lam_eff_depth = int(os.environ.get('DREAMER_LAMBDA_EFF_DEPTH', '15'))
+    lam_eff_depth = max(2, lam_eff_depth)
+    h_for_lam = h_for_warmup
+    eff_depth = max(2, min(h_for_lam, lam_eff_depth))
+    lam_auto = max(0.5, min(0.95, 1.0 - 1.0 / float(eff_depth)))
+    out['gae_lambda'] = {
+        'value': float(lam_auto),
+        'source': (f'1-1/min(H,DREAMER_LAMBDA_EFF_DEPTH)='
+                   f'1-1/min({h_for_lam},{lam_eff_depth})='
+                   f'1-1/{eff_depth}={lam_auto:.3f}'),
+    }
+
     # ---- prbs_seed_segment_steps (full transfer-function coverage) ----
     # PRBS segment must be long enough that, after the dead-time delay
     # θ, the plant reaches an *observable steady state* before the next
@@ -1951,6 +1984,7 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'p3_critic_warmup_iters':   TrainConfig().p3_critic_warmup_iters,
     'prbs_seed_segment_steps':  TrainConfig().prbs_seed_segment_steps,
     'prbs_seed_segment_steps_min': TrainConfig().prbs_seed_segment_steps_min,
+    'gae_lambda':               TrainConfig().gae_lambda,
 }
 
 
@@ -3423,6 +3457,7 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_LR_ACTOR', 'lr_actor', float),
         ('DREAMER_LR_CRITIC', 'lr_critic', float),
         ('DREAMER_LR_WORLD', 'lr_world', float),
+        ('DREAMER_GAE_LAMBDA', 'gae_lambda', float),
         ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
         ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
         ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
