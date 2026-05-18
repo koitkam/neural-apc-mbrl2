@@ -153,11 +153,14 @@ class TrainConfig:
     # Bumped 2026-05-14 (run_p22 RCA: critic_r=-0.50 with wider σ_max,
     # critic could not keep up with the broader experience distribution
     # induced by SEED_TARGET_CV_FRAC=0.20 + SIGMA_MAX_CAP=0.30).
-    # Doubling lr_critic to 6e-5 stays well within DreamerV3's stable
-    # range (paper uses 8e-5 for some Atari tasks) while letting the
-    # value head fit the new return distribution faster.  Override via
-    # ``DREAMER_LR_CRITIC`` env var or TrainConfig field.
-    lr_critic: float = 6e-5
+    # Bumped further 2026-05-18 (run_p24 RCA: critic_r=+0.19, critic
+    # informativeness still too weak — value head failed to converge
+    # even after σ_max was bounded.  8e-5 is the DreamerV3 paper-
+    # validated upper bound (used for Atari tasks); plant-agnostic
+    # since the formula is set absolutely, not as a ratio).  Override
+    # via ``DREAMER_LR_CRITIC`` env var (now wired in single_run.py)
+    # or TrainConfig field.
+    lr_critic: float = 8e-5
     grad_clip: float = 100.0  # DreamerV3 default; was 1000 (too loose,
                               # let the actor explode at the BC→PMPO
                               # transition).
@@ -329,7 +332,12 @@ class TrainConfig:
     # be settled to within 30% std/mean before release; previous 0.40
     # let through enough residual noise to flip the sign on small
     # plants where the action distribution shifts during release.
-    p3_critic_stability_max_cv: float = 0.30
+    # Loosened 2026-05-18 (run_p24 RCA: actor never released —
+    # combined with tighter σ_max the critic targets are now cleaner,
+    # so 0.35 is sufficient and avoids actor starvation on plants
+    # where critic loss has an irreducible noise floor above 30%).
+    # Override via ``DREAMER_P3_CRITIC_CV_MAX`` env var.
+    p3_critic_stability_max_cv: float = 0.35
     # Doubled 2026-05-14 (run_p22 RCA): hard-cap raised 60 → 120 P3
     # iters so the wider σ_max=0.30 actor's experience distribution
     # has enough budget to settle the critic before forced release.
@@ -1683,20 +1691,30 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # gives σ_max = 0.10 (was 0.30), matching the noise scale the
     # collector actually used during seeding so the actor's
     # exploration band aligns with the WM's training distribution.
-    sigma_max_mult = float(os.environ.get('SIGMA_MAX_OVER_SEED', '1.0'))
+    # Tightened 2026-05-18 (run_p24 RCA: σ pinned at the σ_max=0.219
+    # ceiling for all 442 P3 iters, actor never committed, critic_r
+    # stuck at 0.19).  Lower the multiplier 1.0 → 0.7 so the policy
+    # clamp is *tighter* than the seed-buffer exploration std,
+    # forcing μ-commitment.  This stays plant-adaptive because
+    # baseline_seed_action_std is itself auto-tuned from MV authority
+    # / CV sensitivity — on a low-authority plant σ_seed is small,
+    # 0.7×σ_seed remains small (floored at 0.10); on a high-authority
+    # plant σ_seed is large, σ_max scales up but always sits below
+    # the seed-noise band.  Override via ``DREAMER_SIGMA_MAX_OVER_SEED``.
+    sigma_max_mult = float(os.environ.get(
+        'DREAMER_SIGMA_MAX_OVER_SEED',
+        os.environ.get('SIGMA_MAX_OVER_SEED', '0.7')))
     sigma_max_floor = float(os.environ.get('SIGMA_MAX_FLOOR', '0.10'))
     # Cap σ_max independently of the seed-σ cap so a wide seed-buffer
-    # exploration band (now up to 0.30) does not propagate into a wide
-    # policy clamp.  Bumped 2026-05-12 (run_p21 RCA): 0.20 → 0.30 so the
-    # policy can express directional MV moves wide enough to reject
-    # large CV/DV disturbances (validation showed the policy pinned at
-    # σ_max=0.20 with mean magnitude ~0.05 — actor never broke out of
-    # the small-action basin because exploring μ ≈ 0.5 had σ ≈ 0.20 →
-    # noisy advantage).  Wider σ_max + a stable critic lets PG learn a
-    # confident large-magnitude μ when the disturbance demands it.
-    # σ_min is still auto-derived as σ_max/2.5 so confident actions
-    # remain reachable.
-    sigma_max_cap = float(os.environ.get('SIGMA_MAX_CAP', '0.30'))
+    # exploration band does not propagate into a wide policy clamp.
+    # History: 0.20 → 0.30 on 2026-05-12 (p21 RCA: too tight for high-
+    # disturbance plants).  Lowered back 0.30 → 0.20 on 2026-05-18
+    # (p24 RCA: σ-saturation trap at 0.219 prevented critic learning).
+    # 0.20 is a safety belt — the primary adaptivity is now in the
+    # 0.7×σ_seed formula above.  Override via ``DREAMER_SIGMA_MAX_CAP``.
+    sigma_max_cap = float(os.environ.get(
+        'DREAMER_SIGMA_MAX_CAP',
+        os.environ.get('SIGMA_MAX_CAP', '0.20')))
     target_sigma_max = float(np.clip(sigma_max_mult * sigma_seed,
                                        sigma_max_floor, sigma_max_cap))
     log_std_max_val = float(np.log(target_sigma_max))
@@ -3462,6 +3480,7 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
         ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
         ('DREAMER_P3_CRITIC_WARMUP_ITERS', 'p3_critic_warmup_iters', int),
+        ('DREAMER_P3_CRITIC_CV_MAX', 'p3_critic_stability_max_cv', float),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
         ('DREAMER_COMPILE_MODE', 'compile_mode', str),
         ('AGENT_TOTAL_STEPS', 'total_steps', int),

@@ -310,10 +310,13 @@ def main() -> int:
     # train.py is invoked as a CLI; when ``single_run.py`` is the
     # entry-point we must perform the binding ourselves.
     _env_overrides = {
-        'DREAMER_GAE_LAMBDA':     ('gae_lambda',     float),
-        'DREAMER_PHASE1_FRAC':    ('phase1_frac',    float),
-        'DREAMER_PHASE2_FRAC':    ('phase2_frac',    float),
-        'DREAMER_PHASE3_FRAC':    ('phase3_frac',    float),
+        'DREAMER_GAE_LAMBDA':       ('gae_lambda',                 float),
+        'DREAMER_PHASE1_FRAC':      ('phase1_frac',                float),
+        'DREAMER_PHASE2_FRAC':      ('phase2_frac',                float),
+        'DREAMER_PHASE3_FRAC':      ('phase3_frac',                float),
+        'DREAMER_LR_CRITIC':        ('lr_critic',                  float),
+        'DREAMER_LR_ACTOR':         ('lr_actor',                   float),
+        'DREAMER_P3_CRITIC_CV_MAX': ('p3_critic_stability_max_cv', float),
     }
     for _env_k, (_field, _cast) in _env_overrides.items():
         _val = os.environ.get(_env_k, '').strip()
