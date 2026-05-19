@@ -1703,26 +1703,33 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # ceiling for all 442 P3 iters, actor never committed, critic_r
     # stuck at 0.19).  Lower the multiplier 1.0 → 0.7 so the policy
     # clamp is *tighter* than the seed-buffer exploration std,
-    # forcing μ-commitment.  This stays plant-adaptive because
-    # baseline_seed_action_std is itself auto-tuned from MV authority
-    # / CV sensitivity — on a low-authority plant σ_seed is small,
-    # 0.7×σ_seed remains small (floored at 0.10); on a high-authority
-    # plant σ_seed is large, σ_max scales up but always sits below
-    # the seed-noise band.  Override via ``DREAMER_SIGMA_MAX_OVER_SEED``.
+    # forcing μ-commitment.
+    # Reverted 2026-05-19 (run_p26 RCA: with the reward-head fix in
+    # commit bb81cb6, the audit showed the head is now real-reward-
+    # correlated, so σ at the ceiling no longer reflects a critic
+    # pessimism trap — it reflects the actor genuinely needing more
+    # exploration to escape the −500 plateau.  Restore multiplier
+    # 0.7 → 1.0 and cap 0.20 → 0.30 so σ_max ≈ σ_seed instead of
+    # 0.7×σ_seed.  This puts the policy clamp at the same scale the
+    # seed buffer was collected with, aligning the actor's explore
+    # band with the WM's training distribution while still leaving
+    # the σ-saturation entropy-decay safety belt to step in if the
+    # actor *does* drift to the ceiling and refuses to commit.
     sigma_max_mult = float(os.environ.get(
         'DREAMER_SIGMA_MAX_OVER_SEED',
-        os.environ.get('SIGMA_MAX_OVER_SEED', '0.7')))
+        os.environ.get('SIGMA_MAX_OVER_SEED', '1.0')))
     sigma_max_floor = float(os.environ.get('SIGMA_MAX_FLOOR', '0.10'))
     # Cap σ_max independently of the seed-σ cap so a wide seed-buffer
     # exploration band does not propagate into a wide policy clamp.
     # History: 0.20 → 0.30 on 2026-05-12 (p21 RCA: too tight for high-
     # disturbance plants).  Lowered back 0.30 → 0.20 on 2026-05-18
     # (p24 RCA: σ-saturation trap at 0.219 prevented critic learning).
-    # 0.20 is a safety belt — the primary adaptivity is now in the
-    # 0.7×σ_seed formula above.  Override via ``DREAMER_SIGMA_MAX_CAP``.
+    # Restored 0.20 → 0.30 on 2026-05-19 (p26 RCA: reward-head fix
+    # removed the saturation-trap mechanism; σ-saturation is now
+    # benign and handled by the entropy-decay safety belt instead).
     sigma_max_cap = float(os.environ.get(
         'DREAMER_SIGMA_MAX_CAP',
-        os.environ.get('SIGMA_MAX_CAP', '0.20')))
+        os.environ.get('SIGMA_MAX_CAP', '0.30')))
     target_sigma_max = float(np.clip(sigma_max_mult * sigma_seed,
                                        sigma_max_floor, sigma_max_cap))
     log_std_max_val = float(np.log(target_sigma_max))
@@ -3049,7 +3056,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # Detect when the actor's implied σ is pinned at the
             # σ_max ceiling for sat_window consecutive iters → decay
             # η so PG can pull σ down toward the learned mean.
-            if (sat_enabled and sat_window > 0 and sigma_max_live > 0.0):
+            #
+            # 2026-05-19 (p26 RCA): the saturation counter must NOT
+            # advance while the actor is still frozen by
+            # ``p3_critic_warmup_iters`` / the critic-stability gate.
+            # A frozen actor sits at its init σ (or whatever value
+            # the Phase-1/2 WM updates left it at) by definition, so
+            # counting those iters toward "σ stuck at ceiling" fires
+            # the decay before the actor has had any chance to move.
+            # In p26 this halved η before the actor was even released,
+            # leaving it under-incentivised to explore once unfrozen.
+            actor_is_released = (actor_release_iter is not None)
+            if (sat_enabled and sat_window > 0 and sigma_max_live > 0.0
+                    and actor_is_released):
                 try:
                     H_now = float(ac_losses.get('actor_entropy_bonus',
                         torch.tensor(0.0)).detach().item())
