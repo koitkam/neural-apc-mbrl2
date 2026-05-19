@@ -317,6 +317,8 @@ def main() -> int:
         'DREAMER_LR_CRITIC':        ('lr_critic',                  float),
         'DREAMER_LR_ACTOR':         ('lr_actor',                   float),
         'DREAMER_P3_CRITIC_CV_MAX': ('p3_critic_stability_max_cv', float),
+        'DREAMER_P3_COLLECT_EVERY': ('phase3_collect_every_iters', int),
+        'DREAMER_BUFFER_CAP_STEPS': ('buffer_capacity_steps',      int),
     }
     for _env_k, (_field, _cast) in _env_overrides.items():
         _val = os.environ.get(_env_k, '').strip()

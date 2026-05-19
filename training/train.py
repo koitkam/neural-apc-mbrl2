@@ -278,17 +278,25 @@ class TrainConfig:
     tau_ctx: float = 0.1             # context-noise corruption at inference
 
     # ----- Buffer -----
-    buffer_capacity_steps: int = 200_000
+    # 2026-05-18 raised 200k→400k after reward-head saturation diagnosis
+    # on test_sim p25: with 200k cap and ep_len=1220 the buffer holds
+    # only 163 episodes (≈32 P3 on-policy + 131 Phase-1 random), so the
+    # WM/reward head over-weights stale Phase-1 calibration data even
+    # though Phase-3 returns are 30–1000× larger in magnitude than the
+    # calibration baseline. 400k holds ~327 episodes and lets fresh
+    # on-policy data displace the calibration set faster.
+    buffer_capacity_steps: int = 400_000
 
     # ----- Phase-3 evaluation cadence -----
     phase3_eval_every_iters: int = 5
-    # Collect a fresh on-policy episode every K P3 iters (paper
-    # Algorithm 1 line 22 calls for every iter, but every-iter
-    # collection on a CPU plant simulator burns ~50% of wall-clock
-    # without changing the on-policy distribution meaningfully on the
-    # short BO horizons we use; K=4 keeps the actor data within ≤4
-    # gradient steps of the policy snapshot used to collect it).
-    phase3_collect_every_iters: int = 4
+    # Collect a fresh on-policy episode every K P3 iters. DreamerV3
+    # paper Algorithm 1 line 22 calls for every iter; we previously
+    # defaulted to K=4 to save wall-clock on CPU plants, but 2026-05-18
+    # diagnosis on test_sim p25 showed the reward head saturates and
+    # the actor drifts catastrophically when the buffer’s on-policy
+    # fraction is too small to retrain the head between P3 iters. K=1
+    # restores paper behaviour at the cost of ~30% throughput.
+    phase3_collect_every_iters: int = 1
     # Reduce inner train steps in P3 so more iters happen per fixed
     # env-step budget — Optuna's pruner gets more samples and we get
     # finer-grained logs of actor / entropy progression.
@@ -3481,6 +3489,8 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
         ('DREAMER_P3_CRITIC_WARMUP_ITERS', 'p3_critic_warmup_iters', int),
         ('DREAMER_P3_CRITIC_CV_MAX', 'p3_critic_stability_max_cv', float),
+        ('DREAMER_P3_COLLECT_EVERY', 'phase3_collect_every_iters', int),
+        ('DREAMER_BUFFER_CAP_STEPS', 'buffer_capacity_steps', int),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
         ('DREAMER_COMPILE_MODE', 'compile_mode', str),
         ('AGENT_TOTAL_STEPS', 'total_steps', int),
