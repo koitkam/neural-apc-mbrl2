@@ -2268,9 +2268,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # take precedence (detected via dataclass-default sentinel).
     auto = auto_tune_seed_buffer(env, cfg)
     auto_summary: Dict[str, Dict[str, object]] = {}
+    # 2026-05-19 fix: prefer explicit-set tracking over value-equality.
+    # The legacy sentinel ``cur == default`` cannot distinguish
+    # "user explicitly set the paper-default" (e.g. log_std_max=0.0)
+    # from "user did not set".  ``single_run.py`` and ``_cfg_from_env``
+    # now record explicitly-injected field names in ``cfg._explicit_fields``;
+    # we honour that first, falling back to the value-equality check
+    # for legacy entry-points that have not been migrated.
+    explicit: set = set(getattr(cfg, '_explicit_fields', set()) or set())
     for field, info in auto.items():
         cur = getattr(cfg, field)
         default = _AUTO_TUNE_FIELD_DEFAULTS.get(field)
+        was_explicit = field in explicit
+        if was_explicit:
+            auto_summary[field] = {
+                'value': cur, 'source': 'user_override_explicit',
+                'applied': False,
+            }
+            continue
         if cur == default:
             setattr(cfg, field, info['value'])
             auto_summary[field] = {**info, 'applied': True}
@@ -3470,6 +3485,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
 def _cfg_from_env() -> TrainConfig:
     cfg = TrainConfig()
+    explicit: set = set()
     for name, attr, cast in [
         ('DREAMER_D_MODEL', 'd_model', int),
         ('DREAMER_N_LAYERS', 'n_layers', int),
@@ -3544,6 +3560,14 @@ def _cfg_from_env() -> TrainConfig:
         v = os.environ.get(name)
         if v is not None and v != '':
             setattr(cfg, attr, cast(v))
+            explicit.add(attr)
+    # Stash explicitly-set field names so the auto-tune apply loop can
+    # skip them even when the env-injected value equals the dataclass
+    # default (e.g. paper-faithful log_std_max=0.0).
+    try:
+        cfg._explicit_fields = explicit  # type: ignore[attr-defined]
+    except Exception:
+        pass
     return cfg
 
 

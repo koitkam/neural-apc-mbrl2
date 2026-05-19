@@ -336,6 +336,15 @@ def main() -> int:
         if _val:
             try:
                 setattr(cfg, _field, _cast(_val))
+                # Track explicit overrides so train.py's auto-tune apply
+                # loop skips them even when the injected value equals
+                # the dataclass default (e.g. paper σ_max=1.0 → log_std_max=0.0).
+                try:
+                    if not hasattr(cfg, '_explicit_fields'):
+                        cfg._explicit_fields = set()  # type: ignore[attr-defined]
+                    cfg._explicit_fields.add(_field)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
                 print(f"[env-override] {_field}={_cast(_val)} "
                       f"(from {_env_k})", flush=True)
             except Exception as _e:
