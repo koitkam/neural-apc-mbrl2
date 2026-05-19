@@ -319,6 +319,17 @@ def main() -> int:
         'DREAMER_P3_CRITIC_CV_MAX': ('p3_critic_stability_max_cv', float),
         'DREAMER_P3_COLLECT_EVERY': ('phase3_collect_every_iters', int),
         'DREAMER_BUFFER_CAP_STEPS': ('buffer_capacity_steps',      int),
+        # 2026-05-19 paper-strip-back knobs (p28 A/B): expose the
+        # remaining auto-tuned cfg fields so a fully paper-faithful
+        # baseline can be launched purely via env vars, with no code
+        # changes. Setting any of these pre-empts the corresponding
+        # auto-tune branch via the dataclass-default sentinel.
+        'DREAMER_POLICY_LOG_STD_MAX':       ('policy_log_std_max',           float),
+        'DREAMER_POLICY_LOG_STD_MIN':       ('policy_log_std_min',           float),
+        'DREAMER_PMPO_ENTROPY_COEF':        ('pmpo_entropy_coef',            float),
+        'DREAMER_P3_CRITIC_WARMUP_ITERS':   ('p3_critic_warmup_iters',       int),
+        'DREAMER_ENTROPY_DECAY_ON_SAT':     ('pmpo_entropy_decay_on_saturation',
+                                             lambda v: bool(int(v))),
     }
     for _env_k, (_field, _cast) in _env_overrides.items():
         _val = os.environ.get(_env_k, '').strip()
