@@ -1,19 +1,24 @@
 """Bayesian Optimization driver for DreamerV4.
 
-Three axes (the only knobs we tune):
+One axis (the only knob we tune):
 
-  - lookback : grid centred on plant-identified lookback.
   - model_size_preset : {S, M, L} — coordinated triples
                        ``(d_model, n_layers, n_heads, z_dim, n_register)``.
-  - horizon : 5-point band ``{0.5, 0.75, 1.0, 1.5, 2.0} * H_init`` with
-              ``H_init = ceil((dead_time + 3 * tau) / sample_rate)``.
 
-All three axes are seeded from plant identification (`dynamics_identifier` +
-`lookback_identifier`).  No per-knob NN dimension search; no auto-tuning
-band-aids.
+Lookback is pinned to the plant-identified value (the per-frame encoder
+plus GRU memory means the lookback window only controls env warmup).
+Horizon is pinned to the DreamerV3/V4 paper default ``H = 15`` (same
+value ``workflow/single_run.py`` uses) — the plant-derived horizon
+formula and the ``HORIZON_BAND`` BO axis were removed 2026-05-20 with
+the short-budget knob cleanup; at the 1M-step default budget the
+critic settles at H=15 on any plant.
+
+All axes are seeded from plant identification (`dynamics_identifier` +
+`lookback_identifier`).  No per-knob NN dimension search; no
+auto-tuning band-aids.
 
 For each trial we:
-  1. set the 3 parameters,
+  1. set the model_size preset,
   2. train ``trial_total_steps`` with `training/train.train()`,
   3. score by the final EMA return on the policy buffer.
 
@@ -110,15 +115,12 @@ MODEL_SIZE_PRESETS: Dict[str, Dict[str, int]] = {
           'tok_hidden': 384, 'head_hidden': 384},
 }
 
-HORIZON_BAND = (0.5, 0.75, 1.0, 1.25)
-# Narrow search band around the V3 paper default (H_init = 15, capped
-# in ``horizon_init``).  Maps to H ∈ {8, 11, 15, 19} on plants where
-# the cap binds — covers the immediate neighbourhood of V3's
-# universally-optimal horizon without re-introducing the long-horizon
-# failure mode (H ≥ 30 compounded reward-head error catastrophically
-# on test_sim, validate-iter80 RCA 2026-05-06).  V3 ablation
-# (Hafner 2023, Fig. 8) shows monotonic degradation past H=15 on
-# 150-task average; we restrict BO to the safe regime.
+HORIZON_BAND = (1.0,)
+# Horizon BO axis removed 2026-05-20: ``H`` is pinned to the V3/V4
+# paper default of 15 (parity with ``workflow/single_run.py``).  This
+# single-element tuple is retained for backward compatibility with any
+# code that still references the symbol; ``run_trial`` no longer
+# suggests over it.
 
 
 # ---------------------------------------------------------------------------
@@ -208,35 +210,19 @@ def initialize_from_plant(out_dir: Path) -> Dict:
 
 
 def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
-    """Plant-derived imagination horizon (agent steps).
+    """Imagination horizon (agent steps) — DreamerV3/V4 paper default.
 
-    Formula matches ``training.train.auto_tune_seed_buffer`` so the
-    workflow plan, the printed config, and the trainer's effective
-    value all agree (run_p7 RCA: previously capped at V3 paper H=15
-    while the trainer's auto-tune overrode to (θ+2τ)/sr → confusing
-    log mismatch).
+    Returns ``15`` unconditionally.  The plant-derived ``(θ+3τ)/sr``
+    formula was removed 2026-05-20 alongside the rest of the short-
+    budget knob cleanup: with ``--steps`` defaulted to 1M (paper
+    minimum for control), the critic settles fine at H=15 on any
+    plant, so the historical safety belt is no longer needed.
 
-        H = max(15, round((θ + 3τ) / sr))
-
-    2026-05-10 (run_p13 horizon bump): formula updated from 2τ+θ to
-    3τ+θ.  At 2τ the critic only sees ~86 % of the step response,
-    under-weighting the settled disturbance-rejection outcome the
-    controller is graded on.  3τ spans ~95 % settling.
-
-    No upper cap: slow plants (large τ) legitimately need long
-    imagination horizons to bootstrap on settled values.  The
-    runtime fidelity gate ``_probe_wm_fidelity`` (training/train.py)
-    is the safety net — if the WM cannot sustain the requested H,
-    it gets clipped at the P1→P2 boundary or P1 is extended.
-
-    Floor at 15 = V3 paper default so fast-dynamics plants do not
-    regress.
-
-    For BO trials the suggested ``horizon_mult ∈ HORIZON_BAND`` is
-    multiplied with this base value.
+    Signature retained so BO trial code that multiplies the base by
+    ``horizon_mult ∈ HORIZON_BAND`` keeps working.
     """
-    raw = max(15, int(round((dead_time + 3.0 * tau) / max(1, sample_rate))))
-    return int(raw)
+    del tau, dead_time, sample_rate
+    return 15
 
 
 def lookback_grid(plant_lookback: int) -> List[int]:
@@ -395,9 +381,9 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     # same buffer shape.
     lookback = int(plant['lookback'])
     model_size = trial.suggest_categorical('model_size', list(MODEL_SIZE_PRESETS))
-    horizon_mult = trial.suggest_categorical('horizon_mult', HORIZON_BAND)
-    H_init = horizon_init(plant['tau'], plant['dead_time'], base.sample_rate)
-    horizon = max(3, int(round(horizon_mult * H_init)))
+    # Horizon pinned to V3/V4 paper default (parity with single_run.py).
+    H_init = 15
+    horizon = 15
 
     # Adaptive per-trial batch size: re-derive from the trial's actual
     # model_size + horizon so OOM-prone (L, large horizon) trials use a
@@ -517,8 +503,9 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
     # backward-compat with older study summaries that still recorded it.
     lookback = int(best_params.get('lookback', plant['lookback']))
     model_size = str(best_params['model_size'])
-    H_init = horizon_init(plant['tau'], plant['dead_time'], base.sample_rate)
-    horizon = max(3, int(round(float(best_params['horizon_mult']) * H_init)))
+    # Horizon pinned to V3/V4 paper default (parity with single_run.py).
+    H_init = 15
+    horizon = 15
 
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
@@ -792,8 +779,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     with open(out_dir / 'run_plan.json', 'w') as f:
         json.dump(plan, f, indent=2, default=str)
     print(f"[BO] plant: tau={plant['tau']:.2f}  dead_time={plant['dead_time']:.2f}  "
-          f"lookback={plant['lookback']}  H_init="
-          f"{horizon_init(plant['tau'], plant['dead_time'], sr)}", flush=True)
+          f"lookback={plant['lookback']}  H=15 (paper default)", flush=True)
 
     print('[BO] Phase 2: Optuna search', flush=True)
     # Persistent SQLite study so BO can resume after a crash / SIGINT.
@@ -906,10 +892,14 @@ if __name__ == '__main__':
                    help='Workflow output directory. Default: '
                         '<repo>/output/<sim>/bo_<timestamp>/')
     p.add_argument('--n_trials', type=int, default=8)
-    p.add_argument('--trial_steps', type=int, default=0,
-                   help='per-trial training steps (0 = plant-tied auto)')
-    p.add_argument('--final_steps', type=int, default=0,
-                   help='final retrain steps (0 = plant-tied auto)')
+    p.add_argument('--trial_steps', type=int, default=1_000_000,
+                   help='per-trial training steps (default 1,000,000 — '
+                        'parity with workflow/single_run.py; 0 = '
+                        'plant-tied auto)')
+    p.add_argument('--final_steps', type=int, default=1_000_000,
+                   help='final retrain steps (default 1,000,000 — '
+                        'parity with workflow/single_run.py; 0 = '
+                        'plant-tied auto)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--init-from-ckpt', type=str, default='',
                    help="Optional path to a previous run's best.pt / "

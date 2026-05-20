@@ -14,10 +14,11 @@ What is auto-derived (in order):
   4. ``tau``, ``dead_time``         <- ``dynamics_identifier``.
   5. ``lookback``                   <- ``lookback_identifier`` (centred on tau).
   6. ``episode_length``             <- ``auto_episode_length.derive_episode_length``.
-  7. ``horizon = ceil((θ + 3τ)/sr)`` (Dreamer-V4 paper §C plant initialization).
+  7. ``horizon = 15`` (Dreamer-V3/V4 paper default; H is no longer
+     plant-tied — see 2026-05-20 knob cleanup).
   8. ``model_size``                 <- paper default ``M`` (512/512/512, 32x32).
   9. ``seq_len = 64``, ``batch_size = 16``    (paper §C).
- 10. ``total_steps``                <- ``--steps`` (default 200 000).
+ 10. ``total_steps``                <- ``--steps`` (default 1 000 000).
 
 CLI flags allow targeted overrides for advanced usage; everything has a
 sensible default so the typical command is:
@@ -87,9 +88,10 @@ def main() -> int:
     parser.add_argument('--out-dir', '-o', default=None,
                         help='Output directory. Default: '
                              '<repo>/output/<sim>/run_<timestamp>/')
-    parser.add_argument('--steps', type=int, default=0,
-                        help='Total environment steps. 0 = plant-tied auto '
-                             '(derive_step_budgets.trial_steps).')
+    parser.add_argument('--steps', type=int, default=1000000,
+                        help='Total environment steps. Default 1,000,000 '
+                             '(DreamerV3/V4 paper minimum for control '
+                             'tasks).  Pass 0 for plant-tied auto.')
     parser.add_argument('--model-size', choices=['S', 'M', 'L'], default=None,
                         help='Architecture preset. Default: auto-derived from '
                              'plant complexity (channels + multiscale + state_dim).')
@@ -240,10 +242,14 @@ def main() -> int:
 
     # Episode length & horizon from plant.
     from utils.auto_episode_length import derive_episode_length
-    from workflow.bo_runner import horizon_init, MODEL_SIZE_PRESETS
+    from workflow.bo_runner import MODEL_SIZE_PRESETS
     episode_length, ep_source = derive_episode_length()
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
-    horizon = horizon_init(tau, dead, sample_rate)
+    # Horizon: paper default H=15 (DreamerV3/V4, Hafner et al., Table 13).
+    # The plant-adaptive ``horizon_init`` formula was removed 2026-05-20
+    # along with the rest of the short-budget knob cleanup; at the 1M-
+    # step default budget the critic settles fine at H=15 for any plant.
+    horizon = 15
     seq_len = derived['seq_len']
     k_max = derived['k_max']
     arch = MODEL_SIZE_PRESETS[model_size]
@@ -316,7 +322,6 @@ def main() -> int:
         'DREAMER_PHASE3_FRAC':      ('phase3_frac',                float),
         'DREAMER_LR_CRITIC':        ('lr_critic',                  float),
         'DREAMER_LR_ACTOR':         ('lr_actor',                   float),
-        'DREAMER_P3_CRITIC_CV_MAX': ('p3_critic_stability_max_cv', float),
         'DREAMER_P3_COLLECT_EVERY': ('phase3_collect_every_iters', int),
         'DREAMER_BUFFER_CAP_STEPS': ('buffer_capacity_steps',      int),
         # 2026-05-19 paper-strip-back knobs (p28 A/B): expose the
@@ -327,9 +332,7 @@ def main() -> int:
         'DREAMER_POLICY_LOG_STD_MAX':       ('policy_log_std_max',           float),
         'DREAMER_POLICY_LOG_STD_MIN':       ('policy_log_std_min',           float),
         'DREAMER_PMPO_ENTROPY_COEF':        ('pmpo_entropy_coef',            float),
-        'DREAMER_P3_CRITIC_WARMUP_ITERS':   ('p3_critic_warmup_iters',       int),
-        'DREAMER_ENTROPY_DECAY_ON_SAT':     ('pmpo_entropy_decay_on_saturation',
-                                             lambda v: bool(int(v))),
+        'DREAMER_HORIZON':                  ('horizon',                      int),
     }
     for _env_k, (_field, _cast) in _env_overrides.items():
         _val = os.environ.get(_env_k, '').strip()

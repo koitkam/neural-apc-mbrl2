@@ -305,69 +305,24 @@ class TrainConfig:
     # the first few P3 returns which are dominated by the snapshot
     # actor that hasn't been updated by imagination yet).
     phase3_pruner_warmup_iters: int = 8
-    # Critic warm-up: freeze the actor for the first N P3 iters so the
-    # value head sees real imagined returns before REINFORCE reacts to
-    # its baseline.  Prevents the entropy-saturation trap where a
-    # freshly-initialised critic produces noisy advantages → REINFORCE
-    # pushes σ to the clamp ceiling within 1–2 batches (validate-iter80
-    # RCA, 2026-05-06).  V3-aligned in spirit (§3.3 EMA-target).  Set
-    # to 0 to disable.
-    #
-    # Auto-derived in ``auto_tune_seed_buffer`` to scale with the
-    # adaptive imagination horizon (longer horizon → more compounded
-    # WM error → critic needs longer to stabilise).  Default below is
-    # a sentinel; auto-tune resolves to roughly
-    # ``max(16, round(horizon))`` for V3-paper-scale tasks and grows
-    # with the plant's settling time on slower process plants.
-    p3_critic_warmup_iters: int = 16
-    # Critic stability gate (2026-05-08): in addition to the fixed
-    # iteration warm-up, also require the recent critic-loss to be
-    # *stable* before releasing the actor.  Computed as the coefficient
-    # of variation (std / |mean|) of ``critic_loss`` over the last
-    # ``p3_critic_stability_window_iters`` P3 iters.  Actor releases
-    # only when CV ≤ ``p3_critic_stability_max_cv`` AND the iter
-    # count has reached ``p3_critic_warmup_iters``.  A hard cap at
-    # ``p3_critic_stability_max_warmup_iters`` forces release even if
-    # the gate never trips, so a flat-but-still-noisy critic does not
-    # block training indefinitely.  Set
-    # ``p3_critic_stability_window_iters=0`` to disable the gate (use
-    # only the fixed iteration warm-up).
-    p3_critic_stability_window_iters: int = 10
-    # Tightened 2026-05-14 (run_p22 RCA: critic_r_observed=-0.50 —
-    # value head was *anti-aligned* with true returns when actor was
-    # released too early, leading to the actor learning to do the
-    # opposite of what was good).  CV ≤ 0.30 forces the critic loss to
-    # be settled to within 30% std/mean before release; previous 0.40
-    # let through enough residual noise to flip the sign on small
-    # plants where the action distribution shifts during release.
-    # Loosened 2026-05-18 (run_p24 RCA: actor never released —
-    # combined with tighter σ_max the critic targets are now cleaner,
-    # so 0.35 is sufficient and avoids actor starvation on plants
-    # where critic loss has an irreducible noise floor above 30%).
-    # Override via ``DREAMER_P3_CRITIC_CV_MAX`` env var.
-    p3_critic_stability_max_cv: float = 0.35
-    # Doubled 2026-05-14 (run_p22 RCA): hard-cap raised 60 → 120 P3
-    # iters so the wider σ_max=0.30 actor's experience distribution
-    # has enough budget to settle the critic before forced release.
-    # Auto-derived value (auto_tune block below) still scales with
-    # horizon so this cap is the *upper* bound, not the typical case.
-    p3_critic_stability_max_warmup_iters: int = 120
-    # Adaptive entropy decay on σ-saturation (2026-05-08): if the
-    # actor's running entropy sits within
-    # ``pmpo_entropy_saturation_frac × H_max(σ_max)`` for
-    # ``pmpo_entropy_saturation_window_iters`` consecutive P3 iters,
-    # multiply the live ``pmpo_entropy_coef`` by
-    # ``pmpo_entropy_saturation_decay`` (per stuck-window event).
-    # Releases σ-pressure when the entropy bonus is the dominant
-    # gradient (root-cause of run_p7's frozen σ at clamp ceiling).
-    # Set ``pmpo_entropy_decay_on_saturation=False`` to disable.
-    pmpo_entropy_decay_on_saturation: bool = True
-    pmpo_entropy_saturation_frac: float = 0.95
-    pmpo_entropy_saturation_window_iters: int = 20
-    pmpo_entropy_saturation_decay: float = 0.5
-    # Floor on the live η so the decay can't drive entropy regularisation
-    # to zero (which would let σ collapse to log_std_min instantly).
-    pmpo_entropy_coef_min: float = 1e-6
+
+    # NOTE: ``p3_critic_warmup_iters`` and the ``p3_critic_stability_*``
+    # gate (introduced 2026-05-06 and 2026-05-08) were removed on
+    # 2026-05-20 along with the entropy-decay belt.  They were
+    # short-budget symptom fixes: at 600k env steps a freshly-init
+    # critic produced noisy advantages for a few iters before settling
+    # and we papered over it by freezing the actor.  With the budget
+    # bumped to 1M (paper's control-task minimum) the critic settles
+    # naturally during normal training; the freeze just wasted P3
+    # iters that the actor needs.
+
+
+    # NOTE: the adaptive σ-saturation entropy-decay belt (2026-05-08
+    # → 2026-05-20) was removed.  Paper (DreamerV3/V4) uses a constant
+    # η; the belt actively caused the failure mode it was meant to
+    # prevent (run_p30: halving η collapsed entropy to floor, narrowed
+    # the replay buffer, degraded WM step-1 MAE 0.10→0.29).  σ-saturation
+    # is now handled by the ``policy_log_std_max`` clamp alone.
 
     # ----- Early stopping (within a single trial) -----
     # Master switch.  All sub-criteria are gated on this.
@@ -1455,39 +1410,16 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
 
 def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
                                          cfg: 'TrainConfig') -> None:
-    """Clip ``cfg.horizon`` down based on a WM-fidelity probe.
+    """Deprecated no-op.
 
-    Fallback path used only when the P1-extension budget has been
-    exhausted (see P1->P2 transition in ``train_dreamer``).  When the
-    WM is bad enough that even an extended P1 didn't help, this
-    shrinks the critic's imagination horizon to where the WM is
-    actually reliable so the critic doesn't train against noise.
-
-    Disabled by setting env-var ``DREAMER_HORIZON_ADAPT=0``.
+    The runtime WM-fidelity horizon clip + P1-extension mechanism was
+    removed 2026-05-20 alongside the short-budget knob cleanup.  With
+    the 1M-step default budget the P1 schedule has enough time to
+    train the WM at the paper-default H=15; runtime horizon shrinkage
+    is no longer needed.  This stub is retained so out-of-tree callers
+    do not break.
     """
-    if int(os.environ.get('DREAMER_HORIZON_ADAPT', '1') or 0) == 0:
-        return
-    H = int(getattr(cfg, 'horizon', 15))
-    if H <= 5:
-        return
-    probe = _probe_wm_fidelity(model, env, device, cfg)
-    if probe is None:
-        return
-    print(f"[wm-fidelity-probe] {probe['summary']} "
-          f"floor={probe['r_floor']:.2f}", flush=True)
-    h_floor = int(os.environ.get('DREAMER_HORIZON_MIN_AFTER_ADAPT', '5'))
-    h_floor = max(3, min(h_floor, H))
-    best_h = probe['best_h']
-    if best_h <= 0:
-        new_h = h_floor
-    else:
-        new_h = max(h_floor, min(H, best_h))
-    if new_h >= H:
-        return
-    print(f'[wm-fidelity-probe] clipping horizon {H} -> {new_h} '
-          f"(largest h with r_mean >= {probe['r_floor']:.2f} was {best_h})",
-          flush=True)
-    cfg.horizon = int(new_h)
+    return
 
 
 def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
@@ -1712,9 +1644,7 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # 0.7 → 1.0 and cap 0.20 → 0.30 so σ_max ≈ σ_seed instead of
     # 0.7×σ_seed.  This puts the policy clamp at the same scale the
     # seed buffer was collected with, aligning the actor's explore
-    # band with the WM's training distribution while still leaving
-    # the σ-saturation entropy-decay safety belt to step in if the
-    # actor *does* drift to the ceiling and refuses to commit.
+    # band with the WM's training distribution.
     sigma_max_mult = float(os.environ.get(
         'DREAMER_SIGMA_MAX_OVER_SEED',
         os.environ.get('SIGMA_MAX_OVER_SEED', '1.0')))
@@ -1726,7 +1656,7 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # (p24 RCA: σ-saturation trap at 0.219 prevented critic learning).
     # Restored 0.20 → 0.30 on 2026-05-19 (p26 RCA: reward-head fix
     # removed the saturation-trap mechanism; σ-saturation is now
-    # benign and handled by the entropy-decay safety belt instead).
+    # benign).
     sigma_max_cap = float(os.environ.get(
         'DREAMER_SIGMA_MAX_CAP',
         os.environ.get('SIGMA_MAX_CAP', '0.30')))
@@ -1799,48 +1729,21 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                   f'{sigma_v3_ref:.2f} = {eta_adaptive:.2e}',
     }
 
-    # ---- horizon (plant-adaptive imagination depth) --------------------
-    # DreamerV3/V4 paper default H = 15 was calibrated for Atari/DMC
-    # tasks where each agent step ≈ one plant step and dynamics settle
-    # in ≲ 15 steps.  For process-control plants the dominant time
-    # constant τ + dead-time θ (in plant steps) often exceeds
-    # H × sample_rate so the actor's imagined consequence of a Δ-MV
-    # action only spans the initial transient and never sees the CV
-    # settle.  Critic learns to value the transient, not the outcome.
+    # ---- Plant timing (used by PRBS-segment derivation below) ---------
+    # ``horizon`` is no longer auto-tuned here; the paper default H=15
+    # (DreamerV3/V4) is used unless the caller passed an explicit value
+    # via ``cfg.horizon`` or env override ``DREAMER_HORIZON``.  Removed
+    # 2026-05-20 with the short-budget knob cleanup: the plant-derived
+    # H=(θ+3τ)/sr formula compounded WM error over much deeper
+    # imagined trajectories than the paper validates against.
     #
-    # Auto-derive H from identified plant timing:
-    #
-    #     H_auto = max(15, round((θ + 3 × τ) / sample_rate))
-    #
-    # 2026-05-10 (run_p13): bumped from 2τ+θ to 3τ+θ.  At 2τ+θ the
-    # critic only sees 1 - e^-2 ≈ 86 % of the step response, which
-    # under-weights the *settled* disturbance-rejection outcome that
-    # the controller is actually being graded on.  3τ+θ spans 1 -
-    # e^-3 ≈ 95 % settling — the critic now bootstraps on a value
-    # close to the true terminal state.
-    #
-    # No upper cap: slow plants legitimately need long horizons.
-    # WM compounding error is no longer a hard constraint here
-    # because the unified P1->P2 gate (``_probe_wm_fidelity``) CLIPS
-    # H back down at runtime when the WM cannot sustain the
-    # requested horizon, and extends P1 first when budget remains.
-    #
-    # Floor at 15 = V3 paper default so fast-dynamics plants do not
-    # regress.  Env knob DREAMER_HORIZON_MIN overrides the floor;
-    # DREAMER_HORIZON_MAX (if set, default unset = no cap) overrides
-    # the cap if the user wants to constrain memory.
-    #
-    # Plant timing is read from ``run_plan.json`` (written by the
-    # workflow runner before training) or ``plant_id/dynamics_*.json``
-    # using the same dir-walk logic as MV-authority lookup above.  If
-    # neither is available, leaves the dataclass default (15) in place.
-    horizon_min = int(os.environ.get('DREAMER_HORIZON_MIN', '15'))
-    _hm_env = os.environ.get('DREAMER_HORIZON_MAX', '')
-    horizon_max = int(_hm_env) if _hm_env.strip() else 10**9
+    # ``p3_critic_warmup_iters`` and ``gae_lambda`` auto-tune blocks
+    # were removed in the same cleanup.  With ``--steps`` defaulted to
+    # 1M (paper minimum for control), the critic settles naturally and
+    # paper-default ``gae_lambda=0.95`` is appropriate for any horizon.
     sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
     tau_plant = 0.0
     theta_plant = 0.0
-    horizon_src_detail = ''
     try:
         out_dir_h = Path(getattr(cfg, 'out_dir', '.') or '.')
         roots: List[Path] = [out_dir_h]
@@ -1872,77 +1775,9 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                 tau_plant = 0.0
                 theta_plant = 0.0
             if tau_plant > 0.0:
-                horizon_src_detail = cand.name
                 break
     except Exception:
         pass
-    if tau_plant > 0.0:
-        h_target = (theta_plant + 3.0 * tau_plant) / float(sr)
-        horizon_auto = int(np.clip(round(h_target), horizon_min, horizon_max))
-        cap_str = (str(horizon_max) if horizon_max < 10**9 else 'no-cap')
-        out['horizon'] = {
-            'value': int(horizon_auto),
-            'source': (f'clip(round((theta+3*tau)/sample_rate),'
-                       f'{horizon_min},{cap_str})='
-                       f'clip(round(({theta_plant:.1f}+3*{tau_plant:.1f})/'
-                       f'{sr}),{horizon_min},{cap_str})={horizon_auto} '
-                       f'[from {horizon_src_detail}]'),
-        }
-    # else: skip; dataclass default 15 (V3 paper) survives.
-
-    # ---- p3_critic_warmup_iters (scale with horizon) -------------------
-    # Longer imagination horizons compound WM error → noisier critic
-    # targets → critic needs more warm-up iters before the actor can
-    # safely react to its baseline.  Scale linearly with H, with a
-    # floor at the historical default 16 (calibrated for H=15 on
-    # earlier runs).  Hard cap raised 60→120 (2026-05-14, run_p22
-    # RCA) because the wider σ_max regime needs more critic budget;
-    # the runtime stability gate (p3_critic_stability_*) still
-    # release earlier when the loss is stable.
-    h_for_warmup = int(out.get('horizon', {}).get('value',
-                       int(getattr(cfg, 'horizon', 15))))
-    warmup_floor = int(os.environ.get('P3_CRITIC_WARMUP_FLOOR', '16'))
-    warmup_cap = int(os.environ.get('P3_CRITIC_WARMUP_CAP', '120'))
-    warmup_auto = int(np.clip(h_for_warmup, warmup_floor, warmup_cap))
-    out['p3_critic_warmup_iters'] = {
-        'value': int(warmup_auto),
-        'source': (f'clip(horizon,{warmup_floor},{warmup_cap})='
-                   f'clip({h_for_warmup},{warmup_floor},{warmup_cap})='
-                   f'{warmup_auto}'),
-    }
-
-    # ---- gae_lambda (cap effective bootstrap depth) ---------------------
-    # DreamerV3/V4 paper default: λ=0.95 paired with H=15
-    # → effective bootstrap depth 1/(1-λ)=20 ≈ H (full-horizon trust).
-    #
-    # When the auto-tuned horizon is much longer than the paper's 15
-    # (slow plants with large τ), λ=0.95 lets WM error compound 1/(1-λ)
-    # steps deep into λ-returns regardless of H — this manifests as
-    # systematically pessimistic critic targets (run_p22/p23 RCA on
-    # test_sim: critic_r inverted, imagined_return drifted -5 → -69
-    # before actor σ-saturated at the ceiling).
-    #
-    # Adaptive rule: keep the effective bootstrap depth bounded by the
-    # paper's validated depth (default 15 steps) so the λ-tail decays
-    # within paper-validated range, even when H is auto-derived much
-    # longer.  At H=15 this gives λ=0.933 (slightly tighter than paper's
-    # 0.95 — small extra safety margin for non-Atari domains).
-    # At H=42 (test_sim) it gives the same λ=0.933 (cap kicks in).
-    # The DREAMER_LAMBDA_EFF_DEPTH env var (default 15) lets users
-    # restore paper-strict behaviour (=20) or tighten further (=10
-    # ≈ λ=0.90 for very long H or low-fidelity WM).  DREAMER_GAE_LAMBDA
-    # (bound in workflow/single_run.py) is the final override and wins.
-    lam_eff_depth = int(os.environ.get('DREAMER_LAMBDA_EFF_DEPTH', '15'))
-    lam_eff_depth = max(2, lam_eff_depth)
-    h_for_lam = h_for_warmup
-    eff_depth = max(2, min(h_for_lam, lam_eff_depth))
-    lam_auto = max(0.5, min(0.95, 1.0 - 1.0 / float(eff_depth)))
-    out['gae_lambda'] = {
-        'value': float(lam_auto),
-        'source': (f'1-1/min(H,DREAMER_LAMBDA_EFF_DEPTH)='
-                   f'1-1/min({h_for_lam},{lam_eff_depth})='
-                   f'1-1/{eff_depth}={lam_auto:.3f}'),
-    }
 
     # ---- prbs_seed_segment_steps (full transfer-function coverage) ----
     # PRBS segment must be long enough that, after the dead-time delay
@@ -2013,12 +1848,56 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'policy_log_std_max':       TrainConfig().policy_log_std_max,
     'policy_log_std_min':       TrainConfig().policy_log_std_min,
     'pmpo_entropy_coef':        TrainConfig().pmpo_entropy_coef,
-    'horizon':                  TrainConfig().horizon,
-    'p3_critic_warmup_iters':   TrainConfig().p3_critic_warmup_iters,
     'prbs_seed_segment_steps':  TrainConfig().prbs_seed_segment_steps,
     'prbs_seed_segment_steps_min': TrainConfig().prbs_seed_segment_steps_min,
-    'gae_lambda':               TrainConfig().gae_lambda,
 }
+
+
+# --- Calibration robustness constants (plant-agnostic) ---
+# Cap the calibration exploration noise *inside* the calibrator regardless
+# of the caller's ``baseline_action_std`` (often = policy σ ceiling, which
+# is large enough on tight-bound plants to drive 100% violation during
+# calibration).  Values are in normalized action space [-1, +1].
+_REWARD_CAL_SIGMA_LADDER: Tuple[float, ...] = (0.05, 0.02, 0.005, 0.0)
+# A calibration sample is "violation-dominated" when the mean of raw
+# rewards is closer to the cliff (-p95(|raw|)) than to zero.  Equivalent
+# to: the typical sample is below the midpoint between 0 and the cliff.
+# Ratio is dimensionless ⇒ generalises across any reward magnitude.
+_REWARD_CAL_VIOLATION_RATIO: float = 0.5
+
+
+def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
+                                  n_steps: int, mode: str,
+                                  sigma: float
+                                  ) -> Tuple[List[float], List[np.ndarray]]:
+    """Roll out ``n_steps`` of ``env`` under small-σ baseline (or random)
+    exploration and return ``(raw_rewards, obs_trace)``.  Pure-collect
+    helper — does not mutate ``env.reward_scale`` (caller pins it to 1.0
+    first).  Used by ``calibrate_reward_scale`` for σ-ladder retries.
+    """
+    raw_rewards: List[float] = []
+    obs_trace: List[np.ndarray] = []
+    env.reset(exploration=True)
+    for _ in range(int(n_steps)):
+        if mode == 'random':
+            a = rng.uniform(-1.0, 1.0,
+                              size=(env.action_dim,)).astype('float32')
+        else:  # 'baseline' (σ may be 0.0 ⇒ pure zero-action probe)
+            if sigma <= 0.0:
+                a = np.zeros((env.action_dim,), dtype='float32')
+            else:
+                a = rng.normal(0.0, float(sigma),
+                                size=(env.action_dim,)).astype('float32')
+                np.clip(a, -1.0, 1.0, out=a)
+        obs, _, done, info = env.step(a)
+        raw_rewards.append(float(info.get('raw_reward', 0.0)))
+        try:
+            obs_trace.append(np.asarray(obs, dtype='float32').copy())
+        except Exception:
+            pass
+        if done:
+            env.reset(exploration=True)
+    return raw_rewards, obs_trace
 
 
 def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
@@ -2029,79 +1908,135 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
                             mode: str = 'baseline',
                             baseline_action_std: float = 0.05,
                             target_mode: str = 'percentile',
-                            target_percentile: float = 95.0,
-                            target_percentile_value: float = 1.0,
+                            target_percentile: float = 50.0,
+                            target_percentile_value: float = 0.5,
                             ) -> Dict[str, float]:
     """Empirically choose a per-step reward scale to match V4's twohot range.
 
     ``mode='baseline'`` (default, P0 fix): drive the env with small-noise
-    actions around mid-MV (``a ~ N(0, baseline_action_std)`` clipped to
-    ``[-1, 1]``).  This produces the *operating-region* reward distribution
-    that the agent will actually see once it has learned to stay near
-    safe set-points, instead of the violation-saturated distribution
-    produced by uniform-random actions.  Avoids baking the ``raw_min ~
-    -250`` cliff into ``reward_scale``.
+    actions around mid-MV (``a ~ N(0, σ)`` clipped to ``[-1, 1]``) to
+    sample the *operating-region* reward distribution rather than the
+    violation-saturated distribution produced by aggressive exploration.
 
     ``mode='random'``: legacy behaviour (uniform on ``[-1, 1]``); kept
     for back-compat / debugging.
 
-    ``target_mode='percentile'`` (default, root-cause fix 2026-05-07):
-    pick scale so that the ``target_percentile``-th percentile of
-    ``|raw_reward|`` maps to ``target_percentile_value`` (default p95
-    → 1.0).  Robust to bimodal/long-tailed APC reward distributions
-    where ``std``-based calibration is dominated by the violation cliff
-    and yields a degenerate scale.  After scaling, the 'normal'
-    operating mass lands in ``[-1, +1]`` and the cliff lands at
-    ``raw_min/p95`` which symlog spreads safely inside the
-    ``[-20, +20]`` twohot support.
+    σ-ladder (root-cause fix 2026-05-19, plant-agnostic):  the caller's
+    ``baseline_action_std`` is treated as an *upper bound*; the
+    calibrator iterates a fixed ladder ``(0.05, 0.02, 0.005, 0.0)``
+    capped by the caller's value, and stops at the first σ whose
+    rollout is *not* "violation-dominated".  A rollout is
+    violation-dominated when ``|raw_mean| > 0.5 * p95(|raw|)`` — i.e.
+    the typical step is closer to the cliff than to the safe region.
+    This generalises to any simulator because the criterion is
+    dimensionless and the σ-ladder lives in normalised action space.
+
+    Tripwire (plant-agnostic): if *even* σ=0 (pure zero-action) yields
+    a violation-dominated distribution, the simulator's ``reset()`` is
+    returning out-of-spec states.  Raises ``RuntimeError`` with a
+    diagnostic dict so the user fixes the sim/bounds rather than
+    silently training on a degenerate reward scale.
+
+    ``target_mode='percentile'`` (default): pick scale so that the
+    ``target_percentile``-th percentile of ``|raw_reward|`` maps to
+    ``target_percentile_value``.  Default p50 → 0.5 (median |reward|
+    becomes symlog magnitude ≈0.5, occupying ~3 twohot bins from zero
+    ⇒ operating-region span ≈6 bins, enough discrimination for the
+    critic).  The historical p95→1.0 was robust against the violation
+    cliff *only* when calibration sampled the operating region; the
+    σ-ladder above now guarantees that, so p50 is safe and gives
+    better operating-region resolution.
 
     ``target_mode='std'``: legacy behaviour, ``scale = target_std/std``.
-
-    The historical ``min_scale=1.0`` clamp was a transposition bug that
-    *prevented scaling rewards down* — it has been fixed to ``1e-4``
-    so the calibrator can actually move into the V3/V4 design range
-    (rewards O(1) before symlog).
     """
     if env.reward_scale != 1.0:
         env.reward_scale = 1.0
-    raw_rewards: List[float] = []
-    obs_trace: List[np.ndarray] = []
-    env.reset(exploration=True)
     mode = str(mode).lower()
     target_mode = str(target_mode).lower()
-    for _ in range(int(n_steps)):
-        if mode == 'random':
-            a = rng.uniform(-1.0, 1.0,
-                              size=(env.action_dim,)).astype('float32')
-        else:  # 'baseline'
-            a = rng.normal(0.0, float(baseline_action_std),
-                            size=(env.action_dim,)).astype('float32')
-            np.clip(a, -1.0, 1.0, out=a)
-        obs, _, done, info = env.step(a)
-        raw_rewards.append(float(info.get('raw_reward', 0.0)))
-        try:
-            obs_trace.append(np.asarray(obs, dtype='float32').copy())
-        except Exception:
-            pass
-        if done:
-            env.reset(exploration=True)
+
+    # ---- σ-ladder: try progressively smaller exploration noise until
+    # the calibration rollout is no longer violation-dominated.  The
+    # caller's ``baseline_action_std`` caps the ladder so we never
+    # explore *more* aggressively than the caller requested, only less.
+    caller_sigma = max(0.0, float(baseline_action_std))
+    if mode == 'random':
+        # Random mode bypasses the ladder (legacy debug path).
+        sigma_ladder: Tuple[float, ...] = (caller_sigma,)
+    else:
+        sigma_ladder = tuple(
+            s for s in _REWARD_CAL_SIGMA_LADDER if s <= caller_sigma + 1e-9
+        )
+        if not sigma_ladder:
+            sigma_ladder = (caller_sigma,)
+
+    raw_rewards: List[float] = []
+    obs_trace: List[np.ndarray] = []
+    ladder_attempts: List[Dict[str, float]] = []
+    sigma_used: float = float(sigma_ladder[0])
+    violation_dominated = True
+    for sigma in sigma_ladder:
+        raw_rewards, obs_trace = _collect_calibration_rewards(
+            env, rng, n_steps, mode, float(sigma))
+        arr_probe = np.asarray(raw_rewards, dtype='float64')
+        if arr_probe.size == 0:
+            ladder_attempts.append({
+                'sigma': float(sigma), 'raw_mean': 0.0,
+                'raw_abs_p95': 0.0, 'violation_dominated': True,
+                'reason': 'no_samples',
+            })
+            continue
+        probe_p95 = float(np.percentile(np.abs(arr_probe), 95.0))
+        probe_mean = float(arr_probe.mean())
+        # Violation-dominated iff typical step is closer to cliff than zero.
+        # Equivalent test: |mean| > ratio * p95(|raw|).  Dimensionless.
+        vd = (probe_p95 > 1e-8) and (
+            abs(probe_mean) > _REWARD_CAL_VIOLATION_RATIO * probe_p95)
+        ladder_attempts.append({
+            'sigma': float(sigma), 'raw_mean': probe_mean,
+            'raw_abs_p95': probe_p95,
+            'violation_dominated': bool(vd),
+        })
+        sigma_used = float(sigma)
+        violation_dominated = bool(vd)
+        if not vd:
+            break  # success: operating-region sample obtained
+
+    if violation_dominated and mode != 'random':
+        # Tripwire: every σ on the ladder (including σ=0) put the env in
+        # sustained violation ⇒ plant resets out-of-spec.  This is a
+        # simulator/bounds bug, not a calibration knob.  Fail loudly so
+        # the user fixes the sim or relaxes the bounds rather than
+        # training on a degenerate reward scale.  Scoped to baseline
+        # mode; ``mode='random'`` is a legacy debug path that may
+        # legitimately produce a violation-dominated sample.
+        raise RuntimeError(
+            "[reward-scale] Calibration cannot find an operating-region "
+            "sample: every σ on the ladder yielded a violation-dominated "
+            "reward distribution (|raw_mean| > "
+            f"{_REWARD_CAL_VIOLATION_RATIO} * p95(|raw|)). The plant's "
+            "reset() is producing out-of-spec initial states or the "
+            "control bounds are infeasible. Inspect control_objective.json "
+            "(MV/CV bounds), simulator.reset(), and any setpoint "
+            f"manager. Ladder diagnostics: {ladder_attempts}"
+        )
+
     arr = np.asarray(raw_rewards, dtype='float64')
     std = float(arr.std())
     mean = float(arr.mean())
     abs_arr = np.abs(arr)
-    pct_q = float(np.clip(target_percentile, 50.0, 99.9))
-    p95_abs = float(np.percentile(abs_arr, pct_q)) if abs_arr.size else 0.0
+    pct_q = float(np.clip(target_percentile, 1.0, 99.9))
+    p_target_abs = float(np.percentile(abs_arr, pct_q)) if abs_arr.size else 0.0
     if target_mode == 'std':
         if std < 1e-8:
             scale = 1.0
         else:
             scale = float(target_std / std)
     else:  # 'percentile'
-        if p95_abs < 1e-8:
+        if p_target_abs < 1e-8:
             # Degenerate: fall back to std-based, then to identity.
             scale = float(target_std / std) if std >= 1e-8 else 1.0
         else:
-            scale = float(target_percentile_value / p95_abs)
+            scale = float(target_percentile_value / p_target_abs)
     scale_unclamped = scale
     scale = float(np.clip(scale, min_scale, max_scale))
     env.reward_scale = scale
@@ -2121,11 +2056,30 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     sym_mag = max(abs(sym_min), abs(sym_max))
     twohot_warn = sym_mag > 5.0
     twohot_critical = sym_mag > 15.0
+    # Bin-coverage diagnostic (root-cause fix 2026-05-19): how many
+    # twohot bins receive non-trivial mass under the chosen scale.
+    # If top-1 bin holds >80% of mass, the head cannot discriminate
+    # operating-region states and critic learning will collapse.
+    bin_centers = np.linspace(-20.0, 20.0, 255)
+    sym_scaled = np.sign(arr * scale) * np.log1p(np.abs(arr * scale))
+    idx = np.clip(np.searchsorted(bin_centers, sym_scaled, side='left'), 1, 254)
+    left = idx - 1
+    right = idx
+    wr = np.clip((sym_scaled - bin_centers[left]) /
+                  np.maximum(bin_centers[right] - bin_centers[left], 1e-8),
+                  0.0, 1.0)
+    wl = 1.0 - wr
+    mass = np.zeros(255, dtype='float64')
+    np.add.at(mass, left, wl); np.add.at(mass, right, wr)
+    mass_frac = mass / max(mass.sum(), 1e-12)
+    active_bins = int((mass_frac > 1e-3).sum())
+    top1_mass = float(mass_frac.max())
+    bin_coverage_critical = top1_mass > 0.80
     return {
         'reward_scale': scale, 'reward_scale_unclamped': scale_unclamped,
         'raw_std': std, 'raw_mean': mean,
         'raw_min': raw_min, 'raw_max': raw_max,
-        'raw_abs_p95': p95_abs,
+        'raw_abs_p95': p_target_abs,
         'target_std': float(target_std),
         'target_mode': target_mode,
         'target_percentile': pct_q,
@@ -2135,9 +2089,15 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
         'scaled_symlog_mag': sym_mag,
         'twohot_support_warn': bool(twohot_warn),
         'twohot_support_critical': bool(twohot_critical),
+        'twohot_active_bins': active_bins,
+        'twohot_top1_mass': top1_mass,
+        'twohot_bin_coverage_critical': bool(bin_coverage_critical),
         'min_scale': float(min_scale), 'max_scale': float(max_scale),
         'n_steps': int(n_steps),
-        'mode': mode, 'baseline_action_std': float(baseline_action_std),
+        'mode': mode,
+        'baseline_action_std': float(sigma_used),
+        'baseline_action_std_requested': float(caller_sigma),
+        'sigma_ladder_attempts': ladder_attempts,
         '_obs_trace': obs_trace,
     }
 
@@ -2320,14 +2280,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             'percentile').strip().lower() or 'percentile'
         try:
             cal_target_pct = float(os.environ.get(
-                'DREAMER_REWARD_CAL_PCT', '95') or 95.0)
+                'DREAMER_REWARD_CAL_PCT', '50') or 50.0)
         except Exception:
-            cal_target_pct = 95.0
+            cal_target_pct = 50.0
         try:
             cal_target_pct_value = float(os.environ.get(
-                'DREAMER_REWARD_CAL_PCT_VAL', '1.0') or 1.0)
+                'DREAMER_REWARD_CAL_PCT_VAL', '0.5') or 0.5)
         except Exception:
-            cal_target_pct_value = 1.0
+            cal_target_pct_value = 0.5
         # Cover at least 2 episodes so the cohort is representative
         # (paper-aligned: V3 calibrates on rolling buffer of full episodes).
         ep_len = max(1, int(getattr(cfg, 'episode_length', 1500) or 1500))
@@ -2372,6 +2332,27 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"{cal['scaled_symlog_mag']:.2f} > 5 — twohot head is "
                   f"in the high-curvature region; consider reducing "
                   f"DREAMER_REWARD_CAL_PCT_VAL.", flush=True)
+        # Bin-coverage tripwire (2026-05-19): if the chosen scale
+        # collapses operating-region rewards into ≤1 twohot bin, the
+        # critic cannot learn a useful gradient and training will
+        # diverge.  Plant-agnostic check: top-1 bin mass > 80%.
+        if cal.get('twohot_bin_coverage_critical'):
+            print(f"[reward-scale] CRITICAL: twohot bin coverage is "
+                  f"degenerate — top-1 bin holds "
+                  f"{cal['twohot_top1_mass']*100:.1f}% of operating-region "
+                  f"reward mass across only {cal['twohot_active_bins']} "
+                  f"active bins of 255.  The reward/critic head cannot "
+                  f"discriminate operating-region states.  Increase "
+                  f"reward_scale (e.g. raise DREAMER_REWARD_CAL_PCT_VAL "
+                  f"toward 1.0) or shrink DREAMER_REWARD_CAL_PCT.",
+                  flush=True)
+        else:
+            print(f"[reward-scale] bin coverage: "
+                  f"{cal['twohot_active_bins']} active bins, "
+                  f"top-1 mass {cal['twohot_top1_mass']*100:.1f}% "
+                  f"(σ_used={cal['baseline_action_std']:.4f}, "
+                  f"σ_requested={cal['baseline_action_std_requested']:.4f})",
+                  flush=True)
         out_dir_pre = Path(cfg.out_dir or '.')
         out_dir_pre.mkdir(parents=True, exist_ok=True)
         try:
@@ -2573,35 +2554,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     t_sample_acc = 0.0
     t_wm_acc = 0.0
     t_ac_acc = 0.0
-    # ---- Runtime gates (2026-05-08, run_p7 RCA) ----
-    # (1) Critic-stability gate: rolling window of P3 critic_loss to
-    # decide when the actor may unfreeze.  See cfg.p3_critic_stability_*.
-    crit_stab_win = max(0, int(getattr(
-        cfg, 'p3_critic_stability_window_iters', 0)))
-    critic_loss_window: 'deque[float]' = deque(maxlen=max(1, crit_stab_win))
-    actor_release_iter: Optional[int] = None
-    # (2) Entropy-decay-on-saturation: track consecutive iters where
-    # the actor's implied σ (= exp(H_diff) / sqrt(2πe)) is within
-    # ``pmpo_entropy_saturation_frac`` of σ_max.  We compare in
-    # σ-space rather than H-space because differential entropy goes
-    # negative for σ < 1/sqrt(2πe) ≈ 0.24 (which is exactly the
-    # tight-exploration regime we care about), making H/H_max
-    # fractions misbehave.
-    sat_window = max(0, int(getattr(
-        cfg, 'pmpo_entropy_saturation_window_iters', 0)))
-    sat_frac = float(getattr(cfg, 'pmpo_entropy_saturation_frac', 0.95))
-    sat_decay = float(getattr(cfg, 'pmpo_entropy_saturation_decay', 0.5))
-    eta_floor = float(getattr(cfg, 'pmpo_entropy_coef_min', 1e-6))
-    sat_enabled = bool(getattr(cfg, 'pmpo_entropy_decay_on_saturation', True))
-    sat_consec_iters = 0
-    sat_decay_events = 0
-    try:
-        sigma_max_live = float(np.exp(float(getattr(cfg,
-            'policy_log_std_max', 0.0))))
-    except Exception:
-        sigma_max_live = 1.0
-    sat_sigma_thresh = float(sat_frac) * float(sigma_max_live)
-    _sqrt_2pie = float(np.sqrt(2.0 * np.pi * np.e))
 
     # ----- Early-stop bookkeeping -----
     es_enable = bool(getattr(cfg, 'early_stop_enable', True))
@@ -2639,9 +2591,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_losses: Dict = {}
     ag_losses: Dict = {}
     ac_losses: Dict = {}
-    # P1 extension counter — incremented when WM fails the sf-loss gate
-    # and the trainer steals budget from P3 to give WM more time.
-    extra_p1_steps: int = 0
 
     def _phase_for(env_steps: int) -> int:
         if env_steps < p1:
@@ -2698,86 +2647,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # surfaces in summary and is also re-detected in
             # ``evaluation/diagnostics.py``.
             if es_enable and current_phase == 1 and new_phase == 2:
-                # ----- Unified P1->P2 gate (run_p11 RCA + 2026-05-10 unify) -----
-                # Primary signal: open-loop k-step WM fidelity (rollout-r).
-                # This is the quantity the critic actually depends on
-                # (the imagined H-step return).  ``sf_loss`` is kept as
-                # a secondary fallback signal because it can decrease
-                # while compounding-rollout r stays awful (run_p11:
-                # sf 1.00->0.94 but r(H=28)=0.08).
-                #
-                # Decision logic (in order):
-                #   1. If rollout-r passes at full horizon H -> proceed
-                #      to P2 with the original horizon.
-                #   2. Else if P1-extension budget remains -> EXTEND P1
-                #      (steal from P3) and stay in P1.  Re-probe at
-                #      the next boundary.
-                #   3. Else (extension exhausted) -> CLIP horizon to
-                #      the deepest reliable offset as a last resort.
-                #
-                # ``sf_loss`` is logged as a flag if it didn't drop,
-                # but no longer drives the extension decision on its
-                # own.
-                probe = _probe_wm_fidelity(model, env, device, cfg)
-                wm_passes = bool(probe and probe['passes_full'])
-                if probe is not None:
-                    print(f"[wm-fidelity-probe] {probe['summary']} "
-                          f"floor={probe['r_floor']:.2f} "
-                          f"best_h={probe['best_h']}/{probe['H']} "
-                          f"passes_full={wm_passes}", flush=True)
-                # secondary sf_loss diagnostic (informational)
-                min_drop = float(getattr(cfg, 'early_stop_p1_min_sf_drop_frac', 0.0))
-                sf_drop = None
-                if (min_drop > 0 and p1_initial_sf is not None):
+                # P1→P2 transition: WM training done, hand off to P2
+                # (paper Algorithm 1).  The runtime WM-fidelity probe +
+                # P1-extension + horizon-clip mechanism was removed
+                # 2026-05-20; the 1M-step default budget gives P1
+                # enough time at the paper-default H=15.
+                if p1_initial_sf is not None and 'sf_loss' in wm_losses:
                     last_sf = float(wm_losses.get('sf_loss', p1_initial_sf))
-                    sf_drop = (p1_initial_sf - last_sf) / max(1e-8, abs(p1_initial_sf))
-                # extension budget bookkeeping
-                ext_frac = float(os.environ.get(
-                    'DREAMER_P1_EXTENSION_MAX_FRAC', '0.30'))
-                ext_frac = float(np.clip(ext_frac, 0.0, 0.5))
-                ext_used = int(extra_p1_steps)
-                ext_budget = int(ext_frac * cfg.total_steps)
-                ext_available = ext_used < ext_budget
-
-                if not wm_passes and ext_available and probe is not None:
-                    # CASE 2: extend P1
-                    step_chunk = max(
-                        int(cfg.episode_length),
-                        int(0.10 * cfg.total_steps))
-                    grant = min(step_chunk, ext_budget - ext_used)
-                    extra_p1_steps += grant
-                    print(f"[p1-extension] WM not reliable at H={probe['H']} "
-                          f"(best_h={probe['best_h']}, "
-                          f"r_floor={probe['r_floor']:.2f}); "
-                          f"extending P1 by {grant} steps "
-                          f"(total extension={extra_p1_steps}, "
-                          f"cap={ext_budget})"
-                          + (f"  sf_drop={sf_drop*100:.1f}%" if sf_drop is not None else ""),
-                          flush=True)
-                    p1 = p1 + grant
-                    p3 = max(int(cfg.episode_length),
-                             cfg.total_steps - p1 - p2)
-                    # Stay in P1; re-evaluate at next boundary.
-                    new_phase = 1
-                elif not wm_passes and not ext_available:
-                    # CASE 3: extension exhausted -> clip horizon
-                    msg = (f"P1: WM still not reliable at full horizon "
-                           f"after extension budget exhausted "
-                           f"(best_h={probe['best_h'] if probe else 'n/a'}); "
-                           f"falling back to horizon clip")
-                    print(f'[early-stop-flag] {msg}', flush=True)
-                    mid_check_flags.append(msg)
-                    if sf_drop is not None and sf_drop < min_drop:
-                        mid_check_flags.append(
-                            f"P1: sf_loss drop {sf_drop*100:.1f}% < "
-                            f"{min_drop*100:.1f}% (informational)")
-                    try:
-                        _maybe_clip_horizon_to_wm_fidelity(
-                            model, env, device, cfg)
-                    except Exception as e:
-                        print(f'[wm-fidelity-probe] error: {e!r}', flush=True)
-                # CASE 1: wm_passes -> proceed to P2 with original horizon.
-                # (No clip, no extension.)
+                    print(f"[p1→p2] sf_loss {p1_initial_sf:.4f} → "
+                          f"{last_sf:.4f}", flush=True)
             if es_enable and current_phase == 2 and new_phase == 3:
                 # End of P2: is reward MTP head learning?
                 max_rmtp = float(getattr(cfg, 'early_stop_p2_max_reward_mtp_loss',
@@ -2984,63 +2862,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     ac_losses = imagination_step(model, batch, cfg)
                 opt_actor.zero_grad(set_to_none=True)
                 opt_critic.zero_grad(set_to_none=True)
-                # Critic warm-up (2026-05-06): for the first
-                # ``p3_critic_warmup_iters`` P3 iters, only step the
-                # critic; freeze the actor.  This prevents a freshly
-                # initialised value head from feeding noisy advantages
-                # into REINFORCE — under-trained-critic + negative-
-                # advantage noise reliably saturates ``log_std`` against
-                # the σ clamp ceiling within 1–2 batches.  Letting the
-                # critic see real imagined returns first (TD-λ
-                # bootstrap) before the actor reacts to its baseline
-                # mirrors the actor-critic warm-up convention from
-                # DreamerV3 community implementations.  Paper-aligned
-                # in spirit (V3 §3.3 EMA-target stabilisation has the
-                # same goal); the explicit iteration cap is a stronger
-                # version that helps when the P3 budget is short
-                # relative to the WM/critic settling time.
-                p3_warmup = int(getattr(cfg, 'p3_critic_warmup_iters', 0))
-                # Critic-stability gate (2026-05-08): if the recent
-                # critic_loss is still oscillating wildly (high CV),
-                # keep the actor frozen even past the fixed warm-up.
-                # Hard-cap at p3_critic_stability_max_warmup_iters so a
-                # flat-but-noisy critic cannot block training forever.
-                stab_cap = int(getattr(cfg,
-                    'p3_critic_stability_max_warmup_iters', 60))
-                stab_cv_thresh = float(getattr(cfg,
-                    'p3_critic_stability_max_cv', 0.5))
-                fixed_done = (p3_warmup <= 0) or (p3_iters >= p3_warmup)
-                stable = True
-                if (crit_stab_win > 0 and len(critic_loss_window) >=
-                        crit_stab_win):
-                    arr = np.asarray(critic_loss_window, dtype='float64')
-                    mu = float(np.mean(arr))
-                    sd = float(np.std(arr))
-                    cv = sd / max(1e-6, abs(mu))
-                    stable = (cv <= stab_cv_thresh)
-                # Once released, stay released (don't re-freeze).
-                if actor_release_iter is None:
-                    if p3_iters >= stab_cap:
-                        actor_release_iter = p3_iters
-                        if fixed_done and not stable:
-                            print(f'[critic-stab] p3_iter={p3_iters}: '
-                                  f'releasing actor at hard cap '
-                                  f'(critic_loss CV still > '
-                                  f'{stab_cv_thresh:.2f})', flush=True)
-                    elif fixed_done and stable:
-                        actor_release_iter = p3_iters
-                        if crit_stab_win > 0:
-                            print(f'[critic-stab] p3_iter={p3_iters}: '
-                                  f'releasing actor (critic_loss CV '
-                                  f'≤ {stab_cv_thresh:.2f})', flush=True)
-                actor_frozen = (actor_release_iter is None)
-                if actor_frozen:
-                    # Backprop only the critic loss to keep the actor
-                    # graph frozen (actor params receive no gradient).
-                    ac_losses['critic_loss'].backward()
-                else:
-                    (ac_losses['actor_loss']
-                     + ac_losses['critic_loss']).backward()
+                (ac_losses['actor_loss']
+                 + ac_losses['critic_loss']).backward()
                 actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters_actor(), cfg.grad_clip)
                 critic_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -3051,8 +2874,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     opt_actor.zero_grad(set_to_none=True)
                     opt_critic.zero_grad(set_to_none=True)
                 else:
-                    if not actor_frozen:
-                        opt_actor.step()
+                    opt_actor.step()
                     opt_critic.step()
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
@@ -3060,57 +2882,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         total_iters += 1
         if current_phase == 3:
             p3_iters += 1
-            # ---- Critic-stability gate book-keeping (run_p7 RCA) ----
-            try:
-                cl_t = ac_losses.get('critic_loss')
-                if cl_t is not None:
-                    critic_loss_window.append(float(cl_t.detach().item()))
-            except Exception:
-                pass
-            # ---- Adaptive entropy decay on σ-saturation ------------
-            # Detect when the actor's implied σ is pinned at the
-            # σ_max ceiling for sat_window consecutive iters → decay
-            # η so PG can pull σ down toward the learned mean.
-            #
-            # 2026-05-19 (p26 RCA): the saturation counter must NOT
-            # advance while the actor is still frozen by
-            # ``p3_critic_warmup_iters`` / the critic-stability gate.
-            # A frozen actor sits at its init σ (or whatever value
-            # the Phase-1/2 WM updates left it at) by definition, so
-            # counting those iters toward "σ stuck at ceiling" fires
-            # the decay before the actor has had any chance to move.
-            # In p26 this halved η before the actor was even released,
-            # leaving it under-incentivised to explore once unfrozen.
-            actor_is_released = (actor_release_iter is not None)
-            if (sat_enabled and sat_window > 0 and sigma_max_live > 0.0
-                    and actor_is_released):
-                try:
-                    H_now = float(ac_losses.get('actor_entropy_bonus',
-                        torch.tensor(0.0)).detach().item())
-                except Exception:
-                    H_now = 0.0
-                # σ_implied from differential entropy of N(μ, σ):
-                # H = 0.5 ln(2πe σ²) ⇒ σ = exp(H) / sqrt(2πe).
-                sigma_implied = float(np.exp(H_now)) / _sqrt_2pie
-                if sigma_implied >= sat_sigma_thresh:
-                    sat_consec_iters += 1
-                else:
-                    sat_consec_iters = 0
-                if sat_consec_iters >= sat_window:
-                    eta_old = float(getattr(cfg, 'pmpo_entropy_coef', 0.0))
-                    eta_new = max(eta_floor, eta_old * sat_decay)
-                    if eta_new < eta_old - 1e-12:
-                        cfg.pmpo_entropy_coef = float(eta_new)
-                        sat_decay_events += 1
-                        print(f'[entropy-decay] p3_iter={p3_iters}: '
-                              f'σ_implied={sigma_implied:.3f} ≥ '
-                              f'{sat_sigma_thresh:.3f} '
-                              f'(={sat_frac:.2f}×σ_max) for '
-                              f'{sat_consec_iters} iters; η: '
-                              f'{eta_old:.2e} → {eta_new:.2e} '
-                              f'(event #{sat_decay_events})',
-                              flush=True)
-                    sat_consec_iters = 0
 
         if total_iters % cfg.log_every == 0:
             now = time.time()
@@ -3458,6 +3229,27 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     except Exception as e:
         print(f'[train] training_diagnostics.png skipped: {e!r}', flush=True)
 
+    # ---------------------------------------------------------------
+    # End-of-training WM steady-state diagnostic.
+    # Probes whether the trained world model can represent the
+    # steady-state (not just transients) the actor's imagined
+    # rollouts depend on for terminal-value bootstrapping.  Cheap on
+    # GPU (~10s); falls back to CPU if GPU is busy.  Disable with
+    # DREAMER_RUN_WM_DIAGNOSTIC=0.
+    # ---------------------------------------------------------------
+    if int(os.environ.get('DREAMER_RUN_WM_DIAGNOSTIC', '1') or 0) == 1:
+        try:
+            from tools.wm_steady_state_diagnostic import (
+                run_wm_steady_state_diagnostic)
+            n_starts = int(os.environ.get('DREAMER_WM_DIAG_N_STARTS', '8'))
+            horizon = int(os.environ.get('DREAMER_WM_DIAG_HORIZON', '200'))
+            run_wm_steady_state_diagnostic(
+                out_dir, ckpt_name='final.pt',
+                n_starts=n_starts, horizon=horizon)
+        except Exception as e:
+            print(f'[train] wm_steady_state_diagnostic skipped: {e!r}',
+                   flush=True)
+
     return {
         'final_ckpt': str(final_path), 'iters': total_iters,
         'env_steps': total_env_steps,
@@ -3522,8 +3314,6 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
         ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
         ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
-        ('DREAMER_P3_CRITIC_WARMUP_ITERS', 'p3_critic_warmup_iters', int),
-        ('DREAMER_P3_CRITIC_CV_MAX', 'p3_critic_stability_max_cv', float),
         ('DREAMER_P3_COLLECT_EVERY', 'phase3_collect_every_iters', int),
         ('DREAMER_BUFFER_CAP_STEPS', 'buffer_capacity_steps', int),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
