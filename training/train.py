@@ -975,11 +975,24 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     episode forces the WM to learn the long-tail steady-state of the
     plant at this operating point.
 
+    The curriculum disturbance schedule is **suppressed** for these
+    episodes (``env._schedule = []``) so the WM sees a clean settled
+    response — a CV/DV step partway through would defeat the purpose.
+    Domain randomization, OU process noise, and measurement noise remain
+    active (DR fires in ``sim.reset()`` upstream of the schedule build,
+    so it is untouched; OU/measurement live in the ``SimNoiseWrapper``
+    and are independent of ``_schedule``).  This is sim-agnostic:
+    ``APCEnv._schedule`` is the single hook used by every simulator.
+
     ``action_level`` is in the env's normalized action space and is
     clipped to ``[-1, 1]``.  Returns the same dict shape as
     ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
+    # Clear curriculum disturbance schedule so this seed is a clean
+    # held-action steady-state probe.  DR + OU + measurement noise stay
+    # active.
+    env._schedule = []
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     obs_buf = np.zeros((T, L, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
