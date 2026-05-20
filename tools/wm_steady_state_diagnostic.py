@@ -1,0 +1,608 @@
+"""WM steady-state imagination diagnostic.
+
+Probes whether the trained world model, asked to imagine far past its
+training horizon, produces:
+
+  (1) a CONVERGING trajectory in decoded-obs space (sign of stable
+      latent dynamics, not divergence);
+  (2) a steady-state value that MATCHES the real simulator's
+      steady-state from the same initial state under the same
+      constant action (sign of correct steady-state physics, not just
+      stable but-wrong dynamics);
+  (3) reasonable per-step prediction accuracy over the *training*
+      imagination horizon ``H`` so we can see whether 1+2 actually
+      matter or whether the WM is already lost by step H.
+
+Three rollout protocols are run from the same N starting states:
+
+  * ``replay``  — apply the same actions the real env took, measures
+                  pure dynamics-prediction accuracy.
+  * ``zero``    — hold action=0 (mid-MV), measures whether WM
+                  converges to a sensible steady-state.
+  * ``constant`` — hold a randomly-sampled but persistent action,
+                  same convergence question at a different operating
+                  point.
+
+For each protocol we report per-step MAE in the env's CV channel(s),
+final-step (steady-state) error vs. simulator ground truth, and a
+"converged" flag (true if obs std over the last 20 steps < ε).
+
+GPU/CPU selection: auto-detects GPU utilization via ``nvidia-smi`` and
+falls back to CPU if utilization >50% or memory_used/total >0.5. Can
+be forced with ``DREAMER_WM_DIAG_DEVICE={cpu,cuda}``.
+
+CLI::
+
+    python tools/wm_steady_state_diagnostic.py \
+        --run-dir output/test_sim/run_xxx \
+        --ckpt   ckpt_iter_00160.pt        # optional, default = best.pt or final.pt
+        --n-starts 8 \
+        --horizon 200
+
+Outputs: ``<run-dir>/wm_steady_state_diagnostic.json`` and (if
+matplotlib is available) ``wm_steady_state_diagnostic.png``.
+
+Importable as ``run_wm_steady_state_diagnostic(run_dir, ...)`` for
+the end-of-training hook in ``training/train.py``.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+from dataclasses import asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+# Allow `import training.train` from the repo root.
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+
+# ---------------------------------------------------------------------------
+# Device selection
+# ---------------------------------------------------------------------------
+
+def _gpu_busy(util_threshold_pct: float = 50.0,
+              mem_threshold_frac: float = 0.5) -> Tuple[bool, str]:
+    """Return ``(is_busy, reason_str)`` from ``nvidia-smi``.
+
+    ``is_busy=True`` means the script should fall back to CPU. Quiet
+    fallback also on any error (no nvidia driver, no GPU at all, etc.).
+    """
+    if not torch.cuda.is_available():
+        return True, 'cuda_unavailable'
+    try:
+        out = subprocess.check_output(
+            ['nvidia-smi',
+             '--query-gpu=utilization.gpu,memory.used,memory.total',
+             '--format=csv,noheader,nounits'],
+            stderr=subprocess.DEVNULL, timeout=5).decode()
+    except Exception as e:
+        return True, f'nvidia_smi_failed:{e!r}'
+    lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+    if not lines:
+        return True, 'nvidia_smi_no_lines'
+    # Take the busiest GPU (some systems have multiple).
+    parts = [ln.split(',') for ln in lines]
+    util = max(float(p[0]) for p in parts)
+    mem_used = max(float(p[1]) for p in parts)
+    mem_total = max(float(p[2]) for p in parts)
+    mem_frac = mem_used / max(mem_total, 1.0)
+    busy = (util > util_threshold_pct) or (mem_frac > mem_threshold_frac)
+    reason = (f'util={util:.0f}% mem_used={mem_used:.0f}/{mem_total:.0f}MiB '
+              f'({mem_frac*100:.0f}%)')
+    return bool(busy), reason
+
+
+def _pick_device() -> Tuple[torch.device, str]:
+    """Honour ``DREAMER_WM_DIAG_DEVICE`` override; else auto-detect."""
+    forced = os.environ.get('DREAMER_WM_DIAG_DEVICE', '').strip().lower()
+    if forced in ('cpu',):
+        return torch.device('cpu'), 'forced_cpu'
+    if forced in ('cuda', 'gpu'):
+        if not torch.cuda.is_available():
+            return torch.device('cpu'), 'forced_cuda_unavailable_fallback_cpu'
+        return torch.device('cuda'), 'forced_cuda'
+    busy, reason = _gpu_busy()
+    if busy:
+        return torch.device('cpu'), f'cpu_auto_gpu_busy({reason})'
+    return torch.device('cuda'), f'cuda_auto_gpu_free({reason})'
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint discovery + loading
+# ---------------------------------------------------------------------------
+
+def _find_ckpt(run_dir: Path, ckpt_name: Optional[str] = None) -> Path:
+    """Resolve a checkpoint to load.
+
+    Priority: ``ckpt_name`` if given → ``final.pt`` → ``best.pt`` →
+    latest ``ckpt_iter_NNNNN.pt``.
+    """
+    if ckpt_name:
+        p = run_dir / ckpt_name
+        if not p.exists():
+            raise FileNotFoundError(f'requested ckpt not found: {p}')
+        return p
+    for name in ('final.pt', 'best.pt'):
+        p = run_dir / name
+        if p.exists():
+            return p
+    iters = sorted(run_dir.glob('ckpt_iter_*.pt'))
+    if iters:
+        return iters[-1]
+    raise FileNotFoundError(f'no checkpoint in {run_dir}')
+
+
+def _load_model(ckpt_path: Path, device: torch.device):
+    """Load DreamerV4 model + cfg from a checkpoint."""
+    from training.train import TrainConfig
+    from models.dreamer_v4 import DreamerV4, DreamerV4Config
+
+    ckpt_obj = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    cfg_dict = ckpt_obj.get('cfg') or {}
+    valid_keys = set(TrainConfig.__dataclass_fields__.keys())
+    cfg = TrainConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
+
+    model_cfg = DreamerV4Config(
+        obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
+        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
+        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
+        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
+        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
+        n_action_bins=cfg.n_action_bins,
+        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
+        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
+        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
+        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
+        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
+        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
+        # 'sdpa' is significantly faster on CPU than 'manual' (uses torch's
+        # fused scaled_dot_product_attention which has a vectorised CPU path).
+        attn_impl='sdpa',
+    )
+    model = DreamerV4(model_cfg).to(device)
+    sd = ckpt_obj['model']
+    if any('._orig_mod.' in k for k in sd):
+        sd = {k.replace('._orig_mod.', '.'): v for k, v in sd.items()}
+    model.load_state_dict(sd)
+    model.eval()
+
+    obs_norm = ckpt_obj.get('obs_norm') if isinstance(ckpt_obj, dict) else None
+    return model, cfg, obs_norm
+
+
+# ---------------------------------------------------------------------------
+# Rollout: imagined WM trajectory vs simulator ground truth
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _imagine_open_loop(model, z_history: torch.Tensor,
+                        a_history: torch.Tensor,
+                        action_seq: np.ndarray, n_steps: int,
+                        k_max: int, device: torch.device
+                        ) -> np.ndarray:
+    """Roll the WM forward ``n_steps`` open-loop.
+
+    Inputs:
+      ``z_history``  (L, z_dim)  initial encoded lookback latents
+      ``a_history``  (L, A)      initial action history
+      ``action_seq`` (n_steps, A) actions to apply at each imagined step
+      ``n_steps``    int         imagination length
+
+    Returns ``pred_obs`` of shape ``(n_steps, obs_dim)``.
+    """
+    z_hist = z_history.clone()                                   # (L, z)
+    a_hist = a_history.clone()                                   # (L, A)
+    obs_dim = model.tokenizer.obs_dim
+    out = np.zeros((n_steps, obs_dim), dtype='float32')
+    for kk in range(n_steps):
+        a_step = torch.from_numpy(action_seq[kk]).to(device).unsqueeze(0)  # (1, A)
+        z_next = model.imagine_next_z(
+            z_hist.unsqueeze(0), a_step,
+            k_steps=k_max, tau_ctx=None,
+            action_history=a_hist.unsqueeze(0)).squeeze(0)        # (z,)
+        obs_hat = model.tokenizer.decode(
+            z_next.unsqueeze(0)).squeeze(0).float().cpu().numpy()
+        out[kk] = obs_hat[:obs_dim]
+        z_hist = torch.cat([z_hist[1:], z_next.unsqueeze(0)], dim=0)
+        a_hist = torch.cat([a_hist[1:], a_step], dim=0)
+    return out
+
+
+def _real_open_loop(env, cfg, lookback_obs: np.ndarray,
+                     lookback_act: np.ndarray, action_seq: np.ndarray,
+                     n_steps: int) -> np.ndarray:
+    """Run the *real* simulator from the same lookback state under the
+    same ``action_seq``.  Returns ``real_obs`` of shape
+    ``(n_steps, obs_dim)``.
+
+    The env is the same one used to collect the lookback (state is
+    already at the right point); we just keep stepping.
+    """
+    obs_dim = env.obs_dim
+    real = np.zeros((n_steps, obs_dim), dtype='float32')
+    for kk in range(n_steps):
+        ow_next, _, done, _ = env.step(action_seq[kk])
+        real[kk] = ow_next[-1]
+        if done:
+            real[kk + 1:] = real[kk]  # pad with last seen
+            break
+    return real
+
+
+def _convergence_stats(traj: np.ndarray, tail_frac: float = 0.2,
+                        eps_std: float = 0.05) -> Dict[str, float]:
+    """Did the trajectory converge?
+
+    Looks at the last ``tail_frac`` of steps; reports the per-channel
+    std and the mean drift between halves of the tail.  ``converged``
+    is True if max-channel-std in the tail < ``eps_std``.
+    """
+    T = traj.shape[0]
+    tail = traj[-max(2, int(T * tail_frac)):]                   # (Tt, D)
+    half = tail.shape[0] // 2
+    return {
+        'tail_std_max': float(tail.std(axis=0).max()),
+        'tail_std_mean': float(tail.std(axis=0).mean()),
+        'tail_drift': float(np.abs(tail[half:].mean(0)
+                                    - tail[:half].mean(0)).max()),
+        'final': tail[-1].tolist(),
+        'converged': bool(tail.std(axis=0).max() < eps_std),
+    }
+
+
+def _run_protocol(env, model, cfg, device: torch.device,
+                   rng: np.random.Generator, *,
+                   protocol: str, n_starts: int, lookback_steps: int,
+                   horizon: int, k_max: int) -> Dict:
+    """Run one rollout protocol and aggregate stats over ``n_starts``."""
+    L = lookback_steps
+    obs_dim = env.obs_dim
+    action_dim = env.action_dim
+
+    # Collect a single long real episode under small noise to seed
+    # the lookback windows for all starts.
+    seed_sigma = 0.05
+    env.reset(exploration=False)
+    ep_obs, ep_act = [], []
+    for _ in range(L + n_starts * 4):
+        a = rng.normal(0.0, seed_sigma, size=(action_dim,)).astype('float32')
+        np.clip(a, -1.0, 1.0, out=a)
+        ow_next, _, done, _ = env.step(a)
+        ep_obs.append(ow_next[-1].copy())
+        ep_act.append(a.copy())
+        if done:
+            break
+    ep_obs = np.asarray(ep_obs, dtype='float32')
+    ep_act = np.asarray(ep_act, dtype='float32')
+    T = ep_obs.shape[0]
+    if T < L + 4:
+        return {'error': f'seed episode too short: {T} < L+4={L+4}'}
+
+    starts = rng.integers(L, max(L + 1, T - 1), size=int(n_starts))
+
+    per_start_records: List[Dict] = []
+    for sidx, s in enumerate(starts):
+        s = int(s)
+        lookback_obs = ep_obs[s - L:s].copy()
+        lookback_act = ep_act[s - L:s].copy()
+
+        # Build the action sequence for the requested protocol.
+        if protocol == 'replay':
+            # Re-run the seed-noise pattern (small N(0, 0.05)) starting
+            # from the same state. The lookback already used small noise
+            # so this is the "natural continuation" of the trajectory.
+            act_seq = rng.normal(0.0, seed_sigma,
+                                  size=(horizon, action_dim)).astype('float32')
+            np.clip(act_seq, -1.0, 1.0, out=act_seq)
+        elif protocol == 'zero':
+            act_seq = np.zeros((horizon, action_dim), dtype='float32')
+        elif protocol == 'constant':
+            a_const = rng.uniform(-0.5, 0.5,
+                                   size=(action_dim,)).astype('float32')
+            act_seq = np.tile(a_const, (horizon, 1))
+        else:
+            raise ValueError(f'unknown protocol: {protocol}')
+
+        # ---- WM imagination ----
+        with torch.no_grad():
+            z_hist = model.tokenizer.encode(
+                torch.from_numpy(lookback_obs).to(device))         # (L, z)
+            a_hist = torch.from_numpy(lookback_act).to(device)     # (L, A)
+        pred_obs = _imagine_open_loop(model, z_hist, a_hist,
+                                       act_seq, horizon, k_max, device)
+
+        # ---- Real-sim ground truth: re-create env at same lookback state ----
+        # The simulator is deterministic given action sequence; we
+        # need to fast-forward a fresh env to the same start state.
+        # Cheapest way: reset the existing env and replay the entire
+        # seed-noise prefix up to start ``s`` so the sim is at the
+        # same internal state, then step ``horizon`` steps with
+        # ``act_seq``.
+        env.reset(exploration=False)
+        for t in range(s):
+            env.step(ep_act[t])
+        real_obs = _real_open_loop(env, cfg, lookback_obs, lookback_act,
+                                    act_seq, horizon)
+
+        # ---- Metrics ----
+        err_per_step = np.abs(pred_obs - real_obs).mean(axis=1)     # (horizon,)
+        per_start_records.append({
+            'start_idx': s,
+            'protocol': protocol,
+            'mae_step1': float(err_per_step[0]),
+            'mae_step5': float(err_per_step[min(4, horizon - 1)]),
+            'mae_step15': float(err_per_step[min(14, horizon - 1)]),
+            'mae_step42': float(err_per_step[min(41, horizon - 1)])
+                            if horizon > 41 else None,
+            'mae_final': float(err_per_step[-1]),
+            'pred_convergence': _convergence_stats(pred_obs),
+            'real_convergence': _convergence_stats(real_obs),
+            'pred_final': pred_obs[-1].tolist(),
+            'real_final': real_obs[-1].tolist(),
+            'pred_traj': pred_obs.astype('float32').tolist(),
+            'real_traj': real_obs.astype('float32').tolist(),
+            'action_seq': act_seq.astype('float32').tolist(),
+        })
+
+    # Aggregate.
+    def _agg(key):
+        vals = [r[key] for r in per_start_records if r.get(key) is not None]
+        return float(np.mean(vals)) if vals else None
+
+    pred_conv_rate = float(np.mean(
+        [1.0 if r['pred_convergence']['converged'] else 0.0
+         for r in per_start_records]))
+    real_conv_rate = float(np.mean(
+        [1.0 if r['real_convergence']['converged'] else 0.0
+         for r in per_start_records]))
+    ss_err = float(np.mean(
+        [np.abs(np.asarray(r['pred_final'])
+                 - np.asarray(r['real_final'])).mean()
+         for r in per_start_records]))
+
+    return {
+        'protocol': protocol,
+        'n_starts': len(per_start_records),
+        'horizon': horizon,
+        'agg': {
+            'mae_step1': _agg('mae_step1'),
+            'mae_step5': _agg('mae_step5'),
+            'mae_step15': _agg('mae_step15'),
+            'mae_step42': _agg('mae_step42'),
+            'mae_final': _agg('mae_final'),
+            'steady_state_err_mean': ss_err,
+            'pred_convergence_rate': pred_conv_rate,
+            'real_convergence_rate': real_conv_rate,
+        },
+        'per_start': per_start_records,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry
+# ---------------------------------------------------------------------------
+
+def run_wm_steady_state_diagnostic(run_dir: Path,
+                                     ckpt_name: Optional[str] = None,
+                                     n_starts: int = 8,
+                                     horizon: int = 200,
+                                     seed: int = 20260520,
+                                     protocols: Optional[Tuple[str, ...]] = None,
+                                     ) -> Dict:
+    """Run the diagnostic; write JSON (+ plot if matplotlib available).
+
+    Returns the result dict.
+    """
+    run_dir = Path(run_dir)
+    device, dev_reason = _pick_device()
+    ckpt_path = _find_ckpt(run_dir, ckpt_name)
+    print(f'[wm-ss-diag] ckpt={ckpt_path.name}  device={device}  ({dev_reason})',
+          flush=True)
+
+    from training.train import APCEnv
+    model, cfg, obs_norm = _load_model(ckpt_path, device)
+    k_max = int(cfg.k_max)
+    L = int(cfg.lookback)
+    print(f'[wm-ss-diag] cfg: lookback={L} k_max={k_max} horizon_train={cfg.horizon} '
+          f'obs_dim={cfg.obs_dim} action_dim={cfg.action_dim}',
+          flush=True)
+
+    rng = np.random.default_rng(int(seed))
+    env = APCEnv(cfg, rng)
+    if obs_norm is not None:
+        try:
+            env.set_obs_norm_stats(
+                mean=np.asarray(obs_norm.get('mean')),
+                var=np.asarray(obs_norm.get('var')),
+                count=float(obs_norm.get('count', 1.0)),
+                learn=False)
+        except Exception as e:
+            print(f'[wm-ss-diag] obs_norm restore skipped: {e!r}', flush=True)
+    # Reward-scale doesn't matter for prediction-accuracy probing, but set
+    # it for consistency with how the model was trained.
+    cal_path = run_dir / 'reward_calibration.json'
+    if cal_path.exists():
+        try:
+            with open(cal_path) as f:
+                env.reward_scale = float(json.load(f).get('reward_scale', 1.0))
+        except Exception:
+            pass
+
+    if protocols is None:
+        protocols = ('replay', 'zero', 'constant')
+    results: Dict[str, Dict] = {}
+    for protocol in protocols:
+        print(f'[wm-ss-diag] running protocol={protocol} '
+              f'n_starts={n_starts} horizon={horizon} ...', flush=True)
+        results[protocol] = _run_protocol(
+            env, model, cfg, device, rng,
+            protocol=protocol, n_starts=n_starts,
+            lookback_steps=L, horizon=horizon, k_max=k_max)
+
+    # Build top-level verdict.
+    H_train = int(cfg.horizon)
+    verdict = {
+        'horizon_train': H_train,
+        'horizon_probe': horizon,
+        'device': str(device),
+        'device_reason': dev_reason,
+        'ckpt': ckpt_path.name,
+        'per_protocol_mae_at_H_train': {
+            p: results[p]['agg'].get(f'mae_step{H_train}',
+                                       results[p]['agg'].get('mae_final'))
+            for p in results
+        },
+        'steady_state_err_zero_action':
+            results.get('zero', {}).get('agg', {}).get('steady_state_err_mean'),
+        'steady_state_err_constant_action':
+            results.get('constant', {}).get('agg', {}).get('steady_state_err_mean'),
+        'wm_pred_converges_under_zero_action':
+            results.get('zero', {}).get('agg', {}).get('pred_convergence_rate'),
+        'wm_pred_converges_under_constant_action':
+            results.get('constant', {}).get('agg', {}).get('pred_convergence_rate'),
+    }
+    out = {'verdict': verdict, 'results': results}
+    out_path = run_dir / 'wm_steady_state_diagnostic.json'
+    with open(out_path, 'w') as f:
+        json.dump(out, f, indent=2)
+    print(f'[wm-ss-diag] wrote {out_path}', flush=True)
+
+    # Optional plot.
+    try:
+        _save_plot(run_dir, out)
+    except Exception as e:
+        print(f'[wm-ss-diag] plot skipped: {e!r}', flush=True)
+
+    _print_summary(verdict, results)
+    return out
+
+
+def _save_plot(run_dir: Path, out: Dict) -> None:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    protos = [p for p in ('replay', 'zero', 'constant')
+              if p in out['results']]
+    if not protos:
+        return
+    fig, axes = plt.subplots(len(protos), 1, figsize=(11, 3 * len(protos)),
+                               sharex=True, squeeze=False)
+    axes = axes[:, 0]
+    for ax, protocol in zip(axes, protos):
+        r = out['results'].get(protocol, {})
+        per = r.get('per_start', [])
+        if not per:
+            continue
+        # Plot CV channel (channel 0 by convention) for each start.
+        for rec in per[:4]:  # avoid overplotting
+            pred = np.asarray(rec['pred_traj'])
+            real = np.asarray(rec['real_traj'])
+            ax.plot(real[:, 0], color='C0', alpha=0.6,
+                     label='real (sim)' if rec is per[0] else None)
+            ax.plot(pred[:, 0], color='C3', alpha=0.6, ls='--',
+                     label='imagined (WM)' if rec is per[0] else None)
+        ax.set_title(f'{protocol}: CV ch0 over {r["horizon"]}-step rollout '
+                      f'(H_train={out["verdict"]["horizon_train"]})')
+        ax.set_ylabel('obs[0]')
+        ax.grid(alpha=0.3)
+        ax.axvline(out['verdict']['horizon_train'], color='gray',
+                    lw=0.5, ls=':', label='H_train')
+        if protocol == 'replay':
+            ax.legend(fontsize=8, loc='best')
+    axes[-1].set_xlabel('imagination step')
+    fig.suptitle(f'WM steady-state diagnostic: {run_dir.name}',
+                  fontsize=10)
+    fig.tight_layout()
+    out_png = run_dir / 'wm_steady_state_diagnostic.png'
+    fig.savefig(out_png, dpi=110)
+    plt.close(fig)
+    print(f'[wm-ss-diag] wrote {out_png}', flush=True)
+
+
+def _print_summary(verdict: Dict, results: Dict) -> None:
+    print()
+    print('=' * 72)
+    print(f'WM steady-state diagnostic — ckpt={verdict["ckpt"]}  '
+          f'device={verdict["device"]}')
+    print('=' * 72)
+    H = verdict['horizon_train']
+    print(f'  training imagination horizon H = {H}')
+    print(f'  probe horizon                  = {verdict["horizon_probe"]}')
+    print()
+    print('  per-protocol per-step MAE (lower=better):')
+    print('  protocol  | step1   step5   step15  step42  final')
+    for p in ('replay', 'zero', 'constant'):
+        a = results.get(p, {}).get('agg', {})
+        if not a:
+            continue
+        def _fmt(v): return f'{v:7.4f}' if v is not None else '   n/a '
+        print(f'  {p:9s} | {_fmt(a.get("mae_step1"))} {_fmt(a.get("mae_step5"))} '
+              f'{_fmt(a.get("mae_step15"))} {_fmt(a.get("mae_step42"))} '
+              f'{_fmt(a.get("mae_final"))}')
+    print()
+    print('  steady-state behaviour (the APC-specific test):')
+    for p in ('zero', 'constant'):
+        a = results.get(p, {}).get('agg', {})
+        if not a:
+            continue
+        ss = a.get('steady_state_err_mean')
+        wm_conv = a.get('pred_convergence_rate', 0.0)
+        sim_conv = a.get('real_convergence_rate', 0.0)
+        print(f'  {p:9s} action: WM converged in {wm_conv*100:5.1f}% of starts, '
+              f'sim converged in {sim_conv*100:5.1f}%, '
+              f'steady-state err = {ss:.4f}' if ss is not None else '')
+    print()
+    # Verdict heuristic
+    ss_zero = verdict.get('steady_state_err_zero_action') or float('inf')
+    wm_conv_zero = verdict.get('wm_pred_converges_under_zero_action') or 0.0
+    if wm_conv_zero >= 0.8 and ss_zero < 0.2:
+        print('  VERDICT: WM steady-state representation HEALTHY '
+              '(converges, low SS error)')
+    elif wm_conv_zero >= 0.5:
+        print('  VERDICT: WM converges but with noticeable SS bias '
+              '(check controller robustness)')
+    else:
+        print('  VERDICT: WM imagined trajectories DO NOT CONVERGE '
+              'under constant action — actor sees only transient '
+              'dynamics in long imagined rollouts')
+    print('=' * 72)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _cli():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('--run-dir', required=True, type=Path)
+    ap.add_argument('--ckpt', default=None,
+                     help='checkpoint filename inside run-dir '
+                          '(default: final.pt > best.pt > latest ckpt_iter)')
+    ap.add_argument('--n-starts', type=int, default=8)
+    ap.add_argument('--horizon', type=int, default=200,
+                     help='imagination horizon for the probe (env steps); '
+                          'should be ≫ training horizon and ≥ several τ '
+                          'to test steady-state convergence')
+    ap.add_argument('--seed', type=int, default=20260520)
+    ap.add_argument('--protocols', default='replay,zero,constant',
+                     help='comma-separated subset of {replay,zero,constant}')
+    args = ap.parse_args()
+    protocols = tuple(p.strip() for p in args.protocols.split(',') if p.strip())
+    run_wm_steady_state_diagnostic(args.run_dir, ckpt_name=args.ckpt,
+                                    n_starts=args.n_starts,
+                                    horizon=args.horizon, seed=args.seed,
+                                    protocols=protocols)
+
+
+if __name__ == '__main__':
+    _cli()
