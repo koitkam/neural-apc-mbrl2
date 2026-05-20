@@ -260,6 +260,45 @@ def _convergence_stats(traj: np.ndarray, tail_frac: float = 0.2,
     }
 
 
+def _quiet_env(env) -> None:
+    """Disable all stochastic sources on a constructed APCEnv in-place.
+
+    The diagnostic is supposed to probe a *deterministic* steady-state
+    response (WM convergence under constant action when nothing else
+    is moving).  ``APCEnv.reset(exploration=False)`` would otherwise
+    schedule curriculum disturbances ~88% of the time and the underlying
+    ``SimNoiseWrapper`` keeps applying OU + measurement noise on every
+    step.  Both contaminate the convergence signal.
+
+    This helper zeroes the noise sources on the sim wrapper and disables
+    the ``DomainRandomizer`` so subsequent ``env.reset()`` / ``env.step()``
+    calls produce a fully deterministic noise-free trajectory.  Callers
+    must additionally clear ``env._schedule = []`` after every
+    ``env.reset()`` (see ``_run_protocol``) because ``reset()`` rebuilds
+    the schedule from the curriculum.
+    """
+    sim = env.sim
+    # Wipe OU + measurement noise channels on the SimNoiseWrapper.
+    if hasattr(sim, '_ou_sources'):
+        sim._ou_sources = []
+    if hasattr(sim, '_meas_noise'):
+        sim._meas_noise = []
+    if hasattr(sim, '_has_noise'):
+        sim._has_noise = False
+    # Disable domain randomization so plant tau / gain stay at base.
+    rd = getattr(sim, '_randomizer', None)
+    if rd is None:
+        # SimNoiseWrapper proxies most attribute access to the inner sim;
+        # try the inner sim explicitly in case the wrapper does not
+        # surface ``_randomizer`` directly.
+        inner = getattr(sim, '_sim', None)
+        if inner is not None:
+            rd = getattr(inner, '_randomizer', None)
+    if rd is not None and hasattr(rd, 'frac'):
+        rd.enabled = False
+        rd.frac = 0.0
+
+
 def _run_protocol(env, model, cfg, device: torch.device,
                    rng: np.random.Generator, *,
                    protocol: str, n_starts: int, lookback_steps: int,
@@ -273,6 +312,7 @@ def _run_protocol(env, model, cfg, device: torch.device,
     # the lookback windows for all starts.
     seed_sigma = 0.05
     env.reset(exploration=False)
+    env._schedule = []  # see ``_quiet_env`` rationale; defensive clear
     ep_obs, ep_act = [], []
     for _ in range(L + n_starts * 4):
         a = rng.normal(0.0, seed_sigma, size=(action_dim,)).astype('float32')
@@ -329,6 +369,7 @@ def _run_protocol(env, model, cfg, device: torch.device,
         # same internal state, then step ``horizon`` steps with
         # ``act_seq``.
         env.reset(exploration=False)
+        env._schedule = []  # defensive: keep the probe disturbance-free
         for t in range(s):
             env.step(ep_act[t])
         real_obs = _real_open_loop(env, cfg, lookback_obs, lookback_act,
@@ -398,8 +439,19 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
                                      horizon: int = 200,
                                      seed: int = 20260520,
                                      protocols: Optional[Tuple[str, ...]] = None,
+                                     noise_free: bool = True,
                                      ) -> Dict:
     """Run the diagnostic; write JSON (+ plot if matplotlib available).
+
+    Args:
+        noise_free: when True (default), zero out all stochastic sources
+            on the env (OU process noise, measurement noise, curriculum
+            disturbances, domain randomization) so the probe measures a
+            deterministic steady-state response.  Pass ``False`` to keep
+            the noise/disturbance regime that the WM was trained under
+            (legacy behaviour; results are then a mix of WM extrapolation
+            error and stochastic plant variance and should not be read as
+            a pure WM-quality metric).
 
     Returns the result dict.
     """
@@ -419,6 +471,10 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
 
     rng = np.random.default_rng(int(seed))
     env = APCEnv(cfg, rng)
+    if noise_free:
+        _quiet_env(env)
+        print('[wm-ss-diag] noise_free=True: OU + measurement noise + DR + '
+              'disturbance schedule disabled on env', flush=True)
     if obs_norm is not None:
         try:
             env.set_obs_norm_stats(
@@ -453,6 +509,7 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
     H_train = int(cfg.horizon)
     verdict = {
         'horizon_train': H_train,
+        'noise_free': bool(noise_free),
         'horizon_probe': horizon,
         'device': str(device),
         'device_reason': dev_reason,
@@ -596,12 +653,18 @@ def _cli():
     ap.add_argument('--seed', type=int, default=20260520)
     ap.add_argument('--protocols', default='replay,zero,constant',
                      help='comma-separated subset of {replay,zero,constant}')
+    ap.add_argument('--with-noise', action='store_true',
+                     help='keep OU + measurement noise + curriculum '
+                          'disturbances + domain randomization active during '
+                          'the probe (legacy behaviour). Default is a fully '
+                          'noise-free deterministic probe.')
     args = ap.parse_args()
     protocols = tuple(p.strip() for p in args.protocols.split(',') if p.strip())
     run_wm_steady_state_diagnostic(args.run_dir, ckpt_name=args.ckpt,
                                     n_starts=args.n_starts,
                                     horizon=args.horizon, seed=args.seed,
-                                    protocols=protocols)
+                                    protocols=protocols,
+                                    noise_free=not args.with_noise)
 
 
 if __name__ == '__main__':

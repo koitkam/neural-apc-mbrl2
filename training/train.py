@@ -249,6 +249,25 @@ class TrainConfig:
     # system-ID remedy.  Auto-derived in ``auto_tune_seed_buffer``
     # to ``max(2, round(τ / (3 sr)))``.  Sentinel 0 = use auto.
     prbs_seed_segment_steps_min: int = 0
+    # Constant-action seed episodes (2026-05-21, p31 RCA).  Holds the
+    # action perfectly constant for the entire episode at a sampled
+    # level in ``[-constant_action_seed_op_band, +constant_action_seed_op_band]``.
+    # Why: the PRBS seed only ever holds an action for ``(θ + 4τ)/sr``
+    # ≈ 80–150 agent steps, so the WM never sees a long-horizon
+    # constant-action steady state during pretrain.  When the controller
+    # later sits near a setpoint and holds the MV, the WM extrapolates
+    # outside its training distribution and drifts (run_p31 noise-free
+    # diagnostic: real plant converges 75–88%, WM 0% under constant
+    # action).  10 full-length constant-action episodes give the WM
+    # explicit steady-state coverage at a stratified spread of operating
+    # points.  Set to 0 to disable.
+    constant_action_seed_episodes: int = 10
+    # Operating-band fraction for the constant-action seed.  Narrower
+    # than ``prbs_seed_op_band`` (0.95) on purpose: at the very edges of
+    # the MV range the plant typically saturates and the long hold is
+    # uninformative.  0.6 covers the central 60% × 2 = 120% (yes, both
+    # signs) of the realistic operating envelope.
+    constant_action_seed_op_band: float = 0.6
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -257,7 +276,20 @@ class TrainConfig:
     bc_scale: float = 0.0            # Phase-2 policy BC weight
 
     # ----- MTP -----
-    mtp_length: int = 8              # paper L=8 (Phase-2 multi-token prediction)
+    # mtp_length: bumped 8 → 32 on 2026-05-21 (p31 RCA).  The MTP head
+    # provides the only training pressure that asks the WM to predict
+    # state ``L`` steps ahead with high fidelity.  At L=8 the WM has no
+    # gradient signal beyond ~8 steps and learns a representation that
+    # is locally smooth but globally drifts — confirmed by the
+    # noise-free steady-state diagnostic on p31, where WM imagined
+    # trajectories converge in 0% of cases at horizon=200 even though
+    # the real plant converges in 75–88%.  L=32 spans roughly 4× the
+    # planning horizon (15) and matches the seq_len=64 segment so the
+    # WM is supervised over the full BPTT window.  Paper precedent:
+    # DreamerV3 uses L≥8 only on Atari; control-task ablations in the
+    # appendix favour larger L when episodes carry long settled
+    # transients.
+    mtp_length: int = 32              # bumped from paper L=8 (p31 RCA)
 
     # ----- PMPO (Phase 3) -----
     # alpha=0.7 (paper default).  alpha=0.5 caused near-perfect
@@ -921,6 +953,45 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
         np.clip(a_np, -1.0, 1.0, out=a_np)
         next_window, reward, done, _ = env.step(a_np)
         act_buf[t] = a_np
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
+def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
+                                      action_level: float,
+                                      ) -> Dict[str, np.ndarray]:
+    """Collect one episode driven by a single, perfectly constant action.
+
+    Used to seed the buffer with **long-horizon constant-action steady
+    states** (2026-05-21, p31 RCA).  PRBS seed episodes only hold an
+    action for one segment (~80\u2013150 agent steps); the WM then never sees
+    a settled response over the full ``episode_length`` horizon and
+    extrapolates badly when the trained controller later sits near a
+    setpoint and holds the MV.  Holding the action constant for the full
+    episode forces the WM to learn the long-tail steady-state of the
+    plant at this operating point.
+
+    ``action_level`` is in the env's normalized action space and is
+    clipped to ``[-1, 1]``.  Returns the same dict shape as
+    ``collect_episode``.
+    """
+    obs_window = env.reset(exploration=True)
+    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    obs_buf = np.zeros((T, L, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    a_const = np.full((env.action_dim,),
+                       float(np.clip(action_level, -1.0, 1.0)),
+                       dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window
+        next_window, reward, done, _ = env.step(a_const)
+        act_buf[t] = a_const
         rew_buf[t] = reward
         cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
         obs_window = next_window
@@ -2634,6 +2705,29 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     op_band=prbs_op_band)
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
+
+    # Constant-action seed (run_p31 RCA, 2026-05-21): the PRBS sweep
+    # only ever holds an action for ~80–150 agent steps, so the WM has
+    # no long-horizon constant-action data and extrapolates badly when
+    # the trained controller later sits near a setpoint.  These full-
+    # episode constant-action seeds give the WM explicit steady-state
+    # coverage at a stratified spread of operating points within
+    # ``[-constant_action_seed_op_band, +constant_action_seed_op_band]``.
+    n_const_seed = int(getattr(cfg, 'constant_action_seed_episodes', 0))
+    const_op_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
+    if n_const_seed > 0:
+        # Stratified levels: evenly-spaced over [-op_band, +op_band]
+        # with a small jitter so re-running the workflow does not hit
+        # exactly the same operating points.
+        levels = np.linspace(-const_op_band, const_op_band, n_const_seed,
+                              dtype='float32')
+        jitter = env.rng.uniform(-0.05, 0.05, size=levels.shape).astype('float32')
+        levels = np.clip(levels + jitter * const_op_band, -1.0, 1.0)
+        for lvl in levels:
+            ep = collect_constant_action_episode(env, cfg,
+                                                  action_level=float(lvl))
+            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            total_env_steps += cfg.episode_length
 
     # Cached optimizer set per phase.
     while total_env_steps < cfg.total_steps:
