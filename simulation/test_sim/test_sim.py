@@ -39,6 +39,7 @@ import numpy as np
 import pandas as pd
 
 from utils.sim_noise import DisturbanceOffsetMixin, DomainRandomizer
+from utils.initial_conditions import sample_initial_value
 
 
 class TestSimTower(DisturbanceOffsetMixin):
@@ -166,9 +167,21 @@ class TestSimTower(DisturbanceOffsetMixin):
 
         _rng = self._randomizer.rng
         sv = 82.0
-        temp = float(np.clip(sv + _rng.standard_normal() * 0.7, self.temp_limits[0], self.temp_limits[1]))
-        reflux = float(np.clip(50.0 + _rng.standard_normal() * 2.5, self.reflux_limits[0], self.reflux_limits[1]))
-        feed = float(np.clip(100.0 + _rng.standard_normal() * 3.0, self.feed_limits[0], self.feed_limits[1]))
+        # Wide uniform initial-condition randomization (DREAMER_INIT_RANDOMIZATION,
+        # default on, 2026-05-21 / p32).  Replaces the previous narrow Gaussian
+        # (σ 0.7 / 2.5 / 3.0) so the WM sees a true random-operating-point
+        # distribution at episode start, not a tight cloud around one nominal.
+        # Sim-adaptive via the variable's own hard bounds; legacy σ retained as
+        # the fallback when the env var is set to 0.
+        temp = sample_initial_value(
+            _rng, nominal=sv, bounds=self.temp_limits, legacy_sigma=0.7,
+        )
+        reflux = sample_initial_value(
+            _rng, nominal=50.0, bounds=self.reflux_limits, legacy_sigma=2.5,
+        )
+        feed = sample_initial_value(
+            _rng, nominal=100.0, bounds=self.feed_limits, legacy_sigma=3.0,
+        )
 
         self.u_actual = np.array([reflux], dtype='float32')
         self.u_history = [self.u_actual.copy() for _ in range(self.mv_deadtime_steps + 1)]

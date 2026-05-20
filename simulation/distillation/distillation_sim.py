@@ -41,6 +41,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from utils.sim_noise import DisturbanceOffsetMixin, DomainRandomizer
+from utils.initial_conditions import sample_initial_value
 
 
 class DistillationTower(DisturbanceOffsetMixin):
@@ -301,16 +302,37 @@ class DistillationTower(DisturbanceOffsetMixin):
         bottom_sv = 93.0
         pressure_sv = 175.0
 
-        top_pv = np.clip(top_sv + _rng.standard_normal() * 1.5, 80.0, 99.8)
-        bottom_pv = np.clip(bottom_sv + _rng.standard_normal() * 2.0, 75.0, 99.5)
-        pressure_pv = np.clip(pressure_sv + _rng.standard_normal() * 2.0, 150.0, 210.0)
+        # Wide uniform initial-condition randomization (DREAMER_INIT_RANDOMIZATION,
+        # default on, 2026-05-21 / p32).  See utils/initial_conditions.py.  Each
+        # variable is centred on its legacy nominal and drawn uniformly across a
+        # configurable fraction of its hard bounds, then clipped.  Legacy σ
+        # values retained for the env-var=0 fallback.
+        top_pv = sample_initial_value(
+            _rng, nominal=top_sv, bounds=(80.0, 99.8), legacy_sigma=1.5,
+        )
+        bottom_pv = sample_initial_value(
+            _rng, nominal=bottom_sv, bounds=(75.0, 99.5), legacy_sigma=2.0,
+        )
+        pressure_pv = sample_initial_value(
+            _rng, nominal=pressure_sv, bounds=(150.0, 210.0), legacy_sigma=2.0,
+        )
 
-        reflux_mv = np.clip(50 + _rng.standard_normal() * 4, 0, 100)
-        boilup_mv = np.clip(50 + _rng.standard_normal() * 4, 0, 100)
-        cooling_mv = np.clip(50 + _rng.standard_normal() * 4, 0, 100)
+        reflux_mv = sample_initial_value(
+            _rng, nominal=50.0, bounds=(0.0, 100.0), legacy_sigma=4.0,
+        )
+        boilup_mv = sample_initial_value(
+            _rng, nominal=50.0, bounds=(0.0, 100.0), legacy_sigma=4.0,
+        )
+        cooling_mv = sample_initial_value(
+            _rng, nominal=50.0, bounds=(0.0, 100.0), legacy_sigma=4.0,
+        )
 
-        feed_flow = np.clip(50 + _rng.standard_normal() * 2, 30, 70)
-        feed_comp = np.clip(50 + _rng.standard_normal() * 2, 30, 70)
+        feed_flow = sample_initial_value(
+            _rng, nominal=50.0, bounds=(30.0, 70.0), legacy_sigma=2.0,
+        )
+        feed_comp = sample_initial_value(
+            _rng, nominal=50.0, bounds=(30.0, 70.0), legacy_sigma=2.0,
+        )
 
         initial_state = np.array([
             top_pv,

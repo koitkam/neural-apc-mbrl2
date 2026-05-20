@@ -38,6 +38,7 @@ import os
 import numpy as np
 
 from utils.sim_noise import DisturbanceOffsetMixin, DomainRandomizer
+from utils.initial_conditions import sample_initial_value
 
 # ---------------------------------------------------------------------------
 # Historical operating statistics (from Foxboro DCS data 2025-01-01 → 2026-04-14)
@@ -300,12 +301,21 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
         return float(np.clip(val, self.lab_limits[0], self.lab_limits[1]))
 
     def _init_dv_values(self, rng: np.random.Generator) -> dict[str, float]:
-        """Sample initial DV values near their historical means."""
+        """Sample initial DV values.
+
+        Wide uniform IC randomization (``DREAMER_INIT_RANDOMIZATION=1``,
+        default on, 2026-05-21 / p32) draws each DV uniformly across a
+        configurable fraction of its historical (lo, hi) range centred
+        on the historical mean.  Legacy fallback (env var = 0) is the
+        original ``mean + N(0, std*0.3)`` clipped to ``(lo, hi)``.
+        """
         vals = {}
         for tag in _DV_TAGS:
             mean, std, lo, hi = _DV_STATS[tag]
-            v = float(np.clip(mean + rng.standard_normal() * std * 0.3, lo, hi))
-            vals[tag] = v
+            vals[tag] = sample_initial_value(
+                rng, nominal=float(mean), bounds=(float(lo), float(hi)),
+                legacy_sigma=float(std) * 0.3,
+            )
         return vals
 
     def _step_dv(self, tag: str, current: float, rng: np.random.Generator) -> float:
@@ -349,11 +359,11 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
 
         rng = self._randomizer.rng
 
-        # Initial MV (FIC631_SP: mean=75.6, std=80.5 — use tighter init)
-        mv_init = float(np.clip(
-            75.6 + rng.standard_normal() * 10.0,
-            self.mv_limits[0], self.mv_limits[1],
-        ))
+        # Initial MV.  Wide uniform IC randomization (default on, p32);
+        # legacy fallback is N(75.6, 10) clipped to mv_limits.
+        mv_init = sample_initial_value(
+            rng, nominal=75.6, bounds=self.mv_limits, legacy_sigma=10.0,
+        )
 
         # Actuator lag + dead-time buffers start at the initial MV so
         # the history window is steady-state.
