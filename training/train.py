@@ -52,6 +52,10 @@ from utils.training_disturbance import (
     build_training_disturbance_schedule,
     apply_disturbance_schedule,
 )
+from utils.hidden_disturbance import (
+    get_phase_disturbance_prob,
+    maybe_build_hidden_disturbance,
+)
 from utils.agent_utils import (
     load_objective_weights, load_objective_bounds, load_full_objective_spec,
     action_to_control,
@@ -519,6 +523,22 @@ class APCEnv:
         self._last_cv_violation_sum: float = 0.0
         self._last_mv_violation_sum: float = 0.0
 
+        # ---- Hidden (truly unmeasured) CV disturbance process -------------
+        # Per-episode OU process injecting a smoothly evolving bias into
+        # the CV state channels.  The state is NOT exposed to the agent
+        # or the WM — it is the "unmeasured upstream upset" a deployed
+        # APC controller must reject.  Replaces the legacy unmeasured-CV
+        # step events (now removed) which were Dirac spikes the WM had
+        # no way to predict.  See ``utils/hidden_disturbance.py``.
+        self._hidden_disturbance = None  # type: Optional[object]
+        # Phase-aware per-episode disturbance probability override.
+        # Set by the trainer at phase transitions (P1/P2 default 0.3,
+        # P3 default 0.5).  ``None`` = read from env var directly.
+        self._disturbance_prob_override: Optional[float] = None
+        # Force flag: when True, every reset() always builds the hidden
+        # process (validation path).  False = Bernoulli toggle.
+        self._hidden_disturbance_force: bool = False
+
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
         # env.  Applied in ``_build_obs_vec`` before the obs is exposed to
@@ -601,6 +621,22 @@ class APCEnv:
             intensity=intensity,
             sim=self.sim,
         )
+        # Per-episode hidden OU disturbance.  Bernoulli toggle gated
+        # by phase-aware prob (P1/P2: 0.3, P3: 0.5).  Set force=True
+        # in validation to always build.
+        prob = (self._disturbance_prob_override
+                if self._disturbance_prob_override is not None
+                else get_phase_disturbance_prob(phase=1))
+        tau_dom = float(getattr(self.cfg, 'tau', 0.0) or 0.0)
+        sample_rate = float(getattr(self.cfg, 'sample_rate', 1.0) or 1.0)
+        self._hidden_disturbance = maybe_build_hidden_disturbance(
+            rng=self.rng,
+            sim=self.sim,
+            tau_dom=tau_dom,
+            sample_rate=sample_rate,
+            prob=float(prob),
+            force=bool(self._hidden_disturbance_force),
+        )
         obs_vec = self._build_obs_vec(state)
         self._window = np.tile(obs_vec, (self.cfg.lookback, 1)).astype('float32')
         return self._window.copy()
@@ -627,6 +663,19 @@ class APCEnv:
                       f'(further occurrences silenced): {_de!r}', flush=True)
                 traceback.print_exc()
                 self._disturbance_err_logged = True
+        # Hidden (truly unmeasured) CV disturbance: advance OU and add to
+        # CV state channels.  Only active on episodes where the per-episode
+        # Bernoulli toggle (or force flag) fired in reset().
+        if self._hidden_disturbance is not None:
+            try:
+                self._hidden_disturbance.step(next_state)
+            except Exception as _hde:
+                if not getattr(self, '_hidden_dist_err_logged', False):
+                    import traceback
+                    print(f'[env.step] hidden_disturbance error '
+                          f'(further occurrences silenced): {_hde!r}', flush=True)
+                    traceback.print_exc()
+                    self._hidden_dist_err_logged = True
         comps = compute_objective_components(
             state=next_state, sim=self.sim,
             control=control, prev_control=self._prev_control,
@@ -2743,6 +2792,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             total_env_steps += cfg.episode_length
 
     # Cached optimizer set per phase.
+    # Initialize hidden-disturbance probability for the starting phase
+    # (hidden CV disturbance is the default unmeasured-disturbance model).
+    env._disturbance_prob_override = get_phase_disturbance_prob(phase=1)
     while total_env_steps < cfg.total_steps:
         new_phase = _phase_for(total_env_steps)
         if new_phase != current_phase:
@@ -2778,6 +2830,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if current_phase == 3:
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
                 model.snapshot_prior_policy()
+            # Refresh hidden-disturbance per-episode probability for the
+            # new phase (default: 0.3 in P1/P2, 0.5 in P3).
+            env._disturbance_prob_override = get_phase_disturbance_prob(
+                phase=int(current_phase))
 
         # ----- Collection -----
         # Phases 1 & 2: random-action episodes append to the buffer.

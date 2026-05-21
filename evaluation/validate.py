@@ -159,12 +159,13 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
     settle = int(max(40.0, round(max(0.6 * float(lookback), 1.25 * dyn_horizon))))
     min_gap = max(14, int(0.95 * settle))
 
-    # holdout_a profile (validation default).  Single profile — keep it
-    # simple: number of events scales with episode length, half violation,
-    # 40% of CV-class events go to unmeasured-CV.
+    # holdout_a profile (validation default).  Only measured-DV events
+    # are scripted — the unmeasured CV disturbance is now provided
+    # automatically by the hidden OU process attached to the env
+    # (``env._hidden_disturbance`` with ``_hidden_disturbance_force=True``),
+    # which fires on every validation episode.
     n_total = int(max(3, min(14, ep_len // max(36, settle))))
     p_violation = 0.45
-    p_cv_unmeasured = 0.40
 
     earliest = max(8, int(0.06 * ep_len))
     latest = max(earliest + 1, int(0.92 * ep_len))
@@ -193,23 +194,11 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
     cumulative_cv_impact = 0.0
 
     schedule: List[Dict] = []
+    if not dv_targets:
+        return schedule
     for i, start in enumerate(starts):
-        # Force a useful diagnostic mix on the first two events:
-        # i=0 → measured DV, i=1 → unmeasured CV.
-        if dv_targets and cv_targets and i == 0:
-            target = dv_targets[int(rng.integers(0, len(dv_targets)))]
-            source, target_group = 'measured_dv', 'dv'
-        elif dv_targets and cv_targets and i == 1:
-            target = cv_targets[int(rng.integers(0, len(cv_targets)))]
-            source, target_group = 'unmeasured_cv', 'cv'
-        else:
-            use_cv = bool(cv_targets) and (rng.uniform() < p_cv_unmeasured)
-            if use_cv or not dv_targets:
-                target = cv_targets[int(rng.integers(0, len(cv_targets)))]
-                source, target_group = 'unmeasured_cv', 'cv'
-            else:
-                target = dv_targets[int(rng.integers(0, len(dv_targets)))]
-                source, target_group = 'measured_dv', 'dv'
+        target = dv_targets[int(rng.integers(0, len(dv_targets)))]
+        source, target_group = 'measured_dv', 'dv'
 
         is_violation = bool(rng.uniform() < p_violation)
         intent = 'violation' if is_violation else 'economic'
@@ -229,26 +218,19 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
             sign = -1.0 if rng.uniform() < 0.5 else 1.0
 
         span = ch_span
-        if source == 'measured_dv':
-            frac = float(rng.uniform(0.05, 0.16) if not is_violation
-                         else rng.uniform(0.18, 0.38))
-            mag = sign * frac * span
-            gain = float(dv_gain.get(str(target.get('name', '')),
-                                      dv_gain.get(f"dv_{int(target.get('pos', 0))}", 0.0))
-                          or 0.0)
-            if gain > 1e-8:
-                desired_cv = float(rng.uniform(0.08, 0.18) if not is_violation
-                                    else rng.uniform(0.30, 0.55)) * cv_span_ref
-                needed = desired_cv / gain
-                mag = sign * max(abs(mag), abs(needed))
-            allow_oob = False
-            cv_per_unit = abs(gain) if gain > 1e-8 else 0.0
-        else:  # unmeasured_cv
-            frac = float(rng.uniform(0.08, 0.18) if not is_violation
-                         else rng.uniform(0.30, 0.60))
-            mag = sign * frac * span
-            allow_oob = True
-            cv_per_unit = 1.0
+        frac = float(rng.uniform(0.05, 0.16) if not is_violation
+                     else rng.uniform(0.18, 0.38))
+        mag = sign * frac * span
+        gain = float(dv_gain.get(str(target.get('name', '')),
+                                  dv_gain.get(f"dv_{int(target.get('pos', 0))}", 0.0))
+                      or 0.0)
+        if gain > 1e-8:
+            desired_cv = float(rng.uniform(0.08, 0.18) if not is_violation
+                                else rng.uniform(0.30, 0.55)) * cv_span_ref
+            needed = desired_cv / gain
+            mag = sign * max(abs(mag), abs(needed))
+        allow_oob = False
+        cv_per_unit = abs(gain) if gain > 1e-8 else 0.0
 
         # Authority-budget clip (shared with training).
         if cv_per_unit > 0.0 and mv_authority_cv > 1e-9 and authority_frac > 0.0:
@@ -1576,6 +1558,9 @@ def run_validation(*,
         seed = 10_000 + s  # held-out from training (which used SEED=0..N).
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
+        # Force the hidden OU disturbance on every validation episode so
+        # the agent is always tested on its disturbance-rejection skill.
+        env._hidden_disturbance_force = True
         if obs_norm_state is not None:
             try:
                 env.set_obs_norm_stats(
@@ -1648,6 +1633,7 @@ def run_validation(*,
                     ev.pop('_hold_state_idx', None)
                     ev.pop('_hold_value_raw', None)
                 env_b = APCEnv(cfg, np.random.default_rng(seed + 1))
+                env_b._hidden_disturbance_force = True
                 if obs_norm_state is not None:
                     try:
                         env_b.set_obs_norm_stats(
@@ -1800,6 +1786,9 @@ def run_validation(*,
     try:
         from evaluation.diagnostics import compute_training_diagnostics
         diag_env = APCEnv(cfg, np.random.default_rng(99_999))
+        # WM-fidelity probe: disable hidden OU so the WM is scored on
+        # base-plant dynamics, not augmented-system dynamics.
+        diag_env._disturbance_prob_override = 0.0
         if obs_norm_state is not None:
             try:
                 diag_env.set_obs_norm_stats(

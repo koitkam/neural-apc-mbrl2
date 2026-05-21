@@ -297,6 +297,14 @@ def _quiet_env(env) -> None:
     if rd is not None and hasattr(rd, 'frac'):
         rd.enabled = False
         rd.frac = 0.0
+    # Disable hidden OU CV disturbance for the probe — the diagnostic
+    # measures WM convergence under deterministic dynamics.
+    if hasattr(env, '_disturbance_prob_override'):
+        env._disturbance_prob_override = 0.0
+    if hasattr(env, '_hidden_disturbance_force'):
+        env._hidden_disturbance_force = False
+    if hasattr(env, '_hidden_disturbance'):
+        env._hidden_disturbance = None
 
 
 def _run_protocol(env, model, cfg, device: torch.device,
@@ -313,6 +321,7 @@ def _run_protocol(env, model, cfg, device: torch.device,
     seed_sigma = 0.05
     env.reset(exploration=False)
     env._schedule = []  # see ``_quiet_env`` rationale; defensive clear
+    env._hidden_disturbance = None  # same rationale
     ep_obs, ep_act = [], []
     for _ in range(L + n_starts * 4):
         a = rng.normal(0.0, seed_sigma, size=(action_dim,)).astype('float32')
@@ -370,6 +379,7 @@ def _run_protocol(env, model, cfg, device: torch.device,
         # ``act_seq``.
         env.reset(exploration=False)
         env._schedule = []  # defensive: keep the probe disturbance-free
+        env._hidden_disturbance = None
         for t in range(s):
             env.step(ep_act[t])
         real_obs = _real_open_loop(env, cfg, lookback_obs, lookback_act,

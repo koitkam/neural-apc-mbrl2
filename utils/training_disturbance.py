@@ -790,21 +790,30 @@ def build_training_disturbance_schedule(
     intensity: float = 1.0,
     sim=None,
 ) -> List[Dict]:
+    """Build the per-episode operator-event schedule.
+
+    Only measured-DV events are emitted.  Unmeasured-CV step events
+    were removed in favour of the hidden OU disturbance process (see
+    ``utils/hidden_disturbance.py``) because step-shaped CV bumps are
+    Dirac spikes with no observable cue and capped ``sf_loss_flow``
+    around 1.15 in P33.
+    """
     ep_len = max(220, int(episode_length))
 
     channels = {'dv': [], 'cv': []}
     if sim is not None:
         channels = _channel_catalog(sim)
     dv_targets = list(channels.get('dv', []))
+    # CV channels are still catalogued for the cv_span_ref reference
+    # (used to size DV-driven CV impact); we never emit CV step events.
     cv_targets = list(channels.get('cv', []))
-    targets = list(dv_targets) or list(cv_targets)
-    if (not dv_targets) and (not cv_targets):
+    targets = list(dv_targets)
+    if not dv_targets:
         # Generic fallback if simulator metadata is unavailable.
         dv_targets = [{'group': 'dv', 'pos': 0, 'name': 'dv_0', 'bounds': [0.0, 100.0]}]
-        cv_targets = [
-            {'group': 'cv', 'pos': 0, 'name': 'cv_0', 'bounds': [0.0, 100.0]},
-            {'group': 'cv', 'pos': 1, 'name': 'cv_1', 'bounds': [0.0, 100.0]},
-        ]
+        targets = list(dv_targets)
+        if not cv_targets:
+            cv_targets = [{'group': 'cv', 'pos': 0, 'name': 'cv_0', 'bounds': [0.0, 100.0]}]
 
     id_ctx = _load_identifier_context()
     lookback = int((id_ctx.get('lookback', {}) or {}).get('identified_lookback', 0) or 0)
@@ -845,8 +854,7 @@ def build_training_disturbance_schedule(
 
     n_cap = max(1, int(ep_len // max(22, int(0.5 * settle))))
     max_events_eff = int(np.clip(max_events, 1, min(6, n_cap)))
-    lo = 2 if (dv_targets and cv_targets and max_events_eff >= 2) else 1
-    n_events = int(rng.integers(lo, max_events_eff + 1))
+    n_events = int(rng.integers(1, max_events_eff + 1))
 
     # Per-event spacing mixes three regimes so the agent sees both
     # transient and steady-state behaviour:
@@ -901,21 +909,11 @@ def build_training_disturbance_schedule(
     schedule: List[Dict] = []
     last_start = 0
     for i in range(n_events):
-        if dv_targets and cv_targets and i == 0:
+        if dv_targets:
             target = dv_targets[int(rng.integers(0, len(dv_targets)))]
-            source = 'measured_dv'
-        elif dv_targets and cv_targets and i == 1:
-            target = cv_targets[int(rng.integers(0, len(cv_targets)))]
-            source = 'unmeasured_cv'
-        elif dv_targets and (not cv_targets or rng.uniform() < 0.68):
-            target = dv_targets[int(rng.integers(0, len(dv_targets)))]
-            source = 'measured_dv'
-        elif cv_targets:
-            target = cv_targets[int(rng.integers(0, len(cv_targets)))]
-            source = 'unmeasured_cv'
         else:
             target = targets[i % len(targets)]
-            source = 'measured_dv'
+        source = 'measured_dv'
 
         start = int(float(anchors[min(i, len(anchors) - 1)]) * ep_len) + int(rng.integers(-jitter_start, jitter_start + 1))
         start = max(last_start + _sample_recovery(), start)
@@ -936,18 +934,7 @@ def build_training_disturbance_schedule(
         # relative to holdout_b (50% violation) so the policy is never
         # surprised by the constraint location at eval time.
         p_violation = float(np.clip(0.30 + 0.40 * i01, 0.30, 0.70))
-        # R9: guarantee at least one hard CV-bound-exceeding event per episode
-        # once intensity is meaningful (post-warmup). Force the first CV event
-        # to a violation so every episode contains the "teach the constraint"
-        # signal.
-        if (
-            source == 'unmeasured_cv'
-            and i01 > 0.15
-            and not any(e.get('source') == 'unmeasured_cv' and e.get('_is_violation') for e in schedule)
-        ):
-            is_violation = True
-        else:
-            is_violation = bool(rng.uniform() < p_violation)
+        is_violation = bool(rng.uniform() < p_violation)
         # R1: remove intensity double-scaling. `frac` interpolation below already
         # uses `i01` to ramp magnitudes from safe to design peak, so applying
         # `intensity` a second time via `scale` shrank the realised magnitudes
@@ -976,52 +963,40 @@ def build_training_disturbance_schedule(
         # easy gate while failing harder profiles.  Each pair below is
         # ``(lo, hi)`` at intensity=1; at low intensity the ranges narrow
         # toward the historical training-safe values.
-        if source == 'measured_dv':
-            if is_violation:
-                lo = 0.08 + 0.10 * i01   # 0.08 -> 0.18
-                hi = 0.16 + 0.22 * i01   # 0.16 -> 0.38
-            else:
-                lo = 0.03
-                hi = 0.08 + 0.08 * i01   # 0.08 -> 0.16
-            frac = float(rng.uniform(lo, hi))
-            total_magnitude = float(sign * frac * span * scale)
-
-            gain = float(
-                dv_gain.get(
-                    str(target.get('name', '')),
-                    dv_gain.get(f"dv_{int(target.get('pos', 0))}", 0.0),
-                ) or 0.0
-            )
-            if gain > 1e-8:
-                if is_violation:
-                    impact_lo = 0.10 + 0.08 * i01   # 0.10 -> 0.18
-                    impact_hi = 0.22 + 0.33 * i01   # 0.22 -> 0.55
-                else:
-                    impact_lo = 0.04
-                    impact_hi = 0.10 + 0.08 * i01   # 0.10 -> 0.18
-                desired_cv_impact = (
-                    float(rng.uniform(impact_lo, impact_hi))
-                    * cv_span_ref
-                    * max(0.55, min(1.20, scale))
-                )
-                needed = float(desired_cv_impact) / float(gain)
-                total_magnitude = float(sign * max(abs(total_magnitude), abs(needed)))
-
-            # Clip expands with intensity to match the widest fraction
-            # the curriculum can draw (0.22 -> 0.40 of span).
-            dv_clip = (0.22 + 0.18 * i01) * span
-            total_magnitude = float(np.clip(total_magnitude, -dv_clip, dv_clip))
+        if is_violation:
+            lo = 0.08 + 0.10 * i01   # 0.08 -> 0.18
+            hi = 0.16 + 0.22 * i01   # 0.16 -> 0.38
         else:
+            lo = 0.03
+            hi = 0.08 + 0.08 * i01   # 0.08 -> 0.16
+        frac = float(rng.uniform(lo, hi))
+        total_magnitude = float(sign * frac * span * scale)
+
+        gain = float(
+            dv_gain.get(
+                str(target.get('name', '')),
+                dv_gain.get(f"dv_{int(target.get('pos', 0))}", 0.0),
+            ) or 0.0
+        )
+        if gain > 1e-8:
             if is_violation:
-                lo = 0.12 + 0.18 * i01   # 0.12 -> 0.30
-                hi = 0.24 + 0.36 * i01   # 0.24 -> 0.60
+                impact_lo = 0.10 + 0.08 * i01   # 0.10 -> 0.18
+                impact_hi = 0.22 + 0.33 * i01   # 0.22 -> 0.55
             else:
-                lo = 0.05
-                hi = 0.12 + 0.06 * i01   # 0.12 -> 0.18
-            frac = float(rng.uniform(lo, hi))
-            total_magnitude = float(sign * frac * span * scale)
-            cv_clip = (0.28 + 0.32 * i01) * span   # 0.28 -> 0.60
-            total_magnitude = float(np.clip(total_magnitude, -cv_clip, cv_clip))
+                impact_lo = 0.04
+                impact_hi = 0.10 + 0.08 * i01   # 0.10 -> 0.18
+            desired_cv_impact = (
+                float(rng.uniform(impact_lo, impact_hi))
+                * cv_span_ref
+                * max(0.55, min(1.20, scale))
+            )
+            needed = float(desired_cv_impact) / float(gain)
+            total_magnitude = float(sign * max(abs(total_magnitude), abs(needed)))
+
+        # Clip expands with intensity to match the widest fraction
+        # the curriculum can draw (0.22 -> 0.40 of span).
+        dv_clip = (0.22 + 0.18 * i01) * span
+        total_magnitude = float(np.clip(total_magnitude, -dv_clip, dv_clip))
 
         # --- Authority-budget clip --------------------------------------
         # Convert the proposed event delta to its CV-side impact and clamp
@@ -1029,16 +1004,13 @@ def build_training_disturbance_schedule(
         # ``authority_frac * mv_authority_cv``.  This guarantees the policy
         # always has > (1 - frac) of MV travel free to reject the
         # disturbance plus OU drift.
-        if source == 'measured_dv':
-            gain_for_budget = float(
-                dv_gain.get(
-                    str(target.get('name', '')),
-                    dv_gain.get(f"dv_{int(target.get('pos', 0))}", 0.0),
-                ) or 0.0
-            )
-            cv_per_unit = abs(gain_for_budget) if gain_for_budget > 1e-8 else 0.0
-        else:
-            cv_per_unit = 1.0  # unmeasured CV: delta is already in CV units
+        gain_for_budget = float(
+            dv_gain.get(
+                str(target.get('name', '')),
+                dv_gain.get(f"dv_{int(target.get('pos', 0))}", 0.0),
+            ) or 0.0
+        )
+        cv_per_unit = abs(gain_for_budget) if gain_for_budget > 1e-8 else 0.0
         if cv_per_unit > 0.0 and mv_authority_cv > 1e-9 and authority_frac > 0.0:
             new_delta, achieved_cv = clamp_event_to_authority_budget(
                 proposed_delta=float(total_magnitude),
@@ -1189,13 +1161,18 @@ def _apply_event_to_state(state: np.ndarray, sim, event: Dict) -> None:
     if legacy_target:
         if legacy_target in {'feed_flow', 'feed_comp'}:
             event = {**event, 'target_group': 'dv', 'target_pos': 0 if legacy_target == 'feed_flow' else 1}
-        elif legacy_target in {'top_comp', 'bottom_comp', 'pressure'}:
-            mapping = {'top_comp': 0, 'bottom_comp': 1, 'pressure': 2}
-            event = {**event, 'target_group': 'cv', 'target_pos': mapping[legacy_target]}
+        else:
+            # Legacy CV-targeted events are no longer supported; the
+            # hidden OU process replaces them.  Silently drop.
+            return
 
     group = str(event.get('target_group', '')).strip().lower()
     pos = int(event.get('target_pos', -1))
     delta = float(event.get('delta', 0.0))
+
+    # Only measured-DV events are emitted now; ignore stale CV entries.
+    if group != 'dv':
+        return
 
     if group not in channels:
         return
@@ -1216,9 +1193,7 @@ def _apply_event_to_state(state: np.ndarray, sim, event: Dict) -> None:
 
     # If clipping consumed most of the intended delta, flip direction so the
     # disturbance moves away from the limit instead of being stuck at it.
-    # Skip flip for CV: we *want* the CV pushed to normalization-range extremes
-    # (outside control limits) so the agent must take corrective action.
-    if group != 'cv' and abs(delta) > 1e-9:
+    if abs(delta) > 1e-9:
         achieved_frac = abs(tgt - cur) / abs(delta)
         if achieved_frac < 0.55:
             tgt = float(cur - delta)
@@ -1227,74 +1202,18 @@ def _apply_event_to_state(state: np.ndarray, sim, event: Dict) -> None:
             event['delta'] = float(-delta)
 
     # --- Persistent offset (sim-level) -----------------------------------
-    # Use the achieved (clipped) delta so the sim's internal reference
-    # stays consistent with the actual state.  Compute total absolute offset
-    # from baseline (current offset + incremental change).
     achieved_delta = float(tgt - cur)
     if hasattr(sim, 'set_disturbance_offset'):
         current_offset = float(sim.get_disturbance_offset(group, pos)) if hasattr(sim, 'get_disturbance_offset') else 0.0
         sim.set_disturbance_offset(group, pos, current_offset + achieved_delta)
 
-    if group == 'cv':
-        ranges = list(getattr(sim, 'cv_normalization_ranges', []))
-    elif group == 'dv':
-        ranges = list(getattr(sim, 'dv_normalization_ranges', []))
-    else:
-        ranges = []
-
+    ranges = list(getattr(sim, 'dv_normalization_ranges', []))
     state[idx] = _engineering_to_raw(
         tgt,
         ranges=ranges,
         pos=pos,
         state_is_normalized=bool(getattr(sim, 'state_is_normalized', False)),
     )
-
-    # --- Hold horizon for unmeasured CV on non-offset-honoring sims ------
-    # When the simulator's CV physics does NOT consume ``_cv_offsets``
-    # (e.g. ONNX-based softsensor_lab, which recomputes CV from lookback
-    # history every step), the one-shot state write above is erased on
-    # the very next ``sim.step()`` and the agent only ever sees a single
-    # perturbed sample.  Mirror the validation hold here so training-time
-    # unmeasured-CV events produce a sustained excursion (~ tau + dead)
-    # for the agent to learn to reject.  No-op for sims that already
-    # honor offsets in physics (test_sim, distillation).
-    if group == 'cv' and not bool(getattr(sim, 'honors_cv_disturbance_offsets', False)):
-        try:
-            tau = float(os.environ.get('IDENTIFIED_TAU_DOMINANT', '0'))
-            dead = float(os.environ.get('IDENTIFIED_DEAD_TIME', '0'))
-        except Exception:
-            tau, dead = 0.0, 0.0
-        hold_steps = int(max(8, round(tau + dead)))
-        event['_hold_state_idx'] = idx
-        event['_hold_value_raw'] = float(state[idx])
-        event['_hold_until'] = int(sim.episode_counter) + hold_steps
-
-
-def _reassert_cv_holds(state: np.ndarray, sim, schedule: List[Dict]) -> None:
-    """Re-write held CV values after `sim.step()` for non-honoring sims.
-
-    Parallel to ``evaluation.validate_latent._reassert_cv_disturbance_holds``:
-    sims that recompute CV from internal dynamics every step (softsensor
-    ONNX) erase the one-shot injection, so we re-assert for the hold
-    horizon that `_apply_event_to_state` stashed on the event dict.
-    """
-    if not schedule:
-        return
-    counter = int(sim.episode_counter)
-    for ev in schedule:
-        if not ev.get('_applied', False):
-            continue
-        hold_until = int(ev.get('_hold_until', -1))
-        if hold_until < counter:
-            continue
-        idx = int(ev.get('_hold_state_idx', -1))
-        if idx < 0 or idx >= len(state):
-            continue
-        state[idx] = float(ev.get('_hold_value_raw', state[idx]))
-        try:
-            sim.episode_array[counter] = state
-        except Exception:
-            pass
 
 
 def _shape_step_increment(event: Dict, t_local: int, duration: int) -> float:
@@ -1380,9 +1299,6 @@ def apply_disturbance_schedule(
 
     Each event is an instantaneous step applied once at ``event['start']``.
     The ``_applied`` flag prevents re-application on subsequent steps.
-    Also re-asserts any active CV hold windows so that unmeasured-CV
-    disturbances on simulators that do not honor ``_cv_offsets`` produce
-    a realistic sustained excursion (~tau+dead) instead of a 1-step blip.
 
     When ``mv_monitor`` is supplied and reports ``should_suppress()``, the
     pending event is marked suppressed (delta zeroed) instead of fired.
@@ -1443,8 +1359,4 @@ def apply_disturbance_schedule(
     if active and hasattr(sim, "episode_array"):
         sim.episode_array[k] = state
 
-    # Re-assert any live CV hold windows so non-offset-honoring sims
-    # (softsensor) see a sustained unmeasured-CV excursion over ~tau+dead
-    # steps, not just the single step at event trigger time.
-    _reassert_cv_holds(state, sim, schedule)
     return active
