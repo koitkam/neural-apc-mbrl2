@@ -2289,8 +2289,9 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     # Saturation diagnostic: the V4 twohot support is symlog([-20,+20]).
     # If even a single per-step scaled reward exceeds symlog's mid-band,
     # the head will struggle.  symlog(x)≈18 when |x|≈6.6e7; symlog(x)≈10
-    # when |x|≈2.2e4.  Flag if scaled-cliff symlog magnitude > 5
-    # (already encroaching on the head's high-curvature region).
+    # when |x|≈2.2e4.  WARN threshold tracks the bin-fill target
+    # (``target_sym_mag``) since the autoscaler now intentionally aims
+    # for that magnitude; warn only when we overshoot it by 1 unit.
     raw_min = float(arr.min())
     raw_max = float(arr.max())
     scaled_min = raw_min * scale
@@ -2300,7 +2301,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     sym_min = _symlog(scaled_min)
     sym_max = _symlog(scaled_max)
     sym_mag = max(abs(sym_min), abs(sym_max))
-    twohot_warn = sym_mag > 5.0
+    twohot_warn = sym_mag > (target_sym_mag + 1.0)
     twohot_critical = sym_mag > 15.0
     # Bin-coverage diagnostic (root-cause fix 2026-05-19): how many
     # twohot bins receive non-trivial mass under the chosen scale.
@@ -2335,6 +2336,8 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
         'scaled_symlog_mag': sym_mag,
         'twohot_support_warn': bool(twohot_warn),
         'twohot_support_critical': bool(twohot_critical),
+        'twohot_support_warn_threshold': float(target_sym_mag + 1.0),
+        'reward_cal_target_sym_mag': float(target_sym_mag),
         'twohot_active_bins': active_bins,
         'twohot_top1_mass': top1_mass,
         'twohot_bin_coverage_critical': bool(bin_coverage_critical),
@@ -2574,9 +2577,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"reward cliff.", flush=True)
         elif cal.get('twohot_support_warn'):
             print(f"[reward-scale] WARN: scaled symlog magnitude "
-                  f"{cal['scaled_symlog_mag']:.2f} > 5 — twohot head is "
-                  f"in the high-curvature region; consider reducing "
-                  f"DREAMER_REWARD_CAL_PCT_VAL.", flush=True)
+                  f"{cal['scaled_symlog_mag']:.2f} > "
+                  f"{cal['twohot_support_warn_threshold']:.2f} "
+                  f"(target_sym_mag={cal['reward_cal_target_sym_mag']:.2f} + 1) "
+                  f"— twohot head is in the high-curvature region; "
+                  f"reduce DREAMER_REWARD_CAL_TARGET_SYM_MAG.", flush=True)
         # Bin-coverage tripwire (2026-05-19): if the chosen scale
         # collapses operating-region rewards into ≤1 twohot bin, the
         # critic cannot learn a useful gradient and training will
