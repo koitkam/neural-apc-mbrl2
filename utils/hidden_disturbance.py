@@ -65,40 +65,54 @@ def hidden_disturbance_enabled(default: bool = True) -> bool:
 
 
 def curriculum_amp_scale(progress: float) -> float:
-    """Amplitude curriculum scale (≤1.0) as a function of training progress.
+    """Amplitude curriculum scale (≤max) as a function of training progress.
 
     Reads ``DREAMER_HIDDEN_OU_AMP_RAMP="<start_frac>:<reach_full_at>"``.
     ``start_frac``: amplitude scale at ``progress=0`` (e.g. 0.1 = 10% of
     nominal).  ``reach_full_at``: progress fraction at which the scale
-    reaches 1.0 (e.g. 0.4 = full amplitude by 40% of training).
+    reaches the cap (e.g. 0.4 = full amplitude by 40% of training).
 
-    Default (env unset or malformed): ``1.0`` — no curriculum.
+    Reads ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE="<cap>"`` (default 0.2):
+    hard cap on the returned scale.  P37 RCA (2026-05-22): fidelity
+    probe peaked at iter 70 and degraded through iter 150 — correlated
+    with curriculum reaching full nominal amplitude.  Capping the
+    curriculum at 0.2 keeps the WM in a regime where it can learn
+    base dynamics first; raise the cap (or set to 1.0) for the
+    critic/actor phase if needed.
 
-    Designed for the P37 ablation: at the start of training the WM is a
-    random net and a full-amplitude hidden OU is information-theoretically
-    too hard to track.  Ramping the amplitude lets the WM lock in clean
-    dynamics first, then learn to track increasingly stronger drift.
+    Default (env unset or malformed ramp): ``min(1.0, cap)`` — no curriculum,
+    but cap still applies.
+
     The OU is still hidden — only its magnitude is shaped over time.
     """
-    # Default ON (P37 onward): ramp from 10% to full amplitude by 40%
-    # of training progress.  Set ``DREAMER_HIDDEN_OU_AMP_RAMP=1.0:1.0``
-    # (or any malformed value) to disable.
+    # Default ON: ramp from 10% to cap by 40% of training progress.
+    # Set ``DREAMER_HIDDEN_OU_AMP_RAMP=1.0:1.0`` (or any malformed value)
+    # to disable the ramp.  ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE`` clamps
+    # the final value (default 0.2 — keep disturbance light during WM
+    # learning; effective amp ≈ amp_frac * 0.2 of MV authority).
+    try:
+        cap = float(os.environ.get(
+            'DREAMER_HIDDEN_OU_AMP_MAX_SCALE', '0.2'))
+    except Exception:
+        cap = 0.2
+    cap = float(np.clip(cap, 0.0, 1.0))
     raw = os.environ.get('DREAMER_HIDDEN_OU_AMP_RAMP', '0.1:0.4').strip()
     if not raw:
-        return 1.0
+        return cap
     try:
         start_str, reach_str = raw.split(':')
         start = float(start_str)
         reach = float(reach_str)
     except Exception:
-        return 1.0
+        return cap
     p = float(np.clip(progress, 0.0, 1.0))
     start = float(np.clip(start, 0.0, 1.0))
     reach = float(np.clip(reach, 1e-6, 1.0))
     if p >= reach:
-        return 1.0
-    # Linear ramp from start at p=0 to 1.0 at p=reach.
-    return float(start + (1.0 - start) * (p / reach))
+        return cap
+    # Linear ramp from start at p=0 to 1.0 at p=reach, then clamped at cap.
+    val = start + (1.0 - start) * (p / reach)
+    return float(min(val, cap))
 
 
 def _sample_amp_jitter(rng: np.random.Generator) -> float:

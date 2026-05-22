@@ -270,7 +270,7 @@ class TrainConfig:
     # action).  10 full-length constant-action episodes give the WM
     # explicit steady-state coverage at a stratified spread of operating
     # points.  Set to 0 to disable.
-    constant_action_seed_episodes: int = 24
+    constant_action_seed_episodes: int = 40
     # Operating-band fraction for the constant-action seed.  Narrower
     # than ``prbs_seed_op_band`` (0.95) on purpose: at the very edges of
     # the MV range the plant typically saturates and the long hold is
@@ -2821,6 +2821,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_initial_sf: Optional[float] = None
     p2_final_reward_mtp: Optional[float] = None
     mid_check_flags: List[str] = []
+    # ----- WM fidelity tracking (2026-05-22, P37 RCA) -----
+    # The wm-fidelity probe is the single most reliable signal of whether
+    # the WM is critic-ready (sf_loss can plateau at a value that no
+    # longer correlates with imagination skill).  Save a separate
+    # ``wm_best.pt`` whenever the probe score improves, and trigger an
+    # early-stop when the probe has not improved for ``wm_fidelity_patience_iters``
+    # past a warmup of ``wm_fidelity_warmup_iters``.  P37 peaked at iter
+    # 70 and degraded through iter 150; this catches that wastefully
+    # long tail.
+    wm_best_score: float = -1e18
+    wm_best_iter: int = -1
+    wm_best_ckpt_path: Optional[Path] = None
+    wm_fidelity_warmup_iters = int(
+        os.environ.get('DREAMER_WM_FIDELITY_WARMUP_ITERS', '40'))
+    wm_fidelity_patience_iters = int(
+        os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '50'))
     # Reference entropy used for the entropy-collapse early-stop trip.
     # For the discrete categorical actor this is the max-entropy uniform
     # baseline (``log K``) per action dim.  For the continuous TanhNormal
@@ -3272,6 +3288,49 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                               f"floor={_pbe['r_floor']:.2f} "
                               f"best_h={_pbe['best_h']}/{_pbe['H']}",
                               flush=True)
+                        # ---- Fidelity-based best-ckpt + early stop ----
+                        # Score = sum of positive Pearson r across
+                        # probed horizons + small bonus for depth.
+                        # Robust to single-horizon noise.
+                        _per = _pbe.get('per_offset') or []
+                        _r_vals = [float(r) for (_, r) in _per]
+                        _score = (sum(max(0.0, r) for r in _r_vals)
+                                   + 0.05 * float(_pbe.get('best_h', 0))
+                                            / max(1, int(_pbe.get('H', 1))))
+                        if _score > wm_best_score:
+                            wm_best_score = _score
+                            wm_best_iter = int(total_iters)
+                            wm_best_ckpt_path = out_dir / 'wm_best.pt'
+                            torch.save({
+                                'model': model.state_dict(),
+                                'cfg': asdict(cfg),
+                                'obs_norm': env.get_obs_norm_stats(),
+                                'wm_fidelity_score': float(_score),
+                                'wm_fidelity_probe': {
+                                    'iter': int(total_iters),
+                                    'env_steps': int(total_env_steps),
+                                    'per_offset': [(int(o), float(r))
+                                                    for (o, r) in _per],
+                                    'best_h': int(_pbe.get('best_h', 0)),
+                                    'H': int(_pbe.get('H', 0)),
+                                },
+                            }, wm_best_ckpt_path)
+                            print(f"[wm-best] new best fidelity score "
+                                  f"{_score:.3f} at iter {total_iters} "
+                                  f"-> saved {wm_best_ckpt_path.name}",
+                                  flush=True)
+                        elif (es_enable
+                              and current_phase in (1, 2)
+                              and wm_best_iter > 0
+                              and total_iters >= wm_fidelity_warmup_iters
+                              and (total_iters - wm_best_iter)
+                                    >= wm_fidelity_patience_iters):
+                            early_stop_reason = (
+                                f'wm_fidelity_degradation: no improvement '
+                                f'over best={wm_best_score:.3f} '
+                                f'(iter {wm_best_iter}) for '
+                                f'{total_iters - wm_best_iter} iters '
+                                f'(patience={wm_fidelity_patience_iters})')
                 except Exception as _e:
                     print(f"[wm-fidelity-probe-iter{total_iters}] "
                           f"error: {_e!r}", flush=True)
