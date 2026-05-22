@@ -3426,8 +3426,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
             # P39 diag A: emit last computed per-head grad norms (if any).
+            # Values may be float (grad norms) or str (error messages); pass
+            # strings through unchanged so jsonl serialisation works.
             for _k, _v in diag_perhead_last.items():
-                row[_k] = float(_v)
+                if isinstance(_v, str):
+                    row[_k] = _v
+                else:
+                    row[_k] = float(_v)
             # P39 diag D: latent stability probe.  Cheap (one tokenizer
             # forward on N fixed transitions; <0.5% overhead at cadence
             # 10).  Tracks cosine similarity of encoder outputs against
