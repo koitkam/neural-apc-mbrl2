@@ -265,6 +265,26 @@ Both knobs are sim-agnostic and adaptive: injection uses
 `cfg.episode_length` and the env's existing action range; warm-restore
 no-ops when `wm_best.pt` is essentially the current state.
 
+#### Reward-MTP / WM-coupling diagnostics (P39)
+
+Four lightweight knobs to localise *why* the H=15 fidelity collapses
+even when supervised losses look healthy. A and D are standing
+observability (default ON, log-cadence-gated, <2% total overhead).
+B and C are controlled-experiment switches (default OFF) for one-off
+causal runs.
+
+| Var | Effect |
+|---|---|
+| `DREAMER_DIAG_PERHEAD_GRADS_EVERY` | (A) Log `diag_grad_{recon,sf,rmtp}` — per-loss gradient norms at the tokenizer's first parameter. Default 10 iters; 0 = off. |
+| `DREAMER_DIAG_LATENT_STABILITY_EVERY` | (D) Log `diag_latent_cos_{mean,min}` — cosine similarity of the encoder output on a fixed 64-transition reference set, vs. its values when first sampled. A sharp drop = the encoder is re-organising. Default 10 iters; 0 = off. |
+| `DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1` | (B) Ablate the reward MTP loss term from P1's `total_loss`. Reward head receives no gradient in P1 (will be untrained entering P2). If the fidelity cliff disappears, reward gradients are the cause. Default 0. |
+| `DREAMER_DIAG_REWARD_MTP_STOP_GRAD_IN_P1` | (C) Keep training the reward head but detach `agent_hid` before it. Head still learns; encoder/dynamics latent no longer receives reward-head gradient. Complements B: if C alone fixes the cliff, the problem is gradient distortion of shared params; if only B fixes it, it's something deeper. Default 0. Ignored when B is also set. |
+
+Recommended next experiment (P39-B): run with
+`DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1=1` and compare the
+`diag_latent_cos_mean` + fidelity-probe trajectory to the standing
+P39 baseline.
+
 ## Single training run (no BO)
 
 ```bash

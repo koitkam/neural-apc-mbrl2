@@ -2871,6 +2871,29 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P2', '1') or 0))
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
+    # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
+    # All four are cheap and gated by env vars.  A + D are standing
+    # observability (default ON, run at probe cadence → <2% overhead).
+    # B + C are controlled-experiment switches (default OFF) used to
+    # causally isolate whether reward-MTP gradients distort the latent.
+    diag_perhead_grads_every = int(
+        os.environ.get('DREAMER_DIAG_PERHEAD_GRADS_EVERY', '10') or 0)
+    diag_latent_stability_every = int(
+        os.environ.get('DREAMER_DIAG_LATENT_STABILITY_EVERY', '10') or 0)
+    diag_disable_reward_mtp_in_p1 = bool(int(
+        os.environ.get('DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1', '0') or 0))
+    diag_reward_mtp_stop_grad_in_p1 = bool(int(
+        os.environ.get('DREAMER_DIAG_REWARD_MTP_STOP_GRAD_IN_P1', '0') or 0))
+    diag_latent_ref: Optional[Dict[str, torch.Tensor]] = None
+    diag_perhead_last: Dict[str, float] = {}
+    if diag_disable_reward_mtp_in_p1 and diag_reward_mtp_stop_grad_in_p1:
+        print('[diag] WARNING: both DISABLE_REWARD_MTP_IN_P1 and '
+              'REWARD_MTP_STOP_GRAD_IN_P1 set; DISABLE takes precedence.',
+              flush=True)
+    if diag_disable_reward_mtp_in_p1:
+        print('[diag] reward MTP disabled in P1 (experiment B)', flush=True)
+    elif diag_reward_mtp_stop_grad_in_p1:
+        print('[diag] reward MTP stop-grad in P1 (experiment C)', flush=True)
     # Reference entropy used for the entropy-collapse early-stop trip.
     # For the discrete categorical actor this is the max-entropy uniform
     # baseline (``log K``) per action dim.  For the continuous TanhNormal
@@ -3179,8 +3202,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # to uniform (preserves the existing P2-only BC
                     # rationale documented at TrainConfig.bc_scale).
                     if current_phase == 1:
+                        # P39 diag C: optional stop-gradient on agent_hid
+                        # before reward-MTP head, to isolate whether
+                        # reward-MTP gradients distort the encoder/dynamics
+                        # latent (without disabling the head's own
+                        # learning, unlike diag B).
+                        _hid_for_agent = agent_hid
+                        if (diag_reward_mtp_stop_grad_in_p1
+                                and not diag_disable_reward_mtp_in_p1
+                                and isinstance(agent_hid, torch.Tensor)):
+                            _hid_for_agent = agent_hid.detach()
                         ag_losses = agent_finetune_loss(model, batch,
-                                                          agent_hid, cfg)
+                                                          _hid_for_agent, cfg)
                 # Phase 2: also update reward + policy via MTP (eq. 9).
                 if current_phase == 2:
                     with torch.amp.autocast(device_type=device.type,
@@ -3195,15 +3228,60 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # using ``reward_mtp_loss`` (which is .detach()'d for
                     # diagnostics) silently zeros the reward-head gradient
                     # in P1, leaving it untrained until P2 starts.
-                    total_loss = (wm_losses['wm_total']
-                                   + cfg.reward_scale_loss
-                                     * ag_losses['reward_mtp_total'])
+                    if diag_disable_reward_mtp_in_p1:
+                        # P39 diag B: ablate reward MTP from P1 to test
+                        # whether reward-head gradients are responsible
+                        # for the H=15 fidelity collapse.  Head receives
+                        # no gradient at all in P1 — will be untrained
+                        # entering P2 (compare to baseline P2 rmtp loss).
+                        total_loss = wm_losses['wm_total']
+                    else:
+                        total_loss = (wm_losses['wm_total']
+                                       + cfg.reward_scale_loss
+                                         * ag_losses['reward_mtp_total'])
                 else:
                     total_loss = wm_losses['wm_total']
 
                 opt_world.zero_grad(set_to_none=True)
                 if current_phase == 2:
                     opt_actor.zero_grad(set_to_none=True)
+                # P39 diag A: per-head gradient norms (encoder/dynamics
+                # subgraph) — answers "which loss term dominates the WM
+                # gradient at iter N?".  Probe-cadence-gated so cost is
+                # ~3 extra backwards every N iters; negligible at default
+                # cadence 10 (<2% wall-clock).  Uses
+                # ``torch.autograd.grad`` to compute partial grads w.r.t.
+                # the tokenizer's first parameter (a single small tensor),
+                # NOT the full model — same direction signal at ~1/10th
+                # the cost of a true per-loss backward.
+                if (diag_perhead_grads_every > 0
+                        and total_iters > 0
+                        and (total_iters % diag_perhead_grads_every) == 0
+                        and current_phase in (1, 2)):
+                    try:
+                        _ref_param = next(p for p in model.tokenizer.parameters()
+                                            if p.requires_grad)
+                        _diag_terms = {
+                            'recon': wm_losses.get('recon_loss'),
+                            'sf': wm_losses.get('sf_loss'),
+                        }
+                        if ('reward_mtp_total' in ag_losses
+                                and not diag_disable_reward_mtp_in_p1):
+                            _diag_terms['rmtp'] = (cfg.reward_scale_loss
+                                                    * ag_losses['reward_mtp_total'])
+                        diag_perhead_last = {}
+                        for _name, _lt in _diag_terms.items():
+                            if _lt is None or not torch.is_tensor(_lt):
+                                continue
+                            _g = torch.autograd.grad(_lt, [_ref_param],
+                                                       retain_graph=True,
+                                                       allow_unused=True)[0]
+                            diag_perhead_last[f'diag_grad_{_name}'] = (
+                                float(_g.detach().float().norm().item())
+                                if _g is not None else 0.0)
+                    except Exception as _e:
+                        # Non-fatal — diagnostic only.
+                        diag_perhead_last = {'diag_grad_error': 1.0}
                 total_loss.backward()
                 wm_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters_world(), cfg.grad_clip)
@@ -3342,6 +3420,46 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             }
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
+            # P39 diag A: emit last computed per-head grad norms (if any).
+            for _k, _v in diag_perhead_last.items():
+                row[_k] = float(_v)
+            # P39 diag D: latent stability probe.  Cheap (one tokenizer
+            # forward on N fixed transitions; <0.5% overhead at cadence
+            # 10).  Tracks cosine similarity of encoder outputs against
+            # a reference set seeded at first call.  A sharp drop ==
+            # the encoder is re-organising its representation; correlate
+            # with iter index of any fidelity-probe cliff.
+            if (diag_latent_stability_every > 0
+                    and total_iters > 0
+                    and (total_iters % diag_latent_stability_every) == 0
+                    and current_phase in (1, 2)):
+                try:
+                    _N = 64
+                    if diag_latent_ref is None:
+                        _b = buf.sample(min(_N, max(1, buf.filled)),
+                                          cfg.seq_len, rng)
+                        _obs0 = torch.from_numpy(_b['obs']).to(device)
+                        with torch.no_grad():
+                            _z0 = model.tokenizer.encode(_obs0).float()
+                        diag_latent_ref = {'obs': _obs0, 'z': _z0,
+                                            'iter': int(total_iters)}
+                        row['diag_latent_ref_iter'] = int(total_iters)
+                        row['diag_latent_cos_mean'] = 1.0
+                    else:
+                        with torch.no_grad():
+                            _z_now = model.tokenizer.encode(
+                                diag_latent_ref['obs']).float()
+                        # Per-token cosine sim, then mean.
+                        _a = _z_now.reshape(-1, _z_now.shape[-1])
+                        _b = diag_latent_ref['z'].reshape(-1, _z_now.shape[-1])
+                        _cos = torch.nn.functional.cosine_similarity(
+                            _a, _b, dim=-1)
+                        row['diag_latent_ref_iter'] = int(
+                            diag_latent_ref['iter'])
+                        row['diag_latent_cos_mean'] = float(_cos.mean().item())
+                        row['diag_latent_cos_min'] = float(_cos.min().item())
+                except Exception as _e:
+                    row['diag_latent_error'] = str(_e)[:80]
             log_f.write(json.dumps(row) + '\n')
             log_f.flush()
             rwm = row.get('return_window_mean')
