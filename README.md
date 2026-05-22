@@ -190,6 +190,53 @@ search *and* keep warm-starting model weights.
 | `SIGMA_MIN_RATIO_OF_MAX` | `σ_min = σ_max / ratio` (default 2.5, min 2.0). |
 | `OBJ_AUTO_ECON_OVER_MOVE_RATIO` | minimum ratio of `econ_budget` to per-step MV move penalty at typical actor jitter (default 2.0). Caps `move_base` so the user's economics term always strictly dominates the move term. Set to 1.0 to disable the cap; set higher (e.g. 5.0) for plants where you want the actor to ignore move pressure entirely while economics is small. |
 
+#### Hidden OU disturbance (unmeasured CV upsets)
+
+A hidden Ornstein-Uhlenbeck (OU) process injects a smoothly evolving,
+**unobservable** bias into each CV channel — modeling unmeasured upstream
+upsets the controller must reject. The OU state is never exposed to the
+agent or the world model; only the CV reflects it.
+
+| Var | Effect |
+|---|---|
+| `DREAMER_HIDDEN_DISTURBANCE` | `0` to disable hidden OU entirely (default ON). |
+| `DREAMER_DISTURBANCE_PROB_WM` | Per-episode probability the OU fires in P1/P2 (WM training). **Default 0.10** — observable schedule events (SP/DV) fire on 100% of episodes, so this gives the WM ~10× more clean episodes than disturbed ones, matching the realistic "rare upset" frequency and protecting WM fidelity during early learning. |
+| `DREAMER_DISTURBANCE_PROB_AGENT` | Per-episode probability the OU fires in P3 (critic+actor). Default 0.50 — policy needs the full disturbance distribution. |
+| `DREAMER_HIDDEN_OU_PROB_MIN` | Floor of the adaptive P1/P2 trigger probability (default 0.05). The OU fires at least this often even before the WM has learned anything. |
+| `DREAMER_HIDDEN_OU_PROB_MAX` | Cap of the adaptive P1/P2 trigger probability (default = `DREAMER_DISTURBANCE_PROB_WM`, i.e. 0.10). |
+| `DREAMER_HIDDEN_OU_PROB_TARGET_SCORE` | WM fidelity score at which the trigger probability reaches `PROB_MAX` (default 2.0 ≈ all four probe horizons pass the 0.40 Pearson-r floor). Score = `sum(max(0, r_h)) + 0.05·best_h/H`. P1/P2 only; P3 ignores. |
+| `DREAMER_HIDDEN_OU_AMP_RAMP` | `"<start>:<reach>"` (default `0.1:0.4`). Linear amplitude ramp from `start` at progress=0 to 1.0 at `progress=reach`, then capped by `..._AMP_MAX_SCALE`. |
+| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE` | Hard cap on `curriculum_amp_scale()` output (default 0.2). With base `amp_frac=0.10`, peak disturbance ≈ 2% of MV authority. Raise (e.g. 1.0) for P3 robustness training. |
+| `DREAMER_HIDDEN_OU_AMP_JITTER` | `"<lo>:<hi>"` per-episode amplitude DR multiplier (default `0.6:1.6`). |
+| `DREAMER_HIDDEN_OU_DRIFT_FRAC` | Max constant per-episode mean offset as fraction of amp (default 0.4). |
+
+**Adaptive trigger rationale (P38, 2026-05-22):** P37 RCA found the WM
+fidelity probe peaked at iter 70 then degraded as the OU curriculum
+ramped up. Two orthogonal protections now run together:
+
+- **Amplitude axis:** `..._AMP_MAX_SCALE=0.2` keeps each disturbed
+  episode's perturbation small (~2% of MV authority).
+- **Frequency axis:** adaptive `get_phase_disturbance_prob(phase, wm_best_score)`
+  scales the per-episode trigger probability from `PROB_MIN` (0.05) up
+  to `PROB_MAX` (0.10) only as the WM demonstrates it can imagine
+  clean dynamics (`wm_best_score → PROB_TARGET_SCORE`). The WM is
+  never overwhelmed by hidden upsets before it has learned base
+  dynamics.
+
+#### WM fidelity early-stop and `wm_best.pt`
+
+| Var | Effect |
+|---|---|
+| `DREAMER_WM_PROBE_EVERY_ITERS` | Run the fidelity probe every N P1/P2 iters (default 10; set 0 to disable). |
+| `DREAMER_WM_FIDELITY_WARMUP_ITERS` | Iters before degradation early-stop can trigger (default 40). |
+| `DREAMER_WM_FIDELITY_PATIENCE_ITERS` | Iters without a new best score before P1/P2 early-stop trips (default 50). |
+
+When the score improves, a `wm_best.pt` checkpoint is written to the run
+output directory alongside the periodic `ckpt_iter_*.pt` saves, with
+the probe metadata (per-horizon r, best_h, iter) embedded. Downstream
+phases (P2/P3) can warm-start from `wm_best.pt` instead of the latest
+checkpoint when the latest one has degraded past peak quality.
+
 ## Single training run (no BO)
 
 ```bash

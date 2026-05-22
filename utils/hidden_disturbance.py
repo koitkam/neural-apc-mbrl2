@@ -165,23 +165,76 @@ def _sample_drift_frac(rng: np.random.Generator) -> float:
     return float(rng.uniform(-mx, mx))
 
 
-def get_phase_disturbance_prob(phase: int) -> float:
+def get_phase_disturbance_prob(
+    phase: int,
+    wm_best_score: Optional[float] = None,
+) -> float:
     """Return the per-episode probability that hidden disturbance fires.
 
-    Defaults: 0.3 in P1/P2 (WM training), 0.5 in P3 (critic+actor).
-    Override via env vars ``DREAMER_DISTURBANCE_PROB_WM`` and
-    ``DREAMER_DISTURBANCE_PROB_AGENT``.
+    **Adaptive triggering (P38, 2026-05-22).**  Observable forcing
+    (setpoint steps, DV ramps, MV exploration) fires on 100% of
+    episodes; the hidden OU is a much harder learning signal because
+    the WM has no observation to attribute it to.  We want observable
+    events to outnumber hidden ones by ~10× during WM learning so the
+    WM can lock in clean dynamics first, then graduate to handling
+    hidden upsets.
+
+    Default behavior:
+      - P1/P2 (WM training): ``DREAMER_DISTURBANCE_PROB_WM`` (default 0.10).
+        When ``wm_best_score`` is supplied, the probability is linearly
+        interpolated between ``DREAMER_HIDDEN_OU_PROB_MIN`` (default 0.05)
+        at score=0 and ``DREAMER_HIDDEN_OU_PROB_MAX`` (default = the WM
+        static prob, 0.10) at score=``DREAMER_HIDDEN_OU_PROB_TARGET_SCORE``
+        (default 2.0 ≈ all four fidelity horizons pass the 0.40 floor).
+      - P3 (critic+actor): ``DREAMER_DISTURBANCE_PROB_AGENT`` (default 0.50).
+        Adaptive scaling does not apply in P3; the policy needs the
+        full disturbance distribution to learn robust rejection.
+
+    Backward compatible: when called as ``get_phase_disturbance_prob(phase)``
+    (no score), returns the static phase prob from env vars.
     """
     if int(phase) >= 3:
         raw = os.environ.get('DREAMER_DISTURBANCE_PROB_AGENT', '0.5')
         default = 0.5
-    else:
-        raw = os.environ.get('DREAMER_DISTURBANCE_PROB_WM', '0.3')
-        default = 0.3
+        try:
+            return float(np.clip(float(raw), 0.0, 1.0))
+        except Exception:
+            return default
+
+    # P1/P2 static prob (also serves as default cap for adaptive mode).
+    raw_static = os.environ.get('DREAMER_DISTURBANCE_PROB_WM', '0.10')
     try:
-        return float(np.clip(float(raw), 0.0, 1.0))
+        static_prob = float(np.clip(float(raw_static), 0.0, 1.0))
     except Exception:
-        return default
+        static_prob = 0.10
+
+    if wm_best_score is None:
+        return static_prob
+
+    # Adaptive interpolation: ramp prob from MIN to MAX as fidelity
+    # score climbs from 0 to TARGET_SCORE.  Cap at MAX.
+    try:
+        p_min = float(os.environ.get('DREAMER_HIDDEN_OU_PROB_MIN', '0.05'))
+    except Exception:
+        p_min = 0.05
+    try:
+        p_max = float(os.environ.get(
+            'DREAMER_HIDDEN_OU_PROB_MAX', str(static_prob)))
+    except Exception:
+        p_max = static_prob
+    try:
+        target = float(os.environ.get(
+            'DREAMER_HIDDEN_OU_PROB_TARGET_SCORE', '2.0'))
+    except Exception:
+        target = 2.0
+    p_min = float(np.clip(p_min, 0.0, 1.0))
+    p_max = float(np.clip(p_max, 0.0, 1.0))
+    if p_max < p_min:
+        p_max = p_min
+    target = float(max(target, 1e-6))
+    score = float(max(0.0, wm_best_score))
+    frac = float(np.clip(score / target, 0.0, 1.0))
+    return float(p_min + (p_max - p_min) * frac)
 
 
 class HiddenDisturbanceProcess:

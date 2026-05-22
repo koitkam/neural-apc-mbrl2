@@ -2933,6 +2933,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value
         # at every episode reset.  No-op when curriculum env var unset.
         env.set_training_progress(total_env_steps / max(1, int(cfg.total_steps)))
+        # Refresh adaptive hidden-OU per-episode probability (P38):
+        # interpolates between PROB_MIN and PROB_MAX as the WM fidelity
+        # score climbs.  In P3 the score is ignored (full distribution).
+        try:
+            env._disturbance_prob_override = get_phase_disturbance_prob(
+                phase=int(current_phase),
+                wm_best_score=(float(wm_best_score)
+                                if wm_best_score > -1e17 else None),
+            )
+        except Exception:
+            pass
         new_phase = _phase_for(total_env_steps)
         if new_phase != current_phase:
             print(f'[phase] transition {current_phase} -> {new_phase} '
