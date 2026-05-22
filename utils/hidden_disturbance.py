@@ -64,37 +64,38 @@ def hidden_disturbance_enabled(default: bool = True) -> bool:
     return str(raw).strip().lower() not in {'0', 'false', 'no', 'off', ''}
 
 
-def curriculum_amp_scale(progress: float) -> float:
-    """Amplitude curriculum scale (≤max) as a function of training progress.
+def curriculum_amp_scale(progress: float, phase: Optional[int] = None) -> float:
+    """Amplitude curriculum scale (≤cap) as a function of training progress.
 
     Reads ``DREAMER_HIDDEN_OU_AMP_RAMP="<start_frac>:<reach_full_at>"``.
     ``start_frac``: amplitude scale at ``progress=0`` (e.g. 0.1 = 10% of
     nominal).  ``reach_full_at``: progress fraction at which the scale
     reaches the cap (e.g. 0.4 = full amplitude by 40% of training).
 
-    Reads ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE="<cap>"`` (default 0.2):
-    hard cap on the returned scale.  P37 RCA (2026-05-22): fidelity
-    probe peaked at iter 70 and degraded through iter 150 — correlated
-    with curriculum reaching full nominal amplitude.  Capping the
-    curriculum at 0.2 keeps the WM in a regime where it can learn
-    base dynamics first; raise the cap (or set to 1.0) for the
-    critic/actor phase if needed.
+    Phase-aware cap (P38, 2026-05-22):
+      - P1/P2 (or phase unknown): ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE``
+        (default 0.2). Keeps the WM in a regime where it can learn
+        base dynamics first; the critic only sees lightly-disturbed
+        imagined starts.
+      - P3: ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3`` (default 1.0). The
+        WM is frozen and the actor must learn to reject
+        realistic-magnitude upsets.
 
-    Default (env unset or malformed ramp): ``min(1.0, cap)`` — no curriculum,
-    but cap still applies.
+    Default (env unset or malformed ramp): cap value — no curriculum,
+    cap still applies.
 
     The OU is still hidden — only its magnitude is shaped over time.
     """
-    # Default ON: ramp from 10% to cap by 40% of training progress.
-    # Set ``DREAMER_HIDDEN_OU_AMP_RAMP=1.0:1.0`` (or any malformed value)
-    # to disable the ramp.  ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE`` clamps
-    # the final value (default 0.2 — keep disturbance light during WM
-    # learning; effective amp ≈ amp_frac * 0.2 of MV authority).
+    if phase is not None and int(phase) >= 3:
+        env_key = 'DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3'
+        cap_default = 1.0
+    else:
+        env_key = 'DREAMER_HIDDEN_OU_AMP_MAX_SCALE'
+        cap_default = 0.2
     try:
-        cap = float(os.environ.get(
-            'DREAMER_HIDDEN_OU_AMP_MAX_SCALE', '0.2'))
+        cap = float(os.environ.get(env_key, str(cap_default)))
     except Exception:
-        cap = 0.2
+        cap = cap_default
     cap = float(np.clip(cap, 0.0, 1.0))
     raw = os.environ.get('DREAMER_HIDDEN_OU_AMP_RAMP', '0.1:0.4').strip()
     if not raw:
@@ -168,60 +169,111 @@ def _sample_drift_frac(rng: np.random.Generator) -> float:
 def get_phase_disturbance_prob(
     phase: int,
     wm_best_score: Optional[float] = None,
+    phase_progress: Optional[float] = None,
 ) -> float:
     """Return the per-episode probability that hidden disturbance fires.
 
     **Adaptive triggering (P38, 2026-05-22).**  Observable forcing
     (setpoint steps, DV ramps, MV exploration) fires on 100% of
     episodes; the hidden OU is a much harder learning signal because
-    the WM has no observation to attribute it to.  We want observable
-    events to outnumber hidden ones by ~10× during WM learning so the
-    WM can lock in clean dynamics first, then graduate to handling
-    hidden upsets.
+    the WM has no observation to attribute it to.  Per-phase curriculum:
 
-    Default behavior:
-      - P1/P2 (WM training): ``DREAMER_DISTURBANCE_PROB_WM`` (default 0.10).
-        When ``wm_best_score`` is supplied, the probability is linearly
-        interpolated between ``DREAMER_HIDDEN_OU_PROB_MIN`` (default 0.05)
-        at score=0 and ``DREAMER_HIDDEN_OU_PROB_MAX`` (default = the WM
-        static prob, 0.10) at score=``DREAMER_HIDDEN_OU_PROB_TARGET_SCORE``
-        (default 2.0 ≈ all four fidelity horizons pass the 0.40 floor).
-      - P3 (critic+actor): ``DREAMER_DISTURBANCE_PROB_AGENT`` (default 0.50).
-        Adaptive scaling does not apply in P3; the policy needs the
-        full disturbance distribution to learn robust rejection.
+      - **P1 (WM training)**: adaptive on ``wm_best_score``. Interpolates
+        between ``DREAMER_HIDDEN_OU_PROB_MIN`` (default 0.05) at score=0
+        and ``DREAMER_DISTURBANCE_PROB_WM`` (default 0.10) at
+        score=``DREAMER_HIDDEN_OU_PROB_TARGET_SCORE`` (default 2.0).
+      - **P2 (critic training)**: ramp on ``phase_progress`` from the
+        P1/P2 cap (``DREAMER_DISTURBANCE_PROB_WM``, 0.10) to
+        ``DREAMER_DISTURBANCE_PROB_P2`` (default 0.20). Reaches the P2
+        cap by ``DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH`` (default 0.5 =
+        midpoint of P2). Rationale: critic learns value of imagined
+        rollouts that start from buffered real states. If the buffer
+        only contains lightly-disturbed states (P1 cap), the critic
+        never learns values for the disturbed manifold. Ramping P2
+        gradually broadens buffer coverage without destabilising the
+        still-updating WM.
+      - **P3 (actor + critic)**: ramp on ``phase_progress`` from the P2
+        cap (0.20) to ``DREAMER_DISTURBANCE_PROB_AGENT`` (default 0.50).
+        Reaches the P3 cap by ``DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH``
+        (default 0.5 = midpoint of P3). Rationale: actor needs to learn
+        observable tracking before robust rejection; a step to 0.50 from
+        day one of P3 corrupts ~half of its gradient signal on a
+        randomly-initialised policy.
 
-    Backward compatible: when called as ``get_phase_disturbance_prob(phase)``
-    (no score), returns the static phase prob from env vars.
+    Backward compatible: omitting ``phase_progress`` returns the
+    phase-end cap (P1 still uses wm_best_score adaptation when supplied).
     """
+    # ---- P3 ----
     if int(phase) >= 3:
-        raw = os.environ.get('DREAMER_DISTURBANCE_PROB_AGENT', '0.5')
-        default = 0.5
         try:
-            return float(np.clip(float(raw), 0.0, 1.0))
+            p3_cap = float(np.clip(
+                float(os.environ.get('DREAMER_DISTURBANCE_PROB_AGENT', '0.5')),
+                0.0, 1.0))
         except Exception:
-            return default
+            p3_cap = 0.5
+        try:
+            p3_floor = float(np.clip(
+                float(os.environ.get('DREAMER_DISTURBANCE_PROB_P2', '0.2')),
+                0.0, 1.0))
+        except Exception:
+            p3_floor = 0.2
+        if phase_progress is None:
+            return p3_cap
+        try:
+            reach = float(np.clip(
+                float(os.environ.get(
+                    'DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH', '0.5')),
+                1e-6, 1.0))
+        except Exception:
+            reach = 0.5
+        pp = float(np.clip(phase_progress, 0.0, 1.0))
+        if pp >= reach:
+            return p3_cap
+        return float(p3_floor + (p3_cap - p3_floor) * (pp / reach))
 
-    # P1/P2 static prob (also serves as default cap for adaptive mode).
-    raw_static = os.environ.get('DREAMER_DISTURBANCE_PROB_WM', '0.10')
+    # P1/P2 share the static WM cap (also the P2 floor).
+    raw_wm = os.environ.get('DREAMER_DISTURBANCE_PROB_WM', '0.10')
     try:
-        static_prob = float(np.clip(float(raw_static), 0.0, 1.0))
+        wm_cap = float(np.clip(float(raw_wm), 0.0, 1.0))
     except Exception:
-        static_prob = 0.10
+        wm_cap = 0.10
 
+    # ---- P2 ----
+    if int(phase) == 2:
+        try:
+            p2_cap = float(np.clip(
+                float(os.environ.get('DREAMER_DISTURBANCE_PROB_P2', '0.2')),
+                0.0, 1.0))
+        except Exception:
+            p2_cap = 0.2
+        if p2_cap < wm_cap:
+            p2_cap = wm_cap
+        if phase_progress is None:
+            return p2_cap
+        try:
+            reach = float(np.clip(
+                float(os.environ.get(
+                    'DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH', '0.5')),
+                1e-6, 1.0))
+        except Exception:
+            reach = 0.5
+        pp = float(np.clip(phase_progress, 0.0, 1.0))
+        if pp >= reach:
+            return p2_cap
+        return float(wm_cap + (p2_cap - wm_cap) * (pp / reach))
+
+    # ---- P1 (adaptive on wm_best_score) ----
     if wm_best_score is None:
-        return static_prob
-
-    # Adaptive interpolation: ramp prob from MIN to MAX as fidelity
-    # score climbs from 0 to TARGET_SCORE.  Cap at MAX.
+        return wm_cap
     try:
         p_min = float(os.environ.get('DREAMER_HIDDEN_OU_PROB_MIN', '0.05'))
     except Exception:
         p_min = 0.05
     try:
         p_max = float(os.environ.get(
-            'DREAMER_HIDDEN_OU_PROB_MAX', str(static_prob)))
+            'DREAMER_HIDDEN_OU_PROB_MAX', str(wm_cap)))
     except Exception:
-        p_max = static_prob
+        p_max = wm_cap
     try:
         target = float(os.environ.get(
             'DREAMER_HIDDEN_OU_PROB_TARGET_SCORE', '2.0'))
@@ -378,6 +430,7 @@ def maybe_build_hidden_disturbance(
     amp_frac: float = 0.10,
     force: bool = False,
     progress: float = 0.0,
+    phase: Optional[int] = None,
 ) -> Optional[HiddenDisturbanceProcess]:
     """Bernoulli-toggle the per-episode hidden disturbance process.
 
@@ -389,6 +442,7 @@ def maybe_build_hidden_disturbance(
     the amplitude curriculum (see ``curriculum_amp_scale``) and the
     per-episode jitter / drift DR knobs (Stage C #5) to produce the
     effective ``amp_frac`` and ``drift_frac`` for this episode.
+    ``phase`` (optional) selects the phase-aware amp cap (P1/P2 vs P3).
     """
     if not hidden_disturbance_enabled(default=True):
         return None
@@ -398,7 +452,7 @@ def maybe_build_hidden_disturbance(
         if rng.uniform() >= float(prob):
             return None
     # Effective amp_frac = nominal × curriculum scale × per-episode jitter.
-    curr_scale = curriculum_amp_scale(float(progress))
+    curr_scale = curriculum_amp_scale(float(progress), phase=phase)
     jitter = _sample_amp_jitter(rng)
     eff_amp_frac = float(amp_frac) * float(curr_scale) * float(jitter)
     drift_frac = _sample_drift_frac(rng)

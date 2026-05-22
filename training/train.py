@@ -556,8 +556,9 @@ class APCEnv:
         # no way to predict.  See ``utils/hidden_disturbance.py``.
         self._hidden_disturbance = None  # type: Optional[object]
         # Phase-aware per-episode disturbance probability override.
-        # Set by the trainer at phase transitions (P1/P2 default 0.3,
-        # P3 default 0.5).  ``None`` = read from env var directly.
+        # Set by the trainer at phase transitions (P1 default 0.10,
+        # P2 ramp 0.10->0.20, P3 ramp 0.20->0.50).  ``None`` = read
+        # from env var directly.
         self._disturbance_prob_override: Optional[float] = None
         # Force flag: when True, every reset() always builds the hidden
         # process (validation path).  False = Bernoulli toggle.
@@ -566,6 +567,9 @@ class APCEnv:
         # the hidden-OU amplitude curriculum at reset() time.  Updated
         # by the trainer at every episode boundary via ``set_training_progress``.
         self._training_progress: float = 0.0
+        # Current phase (1=WM, 2=critic, 3=actor+critic).  Used by the
+        # phase-aware amplitude cap in ``curriculum_amp_scale``.
+        self._current_phase: int = 1
 
         # ---- Raw-reward clipping (P37 onward, 2026-05-22) ---------------
         # The objective's quadratic violation tail can produce
@@ -725,6 +729,7 @@ class APCEnv:
             prob=float(prob),
             force=bool(self._hidden_disturbance_force),
             progress=float(self._training_progress),
+            phase=int(self._current_phase),
         )
         obs_vec = self._build_obs_vec(state)
         self._window = np.tile(obs_vec, (self.cfg.lookback, 1)).astype('float32')
@@ -2933,14 +2938,28 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value
         # at every episode reset.  No-op when curriculum env var unset.
         env.set_training_progress(total_env_steps / max(1, int(cfg.total_steps)))
+        # Compute per-phase progress for phase-aware OU trigger ramps.
+        if current_phase == 1:
+            _phase_start = 0
+            _phase_len = max(1, int(p1))
+        elif current_phase == 2:
+            _phase_start = int(p1)
+            _phase_len = max(1, int(p2))
+        else:
+            _phase_start = int(p1 + p2)
+            _phase_len = max(1, int(p3))
+        _phase_progress = float(np.clip(
+            (total_env_steps - _phase_start) / _phase_len, 0.0, 1.0))
+        env._current_phase = int(current_phase)
         # Refresh adaptive hidden-OU per-episode probability (P38):
-        # interpolates between PROB_MIN and PROB_MAX as the WM fidelity
-        # score climbs.  In P3 the score is ignored (full distribution).
+        # P1: interpolated on wm_best_score.
+        # P2/P3: ramped on per-phase progress.
         try:
             env._disturbance_prob_override = get_phase_disturbance_prob(
                 phase=int(current_phase),
                 wm_best_score=(float(wm_best_score)
                                 if wm_best_score > -1e17 else None),
+                phase_progress=_phase_progress,
             )
         except Exception:
             pass

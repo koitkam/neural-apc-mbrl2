@@ -200,28 +200,35 @@ agent or the world model; only the CV reflects it.
 | Var | Effect |
 |---|---|
 | `DREAMER_HIDDEN_DISTURBANCE` | `0` to disable hidden OU entirely (default ON). |
-| `DREAMER_DISTURBANCE_PROB_WM` | Per-episode probability the OU fires in P1/P2 (WM training). **Default 0.10** — observable schedule events (SP/DV) fire on 100% of episodes, so this gives the WM ~10× more clean episodes than disturbed ones, matching the realistic "rare upset" frequency and protecting WM fidelity during early learning. |
-| `DREAMER_DISTURBANCE_PROB_AGENT` | Per-episode probability the OU fires in P3 (critic+actor). Default 0.50 — policy needs the full disturbance distribution. |
-| `DREAMER_HIDDEN_OU_PROB_MIN` | Floor of the adaptive P1/P2 trigger probability (default 0.05). The OU fires at least this often even before the WM has learned anything. |
-| `DREAMER_HIDDEN_OU_PROB_MAX` | Cap of the adaptive P1/P2 trigger probability (default = `DREAMER_DISTURBANCE_PROB_WM`, i.e. 0.10). |
-| `DREAMER_HIDDEN_OU_PROB_TARGET_SCORE` | WM fidelity score at which the trigger probability reaches `PROB_MAX` (default 2.0 ≈ all four probe horizons pass the 0.40 Pearson-r floor). Score = `sum(max(0, r_h)) + 0.05·best_h/H`. P1/P2 only; P3 ignores. |
-| `DREAMER_HIDDEN_OU_AMP_RAMP` | `"<start>:<reach>"` (default `0.1:0.4`). Linear amplitude ramp from `start` at progress=0 to 1.0 at `progress=reach`, then capped by `..._AMP_MAX_SCALE`. |
-| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE` | Hard cap on `curriculum_amp_scale()` output (default 0.2). With base `amp_frac=0.10`, peak disturbance ≈ 2% of MV authority. Raise (e.g. 1.0) for P3 robustness training. |
+| `DREAMER_DISTURBANCE_PROB_WM` | Per-episode probability cap in P1/P2 (default 0.10). In P1 acts as the upper bound of the adaptive ramp; in P2 acts as the floor (P2 starts at this value). Observable schedule events (SP/DV) fire on 100% of episodes, so 0.10 gives the WM ~10× more clean episodes than disturbed ones during early learning. |
+| `DREAMER_DISTURBANCE_PROB_P2` | Per-episode probability cap in P2 (default 0.20). P2 linearly ramps from `DREAMER_DISTURBANCE_PROB_WM` (0.10) up to this cap as critic training progresses. Rationale: critic learns value of imagined rollouts starting from buffered real states; broadening buffer coverage with more disturbed episodes lets the critic estimate value across the disturbed manifold. |
+| `DREAMER_DISTURBANCE_PROB_AGENT` | Per-episode probability cap in P3 (default 0.50). P3 linearly ramps from `DREAMER_DISTURBANCE_PROB_P2` (0.20) up to this cap as actor training progresses. Rationale: actor needs to learn observable tracking before robust rejection; a step to 0.50 from day one of P3 corrupts ~half of its gradient signal on a randomly-initialised policy. |
+| `DREAMER_HIDDEN_OU_PROB_MIN` | Floor of the **P1 adaptive** trigger probability (default 0.05). The OU fires at least this often even before the WM has learned anything. |
+| `DREAMER_HIDDEN_OU_PROB_MAX` | Cap of the **P1 adaptive** trigger probability (default = `DREAMER_DISTURBANCE_PROB_WM`, i.e. 0.10). |
+| `DREAMER_HIDDEN_OU_PROB_TARGET_SCORE` | WM fidelity score at which the **P1** trigger probability reaches `PROB_MAX` (default 2.0 ≈ all four probe horizons pass the 0.40 Pearson-r floor). Score = `sum(max(0, r_h)) + 0.05·best_h/H`. P1 only. |
+| `DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH` | Fraction of P2 budget at which the P2 trigger probability reaches `DREAMER_DISTURBANCE_PROB_P2` (default 0.5 = midpoint of P2). |
+| `DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH` | Fraction of P3 budget at which the P3 trigger probability reaches `DREAMER_DISTURBANCE_PROB_AGENT` (default 0.5 = midpoint of P3). |
+| `DREAMER_HIDDEN_OU_AMP_RAMP` | `"<start>:<reach>"` (default `0.1:0.4`). Linear amplitude ramp from `start` at progress=0 to 1.0 at `progress=reach`, then capped by the phase-aware amplitude cap. |
+| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE` | Hard cap on `curriculum_amp_scale()` in **P1/P2** (default 0.2). With base `amp_frac=0.10`, peak disturbance ≈ 2% of MV authority during WM/critic learning. |
+| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3` | Hard cap on `curriculum_amp_scale()` in **P3** (default 1.0). The WM is frozen in P3 and the actor must learn realistic-magnitude rejection, so amplitude jumps to full nominal. |
 | `DREAMER_HIDDEN_OU_AMP_JITTER` | `"<lo>:<hi>"` per-episode amplitude DR multiplier (default `0.6:1.6`). |
 | `DREAMER_HIDDEN_OU_DRIFT_FRAC` | Max constant per-episode mean offset as fraction of amp (default 0.4). |
 
-**Adaptive trigger rationale (P38, 2026-05-22):** P37 RCA found the WM
-fidelity probe peaked at iter 70 then degraded as the OU curriculum
-ramped up. Two orthogonal protections now run together:
+**Per-phase OU curriculum (P38, 2026-05-22):** The hidden disturbance
+ramps along *two* orthogonal axes, each scoped to where it does the
+least harm:
 
-- **Amplitude axis:** `..._AMP_MAX_SCALE=0.2` keeps each disturbed
-  episode's perturbation small (~2% of MV authority).
-- **Frequency axis:** adaptive `get_phase_disturbance_prob(phase, wm_best_score)`
-  scales the per-episode trigger probability from `PROB_MIN` (0.05) up
-  to `PROB_MAX` (0.10) only as the WM demonstrates it can imagine
-  clean dynamics (`wm_best_score → PROB_TARGET_SCORE`). The WM is
-  never overwhelmed by hidden upsets before it has learned base
-  dynamics.
+| Phase | Trigger probability | Amplitude cap | Driving signal |
+|---|---|---|---|
+| P1 (WM) | 0.05 → 0.10 | 0.2 | `wm_best_score / TARGET_SCORE` |
+| P2 (critic) | 0.10 → 0.20 | 0.2 | `phase_progress / P2_RAMP_REACH` |
+| P3 (actor) | 0.20 → 0.50 | 1.0 | `phase_progress / P3_RAMP_REACH` |
+
+This gives a continuous monotonic ramp across phases: trigger
+probability and amplitude both start small (clean signal for WM
+learning), broaden gradually as the critic needs broader state-space
+coverage, and reach full operational magnitude only in P3 when the
+actor is the one learning to reject.
 
 #### WM fidelity early-stop and `wm_best.pt`
 
