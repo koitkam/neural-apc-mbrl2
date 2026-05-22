@@ -2842,6 +2842,35 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         os.environ.get('DREAMER_WM_FIDELITY_WARMUP_ITERS', '40'))
     wm_fidelity_patience_iters = int(
         os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '50'))
+    # ----- P1 const-action re-injection (P39, 2026-05-22) -----
+    # P38 RCA: supervised losses stay flat from iter ~25 onward but the
+    # H=15 imagination-fidelity probe collapses past iter 50, and the
+    # wm_steady_state_diagnostic shows 0% convergence under held actions.
+    # Root cause: the front-loaded const-action seeds (40 episodes ≈
+    # 49k steps) are swamped as the buffer fills with 5×+ that volume of
+    # P1 random-action episodes, so the WM forgets long-horizon
+    # steady-state behaviour even while its short-horizon next-state
+    # loss continues to improve.  Periodically inject fresh const-action
+    # episodes during P1 to keep the steady-state regime represented in
+    # the buffer.  Sim-agnostic: counts are env-tunable, action levels
+    # stratified within ``constant_action_seed_op_band``.
+    const_inject_every = int(
+        os.environ.get('DREAMER_CONST_ACTION_INJECT_EVERY', '20'))
+    const_inject_n = int(
+        os.environ.get('DREAMER_CONST_ACTION_INJECT_N', '5'))
+    # ----- wm_best.pt warm-restore at P1→P2 (P39, 2026-05-22) -----
+    # When the WM's fidelity peak is reached well before P1 ends and the
+    # subsequent iters drift to a lower-quality basin (P38: peak iter 50,
+    # collapse by iter 70), starting critic training from the final P1
+    # weights hands P2 an already-degraded WM.  Restoring wm_best.pt at
+    # the P1→P2 boundary gives critic training the cleanest available
+    # latent dynamics.  Skipped when wm_best.pt is essentially the
+    # current state (gap < ``min_gap``) to avoid wasted I/O.  Disable
+    # with DREAMER_WM_BEST_RESTORE_AT_P2=0.
+    wm_best_restore_at_p2 = bool(int(
+        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P2', '1') or 0))
+    wm_best_restore_min_gap = int(
+        os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # Reference entropy used for the entropy-collapse early-stop trip.
     # For the discrete categorical actor this is the max-entropy uniform
     # baseline (``log K``) per action dim.  For the continuous TanhNormal
@@ -2982,6 +3011,27 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     last_sf = float(wm_losses.get('sf_loss', p1_initial_sf))
                     print(f"[p1→p2] sf_loss {p1_initial_sf:.4f} → "
                           f"{last_sf:.4f}", flush=True)
+                # P39: warm-restore WM to its fidelity peak before P2.
+                if (wm_best_restore_at_p2
+                        and wm_best_ckpt_path is not None
+                        and wm_best_iter > 0
+                        and (total_iters - wm_best_iter)
+                                >= wm_best_restore_min_gap
+                        and wm_best_ckpt_path.exists()):
+                    try:
+                        _blob = torch.load(wm_best_ckpt_path,
+                                            map_location=device,
+                                            weights_only=False)
+                        model.load_state_dict(_blob['model'])
+                        print(f"[p1→p2] WM warm-restore: loaded "
+                              f"wm_best.pt (iter {wm_best_iter}, "
+                              f"score {wm_best_score:.3f}) — discarded "
+                              f"{total_iters - wm_best_iter} iters of "
+                              f"post-peak drift", flush=True)
+                    except Exception as _e:
+                        print(f"[p1→p2] WM warm-restore failed: {_e} "
+                              f"— continuing with current weights",
+                              flush=True)
             if es_enable and current_phase == 2 and new_phase == 3:
                 # End of P2: is reward MTP head learning?
                 max_rmtp = float(getattr(cfg, 'early_stop_p2_max_reward_mtp_loss',
@@ -3001,6 +3051,33 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # new phase (default: 0.3 in P1/P2, 0.5 in P3).
             env._disturbance_prob_override = get_phase_disturbance_prob(
                 phase=int(current_phase))
+
+        # ----- P39 periodic const-action injection (P1 only) -----
+        # Keep the steady-state regime represented in the buffer as P1
+        # fills it with random-action transitions.  Cheap: 5 episodes
+        # every 20 iters ≈ 6% buffer-add overhead.
+        if (current_phase == 1
+                and const_inject_every > 0
+                and const_inject_n > 0
+                and total_iters > 0
+                and (total_iters % const_inject_every) == 0):
+            _op_band = float(getattr(cfg,
+                                       'constant_action_seed_op_band', 0.6))
+            _levels = np.linspace(-_op_band, _op_band, const_inject_n,
+                                   dtype='float32')
+            _jit = env.rng.uniform(-0.05, 0.05,
+                                     size=_levels.shape).astype('float32')
+            _levels = np.clip(_levels + _jit * _op_band, -1.0, 1.0)
+            for _lvl in _levels:
+                _ep = collect_constant_action_episode(
+                    env, cfg, action_level=float(_lvl))
+                buf.add_episode(_ep['obs'], _ep['act'],
+                                 _ep['rew'], _ep['cont'])
+                total_env_steps += cfg.episode_length
+            print(f"[p1-const-inject] iter {total_iters}: added "
+                  f"{const_inject_n} const-action episodes "
+                  f"(buf_fill={buf.filled}/{buf.capacity_eps})",
+                  flush=True)
 
         # ----- Collection -----
         # Phases 1 & 2: random-action episodes append to the buffer.

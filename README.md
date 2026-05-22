@@ -240,9 +240,30 @@ actor is the one learning to reject.
 
 When the score improves, a `wm_best.pt` checkpoint is written to the run
 output directory alongside the periodic `ckpt_iter_*.pt` saves, with
-the probe metadata (per-horizon r, best_h, iter) embedded. Downstream
-phases (P2/P3) can warm-start from `wm_best.pt` instead of the latest
-checkpoint when the latest one has degraded past peak quality.
+the probe metadata (per-horizon r, best_h, iter) embedded. At the
+P1→P2 transition the trainer auto-restores `wm_best.pt` (P39, see
+below) so critic training starts from the highest-fidelity WM rather
+than from post-peak drift weights.
+
+#### P1 const-action re-injection and WM warm-restore (P39)
+
+P38 RCA showed the WM's H=15 imagination fidelity peaks early in P1
+(iter ≈ 50 of 100) then collapses to noise even though supervised
+losses stay flat. Root cause: the front-loaded const-action seeds
+(`constant_action_seed_episodes`) are diluted as the buffer fills with
+several×their volume of random-action episodes, so the WM forgets
+steady-state behaviour. Mitigations:
+
+| Var | Effect |
+|---|---|
+| `DREAMER_CONST_ACTION_INJECT_EVERY` | Inject N fresh const-action episodes every K P1 iters (default K=20; set 0 to disable). |
+| `DREAMER_CONST_ACTION_INJECT_N` | Episodes per injection (default 5, stratified across `constant_action_seed_op_band`). |
+| `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (default 1; set 0 to disable). |
+| `DREAMER_WM_BEST_RESTORE_MIN_GAP` | Skip restore when `total_iters - wm_best_iter` is below this (default 10). |
+
+Both knobs are sim-agnostic and adaptive: injection uses
+`cfg.episode_length` and the env's existing action range; warm-restore
+no-ops when `wm_best.pt` is essentially the current state.
 
 ## Single training run (no BO)
 
