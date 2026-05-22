@@ -3280,8 +3280,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 float(_g.detach().float().norm().item())
                                 if _g is not None else 0.0)
                     except Exception as _e:
-                        # Non-fatal — diagnostic only.
-                        diag_perhead_last = {'diag_grad_error': 1.0}
+                        # Non-fatal — diagnostic only.  Capture the message
+                        # so silent autograd failures (graph freed, param not
+                        # in graph, etc.) are visible in train_log.jsonl.
+                        diag_perhead_last = {
+                            'diag_grad_error': 1.0,
+                            'diag_grad_error_msg': f'{type(_e).__name__}: {str(_e)[:120]}',
+                        }
                 total_loss.backward()
                 wm_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters_world(), cfg.grad_clip)
