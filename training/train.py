@@ -3251,29 +3251,48 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # ~3 extra backwards every N iters; negligible at default
                 # cadence 10 (<2% wall-clock).  Uses
                 # ``torch.autograd.grad`` to compute partial grads w.r.t.
-                # the tokenizer's first parameter (a single small tensor),
-                # NOT the full model — same direction signal at ~1/10th
-                # the cost of a true per-loss backward.
+                # representative parameters of each subgraph.  Per-loss
+                # ref parameter choice (P40 fix):
+                #   - recon depends on tokenizer encoder + decoder.
+                #   - sf depends on dynamics (z_clean is .detach()'d).
+                #   - rmtp depends on dynamics + reward head (agent_hid is
+                #     built from dynamics output on detached z_clean).
+                # So a single tokenizer ref param only sees recon's
+                # gradient — sf and rmtp return None (allow_unused=True).
+                # Use a *dynamics* ref param so sf and rmtp both register;
+                # for recon we additionally use a tokenizer ref param.
                 if (diag_perhead_grads_every > 0
                         and total_iters > 0
                         and (total_iters % diag_perhead_grads_every) == 0
                         and current_phase in (1, 2)):
                     try:
-                        _ref_param = next(p for p in model.tokenizer.parameters()
+                        _ref_tok = next(p for p in model.tokenizer.parameters()
+                                            if p.requires_grad)
+                        _ref_dyn = next(p for p in model.dynamics.parameters()
                                             if p.requires_grad)
                         _diag_terms = {
-                            'recon': wm_losses.get('recon_loss'),
-                            'sf': wm_losses.get('sf_loss'),
+                            # (loss_term, ref_param)
+                            'recon': (wm_losses.get('recon_loss'), _ref_tok),
+                            'sf':    (wm_losses.get('sf_loss'),    _ref_dyn),
                         }
                         if ('reward_mtp_total' in ag_losses
                                 and not diag_disable_reward_mtp_in_p1):
-                            _diag_terms['rmtp'] = (cfg.reward_scale_loss
-                                                    * ag_losses['reward_mtp_total'])
+                            _diag_terms['rmtp'] = (
+                                cfg.reward_scale_loss
+                                    * ag_losses['reward_mtp_total'],
+                                _ref_dyn)
                         diag_perhead_last = {}
-                        for _name, _lt in _diag_terms.items():
+                        for _name, (_lt, _ref) in _diag_terms.items():
                             if _lt is None or not torch.is_tensor(_lt):
                                 continue
-                            _g = torch.autograd.grad(_lt, [_ref_param],
+                            if not _lt.requires_grad or _lt.grad_fn is None:
+                                # Loss tensor was detached upstream — log
+                                # sentinel so we know the term ran but had
+                                # no live graph (separate from "in graph,
+                                # but ref param not reached").
+                                diag_perhead_last[f'diag_grad_{_name}'] = -1.0
+                                continue
+                            _g = torch.autograd.grad(_lt, [_ref],
                                                        retain_graph=True,
                                                        allow_unused=True)[0]
                             diag_perhead_last[f'diag_grad_{_name}'] = (
