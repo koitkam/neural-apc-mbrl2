@@ -142,16 +142,18 @@ def main() -> int:
     # ── Phase 1a: Dynamics identification (no lookback yet — needs sr) ────
     print(f'[run] simulation: {sim_dir}', flush=True)
     print('[run] phase 1a: dynamics identification', flush=True)
-    from utils.dynamics_identifier import identify_and_save_dynamics
+    from workflow._plant_prepare import (
+        identify_dynamics, build_noise_config, identify_lookback,
+        apply_dreamer_env_overrides,
+    )
     plant_dir = out_dir / 'plant_id'
-    plant_dir.mkdir(parents=True, exist_ok=True)
-    dyn_path = plant_dir / 'dynamics_identification.json'
-    dyn = identify_and_save_dynamics(output_path=str(dyn_path))
-    os.environ['DYNAMICS_IDENTIFICATION_JSON'] = str(dyn_path)
-    tau = float(dyn.get('tau_dominant_identified', dyn.get('tau_dominant', 50.0)) or 50.0)
-    dead = float(dyn.get('dead_time_identified', dyn.get('dead_time', 5.0)) or 5.0)
-    tau_fast = float(dyn.get('tau_fastest_identified', tau) or tau)
-    dead_fast = float(dyn.get('dead_time_fastest_identified', dead) or dead)
+    plant_info = identify_dynamics(plant_dir)
+    dyn = plant_info['dynamics_raw']
+    dyn_path = Path(plant_info['dynamics_report'])
+    tau = plant_info['tau']
+    dead = plant_info['dead_time']
+    tau_fast = plant_info['tau_fast']
+    dead_fast = plant_info['dead_time_fast']
 
     # ── Phase 1b: Plant-tied derivations (sample rate, model size, seq_len) ─
     # Sample rate from the *fastest* identified channel.  An explicit
@@ -182,53 +184,18 @@ def main() -> int:
     # both training and validation subprocesses.  Skip with --no-noise for
     # debugging without stochastic confounders.
     if not args.no_noise:
-        try:
-            from utils.sim_factory import create_sim as _create_sim
-            from utils.noise_config import (
-                build_noise_config_from_sim, save_noise_config,
-            )
-            _probe_sim = _create_sim(episode_length=10,
-                                      sample_rate=max(1, sample_rate))
-            bare = _probe_sim
-            for _ in range(4):
-                inner = getattr(bare, '_sim', None)
-                if inner is None:
-                    break
-                bare = inner
-            # lookback not yet identified at this point; pass 0 (only used
-            # for record-keeping inside noise_config).
-            noise_cfg = build_noise_config_from_sim(
-                bare, dynamics_json=dyn,
-                lookback_json={'identified_lookback': 0},
-            )
-            noise_cfg_path = out_dir / 'noise_config.json'
-            save_noise_config(noise_cfg, str(noise_cfg_path))
-            print(f"[run] noise_config: {noise_cfg_path} "
-                  f"(OU={len(noise_cfg.get('ou_noise', []))} "
-                  f"meas={len(noise_cfg.get('measurement_noise', []))})",
-                  flush=True)
-        except Exception as exc:
-            print(f"[run] noise_config: SKIPPED ({exc!r}) — running with no "
-                  "process / measurement noise", flush=True)
+        build_noise_config(out_dir, dynamics_raw=dyn,
+                            sample_rate=sample_rate, log_prefix='[run]')
     else:
         print('[run] noise_config: DISABLED (--no-noise)', flush=True)
 
     # ── Phase 1c: Lookback identification (uses derived sample_rate) ──────
     print('[run] phase 1c: lookback identification', flush=True)
-    from utils.lookback_identifier import identify_and_save_lookback
-    lb_path = plant_dir / 'lookback_identification.json'
-    seed = int(os.environ.get('SEED', '0'))
-    min_lb = max(8, int(round(tau / max(1, sample_rate))))
-    max_lb = max(min_lb + 8, int(round(4.0 * tau / max(1, sample_rate))))
-    lb = identify_and_save_lookback(
-        seed=seed, min_lb=min_lb, max_lb=max_lb,
-        output_path=str(lb_path),
-        tau_dominant=tau, dead_time=dead,
-        tau_fastest=tau_fast, dead_time_fastest=dead_fast,
-        per_pair_estimates=dyn.get('per_pair_estimates')
-                           or dyn.get('pair_estimates') or [],
-    )
-    lookback = int(lb.get('identified_lookback', lb.get('lookback', max(min_lb, 32))))
+    lb_info = identify_lookback(plant_dir, tau=tau, dead_time=dead,
+                                 sample_rate=sample_rate, dynamics_raw=dyn,
+                                 tau_fast=tau_fast, dead_time_fast=dead_fast)
+    lookback = int(lb_info['lookback'])
+    lb_path = Path(lb_info['lookback_report'])
 
     plant = {
         'tau': tau, 'dead_time': dead,
@@ -314,45 +281,11 @@ def main() -> int:
     # treats env-injected values as user overrides and skips them.
     # Note: ``training/train.py``'s ``_cfg_from_env()`` only runs when
     # train.py is invoked as a CLI; when ``single_run.py`` is the
-    # entry-point we must perform the binding ourselves.
-    _env_overrides = {
-        'DREAMER_GAE_LAMBDA':       ('gae_lambda',                 float),
-        'DREAMER_PHASE1_FRAC':      ('phase1_frac',                float),
-        'DREAMER_PHASE2_FRAC':      ('phase2_frac',                float),
-        'DREAMER_PHASE3_FRAC':      ('phase3_frac',                float),
-        'DREAMER_LR_CRITIC':        ('lr_critic',                  float),
-        'DREAMER_LR_ACTOR':         ('lr_actor',                   float),
-        'DREAMER_P3_COLLECT_EVERY': ('phase3_collect_every_iters', int),
-        'DREAMER_BUFFER_CAP_STEPS': ('buffer_capacity_steps',      int),
-        # 2026-05-19 paper-strip-back knobs (p28 A/B): expose the
-        # remaining auto-tuned cfg fields so a fully paper-faithful
-        # baseline can be launched purely via env vars, with no code
-        # changes. Setting any of these pre-empts the corresponding
-        # auto-tune branch via the dataclass-default sentinel.
-        'DREAMER_POLICY_LOG_STD_MAX':       ('policy_log_std_max',           float),
-        'DREAMER_POLICY_LOG_STD_MIN':       ('policy_log_std_min',           float),
-        'DREAMER_PMPO_ENTROPY_COEF':        ('pmpo_entropy_coef',            float),
-        'DREAMER_HORIZON':                  ('horizon',                      int),
-    }
-    for _env_k, (_field, _cast) in _env_overrides.items():
-        _val = os.environ.get(_env_k, '').strip()
-        if _val:
-            try:
-                setattr(cfg, _field, _cast(_val))
-                # Track explicit overrides so train.py's auto-tune apply
-                # loop skips them even when the injected value equals
-                # the dataclass default (e.g. paper σ_max=1.0 → log_std_max=0.0).
-                try:
-                    if not hasattr(cfg, '_explicit_fields'):
-                        cfg._explicit_fields = set()  # type: ignore[attr-defined]
-                    cfg._explicit_fields.add(_field)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                print(f"[env-override] {_field}={_cast(_val)} "
-                      f"(from {_env_k})", flush=True)
-            except Exception as _e:
-                print(f"[env-override] {_env_k}={_val!r} ignored: {_e}",
-                      flush=True)
+    # entry-point we must perform the binding ourselves.  The whitelist
+    # lives in ``workflow/_plant_prepare.ENV_OVERRIDES`` and is shared
+    # with ``workflow/bo_runner.py`` so future knobs only need to be
+    # added in one place.
+    apply_dreamer_env_overrides(cfg)
 
     plan = {
         'simulation_dir': str(sim_dir),

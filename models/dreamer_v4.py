@@ -532,9 +532,6 @@ class DynamicsConfig:
     soft_cap: float = 50.0
     rope_base: float = 10_000.0
     attn_impl: str = 'auto'         # 'auto' | 'manual' | 'sdpa'
-    nsp_scale: float = 0.5          # weight on next-step prediction term
-    nsp_batch_frac: float = 0.5     # batch fraction used for NSP forward pass
-    nsp_seq_len: int = 32           # NSP truncates to last N positions (mem budget)
     # n_tokens_per_step is computed internally:
     #   1 (z̃) + 1 (action) + 1 (τ,d) + n_register
 
@@ -1204,7 +1201,6 @@ class DreamerV4Config:
     tau_n_bins: int = 32
     soft_cap: float = 50.0
     attn_impl: str = 'auto'                # 'auto'|'manual'|'sdpa' (DREAMER_FAST_ATTN=1)
-    nsp_scale: float = 0.5                 # weight on next-step prediction term in shortcut_forcing_loss
     # Heads
     n_action_bins: int = 21
     head_hidden: int = 256
@@ -1237,7 +1233,6 @@ class DreamerV4(nn.Module):
             k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins,
             soft_cap=cfg.soft_cap,
             attn_impl=cfg.attn_impl,
-            nsp_scale=getattr(cfg, 'nsp_scale', 0.5),
         )
         self.dynamics = DynamicsTransformer(dyn_cfg)
         # Heads read from the agent-register hidden state (dim = d_model).
@@ -1587,38 +1582,22 @@ def reinforce_actor_loss(policy, prior_policy,
 
 def shortcut_forcing_loss(dynamics: DynamicsTransformer,
                            z_clean: torch.Tensor, action: torch.Tensor,
-                           disable_nsp: bool = False,
                            ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Shortcut-forcing loss + explicit next-step prediction term.
+    """Shortcut-forcing (flow-matching) world-model loss.
 
     ``z_clean`` (B, T, z_dim)  — frozen tokenizer outputs (target z₁'s).
     ``action``  (B, T, A)      — actions taken before each step.
 
     Returns (loss, diag).
 
-    2026-05-10 redesign for continuous-control APC:
+    APC-continuous-control variant of paper eq. 7:
 
-    1. **Bootstrap term DISABLED** (no few-step inference distillation).
-       The paper's bootstrap loss enables generation in K' < K steps;
-       APC controllers always run K = k_max iterations at deployment
-       (one inference call per agent step), so the bootstrap gradient
-       is pure noise for our use-case and the d > d_min positions are
-       wasted compute.  Restrict (τ, d) sampling to d == d_min only.
-
-    2. **Next-step prediction loss ADDED** (`nsp` term).
-       The paper's standard SF loss trains "denoise z_tilde[t] in-place".
-       Inference at imagine_next_z appends a noise slot at position T+1
-       and asks the model to predict z_clean[T+1] from CLEAN past z[0..T]
-       and actions — a different distribution than what SF trains on.
-
-       We add a second forward pass per batch that builds exactly the
-       inference distribution: past positions at τ = (k_max-1)/k_max
-       (max trained, almost-clean), final position at τ = 0 (pure noise).
-       The loss requires z1_hat[:, -1] to match z_clean[:, -1].  This
-       trains the model on the literal task we use at inference time.
-
-       Weight (`nsp_scale=0.5`) keeps the standard SF term primary so
-       z-token recovery quality is preserved across all τ values.
+    **Bootstrap term DISABLED** (no few-step inference distillation).
+    The paper's bootstrap loss enables generation in K' < K steps;
+    APC controllers always run K = k_max iterations at deployment
+    (one inference call per agent step), so the bootstrap gradient
+    is pure noise for our use-case and the d > d_min positions are
+    wasted compute.  Restrict (τ, d) sampling to d == d_min only.
     """
     cfg = dynamics.cfg
     B, T, Z = z_clean.shape
@@ -1626,7 +1605,6 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     dtype = z_clean.dtype
     d_min = 1.0 / cfg.k_max
 
-    # ---- Standard SF (flow-only) ---------------------------------------
     # Per-(B, T) sample of τ from the trained grid; FORCE d = d_min.
     tau, _ = sample_tau_d((B, T), cfg.k_max, device, dtype)
     d = torch.full_like(tau, d_min)
@@ -1639,46 +1617,12 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     z1_hat = out['z1_hat']                                       # (B, T, Z)
     loss_flow = (z1_hat - z_clean).pow(2).sum(-1)                # (B, T)
 
-    # Per-step ramp weight (eq. 8) — paper-faithful for the SF term.
+    # Per-step ramp weight (eq. 8) — paper-faithful.
     w = ramp_weight(tau)
-    loss_sf = (w * loss_flow).mean()
-
-    # ---- Next-step prediction (NSP) ------------------------------------
-    # Past positions: τ = (k_max-1)/k_max  ("clean" in trained grid).
-    # Last position : τ = 0                ("pure noise" — the inference slot).
-    # Loss only on the last position (B', 1).  Subsample batch AND truncate
-    # to the last ``nsp_seq_len`` positions so the second forward pass fits
-    # within the original WM mem budget; controlled via DynamicsConfig
-    # ``nsp_batch_frac`` (default 0.5) and ``nsp_seq_len`` (default 32).
-    nsp_batch_frac = float(getattr(cfg, 'nsp_batch_frac', 0.5))
-    nsp_seq_len = int(getattr(cfg, 'nsp_seq_len', 32))
-    B_n = max(1, int(round(B * nsp_batch_frac)))
-    T_n = min(T, max(2, nsp_seq_len))
-    if (T >= 2) and (not disable_nsp):
-        z_clean_n = z_clean[:B_n, -T_n:]
-        action_n = action[:B_n, -T_n:]
-        tau_max = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
-        tau_n = torch.full((B_n, T_n), tau_max, device=device, dtype=dtype)
-        tau_n[:, -1] = 0.0
-        d_n = torch.full((B_n, T_n), d_min, device=device, dtype=dtype)
-        z0_n = torch.randn_like(z_clean_n)
-        tau_n_b = tau_n.unsqueeze(-1)
-        z_tilde_n = (1.0 - tau_n_b) * z0_n + tau_n_b * z_clean_n
-        out_n = dynamics(z_tilde_n, tau_n, d_n, action_n)
-        z1_hat_n = out_n['z1_hat'][:, -1]                        # (B', Z)
-        loss_nsp = (z1_hat_n - z_clean_n[:, -1]).pow(2).sum(-1).mean()
-    else:
-        loss_nsp = torch.zeros((), device=device, dtype=dtype)
-
-    nsp_scale = float(getattr(cfg, 'nsp_scale', 0.5))
-    loss = loss_sf + nsp_scale * loss_nsp
+    loss = (w * loss_flow).mean()
 
     diag = {
         'sf_loss': loss.detach(),
-        'sf_loss_flow': loss_sf.detach(),
-        'sf_loss_boot': torch.zeros((), device=device, dtype=dtype),
-        'sf_loss_nsp': loss_nsp.detach(),
-        'sf_d_min_frac': torch.ones((), device=device, dtype=dtype),
     }
     return loss, diag
 

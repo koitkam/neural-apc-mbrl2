@@ -12,7 +12,7 @@ Why this exists
 Step disturbances are mathematically Diracs in the dynamics: the world
 model has zero observable signal predicting the spike, so it incurs a
 loss floor that no amount of training can drive away.  Empirically (run
-p33, WM-only, 1M env-steps) ``sf_loss_flow`` plateaus at ~1.15
+p33, WM-only, 1M env-steps) ``sf_loss`` plateaus at ~1.15
 regardless of training time when the disturbance schedule emits
 unmeasured CV steps.
 
@@ -54,7 +54,7 @@ def hidden_disturbance_enabled(default: bool = True) -> bool:
     """Whether the hidden CV disturbance is active.
 
     Default: ON.  The legacy step-shaped unmeasured-CV events are gone
-    (run p33 showed they capped ``sf_loss_flow`` at ~1.15 by being Dirac
+    (run p33 showed they capped ``sf_loss`` at ~1.15 by being Dirac
     spikes the WM has no observation to predict).  Off-switch only:
     set ``DREAMER_HIDDEN_DISTURBANCE=0`` to disable for ablations.
     """
@@ -62,6 +62,93 @@ def hidden_disturbance_enabled(default: bool = True) -> bool:
     if raw is None:
         return bool(default)
     return str(raw).strip().lower() not in {'0', 'false', 'no', 'off', ''}
+
+
+def curriculum_amp_scale(progress: float) -> float:
+    """Amplitude curriculum scale (≤1.0) as a function of training progress.
+
+    Reads ``DREAMER_HIDDEN_OU_AMP_RAMP="<start_frac>:<reach_full_at>"``.
+    ``start_frac``: amplitude scale at ``progress=0`` (e.g. 0.1 = 10% of
+    nominal).  ``reach_full_at``: progress fraction at which the scale
+    reaches 1.0 (e.g. 0.4 = full amplitude by 40% of training).
+
+    Default (env unset or malformed): ``1.0`` — no curriculum.
+
+    Designed for the P37 ablation: at the start of training the WM is a
+    random net and a full-amplitude hidden OU is information-theoretically
+    too hard to track.  Ramping the amplitude lets the WM lock in clean
+    dynamics first, then learn to track increasingly stronger drift.
+    The OU is still hidden — only its magnitude is shaped over time.
+    """
+    # Default ON (P37 onward): ramp from 10% to full amplitude by 40%
+    # of training progress.  Set ``DREAMER_HIDDEN_OU_AMP_RAMP=1.0:1.0``
+    # (or any malformed value) to disable.
+    raw = os.environ.get('DREAMER_HIDDEN_OU_AMP_RAMP', '0.1:0.4').strip()
+    if not raw:
+        return 1.0
+    try:
+        start_str, reach_str = raw.split(':')
+        start = float(start_str)
+        reach = float(reach_str)
+    except Exception:
+        return 1.0
+    p = float(np.clip(progress, 0.0, 1.0))
+    start = float(np.clip(start, 0.0, 1.0))
+    reach = float(np.clip(reach, 1e-6, 1.0))
+    if p >= reach:
+        return 1.0
+    # Linear ramp from start at p=0 to 1.0 at p=reach.
+    return float(start + (1.0 - start) * (p / reach))
+
+
+def _sample_amp_jitter(rng: np.random.Generator) -> float:
+    """Per-episode amplitude DR factor (multiplier on amp_frac).
+
+    Reads ``DREAMER_HIDDEN_OU_AMP_JITTER="<lo>:<hi>"`` (uniform band).
+    Default (unset): ``1.0`` — no jitter.
+
+    Part of Stage C #5: domain randomization across OU amplitude so the
+    policy is robust to a *family* of disturbance magnitudes, not a
+    single fixed amplitude.
+    """
+    # Default ON (P37 onward): uniform ±60% around nominal amplitude.
+    # Set ``DREAMER_HIDDEN_OU_AMP_JITTER=1.0:1.0`` to disable.
+    raw = os.environ.get('DREAMER_HIDDEN_OU_AMP_JITTER', '0.6:1.6').strip()
+    if not raw:
+        return 1.0
+    try:
+        lo_str, hi_str = raw.split(':')
+        lo = float(lo_str); hi = float(hi_str)
+        if hi <= lo:
+            return float(lo)
+        return float(rng.uniform(lo, hi))
+    except Exception:
+        return 1.0
+
+
+def _sample_drift_frac(rng: np.random.Generator) -> float:
+    """Per-episode constant drift offset (as a fraction of amp).
+
+    Reads ``DREAMER_HIDDEN_OU_DRIFT_FRAC="<max>"`` (uniform in ``[-max,+max]``).
+    Default (unset): ``0.0`` — zero-mean OU (no drift).
+
+    Adds a constant bias to the OU mean per episode so the policy must
+    handle not just zero-mean random walks but also a slowly-shifted
+    operating-point bias.  Part of Stage C #5.
+    """
+    # Default ON (P37 onward): up to ±40% of nominal amplitude as a
+    # constant per-episode mean offset.  Set ``DREAMER_HIDDEN_OU_DRIFT_FRAC=0``
+    # to disable.
+    raw = os.environ.get('DREAMER_HIDDEN_OU_DRIFT_FRAC', '0.4').strip()
+    if not raw:
+        return 0.0
+    try:
+        mx = float(raw)
+    except Exception:
+        return 0.0
+    if mx <= 0.0:
+        return 0.0
+    return float(rng.uniform(-mx, mx))
 
 
 def get_phase_disturbance_prob(phase: int) -> float:
@@ -103,6 +190,7 @@ class HiddenDisturbanceProcess:
         amp_frac: float = 0.10,
         tau_frac_range: tuple = (0.15, 0.5),
         identifier_ctx: Optional[Dict] = None,
+        drift_frac: float = 0.0,
     ) -> None:
         self.sim = sim
         cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
@@ -112,6 +200,7 @@ class HiddenDisturbanceProcess:
             self.alpha: np.ndarray = np.zeros(0, dtype='float64')
             self.d: np.ndarray = np.zeros(0, dtype='float64')
             self.tau_dist: np.ndarray = np.zeros(0, dtype='float64')
+            self.drift: np.ndarray = np.zeros(0, dtype='float64')
             self._is_normalized: bool = bool(getattr(sim, 'state_is_normalized', False))
             return
 
@@ -168,6 +257,11 @@ class HiddenDisturbanceProcess:
         # Initialize OU at the stationary distribution so episode-start
         # behaviour matches mid-episode.
         self.d = rng.normal(0.0, 1.0, size=n_cv) * self.amp
+        # Per-episode constant drift offset (Stage C #5: DR over OU mean).
+        # ``drift_frac`` is a scalar in [-1, 1]; the per-channel constant
+        # added to every OU draw is ``drift_frac * amp`` so the bias is
+        # always within the authority cap.
+        self.drift = float(drift_frac) * self.amp
         self._rng = rng
 
     def is_empty(self) -> bool:
@@ -189,7 +283,7 @@ class HiddenDisturbanceProcess:
         sigma_drive = np.sqrt(np.maximum(2.0 * a - a * a, 1e-12)) * self.amp
         self.d = (1.0 - a) * self.d + sigma_drive * eps
         for pos, idx in enumerate(self.cv_indices):
-            state[int(idx)] = float(state[int(idx)]) + float(self.d[pos])
+            state[int(idx)] = float(state[int(idx)]) + float(self.d[pos]) + float(self.drift[pos])
         # If the sim publishes state in normalized [0,1] space, clip back
         # in to keep downstream consumers (encoder, reward) well-defined.
         if self._is_normalized:
@@ -202,6 +296,7 @@ class HiddenDisturbanceProcess:
             'tau_dist': self.tau_dist.tolist(),
             'amp': self.amp.tolist(),
             'alpha': self.alpha.tolist(),
+            'drift': self.drift.tolist() if hasattr(self.drift, 'tolist') else list(self.drift),
         }
 
 
@@ -215,12 +310,18 @@ def maybe_build_hidden_disturbance(
     identifier_ctx: Optional[Dict] = None,
     amp_frac: float = 0.10,
     force: bool = False,
+    progress: float = 0.0,
 ) -> Optional[HiddenDisturbanceProcess]:
     """Bernoulli-toggle the per-episode hidden disturbance process.
 
     Returns ``None`` for clean episodes so the WM also sees some clean
     data and can sharpen its base dynamics estimate.  Set ``force=True``
     (validation path) to bypass the Bernoulli toggle and always build.
+
+    ``progress`` is the training progress in ``[0, 1]``; combined with
+    the amplitude curriculum (see ``curriculum_amp_scale``) and the
+    per-episode jitter / drift DR knobs (Stage C #5) to produce the
+    effective ``amp_frac`` and ``drift_frac`` for this episode.
     """
     if not hidden_disturbance_enabled(default=True):
         return None
@@ -229,13 +330,19 @@ def maybe_build_hidden_disturbance(
             return None
         if rng.uniform() >= float(prob):
             return None
+    # Effective amp_frac = nominal × curriculum scale × per-episode jitter.
+    curr_scale = curriculum_amp_scale(float(progress))
+    jitter = _sample_amp_jitter(rng)
+    eff_amp_frac = float(amp_frac) * float(curr_scale) * float(jitter)
+    drift_frac = _sample_drift_frac(rng)
     proc = HiddenDisturbanceProcess(
         rng=rng,
         sim=sim,
         tau_dom=float(tau_dom),
         sample_rate=float(sample_rate),
-        amp_frac=float(amp_frac),
+        amp_frac=eff_amp_frac,
         identifier_ctx=identifier_ctx,
+        drift_frac=drift_frac,
     )
     if proc.is_empty():
         return None

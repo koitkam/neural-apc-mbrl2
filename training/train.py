@@ -56,6 +56,11 @@ from utils.hidden_disturbance import (
     get_phase_disturbance_prob,
     maybe_build_hidden_disturbance,
 )
+from utils.derived_observations import (
+    DerivedFeatures,
+    derived_observables_enabled,
+    derived_observables_window,
+)
 from utils.agent_utils import (
     load_objective_weights, load_objective_bounds, load_full_objective_spec,
     action_to_control,
@@ -265,7 +270,7 @@ class TrainConfig:
     # action).  10 full-length constant-action episodes give the WM
     # explicit steady-state coverage at a stratified spread of operating
     # points.  Set to 0 to disable.
-    constant_action_seed_episodes: int = 10
+    constant_action_seed_episodes: int = 24
     # Operating-band fraction for the constant-action seed.  Narrower
     # than ``prbs_seed_op_band`` (0.95) on purpose: at the very edges of
     # the MV range the plant typically saturates and the long hold is
@@ -513,6 +518,25 @@ class APCEnv:
         self.setpoint_mgr._rng = rng
 
         self.aug_obs_dim = int(self.setpoint_mgr.aug_obs_dim)
+        # ---- Derived observable block (Stage B, 2026-05-21) ---------------
+        # Belief-state augmentation: cheap per-CV rolling statistics
+        # (mean tracking error, Δcv, variance) appended to the
+        # augmented-obs block.  OFF by default; enable via
+        # ``DREAMER_DERIVED_OBSERVABLES=1``.  When ON, ``aug_obs_dim``
+        # grows by ``3 * n_cv`` and the running obs normalizer auto-
+        # adapts (features are bounded by construction).
+        self._derived_features: Optional[DerivedFeatures] = None
+        if derived_observables_enabled():
+            n_cv = int(len(self.cv_indices))
+            self._derived_features = DerivedFeatures(
+                n_cv=n_cv,
+                window=derived_observables_window(
+                    tau=float(getattr(self.cfg, 'tau', 0.0) or 0.0) or None,
+                    sample_rate=float(getattr(self.cfg, 'sample_rate', 1.0)
+                                       or 1.0),
+                ),
+            )
+            self.aug_obs_dim += int(self._derived_features.feat_dim)
         self.obs_dim = self.state_dim + self.aug_obs_dim
 
         self._window: Optional[np.ndarray] = None
@@ -538,6 +562,33 @@ class APCEnv:
         # Force flag: when True, every reset() always builds the hidden
         # process (validation path).  False = Bernoulli toggle.
         self._hidden_disturbance_force: bool = False
+        # Training progress in [0, 1] (env_steps / total_steps).  Used by
+        # the hidden-OU amplitude curriculum at reset() time.  Updated
+        # by the trainer at every episode boundary via ``set_training_progress``.
+        self._training_progress: float = 0.0
+
+        # ---- Raw-reward clipping (P37 onward, 2026-05-22) ---------------
+        # The objective's quadratic violation tail can produce
+        # ``raw_reward`` magnitudes 1000× above the operating-region
+        # median (p36: raw_min=-185, raw_abs_p95=0.20).  That dynamic
+        # range pushes the symlog-twohot reward predictor's mass into
+        # ~14 of 255 bins, capping ``reward_mtp_loss`` at the
+        # operating-region entropy floor regardless of training time.
+        # Clipping the raw tail at ``DREAMER_REWARD_RAW_CLIP_MIN``
+        # (default -30) lets the auto-scaler pack the operating-region
+        # into ~60 bins without altering the agent's incentive
+        # direction (catastrophe still strongly avoided).  Set
+        # ``DREAMER_REWARD_RAW_CLIP_MIN=-1e9`` to disable.
+        try:
+            self._reward_clip_min: float = float(
+                os.environ.get('DREAMER_REWARD_RAW_CLIP_MIN', '-30.0'))
+        except Exception:
+            self._reward_clip_min = -30.0
+        try:
+            self._reward_clip_max: float = float(
+                os.environ.get('DREAMER_REWARD_RAW_CLIP_MAX', '1e18'))
+        except Exception:
+            self._reward_clip_max = 1e18
 
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
@@ -555,6 +606,18 @@ class APCEnv:
         self._obs_norm_learn: bool = True
 
     # ---------- observation normalizer (load/save/apply) -----------------
+    def set_training_progress(self, progress: float) -> None:
+        """Set ``progress = env_steps / total_steps`` in ``[0, 1]``.
+
+        Consumed by the hidden-OU amplitude curriculum at every ``reset()``.
+        Trainer pushes this at each outer-loop iteration; defaults to 0.0
+        (curriculum start) until updated.
+        """
+        try:
+            self._training_progress = float(max(0.0, min(1.0, progress)))
+        except Exception:
+            self._training_progress = 0.0
+
     def set_obs_norm_stats(self, mean: np.ndarray, var: np.ndarray,
                             count: float = 1.0, *, learn: bool = False) -> None:
         m = np.asarray(mean, dtype='float64').reshape(-1)
@@ -597,8 +660,27 @@ class APCEnv:
 
     def _build_obs_vec(self, state: np.ndarray) -> np.ndarray:
         aug = self.setpoint_mgr.get_augmented_obs_channels()
-        raw = np.concatenate([np.asarray(state, dtype='float32').reshape(-1),
-                                aug], axis=0).astype('float32')
+        parts = [np.asarray(state, dtype='float32').reshape(-1),
+                 np.asarray(aug, dtype='float32').reshape(-1)]
+        if self._derived_features is not None:
+            # Update with the current CV slice + current CV setpoints,
+            # then append the feature block.  CV setpoints may be NaN
+            # for slots without a target — DerivedFeatures handles that.
+            try:
+                cv_now = np.asarray(state, dtype='float64')[self.cv_indices]
+            except Exception:
+                cv_now = np.zeros(self._derived_features.n_cv, dtype='float64')
+            sp_now = np.asarray(
+                getattr(self.setpoint_mgr, 'current_cv_targets',
+                        np.full(self._derived_features.n_cv, np.nan)),
+                dtype='float64',
+            ).reshape(-1)
+            if sp_now.shape[0] != self._derived_features.n_cv:
+                sp_now = np.full(self._derived_features.n_cv, np.nan,
+                                 dtype='float64')
+            self._derived_features.update(cv_now, sp_now)
+            parts.append(self._derived_features.features())
+        raw = np.concatenate(parts, axis=0).astype('float32')
         if self._obs_norm_learn:
             self._update_obs_norm(raw)
         return self._normalize_obs(raw)
@@ -612,6 +694,12 @@ class APCEnv:
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
         self._last_cv_violation_sum = 0.0
         self._last_mv_violation_sum = 0.0
+        if self._derived_features is not None:
+            try:
+                cv0 = np.asarray(state, dtype='float64')[self.cv_indices]
+            except Exception:
+                cv0 = None
+            self._derived_features.reset(cv0)
         self.setpoint_mgr.reset(episode_length=self.cfg.episode_length,
                                 curriculum_fraction=1.0)
         intensity = 1.0 if not exploration else 1.2
@@ -636,6 +724,7 @@ class APCEnv:
             sample_rate=sample_rate,
             prob=float(prob),
             force=bool(self._hidden_disturbance_force),
+            progress=float(self._training_progress),
         )
         obs_vec = self._build_obs_vec(state)
         self._window = np.tile(obs_vec, (self.cfg.lookback, 1)).astype('float32')
@@ -684,6 +773,13 @@ class APCEnv:
             objective_spec=self.obj_spec,
         )
         raw_reward = float(comps['reward'])
+        # Apply raw clip BEFORE scaling so calibration (which percentile-
+        # fits ``raw_reward``) and the agent both see the same clipped
+        # distribution.  See ``self._reward_clip_min/max`` rationale.
+        if (self._reward_clip_min > -1e17) or (self._reward_clip_max < 1e17):
+            raw_reward = float(np.clip(raw_reward,
+                                       self._reward_clip_min,
+                                       self._reward_clip_max))
         reward = raw_reward * float(self.reward_scale)
         self._prev_control = np.asarray(control, dtype='float32')
         self._t += 1
@@ -1068,7 +1164,6 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
 
 def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
                       cfg: TrainConfig,
-                      disable_nsp: bool = False,
                       ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor,
                                   torch.Tensor]:
     """Eq. 5 + Eq. 7. Returns (losses, z_clean, agent_hid).
@@ -1088,8 +1183,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Shortcut forcing target = clean tokenizer output (no MAE).
     z_clean = model.tokenizer.encode(obs_cur)            # (B, T, z_dim)
     sf_loss, sf_diag = shortcut_forcing_loss(model.dynamics,
-                                                z_clean.detach(), act,
-                                                disable_nsp=disable_nsp)
+                                                z_clean.detach(), act)
 
     # Compute agent_hid from a near-clean dynamics pass (τ=tau_max, d=d_min).
     # Used by the Phase 2 BC + reward MTP heads.
@@ -2170,6 +2264,25 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
             scale = float(target_std / std) if std >= 1e-8 else 1.0
         else:
             scale = float(target_percentile_value / p_target_abs)
+
+    # Opportunistic bin-fill bump (root-cause fix 2026-05-22, P36 RCA):
+    # the percentile target sets a floor that guarantees operating-region
+    # resolution, but with a bounded raw range (e.g. when
+    # ``DREAMER_REWARD_RAW_CLIP_MIN`` clips the violation tail), the
+    # symlog support is under-used and most active bins cluster near zero.
+    # Raise ``scale`` up to the point where the largest |raw_reward|
+    # maps to symlog magnitude ``DREAMER_REWARD_CAL_TARGET_SYM_MAG``
+    # (default 6.0 — well inside the [-20,+20] twohot support, with
+    # ~115 bins per side at 0.157 sym-units/bin).  Never *reduces*
+    # the percentile-floor scale, so operating-region resolution
+    # cannot regress.
+    raw_abs_max = float(abs_arr.max()) if abs_arr.size else 0.0
+    target_sym_mag = float(
+        os.environ.get('DREAMER_REWARD_CAL_TARGET_SYM_MAG', '6.0'))
+    if raw_abs_max > 1e-8 and target_sym_mag > 0.0:
+        scale_fill = (math.exp(target_sym_mag) - 1.0) / raw_abs_max
+        scale = max(scale, min(scale_fill, max_scale))
+
     scale_unclamped = scale
     scale = float(np.clip(scale, min_scale, max_scale))
     env.reward_scale = scale
@@ -2278,8 +2391,7 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
     ax.set_title('Returns')
 
     ax = axes[0, 1]
-    for k, c in [('recon_loss', 'C0'), ('sf_loss', 'C1'),
-                  ('sf_loss_flow', 'C2'), ('sf_loss_boot', 'C3')]:
+    for k, c in [('recon_loss', 'C0'), ('sf_loss', 'C1')]:
         vals = [r.get(k) for r in rows]
         if any(v is not None for v in vals):
             ax.plot(steps, vals, label=k, lw=1.0, color=c)
@@ -2796,6 +2908,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # (hidden CV disturbance is the default unmeasured-disturbance model).
     env._disturbance_prob_override = get_phase_disturbance_prob(phase=1)
     while total_env_steps < cfg.total_steps:
+        # Push training progress into the env so the hidden-OU amplitude
+        # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value
+        # at every episode reset.  No-op when curriculum env var unset.
+        env.set_training_progress(total_env_steps / max(1, int(cfg.total_steps)))
         new_phase = _phase_for(total_env_steps)
         if new_phase != current_phase:
             print(f'[phase] transition {current_phase} -> {new_phase} '
@@ -2917,7 +3033,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
-                    wm_losses, _, agent_hid = world_model_loss(model, batch, cfg)
+                    wm_losses, _, agent_hid = world_model_loss(
+                        model, batch, cfg)
                     # P1 + P2 both train the reward MTP head (paper
                     # Algorithm 1: tokenizer + dynamics + reward + value
                     # are co-trained throughout WM pretraining).
@@ -2989,14 +3106,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
-                    # NSP extra forward is only needed during P1/P2 to teach
-                    # next-step prediction.  By P3 the gating probe has
-                    # already passed; rerunning NSP every P3 iter is a
-                    # ~50% memory tax that competes with the imagination
-                    # rollout buffer and triggers OOM on 22 GB GPUs.
                     wm_losses, _, agent_hid = world_model_loss(model, batch,
-                                                                  cfg,
-                                                                  disable_nsp=True)
+                                                                  cfg)
                     ag_losses = agent_finetune_loss(model, batch,
                                                       agent_hid, cfg)
                     # Drop BC term in P3 (the actor is now driven by
@@ -3114,8 +3225,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"ret_ema {ema_str} ret_w {rwm_str} "
                   f"recon {row.get('recon_loss', 0.0):.4f} "
                   f"sf {row.get('sf_loss', 0.0):.4f} "
-                  f"(flow {row.get('sf_loss_flow', 0.0):.3f} "
-                  f"nsp {row.get('sf_loss_nsp', 0.0):.3f}) "
                   f"encvar {row.get('encoder_var_ratio', 0.0):.2f} "
                   f"zrank {row.get('z_eff_rank', 0.0):.1f}/{int(row.get('z_dim', 0))} "
                   f"alive {int(row.get('z_alive_dims', 0))} "

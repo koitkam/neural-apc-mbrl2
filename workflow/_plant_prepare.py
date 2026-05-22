@@ -1,0 +1,246 @@
+"""Shared plant-preparation helpers for ``workflow/single_run.py`` and
+``workflow/bo_runner.py``.
+
+Both entry-points run the same boilerplate before launching training:
+
+  1. Identify plant dynamics (τ, dead-time).
+  2. Build a plant-aware noise config (OU + measurement noise).
+  3. Identify a lookback window from the derived sample-rate.
+  4. Apply the ``DREAMER_*`` env-var whitelist onto the ``TrainConfig``.
+
+Keeping these in one module avoids the drift class of bug where a fix
+applied to one workflow silently misses the other (e.g. the 2026-05-21
+``max_lb`` cap fix had to be made in two places, and the
+``_env_overrides`` whitelist existed only in ``single_run.py`` for
+several commits — every ``DREAMER_*`` override silently lost in BO mode).
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Dict, Iterable, Optional
+
+
+# ---------------------------------------------------------------------------
+# 1. Dynamics identification
+# ---------------------------------------------------------------------------
+
+def identify_dynamics(out_dir: Path) -> Dict:
+    """Run plant dynamics identification and persist the report.
+
+    Returns a dict with ``tau``, ``dead_time``, ``tau_fast``,
+    ``dead_time_fast``, ``dynamics_report`` (path), ``dynamics_raw``
+    (full report payload).  Also exports ``DYNAMICS_IDENTIFICATION_JSON``
+    and ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME`` env vars
+    for downstream consumers.
+    """
+    from utils.dynamics_identifier import identify_and_save_dynamics
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dyn_path = out_dir / 'dynamics_identification.json'
+    dyn = identify_and_save_dynamics(output_path=str(dyn_path))
+    os.environ['DYNAMICS_IDENTIFICATION_JSON'] = str(dyn_path)
+
+    tau = float(dyn.get('tau_dominant_identified',
+                         dyn.get('tau_dominant', 50.0)) or 50.0)
+    dead = float(dyn.get('dead_time_identified',
+                          dyn.get('dead_time', 5.0)) or 5.0)
+    tau_fast = dyn.get('tau_fastest_identified', tau)
+    dt_fast = dyn.get('dead_time_fastest_identified', dead)
+
+    os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
+    os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'
+
+    return {
+        'tau': tau,
+        'dead_time': dead,
+        'tau_fast': float(tau_fast) if tau_fast else float(tau),
+        'dead_time_fast': float(dt_fast) if dt_fast else float(dead),
+        'dynamics_report': str(dyn_path),
+        'dynamics_raw': dyn,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2. Plant-aware noise config
+# ---------------------------------------------------------------------------
+
+def build_noise_config(out_dir: Path, *, dynamics_raw: Dict,
+                        sample_rate: int,
+                        log_prefix: str = '[run]') -> Optional[Path]:
+    """Build dynamics-derived OU + measurement noise and persist it as
+    ``<out_dir>/noise_config.json``.
+
+    Side-effects: exports ``SIM_NOISE_CONFIG_JSON`` via ``save_noise_config``
+    so every downstream subprocess (training, validation) picks up the same
+    noise profile through ``SimNoiseWrapper``.
+
+    Returns the written path, or ``None`` if construction fails.  Failures
+    are non-fatal (run continues with no process / measurement noise).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from utils.sim_factory import create_sim
+        from utils.noise_config import (
+            build_noise_config_from_sim, save_noise_config,
+        )
+        probe = create_sim(episode_length=10,
+                            sample_rate=max(1, int(sample_rate)))
+        bare = probe
+        for _ in range(4):
+            inner = getattr(bare, '_sim', None)
+            if inner is None:
+                break
+            bare = inner
+        noise_cfg = build_noise_config_from_sim(
+            bare,
+            dynamics_json=dynamics_raw or {},
+            lookback_json={'identified_lookback': 0},
+        )
+        noise_cfg_path = out_dir / 'noise_config.json'
+        save_noise_config(noise_cfg, str(noise_cfg_path))
+        print(f"{log_prefix} noise_config: {noise_cfg_path} "
+              f"(OU={len(noise_cfg.get('ou_noise', []))} "
+              f"meas={len(noise_cfg.get('measurement_noise', []))})",
+              flush=True)
+        return noise_cfg_path
+    except Exception as exc:
+        print(f"{log_prefix} noise_config: SKIPPED ({exc!r}) — running with no "
+              "process / measurement noise", flush=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 3. Lookback identification
+# ---------------------------------------------------------------------------
+
+def identify_lookback(out_dir: Path, *, tau: float, dead_time: float,
+                       sample_rate: int, dynamics_raw: Dict,
+                       tau_fast: Optional[float] = None,
+                       dead_time_fast: Optional[float] = None) -> Dict:
+    """Lookback identification using the *derived* ``sample_rate``.
+
+    Must be called after dynamics identification + sample-rate derivation
+    so ``min_lb`` / ``max_lb`` reflect the actual scan rate the agent will
+    see.
+
+    ``max_lb`` is expressed in raw samples (same units as
+    ``identified_lookback``).  The previous formula divided by
+    ``sample_rate``, which collapsed the cap to ~τ for any
+    ``sample_rate >= 4`` and clamped the inferred seed ``dead + 2τ``
+    back down to τ.  P34 (τ=53) showed the WM needs ~3τ worth of context
+    to infer hidden OU disturbance state; ``dead + 3τ`` in raw samples
+    gives the natural seed ``dead + 2τ`` room to win without artificial
+    truncation.
+    """
+    from utils.lookback_identifier import identify_and_save_lookback
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lb_path = out_dir / 'lookback_identification.json'
+    seed = int(os.environ.get('SEED', '0'))
+    sr = int(max(1, sample_rate))
+    min_lb = max(8, int(round(tau / sr)))
+    max_lb = max(min_lb + 8, int(round(float(dead_time) + 3.0 * float(tau))))
+    pair_est = (dynamics_raw.get('per_pair_estimates')
+                or dynamics_raw.get('pair_estimates') or [])
+
+    lb = identify_and_save_lookback(
+        seed=seed, min_lb=min_lb, max_lb=max_lb,
+        output_path=str(lb_path),
+        tau_dominant=tau, dead_time=dead_time,
+        tau_fastest=tau_fast if tau_fast is not None else tau,
+        dead_time_fastest=(dead_time_fast if dead_time_fast is not None
+                            else dead_time),
+        per_pair_estimates=pair_est,
+    )
+    lookback = int(lb.get('identified_lookback',
+                           lb.get('lookback', max(min_lb, 32))))
+    os.environ['IDENTIFIED_LOOKBACK_SEED'] = str(lookback)
+    return {'lookback': lookback, 'lookback_report': str(lb_path)}
+
+
+# ---------------------------------------------------------------------------
+# 4. DREAMER_* env-var whitelist
+# ---------------------------------------------------------------------------
+
+# Single source of truth for the env-var overrides that map onto
+# ``TrainConfig`` fields.  Both ``workflow/single_run.py`` and
+# ``workflow/bo_runner.py`` (per-trial) call ``apply_dreamer_env_overrides``
+# so a paper-faithful baseline can be launched purely via env vars in
+# either workflow with no code changes.
+#
+# Setting any of these pre-empts the corresponding auto-tune branch via
+# the dataclass-default sentinel (``cfg._explicit_fields``).
+ENV_OVERRIDES: Dict[str, tuple] = {
+    'DREAMER_GAE_LAMBDA':         ('gae_lambda',                 float),
+    'DREAMER_PHASE1_FRAC':        ('phase1_frac',                float),
+    'DREAMER_PHASE2_FRAC':        ('phase2_frac',                float),
+    'DREAMER_PHASE3_FRAC':        ('phase3_frac',                float),
+    'DREAMER_LR_CRITIC':          ('lr_critic',                  float),
+    'DREAMER_LR_ACTOR':           ('lr_actor',                   float),
+    'DREAMER_P3_COLLECT_EVERY':   ('phase3_collect_every_iters', int),
+    'DREAMER_BUFFER_CAP_STEPS':   ('buffer_capacity_steps',      int),
+    # 2026-05-19 paper-strip-back knobs (p28 A/B): expose the remaining
+    # auto-tuned cfg fields so a fully paper-faithful baseline can be
+    # launched purely via env vars.
+    'DREAMER_POLICY_LOG_STD_MAX': ('policy_log_std_max',         float),
+    'DREAMER_POLICY_LOG_STD_MIN': ('policy_log_std_min',         float),
+    'DREAMER_PMPO_ENTROPY_COEF':  ('pmpo_entropy_coef',          float),
+    'DREAMER_HORIZON':            ('horizon',                    int),
+    # 2026-05-21 (P37 robustness sweep): allow overriding the
+    # plant-derived seq_len so longer-context WM training can be
+    # launched without code changes.  Useful when the hidden OU
+    # autocorrelation requires a chunk longer than the auto-derived
+    # settling-time-based default.
+    'DREAMER_SEQ_LEN':            ('seq_len',                    int),
+    # 2026-05-22 (P37 entropy-floor RCA): reward MTP loss weight.
+    # Default 4.0 in TrainConfig; expose env override so we can tune
+    # without code edits if the reward head needs even more gradient.
+    'DREAMER_REWARD_MTP_WEIGHT':  ('reward_scale_loss',          float),
+    # 2026-05-22: number of constant-action seed episodes (steady-state
+    # coverage for the WM before random/imagination data dominates).
+    # Default 24 in TrainConfig.
+    'DREAMER_CONST_ACTION_SEEDS': ('constant_action_seed_episodes', int),
+}
+
+
+def apply_dreamer_env_overrides(cfg) -> Iterable[str]:
+    """Apply the ``DREAMER_*`` env-var overrides onto ``cfg`` in-place.
+
+    Each successful override:
+      - sets the dataclass field via ``setattr``,
+      - records the field in ``cfg._explicit_fields`` so ``training/train.py``'s
+        auto-tune apply loop skips it (even when the injected value equals
+        the dataclass default, e.g. paper σ_max=1.0 → log_std_max=0.0),
+      - logs a single ``[env-override]`` line.
+
+    Returns the iterable of field names that were overridden.
+
+    NOTE: ``training/train.py``'s ``_cfg_from_env()`` only runs when
+    ``train.py`` is invoked as a CLI; when ``single_run.py`` or
+    ``bo_runner.py`` is the entry-point we must perform the binding
+    ourselves.
+    """
+    overridden = []
+    for env_k, (field, cast) in ENV_OVERRIDES.items():
+        val = os.environ.get(env_k, '').strip()
+        if not val:
+            continue
+        try:
+            setattr(cfg, field, cast(val))
+            try:
+                if not hasattr(cfg, '_explicit_fields'):
+                    cfg._explicit_fields = set()  # type: ignore[attr-defined]
+                cfg._explicit_fields.add(field)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            overridden.append(field)
+            print(f"[env-override] {field}={cast(val)} (from {env_k})",
+                  flush=True)
+        except Exception as e:
+            print(f"[env-override] {env_k}={val!r} ignored: {e}", flush=True)
+    return overridden

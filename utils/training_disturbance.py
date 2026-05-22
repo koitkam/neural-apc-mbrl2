@@ -795,7 +795,7 @@ def build_training_disturbance_schedule(
     Only measured-DV events are emitted.  Unmeasured-CV step events
     were removed in favour of the hidden OU disturbance process (see
     ``utils/hidden_disturbance.py``) because step-shaped CV bumps are
-    Dirac spikes with no observable cue and capped ``sf_loss_flow``
+    Dirac spikes with no observable cue and capped ``sf_loss``
     around 1.15 in P33.
     """
     ep_len = max(220, int(episode_length))

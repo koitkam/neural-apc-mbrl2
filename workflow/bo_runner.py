@@ -127,67 +127,16 @@ HORIZON_BAND = (1.0,)
 # Plant initialization
 # ---------------------------------------------------------------------------
 
-def identify_dynamics_from_plant(out_dir: Path) -> Dict:
-    """Run dynamics identification only.  Lookback is identified later
-    once the derived sample_rate is known (see ``identify_lookback``)."""
-    from utils.dynamics_identifier import identify_and_save_dynamics
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dyn_path = out_dir / 'dynamics_identification.json'
-    dyn = identify_and_save_dynamics(output_path=str(dyn_path))
-    os.environ['DYNAMICS_IDENTIFICATION_JSON'] = str(dyn_path)
-    tau = float(dyn.get('tau_dominant_identified', dyn.get('tau_dominant', 50.0)) or 50.0)
-    dead = float(dyn.get('dead_time_identified', dyn.get('dead_time', 5.0)) or 5.0)
-    tau_fast = dyn.get('tau_fastest_identified', tau)
-    dt_fast = dyn.get('dead_time_fastest_identified', dead)
-
-    os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
-    os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'
-
-    return {
-        'tau': tau,
-        'dead_time': dead,
-        'tau_fast': float(tau_fast) if tau_fast else float(tau),
-        'dead_time_fast': float(dt_fast) if dt_fast else float(dead),
-        'dynamics_report': str(dyn_path),
-        'dynamics_raw': dyn,
-    }
-
-
-def identify_lookback(out_dir: Path, *, tau: float, dead_time: float,
-                       sample_rate: int, dynamics_raw: Dict,
-                       tau_fast: float | None = None,
-                       dead_time_fast: float | None = None) -> Dict:
-    """Lookback identification using the *derived* ``sample_rate``.
-
-    Must be called after dynamics identification + sample-rate derivation
-    so ``min_lb``/``max_lb`` reflect the actual scan rate the agent will
-    see (parity with ``workflow/single_run.py``).
-    """
-    from utils.lookback_identifier import identify_and_save_lookback
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    lb_path = out_dir / 'lookback_identification.json'
-    seed = int(os.environ.get('SEED', '0'))
-    sr = int(max(1, sample_rate))
-    min_lb = max(8, int(round(tau / sr)))
-    max_lb = max(min_lb + 8, int(round(4.0 * tau / sr)))
-    pair_est = (dynamics_raw.get('per_pair_estimates')
-                or dynamics_raw.get('pair_estimates') or [])
-
-    lb = identify_and_save_lookback(
-        seed=seed, min_lb=min_lb, max_lb=max_lb,
-        output_path=str(lb_path),
-        tau_dominant=tau, dead_time=dead_time,
-        tau_fastest=tau_fast if tau_fast is not None else tau,
-        dead_time_fastest=(dead_time_fast if dead_time_fast is not None
-                           else dead_time),
-        per_pair_estimates=pair_est,
-    )
-    lookback = int(lb.get('identified_lookback',
-                           lb.get('lookback', max(min_lb, 32))))
-    os.environ['IDENTIFIED_LOOKBACK_SEED'] = str(lookback)
-    return {'lookback': lookback, 'lookback_report': str(lb_path)}
+# Plant-prep helpers live in ``workflow/_plant_prepare.py`` (shared with
+# ``workflow/single_run.py``).  Re-exported here under their historical
+# names so any external caller importing them from ``workflow.bo_runner``
+# keeps working.
+from workflow._plant_prepare import (  # noqa: E402
+    identify_dynamics as identify_dynamics_from_plant,
+    identify_lookback,
+    build_noise_config as _build_noise_config,
+    apply_dreamer_env_overrides,
+)
 
 
 def initialize_from_plant(out_dir: Path) -> Dict:
@@ -409,6 +358,12 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     cfg = make_trial_config(base, lookback=lookback, model_size=model_size,
                             horizon=horizon, total_steps=trial_steps,
                             out_dir=trial_dir, batch_size=bs)
+    # Apply DREAMER_* env-var overrides per-trial (parity with
+    # ``workflow/single_run.py``).  Without this BO trials silently
+    # ignore the user's paper-strip-back / A-B overrides
+    # (DREAMER_GAE_LAMBDA, DREAMER_PHASE*_FRAC, DREAMER_LR_*,
+    # DREAMER_HORIZON, σ-max, ...).
+    apply_dreamer_env_overrides(cfg)
 
     # Pruning hook: report the running EMA return after each log iter so the
     # MedianPruner can stop visibly-bad trials early.  We track the last
@@ -525,6 +480,9 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
     cfg = make_trial_config(base, lookback=lookback, model_size=model_size,
                             horizon=horizon, total_steps=total_steps,
                             out_dir=final_dir, batch_size=bs)
+    # Parity with single_run.py / run_trial: honour DREAMER_* env vars
+    # on the final retrain too.
+    apply_dreamer_env_overrides(cfg)
     summary = run_training(cfg)
 
     # Reload model from final.pt and export ONNX.
@@ -624,44 +582,17 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     print('[BO] Phase 1a: dynamics identification', flush=True)
     plant = identify_dynamics_from_plant(out_dir / 'plant_id')
 
-    # Plant-aware noise config.  ``build_noise_config`` produces dynamics-
-    # derived OU process noise (CV + DV), measurement noise, and domain-
-    # randomization % from the identified plant.  We persist it to
-    # <out_dir>/noise_config.json and export ``SIM_NOISE_CONFIG_JSON`` so
-    # every downstream subprocess (training, validation) loads the same
-    # noise profile via SimNoiseWrapper.  Without this step the wrapper
-    # falls back to an empty config and the agent sees zero process /
-    # measurement / DV-drift noise — which makes "the plant" deterministic
-    # except for discrete disturbance steps.
-    try:
-        from utils.sim_factory import create_sim as _create_sim
-        from utils.noise_config import (
-            build_noise_config_from_sim, save_noise_config,
-        )
-        _probe_sim = _create_sim(episode_length=10,
-                                 sample_rate=max(1, base.sample_rate))
-        # Unwrap SimNoiseWrapper / sanity wrapper to get to the bare sim
-        # whose metadata attributes we need.
-        bare = _probe_sim
-        for _ in range(4):
-            inner = getattr(bare, '_sim', None)
-            if inner is None:
-                break
-            bare = inner
-        noise_cfg = build_noise_config_from_sim(
-            bare,
-            dynamics_json=plant.get('dynamics_raw') or {},
-            lookback_json={'identified_lookback': 0},
-        )
-        noise_cfg_path = out_dir / 'noise_config.json'
-        save_noise_config(noise_cfg, str(noise_cfg_path))
-        print(f"[BO] noise_config: {noise_cfg_path} "
-              f"(OU={len(noise_cfg.get('ou_noise', []))} "
-              f"meas={len(noise_cfg.get('measurement_noise', []))})",
-              flush=True)
-    except Exception as exc:
-        print(f"[BO] noise_config: SKIPPED ({exc!r}) — running with no "
-              "process / measurement noise", flush=True)
+    # Plant-aware noise config — see ``workflow/_plant_prepare.build_noise_config``.
+    # Builds dynamics-derived OU + measurement noise and exports
+    # ``SIM_NOISE_CONFIG_JSON`` so every downstream subprocess (training,
+    # validation) loads the same noise profile via ``SimNoiseWrapper``.
+    # Without this step the wrapper falls back to an empty config and the
+    # agent sees zero process / measurement / DV-drift noise — making
+    # "the plant" deterministic except for discrete disturbance steps.
+    _build_noise_config(out_dir,
+                         dynamics_raw=plant.get('dynamics_raw') or {},
+                         sample_rate=base.sample_rate,
+                         log_prefix='[BO]')
 
     # Plant-tied derivations (sample_rate from fastest dynamics, model_size
     # from complexity, seq_len ≥ settling time).  Env-supplied values take
