@@ -1546,6 +1546,46 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 3e-4)),
             kl_coef=0.0)
 
+    # ------------------------------------------------------------------
+    # P41 diag: critic-training health.  Adds direct readouts of the
+    # critic's regression problem so the P3 σ-saturation + critic-
+    # pessimism cascade documented in run_p40 RCA can be detected
+    # *during training* (rather than only at validation-time).
+    #   - critic_pred_*       : current critic V on imagined latents
+    #   - critic_target_std   : spread of λ-return regression target
+    #   - critic_pred_target_r: per-batch Pearson(V_pred, λ-return)
+    #                           → "is the critic fitting its OWN target?"
+    #                           Low (<0.3) while critic_loss drops
+    #                           means the critic is regressing on noise
+    #                           (target drifts faster than V chases it).
+    #   - critic_target_v_r   : Pearson(target_value_slow, λ-return)
+    #                           → "how much of target is bootstrapped?"
+    #                           High (>0.95) means rewards barely
+    #                           contribute → critic is self-referential.
+    #   - critic_rew_to_tgt_var: Var(rewards)/Var(target_returns).
+    #                           Low (<0.05) → bootstrap dominates;
+    #                           ~1 → reward-driven target (healthy).
+    # All under no_grad; ~3 extra reductions per imagination step —
+    # negligible cost (<0.1% wall-clock at default H).
+    with torch.no_grad():
+        crit_pred = model.value.expectation(val_logits_flat).view(B, H)
+        tgt = target_returns
+        tv = torch.stack(imagined_target_v, dim=1)
+
+        def _pearson_safe(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            a = a.reshape(-1).float()
+            b = b.reshape(-1).float()
+            a_c = a - a.mean()
+            b_c = b - b.mean()
+            denom = (a_c.norm() * b_c.norm()).clamp_min(1e-8)
+            return (a_c * b_c).sum() / denom
+
+        crit_pred_target_r = _pearson_safe(crit_pred, tgt)
+        crit_target_v_r = _pearson_safe(tv, tgt)
+        rew_var = rewards.float().var().clamp_min(1e-8)
+        tgt_var = tgt.float().var().clamp_min(1e-8)
+        rew_to_tgt_var = (rew_var / tgt_var).clamp_max(10.0)
+
     diag = {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
@@ -1556,6 +1596,13 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
         'adv_global_std': adv_raw.std().detach(),
         'return_scale': scale.detach().squeeze(),
+        # P41 critic-health diag (see block above for interpretation).
+        'critic_pred_mean': crit_pred.mean().detach(),
+        'critic_pred_std': crit_pred.std().detach(),
+        'critic_target_std': tgt.std().detach(),
+        'critic_pred_target_r': crit_pred_target_r.detach(),
+        'critic_target_v_r': crit_target_v_r.detach(),
+        'critic_rew_to_tgt_var': rew_to_tgt_var.detach(),
     }
     diag.update(pmpo_diag)
     return diag
@@ -3280,14 +3327,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         and (total_iters % diag_perhead_grads_every) == 0
                         and current_phase in (1, 2)):
                     try:
-                        _ref_tok = next(p for p in model.tokenizer.parameters()
-                                            if p.requires_grad)
-                        _ref_dyn = next(p for p in model.dynamics.parameters()
-                                            if p.requires_grad)
+                        # P41 fix: pass the *full* param list of the
+                        # relevant submodule (not a single ``next()``
+                        # param) so we sum grad norms over all in-graph
+                        # params.  This eliminates the silent
+                        # "first-param-not-in-graph → grad=0.0" failure
+                        # mode that produced ``diag_grad_recon=0.0`` in
+                        # P39/P40 even when recon was actually training.
+                        _tok_params = [p for p in model.tokenizer.parameters()
+                                          if p.requires_grad]
+                        _dyn_params = [p for p in model.dynamics.parameters()
+                                          if p.requires_grad]
                         _diag_terms = {
-                            # (loss_term, ref_param)
-                            'recon': (wm_losses.get('recon_loss'), _ref_tok),
-                            'sf':    (wm_losses.get('sf_loss'),    _ref_dyn),
+                            # (loss_term, [ref_params])
+                            'recon': (wm_losses.get('recon_loss'), _tok_params),
+                            'sf':    (wm_losses.get('sf_loss'),    _dyn_params),
                         }
                         if 'reward_mtp_total' in ag_losses:
                             # Match the actual rmtp weight applied to
@@ -3305,24 +3359,50 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             if _rmtp_w != 0.0:
                                 _diag_terms['rmtp'] = (
                                     _rmtp_w * ag_losses['reward_mtp_total'],
-                                    _ref_dyn)
+                                    _dyn_params)
                         diag_perhead_last = {}
-                        for _name, (_lt, _ref) in _diag_terms.items():
+                        for _name, (_lt, _refs) in _diag_terms.items():
                             if _lt is None or not torch.is_tensor(_lt):
                                 continue
-                            if not _lt.requires_grad or _lt.grad_fn is None:
-                                # Loss tensor was detached upstream — log
-                                # sentinel so we know the term ran but had
-                                # no live graph (separate from "in graph,
-                                # but ref param not reached").
+                            # P41 fix: try autograd.grad regardless of
+                            # the requires_grad / grad_fn quick-check.
+                            # Under bf16 autocast the loss tensor's
+                            # ``grad_fn`` attribute can occasionally
+                            # read as None on the autocast boundary
+                            # while autograd still has the graph
+                            # (observed as ``diag_grad_sf=-1.0`` in
+                            # P39/P40).  Cast to fp32 first to be
+                            # robust to autocast dtype mismatch with
+                            # fp32 model params.
+                            try:
+                                _lt_f = _lt.float()
+                                _gs = torch.autograd.grad(
+                                    _lt_f, _refs,
+                                    retain_graph=True,
+                                    allow_unused=True)
+                                _sq = 0.0
+                                _hit = 0
+                                for _g in _gs:
+                                    if _g is None:
+                                        continue
+                                    _sq += float(_g.detach().float()
+                                                   .pow(2).sum().item())
+                                    _hit += 1
+                                diag_perhead_last[f'diag_grad_{_name}'] = (
+                                    _sq ** 0.5)
+                                # Count of params in-graph — diagnostic
+                                # cross-check for "did we actually reach
+                                # any param of this submodule?".  0 →
+                                # loss term is detached or constant.
+                                diag_perhead_last[
+                                    f'diag_grad_{_name}_nparams'] = _hit
+                            except Exception as _e_inner:
                                 diag_perhead_last[f'diag_grad_{_name}'] = -1.0
-                                continue
-                            _g = torch.autograd.grad(_lt, [_ref],
-                                                       retain_graph=True,
-                                                       allow_unused=True)[0]
-                            diag_perhead_last[f'diag_grad_{_name}'] = (
-                                float(_g.detach().float().norm().item())
-                                if _g is not None else 0.0)
+                                diag_perhead_last[
+                                    f'diag_grad_{_name}_err'] = (
+                                        type(_e_inner).__name__
+                                        + ': '
+                                        + str(_e_inner)[:120])
                     except Exception as _e:
                         # Non-fatal — diagnostic only.  Capture the message
                         # so silent autograd failures (graph freed, param not
