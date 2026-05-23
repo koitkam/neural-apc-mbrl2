@@ -167,24 +167,37 @@ def derive_batch_size(model_size: str,
                       target_util: float = 0.80,
                       min_bs: int = 16, max_bs: int = 256,
                       horizon: int = 42,
-                      horizon_ref: int = 42) -> Dict[str, Any]:
+                      horizon_ref: int = 42,
+                      seq_len: int = 64,
+                      seq_len_ref: int = 64,
+                      lookback: int = 64,
+                      lookback_ref: int = 64) -> Dict[str, Any]:
     """Pick a batch size that uses ~``target_util`` of the GPU.
 
-    Empirical per-batch peak memory (test_sim, seq_len=64, horizon=42, bf16):
-      S ≈ 220 MB / batch
-      M ≈ 330 MB / batch
-      L ≈ 640 MB / batch
+    Reference per-sample peak memory at:
+      model_size=M, seq_len=64, lookback=64, horizon=42, bf16, manual attn
+        S ≈ 260 MB,  M ≈ 380 MB,  L ≈ 740 MB
 
-    Per-batch memory grows linearly with horizon (the imagined-trajectory
-    graph dominates AC memory), so ``per_batch`` is scaled by
-    ``horizon / horizon_ref``.
+    These baselines were re-anchored 2026-05-22 against a measured
+    test_sim run (size=M, seq_len=128, lookback=120, horizon=15,
+    fast_attn=on): bs=16 used 12.2 GiB → 782 MB/sample. The old
+    baseline (M=330 with no seq_len/lookback scaling) under-predicted by
+    ~4×, causing the sizer to pick bs=64 on an A10 (→ OOM).
+
+    Per-sample memory is scaled by:
+      * ``seq_len / seq_len_ref``    (linear — WM token sequence length)
+      * ``lookback / lookback_ref``  (linear — encoder + GRU context)
+      * ``horizon / horizon_ref``    (linear — imagined-trajectory graph)
+      * ``speed_factor``             (~0.55 with SDPA, ~0.30 with +compile)
 
     On CPU or no-CUDA we fall back to the paper default. Batch is snapped
     to powers of two in ``[paper_default, max_bs]`` so the recipe stays a
     strict superset of the paper.
 
-    ``DREAMER_TARGET_UTIL`` and ``DREAMER_MAX_BS`` env vars override the
-    defaults for ad-hoc memory tuning.
+    Env-var overrides (in precedence order):
+      * ``DREAMER_MAX_BS``       — hard cap on the picked batch
+      * ``DREAMER_TARGET_UTIL``  — GPU-headroom fraction (default 0.80)
+      * ``DREAMER_PER_BATCH_MB`` — explicit per-sample baseline (advanced)
     """
     import os
     env_util = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
@@ -199,7 +212,7 @@ def derive_batch_size(model_size: str,
             max_bs = max(min_bs, int(env_max_bs))
         except ValueError:
             pass
-    base_per_batch_mb = {'S': 220, 'M': 330, 'L': 640}.get(model_size, 330)
+    base_per_batch_mb = {'S': 260, 'M': 380, 'L': 740}.get(model_size, 380)
     # When the fast attention + compile paths are on, peak memory is roughly
     # 30% of the manual+eager baseline (measured: M-size W-M fwd+bwd drops
     # from ~290 MB/sample to ~70 MB/sample with bf16+SDPA+compile). Scale
@@ -234,11 +247,16 @@ def derive_batch_size(model_size: str,
             base_per_batch_mb = max(8.0, float(env_pb))
         except ValueError:
             pass
-    per_batch_mb = float(base_per_batch_mb) * max(1, int(horizon)) / max(1, int(horizon_ref))
+    seq_scale = max(1, int(seq_len)) / max(1, int(seq_len_ref))
+    lb_scale = max(1, int(lookback)) / max(1, int(lookback_ref))
+    hz_scale = max(1, int(horizon)) / max(1, int(horizon_ref))
+    per_batch_mb = float(base_per_batch_mb) * seq_scale * lb_scale * hz_scale
     info: Dict[str, Any] = {'model_size': model_size,
                             'per_batch_mb': per_batch_mb,
                             'per_batch_base_mb': base_per_batch_mb,
                             'horizon': horizon, 'horizon_ref': horizon_ref,
+                            'seq_len': seq_len, 'seq_len_ref': seq_len_ref,
+                            'lookback': lookback, 'lookback_ref': lookback_ref,
                             'paper_default': paper_default,
                             'target_util': target_util,
                             'min_bs': min_bs, 'max_bs': max_bs}

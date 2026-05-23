@@ -344,10 +344,12 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
             bs = max(1, int(bs_env))
             bs_info = {'batch_size': bs, 'source': 'env_override'}
         except Exception:
-            bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
+            bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init,
+                                         seq_len=int(base.seq_len), lookback=lookback)
             bs = int(bs_info['batch_size'])
     else:
-        bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init)
+        bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init,
+                                     seq_len=int(base.seq_len), lookback=lookback)
         bs = int(bs_info['batch_size'])
 
     trial_dir = study_dir / f'trial_{trial.number:04d}'
@@ -468,10 +470,14 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
             bs = max(1, int(bs_env))
         except Exception:
             bs = int(derive_batch_size(model_size, horizon=horizon,
-                                        horizon_ref=H_init)['batch_size'])
+                                        horizon_ref=H_init,
+                                        seq_len=int(base.seq_len),
+                                        lookback=lookback)['batch_size'])
     else:
         bs = int(derive_batch_size(model_size, horizon=horizon,
-                                    horizon_ref=H_init)['batch_size'])
+                                    horizon_ref=H_init,
+                                    seq_len=int(base.seq_len),
+                                    lookback=lookback)['batch_size'])
     print(f'[final] model={model_size} lookback={lookback} horizon={horizon} '
           f'batch={bs}', flush=True)
 
@@ -647,10 +653,14 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
             base.batch_size = max(1, int(bs_env))
             bs_info = {'batch_size': base.batch_size, 'source': 'env_override'}
         except Exception:
-            bs_info = derive_batch_size(derived_model_size)
+            bs_info = derive_batch_size(derived_model_size,
+                                         seq_len=int(base.seq_len),
+                                         lookback=int(plant['lookback']))
             base.batch_size = int(bs_info['batch_size'])
     else:
-        bs_info = derive_batch_size(derived_model_size)
+        bs_info = derive_batch_size(derived_model_size,
+                                     seq_len=int(base.seq_len),
+                                     lookback=int(plant['lookback']))
         base.batch_size = int(bs_info['batch_size'])
     print(f"[BO] batch_size_seed={base.batch_size} ({bs_info['source']}; "
           f"per_batch≈{bs_info.get('per_batch_mb',0):.0f}MB, "

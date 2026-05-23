@@ -247,11 +247,13 @@ def main() -> int:
             bs_info = {'batch_size': batch_size, 'source': 'env_override'}
         except Exception:
             bs_info = derive_batch_size(model_size, horizon=horizon,
-                                         horizon_ref=horizon)
+                                         horizon_ref=horizon,
+                                         seq_len=seq_len, lookback=lookback)
             batch_size = int(bs_info['batch_size'])
     else:
         bs_info = derive_batch_size(model_size, horizon=horizon,
-                                     horizon_ref=horizon)
+                                     horizon_ref=horizon,
+                                     seq_len=seq_len, lookback=lookback)
         batch_size = int(bs_info['batch_size'])
     print(f"[run] batch_size={batch_size} ({bs_info['source']}; "
           f"per_batch≈{bs_info.get('per_batch_mb','?')}MB, "
