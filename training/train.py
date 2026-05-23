@@ -289,6 +289,38 @@ class TrainConfig:
     # uninformative.  0.6 covers the central 60% × 2 = 120% (yes, both
     # signs) of the realistic operating envelope.
     constant_action_seed_op_band: float = 0.6
+    # Step-and-settle seed fraction (2026-05-23, P42 design).  Fraction
+    # of ``constant_action_seed_episodes`` that should be allocated to
+    # **step-and-settle** episodes instead of pure constant-action:
+    # hold u₀ for a short prefix → step to u₁ → hold u₁ to episode end.
+    # Why: a pure constant-action episode is *information-poor* — if
+    # the env init lands near SS(u₀) the WM sees ~1220 nearly-identical
+    # samples and gets near-zero gradient.  A step-and-settle episode
+    # is a strict superset: contains the late steady-state (same as
+    # const-action) plus a clean step response with known timing →
+    # direct gain + time-constant supervision.  Also breaks the
+    # degenerate "given constant input → predict no-change" shortcut
+    # that const-action-only seeds may enable (run_p40 RCA: WM
+    # steady-state probe 0% conv at H=200 despite L=32 + 40 const
+    # seeds).  Step-and-settle forces the WM to predict CHANGE under
+    # constant input during settling, which is the actual physics.
+    # 0.5 = half const, half step-settle.  0.0 = pure const (legacy).
+    step_settle_seed_fraction: float = 0.5
+    # Range of the step in normalized action units, |u₁ − u₀|.  Min
+    # ensures the step dominates plant noise and gives a clear gain
+    # readout; max keeps the step in a regime where the plant doesn't
+    # saturate at one end.  ``u₀`` is stratified over op_band as before;
+    # ``u₁ = clip(u₀ + Δ, -1, 1)`` with Δ uniformly sampled from
+    # ``±[step_seed_delta_min, step_seed_delta_max]``.
+    step_seed_delta_min: float = 0.20
+    step_seed_delta_max: float = 0.60
+    # Fraction of the episode used for the pre-step hold (settling
+    # from random IC to SS(u₀)).  Default 0.10 = 122 steps at
+    # ep_len=1220 ≈ 7 settling times at τ=53/sr=4 (τ_steps≈13) — well
+    # past the SS for u₀.  Leaves 1098 steps post-step for the new
+    # settling, ~84 settling times → ample long-horizon SS coverage.
+    step_seed_prefix_frac_min: float = 0.05
+    step_seed_prefix_frac_max: float = 0.20
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -1173,6 +1205,115 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
         if done:
             break
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
+def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
+                                  action_start: float,
+                                  action_end: float,
+                                  switch_step: int,
+                                  ) -> Dict[str, np.ndarray]:
+    """Collect a step-and-settle episode for WM seeding (P42 design).
+
+    Hold ``action_start`` for the first ``switch_step`` agent steps,
+    then step to ``action_end`` and hold to episode end.  Strict
+    superset of ``collect_constant_action_episode``:
+
+      [0, switch_step)        — pre-step settling from random IC to SS(u₀).
+      [switch_step]           — clean step response with known timing.
+      [switch_step, T)        — long-horizon SS at the new operating point.
+
+    Compared to a constant-action episode, this provides:
+      - explicit transient with known excitation timing → direct gain +
+        time-constant supervision for the WM,
+      - same late-episode SS supervision as constant-action (over a
+        shorter but still >>τ tail),
+      - breaks the "predict no-change under constant input" shortcut
+        because between ``switch_step`` and ~``switch_step + 5τ`` the
+        plant changes despite the action being held.
+
+    Curriculum disturbance schedule is suppressed (``env._schedule = []``)
+    so the step's effect is unambiguous; DR + OU + measurement noise
+    remain active.  Sim-agnostic via ``APCEnv._schedule``.
+
+    Both ``action_start`` and ``action_end`` are clipped to ``[-1, 1]``.
+    Returns the same dict shape as ``collect_episode``.
+    """
+    obs_window = env.reset(exploration=True)
+    env._schedule = []
+    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    obs_buf = np.zeros((T, L, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    a_start = np.full((env.action_dim,),
+                       float(np.clip(action_start, -1.0, 1.0)),
+                       dtype='float32')
+    a_end = np.full((env.action_dim,),
+                     float(np.clip(action_end, -1.0, 1.0)),
+                     dtype='float32')
+    sw = int(np.clip(switch_step, 1, T - 1))
+    for t in range(T):
+        a_t = a_start if t < sw else a_end
+        obs_buf[t] = obs_window
+        next_window, reward, done, _ = env.step(a_t)
+        act_buf[t] = a_t
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
+def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
+                                  u0: float) -> Tuple[float, int]:
+    """Sample ``(u1, switch_step)`` for a step-and-settle episode.
+
+    ``u1`` is ``u0 + Δ`` with ``|Δ| ∈ [step_seed_delta_min, max]`` and
+    a random sign; then clipped to ``[-1, 1]``.  If the clip would
+    shrink the step below ``step_seed_delta_min``, the sign is
+    reversed before re-clipping (keeps the step magnitude meaningful
+    even when ``u0`` is near the operating-band edge).
+
+    ``switch_step`` is uniformly sampled from
+    ``int(prefix_frac * episode_length)`` with
+    ``prefix_frac ∈ [step_seed_prefix_frac_min, max]``.
+    """
+    d_min = float(cfg.step_seed_delta_min)
+    d_max = float(cfg.step_seed_delta_max)
+    if d_max < d_min:
+        d_min, d_max = d_max, d_min
+    mag = float(rng.uniform(d_min, d_max))
+    sign = 1.0 if rng.uniform() < 0.5 else -1.0
+    u1 = float(np.clip(u0 + sign * mag, -1.0, 1.0))
+    if abs(u1 - u0) < d_min:
+        u1 = float(np.clip(u0 - sign * mag, -1.0, 1.0))
+    pf_min = float(cfg.step_seed_prefix_frac_min)
+    pf_max = float(cfg.step_seed_prefix_frac_max)
+    if pf_max < pf_min:
+        pf_min, pf_max = pf_max, pf_min
+    prefix_frac = float(rng.uniform(pf_min, pf_max))
+    T = int(cfg.episode_length)
+    switch_step = int(np.clip(round(prefix_frac * T), 1, T - 1))
+    return u1, switch_step
+
+
+def _seed_one_const_or_step(env: APCEnv, cfg: TrainConfig, *,
+                              level: float, do_step: bool,
+                              ) -> Dict[str, np.ndarray]:
+    """Dispatch one constant-action OR step-and-settle seed episode.
+
+    Used by the initial seed loop and the P1 periodic injection block
+    so the const-vs-step allocation is identical in both code paths.
+    """
+    if do_step:
+        u1, sw = _sample_step_settle_params(env.rng, cfg, float(level))
+        return collect_step_settle_episode(env, cfg,
+                                             action_start=float(level),
+                                             action_end=u1,
+                                             switch_step=sw)
+    return collect_constant_action_episode(env, cfg,
+                                             action_level=float(level))
 
 
 # ---------------------------------------------------------------------------
@@ -3017,28 +3158,64 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
 
-    # Constant-action seed (run_p31 RCA, 2026-05-21): the PRBS sweep
-    # only ever holds an action for ~80–150 agent steps, so the WM has
-    # no long-horizon constant-action data and extrapolates badly when
-    # the trained controller later sits near a setpoint.  These full-
-    # episode constant-action seeds give the WM explicit steady-state
-    # coverage at a stratified spread of operating points within
+    # Constant-action / step-and-settle seed (run_p31 RCA 2026-05-21
+    # + P42 design 2026-05-23): the PRBS sweep only ever holds an
+    # action for ~80–150 agent steps, so the WM has no long-horizon
+    # constant-action data and extrapolates badly when the trained
+    # controller later sits near a setpoint.
+    #
+    # Two episode flavours are used (mix controlled by
+    # ``step_settle_seed_fraction``):
+    #   1. pure constant-action — long-horizon SS at one operating point,
+    #   2. step-and-settle — hold u₀ briefly, step to u₁, hold u₁ to
+    #      episode end.  Strict superset: late-episode SS PLUS a clean
+    #      step response with known timing (gain + time-constant signal)
+    #      PLUS supervision for "the plant CHANGES under constant input
+    #      during settling" (breaks the degenerate const-in→const-out
+    #      shortcut the WM may learn from pure const-action seeds —
+    #      run_p40 RCA: WM steady-state probe 0% conv at H=200 despite
+    #      L=32 + 40 const seeds).
+    #
+    # Operating points u₀ are stratified over
     # ``[-constant_action_seed_op_band, +constant_action_seed_op_band]``.
     n_const_seed = int(getattr(cfg, 'constant_action_seed_episodes', 0))
     const_op_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
+    step_frac = float(getattr(cfg, 'step_settle_seed_fraction', 0.0))
+    step_frac = float(np.clip(step_frac, 0.0, 1.0))
     if n_const_seed > 0:
-        # Stratified levels: evenly-spaced over [-op_band, +op_band]
+        # Stratified u₀ levels: evenly-spaced over [-op_band, +op_band]
         # with a small jitter so re-running the workflow does not hit
         # exactly the same operating points.
         levels = np.linspace(-const_op_band, const_op_band, n_const_seed,
                               dtype='float32')
         jitter = env.rng.uniform(-0.05, 0.05, size=levels.shape).astype('float32')
         levels = np.clip(levels + jitter * const_op_band, -1.0, 1.0)
-        for lvl in levels:
-            ep = collect_constant_action_episode(env, cfg,
-                                                  action_level=float(lvl))
+        # Alternate step / const so the const-vs-step split is evenly
+        # spread across the operating-point sweep instead of clustered
+        # at one end.  ``do_step_mask[i]`` is True for step-and-settle.
+        n_step = int(round(step_frac * n_const_seed))
+        do_step_mask = np.zeros(n_const_seed, dtype=bool)
+        if n_step > 0:
+            # Interleave: pick the n_step indices most evenly spread.
+            step_idx = np.linspace(0, n_const_seed - 1, n_step,
+                                     dtype=int)
+            do_step_mask[step_idx] = True
+        n_step_emitted = 0
+        n_const_emitted = 0
+        for i, lvl in enumerate(levels):
+            ep = _seed_one_const_or_step(env, cfg,
+                                          level=float(lvl),
+                                          do_step=bool(do_step_mask[i]))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
             total_env_steps += cfg.episode_length
+            if do_step_mask[i]:
+                n_step_emitted += 1
+            else:
+                n_const_emitted += 1
+        print(f"[seed] const-action={n_const_emitted} "
+              f"step-settle={n_step_emitted} "
+              f"(step_fraction={step_frac:.2f}, op_band={const_op_band:.2f})",
+              flush=True)
 
     # Cached optimizer set per phase.
     # Initialize hidden-disturbance probability for the starting phase
@@ -3134,10 +3311,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             env._disturbance_prob_override = get_phase_disturbance_prob(
                 phase=int(current_phase))
 
-        # ----- P39 periodic const-action injection (P1 only) -----
-        # Keep the steady-state regime represented in the buffer as P1
-        # fills it with random-action transitions.  Cheap: 5 episodes
-        # every 20 iters ≈ 6% buffer-add overhead.
+        # ----- P39 periodic const/step injection (P1 only) -----
+        # Keep the steady-state + step-response regimes represented in
+        # the buffer as P1 fills it with random-action transitions.
+        # Cheap: 5 episodes every 20 iters ≈ 6% buffer-add overhead.
+        # Mix controlled by ``step_settle_seed_fraction`` (P42 design).
         if (current_phase == 1
                 and const_inject_every > 0
                 and const_inject_n > 0
@@ -3145,19 +3323,33 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 and (total_iters % const_inject_every) == 0):
             _op_band = float(getattr(cfg,
                                        'constant_action_seed_op_band', 0.6))
+            _step_frac = float(np.clip(
+                getattr(cfg, 'step_settle_seed_fraction', 0.0), 0.0, 1.0))
             _levels = np.linspace(-_op_band, _op_band, const_inject_n,
                                    dtype='float32')
             _jit = env.rng.uniform(-0.05, 0.05,
                                      size=_levels.shape).astype('float32')
             _levels = np.clip(_levels + _jit * _op_band, -1.0, 1.0)
-            for _lvl in _levels:
-                _ep = collect_constant_action_episode(
-                    env, cfg, action_level=float(_lvl))
+            _n_step = int(round(_step_frac * const_inject_n))
+            _do_step_mask = np.zeros(const_inject_n, dtype=bool)
+            if _n_step > 0:
+                _do_step_mask[np.linspace(
+                    0, const_inject_n - 1, _n_step, dtype=int)] = True
+            _n_c = 0
+            _n_s = 0
+            for _i, _lvl in enumerate(_levels):
+                _ep = _seed_one_const_or_step(
+                    env, cfg, level=float(_lvl),
+                    do_step=bool(_do_step_mask[_i]))
                 buf.add_episode(_ep['obs'], _ep['act'],
                                  _ep['rew'], _ep['cont'])
                 total_env_steps += cfg.episode_length
+                if _do_step_mask[_i]:
+                    _n_s += 1
+                else:
+                    _n_c += 1
             print(f"[p1-const-inject] iter {total_iters}: added "
-                  f"{const_inject_n} const-action episodes "
+                  f"const={_n_c} step={_n_s} episodes "
                   f"(buf_fill={buf.filled}/{buf.capacity_eps})",
                   flush=True)
 

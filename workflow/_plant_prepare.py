@@ -215,6 +215,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # H=200 even with L=32 + const-action seeds).  Override to 8 to
     # test paper-faithful setting.
     'DREAMER_MTP_LENGTH':         ('mtp_length',                 int),
+    # 2026-05-23 (P42): step-and-settle seed fraction.  0.0 = legacy
+    # pure const-action seeds.  0.5 = half const, half step-settle.
+    # 1.0 = all step-settle.  Strict superset of const-action
+    # supervision; recommended ≥0.5 for plants with long settling
+    # times where pure const-action seeds are info-poor.
+    'DREAMER_STEP_SETTLE_FRAC':   ('step_settle_seed_fraction',  float),
 }
 
 
