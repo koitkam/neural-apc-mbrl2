@@ -209,6 +209,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.
     'DREAMER_CONST_ACTION_SEEDS': ('constant_action_seed_episodes', int),
+    # 2026-05-22 (P41): MTP head sequence length.  Paper default 8.
+    # Bumped to 32 in TrainConfig on 2026-05-21 (p31 RCA) but P40
+    # falsified that rationale (0% steady-state WM convergence at
+    # H=200 even with L=32 + const-action seeds).  Override to 8 to
+    # test paper-faithful setting.
+    'DREAMER_MTP_LENGTH':         ('mtp_length',                 int),
 }
 
 
