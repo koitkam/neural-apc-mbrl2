@@ -342,7 +342,14 @@ class TrainConfig:
     # DreamerV3 uses L≥8 only on Atari; control-task ablations in the
     # appendix favour larger L when episodes carry long settled
     # transients.
-    mtp_length: int = 32              # bumped from paper L=8 (p31 RCA)
+    # 2026-05-23 (P41 RCA): reverted 32 → 8 (paper default).  The p31
+    # rationale for L=32 ("WM doesn't converge under const action at
+    # H=200") was falsified by P40 (0% steady-state convergence with L=32
+    # + 40 const-action seeds) and P41 (cascade reappears identically at
+    # L=8).  The cascade root cause is bootstrap-dominated AC-loop
+    # targets, NOT WM-pretrain quality, so L has no leverage.  Save 4×
+    # MTP compute.  Override via DREAMER_MTP_LENGTH.
+    mtp_length: int = 8               # paper default (P41 RCA)
 
     # ----- PMPO (Phase 3) -----
     # alpha=0.7 (paper default).  alpha=0.5 caused near-perfect
@@ -441,6 +448,18 @@ class TrainConfig:
     # logs → stop.
     early_stop_critic_divergence_factor: float = 5.0
     early_stop_critic_divergence_patience_iters: int = 20
+    # 2026-05-23 (P41 RCA): bootstrap-cascade canary.  Trip when the
+    # critic's target is dominated by its own bootstrap V_slow (reward
+    # contributes <``min_rew_var_frac`` of the target variance) AND the
+    # return_scale has drifted >``min_return_scale_growth``× since the
+    # P3 start, sustained for ``patience`` consecutive P3 log iters.
+    # This is the in-training signature of the critic-pessimism /
+    # bootstrap-runaway cascade documented in P40/P41 RCAs; aborting
+    # on this signal avoids burning compute on the plateau detector.
+    # Set ``factor=0.0`` to disable.
+    early_stop_cascade_min_rew_var_frac: float = 0.015
+    early_stop_cascade_min_return_scale_growth: float = 3.0
+    early_stop_cascade_patience_iters: int = 10
     # Grad-skip storm: more than ``max_skips`` skipped optimizer steps
     # within ``window_iters`` consecutive iters → stop (NaN/Inf in
     # actor or critic gradient is unrecoverable in this run).
@@ -3020,6 +3039,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     ent_window: List[float] = []
     critic_div_streak: int = 0
     critic_loss_window: 'deque[float]' = deque(maxlen=200)
+    # 2026-05-23 (P41 RCA): bootstrap-cascade canary state.  Captured
+    # at P2→P3 transition; tripped from the actor-critic log block.
+    p3_start_return_scale: Optional[float] = None
+    cascade_streak: int = 0
     grad_skip_history: 'deque[Tuple[int, int]]' = deque(maxlen=512)  # (iter, skip_count)
     grad_skip_prev_total: int = 0
     early_stop_reason: Optional[str] = None
@@ -3306,6 +3329,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if current_phase == 3:
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
                 model.snapshot_prior_policy()
+                # 2026-05-23 (P41 RCA): snapshot return_scale at P3 start
+                # so the bootstrap-cascade canary can detect runaway growth.
+                # ``model.ret_scale`` is the EMA buffer used by the critic
+                # target normalisation; it's already initialised by P2.
+                try:
+                    _rs0 = float(model.ret_scale.detach().item())
+                    if _rs0 > 0.0 and np.isfinite(_rs0):
+                        p3_start_return_scale = _rs0
+                        print(f'[p3-start] return_scale={_rs0:.2f} '
+                              '(cascade canary baseline)', flush=True)
+                except Exception:
+                    pass
             # Refresh hidden-disturbance per-episode probability for the
             # new phase (default: 0.3 in P1/P2, 0.5 in P3).
             env._disturbance_prob_override = get_phase_disturbance_prob(
@@ -4016,6 +4051,43 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     f'{critic_div_streak} iters')
                         critic_loss_window.append(float(cl))
 
+                    # --- Bootstrap-cascade canary (P41 RCA, 2026-05-23) ---
+                    # Trip when the critic target is bootstrap-dominated
+                    # (rew/tgt variance fraction < threshold) AND
+                    # return_scale has grown >factor× since P3 start,
+                    # sustained for patience consecutive P3 iters.
+                    # See critic-diag interpretation table in
+                    # dreamer-training-diagnosis skill.
+                    if early_stop_reason is None:
+                        _rv = row.get('critic_rew_to_tgt_var')
+                        _rs = row.get('return_scale')
+                        _min_rv = float(getattr(cfg,
+                                'early_stop_cascade_min_rew_var_frac', 0.0))
+                        _min_gr = float(getattr(cfg,
+                                'early_stop_cascade_min_return_scale_growth',
+                                0.0))
+                        _patience = int(getattr(cfg,
+                                'early_stop_cascade_patience_iters', 0))
+                        if (_min_rv > 0.0 and _patience > 0
+                                and _rv is not None and _rs is not None
+                                and p3_start_return_scale is not None
+                                and np.isfinite(float(_rv))
+                                and np.isfinite(float(_rs))):
+                            _rv_f = float(_rv)
+                            _growth = float(_rs) / max(
+                                p3_start_return_scale, 1e-8)
+                            if _rv_f < _min_rv and _growth > _min_gr:
+                                cascade_streak += 1
+                            else:
+                                cascade_streak = 0
+                            if cascade_streak >= _patience:
+                                early_stop_reason = (
+                                    f'bootstrap_cascade: '
+                                    f'rew_to_tgt_var={_rv_f:.4f} < {_min_rv:.4f} '
+                                    f'AND return_scale_growth={_growth:.2f}× > '
+                                    f'{_min_gr:.1f}× for '
+                                    f'{cascade_streak} iters')
+
                 # --- Soft fail: P3 plateau on best ema_return ---
                 if (early_stop_reason is None and current_phase == 3
                         and ema_return is not None and np.isfinite(ema_return)):
@@ -4226,6 +4298,13 @@ def _cfg_from_env() -> TrainConfig:
             'early_stop_critic_divergence_factor', float),
         ('DREAMER_ES_CRITIC_PATIENCE',
             'early_stop_critic_divergence_patience_iters', int),
+        # 2026-05-23 (P41 RCA): bootstrap-cascade canary thresholds.
+        ('DREAMER_ES_CASCADE_REWVAR',
+            'early_stop_cascade_min_rew_var_frac', float),
+        ('DREAMER_ES_CASCADE_GROWTH',
+            'early_stop_cascade_min_return_scale_growth', float),
+        ('DREAMER_ES_CASCADE_PATIENCE',
+            'early_stop_cascade_patience_iters', int),
         ('DREAMER_ES_GRADSKIP_WINDOW',
             'early_stop_grad_skip_window_iters', int),
         ('DREAMER_ES_GRADSKIP_MAX', 'early_stop_grad_skip_max', int),

@@ -1621,9 +1621,16 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     w = ramp_weight(tau)
     loss = (w * loss_flow).mean()
 
-    diag = {
-        'sf_loss': loss.detach(),
-    }
+    # NOTE (2026-05-23, P41 sf_loss diag bug fix): do NOT include
+    # 'sf_loss' in diag.  The caller (``world_model_loss``) does
+    # ``losses.update(sf_diag)`` which would overwrite the live
+    # ``losses['sf_loss']`` (the returned ``loss`` tensor with grad)
+    # with this detached copy, breaking autograd.grad in the diag-A
+    # block (observed as ``diag_grad_sf=-1.0`` + RuntimeError "element 0
+    # of tensors does not require grad" through P39–P41).  Keep diag
+    # empty for now; if per-loss diagnostics are needed later, use a
+    # different key (e.g. ``sf_loss_val``).
+    diag: Dict[str, torch.Tensor] = {}
     return loss, diag
 
 
