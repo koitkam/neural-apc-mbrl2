@@ -198,9 +198,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # settling-time-based default.
     'DREAMER_SEQ_LEN':            ('seq_len',                    int),
     # 2026-05-22 (P37 entropy-floor RCA): reward MTP loss weight.
-    # Default 4.0 in TrainConfig; expose env override so we can tune
-    # without code edits if the reward head needs even more gradient.
+    # Lowered 4.0 → 1.0 in TrainConfig on 2026-05-22 (P40 RCA); env
+    # override remains for tuning experiments.
     'DREAMER_REWARD_MTP_WEIGHT':  ('reward_scale_loss',          float),
+    # 2026-05-22 (P40 RCA): P1 reward-MTP weight.  Paper default 0.0
+    # (reward head trains only from P2).  Override >0 to re-enable a
+    # small P1 weight for experiments.
+    'DREAMER_REWARD_MTP_WEIGHT_P1': ('reward_scale_loss_p1',     float),
     # 2026-05-22: number of constant-action seed episodes (steady-state
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.

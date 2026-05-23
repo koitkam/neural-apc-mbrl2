@@ -192,18 +192,30 @@ class TrainConfig:
     # thin linear projection without VQ for low-D vector obs).
     recon_scale: float = 0.1
     sf_scale: float = 1.0
-    reward_scale_loss: float = 4.0   # P1+P2+P3 reward MTP weight (was 2.0;
-    # bumped 2026-05-07 after run_p5 RCA: reward gate passed (r=0.62) but
-    # critic gate failed (r=-0.25) due to reward-cliff bimodality.  After
-    # switching the reward saturator from hard-clip to tanh (smooth
-    # gradient everywhere), the head can finally fit the full violation
-    # tail; doubling the loss weight again accelerates that convergence
-    # so P3 critic learning sees stable targets sooner.
-    # bumped 2026-05-06 after run_p2 RCA showed reward head pred_std=5.2 vs
-    # real_std=44.9 — head learned ranking r=0.62 but not scale.  2× weight
-    # on the symlog/2-hot reward loss drives the head toward fitting the
-    # full distribution width rather than collapsing onto the mean.
-    # Stays well within stable WM-loss balance (recon+sf already O(1)).
+    # P2+P3 reward-MTP loss weight (Dreamer-V4 paper Eq. 9).  Lowered
+    # 4.0 → 1.0 on 2026-05-22 (P40 RCA): the previous 4.0 was a custom
+    # tune from run_p5 / p2 that we kept stacking on top of an off-paper
+    # P1 reward gradient.  With reward MTP correctly removed from P1
+    # (see ``reward_scale_loss_p1`` below) and ``mtp_length=32`` already
+    # giving 4× more samples per step than paper L=8, the per-step
+    # gradient magnitude is already much higher than paper's effective
+    # weight.  1.0 brings the per-step reward gradient back into the
+    # paper's recon/sf/reward balance band.
+    reward_scale_loss: float = 1.0
+    # P1 (WM pretrain) reward-MTP loss weight.  Paper default 0.0:
+    # Dreamer-V4 §3 trains the WM (tokenizer + dynamics) without the
+    # reward head in pretrain.  The reward head joins in agent
+    # fine-tune (Phase 2, Eq. 9).  We kept this at the same weight as
+    # P2 from 2026-05-06 through P39 — that wired reward-head gradient
+    # into the dynamics head via z_clean.detach(), producing a strong
+    # asymmetric gradient that destabilised the dynamics transformer
+    # once recon+sf had nearly converged.  Symptom: H=15 WM fidelity
+    # peaked around iter 20 then collapsed to ~0 (P38 + P39 cliff).
+    # Restored to paper-default 0.0 on 2026-05-22 after P40 diag-B
+    # ablation (DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1=1) confirmed the
+    # cliff disappears.  Override with DREAMER_REWARD_MTP_WEIGHT_P1
+    # if you want to re-enable a small P1 weight.
+    reward_scale_loss_p1: float = 0.0
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -3223,21 +3235,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                                           agent_hid, cfg)
                     total_loss = wm_losses['wm_total'] + ag_losses['agent_total']
                 elif current_phase == 1:
-                    # P1: WM losses + reward-head MTP only (no BC).
-                    # Use the *non-detached* ``reward_mtp_total`` key —
-                    # using ``reward_mtp_loss`` (which is .detach()'d for
-                    # diagnostics) silently zeros the reward-head gradient
-                    # in P1, leaving it untrained until P2 starts.
-                    if diag_disable_reward_mtp_in_p1:
-                        # P39 diag B: ablate reward MTP from P1 to test
-                        # whether reward-head gradients are responsible
-                        # for the H=15 fidelity collapse.  Head receives
-                        # no gradient at all in P1 — will be untrained
-                        # entering P2 (compare to baseline P2 rmtp loss).
+                    # P1: WM losses + (optional) reward-head MTP.
+                    # Paper default: reward_scale_loss_p1 = 0 (reward
+                    # head trains only in P2+).  Diag B env var still
+                    # honoured as a hard override to force-zero the P1
+                    # weight regardless of cfg, for backward-compat with
+                    # ad-hoc ablation runs.
+                    p1_rmtp_weight = (0.0 if diag_disable_reward_mtp_in_p1
+                                       else float(cfg.reward_scale_loss_p1))
+                    if p1_rmtp_weight == 0.0:
                         total_loss = wm_losses['wm_total']
                     else:
+                        # Use the *non-detached* ``reward_mtp_total`` key —
+                        # using ``reward_mtp_loss`` (which is .detach()'d
+                        # for diagnostics) silently zeros the reward-head
+                        # gradient, leaving it untrained.
                         total_loss = (wm_losses['wm_total']
-                                       + cfg.reward_scale_loss
+                                       + p1_rmtp_weight
                                          * ag_losses['reward_mtp_total'])
                 else:
                     total_loss = wm_losses['wm_total']
@@ -3275,12 +3289,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             'recon': (wm_losses.get('recon_loss'), _ref_tok),
                             'sf':    (wm_losses.get('sf_loss'),    _ref_dyn),
                         }
-                        if ('reward_mtp_total' in ag_losses
-                                and not diag_disable_reward_mtp_in_p1):
-                            _diag_terms['rmtp'] = (
-                                cfg.reward_scale_loss
-                                    * ag_losses['reward_mtp_total'],
-                                _ref_dyn)
+                        if 'reward_mtp_total' in ag_losses:
+                            # Match the actual rmtp weight applied to
+                            # total_loss for this phase: paper-default
+                            # is 0 in P1 (untouched dynamics gradient)
+                            # and reward_scale_loss in P2.  Skip the
+                            # diag entirely when the effective weight
+                            # is 0 — gradient would be exactly 0 and
+                            # the logged value would be meaningless.
+                            if current_phase == 1:
+                                _rmtp_w = (0.0 if diag_disable_reward_mtp_in_p1
+                                            else float(cfg.reward_scale_loss_p1))
+                            else:
+                                _rmtp_w = float(cfg.reward_scale_loss)
+                            if _rmtp_w != 0.0:
+                                _diag_terms['rmtp'] = (
+                                    _rmtp_w * ag_losses['reward_mtp_total'],
+                                    _ref_dyn)
                         diag_perhead_last = {}
                         for _name, (_lt, _ref) in _diag_terms.items():
                             if _lt is None or not torch.is_tensor(_lt):
