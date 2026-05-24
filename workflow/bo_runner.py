@@ -322,7 +322,7 @@ def make_trial_config(base: TrainConfig, *, lookback: int,
 
 def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
               study_dir: Path, trial_steps: int) -> float:
-    from utils.plant_init import derive_batch_size
+    from tools.gpu_calibrate import pick_batch_size_for_plant
     # ``lookback`` is no longer a BO axis: with the per-frame encoder
     # (paper-faithful Dreamer-V4) the GRU provides temporal memory and
     # the lookback window only controls the env's initial-state warmup.
@@ -334,22 +334,26 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     H_init = 15
     horizon = 15
 
-    # Adaptive per-trial batch size: re-derive from the trial's actual
-    # model_size + horizon so OOM-prone (L, large horizon) trials use a
-    # smaller batch.  Paired with sqrt-LR scaling in train() so the
-    # effective gradient step size stays comparable to batch=16.
+    # Empirical per-trial batch sizing (cached on (model_size, seq, lb,
+    # horizon) so repeated trials with same shape skip the ~10 s probe).
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
             bs = max(1, int(bs_env))
             bs_info = {'batch_size': bs, 'source': 'env_override'}
         except Exception:
-            bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init,
-                                         seq_len=int(base.seq_len), lookback=lookback)
+            bs_info = pick_batch_size_for_plant(
+                model_size=model_size, seq_len=int(base.seq_len),
+                lookback=lookback, horizon=horizon, k_max=int(base.k_max),
+                sample_rate=int(base.sample_rate),
+                episode_length=int(base.episode_length))
             bs = int(bs_info['batch_size'])
     else:
-        bs_info = derive_batch_size(model_size, horizon=horizon, horizon_ref=H_init,
-                                     seq_len=int(base.seq_len), lookback=lookback)
+        bs_info = pick_batch_size_for_plant(
+            model_size=model_size, seq_len=int(base.seq_len),
+            lookback=lookback, horizon=horizon, k_max=int(base.k_max),
+            sample_rate=int(base.sample_rate),
+            episode_length=int(base.episode_length))
         bs = int(bs_info['batch_size'])
 
     trial_dir = study_dir / f'trial_{trial.number:04d}'
@@ -454,7 +458,7 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
 
 def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
                            out_dir: Path, total_steps: int) -> Dict:
-    from utils.plant_init import derive_batch_size
+    from tools.gpu_calibrate import pick_batch_size_for_plant
     # ``lookback`` is no longer a BO axis (see ``run_trial``); read it from
     # the plant identification, falling back to ``best_params`` for
     # backward-compat with older study summaries that still recorded it.
@@ -469,15 +473,17 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         try:
             bs = max(1, int(bs_env))
         except Exception:
-            bs = int(derive_batch_size(model_size, horizon=horizon,
-                                        horizon_ref=H_init,
-                                        seq_len=int(base.seq_len),
-                                        lookback=lookback)['batch_size'])
+            bs = int(pick_batch_size_for_plant(
+                model_size=model_size, seq_len=int(base.seq_len),
+                lookback=lookback, horizon=horizon, k_max=int(base.k_max),
+                sample_rate=int(base.sample_rate),
+                episode_length=int(base.episode_length))['batch_size'])
     else:
-        bs = int(derive_batch_size(model_size, horizon=horizon,
-                                    horizon_ref=H_init,
-                                    seq_len=int(base.seq_len),
-                                    lookback=lookback)['batch_size'])
+        bs = int(pick_batch_size_for_plant(
+            model_size=model_size, seq_len=int(base.seq_len),
+            lookback=lookback, horizon=horizon, k_max=int(base.k_max),
+            sample_rate=int(base.sample_rate),
+            episode_length=int(base.episode_length))['batch_size'])
     print(f'[final] model={model_size} lookback={lookback} horizon={horizon} '
           f'batch={bs}', flush=True)
 
@@ -604,7 +610,8 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     # from complexity, seq_len ≥ settling time).  Env-supplied values take
     # precedence so this stays simulator-agnostic.
     from utils.sim_factory import create_sim, resolve_sim_metadata
-    from utils.plant_init import derive_all, derive_step_budgets, derive_batch_size
+    from utils.plant_init import derive_all, derive_step_budgets
+    from tools.gpu_calibrate import pick_batch_size_for_plant
     sr_override = int(sr_env) if sr_env else 0
     tmp_sim = create_sim(episode_length=10,
                          sample_rate=max(1, sr_override or base.sample_rate))
@@ -645,22 +652,29 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
           f"complexity={derived['complexity_score']:.2f}", flush=True)
 
     # Adaptive batch size SEED (per-trial batch is re-derived in run_trial
-    # from the trial's actual model_size + horizon).  This block only
-    # records the seed-config batch in run_plan.json.
+    # from the trial's actual model_size + horizon via the empirical
+    # probe).  This block only records the seed-config batch in
+    # run_plan.json.
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
             base.batch_size = max(1, int(bs_env))
             bs_info = {'batch_size': base.batch_size, 'source': 'env_override'}
         except Exception:
-            bs_info = derive_batch_size(derived_model_size,
-                                         seq_len=int(base.seq_len),
-                                         lookback=int(plant['lookback']))
+            bs_info = pick_batch_size_for_plant(
+                model_size=derived_model_size,
+                seq_len=int(base.seq_len), lookback=int(plant['lookback']),
+                horizon=15, k_max=int(base.k_max),
+                sample_rate=int(base.sample_rate),
+                episode_length=int(base.episode_length))
             base.batch_size = int(bs_info['batch_size'])
     else:
-        bs_info = derive_batch_size(derived_model_size,
-                                     seq_len=int(base.seq_len),
-                                     lookback=int(plant['lookback']))
+        bs_info = pick_batch_size_for_plant(
+            model_size=derived_model_size,
+            seq_len=int(base.seq_len), lookback=int(plant['lookback']),
+            horizon=15, k_max=int(base.k_max),
+            sample_rate=int(base.sample_rate),
+            episode_length=int(base.episode_length))
         base.batch_size = int(bs_info['batch_size'])
     print(f"[BO] batch_size_seed={base.batch_size} ({bs_info['source']}; "
           f"per_batch≈{bs_info.get('per_batch_mb',0):.0f}MB, "

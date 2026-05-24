@@ -2,9 +2,8 @@
 
 Builds the actual training model (same code path as `workflow.single_run`)
 for a given simulation, runs ONE forward + backward of `world_model_loss`
-at bs=4 on synthetic data, and measures peak GPU memory.  Reports actual
-per-sample MB and what `derive_batch_size` would pick under the current
-baselines vs the empirical value.
+at bs=4 on synthetic data, and measures peak GPU memory.  Reports
+measured per-sample MB and recommends an empirical batch size.
 
 Usage::
 
@@ -13,11 +12,10 @@ Usage::
 Skips dynamics ID if `--plant-id` points to an existing plant_id.json
 from a prior run (re-uses tau/dead_time/lookback).
 
-2026-05-24: created during the P44→P45 cross-sim GPU auto-tune work.
-P43 observed bs=16 → 12.4 GiB on test_sim (L, seq=128, lb=120, hz=15) =
-793 MB/sample; the current L baseline of 740 MB under-predicts by 1.46×.
-This tool gives us a measured per-sim number so the baselines aren't
-chosen on one anecdote.
+Also exposes the public helpers consumed by `workflow.single_run` /
+`workflow.bo_runner` for on-the-fly empirical batch sizing:
+``measure_per_sample_mb``, ``pick_batch_size_empirical``, and the
+cached high-level ``pick_batch_size_for_plant``.
 """
 
 from __future__ import annotations
@@ -118,9 +116,9 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
     actor+critic+optimizer state on top of the measured WM peak.  Default
     1.0 = WM-only; pass e.g. 1.15 to reserve 15% for actor/critic/opt.
 
-    Returns a dict with the same shape as ``derive_batch_size`` for
-    seamless drop-in, plus ``per_sample_mb_measured`` and
-    ``source='empirical:gpu_calibrate'``.
+    Returns a ``bs_info`` dict with ``batch_size``, ``source``,
+    ``per_sample_mb_measured``, ``predicted_peak_gib``, etc.  On CPU or
+    probe failure, falls back to ``paper_default`` (no formula).
     """
     from training.train import TrainConfig
     from workflow.bo_runner import MODEL_SIZE_PRESETS
@@ -140,7 +138,7 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
             'horizon': horizon, 'paper_default': paper_default,
             'target_util': target_util, 'min_bs': paper_default, 'max_bs': max_bs,
             'wm_overhead_factor': wm_overhead_factor, 'bs_probe': bs_probe}
-    # Env-var overrides (parity with derive_batch_size).
+    # Env-var overrides.
     env_util = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
     if env_util:
         try:
@@ -161,12 +159,12 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
         return info
     meas = measure_per_sample_mb(cfg, bs_probe=bs_probe)
     if 'error' in meas:
-        # Fall back to formula on probe failure.
-        from utils.plant_init import derive_batch_size as _dbs
-        fb = _dbs(model_size, horizon=horizon, seq_len=seq_len, lookback=lookback,
-                  paper_default=paper_default, max_bs=max_bs, target_util=target_util)
-        fb['source'] = f'empirical_fallback:{meas["error"]}->{fb.get("source","auto")}'
-        return fb
+        # Probe failed (e.g. OOM at bs_probe).  Fall back to the paper
+        # default — no formula to rely on.
+        info.update({'batch_size': paper_default,
+                     'source': f'paper_default_fallback:{meas["error"]}',
+                     'gpu_total_gb': 0.0})
+        return info
     per_sample_mb = float(meas['per_sample_mb']) * float(wm_overhead_factor)
     free_b, total_b = torch.cuda.mem_get_info(0)
     gpu_total_gb = total_b / (1024 ** 3)
@@ -184,6 +182,76 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
         'raw_bs': raw_bs,
         'predicted_peak_gib': bs * per_sample_mb / 1024,
     })
+    return info
+
+
+# Module-level cache so BO trials sharing the same (size, seq, lb, hz) don't
+# pay the probe cost repeatedly.
+_PROBE_CACHE: dict = {}
+_OBS_DIM_CACHE: dict = {}
+
+
+def _resolve_obs_action_dim(lookback: int, sample_rate: int,
+                             seq_len: int, horizon: int, k_max: int,
+                             episode_length: int) -> tuple[int, int]:
+    """Build a throw-away APCEnv to discover ``(obs_dim, action_dim)``
+    for the current SIMULATION_DIR / CONTROL_SETUP_JSON / env overrides.
+    Cached per plant config so repeated BO trials don't rebuild the env.
+    """
+    key = (lookback, sample_rate, seq_len, horizon, k_max, episode_length,
+           os.environ.get('SIMULATION_DIR', ''),
+           os.environ.get('CONTROL_SETUP_JSON', ''))
+    if key in _OBS_DIM_CACHE:
+        return _OBS_DIM_CACHE[key]
+    import numpy as _np
+    from training.train import TrainConfig, APCEnv
+    probe_cfg = TrainConfig(
+        lookback=int(lookback), sample_rate=int(sample_rate),
+        episode_length=int(episode_length), total_steps=1000,
+        horizon=int(horizon), seq_len=int(seq_len), k_max=int(k_max),
+        batch_size=4, out_dir='/tmp/_obs_dim_probe',
+    )
+    env = APCEnv(probe_cfg, _np.random.default_rng(0))
+    od, ad = int(env.obs_dim), int(env.action_dim)
+    del env
+    _OBS_DIM_CACHE[key] = (od, ad)
+    return od, ad
+
+
+def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
+                               horizon: int, k_max: int, sample_rate: int,
+                               episode_length: int,
+                               paper_default: int = 16, max_bs: int = 256,
+                               target_util: float = 0.65,
+                               bs_probe: int = 4,
+                               wm_overhead_factor: float = 1.0) -> dict:
+    """High-level entry: discover ``(obs_dim, action_dim)`` from the
+    current simulation env and pick a batch size empirically.  Result is
+    cached on ``(model_size, seq_len, lookback, horizon)`` so repeated BO
+    trials with identical shape skip the probe.  Returns the same
+    ``bs_info`` dict as :func:`pick_batch_size_empirical`.
+    """
+    cache_key = (model_size, int(seq_len), int(lookback), int(horizon),
+                 int(k_max), os.environ.get('SIMULATION_DIR', ''),
+                 os.environ.get('DREAMER_MAX_BS', ''),
+                 os.environ.get('DREAMER_TARGET_UTIL', ''))
+    if cache_key in _PROBE_CACHE:
+        info = dict(_PROBE_CACHE[cache_key])
+        info['source'] = info.get('source', 'empirical:gpu_calibrate') + ':cached'
+        return info
+    od, ad = _resolve_obs_action_dim(lookback=lookback, sample_rate=sample_rate,
+                                      seq_len=seq_len, horizon=horizon,
+                                      k_max=k_max, episode_length=episode_length)
+    info = pick_batch_size_empirical(
+        model_size=model_size, seq_len=seq_len, lookback=lookback,
+        horizon=horizon, k_max=k_max, sample_rate=sample_rate,
+        obs_dim=od, action_dim=ad,
+        paper_default=paper_default, max_bs=max_bs,
+        target_util=target_util, bs_probe=bs_probe,
+        wm_overhead_factor=wm_overhead_factor)
+    info['obs_dim'] = od
+    info['action_dim'] = ad
+    _PROBE_CACHE[cache_key] = info
     return info
 
 
@@ -284,7 +352,7 @@ def calibrate(sim_dir: Path, bs_probe: int = 4,
 
     # ── Plant-tied derivations (model_size, seq_len, k_max) ──
     from utils.sim_factory import create_sim, resolve_sim_metadata
-    from utils.plant_init import derive_all, derive_batch_size
+    from utils.plant_init import derive_all
     tmp_sim = create_sim(episode_length=10, sample_rate=max(1, sr_setup))
     sim_meta = resolve_sim_metadata(tmp_sim)
     # derive_all expects a dict with per-channel tau lists; rebuild from
@@ -339,23 +407,13 @@ def calibrate(sim_dir: Path, bs_probe: int = 4,
         horizon = int(force_horizon)
     action_dim = len(sim_meta.get('mv_indices', [])) or 1
     # obs_dim is plant-derived and depends on the SetpointManager + aug
-    # features.  Easiest correct way: build a real APCEnv briefly.
-    from training.train import TrainConfig, build_model, world_model_loss
-    from training.train import APCEnv
-    import numpy as np
-    tmp_cfg_for_env = TrainConfig(
-        lookback=lookback, sample_rate=sr_setup,
-        episode_length=1000, total_steps=1000,
-        horizon=horizon, seq_len=seq_len, k_max=k_max,
-        batch_size=bs_probe, out_dir='/tmp/gpu_calib_out',
-    )
-    _tmp_rng = np.random.default_rng(0)
-    _tmp_env = APCEnv(tmp_cfg_for_env, _tmp_rng)
-    obs_dim = int(_tmp_env.obs_dim)
-    action_dim = int(_tmp_env.action_dim)
-    del _tmp_env
+    # features.  Use the cached resolver from above.
+    obs_dim, action_dim = _resolve_obs_action_dim(
+        lookback=lookback, sample_rate=sr_setup, seq_len=seq_len,
+        horizon=horizon, k_max=k_max, episode_length=1000)
 
-    # ── Build TrainConfig + model ──
+    # ── Build TrainConfig + measure ──
+    from training.train import TrainConfig
     from workflow.bo_runner import MODEL_SIZE_PRESETS
     arch = MODEL_SIZE_PRESETS[model_size]
     cfg = TrainConfig(
@@ -373,57 +431,21 @@ def calibrate(sim_dir: Path, bs_probe: int = 4,
     if not torch.cuda.is_available():
         return {'error': 'no CUDA available', 'sim': sim_dir.name}
 
-    device = torch.device('cuda')
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    model = build_model(cfg).to(device)
-    model.train()
+    meas = measure_per_sample_mb(cfg, bs_probe=bs_probe)
+    if 'error' in meas:
+        return {'error': meas['error'], 'sim': sim_dir.name}
+    peak_mb = float(meas['peak_mb'])
+    per_sample_mb = float(meas['per_sample_mb'])
 
-    # ── Synthetic batch matching world_model_loss expectations ──
-    B, T, L, D = bs_probe, seq_len, lookback, obs_dim
-    A = action_dim
-    obs = torch.randn(B, T, L, D, device=device)
-    act = torch.randn(B, T, A, device=device).clamp_(-1, 1)
-    # reward MTP target shape: (B, T, mtp_length)
-    fut_rew = torch.randn(B, T, max(1, int(cfg.mtp_length)), device=device)
-    batch = {'obs': obs, 'act': act, 'fut_rew': fut_rew}
-    # Some loss helpers expect 'rew' as well; include both forms.
-    batch['rew'] = torch.randn(B, T, device=device)
-
-    # Warmup pass (allocate workspaces) and reset peak.
-    losses, _, _ = world_model_loss(model, batch, cfg)
-    total = sum(v for k, v in losses.items()
-                if isinstance(v, torch.Tensor) and v.requires_grad)
-    total.backward()
-    model.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-
-    # Measured pass.
-    losses, _, _ = world_model_loss(model, batch, cfg)
-    total = sum(v for k, v in losses.items()
-                if isinstance(v, torch.Tensor) and v.requires_grad)
-    total.backward()
-    torch.cuda.synchronize()
-    peak_b = torch.cuda.max_memory_allocated()
-    peak_mb = peak_b / (1024 ** 2)
-    per_sample_mb = peak_mb / bs_probe
-
-    # ── What derive_batch_size currently picks for this sim ──
-    bs_info = derive_batch_size(model_size, horizon=horizon,
-                                 seq_len=seq_len, lookback=lookback)
-    free_b, total_b = torch.cuda.mem_get_info(0)
-    gpu_total_gb = total_b / (1024 ** 3)
-
-    # Recommended bs under empirical per_sample (snapped to power of 2, [16, 256]).
-    target_util = 0.75
-    budget_mb = target_util * total_b / (1024 ** 2)
-    raw_bs = max(8, int(budget_mb // per_sample_mb))
-    emp_pow = 1 << max(3, int(math.floor(math.log2(max(raw_bs, 8)))))
-    emp_bs = int(min(256, max(8, emp_pow)))
-
-    del model, obs, act, fut_rew, batch, losses, total
-    torch.cuda.empty_cache()
+    # Recommended bs under empirical per_sample using
+    # pick_batch_size_empirical's snap rule (target_util=0.65, [16, 256]).
+    rec = pick_batch_size_empirical(
+        model_size=model_size, seq_len=seq_len, lookback=lookback,
+        horizon=horizon, k_max=k_max, sample_rate=sr_setup,
+        obs_dim=obs_dim, action_dim=action_dim, bs_probe=bs_probe)
+    emp_bs = int(rec['batch_size'])
+    target_util = float(rec['target_util'])
+    gpu_total_gb = float(rec.get('gpu_total_gb', 0.0))
 
     return {
         'sim': sim_dir.name,
@@ -433,11 +455,7 @@ def calibrate(sim_dir: Path, bs_probe: int = 4,
         'bs_probe': bs_probe,
         'peak_mb_at_bs_probe': peak_mb,
         'per_sample_mb_measured': per_sample_mb,
-        'per_sample_mb_formula': bs_info.get('per_batch_mb'),
-        'formula_undercalibration': (per_sample_mb /
-                                      max(1.0, bs_info.get('per_batch_mb', 1.0))),
-        'current_bs_formula': bs_info.get('batch_size'),
-        'recommended_bs_empirical': emp_bs,
+        'recommended_bs': emp_bs,
         'gpu_total_gb': gpu_total_gb,
         'target_util_used': target_util,
         'predicted_peak_gib_at_rec_bs': emp_bs * per_sample_mb / 1024,
