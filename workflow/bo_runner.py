@@ -323,11 +323,16 @@ def make_trial_config(base: TrainConfig, *, lookback: int,
 def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
               study_dir: Path, trial_steps: int) -> float:
     from tools.gpu_calibrate import pick_batch_size_for_plant
-    # ``lookback`` is no longer a BO axis: with the per-frame encoder
-    # (paper-faithful Dreamer-V4) the GRU provides temporal memory and
-    # the lookback window only controls the env's initial-state warmup.
-    # We pin it to the plant-identified value so all trials share the
-    # same buffer shape.
+    # ``lookback`` is intentionally NOT a BO axis.  The current
+    # paper-faithful Dreamer-V4 build encodes only the current frame
+    # ``obs[:, :, -1, :]`` in ``world_model_loss`` / ``imagination_step``
+    # (see training/train.py:1368, 1597); the block-causal transformer
+    # provides temporal memory across the ``seq_len`` axis ``T``, not
+    # across the lookback axis ``L``.  Training is therefore blind to
+    # lookback — it only affects inference-time encoder latency and
+    # replay-buffer RAM.  The plant-identified value (from
+    # ``identify_lookback`` using the dominant time constant) is the
+    # correct anchor; BO has no differential signal to optimize on.
     lookback = int(plant['lookback'])
     model_size = trial.suggest_categorical('model_size', list(MODEL_SIZE_PRESETS))
     # Horizon pinned to V3/V4 paper default (parity with single_run.py).
