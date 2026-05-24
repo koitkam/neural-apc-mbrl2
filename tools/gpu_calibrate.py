@@ -58,7 +58,11 @@ def measure_per_sample_mb(cfg, bs_probe: int = 4) -> dict:
     if obs_dim <= 0 or action_dim <= 0:
         return {'error': f'cfg.obs_dim/action_dim not set ({obs_dim},{action_dim})'}
     seq_len = int(cfg.seq_len)
-    lookback = int(cfg.lookback)
+    # Phase 2 (2026-05-24): replay buffer no longer carries the L axis;
+    # ``world_model_loss`` consumes obs of shape (B, T, D).  The probe
+    # tensor must match or unpacking fails with
+    # ``ValueError: too many values to unpack (expected 3)`` and the
+    # caller falls back to the paper-default batch size.
     mtp_length = max(1, int(getattr(cfg, 'mtp_length', 8)))
     try:
         torch.cuda.empty_cache()
@@ -66,7 +70,7 @@ def measure_per_sample_mb(cfg, bs_probe: int = 4) -> dict:
         model = build_model(cfg).to(device)
         model.train()
         B = int(bs_probe)
-        obs = torch.randn(B, seq_len, lookback, obs_dim, device=device)
+        obs = torch.randn(B, seq_len, obs_dim, device=device)
         act = torch.randn(B, seq_len, action_dim, device=device).clamp_(-1, 1)
         fut_rew = torch.randn(B, seq_len, mtp_length, device=device)
         batch = {'obs': obs, 'act': act, 'fut_rew': fut_rew,

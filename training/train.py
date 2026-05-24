@@ -4339,6 +4339,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 run_wm_steady_state_diagnostic)
             n_starts = int(os.environ.get('DREAMER_WM_DIAG_N_STARTS', '8'))
             horizon = int(os.environ.get('DREAMER_WM_DIAG_HORIZON', '200'))
+            # Force CUDA for inline diagnostics: the auto-picker reads
+            # nvidia-smi util, which sees *our own* training process as
+            # "GPU busy" and falls back to CPU — making the WM rollout
+            # very slow.  A manual override still wins (set
+            # DREAMER_WM_DIAG_DEVICE=cpu/cuda explicitly).
+            if (torch.cuda.is_available() and
+                    not os.environ.get('DREAMER_WM_DIAG_DEVICE')):
+                os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
             run_wm_steady_state_diagnostic(
                 out_dir, ckpt_name='final.pt',
                 n_starts=n_starts, horizon=horizon)
