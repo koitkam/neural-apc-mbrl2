@@ -164,7 +164,7 @@ def derive_k_max(model_size: str, complexity_score: float,
 
 def derive_batch_size(model_size: str,
                       paper_default: int = 16,
-                      target_util: float = 0.80,
+                      target_util: float = 0.65,
                       min_bs: int = 16, max_bs: int = 256,
                       horizon: int = 42,
                       horizon_ref: int = 42,
@@ -176,13 +176,21 @@ def derive_batch_size(model_size: str,
 
     Reference per-sample peak memory at:
       model_size=M, seq_len=64, lookback=64, horizon=42, bf16, manual attn
-        S ≈ 260 MB,  M ≈ 380 MB,  L ≈ 740 MB
+        S ≈ 370 MB,  M ≈ 540 MB,  L ≈ 1050 MB
 
-    These baselines were re-anchored 2026-05-22 against a measured
-    test_sim run (size=M, seq_len=128, lookback=120, horizon=15,
-    fast_attn=on): bs=16 used 12.2 GiB → 782 MB/sample. The old
-    baseline (M=330 with no seq_len/lookback scaling) under-predicted by
-    ~4×, causing the sizer to pick bs=64 on an A10 (→ OOM).
+    Cross-sim recalibration 2026-05-24 (tools/gpu_calibrate.py): measured
+    actual wm fwd+bwd peaks on three plants at their derived L configs
+    (bs=16, seq=64–128, lb=82–165, hz=15, SDPA bf16):
+      * test_sim       L: 989 MB/sample (predicted 545 → 1.81× under)
+      * distillation   L: 1032 MB/sample (predicted 749 → 1.38× under)
+      * softsensor_lab L: 488 MB/sample (predicted 186 → 2.62× under)
+    Backed-out base_L per sim varies 1019–1939 MB because the linear
+    seq×lookback×horizon scaling under-models attention KV / Z-token
+    overhead for shorter contexts. We pick base_L=1050 (≈ test_sim
+    measurement + small margin) and pair it with a conservative
+    ``target_util=0.65`` headroom so all three sims land at bs≤32 with
+    predicted peaks ≤16 GiB on a 22 GiB A10. Prior baselines (S=260,
+    M=380, L=740) under-predicted by 1.4-2.6× across sims.
 
     Per-sample memory is scaled by:
       * ``seq_len / seq_len_ref``    (linear — WM token sequence length)
@@ -196,7 +204,7 @@ def derive_batch_size(model_size: str,
 
     Env-var overrides (in precedence order):
       * ``DREAMER_MAX_BS``       — hard cap on the picked batch
-      * ``DREAMER_TARGET_UTIL``  — GPU-headroom fraction (default 0.80)
+      * ``DREAMER_TARGET_UTIL``  — GPU-headroom fraction (default 0.65)
       * ``DREAMER_PER_BATCH_MB`` — explicit per-sample baseline (advanced)
     """
     import os
@@ -212,7 +220,7 @@ def derive_batch_size(model_size: str,
             max_bs = max(min_bs, int(env_max_bs))
         except ValueError:
             pass
-    base_per_batch_mb = {'S': 260, 'M': 380, 'L': 740}.get(model_size, 380)
+    base_per_batch_mb = {'S': 370, 'M': 540, 'L': 1050}.get(model_size, 540)
     # When the fast attention + compile paths are on, peak memory is roughly
     # 30% of the manual+eager baseline (measured: M-size W-M fwd+bwd drops
     # from ~290 MB/sample to ~70 MB/sample with bf16+SDPA+compile). Scale
