@@ -33,6 +33,160 @@ from pathlib import Path
 import torch
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Public helpers (also used by workflow.single_run for on-the-fly empirical
+# batch-size selection — see DREAMER_GPU_CALIBRATE).
+# ───────────────────────────────────────────────────────────────────────────
+
+def measure_per_sample_mb(cfg, bs_probe: int = 4) -> dict:
+    """Run one fwd+bwd of ``world_model_loss`` on synthetic data and
+    return the measured per-sample GPU peak in MB.
+
+    ``cfg`` must be a populated ``training.train.TrainConfig`` with
+    ``obs_dim``, ``action_dim``, ``seq_len``, ``lookback``, ``horizon``,
+    and architecture fields set.  ``cfg.batch_size`` is ignored — we use
+    ``bs_probe`` for the synthetic batch.
+
+    Cost: ~5-15 s on an A10 (model build + warmup + measured pass).
+    Returns ``{'peak_mb': float, 'per_sample_mb': float, 'bs_probe': int}``
+    or ``{'error': str}`` on CPU / OOM.
+    """
+    if not torch.cuda.is_available():
+        return {'error': 'no_cuda'}
+    from training.train import build_model, world_model_loss
+    device = torch.device('cuda')
+    obs_dim = int(getattr(cfg, 'obs_dim', 0) or 0)
+    action_dim = int(getattr(cfg, 'action_dim', 0) or 0)
+    if obs_dim <= 0 or action_dim <= 0:
+        return {'error': f'cfg.obs_dim/action_dim not set ({obs_dim},{action_dim})'}
+    seq_len = int(cfg.seq_len)
+    lookback = int(cfg.lookback)
+    mtp_length = max(1, int(getattr(cfg, 'mtp_length', 8)))
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        model = build_model(cfg).to(device)
+        model.train()
+        B = int(bs_probe)
+        obs = torch.randn(B, seq_len, lookback, obs_dim, device=device)
+        act = torch.randn(B, seq_len, action_dim, device=device).clamp_(-1, 1)
+        fut_rew = torch.randn(B, seq_len, mtp_length, device=device)
+        batch = {'obs': obs, 'act': act, 'fut_rew': fut_rew,
+                 'rew': torch.randn(B, seq_len, device=device)}
+        # Warmup pass.
+        losses, _, _ = world_model_loss(model, batch, cfg)
+        total = sum(v for v in losses.values()
+                    if isinstance(v, torch.Tensor) and v.requires_grad)
+        total.backward()
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        # Measured pass.
+        losses, _, _ = world_model_loss(model, batch, cfg)
+        total = sum(v for v in losses.values()
+                    if isinstance(v, torch.Tensor) and v.requires_grad)
+        total.backward()
+        torch.cuda.synchronize()
+        peak_b = torch.cuda.max_memory_allocated()
+        peak_mb = peak_b / (1024 ** 2)
+        per_sample_mb = peak_mb / max(1, B)
+        # Cleanup.
+        del model, obs, act, fut_rew, batch, losses, total
+        torch.cuda.empty_cache()
+        return {'peak_mb': float(peak_mb),
+                'per_sample_mb': float(per_sample_mb),
+                'bs_probe': B}
+    except torch.cuda.OutOfMemoryError as e:
+        torch.cuda.empty_cache()
+        return {'error': f'oom@bs_probe={bs_probe}: {e}'}
+    except Exception as e:
+        torch.cuda.empty_cache()
+        return {'error': f'{type(e).__name__}: {e}'}
+
+
+def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
+                               horizon: int, k_max: int, sample_rate: int,
+                               obs_dim: int, action_dim: int,
+                               paper_default: int = 16, max_bs: int = 256,
+                               target_util: float = 0.65,
+                               bs_probe: int = 4,
+                               wm_overhead_factor: float = 1.0) -> dict:
+    """Empirically size the batch by measuring actual WM fwd+bwd peak
+    memory at ``bs_probe`` and projecting linearly.
+
+    ``wm_overhead_factor`` (>=1.0) accounts for the extra memory of
+    actor+critic+optimizer state on top of the measured WM peak.  Default
+    1.0 = WM-only; pass e.g. 1.15 to reserve 15% for actor/critic/opt.
+
+    Returns a dict with the same shape as ``derive_batch_size`` for
+    seamless drop-in, plus ``per_sample_mb_measured`` and
+    ``source='empirical:gpu_calibrate'``.
+    """
+    from training.train import TrainConfig
+    from workflow.bo_runner import MODEL_SIZE_PRESETS
+    arch = MODEL_SIZE_PRESETS[model_size]
+    cfg = TrainConfig(
+        d_model=arch['d_model'], n_layers=arch['n_layers'],
+        n_heads=arch['n_heads'], z_dim=arch['z_dim'],
+        n_register=arch['n_register'], tok_hidden=arch['tok_hidden'],
+        head_hidden=arch['head_hidden'],
+        lookback=int(lookback), sample_rate=int(sample_rate),
+        episode_length=1000, total_steps=1000,
+        horizon=int(horizon), seq_len=int(seq_len), k_max=int(k_max),
+        batch_size=int(bs_probe), out_dir='/tmp/gpu_calib_inplace',
+        obs_dim=int(obs_dim), action_dim=int(action_dim),
+    )
+    info = {'model_size': model_size, 'seq_len': seq_len, 'lookback': lookback,
+            'horizon': horizon, 'paper_default': paper_default,
+            'target_util': target_util, 'min_bs': paper_default, 'max_bs': max_bs,
+            'wm_overhead_factor': wm_overhead_factor, 'bs_probe': bs_probe}
+    # Env-var overrides (parity with derive_batch_size).
+    env_util = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
+    if env_util:
+        try:
+            target_util = max(0.1, min(0.95, float(env_util)))
+            info['target_util'] = target_util
+        except ValueError:
+            pass
+    env_max_bs = os.environ.get('DREAMER_MAX_BS', '').strip()
+    if env_max_bs:
+        try:
+            max_bs = max(paper_default, int(env_max_bs))
+            info['max_bs'] = max_bs
+        except ValueError:
+            pass
+    if not torch.cuda.is_available():
+        info.update({'batch_size': paper_default, 'source': 'cpu_fallback',
+                     'gpu_total_gb': 0.0})
+        return info
+    meas = measure_per_sample_mb(cfg, bs_probe=bs_probe)
+    if 'error' in meas:
+        # Fall back to formula on probe failure.
+        from utils.plant_init import derive_batch_size as _dbs
+        fb = _dbs(model_size, horizon=horizon, seq_len=seq_len, lookback=lookback,
+                  paper_default=paper_default, max_bs=max_bs, target_util=target_util)
+        fb['source'] = f'empirical_fallback:{meas["error"]}->{fb.get("source","auto")}'
+        return fb
+    per_sample_mb = float(meas['per_sample_mb']) * float(wm_overhead_factor)
+    free_b, total_b = torch.cuda.mem_get_info(0)
+    gpu_total_gb = total_b / (1024 ** 3)
+    budget_mb = target_util * total_b / (1024 ** 2)
+    raw_bs = max(paper_default, int(budget_mb // max(1.0, per_sample_mb)))
+    bs_pow = 1 << max(int(math.log2(paper_default)),
+                      int(math.floor(math.log2(max(raw_bs, paper_default)))))
+    bs = int(min(max_bs, max(paper_default, bs_pow)))
+    info.update({
+        'batch_size': bs, 'source': 'empirical:gpu_calibrate',
+        'per_batch_mb': per_sample_mb,
+        'per_sample_mb_measured': float(meas['per_sample_mb']),
+        'peak_mb_at_probe': float(meas['peak_mb']),
+        'gpu_total_gb': gpu_total_gb, 'budget_mb': budget_mb,
+        'raw_bs': raw_bs,
+        'predicted_peak_gib': bs * per_sample_mb / 1024,
+    })
+    return info
+
+
 def _resolve_sim_dir(arg: str) -> Path:
     repo = Path(__file__).resolve().parent.parent
     p = Path(arg)

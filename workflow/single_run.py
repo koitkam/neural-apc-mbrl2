@@ -249,6 +249,15 @@ def main() -> int:
     # of 22 GiB GPU at bs=16; the auto-sizer can now claim the
     # headroom.  Cap remains controllable via DREAMER_MAX_BS for
     # conservative runs (P44 sets =16 to keep a stable baseline).
+    #
+    # 2026-05-24 (P45): added on-the-fly empirical GPU calibration via
+    # tools.gpu_calibrate.pick_batch_size_empirical, gated by
+    # ``DREAMER_GPU_CALIBRATE`` (default ON when CUDA is available).
+    # Runs ~10 s probe (model build + warmup + measured fwd+bwd) on
+    # synthetic data, then snaps bs to power-of-two under the empirical
+    # per-sample MB.  Removes the dependency on the formulaic
+    # seq×lb×hz scaling which under-predicts by 1.3–2.7× depending on
+    # plant shape (cross-sim measurements 2026-05-24).
     if bs_env:
         try:
             batch_size = max(1, int(bs_env))
@@ -258,9 +267,52 @@ def main() -> int:
                                          seq_len=seq_len, lookback=lookback)
             batch_size = int(bs_info['batch_size'])
     else:
-        bs_info = derive_batch_size(model_size, horizon=horizon,
-                                     seq_len=seq_len, lookback=lookback)
-        batch_size = int(bs_info['batch_size'])
+        _calib_env = os.environ.get('DREAMER_GPU_CALIBRATE', '').strip().lower()
+        try:
+            import torch as _torch
+            _have_cuda = bool(_torch.cuda.is_available())
+        except Exception:
+            _have_cuda = False
+        _do_calib = _have_cuda and _calib_env not in ('0', 'false', 'off', 'no')
+        if _do_calib:
+            # Build a temporary APCEnv to discover obs_dim/action_dim, then
+            # run the empirical probe.
+            try:
+                import numpy as _np
+                from training.train import APCEnv as _APCEnv
+                _probe_cfg = TrainConfig(
+                    lookback=lookback, sample_rate=sample_rate,
+                    episode_length=int(episode_length),
+                    total_steps=1000, horizon=horizon, seq_len=seq_len,
+                    k_max=k_max, batch_size=4,
+                    out_dir=str(out_dir / '_probe'),
+                )
+                _probe_env = _APCEnv(_probe_cfg, _np.random.default_rng(0))
+                _obs_dim = int(_probe_env.obs_dim)
+                _action_dim = int(_probe_env.action_dim)
+                del _probe_env
+                from tools.gpu_calibrate import pick_batch_size_empirical
+                bs_info = pick_batch_size_empirical(
+                    model_size=model_size, seq_len=seq_len, lookback=lookback,
+                    horizon=horizon, k_max=k_max, sample_rate=sample_rate,
+                    obs_dim=_obs_dim, action_dim=_action_dim)
+                batch_size = int(bs_info['batch_size'])
+                print(f"[gpu-calib] empirical probe: "
+                      f"per_sample={bs_info.get('per_sample_mb_measured','?'):.1f} MB, "
+                      f"bs={batch_size}, "
+                      f"predicted_peak={bs_info.get('predicted_peak_gib',0):.1f} GiB",
+                      flush=True)
+            except Exception as _e:
+                print(f"[gpu-calib] probe failed ({_e!r}); "
+                      f"falling back to derive_batch_size formula", flush=True)
+                bs_info = derive_batch_size(model_size, horizon=horizon,
+                                             seq_len=seq_len, lookback=lookback)
+                batch_size = int(bs_info['batch_size'])
+                bs_info['source'] = f'formula_fallback:{type(_e).__name__}'
+        else:
+            bs_info = derive_batch_size(model_size, horizon=horizon,
+                                         seq_len=seq_len, lookback=lookback)
+            batch_size = int(bs_info['batch_size'])
     print(f"[run] batch_size={batch_size} ({bs_info['source']}; "
           f"per_batch≈{bs_info.get('per_batch_mb','?')}MB, "
           f"gpu={bs_info.get('gpu_total_gb',0):.1f}GB)", flush=True)
