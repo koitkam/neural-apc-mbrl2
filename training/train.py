@@ -3941,8 +3941,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # Robust to single-horizon noise.
                         _per = _pbe.get('per_offset') or []
                         _r_vals = [float(r) for (_, r) in _per]
+                        # Score: sum-of-positive-r PLUS a depth bonus
+                        # weighted heavily enough to actually win ties.
+                        # 2026-05-24 (P44 RCA): bonus weight 0.05 → 0.5.
+                        # P44 iter 30 had best_h=7/15 (one horizon
+                        # crossed floor, real improvement) but lost the
+                        # "best" race against iter 10's best_h=0/15 by
+                        # 0.08 of sum-of-r noise because the old bonus
+                        # (0.05*7/15=0.023) was 3 orders of magnitude
+                        # too small. With bonus=0.5*best_h/H, a single
+                        # horizon crossing the floor adds 0.033 — enough
+                        # to overcome typical r-sum noise (<0.10) while
+                        # not dominating a genuinely better probe.
                         _score = (sum(max(0.0, r) for r in _r_vals)
-                                   + 0.05 * float(_pbe.get('best_h', 0))
+                                   + 0.5 * float(_pbe.get('best_h', 0))
                                             / max(1, int(_pbe.get('H', 1))))
                         if _score > wm_best_score:
                             wm_best_score = _score
@@ -3967,11 +3979,25 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                   f"-> saved {wm_best_ckpt_path.name}",
                                   flush=True)
                         elif (es_enable
-                              and current_phase in (1, 2)
+                              and current_phase == 2
                               and wm_best_iter > 0
                               and total_iters >= wm_fidelity_warmup_iters
                               and (total_iters - wm_best_iter)
                                     >= wm_fidelity_patience_iters):
+                            # 2026-05-24 (P44 RCA): scope tightened from
+                            # ``current_phase in (1, 2)`` to ``== 2``.
+                            # This early-stop is designed to catch the
+                            # P2 reward-head encoder-backflow cliff
+                            # (P43 RCA). Applying it in P1 misfires
+                            # because P1 WM is still mid-fit and the
+                            # probe score is naturally noisy in the
+                            # first ~40 iters — P44 was killed at iter
+                            # 40 with best frozen at iter 10 even
+                            # though sf_loss was still falling and a
+                            # later probe showed best_h going 0→7/15.
+                            # P1 underfit is its own concern, addressed
+                            # by P1 budget + (future) p1-extension
+                            # logic, not by this ES path.
                             early_stop_reason = (
                                 f'wm_fidelity_degradation: no improvement '
                                 f'over best={wm_best_score:.3f} '
