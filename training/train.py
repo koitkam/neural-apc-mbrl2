@@ -885,13 +885,24 @@ class APCEnv:
 
 class TrajectoryBuffer:
     def __init__(self, capacity_eps: int, episode_length: int,
-                 lookback: int, obs_dim: int, action_dim: int):
+                 obs_dim: int, action_dim: int,
+                 lookback: int = 0):
+        # ``lookback`` is accepted for backward-compat with callers that
+        # still pass it but is no longer used — the replay buffer stores
+        # per-step observations ``(N, T, D)`` rather than per-step
+        # windows ``(N, T, L, D)``.  The dropped L dimension was dead
+        # weight: the world-model loss already read only ``obs[..., -1,
+        # :]`` (the current frame) and the inference rollout maintains
+        # its own sliding window from live env returns.  Paper alignment:
+        # DreamerV3/V4 Algorithm 1 stores trajectories as sequences of
+        # single-frame transitions, not stacked windows.  See discussion
+        # 2026-05-24 (Phase 2 “unify lookback := seq_len”).
+        del lookback
         self.capacity_eps = int(capacity_eps)
         self.T = int(episode_length)
-        self.L = int(lookback)
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
-        self.obs = np.zeros((capacity_eps, self.T, self.L, self.obs_dim),
+        self.obs = np.zeros((capacity_eps, self.T, self.obs_dim),
                             dtype='float32')
         self.act = np.zeros((capacity_eps, self.T, self.action_dim),
                             dtype='float32')
@@ -904,6 +915,8 @@ class TrajectoryBuffer:
                     cont: np.ndarray) -> None:
         T = obs.shape[0]
         assert T == self.T, f"episode length mismatch: {T} vs {self.T}"
+        assert obs.ndim == 2 and obs.shape[1] == self.obs_dim, (
+            f"expected obs shape (T, D)=(T, {self.obs_dim}); got {obs.shape}")
         i = self.write
         self.obs[i] = obs
         self.act[i] = act
@@ -922,7 +935,7 @@ class TrajectoryBuffer:
             starts = np.zeros(batch_size, dtype=np.int64)
         else:
             starts = rng.integers(0, max_start + 1, size=batch_size)
-        out_obs = np.zeros((batch_size, seq_len, self.L, self.obs_dim),
+        out_obs = np.zeros((batch_size, seq_len, self.obs_dim),
                            dtype='float32')
         out_act = np.zeros((batch_size, seq_len, self.action_dim),
                            dtype='float32')
@@ -957,7 +970,10 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     """
     obs_window = env.reset(exploration=random_action)
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
-    obs_buf = np.zeros((T, L, D), dtype='float32')
+    # Phase 2 (2026-05-24): replay storage is per-step ``(T, D)`` only;
+    # the L-length sliding window persists in ``obs_window`` for the
+    # encoder/dynamics call but is no longer copied into the episode.
+    obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
@@ -971,7 +987,7 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
 
     for t in range(T):
-        obs_buf[t] = obs_window
+        obs_buf[t] = obs_window[-1]
         if random_action:
             a_np = env.rng.uniform(-1.0, 1.0,
                                     size=(env.action_dim,)).astype('float32')
@@ -1028,12 +1044,12 @@ def collect_baseline_episode(env: APCEnv, cfg: TrainConfig, *,
     """
     obs_window = env.reset(exploration=True)
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
-    obs_buf = np.zeros((T, L, D), dtype='float32')
+    obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
     for t in range(T):
-        obs_buf[t] = obs_window
+        obs_buf[t] = obs_window[-1]
         a_np = env.rng.normal(float(center), float(action_std),
                                 size=(env.action_dim,)).astype('float32')
         np.clip(a_np, -1.0, 1.0, out=a_np)
@@ -1075,7 +1091,7 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     """
     obs_window = env.reset(exploration=True)
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
-    obs_buf = np.zeros((T, L, D), dtype='float32')
+    obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
@@ -1183,7 +1199,7 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
             break
         seg_index_for_t[s:e] = k
     for t in range(T):
-        obs_buf[t] = obs_window
+        obs_buf[t] = obs_window[-1]
         seg_idx = int(seg_index_for_t[t])
         center = targets[seg_idx]
         noise = env.rng.normal(0.0, float(action_std),
@@ -1238,7 +1254,7 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     env._schedule = []
     env._hidden_disturbance = None
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
-    obs_buf = np.zeros((T, L, D), dtype='float32')
+    obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
@@ -1246,7 +1262,7 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
                        float(np.clip(action_level, -1.0, 1.0)),
                        dtype='float32')
     for t in range(T):
-        obs_buf[t] = obs_window
+        obs_buf[t] = obs_window[-1]
         next_window, reward, done, _ = env.step(a_const)
         act_buf[t] = a_const
         rew_buf[t] = reward
@@ -1295,7 +1311,7 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     # rationale).  Sim-agnostic.
     env._hidden_disturbance = None
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
-    obs_buf = np.zeros((T, L, D), dtype='float32')
+    obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
@@ -1308,7 +1324,7 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     sw = int(np.clip(switch_step, 1, T - 1))
     for t in range(T):
         a_t = a_start if t < sw else a_end
-        obs_buf[t] = obs_window
+        obs_buf[t] = obs_window[-1]
         next_window, reward, done, _ = env.step(a_t)
         act_buf[t] = a_t
         rew_buf[t] = reward
@@ -1384,9 +1400,12 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     ``agent_hid``: (B, T, d_model) — agent register hidden state from a
                     *clean* dynamics pass (used by Phase 2 BC heads).
     """
-    obs = batch['obs']                     # (B, T, L, D)
+    obs = batch['obs']                     # (B, T, D)
     act = batch['act']                     # (B, T, A)
-    obs_cur = obs[:, :, -1, :]             # (B, T, D)
+    # Phase 2 (2026-05-24): replay buffer now stores per-step obs;
+    # the legacy ``obs[:, :, -1, :]`` slice is no longer needed because
+    # the L (lookback) axis has been removed from the storage path.
+    obs_cur = obs                          # (B, T, D)
 
     # Tokenizer with MAE: recon the masked obs.
     z_mae, recon = model.tokenizer.forward_with_mae(obs_cur)
@@ -1553,7 +1572,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     ``r_t``, ``v_t``, ``v_target_t`` from *that* agent_hid — which
     therefore depends on the chosen action.
     """
-    obs = batch['obs']                       # (B, T, L, D)
+    obs = batch['obs']                       # (B, T, D)
     act = batch['act']                       # (B, T, A)
     B, T = obs.shape[:2]
     H = int(cfg.horizon)
@@ -1561,7 +1580,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # Encode the buffered context (frozen tokenizer).
     with torch.no_grad():
-        obs_cur = obs[:, :, -1, :]
+        obs_cur = obs
         z_ctx = model.tokenizer.encode(obs_cur)              # (B, T, z)
     a_ctx = act
 
@@ -2691,11 +2710,16 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
     ax = axes[1, 2]
     cv = [r.get('iter_cv_violation_mean') for r in rows]
     mv = [r.get('iter_mv_violation_mean') for r in rows]
-    if any(v is not None for v in cv):
+    _has_cv = any(v is not None for v in cv)
+    _has_mv = any(v is not None for v in mv)
+    if _has_cv:
         ax.plot(steps, cv, label='cv_v', lw=1.0, color='C3')
-    if any(v is not None for v in mv):
+    if _has_mv:
         ax.plot(steps, mv, label='mv_v', lw=1.0, color='C1')
-    ax.set_ylabel('mean violation'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    ax.set_ylabel('mean violation')
+    if _has_cv or _has_mv:
+        ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
     ax.set_title('Violations (per-iter mean)')
 
     for ax in axes[1, :]:
@@ -3025,7 +3049,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     capacity_eps = max(1, cfg.buffer_capacity_steps // cfg.episode_length)
     buf = TrajectoryBuffer(capacity_eps, cfg.episode_length,
-                            cfg.lookback, cfg.obs_dim, cfg.action_dim)
+                            cfg.obs_dim, cfg.action_dim)
 
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3351,7 +3375,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # 2026-05-20; the 1M-step default budget gives P1
                 # enough time at the paper-default H=15.
                 if p1_initial_sf is not None and 'sf_loss' in wm_losses:
-                    last_sf = float(wm_losses.get('sf_loss', p1_initial_sf))
+                    _sf_val = wm_losses.get('sf_loss', p1_initial_sf)
+                    last_sf = float(_sf_val.detach().item()
+                                    if torch.is_tensor(_sf_val) else _sf_val)
                     print(f"[p1→p2] sf_loss {p1_initial_sf:.4f} → "
                           f"{last_sf:.4f}", flush=True)
                 # P39: warm-restore WM to its fidelity peak before P2.

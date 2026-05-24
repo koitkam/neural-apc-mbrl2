@@ -189,18 +189,34 @@ def main() -> int:
     else:
         print('[run] noise_config: DISABLED (--no-noise)', flush=True)
 
-    # ── Phase 1c: Lookback identification (uses derived sample_rate) ──────
-    print('[run] phase 1c: lookback identification', flush=True)
+    # ── Phase 1c: Lookback identification (DIAGNOSTIC ONLY) ──────────
+    # Historically ``identify_lookback`` set the runtime history-window
+    # length independently from ``seq_len``.  As of 2026-05-24 the two
+    # are unified: ``lookback := seq_len`` so the world-model's training
+    # context length matches its deployment context length exactly.  The
+    # identifier is still run for the report (and to flag plants where
+    # the identified memory horizon exceeds ``seq_len`` — in which case
+    # ``derive_seq_len`` was too aggressive a downsizer).
+    print('[run] phase 1c: lookback identification (diagnostic)', flush=True)
     lb_info = identify_lookback(plant_dir, tau=tau, dead_time=dead,
                                  sample_rate=sample_rate, dynamics_raw=dyn,
                                  tau_fast=tau_fast, dead_time_fast=dead_fast)
-    lookback = int(lb_info['lookback'])
+    identified_lookback = int(lb_info['lookback'])
     lb_path = Path(lb_info['lookback_report'])
+    # Unified history-window length: train and deployment use the same
+    # transformer context length.
+    lookback = int(derived['seq_len'])
+    if identified_lookback > lookback:
+        print(f'[run] WARNING identified_lookback={identified_lookback} > '
+              f'seq_len={lookback}; ``derive_seq_len`` may be undersizing '
+              f'the WM context (consider raising the multiplier).',
+              flush=True)
 
     plant = {
         'tau': tau, 'dead_time': dead,
         'tau_fast': tau_fast, 'dead_time_fast': dead_fast,
         'lookback': lookback,
+        'identified_lookback': identified_lookback,
         'dynamics_report': str(dyn_path),
         'lookback_report': str(lb_path),
     }
@@ -310,11 +326,23 @@ def main() -> int:
         'out_dir': str(out_dir),
         'sample_rate': sample_rate,
         'sample_rate_source': derived['sample_rate_source'],
+        # Deployment manifest (canonical names for the runtime API):
+        # ``sample_rate_seconds`` is the seconds between successive
+        # control decisions / history-window samples;
+        # ``history_window_samples`` is the length of the history window
+        # that must be supplied to the exported model.  These are aliased
+        # to ``sample_rate`` and ``lookback`` (= ``seq_len``) which are
+        # the internal training-config names.  Phase 1 unification
+        # 2026-05-24: ``lookback == seq_len`` so train and deploy contexts
+        # match exactly.
+        'sample_rate_seconds': sample_rate,
+        'history_window_samples': lookback,
         'tau': tau,
         'dead_time': dead,
         'tau_fast': tau_fast,
         'dead_time_fast': dead_fast,
         'lookback': lookback,
+        'identified_lookback': identified_lookback,
         'horizon': horizon,
         'seq_len': seq_len,
         'k_max': k_max,

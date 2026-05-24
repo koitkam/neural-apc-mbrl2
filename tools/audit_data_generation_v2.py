@@ -220,11 +220,11 @@ const_levels = np.linspace(-op_band, op_band, N, dtype='float32')
 
 def collect_random_episode():
     ow = env.reset(exploration=True); T = cfg.episode_length
-    obs_buf = np.zeros((T, cfg.lookback, env.obs_dim), 'float32')
+    obs_buf = np.zeros((T, env.obs_dim), 'float32')
     act_buf = np.zeros((T, env.action_dim), 'float32')
     rew_buf = np.zeros(T, 'float32'); cont_buf = np.ones(T, 'float32')
     for t in range(T):
-        obs_buf[t] = ow
+        obs_buf[t] = ow[-1]
         a = env.rng.uniform(-1.0, 1.0, size=env.action_dim).astype('float32')
         ow, r, d, _ = env.step(a)
         act_buf[t] = a; rew_buf[t] = r

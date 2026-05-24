@@ -4,14 +4,22 @@ Reference: arXiv:2509.24527.
 
 The exported graph implements the V4 streaming inference path:
 
-    inputs : obs_window      (1, lookback, obs_dim)
-             prev_actions    (1, lookback, action_dim)
+    inputs : obs_window      (1, history_window_samples, obs_dim)
+             prev_actions    (1, history_window_samples, action_dim)
 
     outputs: action          (1, action_dim)   in [-1, 1]
 
+``history_window_samples`` is the training/inference context length
+(unified 2026-05-24: ``lookback == seq_len`` so the exported graph uses
+the same number of context positions the world-model was trained on).
+The deployment runtime must supply observation frames spaced by
+``sample_rate_seconds`` (the agent's control interval) — these two
+fields are written to ``run_plan.json`` for unambiguous runtime
+configuration.
+
 Per-step computation:
-  1. Encode every observation in the lookback window through the
-     causal tokenizer  →  z_ctx of shape (1, lookback, z_dim).
+  1. Encode every observation in the history window through the
+     causal tokenizer  →  z_ctx of shape (1, history_window_samples, z_dim).
   2. Run the dynamics transformer with τ = 1 − τ_ctx, d = 1/k_max
      (clean past) over the (z_ctx, prev_actions) sequence.
   3. Read the agent-register hidden state at the latest time slot.
@@ -137,4 +145,6 @@ if __name__ == '__main__':
     print(json.dumps({'onnx': out, 'inputs': {
         'obs_window':   [1, cfg.lookback, cfg.obs_dim],
         'prev_actions': [1, cfg.lookback, cfg.action_dim],
-    }, 'outputs': ['action']}, indent=2))
+    }, 'history_window_samples': int(cfg.lookback),
+        'sample_rate_seconds': int(getattr(cfg, 'sample_rate', 1)),
+        'outputs': ['action']}, indent=2))

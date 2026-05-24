@@ -5,8 +5,12 @@ One axis (the only knob we tune):
   - model_size_preset : {S, M, L} — coordinated triples
                        ``(d_model, n_layers, n_heads, z_dim, n_register)``.
 
-Lookback is pinned to the plant-identified value (the per-frame encoder
-plus GRU memory means the lookback window only controls env warmup).
+Lookback is pinned to ``seq_len`` (unified 2026-05-24): the world-model's
+training context length and the deployment encoder/dynamics context length
+are the same number, so the trained transformer attends over exactly the
+same number of positions at inference as it did during training.  The
+plant-identifier output is retained as a diagnostic to flag plants where
+``derive_seq_len`` would under-size the WM memory horizon.
 Horizon is pinned to the DreamerV3/V4 paper default ``H = 15`` (same
 value ``workflow/single_run.py`` uses) — the plant-derived horizon
 formula and the ``HORIZON_BAND`` BO axis were removed 2026-05-20 with
@@ -323,16 +327,11 @@ def make_trial_config(base: TrainConfig, *, lookback: int,
 def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
               study_dir: Path, trial_steps: int) -> float:
     from tools.gpu_calibrate import pick_batch_size_for_plant
-    # ``lookback`` is intentionally NOT a BO axis.  The current
-    # paper-faithful Dreamer-V4 build encodes only the current frame
-    # ``obs[:, :, -1, :]`` in ``world_model_loss`` / ``imagination_step``
-    # (see training/train.py:1368, 1597); the block-causal transformer
-    # provides temporal memory across the ``seq_len`` axis ``T``, not
-    # across the lookback axis ``L``.  Training is therefore blind to
-    # lookback — it only affects inference-time encoder latency and
-    # replay-buffer RAM.  The plant-identified value (from
-    # ``identify_lookback`` using the dominant time constant) is the
-    # correct anchor; BO has no differential signal to optimize on.
+    # ``lookback`` is unified with ``seq_len`` (2026-05-24): there is one
+    # history-window length, used identically by the training transformer
+    # context (over seq_len positions) and the deployment encoder/dynamics.
+    # The plant-identifier output is retained only as a diagnostic.  BO
+    # therefore has no separate ``lookback`` axis to optimize.
     lookback = int(plant['lookback'])
     model_size = trial.suggest_categorical('model_size', list(MODEL_SIZE_PRESETS))
     # Horizon pinned to V3/V4 paper default (parity with single_run.py).
@@ -629,10 +628,13 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     base.k_max = derived['k_max']
     os.environ['SIM_SAMPLE_RATE'] = str(sr)
 
-    # Phase 1b: Lookback identification using the *derived* sample_rate
-    # (parity with workflow/single_run.py — must come AFTER sr is known so the
-    # min_lb/max_lb scan range matches the actual agent timestep).
-    print('[BO] Phase 1b: lookback identification', flush=True)
+    # Phase 1b: Lookback identification (DIAGNOSTIC ONLY) — historically
+    # this set the runtime history-window independently from seq_len; as
+    # of 2026-05-24 the two are unified so train/deploy context lengths
+    # match exactly.  We still run the identifier to populate the report
+    # and to flag plants where the identified memory horizon exceeds the
+    # derived seq_len (i.e. ``derive_seq_len`` would be undersizing).
+    print('[BO] Phase 1b: lookback identification (diagnostic)', flush=True)
     lb_info = identify_lookback(out_dir / 'plant_id',
                                  tau=plant['tau'],
                                  dead_time=plant['dead_time'],
@@ -641,7 +643,16 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
                                  tau_fast=plant.get('tau_fast'),
                                  dead_time_fast=plant.get('dead_time_fast'))
     plant.update(lb_info)
-    print(f"[BO] lookback={plant['lookback']} (from sr={sr})", flush=True)
+    identified_lookback = int(plant['lookback'])
+    # Unified history-window length: train context = deploy context.
+    plant['identified_lookback'] = identified_lookback
+    plant['lookback'] = int(base.seq_len)
+    if identified_lookback > int(base.seq_len):
+        print(f"[BO] WARNING identified_lookback={identified_lookback} > "
+              f"seq_len={base.seq_len}; ``derive_seq_len`` may be "
+              f"undersizing the WM context.", flush=True)
+    print(f"[BO] lookback={plant['lookback']} (=seq_len; "
+          f"identified={identified_lookback}, sr={sr})", flush=True)
 
     # Episode length: env override > auto-derived from settling time > paper.
     from utils.auto_episode_length import derive_episode_length
@@ -718,9 +729,16 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         'out_dir': str(out_dir),
         'sample_rate': sr,
         'sample_rate_source': derived['sample_rate_source'],
+        # Deployment manifest (canonical runtime-API names).  Phase 1
+        # unification (2026-05-24): ``lookback == seq_len`` so train and
+        # deploy contexts are bit-identical.
+        'sample_rate_seconds': sr,
+        'history_window_samples': plant['lookback'],
         'tau': plant['tau'], 'dead_time': plant['dead_time'],
         'tau_fast': plant['tau_fast'], 'dead_time_fast': plant['dead_time_fast'],
         'lookback': plant['lookback'],
+        'identified_lookback': plant.get('identified_lookback',
+                                          plant['lookback']),
         'episode_length': base.episode_length,
         'episode_length_source': ep_source,
         'seq_len': base.seq_len,

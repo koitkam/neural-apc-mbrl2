@@ -100,14 +100,14 @@ def collect_random_episode(env: APCEnv, cfg: TrainConfig) -> Dict[str, np.ndarra
     """P1/P2 collection: uniform [-1, 1] per step (mirrors training/train.py)."""
     obs_window = env.reset(exploration=True)
     T = cfg.episode_length
-    L = cfg.lookback
     D = env.obs_dim
-    obs_buf  = np.zeros((T, L, D), dtype='float32')
+    # Phase 2 (2026-05-24): per-step storage (T, D), no L axis.
+    obs_buf  = np.zeros((T, D), dtype='float32')
     act_buf  = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf  = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
     for t in range(T):
-        obs_buf[t] = obs_window
+        obs_buf[t] = obs_window[-1]
         a = env.rng.uniform(-1.0, 1.0, size=env.action_dim).astype('float32')
         nxt, r, done, _ = env.step(a)
         act_buf[t] = a
