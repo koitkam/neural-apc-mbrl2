@@ -3120,16 +3120,31 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_best_score: float = -1e18
     wm_best_iter: int = -1
     wm_best_ckpt_path: Optional[Path] = None
+    # 2026-05-24 (P47 RCA): the raw fidelity score has empirical
+    # std = 0.10–0.14 r-points across consecutive probes (measured
+    # P43/P45/P47), peak-to-trough oscillation up to 0.40.  The ES
+    # logic compares a single instantaneous probe against an
+    # instantaneous best, so it routinely fires on within-noise
+    # oscillation.  Track an EMA of the score in addition to the raw
+    # value and use the EMA for ES decisions; checkpoint promotion
+    # still uses raw score (so wm_best.pt captures the actual best).
+    wm_score_ema: float = -1e18
+    wm_score_ema_best: float = -1e18
+    wm_score_ema_best_iter: int = -1
+    wm_score_ema_alpha = float(
+        os.environ.get('DREAMER_WM_FIDELITY_EMA_ALPHA', '0.5'))
+    # P2-relative ES: reset the "best" tracker on P1→P2 entry so the
+    # P2 critic head gets a fair patience window from its own best,
+    # not from an unreachable P1 best (P47 RCA: iter 50 in P2 was 30
+    # iters past wm_best_iter=20 in P1 → instant trip on P2 entry).
+    wm_es_p2_baseline_iter: int = -1
     wm_fidelity_warmup_iters = int(
         os.environ.get('DREAMER_WM_FIDELITY_WARMUP_ITERS', '40'))
-    # Tightened 50 → 20 on 2026-05-23 (P43 RCA): P43's wm_best peaked at
-    # iter 60 and degraded by iter 70 (10 iters = 1 probe), but the
-    # phase-2 check window ended at iter 80 (only 20 iters past best),
-    # so the old patience=50 could never fire before P3 started —
-    # leaving the broken WM to cascade through P3 instead.  20 iters =
-    # 2 missed probes is enough to distinguish noise from real drift.
+    # P47 RCA: 20 → 40 iters (4 probes) so the EMA can stabilise across
+    # the natural ±0.12 noise band.  Combined with EMA smoothing,
+    # genuine multi-probe degradation still trips within ~50 iters.
     wm_fidelity_patience_iters = int(
-        os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '20'))
+        os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '40'))
     # ----- P1 const-action re-injection (P39, 2026-05-22) -----
     # P38 RCA: supervised losses stay flat from iter ~25 onward but the
     # H=15 imagination-fidelity probe collapses past iter 50, and the
@@ -3982,6 +3997,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         _score = (sum(max(0.0, r) for r in _r_vals)
                                    + 0.5 * float(_pbe.get('best_h', 0))
                                             / max(1, int(_pbe.get('H', 1))))
+                        # Update EMA of the score (used for ES only).
+                        if wm_score_ema <= -1e17:
+                            wm_score_ema = float(_score)
+                        else:
+                            wm_score_ema = (
+                                wm_score_ema_alpha * float(_score) +
+                                (1.0 - wm_score_ema_alpha) * wm_score_ema)
+                        # Track raw-best (checkpoint promotion) and
+                        # EMA-best (ES decisions) separately.
                         if _score > wm_best_score:
                             wm_best_score = _score
                             wm_best_iter = int(total_iters)
@@ -4004,11 +4028,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                   f"{_score:.3f} at iter {total_iters} "
                                   f"-> saved {wm_best_ckpt_path.name}",
                                   flush=True)
-                        elif (es_enable
+                        # EMA-best tracking, scoped to P2 only via
+                        # the P2-entry baseline.
+                        if current_phase == 2 and wm_es_p2_baseline_iter < 0:
+                            wm_es_p2_baseline_iter = int(total_iters)
+                            # Reset EMA-best on P2 entry so the P2
+                            # patience window starts fresh.
+                            wm_score_ema_best = wm_score_ema
+                            wm_score_ema_best_iter = int(total_iters)
+                        if (current_phase == 2
+                                and wm_score_ema > wm_score_ema_best):
+                            wm_score_ema_best = wm_score_ema
+                            wm_score_ema_best_iter = int(total_iters)
+                        if (es_enable
                               and current_phase == 2
-                              and wm_best_iter > 0
+                              and wm_score_ema_best_iter > 0
                               and total_iters >= wm_fidelity_warmup_iters
-                              and (total_iters - wm_best_iter)
+                              and (total_iters - wm_score_ema_best_iter)
                                     >= wm_fidelity_patience_iters):
                             # 2026-05-24 (P44 RCA): scope tightened from
                             # ``current_phase in (1, 2)`` to ``== 2``.
@@ -4025,11 +4061,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             # by P1 budget + (future) p1-extension
                             # logic, not by this ES path.
                             early_stop_reason = (
-                                f'wm_fidelity_degradation: no improvement '
-                                f'over best={wm_best_score:.3f} '
-                                f'(iter {wm_best_iter}) for '
-                                f'{total_iters - wm_best_iter} iters '
-                                f'(patience={wm_fidelity_patience_iters})')
+                                f'wm_fidelity_degradation: EMA score '
+                                f'no improvement over '
+                                f'ema_best={wm_score_ema_best:.3f} '
+                                f'(iter {wm_score_ema_best_iter}) for '
+                                f'{total_iters - wm_score_ema_best_iter} iters '
+                                f'(patience={wm_fidelity_patience_iters}, '
+                                f'ema_alpha={wm_score_ema_alpha:.2f}); '
+                                f'raw_best={wm_best_score:.3f} '
+                                f'(iter {wm_best_iter})')
                 except Exception as _e:
                     print(f"[wm-fidelity-probe-iter{total_iters}] "
                           f"error: {_e!r}", flush=True)
