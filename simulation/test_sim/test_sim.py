@@ -150,8 +150,20 @@ class TestSimTower(DisturbanceOffsetMixin):
         self.tau_temp = float(self.base_tau_temp * rs())
         self.tau_actuator = float(self.base_tau_actuator * rs())
 
-        dt_scale = rs()
-        self.mv_deadtime_steps = int(max(0, round(self.base_mv_deadtime_steps * dt_scale)))
+        # MV dead-time variance: ``round(base * ±10%)`` collapses to a
+        # single mode for small ``base`` (e.g. 3 × 0.9..1.1 → 3 always),
+        # which leaves the WM with no dead-time variability across the
+        # buffer. Force at least ±1-step integer noise so the WM sees
+        # multiple delay realisations even for small base values. When
+        # DR is disabled, the noise term collapses to 0 deterministically.
+        rng = self._randomizer.rng
+        if self._randomizer.enabled and self.base_mv_deadtime_steps > 0:
+            span = max(1, int(round(self._randomizer.frac
+                                     * float(self.base_mv_deadtime_steps))))
+            jitter = int(rng.integers(-span, span + 1))
+            self.mv_deadtime_steps = int(max(0, self.base_mv_deadtime_steps + jitter))
+        else:
+            self.mv_deadtime_steps = int(max(0, self.base_mv_deadtime_steps))
 
         self.target_coeffs = {
             'bias': float(self.base_target_coeffs['bias']),
@@ -163,6 +175,18 @@ class TestSimTower(DisturbanceOffsetMixin):
         self.episode_counter = 0
         self.done = False
         self.reset_disturbance_offsets()
+        # Per-episode wrapper-DR refresh (output_gain/bias/input_jitter/
+        # actuator_tau/mv_deadtime/dv_mean_shift). Stacks on top of the
+        # plant-internal ``_sample_episode_dynamics`` so the WM sees
+        # plant-wrapper variability AND internal-parameter variability.
+        # Reads its config from CONTROL_SETUP_JSON's
+        # ``noise_and_randomization`` block; no-ops when DR disabled or
+        # the block is empty. ``n_dvs=1`` matches ``feed`` DV.
+        self._randomizer.sample_episode(
+            n_dvs=1,
+            identified_tau=float(self.base_tau_temp),
+            identified_dead_time=float(self.base_mv_deadtime_steps),
+        )
         self._sample_episode_dynamics()
 
         _rng = self._randomizer.rng

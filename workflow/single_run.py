@@ -241,18 +241,24 @@ def main() -> int:
     from utils.plant_init import derive_batch_size
     # Horizon-adaptive batch size (parity with workflow.bo_runner.run_trial).
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
+    # 2026-05-23 bug fix (P43 RCA): removed ``horizon_ref=horizon`` from
+    # both calls below.  Passing horizon_ref=horizon made hz_scale=1.0
+    # always, nullifying the horizon-based memory scaling and pinning
+    # bs at the paper default (16) even with H=15 (3× smaller than the
+    # H=42 calibration reference).  With the bug, P43 used ~12.4 GiB
+    # of 22 GiB GPU at bs=16; the auto-sizer can now claim the
+    # headroom.  Cap remains controllable via DREAMER_MAX_BS for
+    # conservative runs (P44 sets =16 to keep a stable baseline).
     if bs_env:
         try:
             batch_size = max(1, int(bs_env))
             bs_info = {'batch_size': batch_size, 'source': 'env_override'}
         except Exception:
             bs_info = derive_batch_size(model_size, horizon=horizon,
-                                         horizon_ref=horizon,
                                          seq_len=seq_len, lookback=lookback)
             batch_size = int(bs_info['batch_size'])
     else:
         bs_info = derive_batch_size(model_size, horizon=horizon,
-                                     horizon_ref=horizon,
                                      seq_len=seq_len, lookback=lookback)
         batch_size = int(bs_info['batch_size'])
     print(f"[run] batch_size={batch_size} ({bs_info['source']}; "

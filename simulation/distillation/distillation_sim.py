@@ -259,10 +259,21 @@ class DistillationTower(DisturbanceOffsetMixin):
         self.tau_pressure = float(self.base_tau_pressure * self._rand_scale())
         self.tau_actuator = float(self.base_tau_actuator * self._rand_scale())
 
-        # Dead times (integer scan steps)
-        dt_scale = np.asarray(self._rand_scale(size=4), dtype='float32')
-        varied_dt = np.rint(self.base_mv_deadtime_steps.astype('float32') * dt_scale).astype('int32')
-        self.mv_deadtime_steps = np.maximum(0, varied_dt)
+        # Dead times (integer scan steps).
+        # P43 (2026-05-23): replaced ``round(base * scale)`` with an explicit
+        # integer-uniform jitter of width ``max(1, round(frac * base))``.
+        # The legacy multiplicative form collapsed to a single value
+        # whenever ``round(base * (1±frac)) == base`` (e.g. base=3 with
+        # frac=0.1 → always 3). This froze plant deadtime across the buffer
+        # and starved the WM of delay-variability — see P43 data-audit RCA.
+        rng = self._randomizer.rng
+        frac = float(self._randomizer.frac)
+        base = self.base_mv_deadtime_steps.astype('int32')
+        spans = np.maximum(1, np.rint(frac * base.astype('float32')).astype('int32'))
+        jitter = np.asarray(
+            [int(rng.integers(-s, s + 1)) for s in spans], dtype='int32'
+        )
+        self.mv_deadtime_steps = np.maximum(0, base + jitter)
 
         # Gain randomization around nominal process map
         gain_scale = np.asarray(self._rand_scale(size=3), dtype='float32')
@@ -295,6 +306,18 @@ class DistillationTower(DisturbanceOffsetMixin):
         self.episode_counter = 0
         self.done = False
         self.reset_disturbance_offsets()
+        # P43 (2026-05-23): refresh wrapper-level DR (output_gain / bias /
+        # input_jitter / actuator_tau / mv_deadtime / dv_mean_shift) before
+        # sampling plant-internal dynamics. Without this call ``sample_episode``
+        # is only triggered from ``SimNoiseWrapper.reset`` for some chains;
+        # making the sim itself responsible keeps wrapper DR active even when
+        # the noise wrapper is bypassed (e.g. in tools/audit_data_generation_v2).
+        # ``n_dvs=1`` matches the feed_comp DV. See P43 RCA notes in test_sim.py.
+        self._randomizer.sample_episode(
+            n_dvs=1,
+            identified_tau=float(self.base_tau_top),
+            identified_dead_time=float(int(self.base_mv_deadtime_steps.min())),
+        )
         self._sample_episode_dynamics()
 
         _rng = self._randomizer.rng

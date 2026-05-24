@@ -9,6 +9,11 @@
         }
     },
     "noise_and_randomization": {
+        "_comment": "P43 2026-05-23: harmonised with test_sim / distillation. Plant is ONNX-backed so wrapper-level DR is the only DR available; explicit values let audit + tuning see them. actuator_tau_pct adds the only DR axis that was previously 0.",
+        "output_gain_pct": 0.08,
+        "output_bias_pct": 0.02,
+        "input_jitter_pct": 0.005,
+        "actuator_tau_steps": 4,
         "dv_mean_shift_pct": 0.05
     },
     "workflow": {

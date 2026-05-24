@@ -193,15 +193,19 @@ class TrainConfig:
     recon_scale: float = 0.1
     sf_scale: float = 1.0
     # P2+P3 reward-MTP loss weight (Dreamer-V4 paper Eq. 9).  Lowered
-    # 4.0 → 1.0 on 2026-05-22 (P40 RCA): the previous 4.0 was a custom
-    # tune from run_p5 / p2 that we kept stacking on top of an off-paper
-    # P1 reward gradient.  With reward MTP correctly removed from P1
-    # (see ``reward_scale_loss_p1`` below) and ``mtp_length=32`` already
-    # giving 4× more samples per step than paper L=8, the per-step
-    # gradient magnitude is already much higher than paper's effective
-    # weight.  1.0 brings the per-step reward gradient back into the
-    # paper's recon/sf/reward balance band.
-    reward_scale_loss: float = 1.0
+    # 1.0 → 0.3 on 2026-05-23 (P43 RCA, run_20260523_p43_data_fixed):
+    # diag_grad_rmtp/(diag_grad_recon+diag_grad_sf+diag_grad_rmtp)
+    # climbed from 0.000 (P1 end) → 0.139 (P2 iter 55) → 0.313 (P2 iter
+    # 65), and the WM fidelity probe collapsed from best_h=15/15 (iter
+    # 60) to best_h=0/15 (iter 70) the SAME iter the ratio peaked.
+    # Same encoder-conflict mechanism that broke P1 (fixed in P40); the
+    # reward head's gradient backflow into the shared encoder/dynamics
+    # was pulling the representation away from forward dynamics.  0.3
+    # keeps the ratio under ~0.10 (linear scaling from measured 0.31)
+    # while remaining a paper-compatible weight knob.  History: 4.0
+    # (P5) → 1.0 (P40, 2026-05-22) → 0.3 (P43 root-cause).  Override
+    # with DREAMER_REWARD_SCALE_LOSS.
+    reward_scale_loss: float = 0.3
     # P1 (WM pretrain) reward-MTP loss weight.  Paper default 0.0:
     # Dreamer-V4 §3 trains the WM (tokenizer + dynamics) without the
     # reward head in pretrain.  The reward head joins in agent
@@ -642,20 +646,26 @@ class APCEnv:
         # ~14 of 255 bins, capping ``reward_mtp_loss`` at the
         # operating-region entropy floor regardless of training time.
         # Clipping the raw tail at ``DREAMER_REWARD_RAW_CLIP_MIN``
-        # (default -30) lets the auto-scaler pack the operating-region
-        # into ~60 bins without altering the agent's incentive
-        # direction (catastrophe still strongly avoided).  Set
-        # ``DREAMER_REWARD_RAW_CLIP_MIN=-1e9`` to disable.
+        # P43 (2026-05-23): default loosened from -30 to -1e6.  Symlog
+        # in the V4 two-hot reward head already compresses heavy tails
+        # (symlog(-30)≈-3.4); the explicit -30 clip was censoring 5 %
+        # of the operating-region reward distribution and contributing
+        # to critic underestimation at the operating-band edges (see
+        # audit output/test_sim/_data_audit_v2_*).  The remaining
+        # -1e6 / +1e18 clip is a runaway-bug safety net, not a routine
+        # censor; ``_reward_clip_warned`` emits a one-shot warning if
+        # it ever triggers so we notice silent saturation.
         try:
             self._reward_clip_min: float = float(
-                os.environ.get('DREAMER_REWARD_RAW_CLIP_MIN', '-30.0'))
+                os.environ.get('DREAMER_REWARD_RAW_CLIP_MIN', '-1e6'))
         except Exception:
-            self._reward_clip_min = -30.0
+            self._reward_clip_min = -1e6
         try:
             self._reward_clip_max: float = float(
                 os.environ.get('DREAMER_REWARD_RAW_CLIP_MAX', '1e18'))
         except Exception:
             self._reward_clip_max = 1e18
+        self._reward_clip_warned: bool = False
 
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
@@ -845,9 +855,16 @@ class APCEnv:
         # fits ``raw_reward``) and the agent both see the same clipped
         # distribution.  See ``self._reward_clip_min/max`` rationale.
         if (self._reward_clip_min > -1e17) or (self._reward_clip_max < 1e17):
-            raw_reward = float(np.clip(raw_reward,
-                                       self._reward_clip_min,
-                                       self._reward_clip_max))
+            clipped = float(np.clip(raw_reward,
+                                     self._reward_clip_min,
+                                     self._reward_clip_max))
+            if (clipped != raw_reward) and (not self._reward_clip_warned):
+                print(f'[env.step] WARNING reward clip triggered: raw={raw_reward:.4g} '
+                      f'-> {clipped:.4g} (range [{self._reward_clip_min:.4g},'
+                      f'{self._reward_clip_max:.4g}]); further occurrences '
+                      f'silenced.', flush=True)
+                self._reward_clip_warned = True
+            raw_reward = clipped
         reward = raw_reward * float(self.reward_scale)
         self._prev_control = np.asarray(control, dtype='float32')
         self._t += 1
@@ -987,15 +1004,24 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
 
 def collect_baseline_episode(env: APCEnv, cfg: TrainConfig, *,
                               action_std: float = 0.05,
+                              center: float = 0.0,
                               ) -> Dict[str, np.ndarray]:
-    """Collect one episode driven by small-noise actions around mid-MV.
+    """Collect one episode driven by small-noise actions around ``center``.
 
     Used to **seed** the replay buffer with non-catastrophic transitions
     before the actor has learned anything (P0 cold-start fix,
-    2026-05-05).  Actions are drawn from ``N(0, action_std)`` clipped to
-    ``[-1, 1]`` in the env's normalized action space (``0.0`` is
-    mid-bound for an MV channel).  No model inference is needed, so this
-    runs on CPU regardless of device.
+    2026-05-05; P43 stratified-center upgrade, 2026-05-23).  Actions
+    are drawn from ``N(center, action_std)`` clipped to ``[-1, 1]`` in
+    the env's normalized action space.  ``center=0.0`` reproduces the
+    legacy mid-MV-hold behaviour; ``center`` stratified across
+    ``[-op_band, +op_band]`` per episode (driven by the P1 loop in
+    ``train_dreamer_v4``) gives the WM operating-point coverage
+    matching PRBS, but with smooth held trajectories that let the
+    steady-state reach equilibrium at each centre.
+
+    Centre is sampled per episode upstream, not within the episode, so
+    each episode is a clean small-noise hold at one stratum.  This is
+    sim-agnostic: no plant-specific code lives here.
 
     Returns the same dict shape as ``collect_episode`` so the result can
     be passed straight to ``buf.add_episode``.
@@ -1008,7 +1034,7 @@ def collect_baseline_episode(env: APCEnv, cfg: TrainConfig, *,
     cont_buf = np.ones(T, dtype='float32')
     for t in range(T):
         obs_buf[t] = obs_window
-        a_np = env.rng.normal(0.0, float(action_std),
+        a_np = env.rng.normal(float(center), float(action_std),
                                 size=(env.action_dim,)).astype('float32')
         np.clip(a_np, -1.0, 1.0, out=a_np)
         next_window, reward, done, _ = env.step(a_np)
@@ -1204,8 +1230,13 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     obs_window = env.reset(exploration=True)
     # Clear curriculum disturbance schedule so this seed is a clean
     # held-action steady-state probe.  DR + OU + measurement noise stay
-    # active.
+    # active EXCEPT the hidden (truly-unmeasured) OU disturbance, which
+    # would corrupt the steady-state target the WM is meant to learn
+    # from this episode (P43, 2026-05-23 audit finding: const_action
+    # was firing hidden OU in 12.5 % of episodes, contaminating the SS
+    # signal).  Sim-agnostic: ``_hidden_disturbance`` lives on APCEnv.
     env._schedule = []
+    env._hidden_disturbance = None
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     obs_buf = np.zeros((T, L, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
@@ -1259,6 +1290,10 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     """
     obs_window = env.reset(exploration=True)
     env._schedule = []
+    # P43 (2026-05-23): also suppress hidden OU disturbance so the step
+    # transient is unambiguous (see ``collect_constant_action_episode``
+    # rationale).  Sim-agnostic.
+    env._hidden_disturbance = None
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     obs_buf = np.zeros((T, L, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
@@ -3063,8 +3098,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_best_ckpt_path: Optional[Path] = None
     wm_fidelity_warmup_iters = int(
         os.environ.get('DREAMER_WM_FIDELITY_WARMUP_ITERS', '40'))
+    # Tightened 50 → 20 on 2026-05-23 (P43 RCA): P43's wm_best peaked at
+    # iter 60 and degraded by iter 70 (10 iters = 1 probe), but the
+    # phase-2 check window ended at iter 80 (only 20 iters past best),
+    # so the old patience=50 could never fire before P3 started —
+    # leaving the broken WM to cascade through P3 instead.  20 iters =
+    # 2 missed probes is enough to distinguish noise from real drift.
     wm_fidelity_patience_iters = int(
-        os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '50'))
+        os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '20'))
     # ----- P1 const-action re-injection (P39, 2026-05-22) -----
     # P38 RCA: supervised losses stay flat from iter ~25 onward but the
     # H=15 imagination-fidelity probe collapses past iter 50, and the
@@ -3158,10 +3199,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     n_random_seed = int(getattr(cfg, 'random_seed_episodes', 2))
     n_prbs_seed = int(getattr(cfg, 'exploration_seed_episodes', 0))
     prbs_op_band = float(getattr(cfg, 'prbs_seed_op_band', 0.95))
+    # P43 (2026-05-23): baseline_seed centres stratified over
+    # ``[-baseline_op_band, +baseline_op_band]`` so the WM sees
+    # held-action steady-state at multiple operating points instead of
+    # only mid-MV.  Audit (output/test_sim/_data_audit_v2_*) showed the
+    # legacy zero-centred baseline_seed only excited 20 % of the MV
+    # band; this stratification raises that to ~100 % with the same
+    # episode budget.  Op-band defaults to PRBS-1-sigma (0.6) and is
+    # overridable via ``DREAMER_BASELINE_SEED_OP_BAND``.
+    baseline_op_band = float(os.environ.get(
+        'DREAMER_BASELINE_SEED_OP_BAND',
+        str(min(0.6, float(prbs_op_band)))))
     if n_baseline_seed > 0:
-        for _ in range(n_baseline_seed):
+        # Stratified centres: split the operating band into
+        # ``n_baseline_seed`` equal strata, draw one centre per stratum
+        # (shuffled).  Guarantees each band-fraction is visited at
+        # least once even for small N.
+        edges = np.linspace(-baseline_op_band, +baseline_op_band,
+                             n_baseline_seed + 1)
+        centres = env.rng.uniform(edges[:-1], edges[1:]).astype('float32')
+        env.rng.shuffle(centres)
+        for i in range(n_baseline_seed):
             ep = collect_baseline_episode(env, cfg,
-                                            action_std=baseline_seed_std)
+                                            action_std=baseline_seed_std,
+                                            center=float(centres[i]))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
             total_env_steps += cfg.episode_length
     for _ in range(max(0, n_random_seed)):
@@ -4198,6 +4259,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # ---------------------------------------------------------------
     if int(os.environ.get('DREAMER_RUN_WM_DIAGNOSTIC', '1') or 0) == 1:
         try:
+            # Pre-free GPU before the diagnostic so its auto-device
+            # picker doesn't fall back to CPU just because OUR training
+            # tensors still occupy >50% of GPU memory.  Added 2026-05-23
+            # after P43's diagnostic ran on CPU (5× slower) despite the
+            # GPU being idle (util=0%) — the mem_frac heuristic counted
+            # our own model+optimizer+buffer as "busy".
+            try:
+                import gc as _gc
+                # Drop large training-only references; the diagnostic
+                # loads its own model from final.pt.
+                for _name in ('opt_wm', 'opt_actor', 'opt_critic',
+                               'opt', 'buf', 'replay', 'model'):
+                    if _name in locals():
+                        try:
+                            del locals()[_name]
+                        except Exception:
+                            pass
+                _gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except Exception as _e:
+                print(f'[wm-ss-diag] pre-free skipped: {_e!r}',
+                       flush=True)
             from tools.wm_steady_state_diagnostic import (
                 run_wm_steady_state_diagnostic)
             n_starts = int(os.environ.get('DREAMER_WM_DIAG_N_STARTS', '8'))
