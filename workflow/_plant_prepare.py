@@ -182,6 +182,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_PHASE3_FRAC':        ('phase3_frac',                float),
     'DREAMER_LR_CRITIC':          ('lr_critic',                  float),
     'DREAMER_LR_ACTOR':           ('lr_actor',                   float),
+    # 2026-05-24 (P48 RCA): structural γ/H mismatch fix.  See
+    # auto_tune_seed_buffer in training/train.py for adaptive formula.
+    'DREAMER_GAMMA':              ('gamma',                      float),
+    'DREAMER_TARGET_CRITIC_TAU':  ('target_critic_tau',          float),
     'DREAMER_P3_COLLECT_EVERY':   ('phase3_collect_every_iters', int),
     'DREAMER_BUFFER_CAP_STEPS':   ('buffer_capacity_steps',      int),
     # 2026-05-19 paper-strip-back knobs (p28 A/B): expose the remaining
@@ -221,6 +225,20 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # supervision; recommended ≥0.5 for plants with long settling
     # times where pure const-action seeds are info-poor.
     'DREAMER_STEP_SETTLE_FRAC':   ('step_settle_seed_fraction',  float),
+    # 2026-05-25 (P51): APC step-test seed episodes — mixed MV+DV step
+    # events with held baselines.  Strict superset of step_settle
+    # (adds DV coverage with held action).  Default 20 in TrainConfig.
+    'DREAMER_STEP_TEST_SEEDS':    ('step_test_seed_episodes',    int),
+    # Minimum step-test episodes per input channel (n_mv + n_dv).
+    'DREAMER_STEP_TEST_PER_CHANNEL': ('step_test_episodes_per_channel', int),
+    # Fraction of step-test events that fire in the OVERLAP regime
+    # (0.5–1·dyn_horizon apart) vs SETTLED (≥4·dyn_horizon apart).
+    'DREAMER_STEP_TEST_OVERLAP_FRAC': ('step_test_overlap_frac', float),
+    # Fraction of step-test events that are DV (rest are MV).
+    'DREAMER_STEP_TEST_DV_SHARE': ('step_test_dv_share',         float),
+    # Fraction of DV events that target the episode's primary DV
+    # channel (round-robined across episodes for balanced coverage).
+    'DREAMER_STEP_TEST_PRIMARY_DV_BIAS': ('step_test_primary_dv_bias', float),
 }
 
 

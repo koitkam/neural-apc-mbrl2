@@ -325,6 +325,47 @@ class TrainConfig:
     # settling, ~84 settling times → ample long-horizon SS coverage.
     step_seed_prefix_frac_min: float = 0.05
     step_seed_prefix_frac_max: float = 0.20
+    # ---- APC step-test seed (P51 design, 2026-05-25) ----
+    # Mixed MV + DV step events in a single held-baseline episode,
+    # mirroring industrial APC step-testing.  Each episode:
+    #   1. holds an MV operating point for an initial settle phase
+    #   2. fires a sequence of MV-step and DV-step events with mixed
+    #      spacing — most ≥ 4·(τ+θ) apart so each gain is identifiable
+    #      in isolation; a configurable fraction overlap (~0.5–1·(τ+θ))
+    #      so the WM also sees coupled multi-channel transients
+    #   3. preserves the held-baseline regime (hidden OU OFF) so the
+    #      pre- and inter-event SS targets remain unambiguous.
+    # Strict superset of ``step_settle_seed_episodes`` (which had 0 DV
+    # activity and only 1 MV step) and of disturbance-active PRBS
+    # (which never holds an MV).  Fixes the P49/P50 DV-coverage gap:
+    # the WM never saw a clean ∂CV/∂DV with action held, and the
+    # actor never saw "DV stepped while I held" in-distribution —
+    # exactly the disturbance-rejection validation scenario.
+    # Sim-adaptive via ``dyn_horizon`` (from identifier) for spacing
+    # and via ``dv_gain_to_cv`` (from identifier) for DV magnitudes.
+    step_test_seed_episodes: int = 20
+    # Minimum step-test episodes PER input channel (n_mv + n_dv).  The
+    # seed loop emits ``max(step_test_seed_episodes,
+    # step_test_episodes_per_channel * (n_mv + n_dv))`` episodes so the
+    # WM gets ≥ k clean isolated step responses for every input axis,
+    # even on plants with many MVs/DVs.  Sim-agnostic (unitless count
+    # per channel); sim-adaptive scaling is applied at runtime once
+    # ``env.sim`` is built.
+    step_test_episodes_per_channel: int = 4
+    # Fraction of inter-event gaps that are in the OVERLAP regime
+    # (~0.5–1·dyn_horizon) vs the SETTLED regime (~4–5·dyn_horizon).
+    # Default 0.25 = 75% settled + 25% overlap.
+    step_test_overlap_frac: float = 0.25
+    # Fraction of step-test events that are DV events (rest are MV).
+    # 0.5 = balanced MV/DV coverage.
+    step_test_dv_share: float = 0.5
+    # Fraction of DV events in a single episode that target the
+    # episode's *primary* DV channel (round-robined across episodes so
+    # every DV gets balanced isolated-step coverage).  The remainder
+    # are picked uniformly at random across all DV channels — covers
+    # cross-DV cases.  0.7 = strong stratification while still seeing
+    # the off-primary DVs.
+    step_test_primary_dv_bias: float = 0.7
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -368,9 +409,25 @@ class TrainConfig:
     pmpo_beta: float = 0.01
 
     # ----- Returns -----
+    # 2026-05-24 (P48 RCA): structural γ/H mismatch caused the recurring
+    # critic-pessimism cascade across p41/p43/p48.  Paper γ=0.997 gives
+    # an effective value horizon 1/(1-γ)=333 steps; with imagination
+    # H=15 the critic must bootstrap ~318 steps through target_value.
+    # For dense signed process-control rewards (mean ~-24/step, V_ss
+    # ~-8000) the bootstrap is asked to do too much → critic self-
+    # references (tv_r→0.95, rew/v→0.005) regardless of WM quality.
+    # γ is now auto-tuned in ``auto_tune_seed_buffer`` to
+    # ``clip(1 - 1/(4·H), 0.97, 0.99)`` so the effective value horizon
+    # is ≤4× the imagination horizon.  The dataclass default below is
+    # retained at the paper value as a fallback only.
     gamma: float = 0.997
-    gae_lambda: float = 0.95
-    target_critic_tau: float = 0.02
+    # 2026-05-24 (P48 RCA): default lowered 0.95→0.90.  Bootstrap weight
+    # at (γλ)^H drops from 44% to 20% at H=15 — see
+    # dreamer-training-diagnosis skill, "critic-training cascade" entry.
+    gae_lambda: float = 0.90
+    # 2026-05-24 (P48 RCA): default raised 0.02→0.05.  Faster target
+    # tracking reduces the stale-target bias that feeds the cascade.
+    target_critic_tau: float = 0.05
     tau_ctx: float = 0.1             # context-noise corruption at inference
 
     # ----- Buffer -----
@@ -423,15 +480,28 @@ class TrainConfig:
     # ----- Early stopping (within a single trial) -----
     # Master switch.  All sub-criteria are gated on this.
     early_stop_enable: bool = True
-    # P3 plateau: stop when no new best ``ema_return`` for this many P3
-    # iters AND we are past ``phase3_pruner_warmup_iters``.  The trainer
-    # writes ``best.pt`` whenever a new best is reached and copies it to
-    # ``final.pt`` on plateau-stop so validation auto-picks the best
-    # state without needing runner / validate.py changes.
+    # P3 plateau: stop when no new best ``return_window_mean`` for this
+    # many P3 iters AND we are past ``phase3_pruner_warmup_iters``.
+    # (P49 RCA, 2026-05-25: switched from stochastic ``ema_return`` to
+    # the deterministic-eval ``return_window_mean`` deque.  ema_return
+    # tracks the stochastic on-policy collection return — for narrow-σ
+    # process-control policies near a nonlinear plant boundary the
+    # stochastic and deterministic returns decouple, and ema_return
+    # froze ~iter 110 in P49 while raw deterministic return improved
+    # 100× to iter 310.  The wrong ckpt was promoted as best.pt.)
+    # The trainer writes ``best.pt`` whenever a new best is reached and
+    # copies it to ``final.pt`` on plateau-stop so validation auto-picks
+    # the best state without needing runner / validate.py changes.
     early_stop_p3_patience_iters: int = 200
     # Minimum relative improvement (vs current best) that counts as
     # "new best" (avoids ratcheting on noise).
     early_stop_p3_min_improvement: float = 0.01
+    # Minimum number of deterministic-eval episodes in the
+    # ``return_window`` deque (maxlen=10) before a best can be locked
+    # in.  Prevents the first single eval from anchoring best at a
+    # noisy early value.  At ``phase3_eval_every_iters=5`` this is
+    # ~25 P3 iters of warmup beyond ``phase3_pruner_warmup_iters``.
+    early_stop_p3_min_window_n: int = 5
     # Entropy-collapse trip: detect a *sustained* low-entropy regime, not
     # just a single dip.  We maintain a sliding window of the last
     # ``window_iters`` P3 entropy values and trip when at least
@@ -1386,6 +1456,210 @@ def _seed_one_const_or_step(env: APCEnv, cfg: TrainConfig, *,
                                              action_level=float(level))
 
 
+def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
+                                initial_level: float,
+                                primary_dv_pos: int = -1,
+                                ) -> Dict[str, np.ndarray]:
+    """APC-style step-test seed episode (P51 design, 2026-05-25).
+
+    Mixes MV step events (held action sequence) with DV step events
+    (explicit ``_schedule``) in a SINGLE held-baseline episode.  The
+    layout mirrors industrial APC step-testing:
+
+      [0, t_settle)              — hold u₀ to clear IC transients.
+      [t_settle, T)              — alternating MV/DV step events with
+                                    mixed spacing:
+        * ~(1 - overlap_frac)    — SETTLED: spacing ≥ 4·(τ+θ),
+                                    so each gain is identifiable from
+                                    a clean isolated step (the WM
+                                    learns ∂CV/∂u_i and ∂CV/∂d_j in
+                                    isolation).
+        * ~overlap_frac           — OVERLAP: spacing ~0.5–1·(τ+θ),
+                                    so the WM also sees coupled
+                                    multi-channel transients (closer
+                                    to real plant operation where
+                                    DVs perturb during MV moves).
+
+    Why this episode type (P49/P50 RCA, 2026-05-24/25):
+      * The 60 cleanest seed episodes (40 constant-action + 20
+        step-settle) had ZERO DV events because both forced
+        ``env._schedule = []``.  Result: the WM never saw a clean
+        ∂CV/∂DV under held action, and the actor never saw
+        "DV stepped while I held" in-distribution — exactly the
+        disturbance-rejection scenario the policy fails at.
+      * Disturbance-active PRBS seeds DO contain DV events but the MV
+        never holds, so DV gain is confounded with MV-induced motion
+        (the WM cannot factor out which input caused which CV move).
+      * Step-test is the strict superset: held baselines + isolated
+        events of both types + a controllable coupling regime.
+
+    Sim-adaptive (unitless thresholds, engineering values derived from
+    the identifier):
+      * Event spacing = multiple of ``dyn_horizon = τ_dom + dead_time``
+        from the identifier context.
+      * MV deltas reuse ``cfg.step_seed_delta_min/max`` (normalized
+        action units).
+      * DV deltas = ``uniform(0.10, 0.30) * (dv_hi - dv_lo)`` of the
+        identifier-reported channel range (engineering units).
+      * Hidden OU disturbance OFF — preserves a clean baseline so
+        each event's response is unambiguous (P43 SS-fidelity logic).
+
+    ``initial_level`` is in normalized action space; clipped to [-1, 1].
+    Returns the same dict shape as ``collect_episode``.
+    """
+    from utils.training_disturbance import (_load_identifier_context,
+                                              _channel_catalog)
+    rng = env.rng
+    T = int(cfg.episode_length)
+    D = env.obs_dim
+
+    # ----- Sim-adaptive timing from identifier --------------------------
+    # ``tau_dominant_identified`` and ``dead_time_identified`` are stored
+    # in AGENT steps by convention (see utils/training_disturbance.py
+    # which uses ``dyn_horizon = tau_dom + dead_time`` directly as a
+    # step count when building schedules).
+    id_ctx = _load_identifier_context()
+    dyn = id_ctx.get('dynamics', {}) if isinstance(id_ctx, dict) else {}
+    tau_dom = float(dyn.get('tau_dominant_identified', 0.0) or 0.0)
+    dead_time = float(dyn.get('dead_time_identified', 0.0) or 0.0)
+    if tau_dom <= 0.0:
+        # Fallback: spread events evenly across the episode.
+        dyn_horizon_steps = max(8, T // 12)
+    else:
+        dyn_horizon_steps = max(8, int(round(tau_dom + dead_time)))
+    # SETTLED gap = 4·(τ+θ) (one full settle + margin).
+    # OVERLAP gap = uniform[0.5, 1.0] · (τ+θ) (events still overlap).
+    settled_gap = max(2 * dyn_horizon_steps, 4 * dyn_horizon_steps)
+    overlap_gap_lo = max(1, int(round(0.5 * dyn_horizon_steps)))
+    overlap_gap_hi = max(overlap_gap_lo + 1, dyn_horizon_steps)
+
+    # Initial settle = 3·dyn_horizon (or 1/8 of the episode, whichever
+    # is smaller — keeps room for events on short episodes).
+    t_settle = min(max(3 * dyn_horizon_steps, 8), T // 4)
+
+    # ----- DV channel catalog -------------------------------------------
+    obs_window = env.reset(exploration=True)
+    env._schedule = []
+    env._hidden_disturbance = None
+    channels = _channel_catalog(env.sim)
+    dv_chs = list(channels.get('dv', []))
+    has_dv = len(dv_chs) > 0
+    dv_share = float(np.clip(cfg.step_test_dv_share, 0.0, 1.0))
+    overlap_frac = float(np.clip(cfg.step_test_overlap_frac, 0.0, 0.9))
+    if not has_dv:
+        dv_share = 0.0  # no DV channels → all events are MV
+
+    # ----- Build event timeline -----------------------------------------
+    # Walk forward from t_settle picking inter-event gaps from the
+    # mixed {settled, overlap} distribution until we run out of room.
+    event_times: List[Tuple[int, str]] = []   # (start_step, 'mv'|'dv')
+    t = int(t_settle)
+    while t < T - max(8, dyn_horizon_steps):
+        if rng.random() < overlap_frac:
+            gap = int(rng.integers(overlap_gap_lo, overlap_gap_hi + 1))
+        else:
+            gap = int(rng.integers(settled_gap,
+                                     int(round(1.25 * settled_gap)) + 1))
+        # Pick channel type.
+        is_dv = (rng.random() < dv_share) and has_dv
+        event_times.append((int(t), 'dv' if is_dv else 'mv'))
+        t += gap
+
+    # Guarantee at least one MV and one DV (when DVs exist) so the
+    # episode is always informative.
+    types = [k for _, k in event_times]
+    if has_dv and 'dv' not in types and event_times:
+        i = int(rng.integers(0, len(event_times)))
+        event_times[i] = (event_times[i][0], 'dv')
+    if 'mv' not in types and event_times:
+        i = int(rng.integers(0, len(event_times)))
+        event_times[i] = (event_times[i][0], 'mv')
+
+    # ----- Build MV action timeline + DV schedule -----------------------
+    u_min = float(cfg.step_seed_delta_min)
+    u_max = float(cfg.step_seed_delta_max)
+    if u_max < u_min:
+        u_min, u_max = u_max, u_min
+    u_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
+
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    cur_u = float(np.clip(initial_level, -1.0, 1.0))
+    last_t = 0
+    dv_schedule: List[Dict] = []
+    mv_event_count = 0
+    dv_event_count = 0
+    for start, kind in event_times:
+        # Fill the held segment up to this event.
+        if start > last_t:
+            act_buf[last_t:start, :] = cur_u
+        if kind == 'mv':
+            # Step the action: pick magnitude and a sign that keeps u in
+            # the operating band when possible.
+            mag = float(rng.uniform(u_min, u_max))
+            sign = +1.0 if rng.random() < 0.5 else -1.0
+            cand = cur_u + sign * mag
+            if abs(cand) > u_band:
+                sign = -sign   # flip toward the centre
+                cand = cur_u + sign * mag
+            cur_u = float(np.clip(cand, -1.0, 1.0))
+            mv_event_count += 1
+        else:
+            # DV step: pick a channel and a magnitude in the channel's
+            # engineering range (10–30 % of the span, random sign).
+            # Stratified: a configurable fraction of DV events target
+            # this episode's ``primary_dv_pos`` so each channel gets
+            # balanced isolated-step coverage across the seed batch.
+            use_primary = (
+                0 <= int(primary_dv_pos) < len(dv_chs)
+                and rng.random()
+                    < float(cfg.step_test_primary_dv_bias))
+            if use_primary:
+                ch = dv_chs[int(primary_dv_pos)]
+            else:
+                ch = dv_chs[int(rng.integers(0, len(dv_chs)))]
+            b = ch.get('bounds')
+            if isinstance(b, list) and len(b) >= 2:
+                span = float(b[1]) - float(b[0])
+            else:
+                span = 1.0
+            mag = float(rng.uniform(0.10, 0.30)) * abs(span)
+            sign = +1.0 if rng.random() < 0.5 else -1.0
+            dv_schedule.append({
+                'name': f"step_test_dv_{ch.get('name', ch.get('pos', '?'))}_"
+                          f"t{int(start)}",
+                'target_group': 'dv',
+                'target_pos': int(ch.get('pos', 0)),
+                'start': int(start),
+                'duration': 1,
+                'shape': 'step',
+                'delta': float(sign * mag),
+                'source': 'step_test_seed',
+                '_applied': False,
+            })
+            dv_event_count += 1
+        last_t = start
+    # Fill the tail after the last event.
+    if last_t < T:
+        act_buf[last_t:T, :] = cur_u
+
+    # Install the DV schedule (env.step → apply_disturbance_schedule).
+    env._schedule = dv_schedule
+
+    # ----- Run the episode ----------------------------------------------
+    obs_buf = np.zeros((T, D), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window[-1]
+        next_window, reward, done, _ = env.step(act_buf[t])
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 / 2 — World model loss (tokenizer recon + shortcut forcing)
 # ---------------------------------------------------------------------------
@@ -2242,10 +2516,34 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # H=(θ+3τ)/sr formula compounded WM error over much deeper
     # imagined trajectories than the paper validates against.
     #
-    # ``p3_critic_warmup_iters`` and ``gae_lambda`` auto-tune blocks
-    # were removed in the same cleanup.  With ``--steps`` defaulted to
-    # 1M (paper minimum for control), the critic settles naturally and
-    # paper-default ``gae_lambda=0.95`` is appropriate for any horizon.
+    # ``p3_critic_warmup_iters`` auto-tune block was removed in the
+    # same cleanup.  With ``--steps`` defaulted to 1M (paper minimum
+    # for control) the critic settles naturally.
+    #
+    # 2026-05-24 (P48 RCA): adaptive γ — bring the effective value
+    # horizon 1/(1-γ) close to the imagination horizon H so the critic
+    # bootstrap is not asked to estimate hundreds of unimagined steps.
+    # Formula: γ = clip(1 - 1/(4·H), 0.97, 0.99).  At H=15 → γ=0.9833
+    # (effective horizon 60 = 4·H).  At H=30 → γ=0.9917 (eff 120).  At
+    # H=50+ approaches the paper γ=0.99 ceiling.  Sim-adaptive via H
+    # (which is itself sim-adaptive via DREAMER_HORIZON / paper H=15).
+    # Skipped only when the caller set ``cfg.gamma`` explicitly
+    # (DREAMER_GAMMA env or constructor kwarg).
+    H_for_gamma = int(getattr(cfg, 'horizon', 15) or 15)
+    gamma_adaptive = float(np.clip(1.0 - 1.0 / (4.0 * H_for_gamma),
+                                    0.97, 0.99))
+    if 'gamma' not in getattr(cfg, '_explicit_fields', set()):
+        # Do NOT set cfg.gamma here; the apply loop in ``train`` checks
+        # ``cur == _AUTO_TUNE_FIELD_DEFAULTS['gamma']`` and will set it
+        # iff still at dataclass default, then mark ``applied: True``.
+        out['gamma'] = {
+            'value': gamma_adaptive,
+            'source': f'clip(1-1/(4*H), 0.97, 0.99)=clip(1-1/(4*{H_for_gamma}), '
+                      f'0.97, 0.99)={gamma_adaptive:.4f} '
+                      f'(eff_horizon=1/(1-γ)={1.0/(1-gamma_adaptive):.0f} steps, '
+                      f'4·H target)',
+        }
+
     sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
     tau_plant = 0.0
     theta_plant = 0.0
@@ -2355,6 +2653,8 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'pmpo_entropy_coef':        TrainConfig().pmpo_entropy_coef,
     'prbs_seed_segment_steps':  TrainConfig().prbs_seed_segment_steps,
     'prbs_seed_segment_steps_min': TrainConfig().prbs_seed_segment_steps_min,
+    # P48 (2026-05-24) structural γ/H mismatch fix: γ adaptive to horizon.
+    'gamma':                    TrainConfig().gamma,
 }
 
 
@@ -3009,10 +3309,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             print(f'[init] {len(unexpected)} unexpected keys '
                    f'(e.g. {unexpected[:3]})', flush=True)
         prev_iter = ckpt.get('best_iter')
-        prev_ema = ckpt.get('best_ema_return')
+        # P49: best.pt now stores ``best_det_return``; fall back to the
+        # legacy ``best_ema_return`` key for ckpts produced before the
+        # 2026-05-25 switch.
+        prev_best = (ckpt.get('best_det_return')
+                     if 'best_det_return' in ckpt
+                     else ckpt.get('best_ema_return'))
         if prev_iter is not None:
             print(f'[init] resumed from iter={prev_iter} '
-                   f'best_ema_return={prev_ema}', flush=True)
+                   f'best_det_return={prev_best}', flush=True)
 
     # Square-root LR scaling for adaptive batch (kept from V3 trainer).
     bs_ref = 16
@@ -3161,6 +3466,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         os.environ.get('DREAMER_CONST_ACTION_INJECT_EVERY', '20'))
     const_inject_n = int(
         os.environ.get('DREAMER_CONST_ACTION_INJECT_N', '5'))
+    # P49 RCA (2026-05-25): WM steady-state probe still shows 0%
+    # convergence under zero/constant action even after P39's periodic
+    # P1 injection — because the const-action episodes are evicted
+    # from the replay buffer (capacity ~65 iters worth) once P2+P3
+    # collect new on-policy data.  The fix attempted in P50 was to
+    # continue injecting through P2 and P3 — this was FALSIFIED:
+    # persistent injection of low-reward-variance episodes during
+    # critic training collapses Var(r)/Var(target_v), triggers the
+    # bootstrap_cascade early-stop, and does NOT restore WM
+    # steady-state convergence (still 0% in P50).  Defaults reverted
+    # to OFF (P1-only injection).  Opt-in for experimentation via
+    # DREAMER_CONST_ACTION_INJECT_IN_{P2,P3}=1.  See P50 RCA.
+    const_inject_in_p2 = int(
+        os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P2', '0'))
+    const_inject_in_p3 = int(
+        os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P3', '0'))
     # ----- wm_best.pt warm-restore at P1→P2 (P39, 2026-05-22) -----
     # When the WM's fidelity peak is reached well before P1 ends and the
     # subsequent iters drift to a lower-quality basin (P38: peak iter 50,
@@ -3340,6 +3661,44 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"(step_fraction={step_frac:.2f}, op_band={const_op_band:.2f})",
               flush=True)
 
+    # APC step-test seed episodes (P51 design, 2026-05-25).  Held-MV
+    # baseline episodes with interleaved MV and DV step events at
+    # mixed spacing.  Adds the missing DV-coverage-with-held-action
+    # regime that constant_action / step_settle episodes deliberately
+    # blank out (both set ``env._schedule = []``).  Sim-adaptive via:
+    #   * dyn_horizon (event spacing)
+    #   * n_channels = n_mv + n_dv (episode count: ≥ k per channel so
+    #     each input axis gets balanced isolated-step coverage)
+    #   * primary_dv_pos round-robin (within-episode DV stratification)
+    n_step_test_floor = int(getattr(cfg, 'step_test_seed_episodes', 0))
+    n_per_ch = int(getattr(cfg, 'step_test_episodes_per_channel', 0))
+    n_mv = int(len(getattr(env.sim, 'mv_indices', []) or []))
+    n_dv = int(len(getattr(env.sim, 'dv_indices', []) or []))
+    n_channels = max(1, n_mv + n_dv)
+    n_step_test_seed = max(n_step_test_floor, n_per_ch * n_channels)
+    if n_step_test_seed > 0:
+        st_levels = np.linspace(-const_op_band, const_op_band,
+                                  n_step_test_seed, dtype='float32')
+        st_jit = env.rng.uniform(-0.05, 0.05,
+                                   size=st_levels.shape).astype('float32')
+        st_levels = np.clip(st_levels + st_jit * const_op_band, -1.0, 1.0)
+        for ep_idx, lvl in enumerate(st_levels):
+            # Round-robin primary DV so each DV channel gets balanced
+            # coverage across the seed batch.  -1 disables when n_dv=0.
+            primary = (ep_idx % n_dv) if n_dv > 0 else -1
+            ep = collect_step_test_episode(env, cfg,
+                                             initial_level=float(lvl),
+                                             primary_dv_pos=int(primary))
+            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            total_env_steps += cfg.episode_length
+        print(f"[seed] step-test={n_step_test_seed} "
+              f"(n_mv={n_mv}, n_dv={n_dv}, per_ch={n_per_ch}, "
+              f"floor={n_step_test_floor}, "
+              f"dv_share={cfg.step_test_dv_share:.2f}, "
+              f"overlap_frac={cfg.step_test_overlap_frac:.2f}, "
+              f"primary_dv_bias={cfg.step_test_primary_dv_bias:.2f})",
+              flush=True)
+
     # Cached optimizer set per phase.
     # Initialize hidden-disturbance probability for the starting phase
     # (hidden CV disturbance is the default unmeasured-disturbance model).
@@ -3448,12 +3807,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             env._disturbance_prob_override = get_phase_disturbance_prob(
                 phase=int(current_phase))
 
-        # ----- P39 periodic const/step injection (P1 only) -----
+        # ----- Periodic const/step injection (all phases) -----
         # Keep the steady-state + step-response regimes represented in
-        # the buffer as P1 fills it with random-action transitions.
-        # Cheap: 5 episodes every 20 iters ≈ 6% buffer-add overhead.
-        # Mix controlled by ``step_settle_seed_fraction`` (P42 design).
-        if (current_phase == 1
+        # the buffer.  Cheap: 5 episodes every 20 iters ≈ 6% buffer-add
+        # overhead.  Mix controlled by ``step_settle_seed_fraction``
+        # (P42 design).  P49 RCA: continue into P2/P3 so const-action
+        # coverage doesn't get evicted as on-policy episodes fill the
+        # buffer (was the root cause of persistent 0% WM steady-state
+        # convergence under zero/constant action protocols).
+        _inject_active = (
+            (current_phase == 1)
+            or (current_phase == 2 and const_inject_in_p2)
+            or (current_phase == 3 and const_inject_in_p3))
+        if (_inject_active
                 and const_inject_every > 0
                 and const_inject_n > 0
                 and total_iters > 0
@@ -3485,7 +3851,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _n_s += 1
                 else:
                     _n_c += 1
-            print(f"[p1-const-inject] iter {total_iters}: added "
+            print(f"[const-inject p{current_phase}] iter {total_iters}: added "
                   f"const={_n_c} step={_n_s} episodes "
                   f"(buf_fill={buf.filled}/{buf.capacity_eps})",
                   flush=True)
@@ -4241,22 +4607,48 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     f'{_min_gr:.1f}× for '
                                     f'{cascade_streak} iters')
 
-                # --- Soft fail: P3 plateau on best ema_return ---
+                # --- Soft fail: P3 plateau on best deterministic-eval ---
+                # P49 RCA (2026-05-25): track best on ``return_window``
+                # (deterministic eval, deque maxlen=10) instead of
+                # ``ema_return`` (stochastic on-policy EMA).  These
+                # decouple for narrow-σ process-control policies, and
+                # the deterministic signal is what ``validate.py`` and
+                # deployment actually run.
+                det_ret = (float(np.mean(return_window))
+                           if return_window else None)
+                det_n = len(return_window)
+                min_window_n = int(getattr(cfg,
+                        'early_stop_p3_min_window_n', 5))
                 if (early_stop_reason is None and current_phase == 3
-                        and ema_return is not None and np.isfinite(ema_return)):
+                        and det_ret is not None and np.isfinite(det_ret)
+                        and det_n >= min_window_n):
                     min_imp = float(getattr(cfg,
                             'early_stop_p3_min_improvement', 0.01))
                     if best_p3_ema is None:
-                        best_p3_ema = float(ema_return)
+                        best_p3_ema = float(det_ret)
                         best_p3_iter = total_iters
                         iters_since_best = 0
+                        # Save first qualifying best so we have a ckpt
+                        # to promote even if no further improvement.
+                        try:
+                            best_ckpt_path = out_dir / 'best.pt'
+                            torch.save({'model': model.state_dict(),
+                                        'cfg': asdict(cfg),
+                                        'obs_norm': env.get_obs_norm_stats(),
+                                        'best_det_return': best_p3_ema,
+                                        'best_window_n': det_n,
+                                        'best_iter': best_p3_iter},
+                                       best_ckpt_path)
+                        except Exception as _e:
+                            print(f'[early-stop] best-ckpt save failed: '
+                                   f'{_e!r}', flush=True)
                     else:
                         # Relative improvement against |best| with floor 1.0
                         # so trials hovering near 0 don't ratchet on noise.
                         denom = max(1.0, abs(best_p3_ema))
-                        improvement = (ema_return - best_p3_ema) / denom
+                        improvement = (det_ret - best_p3_ema) / denom
                         if improvement >= min_imp:
-                            best_p3_ema = float(ema_return)
+                            best_p3_ema = float(det_ret)
                             best_p3_iter = total_iters
                             iters_since_best = 0
                             # Persist best ckpt for plateau-stop recovery.
@@ -4265,7 +4657,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 torch.save({'model': model.state_dict(),
                                             'cfg': asdict(cfg),
                                             'obs_norm': env.get_obs_norm_stats(),
-                                            'best_ema_return': best_p3_ema,
+                                            'best_det_return': best_p3_ema,
+                                            'best_window_n': det_n,
                                             'best_iter': best_p3_iter},
                                            best_ckpt_path)
                             except Exception as _e:
@@ -4281,7 +4674,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             and p3_iters > warmup):
                         early_stop_reason = (
                             f'p3_plateau: no >+{min_imp*100:.1f}% improvement '
-                            f'over best={best_p3_ema:.3f} for '
+                            f'over best_det_return={best_p3_ema:.3f} for '
                             f'{iters_since_best} iters')
 
                 if early_stop_reason is not None:
@@ -4291,16 +4684,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
         if on_iter_end is not None:
             # Gate the BO pruner to *post-warmup P3 only*.  Reporting
-            # P1/P2 random-action EMAs (or early P3 EMAs dominated by
+            # P1/P2 random-action signals (or early P3 dominated by
             # the snapshot actor) makes the pruner kill trials on
             # pre-learning noise, not on actual learning quality.
+            # P49 RCA (2026-05-25): report deterministic-eval window
+            # mean instead of stochastic ema_return so the BO pruner
+            # ranks trials by the same signal used to pick best.pt.
             warmup = max(0, int(getattr(cfg, 'phase3_pruner_warmup_iters', 0)))
             if current_phase == 3 and p3_iters > warmup:
+                _det = (float(np.mean(return_window))
+                        if return_window else None)
                 try:
                     stop = bool(on_iter_end(int(total_iters),
                                               int(total_env_steps),
-                                              float(ema_return)
-                                              if ema_return is not None else 0.0))
+                                              float(_det)
+                                              if _det is not None else 0.0))
                 except Exception:
                     stop = False
                 if stop:
@@ -4331,7 +4729,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             tag = ('early-stop' if early_stop_reason is not None
                     else 'completion')
             print(f'[{tag}] promoted best.pt (iter={best_p3_iter}, '
-                  f'ema={best_p3_ema:.3f}) -> final.pt', flush=True)
+                  f'det_return={best_p3_ema:.3f}) -> final.pt', flush=True)
         except Exception as _e:
             print(f'[best->final] promotion failed: {_e!r}',
                    flush=True)
@@ -4406,6 +4804,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'final_return_window_n': int(len(return_window)),
         'n_grad_skip': int(n_grad_skip),
         'early_stop_reason': early_stop_reason,
+        # P49 RCA: ``best_p3_det_return`` tracks the deterministic-eval
+        # window mean used for best.pt selection.  ``best_p3_ema_return``
+        # alias retained for backward-compat with any downstream tools
+        # that parse the older key name (both hold the same value).
+        'best_p3_det_return': (float(best_p3_ema)
+                                if best_p3_ema is not None else None),
         'best_p3_ema_return': (float(best_p3_ema)
                                 if best_p3_ema is not None else None),
         'best_p3_iter': int(best_p3_iter) if best_p3_iter >= 0 else None,

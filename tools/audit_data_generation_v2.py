@@ -105,7 +105,8 @@ print(f'[v2] plant tau={TAU} dead={DEAD} sr={SAMPLE_RATE} ep_len={EPISODE_LEN} '
 # ---- Build env, then monkey-patch step/reset to log raw state -------------
 from training.train import (TrainConfig, APCEnv,
     collect_baseline_episode, collect_prbs_episode,
-    collect_constant_action_episode, collect_step_settle_episode)
+    collect_constant_action_episode, collect_step_settle_episode,
+    collect_step_test_episode)
 
 cfg = TrainConfig(lookback=LOOKBACK, sample_rate=SAMPLE_RATE,
                   episode_length=EPISODE_LEN)
@@ -280,6 +281,15 @@ collect_n('step_settle_seed',
          action_end=float(env.rng.uniform(-0.5, 0.5)),
          switch_step=int(env.rng.uniform(0.3, 0.7) * EPISODE_LEN)))
      for _ in range(N)])
+# P51 (2026-05-25): APC step-test seed — held-MV baseline with
+# interleaved MV+DV step events.  Round-robin primary DV across the N
+# episodes for balanced per-channel coverage (mirrors the seed loop).
+_n_dv_audit = max(1, len(getattr(env.sim, 'dv_indices', []) or []))
+collect_n('step_test_seed',
+    [(lambda i=i, lv=float(L): collect_step_test_episode(env, cfg,
+         initial_level=lv,
+         primary_dv_pos=(i % _n_dv_audit)))
+     for i, L in enumerate(const_levels)])
 collect_n('random_action', [collect_random_episode for _ in range(N)])
 
 # CV/MV bounds (physical) -- read off env. Per-channel arrays; element 0
@@ -339,6 +349,7 @@ cv_lo, cv_hi = cv_op[0]
 # ---- Analysis: physical-units coverage ------------------------------------
 COLORS = {'baseline_seed': '#1f77b4', 'prbs_seed': '#ff7f0e',
           'const_action_seed': '#2ca02c', 'step_settle_seed': '#d62728',
+          'step_test_seed': '#8c564b',
           'random_action': '#9467bd'}
 
 def _hist_stats(arr, lo, hi, bins=20):
