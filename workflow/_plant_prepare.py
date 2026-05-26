@@ -239,6 +239,18 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Fraction of DV events that target the episode's primary DV
     # channel (round-robined across episodes for balanced coverage).
     'DREAMER_STEP_TEST_PRIMARY_DV_BIAS': ('step_test_primary_dv_bias', float),
+    # 2026-05-26 (P52 RCA): phase-transition quality gates.  P51
+    # entered P2 with an underfit WM and P3 with a critic still
+    # bootstrap-leaning → cascade.  Gates make ``phase{1,2}_env_steps``
+    # lower bounds + adaptive extensions up to the respective
+    # ``max_extension`` × budget cap.
+    'DREAMER_P1_GATE_WM_EMA_MIN':  ('p1_gate_wm_ema_min',         float),
+    'DREAMER_P1_GATE_PLATEAU_FRAC': ('p1_gate_plateau_frac',      float),
+    'DREAMER_P1_GATE_PLATEAU_PROBES': ('p1_gate_plateau_probes',  int),
+    'DREAMER_P1_GATE_MAX_EXTENSION': ('p1_gate_max_extension',    float),
+    'DREAMER_P2_GATE_REW_VAR_MIN': ('p2_gate_rew_var_min',        float),
+    'DREAMER_P2_GATE_RECENT_ITERS': ('p2_gate_recent_iters',      int),
+    'DREAMER_P2_GATE_MAX_EXTENSION': ('p2_gate_max_extension',    float),
 }
 
 

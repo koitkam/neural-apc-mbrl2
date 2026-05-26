@@ -550,6 +550,37 @@ class TrainConfig:
     # for default twohot 255-bin head; 4.5 is "started learning").
     early_stop_p2_max_reward_mtp_loss: float = 4.5
 
+    # ----- Phase-transition quality gates (P52 RCA, 2026-05-26) -----
+    # P51 entered P2 with an underfit WM (fidelity probe peaked at iter
+    # 20 and never improved through iter 70) and P3 with a critic still
+    # bootstrap-leaning (rew_to_tgt_var=0.054 at P3 entry → cascade).
+    # The fix is to make ``phase{1,2}_env_steps`` lower bounds + quality
+    # gates that can extend each phase up to ``max_extension`` × budget.
+    #
+    # P1 gate: at the P1 env-step budget, only transition to P2 if
+    #   (a) ``wm_score_ema >= p1_gate_wm_ema_min``  AND
+    #   (b) ``wm_score_ema`` has been within ±``plateau_frac`` of
+    #       ``wm_score_ema_best`` for ≥ ``plateau_probes`` probes
+    #       (i.e. it's plateaued at a healthy level, not just stalled
+    #       at a low one).
+    # Else extend P1 by 10 % of budget and re-check at next probe, up
+    # to a hard cap of ``(1+max_extension)`` × ``phase1_env_steps``.
+    # Set ``p1_gate_wm_ema_min=0.0`` to disable.
+    p1_gate_wm_ema_min: float = 1.5
+    p1_gate_plateau_frac: float = 0.05
+    p1_gate_plateau_probes: int = 3
+    p1_gate_max_extension: float = 0.5
+
+    # P2 gate: same idea, on ``critic_rew_to_tgt_var`` (paper-aligned
+    # "is the critic actually keyed to reward?" signal).  At the P2
+    # env-step budget, only transition to P3 if the median of the last
+    # ``recent_iters`` logged values is ≥ ``min``.  Else extend up to
+    # ``(1+max_extension)`` × ``phase2_env_steps``.
+    # Set ``p2_gate_rew_var_min=0.0`` to disable.
+    p2_gate_rew_var_min: float = 0.10
+    p2_gate_recent_iters: int = 5
+    p2_gate_max_extension: float = 0.3
+
     # ----- I/O -----
     out_dir: str = ''
     log_every: int = 1
@@ -3450,6 +3481,26 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # genuine multi-probe degradation still trips within ~50 iters.
     wm_fidelity_patience_iters = int(
         os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '40'))
+    # ----- Phase-transition quality gates (P52 RCA, 2026-05-26) -----
+    # ``phase{1,2}_env_steps`` become *lower bounds*; quality gates can
+    # extend each phase up to ``(1+max_extension)`` × budget.  Gate
+    # outcomes recorded in ``phase_gate_decisions`` for run_summary.
+    p1_gate_wm_ema_min_v = float(getattr(cfg, 'p1_gate_wm_ema_min', 0.0))
+    p1_gate_plateau_frac_v = float(getattr(cfg, 'p1_gate_plateau_frac', 0.05))
+    p1_gate_plateau_probes_v = int(getattr(cfg, 'p1_gate_plateau_probes', 3))
+    p1_gate_max_ext_steps = int(
+        float(getattr(cfg, 'p1_gate_max_extension', 0.0)) * p1)
+    p2_gate_rew_var_min_v = float(getattr(cfg, 'p2_gate_rew_var_min', 0.0))
+    p2_gate_recent_iters_v = int(getattr(cfg, 'p2_gate_recent_iters', 5))
+    p2_gate_max_ext_steps = int(
+        float(getattr(cfg, 'p2_gate_max_extension', 0.0)) * p2)
+    p1_ext_steps = 0
+    p2_ext_steps = 0
+    p2_rew_var_recent: 'deque[float]' = deque(
+        maxlen=max(1, p2_gate_recent_iters_v))
+    p1_score_ema_history: List[Tuple[int, float]] = []  # (iter, ema)
+    phase_gate_decisions: List[Dict] = []
+    p1_gate_check_step = max(1, int(0.10 * max(1, p1)))  # 10 % steps
     # ----- P1 const-action re-injection (P39, 2026-05-22) -----
     # P38 RCA: supervised losses stay flat from iter ~25 onward but the
     # H=15 imagination-fidelity probe collapses past iter 50, and the
@@ -3540,9 +3591,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     ac_losses: Dict = {}
 
     def _phase_for(env_steps: int) -> int:
-        if env_steps < p1:
+        # 2026-05-26 (P52 RCA): boundaries are dynamic — the P1/P2
+        # quality gates can extend the phase by up to
+        # ``p{1,2}_gate_max_ext_steps`` if convergence criteria aren't
+        # met at the nominal env-step budget.
+        p1_eff = p1 + p1_ext_steps
+        p2_eff = p2 + p2_ext_steps
+        if env_steps < p1_eff:
             return 1
-        if env_steps < p1 + p2:
+        if env_steps < p1_eff + p2_eff:
             return 2
         return 3
 
@@ -3733,6 +3790,127 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             )
         except Exception:
             pass
+
+        # ---------- P52 RCA: phase-transition quality gates ----------
+        # When the env-step budget says "leave the current phase", check
+        # the corresponding quality gate.  If it fails AND extension
+        # headroom remains, bump the boundary by ``p1_gate_check_step``
+        # (10 % of P1 budget) and stay in the current phase.  If it
+        # fails at the cap, log a flag and proceed anyway.
+        _candidate_phase = _phase_for(total_env_steps)
+        if (current_phase == 1 and _candidate_phase == 2
+                and p1_gate_wm_ema_min_v > 0.0):
+            # Healthy?  EMA above floor AND plateaued (≥ K probes
+            # within ±plateau_frac of EMA-best).
+            _ema_ok = (wm_score_ema_best > -1e17
+                       and wm_score_ema_best >= p1_gate_wm_ema_min_v)
+            _plateau_ok = False
+            if _ema_ok and len(p1_score_ema_history) >= p1_gate_plateau_probes_v:
+                _band = max(1e-6,
+                            p1_gate_plateau_frac_v * wm_score_ema_best)
+                recent = p1_score_ema_history[-p1_gate_plateau_probes_v:]
+                _plateau_ok = all(
+                    abs(e - wm_score_ema_best) <= _band for _, e in recent)
+            if _ema_ok and _plateau_ok:
+                phase_gate_decisions.append({
+                    'gate': 'p1->p2', 'iter': int(total_iters),
+                    'env_steps': int(total_env_steps),
+                    'pass': True, 'ext_steps': int(p1_ext_steps),
+                    'wm_ema_best': float(wm_score_ema_best),
+                    'wm_ema_best_iter': int(wm_score_ema_best_iter),
+                })
+                print(f'[gate p1->p2] PASS at iter {total_iters}: '
+                      f'wm_ema_best={wm_score_ema_best:.3f} '
+                      f'(iter {wm_score_ema_best_iter}, '
+                      f'min={p1_gate_wm_ema_min_v:.2f}), '
+                      f'plateaued over last {p1_gate_plateau_probes_v} probes; '
+                      f'p1_extension={p1_ext_steps}/{p1_gate_max_ext_steps} steps',
+                      flush=True)
+            elif p1_ext_steps + p1_gate_check_step <= p1_gate_max_ext_steps:
+                p1_ext_steps += p1_gate_check_step
+                reason = ('ema_below_floor' if not _ema_ok
+                          else 'not_plateaued')
+                phase_gate_decisions.append({
+                    'gate': 'p1->p2', 'iter': int(total_iters),
+                    'env_steps': int(total_env_steps),
+                    'pass': False, 'extended_to': int(p1 + p1_ext_steps),
+                    'reason': reason,
+                    'wm_ema': float(wm_score_ema)
+                        if wm_score_ema > -1e17 else None,
+                    'wm_ema_best': float(wm_score_ema_best)
+                        if wm_score_ema_best > -1e17 else None,
+                })
+                print(f'[gate p1->p2] FAIL ({reason}) at iter {total_iters}: '
+                      f'wm_ema_best={wm_score_ema_best:.3f} < '
+                      f'{p1_gate_wm_ema_min_v:.2f} — extending P1 by '
+                      f'{p1_gate_check_step} steps to '
+                      f'{p1 + p1_ext_steps} (cap {p1 + p1_gate_max_ext_steps})',
+                      flush=True)
+            else:
+                phase_gate_decisions.append({
+                    'gate': 'p1->p2', 'iter': int(total_iters),
+                    'env_steps': int(total_env_steps),
+                    'pass': False, 'capped': True,
+                    'wm_ema_best': float(wm_score_ema_best)
+                        if wm_score_ema_best > -1e17 else None,
+                })
+                print(f'[gate p1->p2] CAPPED — proceeding to P2 despite '
+                      f'wm_ema_best={wm_score_ema_best:.3f} < '
+                      f'{p1_gate_wm_ema_min_v:.2f} (cap '
+                      f'{p1_gate_max_ext_steps} steps reached)',
+                      flush=True)
+                mid_check_flags.append(
+                    f'p1_gate_capped: wm_ema_best={wm_score_ema_best:.3f}')
+        elif (current_phase == 2 and _candidate_phase == 3
+                and p2_gate_rew_var_min_v > 0.0):
+            _rv_med = (float(np.median(p2_rew_var_recent))
+                       if len(p2_rew_var_recent) > 0 else 0.0)
+            _rv_ok = (len(p2_rew_var_recent) >= max(1, p2_gate_recent_iters_v)
+                      and _rv_med >= p2_gate_rew_var_min_v)
+            _p2_step = max(1, int(0.10 * max(1, p2)))
+            if _rv_ok:
+                phase_gate_decisions.append({
+                    'gate': 'p2->p3', 'iter': int(total_iters),
+                    'env_steps': int(total_env_steps),
+                    'pass': True, 'ext_steps': int(p2_ext_steps),
+                    'rew_var_median': _rv_med,
+                })
+                print(f'[gate p2->p3] PASS at iter {total_iters}: '
+                      f'rew_to_tgt_var median={_rv_med:.4f} '
+                      f'(min={p2_gate_rew_var_min_v:.3f}, '
+                      f'n={len(p2_rew_var_recent)}); '
+                      f'p2_extension={p2_ext_steps}/{p2_gate_max_ext_steps} steps',
+                      flush=True)
+            elif p2_ext_steps + _p2_step <= p2_gate_max_ext_steps:
+                p2_ext_steps += _p2_step
+                phase_gate_decisions.append({
+                    'gate': 'p2->p3', 'iter': int(total_iters),
+                    'env_steps': int(total_env_steps),
+                    'pass': False,
+                    'extended_to': int(p2 + p2_ext_steps),
+                    'rew_var_median': _rv_med,
+                    'reason': 'rew_var_below_floor',
+                })
+                print(f'[gate p2->p3] FAIL at iter {total_iters}: '
+                      f'rew_to_tgt_var median={_rv_med:.4f} < '
+                      f'{p2_gate_rew_var_min_v:.3f} — extending P2 by '
+                      f'{_p2_step} steps to {p2 + p2_ext_steps} '
+                      f'(cap {p2 + p2_gate_max_ext_steps})', flush=True)
+            else:
+                phase_gate_decisions.append({
+                    'gate': 'p2->p3', 'iter': int(total_iters),
+                    'env_steps': int(total_env_steps),
+                    'pass': False, 'capped': True,
+                    'rew_var_median': _rv_med,
+                })
+                print(f'[gate p2->p3] CAPPED — proceeding to P3 despite '
+                      f'rew_to_tgt_var={_rv_med:.4f} < '
+                      f'{p2_gate_rew_var_min_v:.3f} (cap '
+                      f'{p2_gate_max_ext_steps} steps reached)',
+                      flush=True)
+                mid_check_flags.append(
+                    f'p2_gate_capped: rew_to_tgt_var={_rv_med:.4f}')
+
         new_phase = _phase_for(total_env_steps)
         if new_phase != current_phase:
             print(f'[phase] transition {current_phase} -> {new_phase} '
@@ -4289,6 +4467,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         row['diag_latent_cos_min'] = float(_cos.min().item())
                 except Exception as _e:
                     row['diag_latent_error'] = str(_e)[:80]
+            # P52 RCA: feed the P2→P3 gate from the freshly-logged row.
+            if current_phase == 2:
+                _rv = row.get('critic_rew_to_tgt_var')
+                try:
+                    if _rv is not None and np.isfinite(float(_rv)):
+                        p2_rew_var_recent.append(float(_rv))
+                except (TypeError, ValueError):
+                    pass
             log_f.write(json.dumps(row) + '\n')
             log_f.flush()
             rwm = row.get('return_window_mean')
@@ -4370,6 +4556,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             wm_score_ema = (
                                 wm_score_ema_alpha * float(_score) +
                                 (1.0 - wm_score_ema_alpha) * wm_score_ema)
+                        # P52 RCA: history feeds the P1→P2 gate.
+                        p1_score_ema_history.append(
+                            (int(total_iters), float(wm_score_ema)))
                         # Track raw-best (checkpoint promotion) and
                         # EMA-best (ES decisions) separately.
                         if _score > wm_best_score:
@@ -4816,6 +5005,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'best_ckpt': (str(best_ckpt_path)
                        if best_ckpt_path is not None else None),
         'mid_check_flags': list(mid_check_flags),
+        # P52 RCA: record phase-gate decisions for post-hoc analysis.
+        'phase_gate_decisions': list(phase_gate_decisions),
+        'p1_ext_steps': int(p1_ext_steps),
+        'p2_ext_steps': int(p2_ext_steps),
     }
 
 
@@ -4901,6 +5094,14 @@ def _cfg_from_env() -> TrainConfig:
             'early_stop_p1_min_sf_drop_frac', float),
         ('DREAMER_ES_P2_MAX_RMTP',
             'early_stop_p2_max_reward_mtp_loss', float),
+        # 2026-05-26 (P52 RCA): phase-transition quality gates.
+        ('DREAMER_P1_GATE_WM_EMA_MIN', 'p1_gate_wm_ema_min', float),
+        ('DREAMER_P1_GATE_PLATEAU_FRAC', 'p1_gate_plateau_frac', float),
+        ('DREAMER_P1_GATE_PLATEAU_PROBES', 'p1_gate_plateau_probes', int),
+        ('DREAMER_P1_GATE_MAX_EXTENSION', 'p1_gate_max_extension', float),
+        ('DREAMER_P2_GATE_REW_VAR_MIN', 'p2_gate_rew_var_min', float),
+        ('DREAMER_P2_GATE_RECENT_ITERS', 'p2_gate_recent_iters', int),
+        ('DREAMER_P2_GATE_MAX_EXTENSION', 'p2_gate_max_extension', float),
     ]:
         v = os.environ.get(name)
         if v is not None and v != '':
