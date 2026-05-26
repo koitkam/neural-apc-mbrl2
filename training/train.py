@@ -571,13 +571,18 @@ class TrainConfig:
     p1_gate_plateau_probes: int = 3
     p1_gate_max_extension: float = 0.5
 
-    # P2 gate: same idea, on ``critic_rew_to_tgt_var`` (paper-aligned
-    # "is the critic actually keyed to reward?" signal).  At the P2
-    # env-step budget, only transition to P3 if the median of the last
-    # ``recent_iters`` logged values is ≥ ``min``.  Else extend up to
-    # ``(1+max_extension)`` × ``phase2_env_steps``.
-    # Set ``p2_gate_rew_var_min=0.0`` to disable.
-    p2_gate_rew_var_min: float = 0.10
+    # P2 gate: same idea, on ``reward_mtp_loss``.  In this codebase the
+    # critic head only trains in P3 — P2 is WM + reward-MTP head only
+    # — so ``critic_rew_to_tgt_var`` is unavailable here.  Use the
+    # reward-MTP loss as the P2 lock-in signal: paper-baseline log(255)
+    # ≈ 5.5 (random twohot), existing P2 mid-check uses 4.5 as the
+    # "started learning" line.  Tighter floor for the gate: P52 reached
+    # 2.78 after ~40 P2 iters (still falling); 3.0 is "locked in".
+    # The gate compares the median of the last ``recent_iters`` log
+    # rows; we require it to be <= ``p2_gate_reward_mtp_max``.
+    # Set ``p2_gate_reward_mtp_max=0.0`` (≤0 disables: nothing can be
+    # ≤ 0) to disable.
+    p2_gate_reward_mtp_max: float = 3.0
     p2_gate_recent_iters: int = 5
     p2_gate_max_extension: float = 0.3
 
@@ -3490,13 +3495,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_gate_plateau_probes_v = int(getattr(cfg, 'p1_gate_plateau_probes', 3))
     p1_gate_max_ext_steps = int(
         float(getattr(cfg, 'p1_gate_max_extension', 0.0)) * p1)
-    p2_gate_rew_var_min_v = float(getattr(cfg, 'p2_gate_rew_var_min', 0.0))
+    p2_gate_reward_mtp_max_v = float(
+        getattr(cfg, 'p2_gate_reward_mtp_max', 0.0))
     p2_gate_recent_iters_v = int(getattr(cfg, 'p2_gate_recent_iters', 5))
     p2_gate_max_ext_steps = int(
         float(getattr(cfg, 'p2_gate_max_extension', 0.0)) * p2)
     p1_ext_steps = 0
     p2_ext_steps = 0
-    p2_rew_var_recent: 'deque[float]' = deque(
+    p2_reward_mtp_recent: 'deque[float]' = deque(
         maxlen=max(1, p2_gate_recent_iters_v))
     p1_score_ema_history: List[Tuple[int, float]] = []  # (iter, ema)
     phase_gate_decisions: List[Dict] = []
@@ -3862,23 +3868,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 mid_check_flags.append(
                     f'p1_gate_capped: wm_ema_best={wm_score_ema_best:.3f}')
         elif (current_phase == 2 and _candidate_phase == 3
-                and p2_gate_rew_var_min_v > 0.0):
-            _rv_med = (float(np.median(p2_rew_var_recent))
-                       if len(p2_rew_var_recent) > 0 else 0.0)
-            _rv_ok = (len(p2_rew_var_recent) >= max(1, p2_gate_recent_iters_v)
-                      and _rv_med >= p2_gate_rew_var_min_v)
+                and p2_gate_reward_mtp_max_v > 0.0):
+            _rml_med = (float(np.median(p2_reward_mtp_recent))
+                        if len(p2_reward_mtp_recent) > 0 else float('inf'))
+            _rml_ok = (len(p2_reward_mtp_recent)
+                        >= max(1, p2_gate_recent_iters_v)
+                       and _rml_med <= p2_gate_reward_mtp_max_v)
             _p2_step = max(1, int(0.10 * max(1, p2)))
-            if _rv_ok:
+            if _rml_ok:
                 phase_gate_decisions.append({
                     'gate': 'p2->p3', 'iter': int(total_iters),
                     'env_steps': int(total_env_steps),
                     'pass': True, 'ext_steps': int(p2_ext_steps),
-                    'rew_var_median': _rv_med,
+                    'reward_mtp_median': _rml_med,
                 })
                 print(f'[gate p2->p3] PASS at iter {total_iters}: '
-                      f'rew_to_tgt_var median={_rv_med:.4f} '
-                      f'(min={p2_gate_rew_var_min_v:.3f}, '
-                      f'n={len(p2_rew_var_recent)}); '
+                      f'reward_mtp_loss median={_rml_med:.3f} '
+                      f'(max={p2_gate_reward_mtp_max_v:.2f}, '
+                      f'n={len(p2_reward_mtp_recent)}); '
                       f'p2_extension={p2_ext_steps}/{p2_gate_max_ext_steps} steps',
                       flush=True)
             elif p2_ext_steps + _p2_step <= p2_gate_max_ext_steps:
@@ -3888,12 +3895,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'env_steps': int(total_env_steps),
                     'pass': False,
                     'extended_to': int(p2 + p2_ext_steps),
-                    'rew_var_median': _rv_med,
-                    'reason': 'rew_var_below_floor',
+                    'reward_mtp_median': _rml_med,
+                    'reason': 'reward_mtp_above_floor',
                 })
                 print(f'[gate p2->p3] FAIL at iter {total_iters}: '
-                      f'rew_to_tgt_var median={_rv_med:.4f} < '
-                      f'{p2_gate_rew_var_min_v:.3f} — extending P2 by '
+                      f'reward_mtp_loss median={_rml_med:.3f} > '
+                      f'{p2_gate_reward_mtp_max_v:.2f} — extending P2 by '
                       f'{_p2_step} steps to {p2 + p2_ext_steps} '
                       f'(cap {p2 + p2_gate_max_ext_steps})', flush=True)
             else:
@@ -3901,15 +3908,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'gate': 'p2->p3', 'iter': int(total_iters),
                     'env_steps': int(total_env_steps),
                     'pass': False, 'capped': True,
-                    'rew_var_median': _rv_med,
+                    'reward_mtp_median': _rml_med,
                 })
                 print(f'[gate p2->p3] CAPPED — proceeding to P3 despite '
-                      f'rew_to_tgt_var={_rv_med:.4f} < '
-                      f'{p2_gate_rew_var_min_v:.3f} (cap '
+                      f'reward_mtp_loss={_rml_med:.3f} > '
+                      f'{p2_gate_reward_mtp_max_v:.2f} (cap '
                       f'{p2_gate_max_ext_steps} steps reached)',
                       flush=True)
                 mid_check_flags.append(
-                    f'p2_gate_capped: rew_to_tgt_var={_rv_med:.4f}')
+                    f'p2_gate_capped: reward_mtp_loss={_rml_med:.3f}')
 
         new_phase = _phase_for(total_env_steps)
         if new_phase != current_phase:
@@ -4468,11 +4475,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 except Exception as _e:
                     row['diag_latent_error'] = str(_e)[:80]
             # P52 RCA: feed the P2→P3 gate from the freshly-logged row.
+            # ``reward_mtp_loss`` is the P2 reward-head loss — the
+            # critic head doesn't train until P3 in this codebase.
             if current_phase == 2:
-                _rv = row.get('critic_rew_to_tgt_var')
+                _rml = row.get('reward_mtp_loss')
                 try:
-                    if _rv is not None and np.isfinite(float(_rv)):
-                        p2_rew_var_recent.append(float(_rv))
+                    if _rml is not None and np.isfinite(float(_rml)):
+                        p2_reward_mtp_recent.append(float(_rml))
                 except (TypeError, ValueError):
                     pass
             log_f.write(json.dumps(row) + '\n')
@@ -5099,7 +5108,7 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_P1_GATE_PLATEAU_FRAC', 'p1_gate_plateau_frac', float),
         ('DREAMER_P1_GATE_PLATEAU_PROBES', 'p1_gate_plateau_probes', int),
         ('DREAMER_P1_GATE_MAX_EXTENSION', 'p1_gate_max_extension', float),
-        ('DREAMER_P2_GATE_REW_VAR_MIN', 'p2_gate_rew_var_min', float),
+        ('DREAMER_P2_GATE_REWARD_MTP_MAX', 'p2_gate_reward_mtp_max', float),
         ('DREAMER_P2_GATE_RECENT_ITERS', 'p2_gate_recent_iters', int),
         ('DREAMER_P2_GATE_MAX_EXTENSION', 'p2_gate_max_extension', float),
     ]:
