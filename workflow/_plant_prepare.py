@@ -247,10 +247,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_P1_GATE_WM_EMA_MIN':  ('p1_gate_wm_ema_min',         float),
     'DREAMER_P1_GATE_PLATEAU_FRAC': ('p1_gate_plateau_frac',      float),
     'DREAMER_P1_GATE_PLATEAU_PROBES': ('p1_gate_plateau_probes',  int),
-    'DREAMER_P1_GATE_MAX_EXTENSION': ('p1_gate_max_extension',    float),
+        'DREAMER_P1_GATE_MAX_EXTENSION': ('p1_gate_max_extension',    float),  # default 1.0
     'DREAMER_P2_GATE_REWARD_MTP_MAX': ('p2_gate_reward_mtp_max',  float),
     'DREAMER_P2_GATE_RECENT_ITERS': ('p2_gate_recent_iters',      int),
-    'DREAMER_P2_GATE_MAX_EXTENSION': ('p2_gate_max_extension',    float),
+        'DREAMER_P2_GATE_MAX_EXTENSION': ('p2_gate_max_extension',    float),  # default 0.5
 }
 
 

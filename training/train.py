@@ -150,9 +150,9 @@ class TrainConfig:
     horizon: int = 15
 
     # ----- Phase budget fractions (paper Algorithm 1) -----
-    phase1_frac: float = 0.4
-    phase2_frac: float = 0.2
-    phase3_frac: float = 0.4
+    phase1_frac: Optional[float] = None
+    phase2_frac: Optional[float] = None
+    phase3_frac: Optional[float] = None
 
     # ----- Optimizers -----
     lr_world: float = 1e-4
@@ -569,7 +569,7 @@ class TrainConfig:
     p1_gate_wm_ema_min: float = 1.5
     p1_gate_plateau_frac: float = 0.05
     p1_gate_plateau_probes: int = 3
-    p1_gate_max_extension: float = 0.5
+    p1_gate_max_extension: float = 1.0
 
     # P2 gate: same idea, on ``reward_mtp_loss``.  In this codebase the
     # critic head only trains in P3 — P2 is WM + reward-MTP head only
@@ -584,7 +584,7 @@ class TrainConfig:
     # ≤ 0) to disable.
     p2_gate_reward_mtp_max: float = 3.0
     p2_gate_recent_iters: int = 5
-    p2_gate_max_extension: float = 0.3
+    p2_gate_max_extension: float = 0.5
 
     # ----- I/O -----
     out_dir: str = ''
@@ -3397,9 +3397,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     log_path = out_dir / 'train_log.jsonl'
     log_f = open(log_path, 'a')
 
-    # Phase budgets.
-    p1 = int(cfg.phase1_frac * cfg.total_steps)
-    p2 = int(cfg.phase2_frac * cfg.total_steps)
+    # Phase budgets: use provided fracs or fall back to paper defaults.
+    p1_frac = cfg.phase1_frac if cfg.phase1_frac is not None else 0.4
+    p2_frac = cfg.phase2_frac if cfg.phase2_frac is not None else 0.2
+    p3_frac = cfg.phase3_frac if cfg.phase3_frac is not None else 0.4
+    p1 = int(p1_frac * cfg.total_steps)
+    p2 = int(p2_frac * cfg.total_steps)
     p3 = cfg.total_steps - p1 - p2     # absorb rounding
 
     print(f"# train start: {time.strftime('%Y-%m-%d %H:%M:%S')} "

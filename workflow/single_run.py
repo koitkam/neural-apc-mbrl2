@@ -239,18 +239,29 @@ def main() -> int:
 
     # Plant-tied step budget (parity with workflow.bo_runner).  CLI > 0 wins;
     # otherwise derive trial_steps from episode_length + complexity.
-    from utils.plant_init import derive_step_budgets
+
+    # --- Iter-based, model-size-aware phase budget derivation ---
+    from utils.phase_budget import derive_phase_budgets
     if int(args.steps) > 0:
         total_steps = int(args.steps)
+        phase1_frac = None
+        phase2_frac = None
+        phase3_frac = None
         steps_source = 'cli'
     else:
-        budgets = derive_step_budgets(
+        phase_budgets = derive_phase_budgets(
             episode_length=episode_length,
             complexity_score=derived['complexity_score'],
+            model_size=model_size,
         )
-        total_steps = int(budgets['trial_steps'])
-        steps_source = f"plant-tied:{budgets['source']}"
+        total_steps = int(phase_budgets['total_steps'])
+        phase1_frac = phase_budgets['phase1_frac']
+        phase2_frac = phase_budgets['phase2_frac']
+        phase3_frac = phase_budgets['phase3_frac']
+        steps_source = f"iter-based:{phase_budgets['source']}"
     print(f'[run] total_steps={total_steps} ({steps_source})', flush=True)
+    if phase1_frac is not None:
+        print(f"[run] phase_fracs: {phase1_frac:.2f} / {phase2_frac:.2f} / {phase3_frac:.2f}", flush=True)
 
     # Build TrainConfig — every value either plant-tied or paper-faithful default.
     from training.train import TrainConfig, train as run_training
@@ -307,6 +318,8 @@ def main() -> int:
         batch_size=batch_size,
         out_dir=str(out_dir),
         init_from_ckpt=str(args.init_from_ckpt or ''),
+        **(dict(phase1_frac=phase1_frac, phase2_frac=phase2_frac, phase3_frac=phase3_frac) 
+           if phase1_frac is not None else {}),
     )
     # Optional env-var overrides for A/B experiments.  These apply
     # *after* dataclass construction so auto-tune (which compares
