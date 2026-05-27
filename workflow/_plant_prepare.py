@@ -251,6 +251,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_P2_GATE_REWARD_MTP_MAX': ('p2_gate_reward_mtp_max',  float),
     'DREAMER_P2_GATE_RECENT_ITERS': ('p2_gate_recent_iters',      int),
         'DREAMER_P2_GATE_MAX_EXTENSION': ('p2_gate_max_extension',    float),  # default 0.5
+    # 2026-05-27 (P57 RCA): minimum fraction of total_steps reserved
+    # for P3 (actor-critic) regardless of P1/P2 extensions.  Default
+    # 0.20 in TrainConfig.  Set to 0.0 to disable (legacy behaviour).
+    'DREAMER_PHASE3_MIN_FRAC':    ('phase3_min_frac',            float),
 }
 
 

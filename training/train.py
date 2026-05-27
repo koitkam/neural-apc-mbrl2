@@ -586,6 +586,17 @@ class TrainConfig:
     p2_gate_recent_iters: int = 5
     p2_gate_max_extension: float = 0.5
 
+    # 2026-05-27 (P57 RCA): P3 budget floor.  P57 burned 1.14 M of 1.61 M
+    # env_steps on P1 extensions, then P2 + the wm-fidelity ES consumed
+    # the rest before P3 (actor-critic) ever started — validation ran
+    # with an untrained critic.  ``phase3_min_frac`` reserves a fraction
+    # of ``total_steps`` for P3 *before* P1/P2 extensions can borrow from
+    # it: the runtime cap on ``p1_gate_max_ext_steps + p2_gate_max_ext_steps``
+    # is clamped to ``(total_steps - p1 - p2 - phase3_min_frac × total_steps)``,
+    # split proportionally to the configured extension ratios.  Set to
+    # 0.0 to disable (legacy behaviour: extensions can consume P3).
+    phase3_min_frac: float = 0.20
+
     # ----- I/O -----
     out_dir: str = ''
     log_every: int = 1
@@ -2731,10 +2742,35 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
     exploration and return ``(raw_rewards, obs_trace)``.  Pure-collect
     helper — does not mutate ``env.reward_scale`` (caller pins it to 1.0
     first).  Used by ``calibrate_reward_scale`` for σ-ladder retries.
+
+    2026-05-27 (P57 RCA): when ``sigma`` is small (≤ 0.01), the env
+    needs ``settle_steps`` zero-action steps after each reset before
+    the plant reaches its steady-state operating band.  Recording
+    rewards during settling pollutes the calibration sample with
+    transient violation rewards and hides the in-band-bonus mass that
+    only fires once CV converges to its setpoint band.  P57 saw
+    ``raw_max = +0.333`` despite a ``+1.0`` in-band bonus because the
+    bonus rarely fired during settling.  Skipping settling makes the
+    sample reflect the *true* operating distribution.  ``settle_steps``
+    is sim-agnostic — capped by ``n_steps // 10`` and 200 so it
+    scales with the calibration budget.
     """
     raw_rewards: List[float] = []
     obs_trace: List[np.ndarray] = []
+    is_small_sigma = (mode != 'random' and sigma <= 0.01)
+    settle_steps = min(200, max(0, int(n_steps) // 10)) if is_small_sigma else 0
+
+    def _settle():
+        if settle_steps <= 0:
+            return
+        a0 = np.zeros((env.action_dim,), dtype='float32')
+        for _ in range(settle_steps):
+            _, _, _done, _ = env.step(a0)
+            if _done:
+                env.reset(exploration=True)
+
     env.reset(exploration=True)
+    _settle()
     for _ in range(int(n_steps)):
         if mode == 'random':
             a = rng.uniform(-1.0, 1.0,
@@ -2754,6 +2790,7 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
             pass
         if done:
             env.reset(exploration=True)
+            _settle()
     return raw_rewards, obs_trace
 
 
@@ -3519,6 +3556,28 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p2_gate_recent_iters_v = int(getattr(cfg, 'p2_gate_recent_iters', 5))
     p2_gate_max_ext_steps = int(
         float(getattr(cfg, 'p2_gate_max_extension', 0.0)) * p2)
+    # P57 RCA: clamp p1+p2 extension caps so they cannot consume the
+    # P3 budget floor.  ``phase3_min_frac`` (default 0.20) reserves
+    # ≥20 % of total_steps for actor-critic training; the remaining
+    # extension budget is split between p1 and p2 proportionally to
+    # their configured ``max_extension`` ratios.  Sim-agnostic — no
+    # plant-specific constants.
+    _p3_min_frac = float(getattr(cfg, 'phase3_min_frac', 0.20))
+    if _p3_min_frac > 0.0 and (p1_gate_max_ext_steps + p2_gate_max_ext_steps) > 0:
+        _p3_floor = int(_p3_min_frac * cfg.total_steps)
+        _ext_budget = max(0, cfg.total_steps - p1 - p2 - _p3_floor)
+        _ext_requested = p1_gate_max_ext_steps + p2_gate_max_ext_steps
+        if _ext_requested > _ext_budget:
+            _scale = _ext_budget / max(1, _ext_requested)
+            _p1_cap_new = int(p1_gate_max_ext_steps * _scale)
+            _p2_cap_new = int(p2_gate_max_ext_steps * _scale)
+            print(f"[gate-budget] P3-floor={_p3_floor} reserves "
+                  f"{_p3_min_frac:.0%} of total_steps; clamping "
+                  f"p1_ext_cap {p1_gate_max_ext_steps}→{_p1_cap_new}, "
+                  f"p2_ext_cap {p2_gate_max_ext_steps}→{_p2_cap_new} "
+                  f"(ext_budget={_ext_budget})", flush=True)
+            p1_gate_max_ext_steps = _p1_cap_new
+            p2_gate_max_ext_steps = _p2_cap_new
     p1_ext_steps = 0
     p2_ext_steps = 0
     p2_reward_mtp_recent: 'deque[float]' = deque(
@@ -3831,9 +3890,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                        and wm_score_ema_best >= p1_gate_wm_ema_min_v)
             _plateau_ok = False
             if _ema_ok and len(p1_score_ema_history) >= p1_gate_plateau_probes_v:
-                _band = max(1e-6,
-                            p1_gate_plateau_frac_v * wm_score_ema_best)
+                # 2026-05-27 (P57 RCA): adaptive plateau band.  The
+                # static ``plateau_frac × ema_best`` band (default 5 %)
+                # is too tight for plants where the WM-fidelity probe
+                # has high per-probe variance (P57: σ(probe)≈0.4 →
+                # σ(EMA)≈0.3 → 5 % of ema_best=2.7 = 0.135 ≪ noise).
+                # The gate then never sees "plateaued" even after the
+                # EMA has flattened in the noisy sense.  Widen the
+                # band to ``max(plateau_frac × ema_best, k × σ(recent EMAs))``
+                # — sim-agnostic, derived from the actual EMA noise
+                # observed in the last ``2 × plateau_probes`` probes.
                 recent = p1_score_ema_history[-p1_gate_plateau_probes_v:]
+                _noise_window = p1_score_ema_history[
+                    -max(p1_gate_plateau_probes_v * 2, 4):]
+                _noise_std = (float(np.std([e for _, e in _noise_window]))
+                              if len(_noise_window) >= 2 else 0.0)
+                _band_static = p1_gate_plateau_frac_v * wm_score_ema_best
+                _band_noise = 2.0 * _noise_std
+                _band = max(1e-6, _band_static, _band_noise)
                 _plateau_ok = all(
                     abs(e - wm_score_ema_best) <= _band for _, e in recent)
             if _ema_ok and _plateau_ok:
@@ -4636,30 +4710,36 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                               and total_iters >= wm_fidelity_warmup_iters
                               and (total_iters - wm_score_ema_best_iter)
                                     >= wm_fidelity_patience_iters):
-                            # 2026-05-24 (P44 RCA): scope tightened from
-                            # ``current_phase in (1, 2)`` to ``== 2``.
-                            # This early-stop is designed to catch the
-                            # P2 reward-head encoder-backflow cliff
-                            # (P43 RCA). Applying it in P1 misfires
-                            # because P1 WM is still mid-fit and the
-                            # probe score is naturally noisy in the
-                            # first ~40 iters — P44 was killed at iter
-                            # 40 with best frozen at iter 10 even
-                            # though sf_loss was still falling and a
-                            # later probe showed best_h going 0→7/15.
-                            # P1 underfit is its own concern, addressed
-                            # by P1 budget + (future) p1-extension
-                            # logic, not by this ES path.
-                            early_stop_reason = (
-                                f'wm_fidelity_degradation: EMA score '
-                                f'no improvement over '
-                                f'ema_best={wm_score_ema_best:.3f} '
-                                f'(iter {wm_score_ema_best_iter}) for '
-                                f'{total_iters - wm_score_ema_best_iter} iters '
-                                f'(patience={wm_fidelity_patience_iters}, '
-                                f'ema_alpha={wm_score_ema_alpha:.2f}); '
-                                f'raw_best={wm_best_score:.3f} '
-                                f'(iter {wm_best_iter})')
+                            # 2026-05-27 (P57 RCA): suppress wm-fidelity
+                            # ES when P2 is close to its nominal end —
+                            # the WM has done its job in P1, and P2's
+                            # remaining iters are reward-MTP training,
+                            # not WM fidelity.  Killing P2 within
+                            # ``p1_gate_check_step`` env_steps of the
+                            # P2→P3 transition starves P3 of any
+                            # budget at all (P57 outcome).  Threshold
+                            # uses the existing p1 10 %-budget step
+                            # for consistency.
+                            _p2_end_env = p1 + p1_ext_steps + p2 + p2_ext_steps
+                            _p2_remaining = _p2_end_env - total_env_steps
+                            if _p2_remaining < p1_gate_check_step:
+                                print(f"[wm-fidelity-ES] suppressed at "
+                                      f"iter {total_iters}: P2 remaining "
+                                      f"{_p2_remaining} env_steps < "
+                                      f"{p1_gate_check_step}; deferring "
+                                      f"to natural P2→P3 transition",
+                                      flush=True)
+                            else:
+                                early_stop_reason = (
+                                    f'wm_fidelity_degradation: EMA score '
+                                    f'no improvement over '
+                                    f'ema_best={wm_score_ema_best:.3f} '
+                                    f'(iter {wm_score_ema_best_iter}) for '
+                                    f'{total_iters - wm_score_ema_best_iter} iters '
+                                    f'(patience={wm_fidelity_patience_iters}, '
+                                    f'ema_alpha={wm_score_ema_alpha:.2f}); '
+                                    f'raw_best={wm_best_score:.3f} '
+                                    f'(iter {wm_best_iter})')
                 except Exception as _e:
                     print(f"[wm-fidelity-probe-iter{total_iters}] "
                           f"error: {_e!r}", flush=True)
