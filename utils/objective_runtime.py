@@ -40,6 +40,15 @@ import numpy as np
 
 from utils.state_normalization import state_value_in_mode
 
+# DMC in-band bonus (P57, 2026-05-27): constant positive reward awarded
+# per step when all CVs are within their soft bounds. Lifts the positive
+# tail of the reward distribution so the symlog-twohot critic gets
+# meaningful mass on both sides of zero — fixes the critic-pessimism
+# cascade seen in P56 (rew_to_tgt_var ≈ 0.007 ≪ 0.015 threshold).
+# Simulator-agnostic constant; sized at ~2% of the default penalty_clip
+# so it cannot dominate violation gradients.
+DMC_INBAND_BONUS: float = 1.0
+
 
 def _safe_float(v, default=0.0):
     try:
@@ -443,12 +452,11 @@ def compute_objective_components(
     energy_term = 0.0
     movement_term = float(np.mean(np.asarray(mv_move_terms, dtype='float32'))) if mv_move_terms else 0.0
 
-    penalty_clip = float(os.environ.get('OBJECTIVE_PENALTY_CLIP', '250.0'))
-    reward_clip = float(os.environ.get('OBJECTIVE_REWARD_CLIP', '250.0'))
+    penalty_clip = float(os.environ.get('OBJECTIVE_PENALTY_CLIP', '50.0'))
+    reward_clip = float(os.environ.get('OBJECTIVE_REWARD_CLIP', '50.0'))
     sat_mode = str(os.environ.get('OBJECTIVE_PENALTY_SAT_MODE', 'tanh')).strip().lower()
     if sat_mode not in ('hard', 'tanh'):
         sat_mode = 'tanh'
-    # 2026-05-26 (P53 RCA): optional per-step bonus awarded when ALL
     # ---- Optional violation-rate term (DMC only) ----
     # ``OBJECTIVE_DMC_VIOLATION_RATE_COEF`` (env) overrides spec key
     # ``violation_rate_coef`` which overrides the auto-derived value
@@ -522,6 +530,14 @@ def compute_objective_components(
     reward -= mv_economic_penalty
     reward -= cv_economic_penalty
 
+    # DMC in-band bonus (P57): constant positive reward when feasible.
+    # Anchors the positive half of the symlog-twohot support so the
+    # critic doesn't collapse onto an all-negative distribution.
+    inband_bonus_applied = 0.0
+    if is_dmc and in_band:
+        inband_bonus_applied = DMC_INBAND_BONUS
+        reward += inband_bonus_applied
+
     reward = _saturate_two_sided(reward, reward_clip, sat_mode)
 
     return {
@@ -544,6 +560,7 @@ def compute_objective_components(
         'mv_economic_penalty': float(mv_economic_penalty),
         'cv_economic_penalty': float(cv_economic_penalty),
         'in_band': bool(in_band),
+        'in_band_bonus': float(inband_bonus_applied),
         'mv_target_terms': [float(x) for x in mv_target_terms],
         'cv_target_terms': [float(x) for x in cv_target_terms],
         'mv_target_penalty': float(mv_target_penalty),

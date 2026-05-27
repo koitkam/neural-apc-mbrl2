@@ -403,7 +403,11 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     if effective_reward_mode not in ('legacy', 'dmc'):
         effective_reward_mode = 'legacy'
     if effective_reward_mode == 'dmc':
-        dmc_violation_scale = _env_float('OBJ_AUTO_DMC_VIOLATION_SCALE', 0.05)
+        # P57 (2026-05-27): tightened from 0.05 → 0.02 because P56 showed
+        # the linear-penalty depth slope saturated the symlog support and
+        # the critic-pessimism cascade. 0.02 halves the saturation depth
+        # and shrinks the negative tail to give the symlog grid room.
+        dmc_violation_scale = _env_float('OBJ_AUTO_DMC_VIOLATION_SCALE', 0.02)
         cv_base = float(cv_base * dmc_violation_scale)
         mv_base = float(mv_base * dmc_violation_scale)
 

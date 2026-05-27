@@ -3163,9 +3163,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             'percentile').strip().lower() or 'percentile'
         try:
             cal_target_pct = float(os.environ.get(
-                'DREAMER_REWARD_CAL_PCT', '50') or 50.0)
+                'DREAMER_REWARD_CAL_PCT', '95') or 95.0)
         except Exception:
-            cal_target_pct = 50.0
+            cal_target_pct = 95.0
         try:
             cal_target_pct_value = float(os.environ.get(
                 'DREAMER_REWARD_CAL_PCT_VAL', '0.5') or 0.5)
