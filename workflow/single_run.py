@@ -88,10 +88,10 @@ def main() -> int:
     parser.add_argument('--out-dir', '-o', default=None,
                         help='Output directory. Default: '
                              '<repo>/output/<sim>/run_<timestamp>/')
-    parser.add_argument('--steps', type=int, default=1000000,
-                        help='Total environment steps. Default 1,000,000 '
-                             '(DreamerV3/V4 paper minimum for control '
-                             'tasks).  Pass 0 for plant-tied auto.')
+    parser.add_argument('--steps', type=int, default=0,
+                        help='Total environment steps. Default 0 = plant-tied '
+                             'auto-derivation (utils.phase_budget). Pass a '
+                             'positive integer to override.')
     parser.add_argument('--model-size', choices=['S', 'M', 'L'], default=None,
                         help='Architecture preset. Default: auto-derived from '
                              'plant complexity (channels + multiscale + state_dim).')
