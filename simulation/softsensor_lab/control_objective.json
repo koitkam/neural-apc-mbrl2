@@ -1,8 +1,8 @@
 {
     "model": "softsensor_lab_single_loop",
-    "description": "Drive ACYNMP_1259_LV lab value to target (33.0) via ACY_FIC631_SP. Single MV, single CV. Violation/move weights auto-derived.",
+    "description": "Drive ACYNMP_1259_LV lab value to target (33.0) via ACY_FIC631_SP. Single MV, single CV. Violation/move weights auto-derived. 2026-05-27: switched to reward_mode=dmc (linear violation + quadratic move) to unify reward shape across plants; magnitudes auto-rescaled by tolerance in utils/auto_weights.py.",
     "objective_use_normalized": 1,
-    "reward_mode": "legacy",
+    "reward_mode": "dmc",
     "bounds": {
         "mvs": {
             "mv_0": [

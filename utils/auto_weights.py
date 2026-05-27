@@ -228,7 +228,9 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # caps cv_base so the expected penalty at the *typical* violation
     # magnitude stays inside cap_frac of the reward clip, preventing the
     # adaptive formula from producing reward magnitudes that saturate.
-    reward_clip = _env_float('OBJECTIVE_REWARD_CLIP', 250.0)
+    # Default must agree with ``objective_runtime.OBJECTIVE_REWARD_CLIP``
+    # (both read the same env var). Tightened 250 → 50 in P57 to match.
+    reward_clip = _env_float('OBJECTIVE_REWARD_CLIP', 50.0)
     cap_frac = max(0.01, _env_float('OBJ_AUTO_CV_PENALTY_CAP_FRAC', 0.5))
     typical_cv_viol_frac = max(1e-3, _env_float('OBJ_AUTO_TYPICAL_CV_VIOLATION', 0.10))
     # Soft saturation advisory threshold (no longer a hard cap).
@@ -376,40 +378,42 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # Enforce priority #1: MV limits dominate CV limits by construction.
     mv_base = float(max(mv_base_floor_quadratic, mv_over_cv_ratio * cv_base))
 
-    # ---- DMC reward-mode rescaling (2026-05-26) -----------------------
-    # ``cv_base`` / ``mv_base`` are sized to make the QUADRATIC violation
-    # tail (legacy mode) hit a useful gradient at typical operating
-    # depths. In DMC mode the violation shape is LINEAR, so at the same
-    # depth the un-rescaled base produces a penalty ~1/typ_depth times
-    # larger than the legacy curve and tanh-saturates everywhere except
-    # very small depths — destroying both the per-side asymmetry and the
-    # depth gradient. We rescale by ``OBJ_AUTO_DMC_VIOLATION_SCALE``
-    # (default = typical normalized depth = 0.05) so that at typical
-    # depth ``base_dmc * depth`` matches ``base_legacy * depth^2`` in
-    # magnitude. The MV/CV ratio is preserved (both bases scaled
-    # identically) so priority MV > CV is maintained, and the priority
-    # CV > economics is maintained by the same factor (economics already
-    # capped relative to cv_base). Move tier is left untouched: it
-    # becomes ~1/typ_jitter smaller in absolute reward magnitude under
-    # the quadratic shape, but its anti-chatter relative gradient is
-    # preserved and it stays well below the violation tier (priority
-    # violation > move strengthened).
+    # ---- DMC reward-mode rescaling (2026-05-26, refactored 2026-05-27) ----
+    # ``cv_base`` / ``mv_base`` are sized for the QUADRATIC (legacy) shape
+    # so that at ``tolerance`` depth the penalty meets the priority
+    # hierarchy:
+    #     cv_base · tolerance² · rank_decay^(N-1)  =  margin · priority_budget
+    # Under the LINEAR (DMC) shape, matching the same penalty magnitude
+    # at the same design depth requires:
+    #     cv_base_dmc · tolerance  =  cv_base_legacy · tolerance²
+    # i.e. cv_base_dmc = cv_base_legacy · tolerance.
+    # The DMC scale is therefore identical to ``tolerance`` by
+    # construction — no separate knob. Override ``tolerance`` itself
+    # (via ``OBJ_AUTO_VIOLATION_TOLERANCE``) if you want a different
+    # design depth. MV/CV ratio and economics priority are preserved
+    # because both bases scale by the same factor.
     reward_mode_spec = ''
     if isinstance(spec, dict):
         reward_mode_spec = str(spec.get('reward_mode', '') or '').strip().lower()
-    # Env override beats spec, matching objective_runtime precedence.
     reward_mode_env = str(os.environ.get('OBJECTIVE_REWARD_MODE', '') or '').strip().lower()
     effective_reward_mode = reward_mode_env or reward_mode_spec or 'legacy'
     if effective_reward_mode not in ('legacy', 'dmc'):
         effective_reward_mode = 'legacy'
     if effective_reward_mode == 'dmc':
-        # P57 (2026-05-27): tightened from 0.05 → 0.02 because P56 showed
-        # the linear-penalty depth slope saturated the symlog support and
-        # the critic-pessimism cascade. 0.02 halves the saturation depth
-        # and shrinks the negative tail to give the symlog grid room.
-        dmc_violation_scale = _env_float('OBJ_AUTO_DMC_VIOLATION_SCALE', 0.02)
-        cv_base = float(cv_base * dmc_violation_scale)
-        mv_base = float(mv_base * dmc_violation_scale)
+        cv_base = float(cv_base * tolerance)
+        mv_base = float(mv_base * tolerance)
+        try:
+            typ_depth = tolerance
+            cv_pen_typ = cv_base * typ_depth
+            mv_pen_typ = mv_base * typ_depth
+            print(
+                f"[auto_weights] reward_mode=dmc rescale=tolerance={tolerance:.4f}: "
+                f"cv_base={cv_base:.2f} mv_base={mv_base:.2f}  "
+                f"penalty@depth={typ_depth:.3f}: cv={cv_pen_typ:.2f} mv={mv_pen_typ:.2f}  "
+                f"(reward_clip={reward_clip:.0f})"
+            )
+        except Exception:
+            pass
 
     if dynamics is None:
         dynamics = _load_dynamics_json()
