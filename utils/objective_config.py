@@ -3,7 +3,6 @@
 New schema (April 2026 refactor):
 
     {
-      "control_speed": "normal",        # aggressive | normal | slow
       "objective_use_normalized": 1,
       "bounds": {
         "mvs": {"mv_0": [0, 100], ...},
@@ -24,8 +23,8 @@ New schema (April 2026 refactor):
     }
 
 Violation and move weights are **auto-derived at runtime** from
-``cv_priority`` + ``control_speed`` + identified per-MV tau (see
-:mod:`utils.auto_weights`) and are NOT part of the JSON.
+``cv_priority`` + identified per-MV tau (see :mod:`utils.auto_weights`)
+and are NOT part of the JSON.
 
 Legacy fields (``*_violation_weights``, ``mv_move_weights``) are still parsed
 if present for backward compatibility but a warning is printed.
@@ -63,7 +62,6 @@ def _load_file_config() -> Dict[str, Any]:
 
 def _default_spec() -> Dict[str, Any]:
     return {
-        'control_speed': 'normal',
         'objective_use_normalized': 1,
         'bounds': {
             'mvs': {},
@@ -149,7 +147,7 @@ def _warn_legacy_weights(file_cfg: Dict[str, Any]) -> None:
         print(
             f'[objective_config] NOTICE: legacy weight keys {present} found in '
             f'control_objective.json - these are now auto-derived from '
-            f'cv_priority + control_speed + identified dynamics and will be '
+            f'cv_priority + identified dynamics and will be '
             f'ignored. You can safely remove them.',
             file=sys.stderr,
         )
@@ -185,14 +183,9 @@ def _coerce_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     default_rs = _default_spec()['runtime_setpoints']
     rs = {**default_rs, **{k: v for k, v in rs_in.items() if v is not None}}
 
-    speed = str(spec.get('control_speed') or 'normal').strip().lower()
-    if speed not in ('aggressive', 'normal', 'slow'):
-        speed = 'normal'
-
     n_mv = len(mvs)
     n_cv = len(cvs)
     out = {
-        'control_speed': speed,
         'objective_use_normalized': 1 if int(_safe_float(spec.get('objective_use_normalized', 1), 1)) != 0 else 0,
         'bounds': {
             'mvs': mvs,
@@ -229,8 +222,6 @@ def load_objective_spec() -> Dict[str, Any]:
         _warn_legacy_weights(file_cfg)
         spec = _merge(spec, file_cfg)
 
-    if os.environ.get('CONTROL_SPEED'):
-        spec['control_speed'] = os.environ['CONTROL_SPEED']
     spec['objective_use_normalized'] = 1 if int(_safe_float(
         os.environ.get('OBJ_USE_NORMALIZED', spec.get('objective_use_normalized', 1)),
         spec.get('objective_use_normalized', 1),

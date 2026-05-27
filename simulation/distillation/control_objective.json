@@ -1,8 +1,8 @@
 {
     "model": "distillation_tower_example",
     "description": "Objective for the distillation simulator. cv_priority is ranked: top_comp > bottom_comp > pressure. Violation/move weights auto-derived from priority rank + identified dynamics.",
-    "control_speed": "normal",
     "objective_use_normalized": 1,
+    "reward_mode": "legacy",
     "bounds": {
         "mvs": {
             "mv_0": [

@@ -1,8 +1,8 @@
 {
     "model": "test_sim_single_loop",
-    "description": "Objective for fast single-loop distillation-like reflux control: hold control temperature in spec while minimizing reflux usage and movement. Violation/move weights are auto-derived from cv_priority + control_speed + identified dynamics.",
-    "control_speed": "normal",
+    "description": "Objective for fast single-loop distillation-like reflux control: hold control temperature in spec while minimizing reflux usage and movement. Violation/move weights are auto-derived from cv_priority + identified dynamics. 2026-05-26: switched to reward_mode=dmc (linear violation + quadratic move) with HIGH-side temperature limit 2.5x more urgent than LOW-side via cv_side_scale; cv_violation_weights_lo/hi and violation_rate_coef auto-derived in utils/auto_weights.py.",
     "objective_use_normalized": 1,
+    "reward_mode": "dmc",
     "bounds": {
         "mvs": {
             "mv_0": [
@@ -20,6 +20,12 @@
     "cv_priority": [
         "cv_0"
     ],
+    "cv_side_scale": {
+        "cv_0": {
+            "lo": 0.4,
+            "hi": 1.0
+        }
+    },
     "weights": {
         "mv_economic": {
             "mv_0": 5.0

@@ -1,8 +1,8 @@
 {
     "model": "softsensor_lab_single_loop",
     "description": "Drive ACYNMP_1259_LV lab value to target (33.0) via ACY_FIC631_SP. Single MV, single CV. Violation/move weights auto-derived.",
-    "control_speed": "normal",
     "objective_use_normalized": 1,
+    "reward_mode": "legacy",
     "bounds": {
         "mvs": {
             "mv_0": [

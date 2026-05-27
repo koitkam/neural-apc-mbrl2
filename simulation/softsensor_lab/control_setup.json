@@ -15,10 +15,6 @@
         "input_jitter_pct": 0.005,
         "actuator_tau_steps": 4,
         "dv_mean_shift_pct": 0.05
-    },
-    "workflow": {
-        "quick_cycle_polish_agent_total_steps": 393216,
-        "polish_agent_total_steps": 524288
     }
 }
 

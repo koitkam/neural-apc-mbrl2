@@ -7,34 +7,5 @@
             "sample_rate": 1,
             "noise_stdv": 0.02
         }
-    },
-    "io": {
-        "state_variables": [
-            "Y1_PV",
-            "Y2_PV",
-            "Y3_PV",
-            "MV1",
-            "MV2",
-            "MV3",
-            "DV1",
-            "DV2"
-        ],
-        "mv_indices": [3, 4, 5],
-        "dv_indices": [6, 7],
-        "cv_indices": [0, 1, 2],
-        "mv_normalization_ranges": [
-            [0.0, 100.0],
-            [0.0, 100.0],
-            [0.0, 100.0]
-        ],
-        "cv_normalization_ranges": [
-            [0.0, 100.0],
-            [0.0, 100.0],
-            [0.0, 100.0]
-        ],
-        "dv_normalization_ranges": [
-            [0.0, 100.0],
-            [0.0, 100.0]
-        ]
     }
 }

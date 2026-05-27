@@ -68,8 +68,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from utils.control_speed import get_control_speed_factors
-
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -78,14 +76,10 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _cv_rank_order(spec: Dict, n_cv: int) -> List[int]:
-    """Map state-order CV index -> rank (1 = most important).
-
-    Looks for ``spec['cv_priority']`` which is a list of CV names
-    (``cv_0``, ``cv_1`` ...) in decreasing importance.  Missing names get
-    the tail ranks.
+def _cv_rank_order_from_list(raw, n_cv: int) -> List[int]:
+    """Convert a list of CV names (``cv_0``, ``cv_1`` ...) into a per-state-
+    index rank list (1 = most important). Missing names get tail ranks.
     """
-    raw = spec.get('cv_priority') if isinstance(spec, dict) else None
     order = list(range(n_cv))
     if isinstance(raw, list) and raw:
         seen = []
@@ -96,21 +90,50 @@ def _cv_rank_order(spec: Dict, n_cv: int) -> List[int]:
                 continue
             if 0 <= idx < n_cv and idx not in seen:
                 seen.append(idx)
-        # Append any missing CV indices at the end (lowest priority).
         for i in range(n_cv):
             if i not in seen:
                 seen.append(i)
         order = seen
-    # order[k] is the state-index of the k-th most important CV.
-    # Return rank per state index.
     ranks = [0] * n_cv
     for rank_minus_one, state_idx in enumerate(order):
         if 0 <= state_idx < n_cv:
             ranks[state_idx] = rank_minus_one + 1
     for i in range(n_cv):
         if ranks[i] == 0:
-            ranks[i] = n_cv  # any untouched gets last rank
+            ranks[i] = n_cv
     return ranks
+
+
+def _cv_rank_order(spec: Dict, n_cv: int) -> List[int]:
+    """Map state-order CV index -> rank from ``spec['cv_priority']``."""
+    raw = spec.get('cv_priority') if isinstance(spec, dict) else None
+    return _cv_rank_order_from_list(raw, n_cv)
+
+
+def _cv_rank_order_side(spec: Dict, n_cv: int, side: str) -> List[int]:
+    """Per-bound-side rank order. ``side`` is ``'lo'`` or ``'hi'``.
+
+    Reads ``spec['cv_priority_lo']`` / ``spec['cv_priority_hi']`` and
+    falls back to ``spec['cv_priority']`` when the side-specific key is
+    absent. Returns a per-state-index rank list (1 = most important).
+
+    This lets a multi-CV objective express asymmetric urgency between
+    over-limit and under-limit conditions per channel (e.g. tighter
+    over-limit handling on a quality CV, tighter under-limit on a
+    safety CV) without changing the legacy ``cv_priority`` schema. The
+    derived ``cv_violation_weights_lo`` / ``cv_violation_weights_hi``
+    are consumed by ``utils.objective_runtime.compute_objective_components``
+    when ``OBJECTIVE_REWARD_MODE=dmc`` (linear) and produce a true
+    asymmetric penalty: ``w_lo * max(0, lo - x) + w_hi * max(0, x - hi)``.
+    """
+    if not isinstance(spec, dict):
+        return _cv_rank_order_from_list(None, n_cv)
+    side = str(side).lower().strip()
+    key = 'cv_priority_lo' if side == 'lo' else 'cv_priority_hi'
+    raw = spec.get(key)
+    if not isinstance(raw, list) or not raw:
+        raw = spec.get('cv_priority')
+    return _cv_rank_order_from_list(raw, n_cv)
 
 
 def _load_dynamics_json() -> Optional[Dict]:
@@ -174,8 +197,7 @@ def _sum_abs_weights(weights_section: Dict, key: str) -> float:
 
 
 def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
-                        dynamics: Optional[Dict] = None,
-                        control_speed: Optional[str] = None) -> Dict:
+                        dynamics: Optional[Dict] = None) -> Dict:
     """Return a dict of auto-derived weight vectors.
 
     The returned weights are **adaptive** to (a) the user-supplied
@@ -190,8 +212,8 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         mv_target_weights: list[float] length n_mv (linear L1 coeff)
         cv_target_weights: list[float] length n_cv (linear L1 coeff)
         cv_ranks: list[int]
-        speed: str
         tau_per_mv: list[float]
+        violation_rate_coef: float (auto-derived DMC sliding-mode gain)
         econ_budget / target_budget / priority_budget: diagnostic scalars
     """
     mv_base_env = _env_float('OBJ_AUTO_MV_VIOLATION_BASE', 25.0)
@@ -354,16 +376,81 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # Enforce priority #1: MV limits dominate CV limits by construction.
     mv_base = float(max(mv_base_floor_quadratic, mv_over_cv_ratio * cv_base))
 
+    # ---- DMC reward-mode rescaling (2026-05-26) -----------------------
+    # ``cv_base`` / ``mv_base`` are sized to make the QUADRATIC violation
+    # tail (legacy mode) hit a useful gradient at typical operating
+    # depths. In DMC mode the violation shape is LINEAR, so at the same
+    # depth the un-rescaled base produces a penalty ~1/typ_depth times
+    # larger than the legacy curve and tanh-saturates everywhere except
+    # very small depths — destroying both the per-side asymmetry and the
+    # depth gradient. We rescale by ``OBJ_AUTO_DMC_VIOLATION_SCALE``
+    # (default = typical normalized depth = 0.05) so that at typical
+    # depth ``base_dmc * depth`` matches ``base_legacy * depth^2`` in
+    # magnitude. The MV/CV ratio is preserved (both bases scaled
+    # identically) so priority MV > CV is maintained, and the priority
+    # CV > economics is maintained by the same factor (economics already
+    # capped relative to cv_base). Move tier is left untouched: it
+    # becomes ~1/typ_jitter smaller in absolute reward magnitude under
+    # the quadratic shape, but its anti-chatter relative gradient is
+    # preserved and it stays well below the violation tier (priority
+    # violation > move strengthened).
+    reward_mode_spec = ''
+    if isinstance(spec, dict):
+        reward_mode_spec = str(spec.get('reward_mode', '') or '').strip().lower()
+    # Env override beats spec, matching objective_runtime precedence.
+    reward_mode_env = str(os.environ.get('OBJECTIVE_REWARD_MODE', '') or '').strip().lower()
+    effective_reward_mode = reward_mode_env or reward_mode_spec or 'legacy'
+    if effective_reward_mode not in ('legacy', 'dmc'):
+        effective_reward_mode = 'legacy'
+    if effective_reward_mode == 'dmc':
+        dmc_violation_scale = _env_float('OBJ_AUTO_DMC_VIOLATION_SCALE', 0.05)
+        cv_base = float(cv_base * dmc_violation_scale)
+        mv_base = float(mv_base * dmc_violation_scale)
+
     if dynamics is None:
         dynamics = _load_dynamics_json()
-    factors = get_control_speed_factors(control_speed or spec.get('control_speed'))
 
     ranks = _cv_rank_order(spec, n_cv)
+    ranks_lo = _cv_rank_order_side(spec, n_cv, 'lo')
+    ranks_hi = _cv_rank_order_side(spec, n_cv, 'hi')
+    # Optional per-CV per-side explicit multiplier. Used to express
+    # asymmetric hi-vs-lo urgency on a SINGLE-CV plant where the
+    # rank-based scheme is degenerate (one CV → rank=1 on both sides).
+    # Schema: ``"cv_side_scale": {"cv_0": {"lo": 0.4, "hi": 1.0}, ...}``
+    # Missing CV / missing side defaults to 1.0 (no change).
+    side_scale_raw = spec.get('cv_side_scale', {}) if isinstance(spec, dict) else {}
+    if not isinstance(side_scale_raw, dict):
+        side_scale_raw = {}
+
+    def _side_scale(j: int, side: str) -> float:
+        entry = side_scale_raw.get(f'cv_{j}')
+        if not isinstance(entry, dict):
+            return 1.0
+        try:
+            return float(entry.get(side, 1.0))
+        except Exception:
+            return 1.0
     taus = _per_mv_tau(n_mv, dynamics)
     median_tau = float(np.median(taus)) if taus else 1.0
     median_tau = max(1e-3, median_tau)
 
     cv_weights = [float(cv_base * (rank_decay ** max(0, r - 1))) for r in ranks]
+    # Per-side CV weights derived from optional ``cv_priority_lo`` /
+    # ``cv_priority_hi`` (rank-based, useful when N_CV > 1) AND
+    # ``cv_side_scale`` (explicit per-side multiplier, useful when
+    # N_CV == 1 where rank ordering is degenerate). When both keys are
+    # absent the per-side weights collapse to ``cv_weights`` (=symmetric,
+    # legacy behaviour). Consumed by ``OBJECTIVE_REWARD_MODE=dmc`` in
+    # ``objective_runtime.py``; legacy mode keeps using the symmetric
+    # ``cv_violation_weights`` so checkpoint calibrations remain valid.
+    cv_weights_lo = [
+        float(cv_base * (rank_decay ** max(0, r - 1)) * _side_scale(j, 'lo'))
+        for j, r in enumerate(ranks_lo)
+    ]
+    cv_weights_hi = [
+        float(cv_base * (rank_decay ** max(0, r - 1)) * _side_scale(j, 'hi'))
+        for j, r in enumerate(ranks_hi)
+    ]
     mv_weights = [float(mv_base) for _ in range(n_mv)]
     # Adaptive move_base: target a fixed-fraction-of-reward-clip steady-
     # state cost from actor jitter (sigma_ref). Three competing ceilings:
@@ -395,22 +482,48 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
                                         move_base_econ_cap))
     move_base = float(max(move_base_floor, move_base_uncapped_min))
     move_weights = [
-        float(move_base * max(0.2, tau / median_tau) * factors.move_penalty_scale)
+        float(move_base * max(0.2, tau / median_tau))
         for tau in taus
     ]
+
+    # ---- Adaptive DMC violation-rate coefficient (2026-05-26) ----
+    # Sliding-mode "reaching law" gain auto-derived from identified
+    # plant dynamics. Larger gain = faster constraint recovery; smaller
+    # gain = less reaction to spurious growth signals from noise.
+    # Trade-off: slow plants benefit more from anticipatory penalty
+    # (many sample periods to recover), fast plants need less (the
+    # static linear penalty alone reacts in time). The quadratic MV
+    # move penalty in DMC mode already handles anti-jitter, so coef
+    # can be moderately aggressive without inducing chatter.
+    # Formula: coef = clip(median_tau / 4, 0.3, 1.5).
+    # Override via env ``OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR`` (default 4),
+    # ``OBJ_AUTO_VIOLATION_RATE_COEF_MIN`` (default 0.3),
+    # ``OBJ_AUTO_VIOLATION_RATE_COEF_MAX`` (default 1.5).
+    # Hard override via env ``OBJECTIVE_DMC_VIOLATION_RATE_COEF`` or
+    # spec key ``violation_rate_coef`` (consumed in objective_runtime.py).
+    rate_div = max(0.5, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR', 4.0))
+    rate_min = max(0.0, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_MIN', 0.3))
+    rate_max = max(rate_min, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_MAX', 1.5))
+    violation_rate_coef = float(
+        max(rate_min, min(rate_max, median_tau / rate_div))
+    )
     mv_target_weights = [float(target_base if v else 0.0) for v in mv_target_active]
     cv_target_weights = [float(target_base if v else 0.0) for v in cv_target_active]
 
     return {
         'mv_violation_weights': mv_weights,
         'cv_violation_weights': cv_weights,
+        'cv_violation_weights_lo': cv_weights_lo,
+        'cv_violation_weights_hi': cv_weights_hi,
         'mv_move_weights': move_weights,
         'mv_target_weights': mv_target_weights,
         'cv_target_weights': cv_target_weights,
         'cv_ranks': ranks,
-        'speed': factors.name,
+        'cv_ranks_lo': ranks_lo,
+        'cv_ranks_hi': ranks_hi,
         'tau_per_mv': taus,
         'median_tau': median_tau,
+        'violation_rate_coef': violation_rate_coef,
         'mv_violation_base': mv_base,
         'cv_violation_base': cv_base,
         'mv_violation_base_floor_linear': mv_base_env,
@@ -447,7 +560,6 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         'move_target_cost_frac': float(move_target_cost_frac),
         'move_sigma_ref': float(move_sigma_ref),
         'move_expected_step_jitter': float(expected_step_jitter),
-        'speed_move_scale': factors.move_penalty_scale,
         'mv_over_cv_ratio': mv_over_cv_ratio,
         'violation_tolerance': tolerance,
         'violation_margin': margin,

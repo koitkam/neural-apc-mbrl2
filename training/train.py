@@ -715,6 +715,12 @@ class APCEnv:
         self._window: Optional[np.ndarray] = None
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
+        # Previous-step raw per-channel violation depth (lo_viol+hi_viol),
+        # consumed by ``compute_objective_components`` for the DMC
+        # ``OBJECTIVE_DMC_VIOLATION_RATE_COEF`` term.  ``None`` on the
+        # first step of an episode (rate term skipped that step).
+        self._prev_mv_violation_per_channel: Optional[list] = None
+        self._prev_cv_violation_per_channel: Optional[list] = None
         self._schedule: List[Dict] = []
         self.reward_scale: float = 1.0
         self._last_cv_violation_sum: float = 0.0
@@ -875,6 +881,8 @@ class APCEnv:
         state = np.asarray(state, dtype='float32').reshape(-1)
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
+        self._prev_mv_violation_per_channel = None
+        self._prev_cv_violation_per_channel = None
         self._last_cv_violation_sum = 0.0
         self._last_mv_violation_sum = 0.0
         if self._derived_features is not None:
@@ -955,6 +963,8 @@ class APCEnv:
             obj_w=self.obj_w, bounds=self.bounds,
             setpoint_manager=self.setpoint_mgr,
             objective_spec=self.obj_spec,
+            prev_mv_violation_per_channel=self._prev_mv_violation_per_channel,
+            prev_cv_violation_per_channel=self._prev_cv_violation_per_channel,
         )
         raw_reward = float(comps['reward'])
         # Apply raw clip BEFORE scaling so calibration (which percentile-
@@ -973,6 +983,12 @@ class APCEnv:
             raw_reward = clipped
         reward = raw_reward * float(self.reward_scale)
         self._prev_control = np.asarray(control, dtype='float32')
+        # Stash raw per-channel violation depths for next step's
+        # DMC rate term (legacy mode ignores them).
+        self._prev_mv_violation_per_channel = list(
+            comps.get('mv_violation_per_channel_raw', []) or [])
+        self._prev_cv_violation_per_channel = list(
+            comps.get('cv_violation_per_channel_raw', []) or [])
         self._t += 1
         done = self._t >= self.cfg.episode_length
         obs_vec = self._build_obs_vec(next_state)
@@ -4595,16 +4611,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                   f"{_score:.3f} at iter {total_iters} "
                                   f"-> saved {wm_best_ckpt_path.name}",
                                   flush=True)
-                        # EMA-best tracking, scoped to P2 only via
-                        # the P2-entry baseline.
+                        # EMA-best tracking for the phase gates.
+                        # 2026-05-26 (P53 RCA): previously scoped to
+                        # P2 only, which left ``wm_score_ema_best`` at
+                        # the -1e18 sentinel during P1.  The P1→P2
+                        # gate reads this field, so it could never
+                        # pass on the EMA criterion and burned through
+                        # the full extension cap.  Update continuously
+                        # in P1 as well; the P2-entry baseline reset
+                        # still gives the P2 patience window a fresh
+                        # clock.
+                        if wm_score_ema > wm_score_ema_best:
+                            wm_score_ema_best = wm_score_ema
+                            wm_score_ema_best_iter = int(total_iters)
                         if current_phase == 2 and wm_es_p2_baseline_iter < 0:
                             wm_es_p2_baseline_iter = int(total_iters)
                             # Reset EMA-best on P2 entry so the P2
                             # patience window starts fresh.
-                            wm_score_ema_best = wm_score_ema
-                            wm_score_ema_best_iter = int(total_iters)
-                        if (current_phase == 2
-                                and wm_score_ema > wm_score_ema_best):
                             wm_score_ema_best = wm_score_ema
                             wm_score_ema_best_iter = int(total_iters)
                         if (es_enable
