@@ -68,6 +68,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# 2026-05-27 (P58 hotfix): ``derive_auto_weights`` is invoked from
+# ``compute_objective_components`` on every reward step when obj_w lacks
+# pre-computed per-channel weight vectors.  Unconditional advisory
+# prints inside it produced 228 K log lines / 76 MB workflow.log in
+# under 10 minutes.  Module-level one-shot flags keep diagnostics
+# informative without spamming.
+_ADVISORY_WARNED: Dict[str, bool] = {
+    'cv_base_exceeds': False,
+    'dmc_rescale': False,
+}
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -361,7 +372,14 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # (MV > CV(by rank) > targets > economics) takes precedence.
     cv_base = cv_base_raw
     cv_base_above_advisory = bool(cv_base > cv_base_advisory + 1e-9)
-    if cv_base_above_advisory:
+    if cv_base_above_advisory and not _ADVISORY_WARNED['cv_base_exceeds']:
+        # One-shot: ``derive_auto_weights`` is invoked from
+        # ``compute_objective_components`` on every reward step when
+        # obj_w lacks pre-computed weight vectors, so an unconditional
+        # print here exploded P58's workflow.log to 76 MB / 228 K lines
+        # before the first iter completed.  Module-level guard keeps
+        # the diagnostic informative without spamming.
+        _ADVISORY_WARNED['cv_base_exceeds'] = True
         try:
             print(
                 f"[auto_weights] cv_violation_base={cv_base:.0f} exceeds the "
@@ -370,7 +388,8 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
                 f"large; with tanh saturation the gradient is preserved and "
                 f"the priority hierarchy is maintained. Raise "
                 f"OBJECTIVE_REWARD_CLIP if you need linear differentiation "
-                f"between moderate and severe violations."
+                f"between moderate and severe violations. (suppressing "
+                f"further repeats of this advisory)"
             )
         except Exception:
             pass
@@ -402,18 +421,20 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     if effective_reward_mode == 'dmc':
         cv_base = float(cv_base * tolerance)
         mv_base = float(mv_base * tolerance)
-        try:
-            typ_depth = tolerance
-            cv_pen_typ = cv_base * typ_depth
-            mv_pen_typ = mv_base * typ_depth
-            print(
-                f"[auto_weights] reward_mode=dmc rescale=tolerance={tolerance:.4f}: "
-                f"cv_base={cv_base:.2f} mv_base={mv_base:.2f}  "
-                f"penalty@depth={typ_depth:.3f}: cv={cv_pen_typ:.2f} mv={mv_pen_typ:.2f}  "
-                f"(reward_clip={reward_clip:.0f})"
-            )
-        except Exception:
-            pass
+        if not _ADVISORY_WARNED['dmc_rescale']:
+            _ADVISORY_WARNED['dmc_rescale'] = True
+            try:
+                typ_depth = tolerance
+                cv_pen_typ = cv_base * typ_depth
+                mv_pen_typ = mv_base * typ_depth
+                print(
+                    f"[auto_weights] reward_mode=dmc rescale=tolerance={tolerance:.4f}: "
+                    f"cv_base={cv_base:.2f} mv_base={mv_base:.2f}  "
+                    f"penalty@depth={typ_depth:.3f}: cv={cv_pen_typ:.2f} mv={mv_pen_typ:.2f}  "
+                    f"(reward_clip={reward_clip:.0f}; suppressing further repeats)"
+                )
+            except Exception:
+                pass
 
     if dynamics is None:
         dynamics = _load_dynamics_json()
