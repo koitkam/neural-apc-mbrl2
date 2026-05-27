@@ -288,11 +288,13 @@ P39 baseline.
 ## Single training run (no BO)
 
 ```bash
-python -m workflow.single_run --simulation-dir simulation/test_sim --steps 500000
+python -m workflow.single_run --simulation-dir simulation/test_sim
 ```
 
 Same plant-derivation chain; output goes to `output/<sim>/run_<ts>/`.
-Useful for quick smoke tests or debugging without the BO overhead.
+All knobs auto-derive from the plant (including `--steps`, which now
+defaults to `0` = plant-tied auto-derivation via `utils.phase_budget`).
+Pass `--steps N` only to override; useful for quick smoke tests.
 Accepts `--init-from-ckpt PATH` for warm-starts (see *BO* section above
 for semantics; identical for single-run).
 
