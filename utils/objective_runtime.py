@@ -257,12 +257,9 @@ def compute_objective_components(
     # Precedence: env var > objective_spec key > code default.
     # JSON keys (preferred for per-sim persistent config):
     #   - ``reward_mode``          : "legacy" | "dmc"
-    #   - ``inband_bonus``         : float (legacy mode only)
     #   - ``violation_rate_coef``  : float (DMC mode only)
-    #   - ``econ_offset_mode``     : "off" | "gated" | "gated_floor" (legacy only)
     # Env vars (preferred for one-off launch overrides):
-    #   - ``OBJECTIVE_REWARD_MODE``, ``OBJECTIVE_INBAND_BONUS``,
-    #     ``OBJECTIVE_DMC_VIOLATION_RATE_COEF``, ``OBJECTIVE_ECON_OFFSET_MODE``.
+    #   - ``OBJECTIVE_REWARD_MODE``, ``OBJECTIVE_DMC_VIOLATION_RATE_COEF``.
     _spec_cfg = objective_spec if isinstance(objective_spec, dict) else {}
 
     def _resolve_cfg(env_key: str, spec_key: str, default):
@@ -452,51 +449,6 @@ def compute_objective_components(
     if sat_mode not in ('hard', 'tanh'):
         sat_mode = 'tanh'
     # 2026-05-26 (P53 RCA): optional per-step bonus awarded when ALL
-    # MV and CV constraints are within bounds.  The pure-penalty
-    # objective inherited from traditional APC produces a one-sided
-    # reward distribution (range [-X, 0]) which causes the symlog-
-    # scaled critic to collapse to a near-constant prediction
-    # (rew_to_tgt_var → 0) and trigger the bootstrap cascade early
-    # stop.  A small in-band bonus gives the critic two-sided
-    # variance and the actor a positive signal for staying in spec
-    # without changing the relative ordering of violations.  Default
-    # changed 2026-05-26: 1.0 (matches the P53 known-good baseline,
-    # promoted to default after P53 reduced CV violations 85% vs
-    # P52). Set ``OBJECTIVE_INBAND_BONUS=0.0`` (or ``inband_bonus: 0.0``
-    # in the objective spec) to recover the pre-P53 "no bonus" behaviour.
-    # Ignored entirely when ``reward_mode=dmc``.
-    in_band_bonus = float(_resolve_cfg(
-        'OBJECTIVE_INBAND_BONUS', 'inband_bonus', 1.0))
-
-    # 2026-05-26 (P53 RCA, follow-up): gated economic offset.
-    # ``OBJECTIVE_ECON_OFFSET_MODE`` selects how the economic terms
-    # are folded into the reward:
-    #   ``off``         — legacy: econ penalties always subtracted.
-    #   ``gated``       — econ penalties only active in-band, and are
-    #                     offset by the worst-case in-band penalty so
-    #                     in-band economic reward is ≥ 0.  Matches the
-    #                     APC "feasibility-first, then optimize" rule.
-    #   ``gated_floor`` — same as ``gated`` but guarantees at least
-    #                     ``OBJECTIVE_INBAND_BONUS`` worth of positive
-    #                     in-band reward even when configured econ
-    #                     weights are all zero.
-    # The offset is computed from the *currently-resolved* bound box
-    # (``mv_bounds`` / ``cv_bounds`` above already come from
-    # ``setpoint_manager.current_mv_bounds`` / ``current_cv_bounds``),
-    # so it automatically tracks operator-driven runtime bound changes
-    # scheduled by ``RuntimeSetpointManager``.
-    econ_offset_mode = str(_resolve_cfg(
-        'OBJECTIVE_ECON_OFFSET_MODE', 'econ_offset_mode', 'off')).strip().lower()
-    if econ_offset_mode not in ('off', 'gated', 'gated_floor'):
-        econ_offset_mode = 'off'
-    if is_dmc:
-        # DMC reward by design has no in-band bonus and no econ offset:
-        # the linear violation gradient + quadratic move term already
-        # give the critic two-sided variance and a smooth in-band
-        # gradient back toward the economic optimum.
-        in_band_bonus = 0.0
-        econ_offset_mode = 'off'
-
     # ---- Optional violation-rate term (DMC only) ----
     # ``OBJECTIVE_DMC_VIOLATION_RATE_COEF`` (env) overrides spec key
     # ``violation_rate_coef`` which overrides the auto-derived value
@@ -546,46 +498,6 @@ def compute_objective_components(
         <= 1e-9
     )
 
-    # Per-step economic offset over the current bound box.  By
-    # construction ``offset >= max_in_box(econ_penalty)``, so the
-    # quantity ``offset - econ_penalty`` is always >= 0 in-band.
-    econ_offset_total = 0.0
-    if econ_offset_mode != 'off':
-        mid = 0.5 if use_normalized else 0.0
-        for i in range(mv_dim):
-            lo_i, hi_i = float(mv_bounds[i][0]), float(mv_bounds[i][1])
-            if use_normalized:
-                r_lo, r_hi = mv_norm_ranges[i]
-                lo_t, hi_t = _normalized_bounds(lo_i, hi_i, r_lo, r_hi)
-            else:
-                lo_t, hi_t = lo_i, hi_i
-            w_i = (float(mv_economic_weights[i])
-                   if i < len(mv_economic_weights) else 0.0)
-            econ_offset_total += max(w_i * (lo_t - mid),
-                                     w_i * (hi_t - mid))
-        for j in range(cv_dim):
-            lo_j, hi_j = float(cv_bounds[j][0]), float(cv_bounds[j][1])
-            if use_normalized:
-                r_lo, r_hi = cv_norm_ranges[j]
-                lo_t, hi_t = _normalized_bounds(lo_j, hi_j, r_lo, r_hi)
-            else:
-                lo_t, hi_t = lo_j, hi_j
-            w_j = (float(cv_economic_weights[j])
-                   if j < len(cv_economic_weights) else 0.0)
-            econ_offset_total += max(w_j * (lo_t - mid),
-                                     w_j * (hi_t - mid))
-        # Saturate with the same function used for penalties so the
-        # arithmetic ``offset - econ_penalty`` stays monotone-bounded.
-        # ``_saturate_two_sided`` because offset can be negative when
-        # the configured box lies entirely off the economic midpoint
-        # (rare but legal).
-        econ_offset_total = _saturate_two_sided(
-            econ_offset_total, penalty_clip, sat_mode)
-
-    # Stash raw econ penalties before in-place saturation — the gated
-    # path needs the saturated values, but logging benefits from the
-    # raw ones too.  We use the saturated ones in the reward sum so
-    # ``offset - econ_penalty`` stays consistent in scale.
     mv_violation_penalty = _saturate_one_sided(mv_violation_penalty, penalty_clip, sat_mode)
     cv_violation_penalty = _saturate_one_sided(cv_violation_penalty, penalty_clip, sat_mode)
     mv_economic_penalty = _saturate_two_sided(mv_economic_penalty, penalty_clip, sat_mode)
@@ -606,31 +518,9 @@ def compute_objective_components(
     if 'cv_violation' in obj_w:
         reward -= _safe_float(obj_w.get('cv_violation', 0.0), 0.0) * _saturate_one_sided(cv_penalty, penalty_clip, sat_mode)
 
-    # Economic term: legacy vs gated.
-    if econ_offset_mode == 'off':
-        reward -= mv_economic_penalty
-        reward -= cv_economic_penalty
-    else:
-        if in_band:
-            # In-band economic shaping: positive, peaks at the most
-            # economic operating point, zero at the worst in-band point.
-            reward += econ_offset_total - (mv_economic_penalty
-                                           + cv_economic_penalty)
-            if econ_offset_mode == 'gated_floor':
-                # Degenerate-case floor: when configured econ weights
-                # can't generate enough positive signal (e.g. both
-                # cv_econ=0 and mv_econ=0), top up to in_band_bonus so
-                # the critic still sees a two-sided reward.
-                if econ_offset_total < float(in_band_bonus):
-                    reward += float(in_band_bonus) - econ_offset_total
-        # else (out-of-band): economic terms omitted — only violation
-        # penalty drives the reward, matching APC feasibility-first
-        # constraint recovery.
-
-    # Legacy flat in-band bonus is honoured only when the gated path
-    # is disabled, to avoid double-counting.
-    if econ_offset_mode == 'off' and in_band_bonus > 0.0 and in_band:
-        reward += in_band_bonus
+    # Economic terms (always subtracted; sign convention encoded in weights).
+    reward -= mv_economic_penalty
+    reward -= cv_economic_penalty
 
     reward = _saturate_two_sided(reward, reward_clip, sat_mode)
 
@@ -653,8 +543,6 @@ def compute_objective_components(
         'cv_economic_terms': [float(x) for x in cv_economic_terms],
         'mv_economic_penalty': float(mv_economic_penalty),
         'cv_economic_penalty': float(cv_economic_penalty),
-        'econ_offset_mode': str(econ_offset_mode),
-        'econ_offset_total': float(econ_offset_total),
         'in_band': bool(in_band),
         'mv_target_terms': [float(x) for x in mv_target_terms],
         'cv_target_terms': [float(x) for x in cv_target_terms],
