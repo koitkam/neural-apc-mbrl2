@@ -390,9 +390,12 @@ def main() -> int:
         print('[run] phase 3: validation', flush=True)
         try:
             from evaluation.validate import run_validation
+            # Validate best.pt (deterministic-best P3 ckpt) rather than final.pt
+            # (post-cascade-degraded) — fair cross-run comparison. See P60 RCA.
             val_summary = run_validation(controller_dir=out_dir,
                                           episodes=int(args.val_episodes),
-                                          seeds=int(args.val_seeds))
+                                          seeds=int(args.val_seeds),
+                                          ckpt='best.pt')
             with open(out_dir / 'validation_summary.json', 'w') as f:
                 json.dump(val_summary, f, indent=2, default=str)
             print(f"[run] validation cum_raw_reward "

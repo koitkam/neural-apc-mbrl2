@@ -542,7 +542,7 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         from evaluation.validate import run_validation
         print('[final] phase 4: validation on held-out seeds', flush=True)
         val_summary = run_validation(controller_dir=final_dir,
-                                     episodes=3, seeds=3)
+                                     episodes=3, seeds=3, ckpt='best.pt')
         print(f"[final] validation cum_raw_reward "
               f"mean={val_summary.get('cum_raw_reward_mean', float('nan')):.2f} "
               f"std={val_summary.get('cum_raw_reward_std', float('nan')):.2f} "
