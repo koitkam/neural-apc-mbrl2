@@ -236,6 +236,33 @@ class TrainConfig:
     # cliff disappears.  Override with DREAMER_REWARD_MTP_WEIGHT_P1
     # if you want to re-enable a small P1 weight.
     reward_scale_loss_p1: float = 0.0
+    # ---- Adaptive negative-tail clip (P62, 2026-05-28) ----------------
+    # When the operating-region reward distribution is heavily left-
+    # skewed (rare large negative spikes from cliff penalties), the
+    # symlog-twohot critic bins collapse positive reward into the same
+    # bin as zero — the critic loses signal for "this is good", actor
+    # has no gradient direction, and a critic-pessimism cascade follows
+    # (P56 RCA + P58b/P59/P60/P61 falsified knob A/Bs).  The fix is to
+    # clip the raw-reward negative tail to a multiple of the operating-
+    # region p95(|raw|) so the distribution becomes roughly symmetric
+    # in symlog space.  Both knobs below are dimensionless ratios →
+    # sim-agnostic.  Triggered automatically right after
+    # ``calibrate_reward_scale`` from the calibration sample; user's
+    # explicit ``DREAMER_REWARD_RAW_CLIP_MIN`` always wins.
+    #
+    # ``reward_clip_asymmetry_threshold``: ratio |raw_min|/max(|raw_max|,
+    # raw_abs_p95_full) above which the adaptive clip activates.  20.0
+    # is the P56 RCA threshold (memo preferences.md item 32).  Set to a
+    # very large number (e.g. 1e9) to disable the adaptive clip
+    # globally.
+    reward_clip_asymmetry_threshold: float = 20.0
+    # ``reward_clip_tail_k``: when the clip activates, the negative
+    # tail is clipped at ``-k × raw_abs_p95_full``.  k=3.0 keeps the
+    # clip well outside the operating-region typical magnitude (so
+    # ~95% of operating-region rewards are untouched) while bringing
+    # the asymmetry ratio to roughly 3 — symlog support becomes
+    # near-symmetric and the bin distribution recovers.
+    reward_clip_tail_k: float = 3.0
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -805,6 +832,13 @@ class APCEnv:
         except Exception:
             self._reward_clip_max = 1e18
         self._reward_clip_warned: bool = False
+        # P62 (2026-05-28): track whether the negative-tail clip was set
+        # explicitly by the user (DREAMER_REWARD_RAW_CLIP_MIN in env)
+        # vs left at the default -1e6.  The post-calibration adaptive
+        # setter (see ``train`` after ``calibrate_reward_scale``) only
+        # overrides this when the user did NOT set it explicitly.
+        self._reward_clip_min_user_set: bool = (
+            'DREAMER_REWARD_RAW_CLIP_MIN' in os.environ)
 
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
@@ -2952,6 +2986,10 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     abs_arr = np.abs(arr)
     pct_q = float(np.clip(target_percentile, 1.0, 99.9))
     p_target_abs = float(np.percentile(abs_arr, pct_q)) if abs_arr.size else 0.0
+    # P62 (2026-05-28): always compute true p95 of |raw| regardless of
+    # target_percentile so the adaptive negative-tail clip downstream
+    # has a stable reference for "operating-region typical magnitude".
+    raw_abs_p95_full = float(np.percentile(abs_arr, 95.0)) if abs_arr.size else 0.0
     if target_mode == 'std':
         if std < 1e-8:
             scale = 1.0
@@ -3026,6 +3064,11 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
         'raw_std': std, 'raw_mean': mean,
         'raw_min': raw_min, 'raw_max': raw_max,
         'raw_abs_p95': p_target_abs,
+        'raw_abs_p95_full': raw_abs_p95_full,
+        'tail_asymmetry': float(
+            abs(raw_min) /
+            max(abs(raw_max), raw_abs_p95_full, 1e-12)
+        ),
         'target_std': float(target_std),
         'target_mode': target_mode,
         'target_percentile': pct_q,
@@ -3282,6 +3325,80 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # Pop the obs trace before serialising — kept on the dict only
         # to feed the SNR diagnostic below; np.ndarray is not JSON-safe.
         cal_obs = cal.pop('_obs_trace', [])
+        # ---- P62 (2026-05-28): adaptive negative-tail reward clip ----
+        # When the operating-region reward distribution is heavily left-
+        # skewed (rare large cliff penalties), the symlog-twohot critic
+        # bins collapse positive reward into the same bin as zero — the
+        # critic loses signal and a pessimism cascade follows (P56 RCA
+        # + P58b–P61 falsified knob A/Bs).  Clip the negative tail to
+        # ``-k × raw_abs_p95_full`` so the asymmetry ratio drops to ~k
+        # and symlog support is roughly symmetric.  Both knobs are
+        # dimensionless ratios → sim-agnostic.  User's explicit
+        # ``DREAMER_REWARD_RAW_CLIP_MIN`` always wins.
+        cal['reward_clip_asymmetry_threshold'] = float(
+            getattr(cfg, 'reward_clip_asymmetry_threshold', 20.0))
+        cal['reward_clip_tail_k'] = float(
+            getattr(cfg, 'reward_clip_tail_k', 3.0))
+        cal['reward_clip_min_before'] = float(env._reward_clip_min)
+        cal['reward_clip_min_user_set'] = bool(
+            getattr(env, '_reward_clip_min_user_set', False))
+        asym = float(cal.get('tail_asymmetry', 0.0))
+        p95_full = float(cal.get('raw_abs_p95_full', 0.0))
+        cal['adaptive_clip_triggered'] = False
+        cal['adaptive_clip_skipped_reason'] = None
+        if cal['reward_clip_min_user_set']:
+            cal['adaptive_clip_skipped_reason'] = 'user_override_env'
+        elif p95_full < 1e-9:
+            cal['adaptive_clip_skipped_reason'] = 'p95_full_zero'
+        elif asym <= cal['reward_clip_asymmetry_threshold']:
+            cal['adaptive_clip_skipped_reason'] = (
+                f'asymmetry_{asym:.2f}_<=_threshold_'
+                f'{cal["reward_clip_asymmetry_threshold"]:.2f}'
+            )
+        else:
+            new_clip_min = -cal['reward_clip_tail_k'] * p95_full
+            env._reward_clip_min = float(new_clip_min)
+            cal['adaptive_clip_triggered'] = True
+            cal['reward_clip_min_after'] = float(new_clip_min)
+            print(
+                f"[reward-clip] ADAPTIVE clip activated: "
+                f"asymmetry={asym:.1f} > threshold="
+                f"{cal['reward_clip_asymmetry_threshold']:.1f}; "
+                f"p95(|raw|)={p95_full:.4g}, k="
+                f"{cal['reward_clip_tail_k']:.2f} → "
+                f"raw_clip_min {cal['reward_clip_min_before']:.4g} → "
+                f"{new_clip_min:.4g}.  Recalibrating reward_scale with "
+                f"clipped tail.", flush=True)
+            # Re-run calibration once with the new clip so reward_scale
+            # and twohot bin diagnostics reflect the post-clip distribution.
+            cal_post = calibrate_reward_scale(
+                env, rng, mode=cal_mode,
+                n_steps=cal_n_steps,
+                baseline_action_std=float(cfg.baseline_seed_action_std),
+                target_mode=cal_target_mode,
+                target_percentile=cal_target_pct,
+                target_percentile_value=cal_target_pct_value,
+            )
+            cal_post.pop('_obs_trace', None)
+            cal_post['reward_clip_asymmetry_threshold'] = cal[
+                'reward_clip_asymmetry_threshold']
+            cal_post['reward_clip_tail_k'] = cal['reward_clip_tail_k']
+            cal_post['reward_clip_min_before'] = cal['reward_clip_min_before']
+            cal_post['reward_clip_min_after'] = float(new_clip_min)
+            cal_post['reward_clip_min_user_set'] = cal['reward_clip_min_user_set']
+            cal_post['adaptive_clip_triggered'] = True
+            cal_post['adaptive_clip_skipped_reason'] = None
+            cal_post['pre_clip_calibration'] = {
+                k: v for k, v in cal.items()
+                if k not in ('pre_clip_calibration',)
+            }
+            cal = cal_post
+        if not cal['adaptive_clip_triggered']:
+            print(
+                f"[reward-clip] adaptive clip not applied "
+                f"(reason: {cal['adaptive_clip_skipped_reason']}); "
+                f"raw_clip_min={env._reward_clip_min:.4g}.",
+                flush=True)
         print(f"[reward-scale] auto-calibrated ({cal['mode']}, "
               f"target={cal['target_mode']}): "
               f"scale={cal['reward_scale']:.4g}  "

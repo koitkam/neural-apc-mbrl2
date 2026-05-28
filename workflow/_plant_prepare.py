@@ -267,6 +267,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_SIGMA_MAX_FLOOR':     ('sigma_max_floor',           float),
     'DREAMER_SIGMA_MAX_CAP':       ('sigma_max_cap',             float),
     'DREAMER_SIGMA_MIN_RATIO':     ('sigma_min_ratio',           float),
+    # P62 (2026-05-28): adaptive negative-tail reward clip — both knobs
+    # are dimensionless ratios (sim-agnostic per design principle).
+    # See TrainConfig.reward_clip_asymmetry_threshold /
+    # reward_clip_tail_k docstrings for rationale.
+    'DREAMER_REWARD_CLIP_ASYM_THRESHOLD': ('reward_clip_asymmetry_threshold', float),
+    'DREAMER_REWARD_CLIP_TAIL_K':         ('reward_clip_tail_k',              float),
 }
 
 
