@@ -114,6 +114,22 @@ class TrainConfig:
     # via the ``_AUTO_TUNE_FIELD_DEFAULTS`` mechanism.
     policy_log_std_min: float = -2.3
     policy_log_std_max: float = 0.0
+    # ----- σ_max / σ_min auto-tune formula inputs (P59, 2026-05-27) -----
+    # Previously read directly via ``os.environ.get`` inside
+    # ``auto_tune_seed_buffer`` (lines ~2490).  Promoted to TrainConfig
+    # fields so they (a) appear in ``run_plan.json → config``, (b) are
+    # whitelisted in ``ENV_OVERRIDES`` per the documented launch
+    # contract, and (c) are picked up by the paper-defaults-audit skill.
+    # Defaults preserve the legacy code constants — no behaviour change
+    # without an explicit override.  See `dreamer-hyperparameter-
+    # rationale` skill for paper-grounded recommendations (post-p24:
+    # mult=0.7, cap=0.20 are the recommended values for cascade-prone
+    # plants; defaults here are the conservative legacy values that
+    # match historical run reproducibility).
+    sigma_max_mult: float = 1.0       # σ_max = sigma_max_mult × σ_seed
+    sigma_max_floor: float = 0.10     # hard floor on σ_max
+    sigma_max_cap: float = 0.30       # hard ceiling on σ_max
+    sigma_min_ratio: float = 2.5      # σ_min = σ_max / sigma_min_ratio
     # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
     # ``auto_initialize_hyperparams`` as ``η = η_v3 × σ_max / σ_v3_ref``
     # (V3 paper default 3e-4 anchored at σ=1.0). Recovers V3 exactly
@@ -2487,10 +2503,19 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # 0.7×σ_seed.  This puts the policy clamp at the same scale the
     # seed buffer was collected with, aligning the actor's explore
     # band with the WM's training distribution.
-    sigma_max_mult = float(os.environ.get(
+    # 2026-05-27 (P59 refactor): these formula inputs are now
+    # TrainConfig fields (``sigma_max_mult``, ``sigma_max_floor``,
+    # ``sigma_max_cap``) wired through ``ENV_OVERRIDES``.  Legacy
+    # ``DREAMER_SIGMA_MAX_*`` / ``SIGMA_MAX_*`` env-vars still honoured
+    # for back-compat but the canonical path is ``cfg.sigma_max_*``.
+    _legacy_mult_env = os.environ.get(
         'DREAMER_SIGMA_MAX_OVER_SEED',
-        os.environ.get('SIGMA_MAX_OVER_SEED', '1.0')))
-    sigma_max_floor = float(os.environ.get('SIGMA_MAX_FLOOR', '0.10'))
+        os.environ.get('SIGMA_MAX_OVER_SEED', None))
+    sigma_max_mult = float(_legacy_mult_env) if _legacy_mult_env is not None \
+        else float(getattr(cfg, 'sigma_max_mult', 1.0))
+    _legacy_floor_env = os.environ.get('SIGMA_MAX_FLOOR', None)
+    sigma_max_floor = float(_legacy_floor_env) if _legacy_floor_env is not None \
+        else float(getattr(cfg, 'sigma_max_floor', 0.10))
     # Cap σ_max independently of the seed-σ cap so a wide seed-buffer
     # exploration band does not propagate into a wide policy clamp.
     # History: 0.20 → 0.30 on 2026-05-12 (p21 RCA: too tight for high-
@@ -2499,9 +2524,11 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # Restored 0.20 → 0.30 on 2026-05-19 (p26 RCA: reward-head fix
     # removed the saturation-trap mechanism; σ-saturation is now
     # benign).
-    sigma_max_cap = float(os.environ.get(
+    _legacy_cap_env = os.environ.get(
         'DREAMER_SIGMA_MAX_CAP',
-        os.environ.get('SIGMA_MAX_CAP', '0.30')))
+        os.environ.get('SIGMA_MAX_CAP', None))
+    sigma_max_cap = float(_legacy_cap_env) if _legacy_cap_env is not None \
+        else float(getattr(cfg, 'sigma_max_cap', 0.30))
     target_sigma_max = float(np.clip(sigma_max_mult * sigma_seed,
                                        sigma_max_floor, sigma_max_cap))
     log_std_max_val = float(np.log(target_sigma_max))
@@ -2532,8 +2559,13 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # the actor confident-enough (still > 1 decade below the V3
     # paper's σ_max=1.0 reference) while preventing total exploration
     # collapse when the critic has not stabilised.
+    # 2026-05-27 (P59 refactor): ``sigma_min_ratio`` is now a TrainConfig
+    # field (default 2.5).  Legacy ``SIGMA_MIN_RATIO_OF_MAX`` env-var
+    # still honoured for back-compat.
+    _legacy_ratio_env = os.environ.get('SIGMA_MIN_RATIO_OF_MAX', None)
     sigma_min_ratio = max(2.0,
-        float(os.environ.get('SIGMA_MIN_RATIO_OF_MAX', '2.5')))
+        float(_legacy_ratio_env) if _legacy_ratio_env is not None
+        else float(getattr(cfg, 'sigma_min_ratio', 2.5)))
     target_sigma_min = target_sigma_max / sigma_min_ratio
     log_std_min_val = float(np.log(target_sigma_min))
     out['policy_log_std_min'] = {

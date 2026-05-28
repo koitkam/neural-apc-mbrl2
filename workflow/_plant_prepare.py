@@ -255,6 +255,18 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # for P3 (actor-critic) regardless of P1/P2 extensions.  Default
     # 0.20 in TrainConfig.  Set to 0.0 to disable (legacy behaviour).
     'DREAMER_PHASE3_MIN_FRAC':    ('phase3_min_frac',            float),
+    # 2026-05-27 (P59 refactor): σ_max / σ_min auto-tune formula inputs
+    # — previously read directly via os.environ.get inside the auto-tune
+    # body, now promoted to TrainConfig fields with whitelist entries
+    # so they appear in run_plan.json → config.  Legacy
+    # ``DREAMER_SIGMA_MAX_OVER_SEED`` / ``DREAMER_SIGMA_MAX_CAP`` /
+    # ``SIGMA_MAX_FLOOR`` / ``SIGMA_MIN_RATIO_OF_MAX`` env-vars still
+    # honoured for back-compat inside auto_tune_seed_buffer; the
+    # canonical path is the cfg field bound here.
+    'DREAMER_SIGMA_MAX_OVER_SEED': ('sigma_max_mult',            float),
+    'DREAMER_SIGMA_MAX_FLOOR':     ('sigma_max_floor',           float),
+    'DREAMER_SIGMA_MAX_CAP':       ('sigma_max_cap',             float),
+    'DREAMER_SIGMA_MIN_RATIO':     ('sigma_min_ratio',           float),
 }
 
 
