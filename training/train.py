@@ -3149,6 +3149,33 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
+    # Companion CSV with the same series (one row per train_log row).
+    # Lets downstream analysis (and humans without image vision) recover the
+    # panel data without re-parsing train_log.jsonl.  Columns mirror the six
+    # panels above + iter/phase for context.
+    try:
+        import csv
+        csv_path = out_path.with_suffix('.csv')
+        cols = [
+            'iter', 'phase', 'env_steps',
+            'ema_return', 'return_window_mean',                    # panel 1
+            'recon_loss', 'sf_loss',                                # panel 2
+            'bc_loss', 'reward_mtp_loss', 'actor_loss', 'critic_loss',  # panel 3
+            'entropy_mean', 'adv_std_mean',                         # panel 4
+            'wm_grad_norm', 'actor_grad_norm', 'critic_grad_norm',  # panel 5
+            'iter_cv_violation_mean', 'iter_mv_violation_mean',     # panel 6
+            # Critic-cascade canary (not plotted; essential for triage).
+            'critic_rew_to_tgt_var', 'critic_pred_target_r',
+            'critic_target_v_r', 'imagined_return_mean', 'return_scale',
+        ]
+        with open(csv_path, 'w', newline='') as fh:
+            w = csv.writer(fh)
+            w.writerow(cols)
+            for r in rows:
+                w.writerow([r.get(c) for c in cols])
+    except Exception as e:
+        print(f'[train] training_diagnostics.csv skipped: {e!r}', flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Main trainer (three explicit phases)
