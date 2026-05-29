@@ -272,10 +272,14 @@ class TrainConfig:
     # P58b/P59/P60/P61 cascade signatures.  This clamp caps per-update
     # growth of ``ret_scale`` at ``max_step_growth`` (dimensionless
     # ratio — sim-agnostic).  Default 0.02 = 2%/iter ≈ 3× over 55 iters
-    # (would arrest the cascade) and non-binding over normal multi-
-    # thousand-iter learning curves where growth is gradual.  Set to
-    # 0.0 to recover the original DreamerV3-faithful unclamped EMA.
-    return_scale_max_step_growth: float = 0.02
+    # P63 (2026-05-28) tested 0.02/grad-step on test_sim and REGRESSED
+    # (-134997 vs P58b -795).  The clamp throttled the EMA during
+    # legitimate spread growth and made early-iter advantages over-large;
+    # also the per-call semantics interact with phase3_train_steps_per_iter
+    # (25 calls/iter → effective per-iter cap 1.02^25 = 1.64×).  Reverted
+    # default to 0.0 (paper-faithful unclamped EMA).  Opt-in via env var
+    # DREAMER_RETURN_SCALE_MAX_STEP_GROWTH only for explicit experiments.
+    return_scale_max_step_growth: float = 0.0
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -2127,7 +2131,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         scale = model.update_return_scale(
             target_returns,
             max_step_growth=float(getattr(
-                cfg, 'return_scale_max_step_growth', 0.02)),
+                cfg, 'return_scale_max_step_growth', 0.0)),
         ).clamp_min(1.0)
 
     feat_flat = agent_hids.reshape(-1, agent_hids.shape[-1])
