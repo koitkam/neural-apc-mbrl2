@@ -263,6 +263,19 @@ class TrainConfig:
     # the asymmetry ratio to roughly 3 — symlog support becomes
     # near-symmetric and the bin distribution recovers.
     reward_clip_tail_k: float = 3.0
+    # ---- Return-scale growth clamp (P58b-RCA, 2026-05-28) ----------
+    # The (p95-p05)-spread EMA normaliser at ``DreamerV4.update_return_scale``
+    # tracks a monotonically growing spread on the critic-pessimism
+    # cascade — critic targets grow → spread grows → next critic step
+    # has even larger targets, runaway feedback.  P58b on test_sim
+    # showed 12.2× growth over 55 P3 iters (424 → 5180), confirmed by
+    # P58b/P59/P60/P61 cascade signatures.  This clamp caps per-update
+    # growth of ``ret_scale`` at ``max_step_growth`` (dimensionless
+    # ratio — sim-agnostic).  Default 0.02 = 2%/iter ≈ 3× over 55 iters
+    # (would arrest the cascade) and non-binding over normal multi-
+    # thousand-iter learning curves where growth is gradual.  Set to
+    # 0.0 to recover the original DreamerV3-faithful unclamped EMA.
+    return_scale_max_step_growth: float = 0.02
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -2111,7 +2124,11 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
         ).view(B, H)
         adv_raw = target_returns - baseline
-        scale = model.update_return_scale(target_returns).clamp_min(1.0)
+        scale = model.update_return_scale(
+            target_returns,
+            max_step_growth=float(getattr(
+                cfg, 'return_scale_max_step_growth', 0.02)),
+        ).clamp_min(1.0)
 
     feat_flat = agent_hids.reshape(-1, agent_hids.shape[-1])
     # Actor recomputes log_prob_of_raw on the SAME latent the policy

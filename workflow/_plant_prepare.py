@@ -273,6 +273,11 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # reward_clip_tail_k docstrings for rationale.
     'DREAMER_REWARD_CLIP_ASYM_THRESHOLD': ('reward_clip_asymmetry_threshold', float),
     'DREAMER_REWARD_CLIP_TAIL_K':         ('reward_clip_tail_k',              float),
+    # P63 (2026-05-28): return-scale growth clamp — dimensionless ratio.
+    # Caps per-update growth of ret_scale; arrests the critic-pessimism
+    # cascade self-amplification (P58b RCA: 12.2× growth in 55 iters).
+    # Set to 0.0 to recover paper-faithful unclamped EMA.
+    'DREAMER_RETURN_SCALE_MAX_STEP_GROWTH': ('return_scale_max_step_growth', float),
 }
 
 

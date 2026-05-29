@@ -1339,7 +1339,21 @@ class DreamerV4(nn.Module):
             p.requires_grad_(False)
 
     def update_return_scale(self, returns: torch.Tensor,
-                             ema: float = 0.99) -> torch.Tensor:
+                             ema: float = 0.99,
+                             max_step_growth: float = 0.02,
+                             ) -> torch.Tensor:
+        """EMA of the (p95-p05) return spread, with a per-update growth clamp.
+
+        P58b-RCA fix (2026-05-28): on the critic-pessimism cascade, the
+        EMA tracks a monotonically growing spread (critic targets keep
+        growing → spread keeps growing → critic keeps chasing).  P58b
+        on test_sim showed 12.2× growth over 55 P3 iters (424 → 5180).
+        Clamping the per-update growth to ``max_step_growth`` (default
+        2%/iter ≈ 3× over 55 iters, non-binding over normal multi-
+        thousand-iter learning) arrests the self-amplification while
+        respecting the paper's normalisation principle.  ``max_step_growth=0``
+        recovers the original DreamerV3-faithful behaviour.
+        """
         with torch.no_grad():
             r = returns.detach().reshape(-1).float()
             if r.numel() < 2:
@@ -1348,7 +1362,11 @@ class DreamerV4(nn.Module):
                 p05 = torch.quantile(r, 0.05)
                 p95 = torch.quantile(r, 0.95)
                 spread = torch.clamp(p95 - p05, min=1.0)
+            old_scale = self.ret_scale.clone()
             self.ret_scale.mul_(ema).add_((1.0 - ema) * spread)
+            if max_step_growth and max_step_growth > 0.0:
+                growth_cap = old_scale * (1.0 + float(max_step_growth))
+                self.ret_scale.copy_(torch.minimum(self.ret_scale, growth_cap))
         return self.ret_scale.clamp_min(1.0)
 
     # ------------------------------------------------------- parameter groups
