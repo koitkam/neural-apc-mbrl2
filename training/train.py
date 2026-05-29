@@ -294,9 +294,16 @@ class TrainConfig:
     # agnostic: action in [-1,+1] norm; obs in z-scored unit variance;
     # window in samples (independent of plant tau).
     wm_steady_loss_scale: float = 0.0
-    wm_steady_min_run_steps: int = 16
+    # P65 (2026-05-29): K=32 default; smaller K (16) has half-window
+    # noise floor ~σ_obs/√(K/2) which exceeds reasonable eps_o on test_sim
+    # OU+meas noise (drift floor ~0.25 at K=16 vs 0.18 at K=32).
+    wm_steady_min_run_steps: int = 32
     wm_steady_action_eps: float = 0.02
-    wm_steady_settled_eps: float = 0.05
+    # P65 (2026-05-29): obs gate is now half-window mean-DRIFT on z-scored
+    # obs (not std), so 0.20 unit means "two halves of the window differ
+    # by < 0.2 z-scored units in any channel" — robust to OU+meas noise
+    # (synthetic σ=0.5 gives ~9% held_frac while rejecting slow drift).
+    wm_steady_settled_eps: float = 0.20
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -1859,28 +1866,39 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'sf_loss': sf_loss,
         'wm_total': cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss,
     }
-    # P64 (2026-05-28): WM steady-state regulariser.  At positions where
-    # the action has been held (std over rolling K-window < eps_a) AND
-    # the plant has settled (z-scored obs std < eps_o), penalise the
+    # P64 (2026-05-28) + P65 fix (2026-05-29): WM steady-state regulariser.
+    # At positions where the action has been held (action std over rolling
+    # K+1 window < eps_a) AND the plant has settled (|mean drift between
+    # the two halves of the window| < eps_o on z-scored obs), penalise the
     # magnitude of the predicted single-step latent change.  Direct loss
     # pressure on the P38 failure mode (``wm_pred_converges = 0.0``).
-    # ``z_clean`` is detached here — we only push z1_hat toward zero
-    # change, never the tokenizer to track its own prediction.
+    # ``z_clean`` is detached — only push z1_hat toward zero change, never
+    # the tokenizer onto its own prediction.
+    #
+    # P65 fix: the original gate used obs std < eps_o, but training obs
+    # carry measurement noise (OU + meas, ~0.5 z-scored units) that
+    # exceeds eps_o=0.05 by ~10×, so the mask never fired (P64 had
+    # held_frac=0.0000 for all 198 iters).  Mean-drift between half-
+    # windows is robust to high-frequency noise but still detects
+    # genuine steady state.  The diagnostic's eps_std=0.05 threshold
+    # applies to noise-free WM rollouts and is not comparable to noisy
+    # replay obs.
     _wm_ss_scale = float(getattr(cfg, 'wm_steady_loss_scale', 0.0))
     _K_ss = int(getattr(cfg, 'wm_steady_min_run_steps', 16))
-    if _wm_ss_scale > 0.0 and _K_ss >= 1 and (_K_ss + 1) < int(obs_cur.shape[1]):
+    if _wm_ss_scale > 0.0 and _K_ss >= 2 and (_K_ss + 1) < int(obs_cur.shape[1]):
         _eps_a = float(getattr(cfg, 'wm_steady_action_eps', 0.02))
-        _eps_o = float(getattr(cfg, 'wm_steady_settled_eps', 0.05))
-        # Rolling-window (size K+1) std for action and obs; window ends at
-        # the prediction position t.  unfold(dim=1, size=K+1, step=1) →
-        # (B, T-K, *, K+1).
-        _a_std = act.unfold(1, _K_ss + 1, 1).std(dim=-1).amax(dim=-1)   # (B, T-K)
-        _o_std = obs_cur.unfold(1, _K_ss + 1, 1).std(dim=-1).amax(dim=-1)  # (B, T-K)
-        _held_mask = ((_a_std < _eps_a) & (_o_std < _eps_o)).float()
-        # Predicted single-step change at end-of-window positions
-        # K..T-1; z_clean detached so the penalty pushes only z1_hat.
+        _eps_o = float(getattr(cfg, 'wm_steady_settled_eps', 0.10))
+        # Rolling (K+1)-window action std (held-action gate).
+        _a_std = act.unfold(1, _K_ss + 1, 1).std(dim=-1).amax(dim=-1)   # (B,T-K)
+        # Rolling (K+1)-window mean-drift on z-scored obs (settled gate,
+        # noise-robust).  Split window in two halves and compare means.
+        _half = (_K_ss + 1) // 2
+        _obs_win = obs_cur.unfold(1, _K_ss + 1, 1)        # (B, T-K, D, K+1)
+        _drift = (_obs_win[..., _half:].mean(dim=-1)
+                  - _obs_win[..., :_half].mean(dim=-1)).abs().amax(dim=-1)
+        _held_mask = ((_a_std < _eps_a) & (_drift < _eps_o)).float()  # (B,T-K)
         _z_change_sq = (out_clean['z1_hat'] - z_clean.detach()).pow(2).sum(dim=-1)
-        _z_change_at = _z_change_sq[:, _K_ss:]                           # (B, T-K)
+        _z_change_at = _z_change_sq[:, _K_ss:]                          # (B,T-K)
         _denom = _held_mask.sum().clamp_min(1.0)
         _wm_ss_loss = (_held_mask * _z_change_at).sum() / _denom
         losses['wm_steady_loss'] = _wm_ss_loss
