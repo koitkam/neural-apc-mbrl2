@@ -280,6 +280,23 @@ class TrainConfig:
     # default to 0.0 (paper-faithful unclamped EMA).  Opt-in via env var
     # DREAMER_RETURN_SCALE_MAX_STEP_GROWTH only for explicit experiments.
     return_scale_max_step_growth: float = 0.0
+    # P64 (2026-05-28) WM steady-state regulariser (Path B — WM-first).
+    # All five post-P58b runs (P58b/P59/P60/P61/P63) show
+    # ``wm_pred_converges_under_zero_action = 0.0`` and
+    # ``wm_pred_converges_under_constant_action = 0.0`` in
+    # ``wm_steady_state_diagnostic.json``: the WM does NOT predict a
+    # steady-state under held actions, so latent rollouts drift over the
+    # 200-step probe horizon.  This direct penalty fires at training
+    # positions where action AND obs are jointly settled (rolling-window
+    # std small) and penalises the magnitude of the predicted single-step
+    # latent change ``||z1_hat - z_clean||²``.  Default scale 0.0 (off);
+    # opt-in via DREAMER_WM_STEADY_LOSS_SCALE.  Thresholds are sim-
+    # agnostic: action in [-1,+1] norm; obs in z-scored unit variance;
+    # window in samples (independent of plant tau).
+    wm_steady_loss_scale: float = 0.0
+    wm_steady_min_run_steps: int = 16
+    wm_steady_action_eps: float = 0.02
+    wm_steady_settled_eps: float = 0.05
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -1842,6 +1859,36 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'sf_loss': sf_loss,
         'wm_total': cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss,
     }
+    # P64 (2026-05-28): WM steady-state regulariser.  At positions where
+    # the action has been held (std over rolling K-window < eps_a) AND
+    # the plant has settled (z-scored obs std < eps_o), penalise the
+    # magnitude of the predicted single-step latent change.  Direct loss
+    # pressure on the P38 failure mode (``wm_pred_converges = 0.0``).
+    # ``z_clean`` is detached here — we only push z1_hat toward zero
+    # change, never the tokenizer to track its own prediction.
+    _wm_ss_scale = float(getattr(cfg, 'wm_steady_loss_scale', 0.0))
+    _K_ss = int(getattr(cfg, 'wm_steady_min_run_steps', 16))
+    if _wm_ss_scale > 0.0 and _K_ss >= 1 and (_K_ss + 1) < int(obs_cur.shape[1]):
+        _eps_a = float(getattr(cfg, 'wm_steady_action_eps', 0.02))
+        _eps_o = float(getattr(cfg, 'wm_steady_settled_eps', 0.05))
+        # Rolling-window (size K+1) std for action and obs; window ends at
+        # the prediction position t.  unfold(dim=1, size=K+1, step=1) →
+        # (B, T-K, *, K+1).
+        _a_std = act.unfold(1, _K_ss + 1, 1).std(dim=-1).amax(dim=-1)   # (B, T-K)
+        _o_std = obs_cur.unfold(1, _K_ss + 1, 1).std(dim=-1).amax(dim=-1)  # (B, T-K)
+        _held_mask = ((_a_std < _eps_a) & (_o_std < _eps_o)).float()
+        # Predicted single-step change at end-of-window positions
+        # K..T-1; z_clean detached so the penalty pushes only z1_hat.
+        _z_change_sq = (out_clean['z1_hat'] - z_clean.detach()).pow(2).sum(dim=-1)
+        _z_change_at = _z_change_sq[:, _K_ss:]                           # (B, T-K)
+        _denom = _held_mask.sum().clamp_min(1.0)
+        _wm_ss_loss = (_held_mask * _z_change_at).sum() / _denom
+        losses['wm_steady_loss'] = _wm_ss_loss
+        losses['wm_steady_held_frac'] = _held_mask.mean().detach()
+        losses['wm_total'] = losses['wm_total'] + _wm_ss_scale * _wm_ss_loss
+    else:
+        losses['wm_steady_loss'] = torch.zeros((), device=z_clean.device)
+        losses['wm_steady_held_frac'] = torch.zeros((), device=z_clean.device)
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away
     # information" by averaging-out the noise will show var(z) <<

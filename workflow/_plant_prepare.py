@@ -278,6 +278,15 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # cascade self-amplification (P58b RCA: 12.2× growth in 55 iters).
     # Set to 0.0 to recover paper-faithful unclamped EMA.
     'DREAMER_RETURN_SCALE_MAX_STEP_GROWTH': ('return_scale_max_step_growth', float),
+    # P64 (2026-05-28): WM steady-state regulariser knobs (Path B —
+    # WM-first).  Penalises ||z1_hat - z_clean||² at positions where
+    # both action and obs are settled over a K-sample rolling window.
+    # All four are sim-agnostic (unitless / sample-count).  Default
+    # scale 0.0 in code = off; opt-in for explicit WM-fidelity runs.
+    'DREAMER_WM_STEADY_LOSS_SCALE':       ('wm_steady_loss_scale',           float),
+    'DREAMER_WM_STEADY_MIN_RUN_STEPS':    ('wm_steady_min_run_steps',        int),
+    'DREAMER_WM_STEADY_ACTION_EPS':       ('wm_steady_action_eps',           float),
+    'DREAMER_WM_STEADY_SETTLED_EPS':      ('wm_steady_settled_eps',          float),
 }
 
 
