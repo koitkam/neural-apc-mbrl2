@@ -2986,10 +2986,21 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     abs_arr = np.abs(arr)
     pct_q = float(np.clip(target_percentile, 1.0, 99.9))
     p_target_abs = float(np.percentile(abs_arr, pct_q)) if abs_arr.size else 0.0
-    # P62 (2026-05-28): always compute true p95 of |raw| regardless of
-    # target_percentile so the adaptive negative-tail clip downstream
-    # has a stable reference for "operating-region typical magnitude".
+    # P62 (2026-05-28): true p95 of |raw| regardless of target_percentile,
+    # plus positive-tail p95 — the positive-tail p95 is the right scale
+    # for "asymmetric reward distribution" detection, since it represents
+    # the magnitude of the *signal we want the critic to preserve*.
+    # ``raw_abs_p95_full`` is dominated by the negative bulk on
+    # mostly-negative-reward plants (e.g. test_sim) and is NOT a useful
+    # asymmetry denominator on its own (P62 RCA, 2026-05-28).
     raw_abs_p95_full = float(np.percentile(abs_arr, 95.0)) if abs_arr.size else 0.0
+    pos_arr = arr[arr > 0.0]
+    positive_tail_p95 = (
+        float(np.percentile(pos_arr, 95.0)) if pos_arr.size else 0.0
+    )
+    positive_fraction = (
+        float(pos_arr.size) / float(arr.size) if arr.size else 0.0
+    )
     if target_mode == 'std':
         if std < 1e-8:
             scale = 1.0
@@ -3065,9 +3076,15 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
         'raw_min': raw_min, 'raw_max': raw_max,
         'raw_abs_p95': p_target_abs,
         'raw_abs_p95_full': raw_abs_p95_full,
+        'positive_tail_p95': positive_tail_p95,
+        'positive_fraction': positive_fraction,
+        # P62 RCA (2026-05-28): asymmetry uses positive-tail scale (the
+        # signal-to-preserve), NOT raw_abs_p95_full (which on mostly-
+        # negative plants trivially yields asymmetry≈1 and disables the
+        # safety net).  Falls back to |raw_max| if no positive rewards.
         'tail_asymmetry': float(
             abs(raw_min) /
-            max(abs(raw_max), raw_abs_p95_full, 1e-12)
+            max(abs(raw_max), positive_tail_p95, 1e-12)
         ),
         'target_std': float(target_std),
         'target_mode': target_mode,
@@ -3326,15 +3343,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # to feed the SNR diagnostic below; np.ndarray is not JSON-safe.
         cal_obs = cal.pop('_obs_trace', [])
         # ---- P62 (2026-05-28): adaptive negative-tail reward clip ----
-        # When the operating-region reward distribution is heavily left-
-        # skewed (rare large cliff penalties), the symlog-twohot critic
-        # bins collapse positive reward into the same bin as zero — the
-        # critic loses signal and a pessimism cascade follows (P56 RCA
-        # + P58b–P61 falsified knob A/Bs).  Clip the negative tail to
-        # ``-k × raw_abs_p95_full`` so the asymmetry ratio drops to ~k
-        # and symlog support is roughly symmetric.  Both knobs are
-        # dimensionless ratios → sim-agnostic.  User's explicit
-        # ``DREAMER_REWARD_RAW_CLIP_MIN`` always wins.
+        # P56-P61 hypothesised that an asymmetric raw reward distribution
+        # collapses the symlog-twohot critic bins and causes a bootstrap
+        # cascade.  P62 RCA on test_sim FALSIFIED the bin-collapse half
+        # of that hypothesis on its own plant: same raw distribution
+        # (raw_min=-38, raw_max=+0.23, asymmetry|raw_max=166) but the
+        # twohot calibrator reports 45 active bins, top1=17.8%,
+        # scaled_symlog_mag=6.0 — the head can discriminate just fine.
+        #
+        # Therefore the adaptive clip is gated on THREE conditions, all
+        # of which must hold to fire:
+        #   (1) asymmetry > threshold                     — distribution is skewed
+        #   (2) twohot is actually unhealthy              — symptom present
+        #   (3) positive signal exists and clip is safe   — no information loss
+        # If any condition fails, the clip is skipped with a clear reason
+        # in ``adaptive_clip_skipped_reason`` so the audit trail is
+        # complete.  User's explicit ``DREAMER_REWARD_RAW_CLIP_MIN``
+        # always wins (highest precedence skip).
         cal['reward_clip_asymmetry_threshold'] = float(
             getattr(cfg, 'reward_clip_asymmetry_threshold', 20.0))
         cal['reward_clip_tail_k'] = float(
@@ -3343,56 +3368,101 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         cal['reward_clip_min_user_set'] = bool(
             getattr(env, '_reward_clip_min_user_set', False))
         asym = float(cal.get('tail_asymmetry', 0.0))
-        p95_full = float(cal.get('raw_abs_p95_full', 0.0))
+        pos_p95 = float(cal.get('positive_tail_p95', 0.0))
+        twohot_unhealthy = bool(
+            cal.get('twohot_bin_coverage_critical', False)
+            or (
+                float(cal.get('twohot_top1_mass', 0.0)) > 0.50
+                and int(cal.get('twohot_active_bins', 0)) < 10
+            )
+        )
+        cal['twohot_unhealthy'] = twohot_unhealthy
         cal['adaptive_clip_triggered'] = False
         cal['adaptive_clip_skipped_reason'] = None
         if cal['reward_clip_min_user_set']:
             cal['adaptive_clip_skipped_reason'] = 'user_override_env'
-        elif p95_full < 1e-9:
-            cal['adaptive_clip_skipped_reason'] = 'p95_full_zero'
         elif asym <= cal['reward_clip_asymmetry_threshold']:
             cal['adaptive_clip_skipped_reason'] = (
                 f'asymmetry_{asym:.2f}_<=_threshold_'
                 f'{cal["reward_clip_asymmetry_threshold"]:.2f}'
             )
-        else:
-            new_clip_min = -cal['reward_clip_tail_k'] * p95_full
-            env._reward_clip_min = float(new_clip_min)
-            cal['adaptive_clip_triggered'] = True
-            cal['reward_clip_min_after'] = float(new_clip_min)
-            print(
-                f"[reward-clip] ADAPTIVE clip activated: "
-                f"asymmetry={asym:.1f} > threshold="
-                f"{cal['reward_clip_asymmetry_threshold']:.1f}; "
-                f"p95(|raw|)={p95_full:.4g}, k="
-                f"{cal['reward_clip_tail_k']:.2f} → "
-                f"raw_clip_min {cal['reward_clip_min_before']:.4g} → "
-                f"{new_clip_min:.4g}.  Recalibrating reward_scale with "
-                f"clipped tail.", flush=True)
-            # Re-run calibration once with the new clip so reward_scale
-            # and twohot bin diagnostics reflect the post-clip distribution.
-            cal_post = calibrate_reward_scale(
-                env, rng, mode=cal_mode,
-                n_steps=cal_n_steps,
-                baseline_action_std=float(cfg.baseline_seed_action_std),
-                target_mode=cal_target_mode,
-                target_percentile=cal_target_pct,
-                target_percentile_value=cal_target_pct_value,
+        elif not twohot_unhealthy:
+            cal['adaptive_clip_skipped_reason'] = (
+                f'twohot_healthy(bins={cal.get("twohot_active_bins", 0)},'
+                f'top1={cal.get("twohot_top1_mass", 0.0):.2f},'
+                f'critical={cal.get("twohot_bin_coverage_critical", False)})'
+                f'_no_symptom_to_fix'
             )
-            cal_post.pop('_obs_trace', None)
-            cal_post['reward_clip_asymmetry_threshold'] = cal[
-                'reward_clip_asymmetry_threshold']
-            cal_post['reward_clip_tail_k'] = cal['reward_clip_tail_k']
-            cal_post['reward_clip_min_before'] = cal['reward_clip_min_before']
-            cal_post['reward_clip_min_after'] = float(new_clip_min)
-            cal_post['reward_clip_min_user_set'] = cal['reward_clip_min_user_set']
-            cal_post['adaptive_clip_triggered'] = True
-            cal_post['adaptive_clip_skipped_reason'] = None
-            cal_post['pre_clip_calibration'] = {
-                k: v for k, v in cal.items()
-                if k not in ('pre_clip_calibration',)
-            }
-            cal = cal_post
+        elif pos_p95 < 1e-3:
+            cal['adaptive_clip_skipped_reason'] = (
+                f'no_positive_signal(positive_fraction='
+                f'{cal.get("positive_fraction", 0.0):.3f},'
+                f'positive_tail_p95={pos_p95:.4g})_clip_would_destroy_signal'
+            )
+        else:
+            proposed_clip = -cal['reward_clip_tail_k'] * pos_p95
+            try:
+                _arr_dbg = np.asarray(
+                    [float(x) for x in [
+                        cal['raw_min'], cal['raw_max'], cal['raw_mean']
+                    ]]
+                )
+                # mass test: re-derive from sigma-ladder by approximating
+                # via raw_min/mean/std rather than re-sampling
+                _approx_mass = float(np.clip(
+                    (proposed_clip - cal['raw_mean']) /
+                    max(cal['raw_std'], 1e-9),
+                    -5.0, 5.0))
+                # one-sided Gaussian tail approximation: phi(z)
+                from math import erf, sqrt as _sqrt
+                clipped_mass = 0.5 * (1.0 + erf(_approx_mass / _sqrt(2.0)))
+            except Exception:
+                clipped_mass = 0.0
+            cal['clipped_mass_estimate'] = clipped_mass
+            if clipped_mass > 0.25:
+                cal['adaptive_clip_skipped_reason'] = (
+                    f'clip_would_truncate_{clipped_mass*100:.1f}%_of_mass'
+                    f'_(>25%_safety_limit)_proposed_clip={proposed_clip:.4g}'
+                )
+            else:
+                env._reward_clip_min = float(proposed_clip)
+                cal['adaptive_clip_triggered'] = True
+                cal['reward_clip_min_after'] = float(proposed_clip)
+                print(
+                    f"[reward-clip] ADAPTIVE clip activated: "
+                    f"asymmetry={asym:.1f} > threshold="
+                    f"{cal['reward_clip_asymmetry_threshold']:.1f}; "
+                    f"twohot unhealthy (bins="
+                    f"{cal.get('twohot_active_bins', 0)}, top1="
+                    f"{cal.get('twohot_top1_mass', 0.0):.2f}); "
+                    f"positive_tail_p95={pos_p95:.4g}, k="
+                    f"{cal['reward_clip_tail_k']:.2f} → "
+                    f"raw_clip_min {cal['reward_clip_min_before']:.4g} → "
+                    f"{proposed_clip:.4g} (est. clipped mass "
+                    f"{clipped_mass*100:.1f}%).  Recalibrating "
+                    f"reward_scale with clipped tail.", flush=True)
+                cal_post = calibrate_reward_scale(
+                    env, rng, mode=cal_mode,
+                    n_steps=cal_n_steps,
+                    baseline_action_std=float(cfg.baseline_seed_action_std),
+                    target_mode=cal_target_mode,
+                    target_percentile=cal_target_pct,
+                    target_percentile_value=cal_target_pct_value,
+                )
+                cal_post.pop('_obs_trace', None)
+                cal_post['reward_clip_asymmetry_threshold'] = cal[
+                    'reward_clip_asymmetry_threshold']
+                cal_post['reward_clip_tail_k'] = cal['reward_clip_tail_k']
+                cal_post['reward_clip_min_before'] = cal['reward_clip_min_before']
+                cal_post['reward_clip_min_after'] = float(proposed_clip)
+                cal_post['reward_clip_min_user_set'] = cal['reward_clip_min_user_set']
+                cal_post['adaptive_clip_triggered'] = True
+                cal_post['adaptive_clip_skipped_reason'] = None
+                cal_post['pre_clip_calibration'] = {
+                    k: v for k, v in cal.items()
+                    if k != 'pre_clip_calibration'
+                }
+                cal = cal_post
         if not cal['adaptive_clip_triggered']:
             print(
                 f"[reward-clip] adaptive clip not applied "
