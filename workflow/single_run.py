@@ -404,10 +404,24 @@ def main() -> int:
             from evaluation.validate import run_validation
             # Validate best.pt (deterministic-best P3 ckpt) rather than final.pt
             # (post-cascade-degraded) — fair cross-run comparison. See P60 RCA.
+            # Fall back to final.pt when no best.pt was ever written (P3
+            # collapsed before any deterministic-eval improvement, e.g. the
+            # bootstrap_cascade early-stop). Validating the degraded final
+            # controller still produces the disturbance-rejection plots and a
+            # comparable (if poor) score, which is far more useful than
+            # crashing with FileNotFoundError and emitting no plots at all.
+            val_ckpt = 'best.pt'
+            if not (out_dir / 'best.pt').exists():
+                val_ckpt = 'final.pt'
+                print('[run] validation: best.pt not found '
+                      '(no improving P3 ckpt — likely P3 collapse/early-stop); '
+                      'falling back to final.pt (degraded controller)',
+                      flush=True)
             val_summary = run_validation(controller_dir=out_dir,
                                           episodes=int(args.val_episodes),
                                           seeds=int(args.val_seeds),
-                                          ckpt='best.pt')
+                                          ckpt=val_ckpt)
+            val_summary['validated_ckpt'] = val_ckpt
             with open(out_dir / 'validation_summary.json', 'w') as f:
                 json.dump(val_summary, f, indent=2, default=str)
             print(f"[run] validation cum_raw_reward "
