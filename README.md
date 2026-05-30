@@ -19,6 +19,28 @@ World Models" (Dreamer 4), [arXiv:2509.24527](https://arxiv.org/abs/2509.24527).
 
 ## Architecture (paper-faithful, adapted to vector APC observations)
 
+The **world model is selectable** via `world_model_type` (TrainConfig /
+`DREAMER_WORLD_MODEL_TYPE`). Two backbones share the same reward / value /
+policy heads and the same three-phase trainer:
+
+### World model — `rssm` (DreamerV3 RSSM, **default** since P68)
+
+- **`models/dreamer_v4_rssm.py:RSSMDynamics`**: DreamerV3 recurrent
+  state-space model — a deterministic GRU core
+  `h_t = f(h_{t-1}, z_{t-1}, a_{t-1})` plus a 32×32 categorical stochastic
+  latent `z` (straight-through one-hot, 1% uniform mixture). MLP
+  encoder/decoder (LayerNorm+SiLU) operate in **already-normalized** obs
+  space (no extra symlog). Trained with reconstruction (MSE) + KL-balanced
+  free-bits loss (dyn weight 0.5, repr weight 0.1, free-bits 1.0 nat).
+  The agent feature is `feat = [h, z_flat]`.
+- **Why it is the default**: the SF-transformer below has no recurrent
+  fixed point (`wm_pred_converges_under_constant_action = 0.0` by
+  construction), which drove a Phase-3 bootstrap cascade that no
+  critic/reward-side fix could break (P64/P66/P67). The RSSM's GRU can
+  learn a held-action fixed point `h* = f(h*, z*, a)`.
+
+### World model — `sf_transformer` (Dreamer 4 shortcut-forcing, legacy opt-in)
+
 - **Causal Tokenizer** (`models/dreamer_v4.py:Tokenizer`): MLP encoder +
   linear+tanh bottleneck + MLP decoder. MAE-style channel dropout during
   training. MSE reconstruction loss (paper eq. 5; LPIPS dropped — not
@@ -29,18 +51,24 @@ World Models" (Dreamer 4), [arXiv:2509.24527](https://arxiv.org/abs/2509.24527).
   register tokens + 1 action token + 1 (τ, d) token + 1 z̃ token. Trained
   with **shortcut forcing** (paper eq. 7) using x-prediction; bootstrap
   distillation handles d > d_min. K = 4 sampling steps per inference frame.
+  Select via `DREAMER_WORLD_MODEL_TYPE=sf_transformer`.
+
+### Shared trainer + heads
+
 - **Three explicit phases** (paper Algorithm 1, adapted to single-task online APC):
-  - Phase 1 — pretrain world model: tokenizer recon + dynamics shortcut forcing.
+  - Phase 1 — pretrain world model: RSSM recon + KL (or tokenizer recon + dynamics shortcut forcing for `sf_transformer`).
   - Phase 2 — agent finetune: keep WM losses live; add policy + reward MTP heads (eq. 9).
-  - Phase 3 — imagination training: freeze WM transformer, train policy via PMPO (eq. 11) and value via TD-λ (eq. 10) on K=4 imagined rollouts.
-- **Heads** — carried over from Dreamer 3 (paper still uses these in V4):
-  - Policy: per-action-dim categorical over 21 uniform bins in [−1, 1].
-  - Reward + Value: symexp twohot (255 bins on [−20, 20]).
+  - Phase 3 — imagination training: freeze WM, train policy via PMPO (eq. 11) and value via TD-λ (eq. 10) on imagined rollouts.
+- **Heads** — carried over from Dreamer 3 (paper still uses these in V4),
+  shared by both backbones (built on `feat`):
+  - Policy: continuous Tanh-Normal (per-action-dim) — `ContinuousPolicyHead`.
+  - Reward + Value: symexp twohot.
 
 ## Layout
 
 ```
-models/dreamer_v4.py        # Causal tokenizer + dynamics transformer + heads (V4 paper-faithful)
+models/dreamer_v4.py        # Heads (reward/value/policy) + SF-transformer WM (tokenizer + dynamics) + world_model_type dispatch
+models/dreamer_v4_rssm.py   # DreamerV3 RSSM world model (GRU + 32×32 categorical latent) — DEFAULT backbone (P68)
 training/train.py           # Three-phase trainer (Phase 1 WM pretrain / Phase 2 agent finetune / Phase 3 imagination RL)
 utils/
   plant_init.py             # sample_rate / model_size / seq_len / batch_size / step-budget derivations
