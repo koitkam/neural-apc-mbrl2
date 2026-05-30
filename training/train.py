@@ -298,6 +298,61 @@ class TrainConfig:
     # noise floor ~σ_obs/√(K/2) which exceeds reasonable eps_o on test_sim
     # OU+meas noise (drift floor ~0.25 at K=16 vs 0.18 at K=32).
     wm_steady_min_run_steps: int = 32
+
+    # ---- A' : dense potential-based reward shaping (P66-RCA, 2026-05-29) ----
+    # The economic objective is a one-sided cliff (raw_abs_p95≈38 on the
+    # negative/violation side, positive tail p95≈0.15 → tail_asymmetry≈142):
+    # ~0 reward when in-band, a large penalty on CV violation, almost no
+    # POSITIVE gradient toward the band interior.  Under a drifting WM the
+    # imagined rollouts keep hitting the negative cliff → growing-negative
+    # λ-returns that FUEL the critic-pessimism cascade (critic_target_v_r→0.95).
+    # Clipping the negative tail is unsafe here (it would delete the CV-
+    # violation safety signal — basis k×positive_tail_p95≈-0.46 truncates ~67%
+    # of the penalty mass).  Instead we add a dense, *policy-invariant*
+    # potential-based shaping term (Ng et al. 1999):
+    #     F_t = coef · (γ·Φ(s_{t+1}) − Φ(s_t)),   Φ(s) ∈ [0,1]
+    # where Φ is the normalised margin to the nearest CV band edge (1 at band
+    # centre / at an enabled CV target, 0 at the edge, clamped to 0 outside).
+    # Because it is potential-based with the SAME γ, it does NOT change the
+    # optimal economic policy — it only densifies the learning signal so the
+    # policy/critic have a gradient toward the band interior instead of a flat
+    # zero.  ``coef`` is in SCALED-reward units (added to ``raw*reward_scale``).
+    # TRAINING ONLY: the trainer sets ``env._shaping_enabled=True``; validation
+    # scores on the unshaped economic ``info['raw_reward']`` so the audited
+    # objective is unchanged.  Set ``reward_shaping_coef=0.0`` to disable.
+    reward_shaping_coef: float = 1.0
+
+    # ---- C : replay-grounded critic anchor (P66-RCA, 2026-05-29) ----
+    # The cascade's root cause is that the P3 critic regresses purely on
+    # IMAGINED λ-returns from a frozen, non-convergent WM: targets become
+    # ~95% self-bootstrap (critic_target_v_r→0.95, reward <1% of target var),
+    # so the critic drifts into a self-consistent growing-negative fixed point
+    # of its own making.  This anchor adds a critic loss term on REAL replayed
+    # transitions — a TD-λ target built from the buffer's REAL rewards and the
+    # slow target-value bootstrap on the REAL latents — so the critic is pinned
+    # to genuine reward variance and cannot float free.  ``coef`` weights the
+    # anchor vs the imagined critic loss.  Set ``critic_replay_anchor_coef=0.0``
+    # to disable (legacy pure-imagination critic).
+    critic_replay_anchor_coef: float = 0.5
+
+    # ---- World-model backbone (P68, 2026-05-30) ----
+    # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
+    # default: its deterministic GRU core can learn a held-action fixed
+    # point ``h* = f(h*, z*, a)`` — the structural property the
+    # SF-transformer lacked (``wm_pred_converges_under_constant_action``
+    # pinned at 0.0 across P64/P66/P67, the upstream cause of the
+    # bootstrap-cascade that every critic/reward-side fix failed to break).
+    # ``'sf_transformer'`` selects the original V4 shortcut-forcing WM.
+    world_model_type: str = 'rssm'
+    rssm_deter_dim: int = 512          # GRU hidden (paper Medium)
+    rssm_n_categoricals: int = 32      # paper
+    rssm_n_classes: int = 32           # paper
+    rssm_embed_dim: int = 256
+    rssm_hidden_dim: int = 256
+    rssm_unimix: float = 0.01          # paper 1% uniform mixture
+    rssm_free_bits: float = 1.0        # paper free-bits floor (nats)
+    rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
+    rssm_kl_repr_w: float = 0.1        # paper KL-balance repr weight
     wm_steady_action_eps: float = 0.02
     # P65 (2026-05-29): obs gate is now half-window mean-DRIFT on z-scored
     # obs (not std), so 0.20 unit means "two halves of the window differ
@@ -513,6 +568,19 @@ class TrainConfig:
     # tracking reduces the stale-target bias that feeds the cascade.
     target_critic_tau: float = 0.05
     tau_ctx: float = 0.1             # context-noise corruption at inference
+    # Experiment (2026-05-29, WM steady-state RCA): train a clean τ=1.0
+    # bin so the WM can be conditioned on a NOISE-FREE history at
+    # inference.  The paper flow grid (sample_tau_d) only emits
+    # τ ∈ {0, 1/k, …, (k-1)/k} — τ=1.0 is never sampled, so the τ=1.0
+    # embedding bin is OOD and inference is forced to corrupt the context
+    # to τ=(k_max-1)/k_max (injecting (1/k_max)·N(0,I) per step).  That
+    # context-noise floor makes ``wm_pred_converges_under_constant_action``
+    # = 0.0 by construction.  When > 0, this fraction of training
+    # positions are set to τ=1.0 (a clean identity target, ramp-weight
+    # 1.0) AND all inference/conditioning paths feed the context at
+    # τ=1.0 (clean) instead of (k_max-1)/k_max.  Default 0.0 keeps the
+    # exact paper-faithful behaviour; opt-in via DREAMER_SF_CLEAN_TAU_PROB.
+    sf_clean_tau_prob: float = 0.0
 
     # ----- Buffer -----
     # 2026-05-18 raised 200k→400k after reward-head saturation diagnosis
@@ -820,7 +888,6 @@ class APCEnv:
         self.reward_scale: float = 1.0
         self._last_cv_violation_sum: float = 0.0
         self._last_mv_violation_sum: float = 0.0
-
         # ---- Hidden (truly unmeasured) CV disturbance process -------------
         # Per-episode OU process injecting a smoothly evolving bias into
         # the CV state channels.  The state is NOT exposed to the agent
@@ -880,6 +947,17 @@ class APCEnv:
         # overrides this when the user did NOT set it explicitly.
         self._reward_clip_min_user_set: bool = (
             'DREAMER_REWARD_RAW_CLIP_MIN' in os.environ)
+
+        # ---- A' : potential-based reward shaping state ------------------
+        # Dense band-keeping shaping (see TrainConfig.reward_shaping_coef).
+        # Disabled by default; the trainer sets ``_shaping_enabled=True`` on
+        # the training env only.  ``_prev_potential`` caches Φ(s_t) across
+        # steps for the F = γΦ(s') − Φ(s) telescoping form.
+        self._shaping_enabled: bool = False
+        self._shaping_coef: float = float(
+            getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0)
+        self._shaping_gamma: float = float(getattr(cfg, 'gamma', 0.997) or 0.997)
+        self._prev_potential: Optional[float] = None
 
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
@@ -987,6 +1065,7 @@ class APCEnv:
         self._prev_cv_violation_per_channel = None
         self._last_cv_violation_sum = 0.0
         self._last_mv_violation_sum = 0.0
+        self._prev_potential = None
         if self._derived_features is not None:
             try:
                 cv0 = np.asarray(state, dtype='float64')[self.cv_indices]
@@ -1023,6 +1102,41 @@ class APCEnv:
         obs_vec = self._build_obs_vec(state)
         self._window = np.tile(obs_vec, (self.cfg.lookback, 1)).astype('float32')
         return self._window.copy()
+
+    def _shaping_potential(self, state: np.ndarray) -> float:
+        """Dense band-keeping potential Φ(s) ∈ [0, 1] for reward shaping.
+
+        Returns the mean over CVs of the normalised margin to the nearest
+        band edge: 1.0 at the band centre (or at an enabled CV target),
+        0.0 at the edge, clamped to 0 outside the band.  This is the
+        positive-gradient signal the one-sided economic objective lacks
+        inside the safe band.  Read-only; no side effects.
+        """
+        sp = self.setpoint_mgr
+        try:
+            bounds = np.asarray(sp.current_cv_bounds, dtype='float64').reshape(-1, 2)
+            targets = np.asarray(sp.current_cv_targets, dtype='float64').reshape(-1)
+            tgt_en = np.asarray(sp.cv_target_enabled, dtype=bool).reshape(-1)
+        except Exception:
+            return 0.0
+        vals: List[float] = []
+        for i, ci in enumerate(self.cv_indices):
+            if ci is None or i >= bounds.shape[0] or int(ci) >= state.shape[0]:
+                continue
+            lo = float(bounds[i, 0]); hi = float(bounds[i, 1])
+            half = 0.5 * (hi - lo)
+            if half <= 1e-9:
+                continue
+            cv = float(state[int(ci)])
+            if i < tgt_en.shape[0] and bool(tgt_en[i]) and np.isfinite(targets[i]):
+                d = abs(cv - float(targets[i])) / half
+                vals.append(max(0.0, 1.0 - d))
+            else:
+                m = min(cv - lo, hi - cv) / half
+                vals.append(float(np.clip(m, 0.0, 1.0)))
+        if not vals:
+            return 0.0
+        return float(np.mean(vals))
 
     def step(self, action_norm: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         action_norm = np.asarray(action_norm, dtype='float32').reshape(self.action_dim)
@@ -1084,6 +1198,27 @@ class APCEnv:
                 self._reward_clip_warned = True
             raw_reward = clipped
         reward = raw_reward * float(self.reward_scale)
+        # A' : dense potential-based reward shaping (training env only;
+        # ``info['raw_reward']`` below stays the unshaped economic reward so
+        # validation scoring is unaffected).  F = coef·(γΦ(s') − Φ(s)) is
+        # policy-invariant (Ng et al. 1999) — it densifies the learning
+        # signal toward the band interior without changing the optimal
+        # economic policy.  Added in scaled-reward units.
+        if self._shaping_enabled and self._shaping_coef > 0.0:
+            phi_next = self._shaping_potential(next_state)
+            phi_prev = (self._prev_potential
+                        if self._prev_potential is not None else phi_next)
+            # Read γ live from cfg so the shaping discount tracks the
+            # auto-tuned training γ (set AFTER __init__).  Strict
+            # policy-invariance (Ng et al. 1999) requires shaping γ ==
+            # RL γ; caching the __init__ default would break it.
+            shaping_gamma = float(getattr(self.cfg, 'gamma',
+                                          self._shaping_gamma)
+                                  or self._shaping_gamma)
+            shaping = self._shaping_coef * (
+                shaping_gamma * phi_next - phi_prev)
+            self._prev_potential = phi_next
+            reward = reward + float(shaping)
         self._prev_control = np.asarray(control, dtype='float32')
         # Stash raw per-channel violation depths for next step's
         # DMC rate term (legacy mode ignores them).
@@ -1208,13 +1343,56 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max, so the maximum trained
     # τ value is (k_max-1)/k_max.  Using cfg.tau_ctx=0.1 (τ=0.9) with
     # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
-    tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
+    # When the clean τ=1.0 bin is trained (sf_clean_tau_prob>0) the
+    # encoded context IS clean, so condition at τ=1.0 (no corruption).
+    if float(getattr(cfg, 'sf_clean_tau_prob', 0.0)) > 0.0:
+        tau_ctx_val = 1.0
+    else:
+        tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
+
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    # RSSM streaming inference: carry a running recurrent state across the
+    # episode.  Each step advances the posterior with (prev_action, obs)
+    # and the posterior feature drives the policy — the GRU holds the
+    # plant context, so the lookback-window encode is not needed.
+    _rssm_state = (model.dynamics.initial_state(1, device)
+                   if _is_rssm else None)
+    _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
+                    if _is_rssm else None)
 
     for t in range(T):
         obs_buf[t] = obs_window[-1]
         if random_action:
             a_np = env.rng.uniform(-1.0, 1.0,
                                     size=(env.action_dim,)).astype('float32')
+            if _is_rssm:
+                # Advance the posterior even on random actions so the
+                # recurrent state stays consistent if a later step is
+                # policy-driven (mixed-mode collection).
+                with torch.amp.autocast(device_type=device.type,
+                                         dtype=torch.bfloat16,
+                                         enabled=(device.type == 'cuda')):
+                    _o = torch.from_numpy(
+                        obs_window[-1]).to(device).unsqueeze(0)
+                    _emb = model.dynamics.embed(_o)
+                    _post, _ = model.dynamics.obs_step(
+                        _rssm_state, _rssm_prev_a, _emb, sample=True)
+                _rssm_state = _post
+                _rssm_prev_a = torch.from_numpy(
+                    a_np).to(device).unsqueeze(0)
+        elif _is_rssm:
+            with torch.amp.autocast(device_type=device.type,
+                                     dtype=torch.bfloat16,
+                                     enabled=(device.type == 'cuda')):
+                _o = torch.from_numpy(obs_window[-1]).to(device).unsqueeze(0)
+                _emb = model.dynamics.embed(_o)
+                _post, _ = model.dynamics.obs_step(
+                    _rssm_state, _rssm_prev_a, _emb, sample=True)
+                action_t, _, _ = model.policy(_post.feat,
+                                               deterministic=deterministic)
+            a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
+            _rssm_state = _post
+            _rssm_prev_a = torch.from_numpy(a_np).to(device).unsqueeze(0)
         else:
             ow = torch.from_numpy(obs_window).to(device)            # (L, D)
             a_ctx = torch.from_numpy(a_history).to(device)           # (L, A)
@@ -1818,6 +1996,61 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
 # Phase 1 / 2 — World model loss (tokenizer recon + shortcut forcing)
 # ---------------------------------------------------------------------------
 
+def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
+                            act: torch.Tensor, cfg: TrainConfig,
+                            ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor,
+                                        torch.Tensor]:
+    """RSSM world-model loss: reconstruction + KL-balanced free-bits.
+
+    Mirrors the SF return signature ``(losses, z_clean, agent_hid)``:
+      * ``z_clean`` → posterior stochastic features (B, T, stoch_flat) so
+        any legacy consumer that expects a latent still gets one (the
+        Phase-2 BC/reward heads use ``agent_hid`` instead).
+      * ``agent_hid`` → posterior feature ``[h, z_flat]`` (B, T, feat_dim),
+        fed to the V4 BC + reward-MTP heads unchanged.
+    """
+    from models.dreamer_v4_rssm import rssm_kl_loss
+    rssm = model.dynamics
+    feats, post_logits, prior_logits, _last = rssm.rollout_observed(
+        obs_cur, act, sample=True)               # feats (B,T,F)
+    recon = rssm.decode(feats)                    # (B, T, obs_dim)
+    recon_loss = F.mse_loss(recon, obs_cur)
+    kl_loss, kl_diag = rssm_kl_loss(
+        post_logits, prior_logits,
+        free_bits=float(getattr(cfg, 'rssm_free_bits', 1.0)),
+        dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
+        repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
+    wm_total = cfg.recon_scale * recon_loss + kl_loss
+
+    losses: Dict[str, torch.Tensor] = {
+        'recon_loss': recon_loss,
+        'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
+        'kl_loss': kl_loss,
+        'wm_total': wm_total,
+        # keep the steady-state keys present (RSSM solves this structurally,
+        # so the explicit regulariser is left inactive).
+        'wm_steady_loss': torch.zeros((), device=feats.device),
+        'wm_steady_held_frac': torch.zeros((), device=feats.device),
+    }
+    losses.update(kl_diag)
+    # Encoder-quality diagnostics on the posterior stochastic features.
+    with torch.no_grad():
+        z_flat = feats[..., rssm.deter_dim:]
+        obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
+        z_var_per_dim = z_flat.float().var(dim=(0, 1))
+        losses['encoder_var_ratio'] = (z_var_per_dim.mean() / obs_var).detach()
+        s_var = z_var_per_dim.sum().clamp_min(1e-12)
+        s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
+        losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
+        losses['z_dim'] = torch.tensor(float(z_flat.shape[-1]),
+                                        device=feats.device)
+        v_max = z_var_per_dim.max().clamp_min(1e-12)
+        losses['z_alive_dims'] = (
+            (z_var_per_dim > 0.01 * v_max).float().sum().detach())
+    # z_clean here = posterior stochastic features (detached).
+    return losses, feats[..., rssm.deter_dim:].detach(), feats
+
+
 def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
                       cfg: TrainConfig,
                       ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor,
@@ -1835,6 +2068,10 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # the L (lookback) axis has been removed from the storage path.
     obs_cur = obs                          # (B, T, D)
 
+    # ===== RSSM world-model branch =====
+    if getattr(model, 'world_model_type', 'sf_transformer') == 'rssm':
+        return _rssm_world_model_loss(model, obs_cur, act, cfg)
+
     # Tokenizer with MAE: recon the masked obs.
     z_mae, recon = model.tokenizer.forward_with_mae(obs_cur)
     recon_loss = model.tokenizer.recon_loss(obs_cur, recon)
@@ -1842,7 +2079,9 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Shortcut forcing target = clean tokenizer output (no MAE).
     z_clean = model.tokenizer.encode(obs_cur)            # (B, T, z_dim)
     sf_loss, sf_diag = shortcut_forcing_loss(model.dynamics,
-                                                z_clean.detach(), act)
+                                                z_clean.detach(), act,
+                                                clean_tau_prob=float(
+                                                    getattr(cfg, 'sf_clean_tau_prob', 0.0)))
 
     # Compute agent_hid from a near-clean dynamics pass (τ=tau_max, d=d_min).
     # Used by the Phase 2 BC + reward MTP heads.
@@ -1854,7 +2093,12 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # cleanest TRAINED features.
     B, T = z_clean.shape[:2]
     device = z_clean.device
-    tau_max = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
+    # Conditioning τ for the agent-head pass.  When the clean-τ bin is
+    # trained (sf_clean_tau_prob>0) the context is genuinely clean, so
+    # read at τ=1.0; otherwise fall back to the cleanest TRAINED grid
+    # value (k_max-1)/k_max.
+    _clean_tau = float(getattr(cfg, 'sf_clean_tau_prob', 0.0)) > 0.0
+    tau_max = 1.0 if _clean_tau else (float(cfg.k_max) - 1.0) / float(cfg.k_max)
     tau_clean = torch.full((B, T), tau_max, device=device, dtype=z_clean.dtype)
     d_min = torch.full((B, T), 1.0 / cfg.k_max, device=device,
                         dtype=z_clean.dtype)
@@ -2021,6 +2265,201 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
 # Phase 3 — Imagination training (PMPO + TD-λ)
 # ---------------------------------------------------------------------------
 
+def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
+                            cfg: TrainConfig) -> Dict[str, torch.Tensor]:
+    """Phase 3 imagination on the RSSM world-model.
+
+    Mirrors the SF-transformer ``imagination_step`` convention exactly,
+    only swapping the dynamics:
+      * Warm-start from the buffer's last POSTERIOR state (teacher-forced
+        rollout over the real (obs, act) context).  ``feat`` at that state
+        has already integrated the last buffered action — the analog of
+        the SF "post-action agent_hid at the last position".
+      * Each imagined step: sample ``a_h`` from the current state's
+        ``feat`` (which saw the previous action), advance the PRIOR with
+        ``img_step(state, a_h)``, then read reward / value / target-value
+        from the NEW state's ``feat`` (which now sees ``a_h``) — so the
+        predicted reward is action-conditioned, exactly like the SF path.
+    Reward / target-value heads are frozen (P3 only optimises actor +
+    critic params); the value head keeps its gradient path.
+    """
+    rssm = model.dynamics
+    obs = batch['obs']                       # (B, T, D)
+    act = batch['act']                       # (B, T, A)
+    B, T = obs.shape[:2]
+    H = int(cfg.horizon)
+    device = obs.device
+
+    # Warm-start: teacher-forced posterior rollout over the real context
+    # (frozen WM).  ``last_state`` is the posterior at t=T-1; ``feats_real``
+    # are the per-step posterior features used by the replay-grounded
+    # critic anchor.
+    with torch.no_grad():
+        feats_real, _post_lg, _prior_lg, last_state = rssm.rollout_observed(
+            obs, act, sample=True)
+        agent_hid_real = feats_real                          # (B, T, F)
+    state = last_state
+
+    imagined_rewards: List[torch.Tensor] = []
+    imagined_entropy: List[torch.Tensor] = []
+    imagined_actions: List[torch.Tensor] = []
+    imagined_raws: List[torch.Tensor] = []
+    imagined_values: List[torch.Tensor] = []
+    imagined_target_v: List[torch.Tensor] = []
+    imagined_agent_hid: List[torch.Tensor] = []
+    imagined_agent_hid_pre: List[torch.Tensor] = []
+
+    for h in range(H):
+        # 1. Sample action from the current state's feat (saw a_{prev}).
+        feat_pre = state.feat
+        action_t, logp_t, ent_t, raw_t = model.policy.sample_with_raw(feat_pre)
+
+        # 2. Advance the prior under that action (frozen WM).
+        with torch.no_grad():
+            next_state = rssm.img_step(state, action_t, sample=True)
+        feat_post = next_state.feat                          # (B, F) — sees a_h
+
+        # 3. Frozen reward + slow-target value heads (action-aware).
+        with torch.no_grad():
+            reward_pred = model.reward.expectation(model.reward(feat_post))
+            target_v_pred = model.target_value.expectation(
+                model.target_value(feat_post))
+        # 4. Current value head (with grad).
+        value_logits = model.value(feat_post)
+
+        imagined_rewards.append(reward_pred)
+        imagined_entropy.append(ent_t)
+        imagined_actions.append(action_t)
+        imagined_raws.append(raw_t)
+        imagined_values.append(value_logits)
+        imagined_target_v.append(target_v_pred)
+        imagined_agent_hid.append(feat_post)
+        imagined_agent_hid_pre.append(feat_pre)
+        state = next_state
+
+    rewards = torch.stack(imagined_rewards, dim=1)            # (B, H)
+    target_values = torch.stack(imagined_target_v, dim=1)     # (B, H)
+    actions = torch.stack(imagined_actions, dim=1)            # (B, H, A)
+    raws = torch.stack(imagined_raws, dim=1)                  # (B, H, ...)
+    entropies = torch.stack(imagined_entropy, dim=1)          # (B, H)
+    agent_hids = torch.stack(imagined_agent_hid, dim=1)       # (B, H, F)
+    agent_hids_pre = torch.stack(imagined_agent_hid_pre, dim=1)  # (B, H, F)
+    value_logits_seq = torch.stack(imagined_values, dim=1)    # (B, H, n_bins)
+
+    # ----- shared tail: λ-returns (eq. 10) -----
+    gamma = cfg.gamma
+    lam = cfg.gae_lambda
+    returns = torch.zeros_like(target_values)
+    returns[:, -1] = target_values[:, -1]
+    for t in reversed(range(H - 1)):
+        bootstrap = (1.0 - lam) * target_values[:, t + 1] + lam * returns[:, t + 1]
+        returns[:, t] = rewards[:, t] + gamma * bootstrap
+    target_returns = returns.detach()
+
+    # Critic loss (twohot CE).
+    val_logits_flat = value_logits_seq.reshape(-1, value_logits_seq.shape[-1])
+    val_target_flat = target_returns.reshape(-1)
+    critic_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
+
+    # Replay-grounded critic anchor (C) — pin the critic to a TD-λ target
+    # built from REAL rewards + slow-target bootstrap on REAL posterior
+    # features, preventing the imagined-only growing-negative fixed point.
+    anchor_coef = float(getattr(cfg, 'critic_replay_anchor_coef', 0.0) or 0.0)
+    critic_anchor_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
+    if anchor_coef > 0.0:
+        rew_real = batch['rew'].to(device=device, dtype=target_returns.dtype)
+        cont_real = batch.get('cont', None)
+        cont_real = (cont_real.to(device=device, dtype=target_returns.dtype)
+                     if cont_real is not None else torch.ones_like(rew_real))
+        Treal = agent_hid_real.shape[1]
+        feat_real = agent_hid_real.reshape(-1, agent_hid_real.shape[-1])
+        val_real_logits = model.value(feat_real)
+        with torch.no_grad():
+            tv_real = model.target_value.expectation(
+                model.target_value(feat_real)).view(B, Treal)
+            ret_real = torch.zeros_like(tv_real)
+            ret_real[:, -1] = tv_real[:, -1]
+            for t in reversed(range(Treal - 1)):
+                boot = (1.0 - lam) * tv_real[:, t + 1] + lam * ret_real[:, t + 1]
+                ret_real[:, t] = (rew_real[:, t]
+                                  + gamma * cont_real[:, t] * boot)
+            y_real = ret_real.reshape(-1).detach()
+        critic_anchor_loss = model.value.loss(val_real_logits, y_real).mean()
+        critic_loss = critic_loss + anchor_coef * critic_anchor_loss
+
+    # Advantage → actor loss.
+    with torch.no_grad():
+        baseline = model.value.expectation(
+            model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
+        ).view(B, H)
+        adv_raw = target_returns - baseline
+        scale = model.update_return_scale(
+            target_returns,
+            max_step_growth=float(getattr(
+                cfg, 'return_scale_max_step_growth', 0.0)),
+        ).clamp_min(1.0)
+
+    feat_flat_for_policy = agent_hids_pre.reshape(-1, agent_hids_pre.shape[-1])
+    raws_flat = raws.reshape(-1, raws.shape[-1]) if raws.dim() > 2 \
+                  else raws.reshape(-1)
+    adv_flat = (adv_raw / scale).reshape(-1).detach()
+
+    actor_loss_type = str(getattr(cfg, 'actor_loss_type', 'reinforce')).lower()
+    if actor_loss_type == 'pmpo':
+        actor_loss, pmpo_diag = pmpo_loss(
+            model.policy, model.prior_policy,
+            feat_flat_for_policy, raws_flat, adv_flat,
+            alpha=cfg.pmpo_alpha, beta=cfg.pmpo_beta,
+            entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 0.0)))
+    else:
+        actor_loss, pmpo_diag = reinforce_actor_loss(
+            model.policy, model.prior_policy,
+            feat_flat_for_policy, raws_flat, adv_flat,
+            entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 3e-4)),
+            kl_coef=0.0)
+
+    # Critic-health diagnostics (same readouts as the SF path).
+    with torch.no_grad():
+        crit_pred = model.value.expectation(val_logits_flat).view(B, H)
+        tgt = target_returns
+        tv = torch.stack(imagined_target_v, dim=1)
+
+        def _pearson_safe(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            a = a.reshape(-1).float()
+            b = b.reshape(-1).float()
+            a_c = a - a.mean()
+            b_c = b - b.mean()
+            denom = (a_c.norm() * b_c.norm()).clamp_min(1e-8)
+            return (a_c * b_c).sum() / denom
+
+        crit_pred_target_r = _pearson_safe(crit_pred, tgt)
+        crit_target_v_r = _pearson_safe(tv, tgt)
+        rew_var = rewards.float().var().clamp_min(1e-8)
+        tgt_var = tgt.float().var().clamp_min(1e-8)
+        rew_to_tgt_var = (rew_var / tgt_var).clamp_max(10.0)
+
+    diag = {
+        'actor_loss': actor_loss,
+        'critic_loss': critic_loss,
+        'imagined_return_mean': target_returns.mean().detach(),
+        'imagined_reward_mean': rewards.mean().detach(),
+        'imagined_reward_std': rewards.std().detach(),
+        'entropy_mean': entropies.mean().detach(),
+        'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
+        'adv_global_std': adv_raw.std().detach(),
+        'return_scale': scale.detach().squeeze(),
+        'critic_pred_mean': crit_pred.mean().detach(),
+        'critic_pred_std': crit_pred.std().detach(),
+        'critic_target_std': tgt.std().detach(),
+        'critic_pred_target_r': crit_pred_target_r.detach(),
+        'critic_target_v_r': crit_target_v_r.detach(),
+        'critic_rew_to_tgt_var': rew_to_tgt_var.detach(),
+        'critic_anchor_loss': critic_anchor_loss.detach(),
+    }
+    diag.update(pmpo_diag)
+    return diag
+
+
 def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                       cfg: TrainConfig) -> Dict[str, torch.Tensor]:
     """Phase 3: roll out H imagined steps, compute PMPO + TD-λ.
@@ -2047,6 +2486,9 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     H = int(cfg.horizon)
     device = obs.device
 
+    if getattr(model, 'world_model_type', 'sf_transformer') == 'rssm':
+        return _imagination_step_rssm(model, batch, cfg)
+
     # Encode the buffered context (frozen tokenizer).
     with torch.no_grad():
         obs_cur = obs
@@ -2065,6 +2507,13 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # 1.0 — τ=1.0 hits an untrained τ-embedding bin and agent_hid is
     # garbage.  Same fix as in world_model_loss.
     tau_max_v = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
+    # Clean-τ inference (WM steady-state RCA 2026-05-29): when the clean
+    # τ=1.0 bin is trained, condition imagination on a noise-free context
+    # (τ=1.0, tau_ctx=0) to remove the per-step context-noise floor.
+    _clean_tau = float(getattr(cfg, 'sf_clean_tau_prob', 0.0)) > 0.0
+    if _clean_tau:
+        tau_max_v = 1.0
+    _img_tau_ctx = 0.0 if _clean_tau else None
     with torch.no_grad():
         tau_clean = torch.full((B, T), tau_max_v, device=device,
                                  dtype=z_history.dtype)
@@ -2072,6 +2521,10 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                               dtype=z_history.dtype)
         out0 = model.dynamics(z_history, tau_clean, d_min_t, a_history)
         agent_hid_post = out0['agent_hid'][:, -1]            # (B, D)
+        # C : keep the full (B, T, D) real-context agent_hid for the
+        # replay-grounded critic anchor (frozen-WM features; the value
+        # head builds its own grad path on top).
+        agent_hid_real = out0['agent_hid']                   # (B, T, D)
 
     imagined_rewards: List[torch.Tensor] = []
     imagined_logp: List[torch.Tensor] = []
@@ -2110,7 +2563,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         with torch.no_grad():
             z_next = model.imagine_next_z(z_history, action_t,
                                            k_steps=cfg.k_max,
-                                           tau_ctx=None,
+                                           tau_ctx=_img_tau_ctx,
                                            action_history=a_history)      # (B, z)
 
         # 3. Slide histories: append (z_t, a_t).
@@ -2177,6 +2630,34 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     val_logits_flat = value_logits_seq.reshape(-1, value_logits_seq.shape[-1])
     val_target_flat = target_returns.reshape(-1)
     critic_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
+
+    # C : replay-grounded critic anchor.  Pin the critic to a TD-λ target
+    # built from the buffer's REAL rewards + slow-target bootstrap on the
+    # REAL latents, so the imagined-only targets can't drift into the
+    # self-referential growing-negative fixed point that drives the
+    # bootstrap cascade (critic_target_v_r→0.95, reward <1% of target var).
+    anchor_coef = float(getattr(cfg, 'critic_replay_anchor_coef', 0.0) or 0.0)
+    critic_anchor_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
+    if anchor_coef > 0.0:
+        rew_real = batch['rew'].to(device=device, dtype=target_returns.dtype)
+        cont_real = batch.get('cont', None)
+        cont_real = (cont_real.to(device=device, dtype=target_returns.dtype)
+                     if cont_real is not None else torch.ones_like(rew_real))
+        Treal = agent_hid_real.shape[1]
+        feat_real = agent_hid_real.reshape(-1, agent_hid_real.shape[-1])
+        val_real_logits = model.value(feat_real)            # (B*Treal, nbins) w/ grad
+        with torch.no_grad():
+            tv_real = model.target_value.expectation(
+                model.target_value(feat_real)).view(B, Treal)
+            ret_real = torch.zeros_like(tv_real)
+            ret_real[:, -1] = tv_real[:, -1]
+            for t in reversed(range(Treal - 1)):
+                boot = (1.0 - lam) * tv_real[:, t + 1] + lam * ret_real[:, t + 1]
+                ret_real[:, t] = (rew_real[:, t]
+                                  + gamma * cont_real[:, t] * boot)
+            y_real = ret_real.reshape(-1).detach()
+        critic_anchor_loss = model.value.loss(val_real_logits, y_real).mean()
+        critic_loss = critic_loss + anchor_coef * critic_anchor_loss
 
     # Advantage (current critic baseline) → PMPO (eq. 11).
     # Paper-faithful: A_t = R_t - V(s_t), then divide by EMA return scale
@@ -2276,8 +2757,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     diag = {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
-        'imagined_return_mean': target_returns.mean().detach(),
-        'imagined_reward_mean': rewards.mean().detach(),
+        'imagined_return_mean': target_returns.mean().detach(),        'imagined_reward_mean': rewards.mean().detach(),
         'imagined_reward_std': rewards.std().detach(),
         'entropy_mean': entropies.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
@@ -2290,6 +2770,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_pred_target_r': crit_pred_target_r.detach(),
         'critic_target_v_r': crit_target_v_r.detach(),
         'critic_rew_to_tgt_var': rew_to_tgt_var.detach(),
+        'critic_anchor_loss': critic_anchor_loss.detach(),
     }
     diag.update(pmpo_diag)
     return diag
@@ -2314,6 +2795,13 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
         policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
         policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
+        world_model_type=str(getattr(cfg, 'world_model_type', 'rssm')),
+        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
+        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
+        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
     )
     model = DreamerV4(model_cfg)
     # Optional torch.compile (set via TrainConfig.compile_mode or env var).
@@ -3346,6 +3834,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     cfg.state_dim = env.state_dim
     cfg.aug_obs_dim = env.aug_obs_dim
     cfg.obs_dim = env.obs_dim
+
+    # A' : enable potential-based reward shaping on the TRAINING env only.
+    # Validation builds its own APCEnv instances (evaluation/validate.py)
+    # which leave shaping OFF, so the audited economic score is unshaped.
+    if float(getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0) > 0.0:
+        env._shaping_enabled = True
+        print(f"[reward-shaping] potential-based shaping ENABLED on training "
+              f"env (coef={env._shaping_coef:.3g}, γ={env._shaping_gamma:.4g}); "
+              f"validation scores on unshaped economic reward.", flush=True)
 
     # ---- Adaptive cold-start seed-buffer knobs (P0, 2026-05-05) ----
     # Derive plant-aware defaults for the seed buffer so a fresh sim
@@ -4630,7 +5127,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 if (diag_perhead_grads_every > 0
                         and total_iters > 0
                         and (total_iters % diag_perhead_grads_every) == 0
-                        and current_phase in (1, 2)):
+                        and current_phase in (1, 2)
+                        and model.tokenizer is not None):
                     try:
                         # P41 fix: pass the *full* param list of the
                         # relevant submodule (not a single ``next()``
@@ -4871,7 +5369,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if (diag_latent_stability_every > 0
                     and total_iters > 0
                     and (total_iters % diag_latent_stability_every) == 0
-                    and current_phase in (1, 2)):
+                    and current_phase in (1, 2)
+                    and model.tokenizer is not None):
                 try:
                     _N = 64
                     if diag_latent_ref is None:

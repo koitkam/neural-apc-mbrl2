@@ -258,18 +258,36 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
     #    using the proper iterative-denoising protocol.
     pred_obs_all: List[np.ndarray] = []      # per start: (k, obs_dim)
     real_obs_all: List[np.ndarray] = []
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
     for s in starts:
         s = int(s)
-        # Initial lookback ending at index s-1, so the first prediction
-        # is for index s (the action taken there is real_act[s-1]? no:
-        # in this env, real_obs[t] is the obs *after* taking real_act[t],
-        # so to predict real_obs[s] we condition on history ending at
-        # s-1 and use action real_act[s-1]... no wait, real_obs[s-1] is
-        # AFTER real_act[s-1]; to predict real_obs[s] we need real_act[s].
-        # We follow the env convention: predicted obs at offset kk
-        # corresponds to real_obs[s + kk], conditioning on real_act[s + kk].
         ow_window = real_obs[s - L:s].copy()             # (L, D)
         a_window = real_act[s - L:s].copy()              # (L, A)
+
+        if _is_rssm:
+            # Warm the posterior over the lookback, then advance the
+            # prior under the REAL future actions and decode each step.
+            rssm = model.dynamics
+            pred_per_start = np.zeros((k_max, obs_dim), dtype='float32')
+            with torch.no_grad():
+                state = rssm.initial_state(1, device)
+                for l in range(L):
+                    _o = torch.from_numpy(ow_window[l]).to(device).unsqueeze(0)
+                    _a = torch.from_numpy(a_window[l]).to(device).unsqueeze(0)
+                    state, _ = rssm.obs_step(state, _a, rssm.embed(_o),
+                                              sample=True)
+                for kk in range(k_max):
+                    a_step = torch.from_numpy(
+                        real_act[s + kk]).to(device).unsqueeze(0)
+                    state = rssm.img_step(state, a_step, sample=True)
+                    obs_hat = rssm.decode(
+                        state.feat).squeeze(0).float().cpu().numpy()
+                    pred_per_start[kk] = obs_hat[:obs_dim]
+            real_seg = real_obs[s:s + k_max]
+            pred_obs_all.append(pred_per_start)
+            real_obs_all.append(real_seg)
+            continue
+
         z_history_list: List[np.ndarray] = []
         # Encode the initial L windows once into clean z_history
         # (kept on CPU as numpy, re-encoded later).
@@ -347,6 +365,24 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
 # Reward MTP head fidelity
 # ---------------------------------------------------------------------------
 
+def _rssm_feat_from_window(model, ow_window: np.ndarray,
+                            a_window: np.ndarray, device) -> torch.Tensor:
+    """Warm an RSSM posterior over a lookback window; return last feat.
+
+    Mirrors the training/inference convention (``obs_step`` with the
+    contemporaneous ``act[l]``).  Returns ``(1, feat_dim)``.
+    """
+    rssm = model.dynamics
+    L = ow_window.shape[0]
+    with torch.no_grad():
+        state = rssm.initial_state(1, device)
+        for l in range(L):
+            _o = torch.from_numpy(ow_window[l]).to(device).unsqueeze(0)
+            _a = torch.from_numpy(a_window[l]).to(device).unsqueeze(0)
+            state, _ = rssm.obs_step(state, _a, rssm.embed(_o), sample=True)
+    return state.feat
+
+
 def _reward_mtp_fidelity(model, env, device, *,
                           n_starts: int = 32,
                           seed: int = 23456) -> Dict:
@@ -382,20 +418,25 @@ def _reward_mtp_fidelity(model, env, device, *,
 
     pred_rew = np.zeros((len(starts), L_mtp), dtype='float32')
     targ_rew = np.zeros((len(starts), L_mtp), dtype='float32')
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
     for i, s in enumerate(starts):
         s = int(s)
         ow_window = real_obs[s - L:s]
         a_window = real_act[s - L:s]
         with torch.no_grad():
-            ow_t = torch.from_numpy(ow_window).to(device)
-            a_t = torch.from_numpy(a_window).to(device)
-            z_ctx = model.tokenizer.encode(ow_t).unsqueeze(0)
-            tau = torch.full((1, L), tau_ctx_val, device=device,
-                              dtype=z_ctx.dtype)
-            d = torch.full((1, L), d_min, device=device,
-                            dtype=z_ctx.dtype)
-            out = model.dynamics(z_ctx, tau, d, a_t.unsqueeze(0))
-            agent_hid = out['agent_hid'][:, -1]                # (1, D)
+            if _is_rssm:
+                agent_hid = _rssm_feat_from_window(model, ow_window,
+                                                    a_window, device)
+            else:
+                ow_t = torch.from_numpy(ow_window).to(device)
+                a_t = torch.from_numpy(a_window).to(device)
+                z_ctx = model.tokenizer.encode(ow_t).unsqueeze(0)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_t.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]                # (1, D)
             rew_logits = model.reward.forward_mtp(agent_hid)   # (1, L, K)
             r_hat = model.reward.expectation(rew_logits).squeeze(0)
             pred_rew[i] = r_hat.float().cpu().numpy()[:L_mtp]
@@ -475,20 +516,25 @@ def _critic_calibration(model, env, device, *,
 
     v_pred = np.zeros((starts.size,), dtype='float32')
     g_real = np.zeros((starts.size,), dtype='float32')
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
     for i, s in enumerate(starts):
         s = int(s)
         ow_window = real_obs[s - L:s]
         a_window = real_act[s - L:s]
         with torch.no_grad():
-            ow_t = torch.from_numpy(ow_window).to(device)
-            a_t = torch.from_numpy(a_window).to(device)
-            z_ctx = model.tokenizer.encode(ow_t).unsqueeze(0)
-            tau = torch.full((1, L), tau_ctx_val, device=device,
-                              dtype=z_ctx.dtype)
-            d = torch.full((1, L), d_min, device=device,
-                            dtype=z_ctx.dtype)
-            out = model.dynamics(z_ctx, tau, d, a_t.unsqueeze(0))
-            agent_hid = out['agent_hid'][:, -1]
+            if _is_rssm:
+                agent_hid = _rssm_feat_from_window(model, ow_window,
+                                                    a_window, device)
+            else:
+                ow_t = torch.from_numpy(ow_window).to(device)
+                a_t = torch.from_numpy(a_window).to(device)
+                z_ctx = model.tokenizer.encode(ow_t).unsqueeze(0)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_t.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]
             v_logits = model.value(agent_hid)
             v_pred[i] = float(model.value.expectation(v_logits))
         g_real[i] = float(G[s])
@@ -527,22 +573,35 @@ def _policy_distribution(model, env, device, *, deterministic: bool,
     actions = np.zeros((T, action_dim), dtype='float32')
     d_min = 1.0 / cfg.k_max
     tau_ctx_val = 1.0 - cfg.tau_ctx
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    if _is_rssm:
+        _rssm = model.dynamics
+        _state = _rssm.initial_state(1, device)
+        _prev_a = torch.zeros(1, action_dim, device=device)
     for t in range(T):
         with torch.no_grad():
-            ow_t = torch.from_numpy(ow).to(device)
-            a_t = torch.from_numpy(a_history).to(device)
-            z_ctx = model.tokenizer.encode(ow_t).unsqueeze(0)
-            tau = torch.full((1, L), tau_ctx_val, device=device,
-                              dtype=z_ctx.dtype)
-            d = torch.full((1, L), d_min, device=device,
-                            dtype=z_ctx.dtype)
-            out = model.dynamics(z_ctx, tau, d, a_t.unsqueeze(0))
-            agent_hid = out['agent_hid'][:, -1]
+            if _is_rssm:
+                _o = torch.from_numpy(ow[-1]).to(device).unsqueeze(0)
+                _state, _ = _rssm.obs_step(_state, _prev_a,
+                                            _rssm.embed(_o), sample=True)
+                agent_hid = _state.feat
+            else:
+                ow_t = torch.from_numpy(ow).to(device)
+                a_t = torch.from_numpy(a_history).to(device)
+                z_ctx = model.tokenizer.encode(ow_t).unsqueeze(0)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_t.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]
             a_act, _, _ = model.policy(agent_hid, deterministic=deterministic)
         a_np = a_act.float().squeeze(0).cpu().numpy()
         actions[t] = a_np
         ow, _, done, _ = env.step(a_np)
         a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
+        if _is_rssm:
+            _prev_a = a_act.float()
         if done:
             T = t + 1
             actions = actions[:T]

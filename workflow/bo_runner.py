@@ -526,6 +526,15 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
             getattr(cfg_loaded, 'policy_log_std_min', -2.3)),
         policy_log_std_max=float(
             getattr(cfg_loaded, 'policy_log_std_max', 0.0)),
+        world_model_type=str(
+            getattr(cfg_loaded, 'world_model_type', 'sf_transformer')),
+        rssm_deter_dim=int(getattr(cfg_loaded, 'rssm_deter_dim', 512)),
+        rssm_n_categoricals=int(
+            getattr(cfg_loaded, 'rssm_n_categoricals', 32)),
+        rssm_n_classes=int(getattr(cfg_loaded, 'rssm_n_classes', 32)),
+        rssm_embed_dim=int(getattr(cfg_loaded, 'rssm_embed_dim', 256)),
+        rssm_hidden_dim=int(getattr(cfg_loaded, 'rssm_hidden_dim', 256)),
+        rssm_unimix=float(getattr(cfg_loaded, 'rssm_unimix', 0.01)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)

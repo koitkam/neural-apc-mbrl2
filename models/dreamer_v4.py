@@ -1217,26 +1217,60 @@ class DreamerV4Config:
     # exploration; defaults are chosen for stable adaptive operation.
     policy_log_std_min: float = -2.3
     policy_log_std_max: float = 0.0
+    # ===== World-model backbone selection =====
+    # ``'rssm'`` (new default 2026-05-30) uses the DreamerV3 recurrent
+    # state-space model (GRU + categorical latent) whose deterministic
+    # core can learn a held-action fixed point — the property the
+    # SF-transformer lacked (0% steady-state convergence drove the
+    # bootstrap-cascade across P64/P66/P67).  ``'sf_transformer'`` keeps
+    # the original V4 shortcut-forcing transformer dynamics.
+    world_model_type: str = 'rssm'
+    rssm_deter_dim: int = 512
+    rssm_n_categoricals: int = 32
+    rssm_n_classes: int = 32
+    rssm_embed_dim: int = 256
+    rssm_hidden_dim: int = 256
+    rssm_unimix: float = 0.01
 
 
 class DreamerV4(nn.Module):
     def __init__(self, cfg: DreamerV4Config):
         super().__init__()
         self.cfg = cfg
-        self.tokenizer = Tokenizer(cfg.obs_dim, cfg.tok_hidden, cfg.z_dim,
-                                    mae_p_max=cfg.mae_p_max)
-        dyn_cfg = DynamicsConfig(
-            z_dim=cfg.z_dim, action_dim=cfg.action_dim,
-            n_action_bins=cfg.n_action_bins,
-            d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
-            ff_mult=cfg.ff_mult, n_register=cfg.n_register,
-            k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins,
-            soft_cap=cfg.soft_cap,
-            attn_impl=cfg.attn_impl,
-        )
-        self.dynamics = DynamicsTransformer(dyn_cfg)
-        # Heads read from the agent-register hidden state (dim = d_model).
-        D = cfg.d_model
+        self.world_model_type = str(
+            getattr(cfg, 'world_model_type', 'sf_transformer')).lower()
+        if self.world_model_type == 'rssm':
+            # DreamerV3 RSSM backbone.  No tokenizer (the RSSM has an
+            # integrated MLP encoder/decoder); heads read from the
+            # posterior feature ``[h, z_flat]`` of width ``feat_dim``.
+            from models.dreamer_v4_rssm import RSSMDynamics, RSSMConfig
+            self.tokenizer = None
+            rssm_cfg = RSSMConfig(
+                obs_dim=cfg.obs_dim, action_dim=cfg.action_dim,
+                deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
+                n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+                n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+                embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+                hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
+                unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+            )
+            self.dynamics = RSSMDynamics(rssm_cfg)
+            D = self.dynamics.feat_dim
+        else:
+            self.tokenizer = Tokenizer(cfg.obs_dim, cfg.tok_hidden, cfg.z_dim,
+                                        mae_p_max=cfg.mae_p_max)
+            dyn_cfg = DynamicsConfig(
+                z_dim=cfg.z_dim, action_dim=cfg.action_dim,
+                n_action_bins=cfg.n_action_bins,
+                d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
+                ff_mult=cfg.ff_mult, n_register=cfg.n_register,
+                k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins,
+                soft_cap=cfg.soft_cap,
+                attn_impl=cfg.attn_impl,
+            )
+            self.dynamics = DynamicsTransformer(dyn_cfg)
+            # Heads read from the agent-register hidden state (dim = d_model).
+            D = cfg.d_model
         self.policy_type = str(getattr(cfg, 'policy_type', 'continuous')).lower()
         if self.policy_type == 'continuous':
             self.policy = ContinuousPolicyHead(
@@ -1315,11 +1349,13 @@ class DreamerV4(nn.Module):
                 pass
             self.dynamics = torch.compile(self.dynamics, mode=mode,
                                             dynamic=True)
-            self.tokenizer = torch.compile(self.tokenizer, mode=mode,
-                                             dynamic=True)
+            if self.tokenizer is not None:
+                self.tokenizer = torch.compile(self.tokenizer, mode=mode,
+                                                 dynamic=True)
             self._compiled = True
+            _tok = '+ tokenizer' if self.tokenizer is not None else '(rssm)'
             print(f'[dreamer_v4] torch.compile(mode={mode}) enabled '
-                  f'on dynamics + tokenizer', flush=True)
+                  f'on dynamics {_tok}', flush=True)
         except Exception as e:
             print(f'[dreamer_v4] torch.compile failed ({e!r}); '
                   f'falling back to eager', flush=True)
@@ -1371,7 +1407,15 @@ class DreamerV4(nn.Module):
 
     # ------------------------------------------------------- parameter groups
     def parameters_world(self):
-        """Tokenizer + dynamics + reward head — trained in Phases 1 & 2."""
+        """World-model + reward head — trained in Phases 1 & 2.
+
+        SF-transformer: tokenizer + dynamics + reward head.
+        RSSM: dynamics (integrated encoder/decoder/GRU/prior/post) +
+        reward head (no separate tokenizer).
+        """
+        if getattr(self, 'world_model_type', 'sf_transformer') == 'rssm':
+            return (list(self.dynamics.parameters())
+                    + list(self.reward.parameters()))
         return (list(self.tokenizer.parameters())
                 + list(self.dynamics.parameters())
                 + list(self.reward.parameters()))
@@ -1600,6 +1644,7 @@ def reinforce_actor_loss(policy, prior_policy,
 
 def shortcut_forcing_loss(dynamics: DynamicsTransformer,
                            z_clean: torch.Tensor, action: torch.Tensor,
+                           clean_tau_prob: float = 0.0,
                            ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Shortcut-forcing (flow-matching) world-model loss.
 
@@ -1626,6 +1671,16 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     # Per-(B, T) sample of τ from the trained grid; FORCE d = d_min.
     tau, _ = sample_tau_d((B, T), cfg.k_max, device, dtype)
     d = torch.full_like(tau, d_min)
+
+    # Clean-τ injection (WM steady-state RCA 2026-05-29): override a
+    # fraction of positions to τ=1.0 so the (otherwise-OOD) clean bin is
+    # trained as an identity target ``z1_hat ≈ z_clean``.  This lets
+    # inference condition on a noise-free history (tau_ctx=0) and removes
+    # the per-step context-noise floor that pins
+    # wm_pred_converges_under_constant_action at 0.0.
+    if clean_tau_prob > 0.0:
+        clean_mask = torch.rand_like(tau) < float(clean_tau_prob)
+        tau = torch.where(clean_mask, torch.ones_like(tau), tau)
 
     z0 = torch.randn_like(z_clean)
     tau_b = tau.unsqueeze(-1)

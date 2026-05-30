@@ -339,6 +339,12 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     d_min = 1.0 / cfg.k_max
     tau_ctx_val = 1.0 - cfg.tau_ctx
 
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    _rssm_state = (model.dynamics.initial_state(1, device)
+                   if _is_rssm else None)
+    _rssm_prev_a = (torch.zeros(1, action_dim, device=device)
+                    if _is_rssm else None)
+
     for t in range(T):
         ow = torch.from_numpy(obs_window).to(device)
         a_ctx = torch.from_numpy(a_history).to(device)
@@ -346,16 +352,27 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
             with torch.amp.autocast(device_type=device.type,
                                      dtype=torch.bfloat16,
                                      enabled=(device.type == 'cuda')):
-                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
-                tau = torch.full((1, L), tau_ctx_val, device=device,
-                                  dtype=z_ctx.dtype)
-                d = torch.full((1, L), d_min, device=device,
-                                dtype=z_ctx.dtype)
-                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
-                agent_hid = out['agent_hid'][:, -1]
+                if _is_rssm:
+                    _o = torch.from_numpy(
+                        obs_window[-1]).to(device).unsqueeze(0)
+                    _emb = model.dynamics.embed(_o)
+                    _post, _ = model.dynamics.obs_step(
+                        _rssm_state, _rssm_prev_a, _emb, sample=True)
+                    agent_hid = _post.feat
+                    _rssm_state = _post
+                else:
+                    z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
+                    tau = torch.full((1, L), tau_ctx_val, device=device,
+                                      dtype=z_ctx.dtype)
+                    d = torch.full((1, L), d_min, device=device,
+                                    dtype=z_ctx.dtype)
+                    out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                    agent_hid = out['agent_hid'][:, -1]
                 action_t, _, _ = model.policy(agent_hid,
                                                 deterministic=deterministic)
         a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
+        if _is_rssm:
+            _rssm_prev_a = torch.from_numpy(a_np).to(device).unsqueeze(0)
         next_window, scaled_r, done, info = env.step(a_np)
         comps = info.get('reward_components', {}) or {}
         # Record the *raw* (physical-units) state so plots/npz read true
@@ -1529,6 +1546,13 @@ def run_validation(*,
         policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
         policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
         policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
+        world_model_type=str(getattr(cfg, 'world_model_type', 'sf_transformer')),
+        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
+        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
+        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
         attn_impl=getattr(cfg, 'attn_impl', 'auto'),
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

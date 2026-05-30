@@ -135,6 +135,13 @@ if __name__ == '__main__':
         policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
         policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
         policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
+        world_model_type=str(getattr(cfg, 'world_model_type', 'sf_transformer')),
+        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
+        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
+        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)

@@ -165,6 +165,13 @@ def _load_model(ckpt_path: Path, device: torch.device):
         policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
         policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
         policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
+        world_model_type=str(getattr(cfg, 'world_model_type', 'sf_transformer')),
+        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
+        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
+        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
         # 'sdpa' is significantly faster on CPU than 'manual' (uses torch's
         # fused scaled_dot_product_attention which has a vectorised CPU path).
         attn_impl='sdpa',
@@ -215,6 +222,42 @@ def _imagine_open_loop(model, z_history: torch.Tensor,
         out[kk] = obs_hat[:obs_dim]
         z_hist = torch.cat([z_hist[1:], z_next.unsqueeze(0)], dim=0)
         a_hist = torch.cat([a_hist[1:], a_step], dim=0)
+    return out
+
+
+def _is_rssm_model(model) -> bool:
+    return getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+
+
+@torch.no_grad()
+def _imagine_open_loop_rssm(model, lookback_obs: np.ndarray,
+                             lookback_act: np.ndarray,
+                             action_seq: np.ndarray, n_steps: int,
+                             device: torch.device) -> np.ndarray:
+    """RSSM open-loop rollout (mirrors training warmup + imagination).
+
+    Warm-start the posterior over the real lookback via teacher-forced
+    ``obs_step`` (action convention ``act[l]`` paired with ``obs[l]``),
+    then advance the PRIOR with ``img_step`` under ``action_seq`` and
+    decode each imagined feature.  Operates entirely in normalized-obs
+    space (decoder output is directly comparable to ``env.step`` obs).
+    """
+    rssm = model.dynamics
+    obs_dim = rssm.obs_dim
+    L = lookback_obs.shape[0]
+    state = rssm.initial_state(1, device)
+    for l in range(L):
+        o = torch.from_numpy(lookback_obs[l]).to(device).unsqueeze(0)
+        a = torch.from_numpy(lookback_act[l]).to(device).unsqueeze(0)
+        emb = rssm.embed(o)
+        post, _ = rssm.obs_step(state, a, emb, sample=True)
+        state = post
+    out = np.zeros((n_steps, obs_dim), dtype='float32')
+    for kk in range(n_steps):
+        a_step = torch.from_numpy(action_seq[kk]).to(device).unsqueeze(0)
+        state = rssm.img_step(state, a_step, sample=True)
+        obs_hat = rssm.decode(state.feat).squeeze(0).float().cpu().numpy()
+        out[kk] = obs_hat[:obs_dim]
     return out
 
 
@@ -363,12 +406,16 @@ def _run_protocol(env, model, cfg, device: torch.device,
             raise ValueError(f'unknown protocol: {protocol}')
 
         # ---- WM imagination ----
-        with torch.no_grad():
-            z_hist = model.tokenizer.encode(
-                torch.from_numpy(lookback_obs).to(device))         # (L, z)
-            a_hist = torch.from_numpy(lookback_act).to(device)     # (L, A)
-        pred_obs = _imagine_open_loop(model, z_hist, a_hist,
-                                       act_seq, horizon, k_max, device)
+        if _is_rssm_model(model):
+            pred_obs = _imagine_open_loop_rssm(
+                model, lookback_obs, lookback_act, act_seq, horizon, device)
+        else:
+            with torch.no_grad():
+                z_hist = model.tokenizer.encode(
+                    torch.from_numpy(lookback_obs).to(device))         # (L, z)
+                a_hist = torch.from_numpy(lookback_act).to(device)     # (L, A)
+            pred_obs = _imagine_open_loop(model, z_hist, a_hist,
+                                           act_seq, horizon, k_max, device)
 
         # ---- Real-sim ground truth: re-create env at same lookback state ----
         # The simulator is deterministic given action sequence; we

@@ -287,6 +287,35 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_STEADY_MIN_RUN_STEPS':    ('wm_steady_min_run_steps',        int),
     'DREAMER_WM_STEADY_ACTION_EPS':       ('wm_steady_action_eps',           float),
     'DREAMER_WM_STEADY_SETTLED_EPS':      ('wm_steady_settled_eps',          float),
+    # WM steady-state RCA (2026-05-29): trains a clean τ=1.0 bin so
+    # inference can condition on a noise-free history (removes the
+    # per-step context-noise floor that pins
+    # wm_pred_converges_under_constant_action at 0.0).  Sim-agnostic
+    # probability in [0,1].  Default 0.0 = paper-faithful (no clean bin).
+    'DREAMER_SF_CLEAN_TAU_PROB':          ('sf_clean_tau_prob',              float),
+    # Cascade RCA (2026-05-29): the two corrected anti-cascade fixes.
+    # A' — potential-based reward shaping (dense, policy-invariant, same
+    # γ; training-only, validation scores on unshaped raw_reward).
+    # C — replay-grounded critic anchor: pins the critic to a TD-λ
+    # target from REAL buffered rewards + slow-target bootstrap on the
+    # REAL latents, breaking the self-referential growing-negative
+    # fixed point (critic_target_v_r→0.95) that drives the cascade.
+    # Both sim-agnostic dimensionless coefficients.
+    'DREAMER_REWARD_SHAPING_COEF':        ('reward_shaping_coef',            float),
+    'DREAMER_CRITIC_REPLAY_ANCHOR_COEF':  ('critic_replay_anchor_coef',      float),
+    # ---- World-model backbone (P68, 2026-05-30) ----
+    # ``rssm`` (default) vs ``sf_transformer``; RSSM categorical-latent
+    # sizes and KL-balance knobs.  See TrainConfig for paper rationale.
+    'DREAMER_WORLD_MODEL_TYPE':           ('world_model_type',               str),
+    'DREAMER_RSSM_DETER_DIM':             ('rssm_deter_dim',                 int),
+    'DREAMER_RSSM_N_CATEGORICALS':        ('rssm_n_categoricals',            int),
+    'DREAMER_RSSM_N_CLASSES':             ('rssm_n_classes',                 int),
+    'DREAMER_RSSM_EMBED_DIM':             ('rssm_embed_dim',                 int),
+    'DREAMER_RSSM_HIDDEN_DIM':            ('rssm_hidden_dim',                int),
+    'DREAMER_RSSM_UNIMIX':                ('rssm_unimix',                    float),
+    'DREAMER_RSSM_FREE_BITS':             ('rssm_free_bits',                 float),
+    'DREAMER_RSSM_KL_DYN_W':              ('rssm_kl_dyn_w',                  float),
+    'DREAMER_RSSM_KL_REPR_W':             ('rssm_kl_repr_w',                 float),
 }
 
 
