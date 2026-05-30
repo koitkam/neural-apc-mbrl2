@@ -109,16 +109,29 @@ def measure_per_sample_mb(cfg, bs_probe: int = 4) -> dict:
 def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
                                horizon: int, k_max: int, sample_rate: int,
                                obs_dim: int, action_dim: int,
-                               paper_default: int = 16, max_bs: int = 256,
+                               paper_default: int = 16, max_bs: int = 512,
                                target_util: float = 0.65,
                                bs_probe: int = 4,
                                wm_overhead_factor: float = 1.0) -> dict:
     """Empirically size the batch by measuring actual WM fwd+bwd peak
     memory at ``bs_probe`` and projecting linearly.
 
-    ``wm_overhead_factor`` (>=1.0) accounts for the extra memory of
-    actor+critic+optimizer state on top of the measured WM peak.  Default
-    1.0 = WM-only; pass e.g. 1.15 to reserve 15% for actor/critic/opt.
+    The probe builds the **actual world-model backbone** that the run will
+    use: ``world_model_type`` and the ``rssm_*`` dims are read from the
+    ``DREAMER_WORLD_MODEL_TYPE`` / ``DREAMER_RSSM_*`` env vars (falling
+    back to the ``TrainConfig`` defaults, currently the DreamerV3 RSSM).
+    This keeps the memory measurement faithful when the backbone or its
+    latent sizes are overridden at launch.
+
+    ``wm_overhead_factor`` (>=1.0) inflates the measured **WM-only** peak
+    to reserve for memory the probe does NOT see: actor+critic+optimizer
+    state and the Phase-3 imagination rollout.  Default 1.0 = WM-only;
+    pass e.g. 1.30 to reserve 30% for actor/critic/opt + P3 imagination.
+
+    ``max_bs`` default is 512 (the RSSM backbone is ~4x lighter per sample
+    than the legacy SF-transformer, so the ceiling no longer needs to clip
+    at 256); on a memory-bound card the ``target_util`` budget still pins
+    the choice well below this.
 
     Returns a ``bs_info`` dict with ``batch_size``, ``source``,
     ``per_sample_mb_measured``, ``predicted_peak_gib``, etc.  On CPU or
@@ -138,9 +151,31 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
         batch_size=int(bs_probe), out_dir='/tmp/gpu_calib_inplace',
         obs_dim=int(obs_dim), action_dim=int(action_dim),
     )
+    # Mirror the world-model backbone the run will actually build so the
+    # measured per-sample memory matches.  Env overrides take precedence
+    # over the TrainConfig defaults (which already select the RSSM).
+    wmt = (os.environ.get('DREAMER_WORLD_MODEL_TYPE', '').strip()
+           or str(getattr(cfg, 'world_model_type', 'rssm')))
+    cfg.world_model_type = wmt
+    if wmt == 'rssm':
+        def _envint(name: str, cur) -> int:
+            v = os.environ.get(name, '').strip()
+            try:
+                return int(v) if v else int(cur)
+            except ValueError:
+                return int(cur)
+        cfg.rssm_deter_dim = _envint('DREAMER_RSSM_DETER_DIM', cfg.rssm_deter_dim)
+        cfg.rssm_n_categoricals = _envint(
+            'DREAMER_RSSM_N_CATEGORICALS', cfg.rssm_n_categoricals)
+        cfg.rssm_n_classes = _envint(
+            'DREAMER_RSSM_N_CLASSES', cfg.rssm_n_classes)
+        cfg.rssm_embed_dim = _envint('DREAMER_RSSM_EMBED_DIM', cfg.rssm_embed_dim)
+        cfg.rssm_hidden_dim = _envint(
+            'DREAMER_RSSM_HIDDEN_DIM', cfg.rssm_hidden_dim)
     info = {'model_size': model_size, 'seq_len': seq_len, 'lookback': lookback,
             'horizon': horizon, 'paper_default': paper_default,
             'target_util': target_util, 'min_bs': paper_default, 'max_bs': max_bs,
+            'world_model_type': wmt,
             'wm_overhead_factor': wm_overhead_factor, 'bs_probe': bs_probe}
     # Env-var overrides.
     env_util = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
@@ -225,7 +260,7 @@ def _resolve_obs_action_dim(lookback: int, sample_rate: int,
 def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
                                horizon: int, k_max: int, sample_rate: int,
                                episode_length: int,
-                               paper_default: int = 16, max_bs: int = 256,
+                               paper_default: int = 16, max_bs: int = 512,
                                target_util: float = 0.65,
                                bs_probe: int = 4,
                                wm_overhead_factor: float = 1.0) -> dict:
@@ -238,7 +273,12 @@ def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
     cache_key = (model_size, int(seq_len), int(lookback), int(horizon),
                  int(k_max), os.environ.get('SIMULATION_DIR', ''),
                  os.environ.get('DREAMER_MAX_BS', ''),
-                 os.environ.get('DREAMER_TARGET_UTIL', ''))
+                 os.environ.get('DREAMER_TARGET_UTIL', ''),
+                 os.environ.get('DREAMER_WORLD_MODEL_TYPE', ''),
+                 os.environ.get('DREAMER_RSSM_DETER_DIM', ''),
+                 os.environ.get('DREAMER_RSSM_N_CATEGORICALS', ''),
+                 os.environ.get('DREAMER_RSSM_N_CLASSES', ''),
+                 float(wm_overhead_factor))
     if cache_key in _PROBE_CACHE:
         info = dict(_PROBE_CACHE[cache_key])
         info['source'] = info.get('source', 'empirical:gpu_calibrate') + ':cached'

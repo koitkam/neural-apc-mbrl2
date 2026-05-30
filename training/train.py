@@ -1355,68 +1355,84 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # episode.  Each step advances the posterior with (prev_action, obs)
     # and the posterior feature drives the policy — the GRU holds the
     # plant context, so the lookback-window encode is not needed.
-    _rssm_state = (model.dynamics.initial_state(1, device)
-                   if _is_rssm else None)
-    _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
-                    if _is_rssm else None)
+    #
+    # Collection is pure inference, so the whole rollout runs under
+    # ``torch.inference_mode()``: no autograd graph is built (lower memory
+    # and lower per-step overhead than ``no_grad`` on the bs=1 streaming
+    # path, which is the collection bottleneck).  The RSSM recurrent state
+    # is kept ON-DEVICE across steps and the previous action is reused
+    # directly from the policy's on-device output instead of round-tripping
+    # host→device every step — that removes one transfer per step.  The
+    # single device→host ``.cpu()`` of the chosen action is unavoidable
+    # because the simulator runs on CPU/numpy.
+    with torch.inference_mode():
+        _rssm_state = (model.dynamics.initial_state(1, device)
+                       if _is_rssm else None)
+        _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
+                        if _is_rssm else None)
 
-    for t in range(T):
-        obs_buf[t] = obs_window[-1]
-        if random_action:
-            a_np = env.rng.uniform(-1.0, 1.0,
-                                    size=(env.action_dim,)).astype('float32')
-            if _is_rssm:
-                # Advance the posterior even on random actions so the
-                # recurrent state stays consistent if a later step is
-                # policy-driven (mixed-mode collection).
+        for t in range(T):
+            obs_buf[t] = obs_window[-1]
+            if random_action:
+                a_np = env.rng.uniform(-1.0, 1.0,
+                                        size=(env.action_dim,)).astype('float32')
+                if _is_rssm:
+                    # Advance the posterior even on random actions so the
+                    # recurrent state stays consistent if a later step is
+                    # policy-driven (mixed-mode collection).
+                    with torch.amp.autocast(device_type=device.type,
+                                             dtype=torch.bfloat16,
+                                             enabled=(device.type == 'cuda')):
+                        _o = torch.from_numpy(
+                            obs_window[-1]).to(device).unsqueeze(0)
+                        _emb = model.dynamics.embed(_o)
+                        _post, _ = model.dynamics.obs_step(
+                            _rssm_state, _rssm_prev_a, _emb, sample=True)
+                    _rssm_state = _post
+                    # Random action originates on host; the (1, A) host→device
+                    # copy is negligible and necessary (no device tensor yet).
+                    _rssm_prev_a = torch.from_numpy(
+                        a_np).to(device).unsqueeze(0)
+            elif _is_rssm:
                 with torch.amp.autocast(device_type=device.type,
                                          dtype=torch.bfloat16,
                                          enabled=(device.type == 'cuda')):
-                    _o = torch.from_numpy(
-                        obs_window[-1]).to(device).unsqueeze(0)
+                    _o = torch.from_numpy(obs_window[-1]).to(device).unsqueeze(0)
                     _emb = model.dynamics.embed(_o)
                     _post, _ = model.dynamics.obs_step(
                         _rssm_state, _rssm_prev_a, _emb, sample=True)
+                    action_t, _, _ = model.policy(_post.feat,
+                                                   deterministic=deterministic)
+                a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
                 _rssm_state = _post
-                _rssm_prev_a = torch.from_numpy(
-                    a_np).to(device).unsqueeze(0)
-        elif _is_rssm:
-            with torch.amp.autocast(device_type=device.type,
-                                     dtype=torch.bfloat16,
-                                     enabled=(device.type == 'cuda')):
-                _o = torch.from_numpy(obs_window[-1]).to(device).unsqueeze(0)
-                _emb = model.dynamics.embed(_o)
-                _post, _ = model.dynamics.obs_step(
-                    _rssm_state, _rssm_prev_a, _emb, sample=True)
-                action_t, _, _ = model.policy(_post.feat,
-                                               deterministic=deterministic)
-            a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-            _rssm_state = _post
-            _rssm_prev_a = torch.from_numpy(a_np).to(device).unsqueeze(0)
-        else:
-            ow = torch.from_numpy(obs_window).to(device)            # (L, D)
-            a_ctx = torch.from_numpy(a_history).to(device)           # (L, A)
-            with torch.amp.autocast(device_type=device.type,
-                                     dtype=torch.bfloat16,
-                                     enabled=(device.type == 'cuda')):
-                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)     # (1, L, z)
-                tau = torch.full((1, L), tau_ctx_val, device=device,
-                                  dtype=z_ctx.dtype)
-                d = torch.full((1, L), d_min, device=device,
-                                dtype=z_ctx.dtype)
-                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
-                agent_hid = out['agent_hid'][:, -1]                  # (1, D)
-                action_t, _, _ = model.policy(agent_hid,
-                                                deterministic=deterministic)
-            a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-        next_window, reward, done, _ = env.step(a_np)
-        act_buf[t] = a_np
-        rew_buf[t] = reward
-        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
-        a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
-        obs_window = next_window
-        if done:
-            break
+                # Reuse the on-device action for the next GRU step — no
+                # host→device round-trip (the .cpu() above already paid the
+                # only unavoidable sync for env.step).
+                _rssm_prev_a = action_t.detach().float().reshape(1, -1)
+            else:
+                ow = torch.from_numpy(obs_window).to(device)            # (L, D)
+                a_ctx = torch.from_numpy(a_history).to(device)           # (L, A)
+                with torch.amp.autocast(device_type=device.type,
+                                         dtype=torch.bfloat16,
+                                         enabled=(device.type == 'cuda')):
+                    z_ctx = model.tokenizer.encode(ow).unsqueeze(0)     # (1, L, z)
+                    tau = torch.full((1, L), tau_ctx_val, device=device,
+                                      dtype=z_ctx.dtype)
+                    d = torch.full((1, L), d_min, device=device,
+                                    dtype=z_ctx.dtype)
+                    out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                    agent_hid = out['agent_hid'][:, -1]                  # (1, D)
+                    action_t, _, _ = model.policy(agent_hid,
+                                                    deterministic=deterministic)
+                a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
+            next_window, reward, done, _ = env.step(a_np)
+            act_buf[t] = a_np
+            rew_buf[t] = reward
+            cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+            a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
+            obs_window = next_window
+            if done:
+                break
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
 

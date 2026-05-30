@@ -1347,15 +1347,32 @@ class DreamerV4(nn.Module):
                     int(getattr(_dynamo.config, 'cache_size_limit', 8)), 128)
             except Exception:
                 pass
-            self.dynamics = torch.compile(self.dynamics, mode=mode,
-                                            dynamic=True)
-            if self.tokenizer is not None:
-                self.tokenizer = torch.compile(self.tokenizer, mode=mode,
-                                                 dynamic=True)
-            self._compiled = True
-            _tok = '+ tokenizer' if self.tokenizer is not None else '(rssm)'
-            print(f'[dreamer_v4] torch.compile(mode={mode}) enabled '
-                  f'on dynamics {_tok}', flush=True)
+            if self.world_model_type == 'rssm':
+                # RSSM hot path is ``rollout_observed`` (always called with a
+                # static (B, seq_len) batch in every phase — the SF-transformer's
+                # varying imagination context that forced ``dynamic=True`` does
+                # not exist here).  Compiling the *module* is a no-op for RSSM
+                # because ``rollout_observed`` is invoked as a method, not
+                # ``forward``; so compile the bound method directly with
+                # ``dynamic=False`` to let ``reduce-overhead`` capture the full
+                # ~128-step GRU rollout as a single CUDA graph — this is what
+                # actually removes the per-step kernel-launch overhead that
+                # keeps the WM launch-bound at ~16% GPU util.
+                self.dynamics.rollout_observed = torch.compile(
+                    self.dynamics.rollout_observed, mode=mode, dynamic=False)
+                self._compiled = True
+                print(f'[dreamer_v4] torch.compile(mode={mode}, dynamic=False) '
+                      f'enabled on RSSM rollout_observed', flush=True)
+            else:
+                self.dynamics = torch.compile(self.dynamics, mode=mode,
+                                                dynamic=True)
+                if self.tokenizer is not None:
+                    self.tokenizer = torch.compile(self.tokenizer, mode=mode,
+                                                     dynamic=True)
+                self._compiled = True
+                _tok = '+ tokenizer' if self.tokenizer is not None else '(rssm)'
+                print(f'[dreamer_v4] torch.compile(mode={mode}) enabled '
+                      f'on dynamics {_tok}', flush=True)
         except Exception as e:
             print(f'[dreamer_v4] torch.compile failed ({e!r}); '
                   f'falling back to eager', flush=True)

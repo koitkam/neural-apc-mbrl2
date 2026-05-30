@@ -274,6 +274,16 @@ def main() -> int:
     # sizing which under-predicted by 1.27–2.74× across plants
     # (cross-sim measurements 2026-05-24).  On CPU or probe failure
     # falls back to paper_default=16.
+    #
+    # ``wm_overhead_factor`` reserves headroom the WM-only probe does NOT
+    # measure: the actor/critic/optimizer state and the Phase-3 imagination
+    # rollout (horizon-step latent unroll).  Tunable via DREAMER_WM_OVERHEAD;
+    # default 1.30 (≈30% reserve) keeps the RSSM run inside the card in P3.
+    try:
+        _wm_overhead = float(os.environ.get('DREAMER_WM_OVERHEAD', '1.30'))
+    except ValueError:
+        _wm_overhead = 1.30
+    _wm_overhead = max(1.0, _wm_overhead)
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
@@ -283,13 +293,15 @@ def main() -> int:
             bs_info = pick_batch_size_for_plant(
                 model_size=model_size, seq_len=seq_len, lookback=lookback,
                 horizon=horizon, k_max=k_max, sample_rate=sample_rate,
-                episode_length=int(episode_length))
+                episode_length=int(episode_length),
+                wm_overhead_factor=_wm_overhead)
             batch_size = int(bs_info['batch_size'])
     else:
         bs_info = pick_batch_size_for_plant(
             model_size=model_size, seq_len=seq_len, lookback=lookback,
             horizon=horizon, k_max=k_max, sample_rate=sample_rate,
-            episode_length=int(episode_length))
+            episode_length=int(episode_length),
+            wm_overhead_factor=_wm_overhead)
         batch_size = int(bs_info['batch_size'])
     if bs_info.get('source', '').startswith('empirical'):
         print(f"[gpu-calib] empirical probe: "
