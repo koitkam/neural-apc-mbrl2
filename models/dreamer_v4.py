@@ -1661,7 +1661,6 @@ def reinforce_actor_loss(policy, prior_policy,
 
 def shortcut_forcing_loss(dynamics: DynamicsTransformer,
                            z_clean: torch.Tensor, action: torch.Tensor,
-                           clean_tau_prob: float = 0.0,
                            ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Shortcut-forcing (flow-matching) world-model loss.
 
@@ -1688,16 +1687,6 @@ def shortcut_forcing_loss(dynamics: DynamicsTransformer,
     # Per-(B, T) sample of τ from the trained grid; FORCE d = d_min.
     tau, _ = sample_tau_d((B, T), cfg.k_max, device, dtype)
     d = torch.full_like(tau, d_min)
-
-    # Clean-τ injection (WM steady-state RCA 2026-05-29): override a
-    # fraction of positions to τ=1.0 so the (otherwise-OOD) clean bin is
-    # trained as an identity target ``z1_hat ≈ z_clean``.  This lets
-    # inference condition on a noise-free history (tau_ctx=0) and removes
-    # the per-step context-noise floor that pins
-    # wm_pred_converges_under_constant_action at 0.0.
-    if clean_tau_prob > 0.0:
-        clean_mask = torch.rand_like(tau) < float(clean_tau_prob)
-        tau = torch.where(clean_mask, torch.ones_like(tau), tau)
 
     z0 = torch.randn_like(z_clean)
     tau_b = tau.unsqueeze(-1)

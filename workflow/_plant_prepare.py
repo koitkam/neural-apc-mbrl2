@@ -175,6 +175,13 @@ def identify_lookback(out_dir: Path, *, tau: float, dead_time: float,
 #
 # Setting any of these pre-empts the corresponding auto-tune branch via
 # the dataclass-default sentinel (``cfg._explicit_fields``).
+
+
+def _as_bool(s: str) -> bool:
+    """Parse an env-var string into a bool (1/true/yes/on -> True)."""
+    return str(s).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')
+
+
 ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAE_LAMBDA':         ('gae_lambda',                 float),
     'DREAMER_PHASE1_FRAC':        ('phase1_frac',                float),
@@ -287,12 +294,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_STEADY_MIN_RUN_STEPS':    ('wm_steady_min_run_steps',        int),
     'DREAMER_WM_STEADY_ACTION_EPS':       ('wm_steady_action_eps',           float),
     'DREAMER_WM_STEADY_SETTLED_EPS':      ('wm_steady_settled_eps',          float),
-    # WM steady-state RCA (2026-05-29): trains a clean τ=1.0 bin so
-    # inference can condition on a noise-free history (removes the
-    # per-step context-noise floor that pins
-    # wm_pred_converges_under_constant_action at 0.0).  Sim-agnostic
-    # probability in [0,1].  Default 0.0 = paper-faithful (no clean bin).
-    'DREAMER_SF_CLEAN_TAU_PROB':          ('sf_clean_tau_prob',              float),
     # Cascade RCA (2026-05-29): the two corrected anti-cascade fixes.
     # A' — potential-based reward shaping (dense, policy-invariant, same
     # γ; training-only, validation scores on unshaped raw_reward).
@@ -316,6 +317,14 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RSSM_FREE_BITS':             ('rssm_free_bits',                 float),
     'DREAMER_RSSM_KL_DYN_W':              ('rssm_kl_dyn_w',                  float),
     'DREAMER_RSSM_KL_REPR_W':             ('rssm_kl_repr_w',                 float),
+    # P70 (2026-05-30): RSSM imagination steady-state fixes (opt-in).
+    # latent-mode = roll imagined prior with categorical MODE (kills the
+    # per-step jitter that biases the reward head); bt_starts = warm-start
+    # imagination from all (B,T) posterior states (capped) for large
+    # imagination batch averaging.  Both sim-agnostic.
+    'DREAMER_RSSM_IMAG_LATENT_MODE':      ('rssm_imag_latent_mode',          _as_bool),
+    'DREAMER_RSSM_IMAG_BT_STARTS':        ('rssm_imag_bt_starts',            _as_bool),
+    'DREAMER_RSSM_IMAG_BT_MAX_STARTS':    ('rssm_imag_bt_max_starts',        int),
 }
 
 

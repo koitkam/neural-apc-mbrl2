@@ -353,6 +353,28 @@ class TrainConfig:
     rssm_free_bits: float = 1.0        # paper free-bits floor (nats)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
     rssm_kl_repr_w: float = 0.1        # paper KL-balance repr weight
+    # P70 (2026-05-30) imagination steady-state fixes.  The trained RSSM
+    # prior map CONTRACTS to a fixed point under a held action (offline
+    # probe: deterministic-mode tail_std ~0.01), but per-step categorical
+    # RE-sampling in imagination re-injects ~0.84 nats/group of latent
+    # noise every step → the reward head (≈quadratic CV penalty) sees a
+    # curvature·Var positive penalty bias on EVERY imagined step → too-
+    # negative imagined returns → critic pessimism → return_scale runaway
+    # → bootstrap cascade (flat MV).  Two opt-in mitigations:
+    #   (1) ``rssm_imag_latent_mode``: roll the imagined PRIOR with the
+    #       categorical MODE (argmax, sample=False) instead of a sample —
+    #       removes the per-step jitter so the reward head sees the
+    #       settled mean latent.  Actor exploration still comes from the
+    #       policy's own action sampling (TD-MPC2-style deterministic
+    #       latent + stochastic action).  Default False = paper-faithful.
+    #   (2) ``rssm_imag_bt_starts``: warm-start imagination from ALL
+    #       posterior states across the (B, T) context window (capped /
+    #       subsampled), not just the last t=T-1 state — restores the
+    #       DreamerV3 large imagination batch so residual jitter averages
+    #       over many trajectories + start-state diversity.  Default False.
+    rssm_imag_latent_mode: bool = False
+    rssm_imag_bt_starts: bool = False
+    rssm_imag_bt_max_starts: int = 8192   # cap on B×T imagination starts
     wm_steady_action_eps: float = 0.02
     # P65 (2026-05-29): obs gate is now half-window mean-DRIFT on z-scored
     # obs (not std), so 0.20 unit means "two halves of the window differ
@@ -568,19 +590,6 @@ class TrainConfig:
     # tracking reduces the stale-target bias that feeds the cascade.
     target_critic_tau: float = 0.05
     tau_ctx: float = 0.1             # context-noise corruption at inference
-    # Experiment (2026-05-29, WM steady-state RCA): train a clean τ=1.0
-    # bin so the WM can be conditioned on a NOISE-FREE history at
-    # inference.  The paper flow grid (sample_tau_d) only emits
-    # τ ∈ {0, 1/k, …, (k-1)/k} — τ=1.0 is never sampled, so the τ=1.0
-    # embedding bin is OOD and inference is forced to corrupt the context
-    # to τ=(k_max-1)/k_max (injecting (1/k_max)·N(0,I) per step).  That
-    # context-noise floor makes ``wm_pred_converges_under_constant_action``
-    # = 0.0 by construction.  When > 0, this fraction of training
-    # positions are set to τ=1.0 (a clean identity target, ramp-weight
-    # 1.0) AND all inference/conditioning paths feed the context at
-    # τ=1.0 (clean) instead of (k_max-1)/k_max.  Default 0.0 keeps the
-    # exact paper-faithful behaviour; opt-in via DREAMER_SF_CLEAN_TAU_PROB.
-    sf_clean_tau_prob: float = 0.0
 
     # ----- Buffer -----
     # 2026-05-18 raised 200k→400k after reward-head saturation diagnosis
@@ -1343,12 +1352,7 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max, so the maximum trained
     # τ value is (k_max-1)/k_max.  Using cfg.tau_ctx=0.1 (τ=0.9) with
     # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
-    # When the clean τ=1.0 bin is trained (sf_clean_tau_prob>0) the
-    # encoded context IS clean, so condition at τ=1.0 (no corruption).
-    if float(getattr(cfg, 'sf_clean_tau_prob', 0.0)) > 0.0:
-        tau_ctx_val = 1.0
-    else:
-        tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
+    tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
 
     _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
     # RSSM streaming inference: carry a running recurrent state across the
@@ -2095,9 +2099,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Shortcut forcing target = clean tokenizer output (no MAE).
     z_clean = model.tokenizer.encode(obs_cur)            # (B, T, z_dim)
     sf_loss, sf_diag = shortcut_forcing_loss(model.dynamics,
-                                                z_clean.detach(), act,
-                                                clean_tau_prob=float(
-                                                    getattr(cfg, 'sf_clean_tau_prob', 0.0)))
+                                                z_clean.detach(), act)
 
     # Compute agent_hid from a near-clean dynamics pass (τ=tau_max, d=d_min).
     # Used by the Phase 2 BC + reward MTP heads.
@@ -2109,12 +2111,9 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # cleanest TRAINED features.
     B, T = z_clean.shape[:2]
     device = z_clean.device
-    # Conditioning τ for the agent-head pass.  When the clean-τ bin is
-    # trained (sf_clean_tau_prob>0) the context is genuinely clean, so
-    # read at τ=1.0; otherwise fall back to the cleanest TRAINED grid
-    # value (k_max-1)/k_max.
-    _clean_tau = float(getattr(cfg, 'sf_clean_tau_prob', 0.0)) > 0.0
-    tau_max = 1.0 if _clean_tau else (float(cfg.k_max) - 1.0) / float(cfg.k_max)
+    # Conditioning τ for the agent-head pass: use the cleanest TRAINED
+    # grid value (k_max-1)/k_max (τ=1.0 is OOD).
+    tau_max = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
     tau_clean = torch.full((B, T), tau_max, device=device, dtype=z_clean.dtype)
     d_min = torch.full((B, T), 1.0 / cfg.k_max, device=device,
                         dtype=z_clean.dtype)
@@ -2306,6 +2305,9 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     H = int(cfg.horizon)
     device = obs.device
 
+    _imag_mode = bool(getattr(cfg, 'rssm_imag_latent_mode', False))
+    _bt_starts = bool(getattr(cfg, 'rssm_imag_bt_starts', False))
+
     # Warm-start: teacher-forced posterior rollout over the real context
     # (frozen WM).  ``last_state`` is the posterior at t=T-1; ``feats_real``
     # are the per-step posterior features used by the replay-grounded
@@ -2314,7 +2316,29 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         feats_real, _post_lg, _prior_lg, last_state = rssm.rollout_observed(
             obs, act, sample=True)
         agent_hid_real = feats_real                          # (B, T, F)
-    state = last_state
+
+    # P70 fix (2): start imagination from ALL (B, T) posterior states
+    # (subsampled to ``rssm_imag_bt_max_starts``), not just t=T-1.  The
+    # imagined batch ``Bi`` then averages residual latent jitter over many
+    # trajectories.  States are rebuilt from ``feats_real`` (feat =
+    # [h ; z_flat]); ``img_step`` only consumes ``h`` and ``z`` (one-hot),
+    # not ``z_logits``, so a zero-logit placeholder is safe here.
+    from models.dreamer_v4_rssm import RSSMState
+    if _bt_starts:
+        deter = rssm.deter_dim
+        K, C = rssm.n_categoricals, rssm.n_classes
+        feats_flat = feats_real.reshape(B * T, -1)
+        N = feats_flat.shape[0]
+        cap = int(getattr(cfg, 'rssm_imag_bt_max_starts', 8192))
+        if 0 < cap < N:
+            idx = torch.randperm(N, device=device)[:cap]
+            feats_flat = feats_flat[idx]
+        h0 = feats_flat[:, :deter].contiguous()
+        z0 = feats_flat[:, deter:].reshape(-1, K, C).contiguous()
+        state = RSSMState(h=h0, z_logits=torch.zeros_like(z0), z=z0)
+    else:
+        state = last_state
+    Bi = state.h.shape[0]
 
     imagined_rewards: List[torch.Tensor] = []
     imagined_entropy: List[torch.Tensor] = []
@@ -2330,9 +2354,12 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         feat_pre = state.feat
         action_t, logp_t, ent_t, raw_t = model.policy.sample_with_raw(feat_pre)
 
-        # 2. Advance the prior under that action (frozen WM).
+        # 2. Advance the prior under that action (frozen WM).  P70 fix (1):
+        #    use the categorical MODE (sample=False) when latent-mode is on
+        #    so imagination follows the contracting deterministic path.
         with torch.no_grad():
-            next_state = rssm.img_step(state, action_t, sample=True)
+            next_state = rssm.img_step(state, action_t,
+                                       sample=not _imag_mode)
         feat_post = next_state.feat                          # (B, F) — sees a_h
 
         # 3. Frozen reward + slow-target value heads (action-aware).
@@ -2407,7 +2434,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     with torch.no_grad():
         baseline = model.value.expectation(
             model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
-        ).view(B, H)
+        ).view(Bi, H)
         adv_raw = target_returns - baseline
         scale = model.update_return_scale(
             target_returns,
@@ -2436,7 +2463,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # Critic-health diagnostics (same readouts as the SF path).
     with torch.no_grad():
-        crit_pred = model.value.expectation(val_logits_flat).view(B, H)
+        crit_pred = model.value.expectation(val_logits_flat).view(Bi, H)
         tgt = target_returns
         tv = torch.stack(imagined_target_v, dim=1)
 
@@ -2523,13 +2550,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # 1.0 — τ=1.0 hits an untrained τ-embedding bin and agent_hid is
     # garbage.  Same fix as in world_model_loss.
     tau_max_v = (float(cfg.k_max) - 1.0) / float(cfg.k_max)
-    # Clean-τ inference (WM steady-state RCA 2026-05-29): when the clean
-    # τ=1.0 bin is trained, condition imagination on a noise-free context
-    # (τ=1.0, tau_ctx=0) to remove the per-step context-noise floor.
-    _clean_tau = float(getattr(cfg, 'sf_clean_tau_prob', 0.0)) > 0.0
-    if _clean_tau:
-        tau_max_v = 1.0
-    _img_tau_ctx = 0.0 if _clean_tau else None
+    _img_tau_ctx = None
     with torch.no_grad():
         tau_clean = torch.full((B, T), tau_max_v, device=device,
                                  dtype=z_history.dtype)
@@ -6064,6 +6085,12 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_P2_GATE_REWARD_MTP_MAX', 'p2_gate_reward_mtp_max', float),
         ('DREAMER_P2_GATE_RECENT_ITERS', 'p2_gate_recent_iters', int),
         ('DREAMER_P2_GATE_MAX_EXTENSION', 'p2_gate_max_extension', float),
+        # 2026-05-30 (P70): RSSM imagination steady-state fixes.
+        ('DREAMER_RSSM_IMAG_LATENT_MODE', 'rssm_imag_latent_mode',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_RSSM_IMAG_BT_STARTS', 'rssm_imag_bt_starts',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_RSSM_IMAG_BT_MAX_STARTS', 'rssm_imag_bt_max_starts', int),
     ]:
         v = os.environ.get(name)
         if v is not None and v != '':
