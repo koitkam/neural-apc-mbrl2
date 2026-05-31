@@ -322,6 +322,34 @@ class TrainConfig:
     # objective is unchanged.  Set ``reward_shaping_coef=0.0`` to disable.
     reward_shaping_coef: float = 1.0
 
+    # ---- P73 : bounded training reward (cascade root-cause fix) ------
+    # The bootstrap-cascade root cause (P69-P71) is UNBOUNDED reward scale:
+    # raw economic reward (±50 after clip) × adaptive ``reward_scale`` (≤200)
+    # → per-step training reward ±50-200 → imagined H-step λ-returns reach
+    # -2000..-6000 → return_scale percentile spread runs away (5756×) → critic
+    # pessimism cascade (flat MV).  The working Cursor APC-Dreamer reference
+    # bounds the per-step training reward into [-1, 1] via a symlog squash:
+    #     r_train = clip( sign(r_raw)·log1p(|r_raw|), -B, B )
+    # computed on the UNSCALED economic reward (``reward_scale`` is bypassed
+    # when bounding is on — it is meaningless once rewards saturate).  Bounded
+    # rewards ⇒ bounded returns ⇒ return_scale CANNOT run away.  Applied to the
+    # TRAINING reward only; ``info['raw_reward']`` stays the unshaped economic
+    # reward so validation scoring is unaffected.  P73 (2026-05-31) PROMOTED
+    # the default to True after the bounded-reward run unfroze the actor
+    # (MV moves, mv_violation 0→1.75) and tamed return_scale runaway 5756×→27×.
+    # Set DREAMER_BOUND_TRAINING_REWARD=0 to restore legacy (scaled) reward.
+    bound_training_reward: bool = True
+    bound_training_reward_max: float = 1.0
+
+    # ---- P74 : advantage clipping (Cursor stabilizer #3) ------------
+    # Clamp the normalised advantage ``adv/scale`` into [-clip, +clip] before
+    # the REINFORCE/PMPO actor loss.  Without it a single large imagined
+    # return produces an outsized policy-gradient step → jerky, chattering
+    # MV (P73 deterministic-eval reversal_rate up to 0.70).  The working
+    # Cursor reference clamps at ±4 (single-MV) / ±8 (multi-MV); we default
+    # to 8.0.  Set ``advantage_clip=0.0`` to disable (legacy unclamped).
+    advantage_clip: float = 8.0
+
     # ---- C : replay-grounded critic anchor (P66-RCA, 2026-05-29) ----
     # The cascade's root cause is that the P3 critic regresses purely on
     # IMAGINED λ-returns from a frozen, non-convergent WM: targets become
@@ -360,21 +388,14 @@ class TrainConfig:
     # noise every step → the reward head (≈quadratic CV penalty) sees a
     # curvature·Var positive penalty bias on EVERY imagined step → too-
     # negative imagined returns → critic pessimism → return_scale runaway
-    # → bootstrap cascade (flat MV).  Two opt-in mitigations:
-    #   (1) ``rssm_imag_latent_mode``: roll the imagined PRIOR with the
+    # → bootstrap cascade (flat MV).  Opt-in mitigation:
+    #   ``rssm_imag_latent_mode``: roll the imagined PRIOR with the
     #       categorical MODE (argmax, sample=False) instead of a sample —
     #       removes the per-step jitter so the reward head sees the
     #       settled mean latent.  Actor exploration still comes from the
     #       policy's own action sampling (TD-MPC2-style deterministic
     #       latent + stochastic action).  Default False = paper-faithful.
-    #   (2) ``rssm_imag_bt_starts``: warm-start imagination from ALL
-    #       posterior states across the (B, T) context window (capped /
-    #       subsampled), not just the last t=T-1 state — restores the
-    #       DreamerV3 large imagination batch so residual jitter averages
-    #       over many trajectories + start-state diversity.  Default False.
     rssm_imag_latent_mode: bool = False
-    rssm_imag_bt_starts: bool = False
-    rssm_imag_bt_max_starts: int = 8192   # cap on B×T imagination starts
     wm_steady_action_eps: float = 0.02
     # P65 (2026-05-29): obs gate is now half-window mean-DRIFT on z-scored
     # obs (not std), so 0.20 unit means "two halves of the window differ
@@ -692,8 +713,14 @@ class TrainConfig:
     # bootstrap-runaway cascade documented in P40/P41 RCAs; aborting
     # on this signal avoids burning compute on the plateau detector.
     # Set ``factor=0.0`` to disable.
+    # P74 (2026-05-31): default growth threshold raised 3.0 → 100.0 for the
+    # bounded-reward regime.  With reward squashed to [-1,1] a benign P3
+    # settles around 25-30× return_scale growth (NOT the 5756× unbounded
+    # runaway), and ``rew_to_tgt_var`` is structurally tiny (small rewards),
+    # so the old 3.0× threshold was a FALSE POSITIVE that cut P3 to ~19 iters
+    # (undertrained actor → noisy MV).  100× still catches a genuine runaway.
     early_stop_cascade_min_rew_var_frac: float = 0.015
-    early_stop_cascade_min_return_scale_growth: float = 3.0
+    early_stop_cascade_min_return_scale_growth: float = 100.0
     early_stop_cascade_patience_iters: int = 10
     # Grad-skip storm: more than ``max_skips`` skipped optimizer steps
     # within ``window_iters`` consecutive iters → stop (NaN/Inf in
@@ -968,6 +995,16 @@ class APCEnv:
         self._shaping_gamma: float = float(getattr(cfg, 'gamma', 0.997) or 0.997)
         self._prev_potential: Optional[float] = None
 
+        # ---- P73 : bounded training reward ------------------------------
+        # When enabled, the per-step TRAINING reward is symlog-squashed into
+        # [-B, B] (``reward_scale`` bypassed) so imagined returns stay bounded
+        # and the return_scale percentile cannot run away (cascade root-cause
+        # fix).  ``info['raw_reward']`` stays unshaped for validation scoring.
+        self._bound_reward: bool = bool(
+            getattr(cfg, 'bound_training_reward', False))
+        self._bound_reward_max: float = float(
+            getattr(cfg, 'bound_training_reward_max', 1.0) or 1.0)
+
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
         # env.  Applied in ``_build_obs_vec`` before the obs is exposed to
@@ -1206,7 +1243,15 @@ class APCEnv:
                       f'silenced.', flush=True)
                 self._reward_clip_warned = True
             raw_reward = clipped
-        reward = raw_reward * float(self.reward_scale)
+        if self._bound_reward:
+            # P73: symlog-squash the UNSCALED economic reward into [-B, B]
+            # (``reward_scale`` bypassed).  Bounded reward ⇒ bounded imagined
+            # returns ⇒ return_scale cannot run away (cascade root-cause fix).
+            b = self._bound_reward_max
+            reward = float(np.clip(
+                np.sign(raw_reward) * np.log1p(abs(raw_reward)), -b, b))
+        else:
+            reward = raw_reward * float(self.reward_scale)
         # A' : dense potential-based reward shaping (training env only;
         # ``info['raw_reward']`` below stays the unshaped economic reward so
         # validation scoring is unaffected).  F = coef·(γΦ(s') − Φ(s)) is
@@ -1228,6 +1273,11 @@ class APCEnv:
                 shaping_gamma * phi_next - phi_prev)
             self._prev_potential = phi_next
             reward = reward + float(shaping)
+            if self._bound_reward:
+                # Keep the shaped reward inside the bounded envelope so the
+                # densifier cannot reintroduce an unbounded scale.
+                b = self._bound_reward_max
+                reward = float(np.clip(reward, -b, b))
         self._prev_control = np.asarray(control, dtype='float32')
         # Stash raw per-channel violation depths for next step's
         # DMC rate term (legacy mode ignores them).
@@ -2306,7 +2356,6 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     device = obs.device
 
     _imag_mode = bool(getattr(cfg, 'rssm_imag_latent_mode', False))
-    _bt_starts = bool(getattr(cfg, 'rssm_imag_bt_starts', False))
 
     # Warm-start: teacher-forced posterior rollout over the real context
     # (frozen WM).  ``last_state`` is the posterior at t=T-1; ``feats_real``
@@ -2317,28 +2366,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
             obs, act, sample=True)
         agent_hid_real = feats_real                          # (B, T, F)
 
-    # P70 fix (2): start imagination from ALL (B, T) posterior states
-    # (subsampled to ``rssm_imag_bt_max_starts``), not just t=T-1.  The
-    # imagined batch ``Bi`` then averages residual latent jitter over many
-    # trajectories.  States are rebuilt from ``feats_real`` (feat =
-    # [h ; z_flat]); ``img_step`` only consumes ``h`` and ``z`` (one-hot),
-    # not ``z_logits``, so a zero-logit placeholder is safe here.
-    from models.dreamer_v4_rssm import RSSMState
-    if _bt_starts:
-        deter = rssm.deter_dim
-        K, C = rssm.n_categoricals, rssm.n_classes
-        feats_flat = feats_real.reshape(B * T, -1)
-        N = feats_flat.shape[0]
-        cap = int(getattr(cfg, 'rssm_imag_bt_max_starts', 8192))
-        if 0 < cap < N:
-            idx = torch.randperm(N, device=device)[:cap]
-            feats_flat = feats_flat[idx]
-        h0 = feats_flat[:, :deter].contiguous()
-        z0 = feats_flat[:, deter:].reshape(-1, K, C).contiguous()
-        state = RSSMState(h=h0, z_logits=torch.zeros_like(z0), z=z0)
-    else:
-        state = last_state
-    Bi = state.h.shape[0]
+    state = last_state
 
     imagined_rewards: List[torch.Tensor] = []
     imagined_entropy: List[torch.Tensor] = []
@@ -2434,7 +2462,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     with torch.no_grad():
         baseline = model.value.expectation(
             model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
-        ).view(Bi, H)
+        ).view(B, H)
         adv_raw = target_returns - baseline
         scale = model.update_return_scale(
             target_returns,
@@ -2446,6 +2474,11 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     raws_flat = raws.reshape(-1, raws.shape[-1]) if raws.dim() > 2 \
                   else raws.reshape(-1)
     adv_flat = (adv_raw / scale).reshape(-1).detach()
+    # P74: clamp the normalised advantage so a single large imagined return
+    # cannot drive an outsized actor step (the source of MV chatter).
+    _adv_clip = float(getattr(cfg, 'advantage_clip', 0.0) or 0.0)
+    if _adv_clip > 0.0:
+        adv_flat = adv_flat.clamp(-_adv_clip, _adv_clip)
 
     actor_loss_type = str(getattr(cfg, 'actor_loss_type', 'reinforce')).lower()
     if actor_loss_type == 'pmpo':
@@ -2463,7 +2496,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # Critic-health diagnostics (same readouts as the SF path).
     with torch.no_grad():
-        crit_pred = model.value.expectation(val_logits_flat).view(Bi, H)
+        crit_pred = model.value.expectation(val_logits_flat).view(B, H)
         tgt = target_returns
         tv = torch.stack(imagined_target_v, dim=1)
 
@@ -2733,6 +2766,12 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     raws_flat = raws.reshape(-1, raws.shape[-1]) if raws.dim() > 2 \
                   else raws.reshape(-1)
     adv_flat = (adv_raw / scale).reshape(-1).detach()
+    # P74: clamp the normalised advantage so a single large imagined return
+    # cannot drive an outsized actor step (the source of MV chatter).  Same
+    # stabilizer as the RSSM path.
+    _adv_clip = float(getattr(cfg, 'advantage_clip', 0.0) or 0.0)
+    if _adv_clip > 0.0:
+        adv_flat = adv_flat.clamp(-_adv_clip, _adv_clip)
 
     actor_loss_type = str(getattr(cfg, 'actor_loss_type', 'reinforce')).lower()
     if actor_loss_type == 'pmpo':
@@ -6085,12 +6124,15 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_P2_GATE_REWARD_MTP_MAX', 'p2_gate_reward_mtp_max', float),
         ('DREAMER_P2_GATE_RECENT_ITERS', 'p2_gate_recent_iters', int),
         ('DREAMER_P2_GATE_MAX_EXTENSION', 'p2_gate_max_extension', float),
-        # 2026-05-30 (P70): RSSM imagination steady-state fixes.
+        # 2026-05-30 (P70): RSSM imagination steady-state fix.
         ('DREAMER_RSSM_IMAG_LATENT_MODE', 'rssm_imag_latent_mode',
             lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_RSSM_IMAG_BT_STARTS', 'rssm_imag_bt_starts',
+        # 2026-05-31 (P73): bounded training reward (cascade root-cause fix).
+        ('DREAMER_BOUND_TRAINING_REWARD', 'bound_training_reward',
             lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_RSSM_IMAG_BT_MAX_STARTS', 'rssm_imag_bt_max_starts', int),
+        ('DREAMER_BOUND_TRAINING_REWARD_MAX', 'bound_training_reward_max', float),
+        # 2026-05-31 (P74): advantage clipping (Cursor stabilizer #3).
+        ('DREAMER_ADVANTAGE_CLIP', 'advantage_clip', float),
     ]:
         v = os.environ.get(name)
         if v is not None and v != '':

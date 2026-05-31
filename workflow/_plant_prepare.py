@@ -317,14 +317,17 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RSSM_FREE_BITS':             ('rssm_free_bits',                 float),
     'DREAMER_RSSM_KL_DYN_W':              ('rssm_kl_dyn_w',                  float),
     'DREAMER_RSSM_KL_REPR_W':             ('rssm_kl_repr_w',                 float),
-    # P70 (2026-05-30): RSSM imagination steady-state fixes (opt-in).
+    # P70 (2026-05-30): RSSM imagination steady-state fix (opt-in).
     # latent-mode = roll imagined prior with categorical MODE (kills the
-    # per-step jitter that biases the reward head); bt_starts = warm-start
-    # imagination from all (B,T) posterior states (capped) for large
-    # imagination batch averaging.  Both sim-agnostic.
+    # per-step jitter that biases the reward head).  Sim-agnostic.
     'DREAMER_RSSM_IMAG_LATENT_MODE':      ('rssm_imag_latent_mode',          _as_bool),
-    'DREAMER_RSSM_IMAG_BT_STARTS':        ('rssm_imag_bt_starts',            _as_bool),
-    'DREAMER_RSSM_IMAG_BT_MAX_STARTS':    ('rssm_imag_bt_max_starts',        int),
+    # P73 (2026-05-31): bounded training reward (cascade root-cause fix).
+    # symlog-squash per-step training reward into [-B,B] so imagined returns
+    # stay bounded and return_scale cannot run away.  Sim-agnostic.
+    'DREAMER_BOUND_TRAINING_REWARD':      ('bound_training_reward',          _as_bool),
+    'DREAMER_BOUND_TRAINING_REWARD_MAX':  ('bound_training_reward_max',      float),
+    # P74 (2026-05-31): advantage clip (smooths actor grad -> less MV chatter).
+    'DREAMER_ADVANTAGE_CLIP':             ('advantage_clip',                 float),
 }
 
 
