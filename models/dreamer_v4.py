@@ -532,6 +532,7 @@ class DynamicsConfig:
     soft_cap: float = 50.0
     rope_base: float = 10_000.0
     attn_impl: str = 'auto'         # 'auto' | 'manual' | 'sdpa'
+    sf_bootstrap: bool = True       # shortcut self-consistency term (paper eq. 7)
     # n_tokens_per_step is computed internally:
     #   1 (z̃) + 1 (action) + 1 (τ,d) + n_register
 
@@ -1662,43 +1663,86 @@ def reinforce_actor_loss(policy, prior_policy,
 def shortcut_forcing_loss(dynamics: DynamicsTransformer,
                            z_clean: torch.Tensor, action: torch.Tensor,
                            ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Shortcut-forcing (flow-matching) world-model loss.
+    """Shortcut-forcing (flow-matching + self-consistency) world-model loss.
 
     ``z_clean`` (B, T, z_dim)  — frozen tokenizer outputs (target z₁'s).
     ``action``  (B, T, A)      — actions taken before each step.
 
     Returns (loss, diag).
 
-    APC-continuous-control variant of paper eq. 7:
+    Paper-faithful DreamerV4 shortcut-forcing objective (eq. 7), restored
+    2026-05-31.  Two terms, sampled jointly per the (τ, d) grid:
 
-    **Bootstrap term DISABLED** (no few-step inference distillation).
-    The paper's bootstrap loss enables generation in K' < K steps;
-    APC controllers always run K = k_max iterations at deployment
-    (one inference call per agent step), so the bootstrap gradient
-    is pure noise for our use-case and the d > d_min positions are
-    wasted compute.  Restrict (τ, d) sampling to d == d_min only.
+      * **Flow-matching** (where ``d == d_min``): the model's x-prediction
+        ``ẑ₁`` is regressed onto the clean target ``z₁``.
+      * **Self-consistency / bootstrap** (where ``d > d_min``): a single
+        step of size ``d`` must equal two consecutive steps of size
+        ``d/2`` (stop-grad target).  This is the mechanism that makes
+        *few-step* Euler integration accurate — without it the K-step
+        inference rollout drifts off-manifold and the WM fails to settle
+        under constant action (observed as
+        ``wm_pred_converges_under_constant_action == 0``).
+
+    Earlier this term was disabled under the assumption that APC always
+    runs K = k_max steps so the bootstrap gradient is "pure noise".  That
+    reasoning was wrong: the self-consistency constraint governs the
+    *accuracy* of every multi-step Euler rollout (not just K' < K
+    generation), so disabling it is what caused the convergence failure.
+
+    Set ``DynamicsConfig.sf_bootstrap = False`` to fall back to the
+    flow-matching-only behaviour.
     """
     cfg = dynamics.cfg
     B, T, Z = z_clean.shape
     device = z_clean.device
     dtype = z_clean.dtype
     d_min = 1.0 / cfg.k_max
+    use_bootstrap = bool(getattr(cfg, 'sf_bootstrap', True))
 
-    # Per-(B, T) sample of τ from the trained grid; FORCE d = d_min.
-    tau, _ = sample_tau_d((B, T), cfg.k_max, device, dtype)
-    d = torch.full_like(tau, d_min)
+    # Per-(B, T) sample of (τ, d) from the paper grid.  When bootstrap is
+    # disabled we force d == d_min (pure flow-matching, the old behaviour).
+    tau, d = sample_tau_d((B, T), cfg.k_max, device, dtype)
+    if not use_bootstrap:
+        d = torch.full_like(tau, d_min)
 
     z0 = torch.randn_like(z_clean)
     tau_b = tau.unsqueeze(-1)
     z_tilde = (1.0 - tau_b) * z0 + tau_b * z_clean
 
+    # ---- Build the per-position x-prediction target -------------------
+    # Flow positions (d == d_min) → clean z₁.
+    # Bootstrap positions (d > d_min) → endpoint of two stop-grad d/2 steps,
+    # converted back into the equivalent single-step x-prediction target.
+    target = z_clean
+    if use_bootstrap:
+        is_flow = (d <= d_min + 1e-6)                               # (B, T)
+        with torch.no_grad():
+            # Half-step size; clamp keeps the d==d_min rows on-grid (their
+            # bootstrap target is discarded by the mask below).
+            d_half = (d * 0.5).clamp_min(d_min)
+            inv_omt = (1.0 - tau_b).clamp_min(1e-6)                 # 1 / (1−τ)
+            # First d/2 step from z_tilde at τ.
+            z1_a = dynamics(z_tilde, tau, d_half, action)['z1_hat']
+            v_a = (z1_a - z_tilde) / inv_omt
+            z_mid = z_tilde + v_a * d_half.unsqueeze(-1)
+            tau_mid = tau + d_half
+            # Second d/2 step from z_mid at τ + d/2.
+            inv_omt_mid = (1.0 - tau_mid.unsqueeze(-1)).clamp_min(1e-6)
+            z1_b = dynamics(z_mid, tau_mid, d_half, action)['z1_hat']
+            v_b = (z1_b - z_mid) / inv_omt_mid
+            z_two = z_mid + v_b * d_half.unsqueeze(-1)
+            # Single d-step x-prediction target that lands at z_two:
+            #   z_tilde + (ẑ₁ − z_tilde) · d/(1−τ) = z_two
+            target_boot = z_tilde + (z_two - z_tilde) * inv_omt / d.unsqueeze(-1).clamp_min(1e-6)
+            target = torch.where(is_flow.unsqueeze(-1), z_clean, target_boot)
+
     out = dynamics(z_tilde, tau, d, action)
-    z1_hat = out['z1_hat']                                       # (B, T, Z)
-    loss_flow = (z1_hat - z_clean).pow(2).sum(-1)                # (B, T)
+    z1_hat = out['z1_hat']                                          # (B, T, Z)
+    loss_mse = (z1_hat - target).pow(2).sum(-1)                     # (B, T)
 
     # Per-step ramp weight (eq. 8) — paper-faithful.
     w = ramp_weight(tau)
-    loss = (w * loss_flow).mean()
+    loss = (w * loss_mse).mean()
 
     # NOTE (2026-05-23, P41 sf_loss diag bug fix): do NOT include
     # 'sf_loss' in diag.  The caller (``world_model_loss``) does
