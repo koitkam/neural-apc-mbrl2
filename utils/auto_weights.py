@@ -234,19 +234,50 @@ def _per_channel_abs_weights(weights_section: Dict, key: str, n: int,
     return out
 
 
-def resolve_econ_typical(spec: Optional[Dict], n_mv: int,
-                         n_cv: int) -> Tuple[List[float], List[float]]:
+def _band_mid_normalized(lo: float, hi: float,
+                         r_lo: float, r_hi: float) -> float:
+    """Normalised midpoint of the operating band ``[lo, hi]`` within the
+    identifier normalisation range ``[r_lo, r_hi]``.
+
+    Returns ``clip((norm(lo) + norm(hi)) / 2, 0, 1)``.  Equals ``0.5`` only
+    when the band spans the full normalisation range symmetrically; for the
+    usual case where the identifier range is wider than the operating band
+    it lands on the band centre, *not* the range midpoint.
+    """
+    rng = max(1e-6, float(r_hi) - float(r_lo))
+    lo_n = (float(lo) - float(r_lo)) / rng
+    hi_n = (float(hi) - float(r_lo)) / rng
+    return float(np.clip(0.5 * (lo_n + hi_n), 0.0, 1.0))
+
+
+def resolve_econ_typical(
+    spec: Optional[Dict],
+    n_mv: int,
+    n_cv: int,
+    mv_bounds: Optional[List] = None,
+    cv_bounds: Optional[List] = None,
+    mv_norm_ranges: Optional[List] = None,
+    cv_norm_ranges: Optional[List] = None,
+) -> Tuple[List[float], List[float]]:
     """Resolve the per-channel economic *typical* operating point.
 
     Returns ``(mv_typical, cv_typical)`` as normalised [0, 1] lists.  The
     economic term measures deviation from this point (``x_norm - typical``)
-    rather than from the range midpoint.  Read from
-    ``spec['weights']['mv_economic_typical']`` /
-    ``['cv_economic_typical']`` (list or named-dict form); absent entries
-    default to ``0.5`` (midpoint), which reduces the economic term to the
-    historical ``x_norm - 0.5`` behaviour.  Shared single source of truth
-    for both the reward engine (which applies the offset) and the adaptive
-    weight derivation (which sizes the economic budget against it).
+    rather than from the range midpoint.
+
+    Precedence per channel:
+      1. Explicit ``spec['weights']['mv_economic_typical']`` /
+         ``['cv_economic_typical']`` (list or named-dict) when the user
+         supplied it -- a hard override.
+      2. Otherwise, when bounds + normalisation ranges are supplied, the
+         normalised *band midpoint* (``_band_mid_normalized``) so the
+         economic nudge is zero-centred within the actually-reachable
+         operating window rather than the wider identifier range.
+      3. Otherwise ``0.5`` (range midpoint -- historical behaviour).
+
+    Shared single source of truth for both the reward engine (which applies
+    the offset) and the adaptive weight derivation (which sizes the
+    economic budget against it), so the priority ladder stays consistent.
     """
     weights_section: Dict = {}
     if isinstance(spec, dict):
@@ -254,12 +285,26 @@ def resolve_econ_typical(spec: Optional[Dict], n_mv: int,
         if isinstance(w, dict):
             weights_section = w
 
-    def _vec(key: str, prefix: str, n: int) -> List[float]:
+    def _default_vec(n: int, bounds, ranges) -> List[float]:
         out = [0.5] * n
+        if bounds is None or ranges is None:
+            return out
+        for i in range(n):
+            if i < len(bounds) and i < len(ranges):
+                try:
+                    lo, hi = float(bounds[i][0]), float(bounds[i][1])
+                    r_lo, r_hi = float(ranges[i][0]), float(ranges[i][1])
+                    out[i] = _band_mid_normalized(lo, hi, r_lo, r_hi)
+                except Exception:
+                    out[i] = 0.5
+        return out
+
+    def _vec(key: str, prefix: str, n: int, bounds, ranges) -> List[float]:
+        out = _default_vec(n, bounds, ranges)
         raw = weights_section.get(key)
         if isinstance(raw, list):
             for i in range(min(n, len(raw))):
-                out[i] = float(np.clip(_safe_float(raw[i], 0.5), 0.0, 1.0))
+                out[i] = float(np.clip(_safe_float(raw[i], out[i]), 0.0, 1.0))
         elif isinstance(raw, dict):
             for k, v in raw.items():
                 try:
@@ -267,15 +312,22 @@ def resolve_econ_typical(spec: Optional[Dict], n_mv: int,
                 except Exception:
                     continue
                 if 0 <= idx < n:
-                    out[idx] = float(np.clip(_safe_float(v, 0.5), 0.0, 1.0))
+                    out[idx] = float(np.clip(_safe_float(v, out[idx]), 0.0, 1.0))
         return out
 
-    return _vec('mv_economic_typical', 'mv', n_mv), _vec('cv_economic_typical', 'cv', n_cv)
+    return (
+        _vec('mv_economic_typical', 'mv', n_mv, mv_bounds, mv_norm_ranges),
+        _vec('cv_economic_typical', 'cv', n_cv, cv_bounds, cv_norm_ranges),
+    )
 
 
 
 def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
-                        dynamics: Optional[Dict] = None) -> Dict:
+                        dynamics: Optional[Dict] = None,
+                        mv_bounds: Optional[List] = None,
+                        cv_bounds: Optional[List] = None,
+                        mv_norm_ranges: Optional[List] = None,
+                        cv_norm_ranges: Optional[List] = None) -> Dict:
     """Return a dict of auto-derived weight vectors.
 
     The returned weights are **adaptive** to (a) the user-supplied
@@ -402,7 +454,10 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # the priority ladder stays consistent with the realised reward.
     mv_econ_pc = _per_channel_abs_weights(weights_section, 'mv_economic', n_mv, 'mv')
     cv_econ_pc = _per_channel_abs_weights(weights_section, 'cv_economic', n_cv, 'cv')
-    mv_econ_typ, cv_econ_typ = resolve_econ_typical(spec, n_mv, n_cv)
+    mv_econ_typ, cv_econ_typ = resolve_econ_typical(
+        spec, n_mv, n_cv,
+        mv_bounds=mv_bounds, cv_bounds=cv_bounds,
+        mv_norm_ranges=mv_norm_ranges, cv_norm_ranges=cv_norm_ranges)
     econ_budget = (
         sum(max(t, 1.0 - t) * w for t, w in zip(mv_econ_typ, mv_econ_pc))
         + sum(max(t, 1.0 - t) * w for t, w in zip(cv_econ_typ, cv_econ_pc))

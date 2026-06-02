@@ -189,11 +189,15 @@ def _coerce_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     cv_econ = _coerce_named_scalar(w_in.get('cv_economic') or w_in.get('cv_economic_weights') or {}, 'cv')
     # Typical (design) operating point for the economic term, normalised
     # to [0, 1] of each channel's range. The economic nudge measures
-    # deviation from this point (``x_norm - typical``) instead of from the
-    # range midpoint. Absent keys default to 0.5 (midpoint) so the term
-    # reduces to the historical ``x_norm - 0.5`` behaviour.
-    mv_econ_typ = _coerce_named_scalar(w_in.get('mv_economic_typical') or {}, 'mv')
-    cv_econ_typ = _coerce_named_scalar(w_in.get('cv_economic_typical') or {}, 'cv')
+    # deviation from this point (``x_norm - typical``). Only emitted here
+    # when the user *explicitly* supplied it; when absent the key is left
+    # off the spec so the reward engine / auto-weight derivation can
+    # default it to the normalised band midpoint (derived from the limits)
+    # via ``resolve_econ_typical``.
+    mv_econ_typ_user = w_in.get('mv_economic_typical')
+    cv_econ_typ_user = w_in.get('cv_economic_typical')
+    mv_econ_typ = _coerce_named_scalar(mv_econ_typ_user or {}, 'mv')
+    cv_econ_typ = _coerce_named_scalar(cv_econ_typ_user or {}, 'cv')
 
     rs_in = spec.get('runtime_setpoints') or {}
     default_rs = _default_spec()['runtime_setpoints']
@@ -220,8 +224,6 @@ def _coerce_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
             'cv_economic': cv_econ,
             'mv_economic_weights': [mv_econ.get(f'mv_{i}', 0.0) for i in range(n_mv)],
             'cv_economic_weights': [cv_econ.get(f'cv_{i}', 0.0) for i in range(n_cv)],
-            'mv_economic_typical': [_clip01(mv_econ_typ.get(f'mv_{i}', 0.5)) for i in range(n_mv)],
-            'cv_economic_typical': [_clip01(cv_econ_typ.get(f'cv_{i}', 0.5)) for i in range(n_cv)],
             'mv_target_values': [mv_targets.get(f'mv_{i}', 0.0) for i in range(n_mv)],
             'cv_target_values': [cv_targets.get(f'cv_{i}', 0.0) for i in range(n_cv)],
             'mv_target_weights': [0.0 for _ in range(n_mv)],
@@ -230,6 +232,14 @@ def _coerce_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         },
         'runtime_setpoints': rs,
     }
+    # Only carry explicit user-supplied economic typicals onto the spec;
+    # absent ones are derived downstream (band midpoint from the limits).
+    if mv_econ_typ_user is not None:
+        out['weights']['mv_economic_typical'] = [
+            _clip01(mv_econ_typ.get(f'mv_{i}', 0.5)) for i in range(n_mv)]
+    if cv_econ_typ_user is not None:
+        out['weights']['cv_economic_typical'] = [
+            _clip01(cv_econ_typ.get(f'cv_{i}', 0.5)) for i in range(n_cv)]
     return out
 
 

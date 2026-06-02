@@ -154,7 +154,11 @@ def _objective_uses_normalized(obj_w: Dict, terms: Dict) -> bool:
     return bool(int(_safe_float(obj_w.get('objective_use_normalized', 1), 1)))
 
 
-def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict]) -> Dict:
+def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
+                        mv_bounds: Optional[list] = None,
+                        cv_bounds: Optional[list] = None,
+                        mv_norm_ranges: Optional[list] = None,
+                        cv_norm_ranges: Optional[list] = None) -> Dict:
     """Fill in violation/move/target weight vectors if absent, using auto-derivation."""
     needs = (
         not obj_w.get('mv_violation_weights')
@@ -170,7 +174,10 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict])
     except Exception:
         return obj_w
     spec_local = spec if isinstance(spec, dict) else {}
-    auto = derive_auto_weights(spec_local, n_mv=n_mv, n_cv=n_cv)
+    auto = derive_auto_weights(spec_local, n_mv=n_mv, n_cv=n_cv,
+                               mv_bounds=mv_bounds, cv_bounds=cv_bounds,
+                               mv_norm_ranges=mv_norm_ranges,
+                               cv_norm_ranges=cv_norm_ranges)
     merged = dict(obj_w)
     for k in ('mv_violation_weights', 'cv_violation_weights', 'mv_move_weights',
               'mv_target_weights', 'cv_target_weights',
@@ -239,13 +246,21 @@ def compute_objective_components(
     mv_dim = len(control)
     cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
     cv_dim = len(cv_indices)
-    obj_w = _maybe_auto_weights(obj_w, n_mv=mv_dim, n_cv=cv_dim, spec=objective_spec)
 
     mv_bounds = _resolve_mv_bounds(bounds, action_dim=mv_dim, setpoint_manager=setpoint_manager)
     cv_bounds = _resolve_cv_bounds(bounds, cv_dim=cv_dim, setpoint_manager=setpoint_manager)
-    use_normalized = _objective_uses_normalized(obj_w, terms)
     mv_norm_ranges = _resolve_ranges(getattr(sim, 'mv_normalization_ranges', []), mv_dim, mv_bounds)
     cv_norm_ranges = _resolve_ranges(getattr(sim, 'cv_normalization_ranges', []), cv_dim, cv_bounds)
+
+    # Auto-derive weights *after* bounds/ranges are known so the economic
+    # budget sizing uses the same band-midpoint ``typical`` as the reward
+    # engine (shared ``resolve_econ_typical``).
+    obj_w = _maybe_auto_weights(obj_w, n_mv=mv_dim, n_cv=cv_dim, spec=objective_spec,
+                                mv_bounds=mv_bounds, cv_bounds=cv_bounds,
+                                mv_norm_ranges=mv_norm_ranges,
+                                cv_norm_ranges=cv_norm_ranges)
+
+    use_normalized = _objective_uses_normalized(obj_w, terms)
     if not isinstance(terms, dict):
         terms = {}
 
@@ -276,12 +291,16 @@ def compute_objective_components(
     # nudge measures deviation from this point (``x_norm - typical``)
     # instead of from the range midpoint. Shared single source of truth
     # with the adaptive weight derivation (``resolve_econ_typical``) so the
-    # priority ladder stays consistent. Defaults to 0.5 (midpoint), which
-    # reproduces the historical ``x_norm - 0.5`` behaviour.
+    # priority ladder stays consistent. Absent an explicit user value it
+    # defaults to the normalised *band midpoint* (derived from bounds +
+    # normalisation ranges), falling back to 0.5 only when those are
+    # unavailable.
     try:
         from utils.auto_weights import resolve_econ_typical as _resolve_econ_typical
         mv_economic_typical, cv_economic_typical = _resolve_econ_typical(
-            objective_spec, mv_dim, cv_dim)
+            objective_spec, mv_dim, cv_dim,
+            mv_bounds=mv_bounds, cv_bounds=cv_bounds,
+            mv_norm_ranges=mv_norm_ranges, cv_norm_ranges=cv_norm_ranges)
     except Exception:
         mv_economic_typical = [0.5] * mv_dim
         cv_economic_typical = [0.5] * cv_dim
