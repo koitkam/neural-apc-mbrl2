@@ -40,15 +40,6 @@ import numpy as np
 
 from utils.state_normalization import state_value_in_mode
 
-# DMC in-band bonus (P57, 2026-05-27): constant positive reward awarded
-# per step when all CVs are within their soft bounds. Lifts the positive
-# tail of the reward distribution so the symlog-twohot critic gets
-# meaningful mass on both sides of zero — fixes the critic-pessimism
-# cascade seen in P56 (rew_to_tgt_var ≈ 0.007 ≪ 0.015 threshold).
-# Simulator-agnostic constant; sized at ~2% of the default penalty_clip
-# so it cannot dominate violation gradients.
-DMC_INBAND_BONUS: float = 1.0
-
 
 def _safe_float(v, default=0.0):
     try:
@@ -195,6 +186,38 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict])
     return merged
 
 
+def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
+    """Resolve the integral (accumulated-violation) term configuration.
+
+    Shared single source of truth for both
+    :func:`compute_objective_components` (which applies the penalty) and
+    the environment (which sizes/normalises the exposed accumulator
+    observation channel).  Precedence: env var > objective_spec key >
+    default — identical to the in-function resolution.
+
+    Returns ``(enabled, coef, windup)``.
+    """
+    spec = objective_spec if isinstance(objective_spec, dict) else {}
+
+    def _r(env_key: str, spec_key: str, default):
+        v = os.environ.get(env_key)
+        if v is not None and str(v).strip() != '':
+            return v
+        if spec_key in spec and spec.get(spec_key) is not None:
+            return spec.get(spec_key)
+        return default
+
+    # ON by default (opt-out): a small positive coefficient applies a
+    # dwell penalty for SUSTAINED limit violation, attacking the passive
+    # "park just outside the bound" attractor. Opt out by setting the coef
+    # to 0 (env ``OBJECTIVE_INTEGRAL_COEF`` or spec ``integral_coef``).
+    coef = float(_safe_float(_r('OBJECTIVE_INTEGRAL_COEF', 'integral_coef', 0.05), 0.05))
+    windup = float(_safe_float(_r('OBJECTIVE_INTEGRAL_WINDUP', 'integral_windup', 5.0), 5.0))
+    if windup <= 0.0:
+        windup = 5.0
+    return (coef > 0.0, coef, windup)
+
+
 def compute_objective_components(
     state,
     sim,
@@ -207,6 +230,7 @@ def compute_objective_components(
     objective_spec: Optional[Dict] = None,
     prev_mv_violation_per_channel=None,
     prev_cv_violation_per_channel=None,
+    prev_integral_cv_per_channel=None,
 ) -> Dict[str, float]:
     state = np.asarray(state, dtype='float32').reshape(-1)
     control = np.asarray(control, dtype='float32').reshape(-1)
@@ -228,13 +252,13 @@ def compute_objective_components(
     mv_violation_weights = _resolve_vector(obj_w.get('mv_violation_weights', []), mv_dim, 0.0)
     cv_violation_weights = _resolve_vector(obj_w.get('cv_violation_weights', []), cv_dim,
                                            _safe_float(obj_w.get('cv_violation', 0.0), 0.0))
-    # Per-side CV weights (NEW 2026-05-26): asymmetric high vs low limit
-    # urgency derived from optional ``cv_priority_lo`` / ``cv_priority_hi``
-    # in the objective spec.  Falls back to the symmetric vector when
-    # absent, preserving legacy behaviour.  Only consumed by
-    # ``OBJECTIVE_REWARD_MODE=dmc`` (linear path); legacy quadratic path
-    # keeps using the symmetric ``cv_violation_weights`` for backward
-    # compatibility with checkpoints calibrated against it.
+    # Per-side CV weights: asymmetric high vs low limit urgency derived
+    # from optional ``cv_priority_lo`` / ``cv_priority_hi`` in the
+    # objective spec.  Falls back to the symmetric vector when absent.
+    # The quadratic CV violation penalty uses the symmetric
+    # ``cv_violation_weights``; the per-side weights drive the urgency
+    # scale (``max(w_lo, w_hi)``) of the optional derivative and integral
+    # shaping terms.
     raw_lo = obj_w.get('cv_violation_weights_lo')
     if raw_lo:
         cv_violation_weights_lo = _resolve_vector(raw_lo, cv_dim, 0.0)
@@ -248,6 +272,19 @@ def compute_objective_components(
     mv_move_weights = _resolve_vector(obj_w.get('mv_move_weights', []), mv_dim, 0.0)
     mv_economic_weights = _resolve_vector(obj_w.get('mv_economic_weights', []), mv_dim, 0.0)
     cv_economic_weights = _resolve_vector(obj_w.get('cv_economic_weights', []), cv_dim, 0.0)
+    # Economic *typical* operating point (normalised [0, 1]). The economic
+    # nudge measures deviation from this point (``x_norm - typical``)
+    # instead of from the range midpoint. Shared single source of truth
+    # with the adaptive weight derivation (``resolve_econ_typical``) so the
+    # priority ladder stays consistent. Defaults to 0.5 (midpoint), which
+    # reproduces the historical ``x_norm - 0.5`` behaviour.
+    try:
+        from utils.auto_weights import resolve_econ_typical as _resolve_econ_typical
+        mv_economic_typical, cv_economic_typical = _resolve_econ_typical(
+            objective_spec, mv_dim, cv_dim)
+    except Exception:
+        mv_economic_typical = [0.5] * mv_dim
+        cv_economic_typical = [0.5] * cv_dim
     mv_target_weights = _resolve_vector(obj_w.get('mv_target_weights', []), mv_dim, 0.0)
     cv_target_weights = _resolve_vector(obj_w.get('cv_target_weights', []), cv_dim, 0.0)
     mv_target_values = _resolve_vector(obj_w.get('mv_target_values', []), mv_dim, 0.0)
@@ -262,13 +299,12 @@ def compute_objective_components(
     else:
         cv_target_values = _resolve_vector(obj_w.get('cv_target_values', []), cv_dim, 0.0)
 
-    # ---------------- Reward-mode selection (2026-05-26) ----------------
-    # Precedence: env var > objective_spec key > code default.
-    # JSON keys (preferred for per-sim persistent config):
-    #   - ``reward_mode``          : "legacy" | "dmc"
-    #   - ``violation_rate_coef``  : float (DMC mode only)
-    # Env vars (preferred for one-off launch overrides):
-    #   - ``OBJECTIVE_REWARD_MODE``, ``OBJECTIVE_DMC_VIOLATION_RATE_COEF``.
+    # ---------------- Optional-term config resolution -------------------
+    # Single reward shape (quadratic violations, L1 mv-move).  Two
+    # OPTIONAL PID-style shaping terms can be switched on independently:
+    #   - derivative (violation-rate) term  -> OBJECTIVE_VIOLATION_RATE_COEF
+    #   - integral (accumulated-violation)  -> OBJECTIVE_INTEGRAL_COEF
+    # Precedence for every knob: env var > objective_spec key > default.
     _spec_cfg = objective_spec if isinstance(objective_spec, dict) else {}
 
     def _resolve_cfg(env_key: str, spec_key: str, default):
@@ -279,13 +315,7 @@ def compute_objective_components(
             return _spec_cfg.get(spec_key)
         return default
 
-    reward_mode = str(_resolve_cfg(
-        'OBJECTIVE_REWARD_MODE', 'reward_mode', 'legacy')).strip().lower()
-    if reward_mode not in ('legacy', 'dmc'):
-        reward_mode = 'legacy'
-    is_dmc = (reward_mode == 'dmc')
-
-    # ---- MV violations (mode-dispatched: quadratic legacy, linear DMC) ----
+    # ---- MV violations (quadratic in bound-violation depth) ----
     mv_violation_per_channel = []        # shaped magnitude (matches mode)
     mv_violation_per_channel_raw = []    # raw depth (lo_viol+hi_viol) for rate term
     mv_violation_penalty = 0.0
@@ -299,17 +329,14 @@ def compute_objective_components(
             u_term = _normalize(u_term, r_lo, r_hi)
         lo_viol = max(0.0, lo_term - u_term)
         hi_viol = max(0.0, u_term - hi_term)
-        if is_dmc:
-            lo_shaped, hi_shaped = lo_viol, hi_viol
-        else:
-            lo_shaped, hi_shaped = lo_viol * lo_viol, hi_viol * hi_viol
+        lo_shaped, hi_shaped = lo_viol * lo_viol, hi_viol * hi_viol
         w_i = float(mv_violation_weights[i])
         mv_violation_penalty += w_i * (lo_shaped + hi_shaped)
         mv_violation_per_channel.append(float(lo_shaped + hi_shaped))
         mv_violation_per_channel_raw.append(float(lo_viol + hi_viol))
     mv_violation_penalty = float(mv_violation_penalty)
 
-    # ---- CV violations (mode-dispatched + per-side weights in DMC) ----
+    # ---- CV violations (quadratic, symmetric per-side weights) ----
     cv_violation_per_channel = []
     cv_violation_per_channel_raw = []
     cv_violation_penalty = 0.0
@@ -329,15 +356,9 @@ def compute_objective_components(
         else:
             lo_viol = max(0.0, lo - pv)
             hi_viol = max(0.0, pv - hi)
-        if is_dmc:
-            lo_shaped, hi_shaped = lo_viol, hi_viol
-            w_lo = float(cv_violation_weights_lo[j])
-            w_hi = float(cv_violation_weights_hi[j])
-            cv_violation_penalty += w_lo * lo_shaped + w_hi * hi_shaped
-        else:
-            lo_shaped, hi_shaped = lo_viol * lo_viol, hi_viol * hi_viol
-            w_sym = float(cv_violation_weights[j])
-            cv_violation_penalty += w_sym * (lo_shaped + hi_shaped)
+        lo_shaped, hi_shaped = lo_viol * lo_viol, hi_viol * hi_viol
+        w_sym = float(cv_violation_weights[j])
+        cv_violation_penalty += w_sym * (lo_shaped + hi_shaped)
         cv_violation_per_channel.append(float(lo_shaped + hi_shaped))
         cv_violation_per_channel_raw.append(float(lo_viol + hi_viol))
     cv_violation_penalty = float(cv_violation_penalty)
@@ -355,7 +376,7 @@ def compute_objective_components(
             u_raw = _normalize(float(control[i]), r_lo, r_hi)
             lo_term, hi_term = _normalized_bounds(lo_i, hi_i, r_lo, r_hi)
             u_clipped = float(np.clip(u_raw, lo_term, hi_term))
-            term = u_clipped - 0.5
+            term = u_clipped - float(mv_economic_typical[i])
         else:
             u_clipped = float(np.clip(float(control[i]), lo_i, hi_i))
             term = u_clipped
@@ -365,11 +386,7 @@ def compute_objective_components(
                * np.asarray(mv_economic_weights, dtype='float32'))
     )
 
-    # ---- MV move (mode-dispatched: linear legacy, quadratic DMC) ----
-    # DMC mode uses (Δu)^2 (standard R-matrix term) so the agent's
-    # in-band steady-state cost of small oscillations grows much faster
-    # than the cost of an equivalent single smooth move — directly
-    # killing the chatter pattern observed in P54.
+    # ---- MV move (L1 |Δu|) ----
     mv_move_terms = []
     for i in range(mv_dim):
         r_lo, r_hi = mv_norm_ranges[i]
@@ -380,10 +397,7 @@ def compute_objective_components(
             u_term = float(control[i])
             p_term = float(prev_control[i])
         du = u_term - p_term
-        if is_dmc:
-            mv_move_terms.append(float(du * du))
-        else:
-            mv_move_terms.append(float(abs(du)))
+        mv_move_terms.append(float(abs(du)))
     mv_move_penalty = float(
         np.sum(np.asarray(mv_move_terms, dtype='float32')
                * np.asarray(mv_move_weights, dtype='float32'))
@@ -401,7 +415,7 @@ def compute_objective_components(
         if use_normalized:
             lo_term, hi_term = _normalized_bounds(lo_j, hi_j, r_lo, r_hi)
             y_clipped = float(np.clip(y_raw, lo_term, hi_term))
-            term = y_clipped - 0.5
+            term = y_clipped - float(cv_economic_typical[j])
         else:
             y_clipped = float(np.clip(y_raw, lo_j, hi_j))
             term = y_clipped
@@ -457,27 +471,27 @@ def compute_objective_components(
     sat_mode = str(os.environ.get('OBJECTIVE_PENALTY_SAT_MODE', 'tanh')).strip().lower()
     if sat_mode not in ('hard', 'tanh'):
         sat_mode = 'tanh'
-    # ---- Optional violation-rate term (DMC only) ----
-    # ``OBJECTIVE_DMC_VIOLATION_RATE_COEF`` (env) overrides spec key
-    # ``violation_rate_coef`` which overrides the auto-derived value
-    # computed in ``utils.auto_weights.derive_auto_weights`` (a function
-    # of identified median_tau; see that file for the formula).
-    # When the chain yields 0.0 the rate term is disabled.
-    # When > 0 *and* a previous-step per-channel raw violation depth
-    # is supplied, adds a penalty proportional to the growth rate of
-    # the violation depth: r -= coef * sum_j(w_j * max(0, v_t - v_{t-1})).
-    # Inspired by sliding-mode "reaching law" controllers (Slotine &
-    # Li 1991): give the agent a strong incentive to stop the
-    # violation from growing *before* the linear depth term builds
-    # enough magnitude to dominate. One-sided (no bonus for shrinking
-    # violations) so it cannot be exploited by oscillating across a
-    # bound. CV channels use ``max(w_lo, w_hi)`` as the urgency scale
-    # so the asymmetric per-side weights still drive the rate term.
+    # ---- Optional violation-rate (derivative) term ----
+    # Sliding-mode "reaching law" shaping (Slotine & Li 1991): when the
+    # per-channel violation depth is *growing*, add a penalty proportional
+    # to the growth rate so the agent is pushed to arrest the excursion
+    # before the depth term builds enough magnitude to dominate. One-sided
+    # (no bonus for shrinking violations) so it cannot be exploited by
+    # oscillating across a bound. CV channels use ``max(w_lo, w_hi)`` as
+    # the urgency scale so the asymmetric per-side weights still drive it.
+    # Precedence: ``OBJECTIVE_VIOLATION_RATE_COEF`` (env) > spec key
+    # ``violation_rate_coef`` > default ``"auto"``. ON by default: the
+    # default ``"auto"`` resolves to the dynamics-derived
+    # ``auto_violation_rate_coef`` computed in ``utils.auto_weights``.
+    # Opt out by setting the coefficient to ``0`` (env or spec).
     auto_rate_default = float(obj_w.get('auto_violation_rate_coef', 0.0))
-    violation_rate_coef = float(_resolve_cfg(
-        'OBJECTIVE_DMC_VIOLATION_RATE_COEF', 'violation_rate_coef', auto_rate_default))
+    _rate_raw = _resolve_cfg('OBJECTIVE_VIOLATION_RATE_COEF', 'violation_rate_coef', 'auto')
+    if isinstance(_rate_raw, str) and _rate_raw.strip().lower() == 'auto':
+        violation_rate_coef = auto_rate_default
+    else:
+        violation_rate_coef = float(_safe_float(_rate_raw, 0.0))
     violation_rate_penalty = 0.0
-    if (is_dmc and violation_rate_coef > 0.0
+    if (violation_rate_coef > 0.0
             and prev_cv_violation_per_channel is not None):
         for j in range(cv_dim):
             prev_v = (float(prev_cv_violation_per_channel[j])
@@ -487,7 +501,7 @@ def compute_objective_components(
             w_lo = float(cv_violation_weights_lo[j])
             w_hi = float(cv_violation_weights_hi[j])
             violation_rate_penalty += violation_rate_coef * max(w_lo, w_hi) * growth
-    if (is_dmc and violation_rate_coef > 0.0
+    if (violation_rate_coef > 0.0
             and prev_mv_violation_per_channel is not None):
         for i in range(mv_dim):
             prev_v = (float(prev_mv_violation_per_channel[i])
@@ -499,12 +513,76 @@ def compute_objective_components(
     violation_rate_penalty = _saturate_one_sided(
         violation_rate_penalty, penalty_clip, sat_mode)
 
+    # ---- Optional integral (accumulated-violation) term ----
+    # PID-style "reset action": penalises SUSTAINED CV limit violation so
+    # a passive policy that parks the CV just outside a limit pays a cost
+    # that grows with dwell time (directly attacks the P74 passivity
+    # attractor).  The accumulator I_t = clip(I_{t-1} + depth_t, 0, windup)
+    # is anti-windup clamped and EXPOSED TO THE AGENT in the observation
+    # (see DreamerEnv._build_obs_vec) so the reward stays Markov and the
+    # world model can predict it.  CV-only (MVs are actuated within
+    # bounds, so they do not drift out and accumulate).
+    # ``OBJECTIVE_INTEGRAL_COEF`` (env) > spec ``integral_coef`` > default.
+    # ON by default (see ``resolve_integral_config`` for the default coef);
+    # opt out by setting the coefficient to ``0`` (env or spec).
+    # Windup cap: ``OBJECTIVE_INTEGRAL_WINDUP`` > spec ``integral_windup``
+    # > 5.0.  ``prev_integral_cv_per_channel`` carries I_{t-1} (owned and
+    # reset per-episode by the env); the updated I_t is returned for the
+    # env to store + expose next step.
+    _intg_enabled, integral_coef, integral_windup = resolve_integral_config(objective_spec)
+    integral_cv_per_channel = [0.0] * cv_dim
+    integral_penalty = 0.0
+    if integral_coef > 0.0:
+        for j in range(cv_dim):
+            prev_I = (float(prev_integral_cv_per_channel[j])
+                      if (prev_integral_cv_per_channel is not None
+                          and j < len(prev_integral_cv_per_channel)) else 0.0)
+            depth = (cv_violation_per_channel_raw[j]
+                     if j < len(cv_violation_per_channel_raw) else 0.0)
+            I_t = float(np.clip(prev_I + depth, 0.0, integral_windup))
+            integral_cv_per_channel[j] = I_t
+            w_lo = float(cv_violation_weights_lo[j])
+            w_hi = float(cv_violation_weights_hi[j])
+            integral_penalty += integral_coef * max(w_lo, w_hi) * I_t
+    else:
+        # Pass through the previous accumulator unchanged when the term is
+        # off so the env's exposed channel stays well-defined (all-zero).
+        if prev_integral_cv_per_channel is not None:
+            for j in range(min(cv_dim, len(prev_integral_cv_per_channel))):
+                integral_cv_per_channel[j] = float(prev_integral_cv_per_channel[j])
+    integral_penalty = _saturate_one_sided(integral_penalty, penalty_clip, sat_mode)
+
     # In-band test (uses pre-saturation violations to avoid false
     # positives from tanh tail).
     in_band = (
         (sum(mv_violation_per_channel) + sum(cv_violation_per_channel))
         <= 1e-9
     )
+
+    # ---- Feasibility gate (priority hierarchy, no toggle) ----
+    # When the agent is outside ANY limit, exponentially suppress the
+    # "optimisation" penalties (economic / target / move) so the only
+    # active gradients are the limit-handling terms: violations plus the
+    # derivative (reaching) and integral (dwell) terms. This makes the
+    # MV/CV-limits > targets > economics ladder unconditional without a
+    # reward-mode switch. ``feasibility = exp(-min(V, cap) / scale)`` with
+    # ``V`` the summed pre-saturation quadratic violation depth across all
+    # MV+CV channels; ``feasibility -> 1`` in-band and ``-> 0`` as the
+    # excursion grows. ``cap`` bounds the argument so a huge excursion does
+    # not underflow before the gate has fully closed.
+    feas_cap = max(0.0, float(os.environ.get('OBJECTIVE_FEASIBILITY_CAP', '4.0')))
+    feas_scale = max(1e-6, float(os.environ.get('OBJECTIVE_FEASIBILITY_SCALE', '0.08')))
+    total_violation_norm = float(
+        sum(mv_violation_per_channel) + sum(cv_violation_per_channel))
+    feasibility = float(np.exp(-min(total_violation_norm, feas_cap) / feas_scale))
+    # Apply the gate BEFORE saturation so the suppression acts on the raw
+    # penalty magnitude (not the tanh-compressed value).
+    mv_economic_penalty *= feasibility
+    cv_economic_penalty *= feasibility
+    mv_target_penalty *= feasibility
+    cv_target_penalty *= feasibility
+    mv_move_penalty *= feasibility
+    movement_term *= feasibility
 
     mv_violation_penalty = _saturate_one_sided(mv_violation_penalty, penalty_clip, sat_mode)
     cv_violation_penalty = _saturate_one_sided(cv_violation_penalty, penalty_clip, sat_mode)
@@ -522,6 +600,7 @@ def compute_objective_components(
     reward -= cv_target_penalty
     reward -= mv_move_penalty
     reward -= violation_rate_penalty
+    reward -= integral_penalty
     reward -= _safe_float(obj_w.get('movement', 0.0), 0.0) * movement_term
     if 'cv_violation' in obj_w:
         reward -= _safe_float(obj_w.get('cv_violation', 0.0), 0.0) * _saturate_one_sided(cv_penalty, penalty_clip, sat_mode)
@@ -529,14 +608,6 @@ def compute_objective_components(
     # Economic terms (always subtracted; sign convention encoded in weights).
     reward -= mv_economic_penalty
     reward -= cv_economic_penalty
-
-    # DMC in-band bonus (P57): constant positive reward when feasible.
-    # Anchors the positive half of the symlog-twohot support so the
-    # critic doesn't collapse onto an all-negative distribution.
-    inband_bonus_applied = 0.0
-    if is_dmc and in_band:
-        inband_bonus_applied = DMC_INBAND_BONUS
-        reward += inband_bonus_applied
 
     reward = _saturate_two_sided(reward, reward_clip, sat_mode)
 
@@ -552,15 +623,22 @@ def compute_objective_components(
         'cv_violation_penalty': float(cv_violation_penalty),
         'cv_violation_weights_lo': [float(x) for x in cv_violation_weights_lo],
         'cv_violation_weights_hi': [float(x) for x in cv_violation_weights_hi],
-        'reward_mode': str(reward_mode),
+        'reward_mode': 'legacy',
+        'feasibility': float(feasibility),
+        'total_violation_norm': float(total_violation_norm),
         'violation_rate_coef': float(violation_rate_coef),
         'violation_rate_penalty': float(violation_rate_penalty),
+        'integral_coef': float(integral_coef),
+        'integral_cv_per_channel': [float(x) for x in integral_cv_per_channel],
+        'integral_penalty': float(integral_penalty),
         'mv_economic_terms': [float(x) for x in mv_economic_terms],
         'cv_economic_terms': [float(x) for x in cv_economic_terms],
+        'mv_economic_typical': [float(x) for x in mv_economic_typical],
+        'cv_economic_typical': [float(x) for x in cv_economic_typical],
         'mv_economic_penalty': float(mv_economic_penalty),
         'cv_economic_penalty': float(cv_economic_penalty),
         'in_band': bool(in_band),
-        'in_band_bonus': float(inband_bonus_applied),
+        'in_band_bonus': 0.0,
         'mv_target_terms': [float(x) for x in mv_target_terms],
         'cv_target_terms': [float(x) for x in cv_target_terms],
         'mv_target_penalty': float(mv_target_penalty),

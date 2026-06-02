@@ -76,7 +76,6 @@ import numpy as np
 # informative without spamming.
 _ADVISORY_WARNED: Dict[str, bool] = {
     'cv_base_exceeds': False,
-    'dmc_rescale': False,
 }
 
 
@@ -134,8 +133,9 @@ def _cv_rank_order_side(spec: Dict, n_cv: int, side: str) -> List[int]:
     safety CV) without changing the legacy ``cv_priority`` schema. The
     derived ``cv_violation_weights_lo`` / ``cv_violation_weights_hi``
     are consumed by ``utils.objective_runtime.compute_objective_components``
-    when ``OBJECTIVE_REWARD_MODE=dmc`` (linear) and produce a true
-    asymmetric penalty: ``w_lo * max(0, lo - x) + w_hi * max(0, x - hi)``.
+    as the urgency scale (``max(w_lo, w_hi)``) of the optional derivative
+    and integral shaping terms.  The base quadratic CV violation penalty
+    uses the symmetric ``cv_violation_weights``.
     """
     if not isinstance(spec, dict):
         return _cv_rank_order_from_list(None, n_cv)
@@ -205,6 +205,73 @@ def _sum_abs_weights(weights_section: Dict, key: str) -> float:
     if isinstance(sub, (list, tuple)):
         return float(sum(abs(_safe_float(v, 0.0)) for v in sub))
     return 0.0
+
+
+def _per_channel_abs_weights(weights_section: Dict, key: str, n: int,
+                             prefix: str) -> List[float]:
+    """Per-channel absolute weights (length ``n``) under ``weights[key]``.
+
+    Like :func:`_sum_abs_weights` but keeps the per-channel resolution so
+    the caller can pair each weight with that channel's economic typical
+    point.  Accepts dict-of-channels (``{"mv_0": 5.0}``) or list form.
+    """
+    out = [0.0] * n
+    if not isinstance(weights_section, dict):
+        return out
+    sub = weights_section.get(key)
+    if isinstance(sub, dict):
+        for k, v in sub.items():
+            try:
+                idx = int(str(k).lower().replace(f'{prefix}_', ''))
+            except Exception:
+                continue
+            if 0 <= idx < n:
+                out[idx] = abs(_safe_float(v, 0.0))
+    elif isinstance(sub, (list, tuple)):
+        for i, v in enumerate(sub):
+            if i < n:
+                out[i] = abs(_safe_float(v, 0.0))
+    return out
+
+
+def resolve_econ_typical(spec: Optional[Dict], n_mv: int,
+                         n_cv: int) -> Tuple[List[float], List[float]]:
+    """Resolve the per-channel economic *typical* operating point.
+
+    Returns ``(mv_typical, cv_typical)`` as normalised [0, 1] lists.  The
+    economic term measures deviation from this point (``x_norm - typical``)
+    rather than from the range midpoint.  Read from
+    ``spec['weights']['mv_economic_typical']`` /
+    ``['cv_economic_typical']`` (list or named-dict form); absent entries
+    default to ``0.5`` (midpoint), which reduces the economic term to the
+    historical ``x_norm - 0.5`` behaviour.  Shared single source of truth
+    for both the reward engine (which applies the offset) and the adaptive
+    weight derivation (which sizes the economic budget against it).
+    """
+    weights_section: Dict = {}
+    if isinstance(spec, dict):
+        w = spec.get('weights')
+        if isinstance(w, dict):
+            weights_section = w
+
+    def _vec(key: str, prefix: str, n: int) -> List[float]:
+        out = [0.5] * n
+        raw = weights_section.get(key)
+        if isinstance(raw, list):
+            for i in range(min(n, len(raw))):
+                out[i] = float(np.clip(_safe_float(raw[i], 0.5), 0.0, 1.0))
+        elif isinstance(raw, dict):
+            for k, v in raw.items():
+                try:
+                    idx = int(str(k).lower().replace(f'{prefix}_', ''))
+                except Exception:
+                    continue
+                if 0 <= idx < n:
+                    out[idx] = float(np.clip(_safe_float(v, 0.5), 0.0, 1.0))
+        return out
+
+    return _vec('mv_economic_typical', 'mv', n_mv), _vec('cv_economic_typical', 'cv', n_cv)
+
 
 
 def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
@@ -326,10 +393,20 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
 
     mv_econ_total = _sum_abs_weights(weights_section, 'mv_economic')
     cv_econ_total = _sum_abs_weights(weights_section, 'cv_economic')
-    # Max per-step economic benefit: pushing a normalised channel from one
-    # bound to the other yields |x_clipped - 0.5| up to 0.5 per unit
-    # weight. Economic is now clipped to bounds so this is a hard cap.
-    econ_budget = 0.5 * (mv_econ_total + cv_econ_total)
+    # Max per-step economic benefit, sized against the economic *typical*
+    # operating point. The economic term measures ``x_norm - typical`` and
+    # x_norm is clipped to [0, 1], so the worst-case deviation a channel
+    # can contribute is ``max(typical, 1 - typical)`` per unit weight
+    # (= 0.5 only at the midpoint). Summed per-channel against the same
+    # typical the reward engine uses (shared ``resolve_econ_typical``) so
+    # the priority ladder stays consistent with the realised reward.
+    mv_econ_pc = _per_channel_abs_weights(weights_section, 'mv_economic', n_mv, 'mv')
+    cv_econ_pc = _per_channel_abs_weights(weights_section, 'cv_economic', n_cv, 'cv')
+    mv_econ_typ, cv_econ_typ = resolve_econ_typical(spec, n_mv, n_cv)
+    econ_budget = (
+        sum(max(t, 1.0 - t) * w for t, w in zip(mv_econ_typ, mv_econ_pc))
+        + sum(max(t, 1.0 - t) * w for t, w in zip(cv_econ_typ, cv_econ_pc))
+    )
 
     # Which targets are actually active? Only channels flagged in
     # runtime_setpoints.targets_enabled contribute to the target budget.
@@ -397,45 +474,6 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # Enforce priority #1: MV limits dominate CV limits by construction.
     mv_base = float(max(mv_base_floor_quadratic, mv_over_cv_ratio * cv_base))
 
-    # ---- DMC reward-mode rescaling (2026-05-26, refactored 2026-05-27) ----
-    # ``cv_base`` / ``mv_base`` are sized for the QUADRATIC (legacy) shape
-    # so that at ``tolerance`` depth the penalty meets the priority
-    # hierarchy:
-    #     cv_base · tolerance² · rank_decay^(N-1)  =  margin · priority_budget
-    # Under the LINEAR (DMC) shape, matching the same penalty magnitude
-    # at the same design depth requires:
-    #     cv_base_dmc · tolerance  =  cv_base_legacy · tolerance²
-    # i.e. cv_base_dmc = cv_base_legacy · tolerance.
-    # The DMC scale is therefore identical to ``tolerance`` by
-    # construction — no separate knob. Override ``tolerance`` itself
-    # (via ``OBJ_AUTO_VIOLATION_TOLERANCE``) if you want a different
-    # design depth. MV/CV ratio and economics priority are preserved
-    # because both bases scale by the same factor.
-    reward_mode_spec = ''
-    if isinstance(spec, dict):
-        reward_mode_spec = str(spec.get('reward_mode', '') or '').strip().lower()
-    reward_mode_env = str(os.environ.get('OBJECTIVE_REWARD_MODE', '') or '').strip().lower()
-    effective_reward_mode = reward_mode_env or reward_mode_spec or 'legacy'
-    if effective_reward_mode not in ('legacy', 'dmc'):
-        effective_reward_mode = 'legacy'
-    if effective_reward_mode == 'dmc':
-        cv_base = float(cv_base * tolerance)
-        mv_base = float(mv_base * tolerance)
-        if not _ADVISORY_WARNED['dmc_rescale']:
-            _ADVISORY_WARNED['dmc_rescale'] = True
-            try:
-                typ_depth = tolerance
-                cv_pen_typ = cv_base * typ_depth
-                mv_pen_typ = mv_base * typ_depth
-                print(
-                    f"[auto_weights] reward_mode=dmc rescale=tolerance={tolerance:.4f}: "
-                    f"cv_base={cv_base:.2f} mv_base={mv_base:.2f}  "
-                    f"penalty@depth={typ_depth:.3f}: cv={cv_pen_typ:.2f} mv={mv_pen_typ:.2f}  "
-                    f"(reward_clip={reward_clip:.0f}; suppressing further repeats)"
-                )
-            except Exception:
-                pass
-
     if dynamics is None:
         dynamics = _load_dynamics_json()
 
@@ -469,9 +507,9 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # ``cv_side_scale`` (explicit per-side multiplier, useful when
     # N_CV == 1 where rank ordering is degenerate). When both keys are
     # absent the per-side weights collapse to ``cv_weights`` (=symmetric,
-    # legacy behaviour). Consumed by ``OBJECTIVE_REWARD_MODE=dmc`` in
-    # ``objective_runtime.py``; legacy mode keeps using the symmetric
-    # ``cv_violation_weights`` so checkpoint calibrations remain valid.
+    # legacy behaviour). Consumed by the optional derivative/integral
+    # shaping terms in ``objective_runtime.py`` as the urgency scale; the
+    # base quadratic CV penalty uses the symmetric ``cv_violation_weights``.
     cv_weights_lo = [
         float(cv_base * (rank_decay ** max(0, r - 1)) * _side_scale(j, 'lo'))
         for j, r in enumerate(ranks_lo)
@@ -522,14 +560,16 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # Trade-off: slow plants benefit more from anticipatory penalty
     # (many sample periods to recover), fast plants need less (the
     # static linear penalty alone reacts in time). The quadratic MV
-    # move penalty in DMC mode already handles anti-jitter, so coef
+    # move penalty already handles anti-jitter, so coef
     # can be moderately aggressive without inducing chatter.
     # Formula: coef = clip(median_tau / 4, 0.3, 1.5).
     # Override via env ``OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR`` (default 4),
     # ``OBJ_AUTO_VIOLATION_RATE_COEF_MIN`` (default 0.3),
     # ``OBJ_AUTO_VIOLATION_RATE_COEF_MAX`` (default 1.5).
-    # Hard override via env ``OBJECTIVE_DMC_VIOLATION_RATE_COEF`` or
-    # spec key ``violation_rate_coef`` (consumed in objective_runtime.py).
+    # Hard override via env ``OBJECTIVE_VIOLATION_RATE_COEF`` (canonical)
+    # or spec key ``violation_rate_coef`` (consumed in
+    # objective_runtime.py). This auto value is the default and is used
+    # whenever that knob is unset or set to ``"auto"``.
     rate_div = max(0.5, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR', 4.0))
     rate_min = max(0.0, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_MIN', 0.3))
     rate_max = max(rate_min, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_MAX', 1.5))

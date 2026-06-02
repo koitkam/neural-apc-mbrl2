@@ -48,6 +48,15 @@ def _safe_float(v: Any, d: float) -> float:
         return float(d)
 
 
+def _clip01(v: Any, d: float = 0.5) -> float:
+    x = _safe_float(v, d)
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
 def _load_file_config() -> Dict[str, Any]:
     path = os.environ.get('CONTROL_OBJECTIVE_JSON', '')
     if not path:
@@ -178,6 +187,13 @@ def _coerce_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     mv_econ = _coerce_named_scalar(w_in.get('mv_economic') or w_in.get('mv_economic_weights') or {}, 'mv')
     cv_econ = _coerce_named_scalar(w_in.get('cv_economic') or w_in.get('cv_economic_weights') or {}, 'cv')
+    # Typical (design) operating point for the economic term, normalised
+    # to [0, 1] of each channel's range. The economic nudge measures
+    # deviation from this point (``x_norm - typical``) instead of from the
+    # range midpoint. Absent keys default to 0.5 (midpoint) so the term
+    # reduces to the historical ``x_norm - 0.5`` behaviour.
+    mv_econ_typ = _coerce_named_scalar(w_in.get('mv_economic_typical') or {}, 'mv')
+    cv_econ_typ = _coerce_named_scalar(w_in.get('cv_economic_typical') or {}, 'cv')
 
     rs_in = spec.get('runtime_setpoints') or {}
     default_rs = _default_spec()['runtime_setpoints']
@@ -204,6 +220,8 @@ def _coerce_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
             'cv_economic': cv_econ,
             'mv_economic_weights': [mv_econ.get(f'mv_{i}', 0.0) for i in range(n_mv)],
             'cv_economic_weights': [cv_econ.get(f'cv_{i}', 0.0) for i in range(n_cv)],
+            'mv_economic_typical': [_clip01(mv_econ_typ.get(f'mv_{i}', 0.5)) for i in range(n_mv)],
+            'cv_economic_typical': [_clip01(cv_econ_typ.get(f'cv_{i}', 0.5)) for i in range(n_cv)],
             'mv_target_values': [mv_targets.get(f'mv_{i}', 0.0) for i in range(n_mv)],
             'cv_target_values': [cv_targets.get(f'cv_{i}', 0.0) for i in range(n_cv)],
             'mv_target_weights': [0.0 for _ in range(n_mv)],

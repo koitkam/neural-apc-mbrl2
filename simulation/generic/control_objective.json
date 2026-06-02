@@ -2,7 +2,6 @@
     "model": "generic_control_example",
     "description": "Generic objective template for any simulator using MV/CV index mappings from CONTROL_SETUP_JSON. Violation/move weights are auto-derived.",
     "objective_use_normalized": 1,
-    "reward_mode": "legacy",
     "bounds": {
         "mvs": {
             "mv_0": [

@@ -909,15 +909,28 @@ class APCEnv:
                 ),
             )
             self.aug_obs_dim += int(self._derived_features.feat_dim)
+        # ---- Integral (accumulated-violation) observation channel -------
+        # When the integral reward term is enabled (OBJECTIVE_INTEGRAL_COEF
+        # > 0 or spec ``integral_coef``), expose the per-CV anti-windup
+        # accumulator to the agent + WM so the otherwise non-Markov
+        # integral penalty stays predictable (state augmentation).  The
+        # accumulator is normalised by the windup cap to [0, 1].  CV-only.
+        from utils.objective_runtime import resolve_integral_config
+        self._integral_enabled, _intg_coef, self._integral_windup = \
+            resolve_integral_config(self.obj_spec)
+        n_cv_intg = int(len(self.cv_indices))
+        self._integral_cv = np.zeros(n_cv_intg, dtype='float32')
+        if self._integral_enabled:
+            self.aug_obs_dim += n_cv_intg
         self.obs_dim = self.state_dim + self.aug_obs_dim
 
         self._window: Optional[np.ndarray] = None
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
         # Previous-step raw per-channel violation depth (lo_viol+hi_viol),
-        # consumed by ``compute_objective_components`` for the DMC
-        # ``OBJECTIVE_DMC_VIOLATION_RATE_COEF`` term.  ``None`` on the
-        # first step of an episode (rate term skipped that step).
+        # consumed by ``compute_objective_components`` for the optional
+        # derivative (violation-rate) term.  ``None`` on the first step of
+        # an episode (rate term skipped that step).
         self._prev_mv_violation_per_channel: Optional[list] = None
         self._prev_cv_violation_per_channel: Optional[list] = None
         self._schedule: List[Dict] = []
@@ -1095,6 +1108,13 @@ class APCEnv:
                                  dtype='float64')
             self._derived_features.update(cv_now, sp_now)
             parts.append(self._derived_features.features())
+        if self._integral_enabled:
+            # Anti-windup accumulator normalised to [0, 1] by the windup cap
+            # so it sits on the same scale as the other augmented channels.
+            cap = max(1e-6, float(self._integral_windup))
+            parts.append(np.clip(
+                np.asarray(self._integral_cv, dtype='float32') / cap,
+                0.0, 1.0).reshape(-1))
         raw = np.concatenate(parts, axis=0).astype('float32')
         if self._obs_norm_learn:
             self._update_obs_norm(raw)
@@ -1109,6 +1129,7 @@ class APCEnv:
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
         self._prev_mv_violation_per_channel = None
         self._prev_cv_violation_per_channel = None
+        self._integral_cv = np.zeros_like(self._integral_cv)
         self._last_cv_violation_sum = 0.0
         self._last_mv_violation_sum = 0.0
         self._prev_potential = None
@@ -1227,6 +1248,7 @@ class APCEnv:
             objective_spec=self.obj_spec,
             prev_mv_violation_per_channel=self._prev_mv_violation_per_channel,
             prev_cv_violation_per_channel=self._prev_cv_violation_per_channel,
+            prev_integral_cv_per_channel=self._integral_cv,
         )
         raw_reward = float(comps['reward'])
         # Apply raw clip BEFORE scaling so calibration (which percentile-
@@ -1280,11 +1302,18 @@ class APCEnv:
                 reward = float(np.clip(reward, -b, b))
         self._prev_control = np.asarray(control, dtype='float32')
         # Stash raw per-channel violation depths for next step's
-        # DMC rate term (legacy mode ignores them).
+        # derivative (violation-rate) term (off unless its coef > 0).
         self._prev_mv_violation_per_channel = list(
             comps.get('mv_violation_per_channel_raw', []) or [])
         self._prev_cv_violation_per_channel = list(
             comps.get('cv_violation_per_channel_raw', []) or [])
+        # Update the integral accumulator from the reward engine's
+        # anti-windup-clamped value BEFORE building the obs so the agent
+        # observes I_t (state augmentation keeps the integral Markov).
+        if self._integral_enabled:
+            intg = comps.get('integral_cv_per_channel', None)
+            if intg is not None:
+                self._integral_cv = np.asarray(intg, dtype='float32').reshape(-1)
         self._t += 1
         done = self._t >= self.cfg.episode_length
         obs_vec = self._build_obs_vec(next_state)
