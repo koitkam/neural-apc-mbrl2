@@ -225,6 +225,34 @@ def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
     return (coef > 0.0, coef, windup)
 
 
+def resolve_integral_leak(objective_spec=None) -> float:
+    """Resolve the in-band leak (bleed-off) factor for the integral
+    accumulator.
+
+    Anti-windup recovery: while a CV is actively violating its limit the
+    accumulator integrates the violation depth in full (no leak — the
+    sustained-violation pressure that defeats the passivity attractor is
+    preserved).  Once the CV returns *in-band* (depth == 0) the accumulator
+    is multiplied by this leak factor every step, so a transient excursion
+    bleeds off exponentially (~``1/(1 - leak)`` step memory) instead of
+    permanently taxing the rest of the episode.  This restores a positive
+    "recovery" gradient for clearing a violation.
+
+    Precedence: env ``OBJECTIVE_INTEGRAL_LEAK`` > spec ``integral_leak`` >
+    default 0.98 (~50-step recovery memory).  Clamped to ``(0, 1]``; a
+    value of 1.0 disables the leak (legacy hold-forever behaviour).
+    """
+    spec = objective_spec if isinstance(objective_spec, dict) else {}
+    raw = os.environ.get('OBJECTIVE_INTEGRAL_LEAK')
+    if raw is None or str(raw).strip() == '':
+        raw = spec.get('integral_leak') if 'integral_leak' in spec else 0.98
+    leak = float(_safe_float(raw, 0.98))
+    if leak <= 0.0:
+        leak = 0.98
+    return float(min(1.0, leak))
+
+
+
 def _shaping_linear_equiv_scale() -> float:
     """Quadratic→linear conversion scale for the integral / derivative
     shaping terms.
@@ -586,6 +614,7 @@ def compute_objective_components(
     # reset per-episode by the env); the updated I_t is returned for the
     # env to store + expose next step.
     _intg_enabled, integral_coef, integral_windup = resolve_integral_config(objective_spec)
+    integral_leak = resolve_integral_leak(objective_spec)
     integral_cv_per_channel = [0.0] * cv_dim
     integral_penalty = 0.0
     if integral_coef > 0.0:
@@ -595,7 +624,16 @@ def compute_objective_components(
                           and j < len(prev_integral_cv_per_channel)) else 0.0)
             depth = (cv_violation_per_channel_raw[j]
                      if j < len(cv_violation_per_channel_raw) else 0.0)
-            I_t = float(np.clip(prev_I + depth, 0.0, integral_windup))
+            if depth > 0.0:
+                # Active violation: integrate depth in full (no leak) so the
+                # sustained-violation pressure that defeats the passivity
+                # attractor is preserved.
+                I_t = float(np.clip(prev_I + depth, 0.0, integral_windup))
+            else:
+                # In-band: bleed the accumulator off so a transient excursion
+                # recovers (~1/(1-leak) step memory) instead of permanently
+                # taxing the episode — restores a recovery gradient.
+                I_t = float(np.clip(prev_I * integral_leak, 0.0, integral_windup))
             integral_cv_per_channel[j] = I_t
             w_lo = float(cv_violation_weights_lo[j])
             w_hi = float(cv_violation_weights_hi[j])
