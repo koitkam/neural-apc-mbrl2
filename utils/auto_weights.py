@@ -243,10 +243,17 @@ def _band_mid_normalized(lo: float, hi: float,
     when the band spans the full normalisation range symmetrically; for the
     usual case where the identifier range is wider than the operating band
     it lands on the band centre, *not* the range midpoint.
+
+    The band edges are first clamped into ``[r_lo, r_hi]`` so degenerate
+    sentinel bounds (e.g. the ``±1e12`` fallback emitted when no operating
+    band is available) collapse to the full normalisation range and hence
+    to ``0.5`` -- a safe, neutral typical -- instead of clipping to 0/1.
     """
     rng = max(1e-6, float(r_hi) - float(r_lo))
-    lo_n = (float(lo) - float(r_lo)) / rng
-    hi_n = (float(hi) - float(r_lo)) / rng
+    lo_c = min(max(float(lo), float(r_lo)), float(r_hi))
+    hi_c = min(max(float(hi), float(r_lo)), float(r_hi))
+    lo_n = (lo_c - float(r_lo)) / rng
+    hi_n = (hi_c - float(r_lo)) / rng
     return float(np.clip(0.5 * (lo_n + hi_n), 0.0, 1.0))
 
 
