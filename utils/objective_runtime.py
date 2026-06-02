@@ -225,6 +225,34 @@ def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
     return (coef > 0.0, coef, windup)
 
 
+def _shaping_linear_equiv_scale() -> float:
+    """Quadratic→linear conversion scale for the integral / derivative
+    shaping terms.
+
+    The per-channel CV/MV violation weights (``cv_violation_base`` etc.)
+    are sized for the **quadratic** instantaneous penalty ``w·depth²`` and
+    are therefore very large (``base ≈ floor/tolerance``), so they dominate
+    everything below them *at the tolerance-magnitude violation*.  The
+    integral (accumulated depth ``I_t``) and derivative (depth growth) terms
+    are **linear** in depth, so multiplying that quadratically-sized weight
+    by a linear accumulator over-scales by ~``1/tolerance`` and pegs the
+    penalty clip after a trivial dwell (e.g. ``I_t≈0.08`` here), turning the
+    shaping term into an on/off cliff instead of a gradient.
+
+    Rescaling the derived weight by the violation ``tolerance`` yields the
+    **linear-equivalent** weight (``w·tolerance``): the shaping penalty then
+    matches the quadratic base penalty exactly at a tolerance-magnitude
+    violation and stays strictly bounded below it for smaller dwells,
+    restoring a usable gradient.  Adaptive: it scales with the per-channel
+    derived CV/MV violation weight.  Mirrors ``OBJ_AUTO_VIOLATION_TOLERANCE``
+    (default 0.02).
+    """
+    try:
+        return max(1e-4, float(os.environ.get('OBJ_AUTO_VIOLATION_TOLERANCE', 0.02)))
+    except Exception:
+        return 0.02
+
+
 def compute_objective_components(
     state,
     sim,
@@ -510,6 +538,10 @@ def compute_objective_components(
     else:
         violation_rate_coef = float(_safe_float(_rate_raw, 0.0))
     violation_rate_penalty = 0.0
+    # Quadratic→linear conversion scale shared by the derivative (rate) and
+    # integral shaping terms below; keeps their linear-in-depth penalties
+    # bounded below the quadratic base penalty (prevents the dwell cliff).
+    _shaping_lin = _shaping_linear_equiv_scale()
     if (violation_rate_coef > 0.0
             and prev_cv_violation_per_channel is not None):
         for j in range(cv_dim):
@@ -519,7 +551,11 @@ def compute_objective_components(
             growth = max(0.0, cur_v - prev_v)
             w_lo = float(cv_violation_weights_lo[j])
             w_hi = float(cv_violation_weights_hi[j])
-            violation_rate_penalty += violation_rate_coef * max(w_lo, w_hi) * growth
+            # Linear-equivalent shaping weight (quadratic base × tolerance):
+            # the rate term is linear in depth-growth, so size it against the
+            # same tolerance-magnitude reference as the integral term.
+            w_rate = max(w_lo, w_hi) * _shaping_lin
+            violation_rate_penalty += violation_rate_coef * w_rate * growth
     if (violation_rate_coef > 0.0
             and prev_mv_violation_per_channel is not None):
         for i in range(mv_dim):
@@ -527,8 +563,9 @@ def compute_objective_components(
                       if i < len(prev_mv_violation_per_channel) else 0.0)
             cur_v = mv_violation_per_channel_raw[i]
             growth = max(0.0, cur_v - prev_v)
+            w_rate_mv = float(mv_violation_weights[i]) * _shaping_lin
             violation_rate_penalty += (
-                violation_rate_coef * float(mv_violation_weights[i]) * growth)
+                violation_rate_coef * w_rate_mv * growth)
     violation_rate_penalty = _saturate_one_sided(
         violation_rate_penalty, penalty_clip, sat_mode)
 
@@ -562,7 +599,11 @@ def compute_objective_components(
             integral_cv_per_channel[j] = I_t
             w_lo = float(cv_violation_weights_lo[j])
             w_hi = float(cv_violation_weights_hi[j])
-            integral_penalty += integral_coef * max(w_lo, w_hi) * I_t
+            # Linear-equivalent shaping weight (quadratic base × tolerance):
+            # keeps the accumulated-dwell penalty bounded below the quadratic
+            # base penalty and proportional to the derived CV urgency.
+            w_int = max(w_lo, w_hi) * _shaping_lin
+            integral_penalty += integral_coef * w_int * I_t
     else:
         # Pass through the previous accumulator unchanged when the term is
         # off so the env's exposed channel stays well-defined (all-zero).
