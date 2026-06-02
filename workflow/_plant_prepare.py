@@ -324,8 +324,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # P73 (2026-05-31): bounded training reward (cascade root-cause fix).
     # symlog-squash per-step training reward into [-B,B] so imagined returns
     # stay bounded and return_scale cannot run away.  Sim-agnostic.
+    # P77: bounded path is now a scale-invariant linear remap
+    # reward = clip(raw * B/reward_clip_ref, -B, B); _REF is the fallback
+    # reward_clip_ref when objective_runtime does not expose one.
     'DREAMER_BOUND_TRAINING_REWARD':      ('bound_training_reward',          _as_bool),
     'DREAMER_BOUND_TRAINING_REWARD_MAX':  ('bound_training_reward_max',      float),
+    'DREAMER_BOUND_TRAINING_REWARD_REF':  ('bound_training_reward_ref',      float),
     # P74 (2026-05-31): advantage clip (smooths actor grad -> less MV chatter).
     'DREAMER_ADVANTAGE_CLIP':             ('advantage_clip',                 float),
 }

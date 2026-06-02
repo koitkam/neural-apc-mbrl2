@@ -86,6 +86,66 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+# --- Reward-shape / weight-magnitude reconciliation -----------------------
+# The CV/MV violation penalties are QUADRATIC in the normalised bound-
+# violation depth: ``penalty = base * depth²``. The reward path saturates
+# each penalty term at ``penalty_clip`` (and the final reward at
+# ``reward_clip``). A FIXED clip therefore makes the *differentiable
+# violation depth* (the depth at which the quadratic reaches the clip and
+# the gradient flattens) depend on ``base``:
+#
+#     d_sat = sqrt(clip / base)
+#
+# Because ``base = margin * priority_budget / tolerance²`` grows with the
+# user's economic / priority budget, a fixed clip gives a DIFFERENT (and
+# for large-econ sims, vanishingly small) differentiable range per
+# simulator — the saturation cliff that pinned P76's actor at the bounds.
+#
+# Reconciliation: make the clip ADAPTIVE so the differentiable depth is a
+# CONSTANT fraction of normalised range (``OBJ_AUTO_DIFFERENTIABLE_DEPTH``)
+# across every simulator and every economic configuration:
+#
+#     clip = max(floor, base * d_diff²)   ⇒   d_sat = max(sqrt(floor/base), d_diff)
+#
+# This preserves the priority hierarchy EXACTLY (the tolerance-region
+# sizing of every weight is untouched) while guaranteeing the reward stays
+# regressable and gives the actor gradient to reduce realistic-magnitude
+# violations. ``d_diff`` is a reward-shape design constant (NOT plant-
+# dependent); only the clip is adaptive, and only through ``base`` which
+# must vary because it encodes the user's economic weights.
+def _differentiable_depth() -> float:
+    """Constant normalised violation depth that must stay below the
+    penalty-saturation cliff (gradient preserved). Design constant, not
+    plant-dependent."""
+    return max(1e-3, _env_float('OBJ_AUTO_DIFFERENTIABLE_DEPTH', 0.20))
+
+
+def _reward_clip_floor() -> float:
+    """Lower bound for the adaptive clip. Equals the historical fixed
+    default so small-weight simulators behave exactly as before."""
+    return max(1e-6, _env_float('OBJ_AUTO_REWARD_CLIP_FLOOR', 50.0))
+
+
+def adaptive_penalty_clip(max_violation_weight: float,
+                          d_diff: Optional[float] = None,
+                          floor: Optional[float] = None) -> float:
+    """Clip that keeps the quadratic violation penalty differentiable up to
+    a violation depth of ``d_diff`` for the largest active violation
+    weight.
+
+    ``max_violation_weight`` is the rank-1 quadratic ``base`` (the largest
+    of the resolved CV/MV violation weights). The returned clip satisfies
+    ``base * d_diff² <= clip`` while never dropping below ``floor`` so
+    low-budget simulators keep the historical scale.
+    """
+    if d_diff is None:
+        d_diff = _differentiable_depth()
+    if floor is None:
+        floor = _reward_clip_floor()
+    w = max(0.0, float(max_violation_weight))
+    return float(max(floor, w * d_diff * d_diff))
+
+
 def _cv_rank_order_from_list(raw, n_cv: int) -> List[int]:
     """Convert a list of CV names (``cv_0``, ``cv_1`` ...) into a per-state-
     index rank list (1 = most important). Missing names get tail ranks.
@@ -511,30 +571,40 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # (MV > CV(by rank) > targets > economics) takes precedence.
     cv_base = cv_base_raw
     cv_base_above_advisory = bool(cv_base > cv_base_advisory + 1e-9)
+    cv_base_capped = False  # legacy field, retained for diagnostics
+    # Enforce priority #1: MV limits dominate CV limits by construction.
+    mv_base = float(max(mv_base_floor_quadratic, mv_over_cv_ratio * cv_base))
+
+    # --- Adaptive reward-shape clip (P77) -------------------------------
+    # Size the penalty/reward saturation clip from the largest active
+    # violation weight so the quadratic stays differentiable up to a
+    # CONSTANT depth ``d_diff`` regardless of how large economics/priority
+    # inflate ``cv_base``. This replaces the soft "advisory cap" notice:
+    # instead of asking the user to raise OBJECTIVE_REWARD_CLIP by hand,
+    # the clip now tracks the weights automatically (single source of
+    # truth: ``adaptive_penalty_clip``). objective_runtime consumes the
+    # same formula so the reward shape and the weights stay aligned.
+    d_diff = _differentiable_depth()
+    max_violation_base = float(max(mv_base, cv_base))
+    adaptive_clip = adaptive_penalty_clip(max_violation_base, d_diff=d_diff)
     if cv_base_above_advisory and not _ADVISORY_WARNED['cv_base_exceeds']:
-        # One-shot: ``derive_auto_weights`` is invoked from
-        # ``compute_objective_components`` on every reward step when
-        # obj_w lacks pre-computed weight vectors, so an unconditional
-        # print here exploded P58's workflow.log to 76 MB / 228 K lines
-        # before the first iter completed.  Module-level guard keeps
-        # the diagnostic informative without spamming.
+        # One-shot guard: ``derive_auto_weights`` runs on every reward step
+        # when obj_w lacks pre-computed weight vectors, so an unconditional
+        # print here exploded P58's workflow.log. Now informational only.
         _ADVISORY_WARNED['cv_base_exceeds'] = True
         try:
             print(
                 f"[auto_weights] cv_violation_base={cv_base:.0f} exceeds the "
-                f"advisory cap {cv_base_advisory:.0f} (=cap_frac*reward_clip/"
-                f"typ_viol²). This is expected when economics or n_cv are "
-                f"large; with tanh saturation the gradient is preserved and "
-                f"the priority hierarchy is maintained. Raise "
-                f"OBJECTIVE_REWARD_CLIP if you need linear differentiation "
-                f"between moderate and severe violations. (suppressing "
-                f"further repeats of this advisory)"
+                f"legacy advisory cap {cv_base_advisory:.0f} (expected with "
+                f"large economics / n_cv). Adaptive reward clip set to "
+                f"{adaptive_clip:.0f} so the quadratic stays differentiable "
+                f"up to depth d_diff={d_diff:.2f} (d_sat_cv="
+                f"{(adaptive_clip / max(cv_base, 1e-9)) ** 0.5:.3f}, d_sat_mv="
+                f"{(adaptive_clip / max(mv_base, 1e-9)) ** 0.5:.3f}). The "
+                f"priority hierarchy is unchanged. (suppressing repeats)"
             )
         except Exception:
             pass
-    cv_base_capped = False  # legacy field, retained for diagnostics
-    # Enforce priority #1: MV limits dominate CV limits by construction.
-    mv_base = float(max(mv_base_floor_quadratic, mv_over_cv_ratio * cv_base))
 
     if dynamics is None:
         dynamics = _load_dynamics_json()
@@ -667,6 +737,11 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         'cv_violation_base_advisory': float(cv_base_advisory),
         'cv_violation_base_above_advisory': bool(cv_base_above_advisory),
         'cv_violation_base_capped': bool(cv_base_capped),
+        'reward_clip_adaptive': float(adaptive_clip),
+        'penalty_clip_adaptive': float(adaptive_clip),
+        'differentiable_depth': float(d_diff),
+        'differentiable_depth_cv': float((adaptive_clip / max(cv_base, 1e-9)) ** 0.5),
+        'differentiable_depth_mv': float((adaptive_clip / max(mv_base, 1e-9)) ** 0.5),
         'cv_tail_rank_factor': float(tail_factor),
         'n_cv_for_tail_guard': int(n_cv_eff),
         'cv_penalty_cap_frac': float(cap_frac),

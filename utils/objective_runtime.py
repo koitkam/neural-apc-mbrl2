@@ -541,8 +541,25 @@ def compute_objective_components(
     energy_term = 0.0
     movement_term = float(np.mean(np.asarray(mv_move_terms, dtype='float32'))) if mv_move_terms else 0.0
 
-    penalty_clip = float(os.environ.get('OBJECTIVE_PENALTY_CLIP', '50.0'))
-    reward_clip = float(os.environ.get('OBJECTIVE_REWARD_CLIP', '50.0'))
+    # ---- Penalty / reward saturation clips (adaptive, reward-shape aware) ----
+    # The clip is sized from the largest active violation weight so the
+    # quadratic penalty stays differentiable up to a CONSTANT normalised
+    # depth ``d_diff`` across every simulator and economic configuration
+    # (see utils.auto_weights.adaptive_penalty_clip). An explicit env
+    # override (OBJECTIVE_PENALTY_CLIP / OBJECTIVE_REWARD_CLIP) always wins
+    # so the user keeps a manual escape hatch.
+    try:
+        from utils.auto_weights import adaptive_penalty_clip as _adaptive_clip
+        _mv_vw = [abs(float(w)) for w in mv_violation_weights]
+        _cv_vw = [abs(float(w)) for w in cv_violation_weights]
+        _max_vw = max(_mv_vw + _cv_vw + [0.0])
+        _clip_auto = _adaptive_clip(_max_vw)
+    except Exception:
+        _clip_auto = 50.0
+    _penalty_env = os.environ.get('OBJECTIVE_PENALTY_CLIP')
+    _reward_env = os.environ.get('OBJECTIVE_REWARD_CLIP')
+    penalty_clip = float(_penalty_env) if _penalty_env is not None else float(_clip_auto)
+    reward_clip = float(_reward_env) if _reward_env is not None else float(_clip_auto)
     sat_mode = str(os.environ.get('OBJECTIVE_PENALTY_SAT_MODE', 'tanh')).strip().lower()
     if sat_mode not in ('hard', 'tanh'):
         sat_mode = 'tanh'
@@ -745,6 +762,13 @@ def compute_objective_components(
         'mv_move_penalty': float(mv_move_penalty),
         'cv_penalty': float(cv_penalty),
         'reward': float(reward),
+        # Econ-derived reward-shape scale (adaptive_penalty_clip output).
+        # ``reward`` is tanh-saturated at ``reward_clip`` so |reward| <=
+        # reward_clip; the training env's bounded-reward path uses this as
+        # the scale-invariant normaliser (reward * B / reward_clip), which
+        # cancels the absolute magnitude of the user's economic weights.
+        'reward_clip': float(reward_clip),
+        'penalty_clip': float(penalty_clip),
         'production_signal': float(production_signal),
         'production_state_index': int(production_idx),
         'cv_penalties': [float(x) for x in cv_violation_per_channel],

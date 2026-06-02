@@ -339,7 +339,14 @@ class TrainConfig:
     # (MV moves, mv_violation 0→1.75) and tamed return_scale runaway 5756×→27×.
     # Set DREAMER_BOUND_TRAINING_REWARD=0 to restore legacy (scaled) reward.
     bound_training_reward: bool = True
-    bound_training_reward_max: float = 1.0
+    # P77: B for the scale-invariant linear remap
+    # ``reward = clip(raw * B/reward_clip_ref, -B, B)``.  Raised 1.0→6.0 so
+    # the per-step reward spans ~12 twohot bins (head resolution) while
+    # imagined returns stay bounded ~B·H (cascade-safe).  See env.step.
+    bound_training_reward_max: float = 6.0
+    # Fallback ``reward_clip_ref`` when objective_runtime does not expose
+    # one (older comps / degenerate weights); matches the adaptive-clip floor.
+    bound_training_reward_ref: float = 50.0
 
     # ---- P74 : advantage clipping (Cursor stabilizer #3) ------------
     # Clamp the normalised advantage ``adv/scale`` into [-clip, +clip] before
@@ -1008,15 +1015,35 @@ class APCEnv:
         self._shaping_gamma: float = float(getattr(cfg, 'gamma', 0.997) or 0.997)
         self._prev_potential: Optional[float] = None
 
-        # ---- P73 : bounded training reward ------------------------------
-        # When enabled, the per-step TRAINING reward is symlog-squashed into
-        # [-B, B] (``reward_scale`` bypassed) so imagined returns stay bounded
-        # and the return_scale percentile cannot run away (cascade root-cause
+        # ---- P73/P77 : bounded training reward --------------------------
+        # When enabled, the per-step TRAINING reward is mapped into [-B, B]
+        # (``reward_scale`` bypassed) so imagined returns stay bounded and
+        # the return_scale percentile cannot run away (cascade root-cause
         # fix).  ``info['raw_reward']`` stays unshaped for validation scoring.
+        #
+        # P77: the mapping is now a SCALE-INVARIANT LINEAR REMAP
+        #   reward = clip(raw * (B / reward_clip_ref), -B, B)
+        # where ``reward_clip_ref`` is the econ-derived adaptive reward clip
+        # exposed by objective_runtime (== max-violation-weight * d_diff²).
+        # Because objective_runtime already tanh-saturates ``raw`` at
+        # reward_clip_ref, |raw| <= reward_clip_ref, so the remap lands in
+        # [-B, B] and the absolute magnitude of the user's economic weights
+        # CANCELS (double the econ weights ⇒ reward_clip_ref doubles ⇒ the
+        # ratio is unchanged).  This replaces the old symlog squash, which
+        # (a) double-symlogged against the twohot head's own symlog and
+        # (b) saturated the actor reward to a near-binary signal whenever
+        # reward_clip_ref was large.  Single symlog now happens only inside
+        # the reward head, restoring head resolution + actor gradient.
         self._bound_reward: bool = bool(
             getattr(cfg, 'bound_training_reward', False))
         self._bound_reward_max: float = float(
-            getattr(cfg, 'bound_training_reward_max', 1.0) or 1.0)
+            getattr(cfg, 'bound_training_reward_max', 6.0) or 6.0)
+        # Fallback reward_clip_ref when a comps dict lacks the field (older
+        # objective_runtime / degenerate weights).  Matches the historical
+        # adaptive-clip floor so small-weight sims behave sensibly.
+        self._bound_reward_ref_fallback: float = float(
+            getattr(cfg, 'bound_training_reward_ref', 50.0) or 50.0)
+        self._bound_reward_ref: float = self._bound_reward_ref_fallback
 
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
@@ -1266,12 +1293,19 @@ class APCEnv:
                 self._reward_clip_warned = True
             raw_reward = clipped
         if self._bound_reward:
-            # P73: symlog-squash the UNSCALED economic reward into [-B, B]
-            # (``reward_scale`` bypassed).  Bounded reward ⇒ bounded imagined
-            # returns ⇒ return_scale cannot run away (cascade root-cause fix).
+            # P77: scale-invariant linear remap of the (already tanh-bounded)
+            # economic reward into [-B, B].  ``reward_clip_ref`` is the
+            # econ-derived adaptive clip from objective_runtime; dividing by
+            # it cancels the absolute magnitude of the user's economic
+            # weights so the actor sees the SAME reward shape across every
+            # simulator and economic configuration.  Single symlog happens
+            # only at the twohot reward head (no double-symlog squash).
             b = self._bound_reward_max
-            reward = float(np.clip(
-                np.sign(raw_reward) * np.log1p(abs(raw_reward)), -b, b))
+            ref = float(comps.get('reward_clip', self._bound_reward_ref))
+            if not np.isfinite(ref) or ref <= 1e-9:
+                ref = self._bound_reward_ref_fallback
+            self._bound_reward_ref = ref
+            reward = float(np.clip(raw_reward * (b / ref), -b, b))
         else:
             reward = raw_reward * float(self.reward_scale)
         # A' : dense potential-based reward shaping (training env only;
@@ -6160,6 +6194,7 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_BOUND_TRAINING_REWARD', 'bound_training_reward',
             lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
         ('DREAMER_BOUND_TRAINING_REWARD_MAX', 'bound_training_reward_max', float),
+        ('DREAMER_BOUND_TRAINING_REWARD_REF', 'bound_training_reward_ref', float),
         # 2026-05-31 (P74): advantage clipping (Cursor stabilizer #3).
         ('DREAMER_ADVANTAGE_CLIP', 'advantage_clip', float),
     ]:
