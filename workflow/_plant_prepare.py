@@ -280,20 +280,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # reward_clip_tail_k docstrings for rationale.
     'DREAMER_REWARD_CLIP_ASYM_THRESHOLD': ('reward_clip_asymmetry_threshold', float),
     'DREAMER_REWARD_CLIP_TAIL_K':         ('reward_clip_tail_k',              float),
-    # P63 (2026-05-28): return-scale growth clamp — dimensionless ratio.
-    # Caps per-update growth of ret_scale; arrests the critic-pessimism
-    # cascade self-amplification (P58b RCA: 12.2× growth in 55 iters).
-    # Set to 0.0 to recover paper-faithful unclamped EMA.
-    'DREAMER_RETURN_SCALE_MAX_STEP_GROWTH': ('return_scale_max_step_growth', float),
-    # P64 (2026-05-28): WM steady-state regulariser knobs (Path B —
-    # WM-first).  Penalises ||z1_hat - z_clean||² at positions where
-    # both action and obs are settled over a K-sample rolling window.
-    # All four are sim-agnostic (unitless / sample-count).  Default
-    # scale 0.0 in code = off; opt-in for explicit WM-fidelity runs.
-    'DREAMER_WM_STEADY_LOSS_SCALE':       ('wm_steady_loss_scale',           float),
-    'DREAMER_WM_STEADY_MIN_RUN_STEPS':    ('wm_steady_min_run_steps',        int),
-    'DREAMER_WM_STEADY_ACTION_EPS':       ('wm_steady_action_eps',           float),
-    'DREAMER_WM_STEADY_SETTLED_EPS':      ('wm_steady_settled_eps',          float),
+    # P79 (2026-06-02): return-scale ABSOLUTE cap — dimensionless (return
+    # units).  Arrests the critic-pessimism cascade runaway once the spread
+    # is implausibly large WITHOUT throttling legitimate early growth (the
+    # P63 growth-rate clamp regressed for that reason).  Set 0.0 to recover
+    # the paper-faithful uncapped EMA.
+    'DREAMER_RETURN_SCALE_ABS_CAP':       ('return_scale_abs_cap',           float),
     # Cascade RCA (2026-05-29): the two corrected anti-cascade fixes.
     # A' — potential-based reward shaping (dense, policy-invariant, same
     # γ; training-only, validation scores on unshaped raw_reward).

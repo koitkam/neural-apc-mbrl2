@@ -263,41 +263,21 @@ class TrainConfig:
     # the asymmetry ratio to roughly 3 — symlog support becomes
     # near-symmetric and the bin distribution recovers.
     reward_clip_tail_k: float = 3.0
-    # ---- Return-scale growth clamp (P58b-RCA, 2026-05-28) ----------
+    # ---- Return-scale absolute cap (P79, 2026-06-02) ---------------
     # The (p95-p05)-spread EMA normaliser at ``DreamerV4.update_return_scale``
     # tracks a monotonically growing spread on the critic-pessimism
     # cascade — critic targets grow → spread grows → next critic step
-    # has even larger targets, runaway feedback.  P58b on test_sim
-    # showed 12.2× growth over 55 P3 iters (424 → 5180), confirmed by
-    # P58b/P59/P60/P61 cascade signatures.  This clamp caps per-update
-    # growth of ``ret_scale`` at ``max_step_growth`` (dimensionless
-    # ratio — sim-agnostic).  Default 0.02 = 2%/iter ≈ 3× over 55 iters
-    # P63 (2026-05-28) tested 0.02/grad-step on test_sim and REGRESSED
-    # (-134997 vs P58b -795).  The clamp throttled the EMA during
-    # legitimate spread growth and made early-iter advantages over-large;
-    # also the per-call semantics interact with phase3_train_steps_per_iter
-    # (25 calls/iter → effective per-iter cap 1.02^25 = 1.64×).  Reverted
-    # default to 0.0 (paper-faithful unclamped EMA).  Opt-in via env var
-    # DREAMER_RETURN_SCALE_MAX_STEP_GROWTH only for explicit experiments.
-    return_scale_max_step_growth: float = 0.0
-    # P64 (2026-05-28) WM steady-state regulariser (Path B — WM-first).
-    # All five post-P58b runs (P58b/P59/P60/P61/P63) show
-    # ``wm_pred_converges_under_zero_action = 0.0`` and
-    # ``wm_pred_converges_under_constant_action = 0.0`` in
-    # ``wm_steady_state_diagnostic.json``: the WM does NOT predict a
-    # steady-state under held actions, so latent rollouts drift over the
-    # 200-step probe horizon.  This direct penalty fires at training
-    # positions where action AND obs are jointly settled (rolling-window
-    # std small) and penalises the magnitude of the predicted single-step
-    # latent change ``||z1_hat - z_clean||²``.  Default scale 0.0 (off);
-    # opt-in via DREAMER_WM_STEADY_LOSS_SCALE.  Thresholds are sim-
-    # agnostic: action in [-1,+1] norm; obs in z-scored unit variance;
-    # window in samples (independent of plant tau).
-    wm_steady_loss_scale: float = 0.0
-    # P65 (2026-05-29): K=32 default; smaller K (16) has half-window
-    # noise floor ~σ_obs/√(K/2) which exceeds reasonable eps_o on test_sim
-    # OU+meas noise (drift floor ~0.25 at K=16 vs 0.18 at K=32).
-    wm_steady_min_run_steps: int = 32
+    # has even larger targets, runaway feedback (P58b: 12.2× over 55
+    # iters; P77: 109× → bootstrap_cascade early-stop, frozen actor).
+    # The per-step GROWTH-RATE clamp tried earlier (P63) REGRESSED
+    # (-134997 vs -795) because it also throttled legitimate early-iter
+    # spread growth.  The working Cursor APC-Dreamer reference instead
+    # uses an ABSOLUTE cap (``max_scale=500`` in its percentile_scale):
+    # it never touches normal growth, only arrests the runaway once the
+    # spread is implausibly large.  Dimensionless (return units) and
+    # sim-agnostic because returns are themselves bounded by the
+    # bounded-reward remap (≈ B·H).  Set 0.0 to disable (uncapped EMA).
+    return_scale_abs_cap: float = 500.0
 
     # ---- A' : dense potential-based reward shaping (P66-RCA, 2026-05-29) ----
     # The economic objective is a one-sided cliff (raw_abs_p95≈38 on the
@@ -403,12 +383,6 @@ class TrainConfig:
     #       policy's own action sampling (TD-MPC2-style deterministic
     #       latent + stochastic action).  Default False = paper-faithful.
     rssm_imag_latent_mode: bool = False
-    wm_steady_action_eps: float = 0.02
-    # P65 (2026-05-29): obs gate is now half-window mean-DRIFT on z-scored
-    # obs (not std), so 0.20 unit means "two halves of the window differ
-    # by < 0.2 z-scored units in any channel" — robust to OU+meas noise
-    # (synthetic σ=0.5 gives ~9% held_frac while rejecting slow drift).
-    wm_steady_settled_eps: float = 0.20
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -2160,10 +2134,6 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
         'kl_loss': kl_loss,
         'wm_total': wm_total,
-        # keep the steady-state keys present (RSSM solves this structurally,
-        # so the explicit regulariser is left inactive).
-        'wm_steady_loss': torch.zeros((), device=feats.device),
-        'wm_steady_held_frac': torch.zeros((), device=feats.device),
     }
     losses.update(kl_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
@@ -2238,47 +2208,6 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'sf_loss': sf_loss,
         'wm_total': cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss,
     }
-    # P64 (2026-05-28) + P65 fix (2026-05-29): WM steady-state regulariser.
-    # At positions where the action has been held (action std over rolling
-    # K+1 window < eps_a) AND the plant has settled (|mean drift between
-    # the two halves of the window| < eps_o on z-scored obs), penalise the
-    # magnitude of the predicted single-step latent change.  Direct loss
-    # pressure on the P38 failure mode (``wm_pred_converges = 0.0``).
-    # ``z_clean`` is detached — only push z1_hat toward zero change, never
-    # the tokenizer onto its own prediction.
-    #
-    # P65 fix: the original gate used obs std < eps_o, but training obs
-    # carry measurement noise (OU + meas, ~0.5 z-scored units) that
-    # exceeds eps_o=0.05 by ~10×, so the mask never fired (P64 had
-    # held_frac=0.0000 for all 198 iters).  Mean-drift between half-
-    # windows is robust to high-frequency noise but still detects
-    # genuine steady state.  The diagnostic's eps_std=0.05 threshold
-    # applies to noise-free WM rollouts and is not comparable to noisy
-    # replay obs.
-    _wm_ss_scale = float(getattr(cfg, 'wm_steady_loss_scale', 0.0))
-    _K_ss = int(getattr(cfg, 'wm_steady_min_run_steps', 16))
-    if _wm_ss_scale > 0.0 and _K_ss >= 2 and (_K_ss + 1) < int(obs_cur.shape[1]):
-        _eps_a = float(getattr(cfg, 'wm_steady_action_eps', 0.02))
-        _eps_o = float(getattr(cfg, 'wm_steady_settled_eps', 0.10))
-        # Rolling (K+1)-window action std (held-action gate).
-        _a_std = act.unfold(1, _K_ss + 1, 1).std(dim=-1).amax(dim=-1)   # (B,T-K)
-        # Rolling (K+1)-window mean-drift on z-scored obs (settled gate,
-        # noise-robust).  Split window in two halves and compare means.
-        _half = (_K_ss + 1) // 2
-        _obs_win = obs_cur.unfold(1, _K_ss + 1, 1)        # (B, T-K, D, K+1)
-        _drift = (_obs_win[..., _half:].mean(dim=-1)
-                  - _obs_win[..., :_half].mean(dim=-1)).abs().amax(dim=-1)
-        _held_mask = ((_a_std < _eps_a) & (_drift < _eps_o)).float()  # (B,T-K)
-        _z_change_sq = (out_clean['z1_hat'] - z_clean.detach()).pow(2).sum(dim=-1)
-        _z_change_at = _z_change_sq[:, _K_ss:]                          # (B,T-K)
-        _denom = _held_mask.sum().clamp_min(1.0)
-        _wm_ss_loss = (_held_mask * _z_change_at).sum() / _denom
-        losses['wm_steady_loss'] = _wm_ss_loss
-        losses['wm_steady_held_frac'] = _held_mask.mean().detach()
-        losses['wm_total'] = losses['wm_total'] + _wm_ss_scale * _wm_ss_loss
-    else:
-        losses['wm_steady_loss'] = torch.zeros((), device=z_clean.device)
-        losses['wm_steady_held_frac'] = torch.zeros((), device=z_clean.device)
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away
     # information" by averaging-out the noise will show var(z) <<
@@ -2529,8 +2458,8 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         adv_raw = target_returns - baseline
         scale = model.update_return_scale(
             target_returns,
-            max_step_growth=float(getattr(
-                cfg, 'return_scale_max_step_growth', 0.0)),
+            abs_cap=float(getattr(
+                cfg, 'return_scale_abs_cap', 500.0)),
         ).clamp_min(1.0)
 
     feat_flat_for_policy = agent_hids_pre.reshape(-1, agent_hids_pre.shape[-1])
@@ -2809,8 +2738,8 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         adv_raw = target_returns - baseline
         scale = model.update_return_scale(
             target_returns,
-            max_step_growth=float(getattr(
-                cfg, 'return_scale_max_step_growth', 0.0)),
+            abs_cap=float(getattr(
+                cfg, 'return_scale_abs_cap', 500.0)),
         ).clamp_min(1.0)
 
     feat_flat = agent_hids.reshape(-1, agent_hids.shape[-1])

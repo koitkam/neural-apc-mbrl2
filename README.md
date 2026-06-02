@@ -388,6 +388,40 @@ early via the `on_iter_end` callback in the trainer.
 | `policy_log_std_max` | log(1.0) | `log(clip(SIGMA_MAX_OVER_SEED × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `SIGMA_MAX_CAP`, `SIGMA_MAX_FLOOR`, `SIGMA_MAX_OVER_SEED` |
 | `policy_log_std_min` | log(0.1) | `log(σ_max / SIGMA_MIN_RATIO_OF_MAX)` (default ratio 2.5) | `SIGMA_MIN_RATIO_OF_MAX` |
 
+## Cascade stabilizers — fixed defaults
+
+These are the **non-adaptive** anti-cascade / anti-runaway defaults. They are
+universal (sim-agnostic) constants, not auto-tuned. Both world-model backbones
+(`rssm` and `sf_transformer`) carry their own copy in each imagination path, and
+`workflow/bo_runner.py` inherits all of them via `TrainConfig()` defaults. Keep
+this table in sync whenever a default changes.
+
+| Knob | Default | Role | Override | Origin |
+|---|---|---|---|---|
+| `bound_training_reward` | `True` | clip per-step training reward to `[-B, B]` after scale-invariant remap (`raw·B/ref`); `info['raw_reward']` stays unshaped for validation | `DREAMER_BOUND_TRAINING_REWARD` | Cursor stabilizer #1 (P73/P77) |
+| `bound_training_reward_max` (`B`) | `6.0` | the bound `B`; dimensionless because `ref` cancels econ magnitude | `DREAMER_BOUND_TRAINING_REWARD_MAX` | P77 (under test at `B=3`, P79) |
+| `bound_training_reward_ref` (`ref`) | `50.0` | econ-derived adaptive clip used to normalize raw reward before bounding | — | P77 |
+| `return_scale_abs_cap` | `500.0` | absolute hard cap on the percentile return_scale EMA (`0` disables); prevents the return-normalization runaway that froze the actor | `DREAMER_RETURN_SCALE_ABS_CAP` | Cursor stabilizer #2 (P79) |
+| `advantage_clip` | `8.0` | clamp normalized advantage to `±clip` before the actor loss | `DREAMER_ADVANTAGE_CLIP` | Cursor stabilizer #3 (P74) |
+| `critic_replay_anchor_coef` | `0.5` | anchors the critic on replayed real returns to resist the pessimistic self-consistent fixed point | — | anti-cascade |
+
+## Disabled / dormant knobs (intentionally off)
+
+Off by design — **not** failed code, but levers we keep wired for a specific
+future use or paper parity. Do **not** delete these without re-checking the
+rationale here.
+
+| Knob | Default | Why off now | When to enable |
+|---|---|---|---|
+| `bc_scale` | `0.0` | Phase-2 policy behaviour-cloning weight. Clones the **logged buffer actions** over the MTP horizon. Our buffer is filled with *uniform-random* P1 exploration, so `bc_scale>0` would clone uniform → uniform `prior_policy` → the P3 PMPO-KL term pins the policy near uniform → collapse. | The day the seed buffer is populated with **expert demonstrations**. This is the exact mechanism for Cursor stabilizer #6 (expert-BC, `actor_bc_coef 0.15–0.18`): seed the trivial `pi_trim` expert (`0.75·mid + 0.25·trim`, computable from the CV/setpoint spec with **no real controller**) into the buffer, then set `bc_scale>0`. **Keep — it is the hook for an identified future port.** |
+| `mae_p_max` | `0.0` | Tokenizer MAE-reconstruction masking prob. MAE is genuine V4 paper §3.1 but is defined for **image** observations; on low-D APC vector obs it collapses the encoder (diagnosed 2026-05-03). | Image / high-D observation plants. **Keep — it is a paper knob.** |
+
+> **Removed knobs** (do not re-add — failed experiments, superseded):
+> `return_scale_max_step_growth` (P63 growth-rate clamp — regressed −134997 vs
+> −795; replaced by `return_scale_abs_cap`) and the `wm_steady_*` regulariser
+> cluster (P64 — superseded structurally by the P68 RSSM held-action fixed
+> point). The `wm_steady_state_diagnostic.py` *tool* is unrelated and retained.
+
 ## Performance notes
 
 - **SDPA attention** (FlashAttention-2 / cuDNN, auto-dispatched) is the

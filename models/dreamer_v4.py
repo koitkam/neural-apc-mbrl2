@@ -1394,19 +1394,20 @@ class DreamerV4(nn.Module):
 
     def update_return_scale(self, returns: torch.Tensor,
                              ema: float = 0.99,
-                             max_step_growth: float = 0.02,
+                             abs_cap: float = 500.0,
                              ) -> torch.Tensor:
-        """EMA of the (p95-p05) return spread, with a per-update growth clamp.
+        """EMA of the (p95-p05) return spread, with an absolute upper cap.
 
-        P58b-RCA fix (2026-05-28): on the critic-pessimism cascade, the
-        EMA tracks a monotonically growing spread (critic targets keep
-        growing → spread keeps growing → critic keeps chasing).  P58b
-        on test_sim showed 12.2× growth over 55 P3 iters (424 → 5180).
-        Clamping the per-update growth to ``max_step_growth`` (default
-        2%/iter ≈ 3× over 55 iters, non-binding over normal multi-
-        thousand-iter learning) arrests the self-amplification while
-        respecting the paper's normalisation principle.  ``max_step_growth=0``
-        recovers the original DreamerV3-faithful behaviour.
+        On the critic-pessimism cascade the EMA tracks a monotonically
+        growing spread (critic targets keep growing → spread keeps
+        growing → critic keeps chasing), which normalises the actor
+        advantage to death (P77: 4→109×, frozen actor).  The earlier
+        per-update GROWTH-RATE clamp (P63) regressed because it also
+        throttled legitimate early growth.  Following the working Cursor
+        APC-Dreamer reference, we instead apply an ABSOLUTE cap
+        (``abs_cap``, default 500): normal growth is untouched and only
+        the implausible runaway is arrested.  ``abs_cap=0`` recovers the
+        original DreamerV3-faithful uncapped behaviour.
         """
         with torch.no_grad():
             r = returns.detach().reshape(-1).float()
@@ -1416,11 +1417,9 @@ class DreamerV4(nn.Module):
                 p05 = torch.quantile(r, 0.05)
                 p95 = torch.quantile(r, 0.95)
                 spread = torch.clamp(p95 - p05, min=1.0)
-            old_scale = self.ret_scale.clone()
             self.ret_scale.mul_(ema).add_((1.0 - ema) * spread)
-            if max_step_growth and max_step_growth > 0.0:
-                growth_cap = old_scale * (1.0 + float(max_step_growth))
-                self.ret_scale.copy_(torch.minimum(self.ret_scale, growth_cap))
+            if abs_cap and abs_cap > 0.0:
+                self.ret_scale.clamp_max_(float(abs_cap))
         return self.ret_scale.clamp_min(1.0)
 
     # ------------------------------------------------------- parameter groups
