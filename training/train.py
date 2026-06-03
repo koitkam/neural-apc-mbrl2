@@ -536,6 +536,29 @@ class TrainConfig:
     # this >0 only when expert demonstrations populate the buffer.
     bc_scale: float = 0.0            # Phase-2 policy BC weight
 
+    # ----- APC expert (BC anchor for the policy mean) -----
+    # P81 (2026-06-03): the deterministic policy mean converges to a
+    # worse-than-do-nothing basin because imagination exploitation under
+    # bootstrap dominance (critic_rew_to_tgt_var→~0.001) lands μ in the wrong
+    # place and the reward's deceptive geometry gives nothing to climb back
+    # out with (gamma/σ/entropy all ruled out as levers, P79/P80).  An
+    # objective-ALIGNED steady-state expert (utils/apc_expert.py) demonstrates
+    # constraint-riding economic moves; BC toward it (Cursor stabilizer #6)
+    # grounds μ WITHOUT changing the optimum (RL still owns the true optimum
+    # via the real reward + WM).
+    #   expert_type ∈ {'none', 'static', 'nn'}:
+    #     'static' = robust gain-scheduled mover (GainScheduleExpert),
+    #     'nn'     = MLP steady-state surrogate + projected-grad reward optimiser,
+    #     'none'   = disabled (legacy behaviour, bc_scale stays 0).
+    # When the expert is usable and expert_type != 'none', ``bc_scale`` is
+    # auto-set to ``expert_bc_scale`` (cloning is MASKED to expert steps only).
+    expert_type: str = 'static'
+    expert_bc_scale: float = 0.15     # bc_scale applied when expert populates buffer
+    expert_seed_episodes: int = 24    # expert-driven seed episodes added in P1
+    expert_action_jitter: float = 0.03  # Gaussian σ around expert action (norm units)
+    expert_keep_schedule: bool = True   # demonstrate under curriculum disturbances
+    expert_use_ss_samples: bool = True  # fit/train from a fresh steady-state sweep
+
     # ----- MTP -----
     # mtp_length: bumped 8 → 32 on 2026-05-21 (p31 RCA).  The MTP head
     # provides the only training pressure that asks the WM to predict
@@ -846,6 +869,12 @@ class APCEnv:
                 cvb = np.tile(np.array([[0.0, 100.0]], dtype='float32'),
                               (max(1, len(self.cv_indices)), 1))
         n_cv = cvb.shape[0]
+
+        # Engineering-unit base bounds, exposed for the APC expert (BC anchor).
+        # These are the STATIC base bounds the action mapping uses (P60), so the
+        # expert's ``action_norm`` round-trips exactly through ``env.step``.
+        self.mv_bounds_eu = np.asarray(mvb, dtype='float64').reshape(-1, 2)
+        self.cv_bounds_eu = np.asarray(cvb, dtype='float64').reshape(-1, 2)
 
         rt_spec = (self.obj_spec or {}).get('runtime_setpoints', {}) or {}
         targets_enabled_spec = rt_spec.get('targets_enabled', False)
@@ -1363,11 +1392,15 @@ class TrajectoryBuffer:
                             dtype='float32')
         self.rew = np.zeros((capacity_eps, self.T), dtype='float32')
         self.cont = np.ones((capacity_eps, self.T), dtype='float32')
+        # Per-step flag marking transitions produced by the APC expert.  BC is
+        # applied ONLY where this is 1.0 (avoids the documented "clone the
+        # whole replay buffer → policy collapse" trap).
+        self.expert = np.zeros((capacity_eps, self.T), dtype='float32')
         self.filled = 0
         self.write = 0
 
     def add_episode(self, obs: np.ndarray, act: np.ndarray, rew: np.ndarray,
-                    cont: np.ndarray) -> None:
+                    cont: np.ndarray, expert: Optional[np.ndarray] = None) -> None:
         T = obs.shape[0]
         assert T == self.T, f"episode length mismatch: {T} vs {self.T}"
         assert obs.ndim == 2 and obs.shape[1] == self.obs_dim, (
@@ -1377,6 +1410,8 @@ class TrajectoryBuffer:
         self.act[i] = act
         self.rew[i] = rew
         self.cont[i] = cont
+        self.expert[i] = (expert if expert is not None
+                          else np.zeros(self.T, dtype='float32'))
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
@@ -1396,13 +1431,16 @@ class TrajectoryBuffer:
                            dtype='float32')
         out_rew = np.zeros((batch_size, seq_len), dtype='float32')
         out_cont = np.zeros((batch_size, seq_len), dtype='float32')
+        out_expert = np.zeros((batch_size, seq_len), dtype='float32')
         for b in range(batch_size):
             s = starts[b]
             out_obs[b] = self.obs[ep_idx[b], s:s + seq_len]
             out_act[b] = self.act[ep_idx[b], s:s + seq_len]
             out_rew[b] = self.rew[ep_idx[b], s:s + seq_len]
             out_cont[b] = self.cont[ep_idx[b], s:s + seq_len]
-        return {'obs': out_obs, 'act': out_act, 'rew': out_rew, 'cont': out_cont}
+            out_expert[b] = self.expert[ep_idx[b], s:s + seq_len]
+        return {'obs': out_obs, 'act': out_act, 'rew': out_rew,
+                'cont': out_cont, 'expert': out_expert}
 
 
 # ---------------------------------------------------------------------------
@@ -1780,6 +1818,85 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
         if done:
             break
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
+def collect_expert_episode(env: APCEnv, cfg: TrainConfig, *,
+                            expert,
+                            keep_schedule: bool = True,
+                            action_jitter: float = 0.0,
+                            rng: Optional[np.random.Generator] = None,
+                            ) -> Dict[str, np.ndarray]:
+    """Collect one episode driven by the APC steady-state expert.
+
+    The expert (``utils.apc_expert.SteadyStateExpert``) emits an engineering
+    MV target each step; we map it to the actor's normalised ``[-1, 1]`` space
+    via ``expert.action_norm`` (which uses the STATIC base MV bounds, matching
+    ``env.step``'s action mapping, so the round-trip is exact) and feed that to
+    ``env.step``.  CV/DV feedback is read in engineering units from
+    ``info['raw_state']`` via the simulator metadata denormaliser.
+
+    Every transition is flagged ``expert=1`` so the BC loss anchors the policy
+    mean ONLY on these steps.  The curriculum disturbance schedule is kept on by
+    default (``keep_schedule=True``) so the expert demonstrates good economic +
+    constraint behaviour under realistic disturbances; ``action_jitter`` adds a
+    small Gaussian exploration around the expert action so BC sees a tube, not a
+    razor-thin trajectory.  Returns the same dict shape as ``collect_episode``
+    plus an ``expert`` mask channel.
+    """
+    from utils.dynamics_identifier import _state_value_to_engineering
+
+    obs_window = env.reset(exploration=True)
+    if not keep_schedule:
+        env._schedule = []
+        env._hidden_disturbance = None
+    if rng is None:
+        rng = getattr(env, 'rng', np.random.default_rng())
+
+    meta = env.meta
+    cv_idx = list(env.cv_indices)
+    dv_idx = [int(x) for x in meta.get('dv_indices', []) if x is not None]
+    cv_bounds_eu = np.asarray(env.cv_bounds_eu, dtype='float64')
+
+    T, D = cfg.episode_length, env.obs_dim
+    obs_buf = np.zeros((T, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    exp_buf = np.zeros(T, dtype='float32')
+
+    expert.reset()
+    # Causal init: first action uses the band-midpoint CV (no feedback yet).
+    last_cv = cv_bounds_eu.mean(axis=1) if cv_bounds_eu.size else np.zeros(len(cv_idx))
+    last_dv = None
+
+    for t in range(T):
+        obs_buf[t] = obs_window[-1]
+        expert.step_eu(last_cv, cv_bounds=cv_bounds_eu, dv_eu=last_dv)
+        a_norm = expert.action_norm().astype('float32').reshape(-1)
+        if action_jitter > 0.0:
+            a_norm = np.clip(
+                a_norm + rng.normal(0.0, action_jitter, size=a_norm.shape),
+                -1.0, 1.0).astype('float32')
+        next_window, reward, done, info = env.step(a_norm)
+        rs = info.get('raw_state')
+        if rs is not None:
+            rs = np.asarray(rs, dtype='float64')
+            last_cv = np.asarray(
+                [_state_value_to_engineering(rs, ci, meta) for ci in cv_idx],
+                dtype='float64')
+            if dv_idx:
+                last_dv = np.asarray(
+                    [_state_value_to_engineering(rs, di, meta) for di in dv_idx],
+                    dtype='float64')
+        act_buf[t] = a_norm
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        exp_buf[t] = 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf,
+            'cont': cont_buf, 'expert': exp_buf}
 
 
 def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
@@ -2283,7 +2400,12 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     fut_act = fut_act.reshape(B * T_ctx, L_mtp_eff, A)
     fut_rew = fut_rew.reshape(B * T_ctx, L_mtp_eff)
 
-    # Policy MTP (BC over L future actions)
+    # Policy MTP (BC over L future actions).  BC is masked to EXPERT context
+    # positions only: cloning the whole replay buffer (random/PRBS/baseline
+    # actions) drags the policy mean toward a uniform/no-op clone and collapses
+    # it.  ``batch['expert'][t]`` flags transitions produced by the APC expert;
+    # only those anchor the policy mean.  When no expert steps are present in a
+    # batch the BC term is exactly zero (no gradient).
     if L_mtp_eff < model.policy.mtp_length:
         # Pad target with zeros so we can use logits_mtp; mask out the pad in loss.
         pad_act = torch.zeros(B * T_ctx,
@@ -2291,10 +2413,19 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
                                device=fut_act.device, dtype=fut_act.dtype)
         fut_act_full = torch.cat([fut_act, pad_act], dim=1)
         bc_lp_full = model.policy.log_prob_of_mtp(feat, fut_act_full)
-        bc_loss = -bc_lp_full[:, :L_mtp_eff].mean()
+        bc_lp_pos = bc_lp_full[:, :L_mtp_eff].mean(dim=1)          # (BT,)
     else:
         bc_lp = model.policy.log_prob_of_mtp(feat, fut_act)        # (BT, L)
-        bc_loss = -bc_lp.mean()
+        bc_lp_pos = bc_lp.mean(dim=1)                              # (BT,)
+
+    # ``batch['expert']`` is always present (TrajectoryBuffer.sample always
+    # emits the channel — zeros for non-expert episodes), so the mask is the
+    # single BC code path.  Align it with context positions t (predicting
+    # a_{t+1..t+L}) and clone ONLY expert-flagged steps; denom>=1 keeps the
+    # term well-defined (and exactly zero) when a batch has no expert steps.
+    em = batch['expert'][:, :T_ctx].reshape(-1).to(bc_lp_pos.dtype)  # (BT,)
+    denom = em.sum().clamp_min(1.0)
+    bc_loss = -(bc_lp_pos * em).sum() / denom
 
     # Reward MTP (twohot CE over L future rewards)
     rew_logits_all = model.reward.forward_mtp(feat)           # (BT, L, K)
@@ -4514,6 +4645,27 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P2', '0'))
     const_inject_in_p3 = int(
         os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P3', '0'))
+    # ----- Periodic EXPERT re-injection (P81 RCA, 2026-06-03) -----
+    # Same eviction failure mode as the const-action seeds above, but for
+    # the objective-aligned expert demonstrations: the expert episodes are
+    # added ONCE during seeding (before P1), and the 327-episode ring
+    # buffer is fully lapped ~1.4x during P1's 70 iters, so ZERO expert
+    # steps survive to P2 — the masked BC term reads an empty mask and
+    # ``bc_loss`` is exactly 0.0 for the entire P2 phase (expert is a
+    # no-op; P81 degenerates to a P80 re-run).  Fix: periodically
+    # re-inject fresh expert episodes during P1+P2 so the masked BC
+    # always has demonstrations to clone.  Unlike the P50 const-inject
+    # cascade risk, expert episodes ride the constraint edge with healthy
+    # reward variance, and BC runs only in P2 (critic trains in P3), so
+    # P2 injection does not threaten Var(r)/Var(target_v).  P3 injection
+    # is OFF by default (BC is dropped in P3); opt-in only for the future
+    # decaying-P3-BC contingency via DREAMER_EXPERT_INJECT_IN_P3=1.
+    expert_inject_every = int(
+        os.environ.get('DREAMER_EXPERT_INJECT_EVERY', '20'))
+    expert_inject_n = int(
+        os.environ.get('DREAMER_EXPERT_INJECT_N', '3'))
+    expert_inject_in_p3 = int(
+        os.environ.get('DREAMER_EXPERT_INJECT_IN_P3', '0'))
     # ----- wm_best.pt warm-restore at P1→P2 (P39, 2026-05-22) -----
     # When the WM's fidelity peak is reached well before P1 ends and the
     # subsequent iters drift to a lower-quality basin (P38: peak iter 50,
@@ -4736,6 +4888,76 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"overlap_frac={cfg.step_test_overlap_frac:.2f}, "
               f"primary_dv_bias={cfg.step_test_primary_dv_bias:.2f})",
               flush=True)
+
+    # ---------- APC expert seed episodes (P81 design, 2026-06-03) ----------
+    # Build the steady-state expert (static gain-schedule or NN surrogate),
+    # collect ``expert_seed_episodes`` expert-driven demonstrations (flagged
+    # expert=1 so BC is masked to them), and auto-enable ``bc_scale`` when the
+    # expert is usable.  The expert is objective-ALIGNED: it grounds the policy
+    # mean without changing the optimum (RL still owns the true optimum via the
+    # real reward + WM).  Disabled cleanly when expert_type='none' or the
+    # identified gains / steady-state sweep are unavailable.
+    cfg._expert_active = False
+    expert_type = str(getattr(cfg, 'expert_type', 'none') or 'none').lower()
+    n_expert_seed = int(getattr(cfg, 'expert_seed_episodes', 0))
+    if expert_type not in ('', 'none') and n_expert_seed > 0:
+        try:
+            from utils import apc_expert as _apc_expert
+            sv = list(env.meta.get('state_variables', []) or [])
+
+            def _names(idxs):
+                return [sv[i] if 0 <= i < len(sv) else f'idx{i}' for i in idxs]
+
+            mv_names = _names([int(x) for x in env.meta.get('mv_indices', [])])
+            cv_names = _names([int(x) for x in env.cv_indices])
+            dv_names = _names([int(x) for x in env.meta.get('dv_indices', [])
+                               if x is not None])
+            expert, expert_info = _apc_expert.build_expert(
+                expert_type=expert_type,
+                out_dir=getattr(cfg, 'out_dir', '') or '.',
+                obj_spec=env.obj_spec, obj_w=env.obj_w,
+                mv_bounds=env.mv_bounds_eu, cv_bounds=env.cv_bounds_eu,
+                mv_names=mv_names, cv_names=cv_names, dv_names=dv_names,
+                use_ss_samples=bool(getattr(cfg, 'expert_use_ss_samples', True)),
+                seed=int(getattr(cfg, 'seed', 0)),
+            )
+        except Exception as _exc:
+            expert, expert_info = None, {'expert_type': expert_type,
+                                         'usable': False,
+                                         'build_error': repr(_exc)}
+
+        # Persist the build report next to the run artefacts for diagnosis.
+        try:
+            _ed = Path(cfg.out_dir or '.')
+            _ed.mkdir(parents=True, exist_ok=True)
+            with open(_ed / 'expert_seed_info.json', 'w', encoding='utf-8') as _f:
+                json.dump(expert_info, _f, indent=2, default=str)
+        except Exception:
+            pass
+
+        if expert is not None and expert_info.get('usable', False):
+            env._apc_expert = expert
+            jitter = float(getattr(cfg, 'expert_action_jitter', 0.0))
+            keep_sched = bool(getattr(cfg, 'expert_keep_schedule', True))
+            for _ in range(n_expert_seed):
+                ep = collect_expert_episode(
+                    env, cfg, expert=expert,
+                    keep_schedule=keep_sched, action_jitter=jitter,
+                    rng=env.rng)
+                buf.add_episode(ep['obs'], ep['act'], ep['rew'],
+                                ep['cont'], ep.get('expert'))
+                total_env_steps += cfg.episode_length
+            # Auto-enable masked BC toward the expert demonstrations.
+            cfg.bc_scale = float(getattr(cfg, 'expert_bc_scale', 0.15))
+            cfg._expert_active = True
+            print(f"[seed] apc-expert={n_expert_seed} type={expert_type} "
+                  f"bc_scale->{cfg.bc_scale:.3f} jitter={jitter:.3f} "
+                  f"src={expert_info.get('gain_source', expert_info.get('reason', '?'))}",
+                  flush=True)
+        else:
+            print(f"[seed] apc-expert SKIPPED type={expert_type} "
+                  f"reason={expert_info.get('reason', expert_info.get('build_error', 'not_usable'))}",
+                  flush=True)
 
     # Cached optimizer set per phase.
     # Initialize hidden-disturbance probability for the starting phase
@@ -5028,6 +5250,39 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _n_c += 1
             print(f"[const-inject p{current_phase}] iter {total_iters}: added "
                   f"const={_n_c} step={_n_s} episodes "
+                  f"(buf_fill={buf.filled}/{buf.capacity_eps})",
+                  flush=True)
+
+        # ----- Periodic EXPERT re-injection (P81 RCA) -----
+        # Keep objective-aligned expert demonstrations alive in the ring
+        # buffer so the masked BC term in P2 always has steps to clone.
+        # Without this the seed-time expert episodes are evicted before
+        # P2 begins (capacity ~327 eps, fully lapped during P1) and
+        # bc_loss collapses to exactly 0.0 (expert no-op).  Active in
+        # P1+P2 by default; P3 opt-in for the decaying-P3-BC contingency.
+        _expert_inject_active = (
+            bool(getattr(cfg, '_expert_active', False))
+            and getattr(env, '_apc_expert', None) is not None
+            and ((current_phase == 1)
+                 or (current_phase == 2)
+                 or (current_phase == 3 and expert_inject_in_p3)))
+        if (_expert_inject_active
+                and expert_inject_every > 0
+                and expert_inject_n > 0
+                and total_iters > 0
+                and (total_iters % expert_inject_every) == 0):
+            _ej_jit = float(getattr(cfg, 'expert_action_jitter', 0.0))
+            _ej_keep = bool(getattr(cfg, 'expert_keep_schedule', True))
+            for _ in range(expert_inject_n):
+                _eep = collect_expert_episode(
+                    env, cfg, expert=env._apc_expert,
+                    keep_schedule=_ej_keep, action_jitter=_ej_jit,
+                    rng=env.rng)
+                buf.add_episode(_eep['obs'], _eep['act'], _eep['rew'],
+                                 _eep['cont'], _eep.get('expert'))
+                total_env_steps += cfg.episode_length
+            print(f"[expert-inject p{current_phase}] iter {total_iters}: "
+                  f"added expert={expert_inject_n} episodes "
                   f"(buf_fill={buf.filled}/{buf.capacity_eps})",
                   flush=True)
 

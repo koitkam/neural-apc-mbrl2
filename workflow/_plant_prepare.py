@@ -324,6 +324,17 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_BOUND_TRAINING_REWARD_REF':  ('bound_training_reward_ref',      float),
     # P74 (2026-05-31): advantage clip (smooths actor grad -> less MV chatter).
     'DREAMER_ADVANTAGE_CLIP':             ('advantage_clip',                 float),
+    # P81 (2026-06-03): APC steady-state expert (BC anchor for the policy mean).
+    # expert_type ∈ {none, static, nn}; bc_scale auto-set to expert_bc_scale when
+    # the expert is usable (cloning MASKED to expert steps).  See
+    # utils/apc_expert.py + TrainConfig for rationale.  Dimensionless / sim-
+    # adaptive; the DREAMER_EXPERT_* move-law knobs are read inside apc_expert.
+    'DREAMER_EXPERT_TYPE':                ('expert_type',                    str),
+    'DREAMER_EXPERT_BC_SCALE':            ('expert_bc_scale',                float),
+    'DREAMER_EXPERT_SEED_EPISODES':       ('expert_seed_episodes',           int),
+    'DREAMER_EXPERT_ACTION_JITTER':       ('expert_action_jitter',           float),
+    'DREAMER_EXPERT_KEEP_SCHEDULE':       ('expert_keep_schedule',           _as_bool),
+    'DREAMER_EXPERT_USE_SS_SAMPLES':      ('expert_use_ss_samples',          _as_bool),
 }
 
 
