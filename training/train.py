@@ -559,6 +559,33 @@ class TrainConfig:
     expert_keep_schedule: bool = True   # demonstrate under curriculum disturbances
     expert_use_ss_samples: bool = True  # fit/train from a fresh steady-state sweep
 
+    # ----- P83: decaying P3 expert-BC anchor (anti-reversion) -----
+    # P79/P80/P81b all show the SAME late-P3 reversion: the deterministic
+    # policy mean drifts BACK toward the worse-than-do-nothing basin once
+    # imagination exploitation under bootstrap dominance takes over
+    # (critic_rew_to_tgt_var→~4e-4, return_scale 3→101).  The P2 BC anchor
+    # is dropped at the P2→P3 boundary, so nothing holds μ near the expert
+    # during P3 — the anchor evaporates exactly when it's needed most.
+    # P83 keeps a MASKED expert-BC term alive THROUGH P3, applied to the
+    # actor params only (WM isolation preserved), with a Kickstarting-style
+    # decay 1→floor over the phase so RL still owns the true optimum late.
+    # DEFAULT ON: it makes no sense to leave the anchor off when the run
+    # provably reverts without it.  Disable for ablation via
+    # DREAMER_EXPERT_BC_P3=0.
+    expert_bc_p3: bool = True
+    # Decay floor: the P3 BC weight decays expert_bc_scale*(1→floor) across
+    # P3 (phase-length adaptive — stretches with the run).  A non-zero floor
+    # is a PERMANENT anti-reversion anchor; 0.05 keeps ~1/3 of the seed
+    # weight at the very end without overriding the matured RL gradient.
+    expert_bc_p3_floor: float = 0.05
+    # TD3+BC return-scale normalisation (Fujimoto 2021).  OPT-IN (default
+    # off): REINFORCE already divides the advantage by return_scale, so the
+    # PG gradient on μ is already O(1) regardless of scale and a fixed-weight
+    # MSE-on-μ BC is already proportionate.  Enable only if the logged
+    # bc_p3/pg grad ratio shows the anchor being drowned as return_scale
+    # grows (then bc_weight_eff = w * advantage_clip / max(return_scale,1)).
+    expert_bc_p3_adaptive_scale: bool = False
+
     # ----- MTP -----
     # mtp_length: bumped 8 → 32 on 2026-05-21 (p31 RCA).  The MTP head
     # provides the only training pressure that asks the WM to predict
@@ -2447,6 +2474,43 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'reward_mtp_total': reward_mtp_loss,
         'agent_total': total,
     }
+
+
+def expert_bc_p3_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
+                       agent_hid: torch.Tensor
+                       ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """P83: masked MSE-on-μ expert BC anchor for Phase 3.
+
+    Regresses the policy's DETERMINISTIC mean action ``μ = tanh(mu)`` onto
+    the stored expert action on expert-flagged real transitions only.  The
+    feature ``agent_hid`` is the same agent-register state P2 BC consumed;
+    it is DETACHED here so ONLY the policy params receive gradient — the WM
+    update (``opt_world``) is fully isolated.
+
+    MSE-on-μ (vs. masked NLL) is preferred because it (a) matches the
+    deterministic-mean evaluation used to score the controller and (b) does
+    not fight the policy σ — the anchor pulls the mean without collapsing
+    exploration.  Returns ``(bc_loss, n_expert_steps)``; the loss is exactly
+    zero (no gradient) when a batch carries no expert steps.
+    """
+    act = batch['act']                                   # (B, T, A)
+    B, T, A = act.shape
+    if T < 2:
+        z = act.new_zeros(())
+        return z, z
+    T_ctx = T - 1
+    feat = agent_hid[:, :T_ctx].reshape(-1, agent_hid.shape[-1]).detach()
+    # Deterministic policy mean (offset 0) at each context state.
+    mu, _log_std = model.policy.dist_params(feat)        # (B*T_ctx, A)
+    det_action = torch.tanh(mu)                          # μ ∈ [-1, 1]
+    # Mirror P2 BC alignment: agent_hid[t] predicts a_{t+1}; mask on the
+    # expert flag at the context position t.
+    tgt = act[:, 1:1 + T_ctx].reshape(-1, A).to(det_action.dtype)
+    em = batch['expert'][:, :T_ctx].reshape(-1).to(det_action.dtype)  # (BT,)
+    denom = em.sum().clamp_min(1.0)
+    se = ((det_action - tgt) ** 2).mean(dim=-1)          # (BT,)
+    bc_loss = (se * em).sum() / denom
+    return bc_loss, em.sum()
 
 
 # ---------------------------------------------------------------------------
@@ -4526,6 +4590,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # 2026-05-23 (P41 RCA): bootstrap-cascade canary state.  Captured
     # at P2→P3 transition; tripped from the actor-critic log block.
     p3_start_return_scale: Optional[float] = None
+    p3_start_steps: int = 0
     cascade_streak: int = 0
     grad_skip_history: 'deque[Tuple[int, int]]' = deque(maxlen=512)  # (iter, skip_count)
     grad_skip_prev_total: int = 0
@@ -4657,15 +4722,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # always has demonstrations to clone.  Unlike the P50 const-inject
     # cascade risk, expert episodes ride the constraint edge with healthy
     # reward variance, and BC runs only in P2 (critic trains in P3), so
-    # P2 injection does not threaten Var(r)/Var(target_v).  P3 injection
-    # is OFF by default (BC is dropped in P3); opt-in only for the future
-    # decaying-P3-BC contingency via DREAMER_EXPERT_INJECT_IN_P3=1.
+    # P2 injection does not threaten Var(r)/Var(target_v).  P83 keeps a
+    # decaying masked-BC anchor alive THROUGH P3, so the expert episodes
+    # must also survive in the buffer during P3 — hence injection in P3 is
+    # now ON by default.  Volume is kept low (3 eps every 20 iters) and the
+    # episodes ride the constraint edge with healthy reward variance, so the
+    # P50 const-inject cascade risk (flat steady-state collapsing Var(r))
+    # does not apply.  Disable via DREAMER_EXPERT_INJECT_IN_P3=0 for ablation.
     expert_inject_every = int(
         os.environ.get('DREAMER_EXPERT_INJECT_EVERY', '20'))
     expert_inject_n = int(
         os.environ.get('DREAMER_EXPERT_INJECT_N', '3'))
     expert_inject_in_p3 = int(
-        os.environ.get('DREAMER_EXPERT_INJECT_IN_P3', '0'))
+        os.environ.get('DREAMER_EXPERT_INJECT_IN_P3', '1'))
     # ----- wm_best.pt warm-restore at P1→P2 (P39, 2026-05-22) -----
     # When the WM's fidelity peak is reached well before P1 ends and the
     # subsequent iters drift to a lower-quality basin (P38: peak iter 50,
@@ -5199,6 +5268,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                               '(cascade canary baseline)', flush=True)
                 except Exception:
                     pass
+                # P83: anchor the P3 BC decay schedule to the step count at
+                # phase start (the schedule is phase-length adaptive).
+                p3_start_steps = total_env_steps
             # Refresh hidden-disturbance per-episode probability for the
             # new phase (default: 0.3 in P1/P2, 0.5 in P3).
             env._disturbance_prob_override = get_phase_disturbance_prob(
@@ -5595,9 +5667,42 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
                     ac_losses = imagination_step(model, batch, cfg)
+                # ---- P83: decaying masked expert-BC actor anchor -----
+                # Keep the policy mean grounded near the expert THROUGH P3
+                # (the P2 anchor was dropped at the boundary, which is when
+                # the reversion historically starts).  Applied to the actor
+                # params ONLY; ``agent_hid`` is detached inside the helper so
+                # the WM update stays isolated.  Kickstarting decay 1→floor
+                # over P3 hands the optimum back to RL late in the phase.
+                _actor_loss = ac_losses['actor_loss']
+                if (cfg.expert_bc_p3
+                        and getattr(cfg, '_expert_active', False)):
+                    with torch.amp.autocast(device_type=device.type,
+                                              dtype=torch.bfloat16,
+                                              enabled=(device.type == 'cuda')):
+                        bc_p3_loss, bc_p3_cnt = expert_bc_p3_loss(
+                            model, batch, agent_hid)
+                    p3_prog = min(1.0, max(0.0,
+                        (total_env_steps - p3_start_steps) / max(1, p3)))
+                    decay = max(float(cfg.expert_bc_p3_floor), 1.0 - p3_prog)
+                    bc_p3_w = float(cfg.expert_bc_scale) * decay
+                    if cfg.expert_bc_p3_adaptive_scale:
+                        # TD3+BC normalisation: keep the anchor proportionate
+                        # as return_scale grows (the reversion symptom).
+                        _adv_ref = float(getattr(cfg, 'advantage_clip', 8.0)
+                                          or 8.0)
+                        _scale = float(ac_losses.get('return_scale', 1.0))
+                        bc_p3_w = bc_p3_w * (_adv_ref / max(_scale, 1.0))
+                    _actor_loss = _actor_loss + bc_p3_w * bc_p3_loss
+                    # Surface diagnostics through the existing ac_losses log
+                    # merge (bc_p3 grad-ratio decides future adaptive-scale).
+                    ac_losses['bc_p3_loss'] = bc_p3_loss.detach()
+                    ac_losses['bc_p3_weight'] = float(bc_p3_w)
+                    ac_losses['bc_p3_n_steps'] = bc_p3_cnt.detach()
+                    ac_losses['bc_p3_decay'] = float(decay)
                 opt_actor.zero_grad(set_to_none=True)
                 opt_critic.zero_grad(set_to_none=True)
-                (ac_losses['actor_loss']
+                (_actor_loss
                  + ac_losses['critic_loss']).backward()
                 actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters_actor(), cfg.grad_clip)

@@ -335,6 +335,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_EXPERT_ACTION_JITTER':       ('expert_action_jitter',           float),
     'DREAMER_EXPERT_KEEP_SCHEDULE':       ('expert_keep_schedule',           _as_bool),
     'DREAMER_EXPERT_USE_SS_SAMPLES':      ('expert_use_ss_samples',          _as_bool),
+    # P83: decaying P3 expert-BC anchor (default ON via TrainConfig; expose
+    # for ablation).  expert_bc_p3 toggles the anchor, _floor sets the decay
+    # floor, _adaptive_scale enables the TD3+BC return-scale normalisation.
+    'DREAMER_EXPERT_BC_P3':               ('expert_bc_p3',                   _as_bool),
+    'DREAMER_EXPERT_BC_P3_FLOOR':         ('expert_bc_p3_floor',             float),
+    'DREAMER_EXPERT_BC_P3_ADAPTIVE_SCALE': ('expert_bc_p3_adaptive_scale',   _as_bool),
 }
 
 
