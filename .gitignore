@@ -30,3 +30,6 @@ experiment_runs_*/
 .DS_Store
 *.swp
 _smoke_*
+
+# Vision API credentials (never commit secrets)
+vision_endpoints.txt
