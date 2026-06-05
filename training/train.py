@@ -375,6 +375,21 @@ class TrainConfig:
     # myopic imagined critic loss that keeps dragging V back to a ~10-step
     # estimate.  ``None`` ⇒ use ``critic_replay_anchor_coef`` unchanged.
     critic_anchor_coef_long: Optional[float] = None
+    # ---- #1 (P88, 2026-06-05): critic real-grounding rebalance ----
+    # Weight on the IMAGINED critic CE.  The cascade through-line is that the
+    # critic regresses almost entirely on its own imagined bootstrap
+    # (critic_target_v_r->0.97, critic_rew_to_tgt_var->0.001 = reward <0.1% of
+    # target variance) -> a self-referential pessimistic fixed point that
+    # freezes the actor.  Down-weighting the imagined CE (<1.0) lets the
+    # REAL-return replay anchor (``critic_replay_anchor_coef`` /
+    # ``critic_anchor_coef_long`` with ``critic_anchor_lambda``->1.0 = near-MC
+    # return-to-go over the real buffer) DOMINATE the critic target, so the
+    # value is grounded in realised economics instead of model fiction.  Pairs
+    # with #2 (latent overshooting): once the WM is accurate at long H the
+    # critic trained on REAL states also values IMAGINED states correctly
+    # (value-equivalence).  ``1.0`` = legacy (imagined-primary).  Env
+    # ``DREAMER_CRITIC_IMAG_LOSS_COEF``.
+    critic_imag_loss_coef: float = 1.0
 
     # ---- MV / limit consistency (P86, 2026-06-05) ----
     # (1) Action→MV mapping basis.  The normalised actor action is mapped to an
@@ -708,6 +723,23 @@ class TrainConfig:
     wm_steady_consistency_coef: float = 0.5
     wm_steady_settle_frac: float = 0.15   # settled if |Δobs| < frac·channel_std
     wm_steady_held_eps: float = 0.02      # action held if |Δact| ≤ eps (norm)
+
+    # ---- #2 (P88, 2026-06-05): multi-step latent overshooting ----
+    # Dreamer-v3 trains the prior ONLY one step ahead (the KL term), so the
+    # open-loop imagination rollout the actor depends on compounds error every
+    # step (per-offset fidelity r 0.74@H13 -> 0.52@H55) — extending H then just
+    # leans on the WM's weakest capability (the P86/P87 H=55 regression).  This
+    # is the PlaNet/Dreamer-v1 latent-overshooting objective (dropped in v2/v3
+    # because 1-step sufficed for Atari): roll the PRIOR forward ``len`` steps
+    # under REAL actions with NO obs and penalise decode-vs-real-obs, directly
+    # training accurate MULTI-step prediction so a long H becomes legitimately
+    # usable (and steady-state behaviour is learnable in imagination).  RSSM
+    # only (the SF backbone's shortcut-forcing is its native multi-step term).
+    # ``coef=0`` = OFF (legacy / paper-faithful).  Cost ~ O(B·max_starts·len)
+    # GRU steps.  Env DREAMER_WM_OVERSHOOT_{COEF,LEN,MAX_STARTS}.
+    wm_overshoot_coef: float = 0.0
+    wm_overshoot_len: int = 15            # K open-loop prior steps to supervise
+    wm_overshoot_max_starts: int = 24     # cap start positions (stride) for cost
 
     # ----- MTP -----
     # mtp_length: bumped 8 → 32 on 2026-05-21 (p31 RCA).  The MTP head
@@ -2664,6 +2696,73 @@ def _disturbance_head_loss(model: DreamerV4, feat: torch.Tensor,
     return term, dist_loss.detach(), rmse
 
 
+def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
+                               obs: torch.Tensor, act: torch.Tensor,
+                               cfg: TrainConfig,
+                               ) -> Tuple[torch.Tensor, float]:
+    """Option #2 (P88): multi-step LATENT OVERSHOOTING — open-loop prior
+    rollout accuracy.
+
+    Dreamer-v3 trains the prior only ONE step ahead (the KL term), so the
+    open-loop imagination rollout the actor depends on accumulates error every
+    step and per-offset WM fidelity decays fast (r 0.74@H13 -> 0.52@H55).  This
+    is the PlaNet/Dreamer-v1 "latent overshooting" objective (v2/v3 dropped it
+    because 1-step sufficed for Atari): from a strided set of start positions
+    ``t`` we reconstruct the posterior state, roll the PRIOR forward ``K`` steps
+    under the REAL actions ``a_{t+1..t+K}`` WITH NO OBSERVATIONS, decode each
+    predicted feature and penalise ``MSE(decode, obs_{t+1..t+K})``.  This
+    directly trains the gru+prior+decoder for accurate MULTI-step prediction —
+    what makes a long imagination horizon H legitimately usable instead of
+    leaning on the WM's weakest capability.
+
+    RSSM-only; returns ``(0, 0.0)`` for the SF-transformer backbone (its
+    shortcut-forcing loss is the native multi-step-prediction mechanism).
+    Cost ~ O(B · n_starts · K) GRU steps; ``n_starts`` capped via a stride by
+    ``wm_overshoot_max_starts`` so the term is bounded.  ``sample=True`` so the
+    straight-through categorical grad trains the PRIOR (sample=False would give
+    the prior logits no gradient).
+    """
+    coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
+    K = int(getattr(cfg, 'wm_overshoot_len', 0) or 0)
+    device = obs.device
+    zero = torch.zeros((), device=device, dtype=obs.dtype)
+    if coef <= 0.0 or K < 1:
+        return zero, 0.0
+    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+        return zero, 0.0
+    from models.dreamer_v4_rssm import RSSMState
+    rssm = model.dynamics
+    B, T = obs.shape[:2]
+    K = min(K, T - 1)
+    n_valid = T - K
+    if n_valid < 1:
+        return zero, 0.0
+    max_starts = max(1, int(getattr(cfg, 'wm_overshoot_max_starts', 24) or 24))
+    stride = max(1, n_valid // max_starts)
+    starts = torch.arange(0, n_valid, stride, device=device)      # (S,)
+    S = int(starts.numel())
+    f0 = feats[:, starts]                                         # (B, S, F)
+    Bm = B * S
+    h = f0[..., :rssm.deter_dim].reshape(Bm, -1)
+    z = f0[..., rssm.deter_dim:].reshape(
+        Bm, rssm.n_categoricals, rssm.n_classes)
+    state = RSSMState(
+        h=h,
+        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
+                             device=device, dtype=f0.dtype),
+        z=z)
+    total = zero
+    for k in range(1, K + 1):
+        a_idx = starts + k                                        # (S,)
+        a_k = act[:, a_idx].reshape(Bm, -1)                       # (B*S, A)
+        state = rssm.img_step(state, a_k, sample=True)
+        pred = rssm.decode(state.feat).reshape(B, S, -1)
+        tgt = obs[:, a_idx].detach()                             # (B, S, D)
+        total = total + (pred - tgt).pow(2).mean()
+    loss = total / float(K)
+    return loss, float(S)
+
+
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                             act: torch.Tensor, cfg: TrainConfig,
                             dist_target: Optional[torch.Tensor] = None,
@@ -2711,6 +2810,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         model, feats, dist_target, recon_loss, cfg)
     wm_total = wm_total + dist_term
 
+    # ----- (#2, P88) multi-step latent overshooting (RSSM) -----
+    overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
+    overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
+        model, feats, obs_cur, act, cfg)
+    wm_total = wm_total + overshoot_coef * overshoot_loss
+
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
         'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
@@ -2721,6 +2826,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                                             device=feats.device),
         'disturbance_loss': dist_loss,
         'disturbance_rmse': torch.tensor(dist_rmse, device=feats.device),
+        'wm_overshoot_loss': overshoot_loss.detach(),
+        'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
+                                            device=feats.device),
     }
     losses.update(kl_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
@@ -2807,15 +2915,25 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
         model, agent_hid, batch.get('dist'), recon_loss, cfg)
 
+    # ----- (#2, P88) latent overshooting — RSSM-only (no-op for SF, whose
+    # shortcut-forcing loss is its native multi-step-prediction mechanism) ----
+    overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
+    overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
+        model, z_clean, obs_cur, act, cfg)
+
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
         'sf_loss': sf_loss,
         'wm_total': (cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss
-                     + steady_coef * steady_loss + dist_term),
+                     + steady_coef * steady_loss + dist_term
+                     + overshoot_coef * overshoot_loss),
         'wm_steady_loss': steady_loss.detach(),
         'wm_steady_held_frac': torch.tensor(steady_held_frac, device=device),
         'disturbance_loss': dist_loss,
         'disturbance_rmse': torch.tensor(dist_rmse, device=device),
+        'wm_overshoot_loss': overshoot_loss.detach(),
+        'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
+                                            device=device),
     }
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away
@@ -3090,7 +3208,12 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Critic loss (twohot CE).
     val_logits_flat = value_logits_seq.reshape(-1, value_logits_seq.shape[-1])
     val_target_flat = target_returns.reshape(-1)
-    critic_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
+    critic_imag_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
+    # #1 (P88): down-weight the IMAGINED critic CE (<1.0) so the REAL-return
+    # anchor below can dominate the critic target, breaking the self-bootstrap
+    # dominance that froze the actor.  Default 1.0 = legacy imagined-primary.
+    critic_imag_coef = float(getattr(cfg, 'critic_imag_loss_coef', 1.0))
+    critic_loss = critic_imag_coef * critic_imag_loss
 
     # Replay-grounded critic anchor (C) — pin the critic to a TD-λ target
     # built from REAL rewards + slow-target bootstrap on REAL posterior
@@ -3186,6 +3309,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     diag = {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
+        'critic_imag_loss': critic_imag_loss.detach(),
         'imagined_return_mean': target_returns.mean().detach(),
         'imagined_reward_mean': rewards.mean().detach(),
         'imagined_reward_std': rewards.std().detach(),
@@ -3374,7 +3498,11 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Critic loss (twohot CE).
     val_logits_flat = value_logits_seq.reshape(-1, value_logits_seq.shape[-1])
     val_target_flat = target_returns.reshape(-1)
-    critic_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
+    critic_imag_loss = model.value.loss(val_logits_flat, val_target_flat).mean()
+    # #1 (P88): down-weight the IMAGINED critic CE (<1.0) so the REAL-return
+    # anchor below can dominate the critic target.  Default 1.0 = legacy.
+    critic_imag_coef = float(getattr(cfg, 'critic_imag_loss_coef', 1.0))
+    critic_loss = critic_imag_coef * critic_imag_loss
 
     # C : replay-grounded critic anchor.  Pin the critic to a TD-λ target
     # built from the buffer's REAL rewards + slow-target bootstrap on the
@@ -3516,6 +3644,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     diag = {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
+        'critic_imag_loss': critic_imag_loss.detach(),
         'imagined_return_mean': target_returns.mean().detach(),        'imagined_reward_mean': rewards.mean().detach(),
         'imagined_reward_std': rewards.std().detach(),
         'entropy_mean': entropies.mean().detach(),

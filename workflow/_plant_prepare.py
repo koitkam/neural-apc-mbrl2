@@ -376,6 +376,14 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_DISTURBANCE_LOSS_GATE_RECON':('disturbance_loss_gate_recon',    float),
     'DREAMER_DISTURBANCE_HEAD_HIDDEN':    ('disturbance_head_hidden',        int),
     'DREAMER_DISTURBANCE_HEAD_LAYERS':    ('disturbance_head_layers',        int),
+    # #1 (P88): critic real-grounding rebalance (down-weight imagined critic CE
+    # so the real-return anchor dominates -> breaks bootstrap self-dominance).
+    'DREAMER_CRITIC_IMAG_LOSS_COEF':      ('critic_imag_loss_coef',          float),
+    # #2 (P88): multi-step latent overshooting (open-loop prior rollout
+    # accuracy; RSSM backbone).  coef=0 = OFF (paper-faithful default).
+    'DREAMER_WM_OVERSHOOT_COEF':          ('wm_overshoot_coef',              float),
+    'DREAMER_WM_OVERSHOOT_LEN':           ('wm_overshoot_len',               int),
+    'DREAMER_WM_OVERSHOOT_MAX_STARTS':    ('wm_overshoot_max_starts',        int),
 }
 
 
