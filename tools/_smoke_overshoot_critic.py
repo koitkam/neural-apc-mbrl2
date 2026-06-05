@@ -1,5 +1,5 @@
-"""Smoke test for P88 features #1 (critic real-grounding rebalance) and
-#2 (multi-step latent overshooting).
+"""Smoke test for the latent-overshooting (#2) and critic real-grounding (#1)
+world-model/critic training levers.
 
 Verifies, for both backbones, WITHOUT a real env:
   * default cfg => #2 OFF (wm_overshoot_loss == 0) and #1 identity
@@ -13,7 +13,7 @@ Verifies, for both backbones, WITHOUT a real env:
 
 Run (CPU, do not disturb a live GPU run):
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=/home/koitkam/neural-apc-dreamerV4 \
-  /home/koitkam/neural-apc-dreamerV4-env/bin/python tools/_smoke_p88.py
+  /home/koitkam/neural-apc-dreamerV4-env/bin/python tools/_smoke_overshoot_critic.py
 """
 import torch
 
@@ -122,10 +122,10 @@ def _run(wm_type):
         print('[smoke] OK  #2 SF no-op (overshoot == 0)')
     cfg.wm_overshoot_coef = 0.0
 
-    print(f'[smoke] ALL P88 CHECKS PASSED ({wm_type})')
+    print(f'[smoke] ALL OVERSHOOT/CRITIC CHECKS PASSED ({wm_type})')
 
 
 if __name__ == '__main__':
     _run('rssm')
     _run('sf_transformer')
-    print('\n[smoke] P88 #1 + #2 smoke complete — both backbones OK')
+    print('\n[smoke] overshoot (#2) + critic-grounding (#1) smoke complete — both backbones OK')
