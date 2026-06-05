@@ -14,8 +14,9 @@ What is auto-derived (in order):
   4. ``tau``, ``dead_time``         <- ``dynamics_identifier``.
   5. ``lookback``                   <- ``lookback_identifier`` (centred on tau).
   6. ``episode_length``             <- ``auto_episode_length.derive_episode_length``.
-  7. ``horizon = 15`` (Dreamer-V3/V4 paper default; H is no longer
-     plant-tied — see 2026-05-20 knob cleanup).
+  7. ``horizon``                    <- ``auto_episode_length.derive_horizon``
+     (identified time-to-steady-state = dead_time + 4*tau, in agent steps;
+     floored at the paper default 15, capped by DREAMER_HORIZON_MAX).
   8. ``model_size``                 <- paper default ``M`` (512/512/512, 32x32).
   9. ``seq_len = 64``, ``batch_size = 16``    (paper §C).
  10. ``total_steps``                <- ``--steps`` (default 1 000 000).
@@ -224,15 +225,22 @@ def main() -> int:
         json.dump(plant, f, indent=2)
 
     # Episode length & horizon from plant.
-    from utils.auto_episode_length import derive_episode_length
+    from utils.auto_episode_length import derive_episode_length, derive_horizon
     from workflow.bo_runner import MODEL_SIZE_PRESETS
     episode_length, ep_source = derive_episode_length()
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
-    # Horizon: paper default H=15 (DreamerV3/V4, Hafner et al., Table 13).
-    # The plant-adaptive ``horizon_init`` formula was removed 2026-05-20
-    # along with the rest of the short-budget knob cleanup; at the 1M-
-    # step default budget the critic settles fine at H=15 for any plant.
-    horizon = 15
+    # Imagination horizon: sized to the identified time-to-steady-state
+    # (2% settling time = dead_time + 4*tau, in agent steps) so the
+    # actor/critic credit the full settling response of the slowest loop —
+    # including the consequence of riding vs not-riding a moved operator
+    # limit over the whole transient.  Floored at the paper default 15 and
+    # capped (DREAMER_HORIZON_MAX) to bound WM-rollout error; tune the settle
+    # multiple via DREAMER_HORIZON_SETTLE_NTAU.  An explicit DREAMER_HORIZON
+    # still hard-overrides downstream via the env-override layer.
+    horizon, horizon_source = derive_horizon(
+        tau=tau, dead_time=dead, sample_rate=sample_rate)
+    print(f'[run] horizon={horizon} ({horizon_source}; '
+          f'tau={tau:g} dead_time={dead:g} sr={sample_rate})', flush=True)
     seq_len = derived['seq_len']
     k_max = derived['k_max']
     arch = MODEL_SIZE_PRESETS[model_size]

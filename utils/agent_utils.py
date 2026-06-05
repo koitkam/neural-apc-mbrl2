@@ -67,18 +67,58 @@ def action_to_control(action, bounds, setpoint_manager=None):
     agent's MV stays where it was unless the policy intentionally moves
     it.
 
+    **Physical-envelope mapping (P86, 2026-06-05).**  When ``bounds`` carries
+    an ``'mv_action_range'`` key (the simulator's MV normalisation range, the
+    fixed physical actuator envelope), the mapping uses it instead of the base
+    bounds.  This keeps the P60 fixed-band property (no warp on operator-limit
+    steps, since the envelope never moves) while giving the agent full reach
+    over every attainable active operator limit and removing the baked-in
+    "rest on the base floor" point.  Falls back to the static base bounds when
+    the key is absent (legacy P60 behaviour).
+
     ``setpoint_manager`` is kept in the signature for backward
     compatibility; it is ignored.
     """
     del setpoint_manager  # intentionally unused; see docstring.
     action = np.clip(np.asarray(action, dtype='float32').reshape(-1), 0.0, 1.0)
-    mv_bounds = list(bounds.get('mv_bounds', []))
-    if len(mv_bounds) < len(action) and isinstance(bounds.get('mvs'), dict):
-        mvs = bounds['mvs']
-        mv_bounds = [list(mvs[k]) for k in sorted(mvs)]
-    if len(mv_bounds) < len(action):
-        mv_bounds = mv_bounds + [[0.0, 100.0] for _ in range(len(action) - len(mv_bounds))]
-    mv_bounds = mv_bounds[:len(action)]
+    mv_bounds = _mv_action_bounds(bounds, len(action))
     lo = np.array([b[0] for b in mv_bounds], dtype='float32')
     hi = np.array([b[1] for b in mv_bounds], dtype='float32')
     return lo + action * (hi - lo)
+
+
+def _mv_action_bounds(bounds, n_action):
+    """Resolve the fixed [lo, hi] band the action↔MV mapping uses.
+
+    Prefers ``bounds['mv_action_range']`` (the physical MV envelope, P86);
+    falls back to ``bounds['mv_bounds']`` (static base bounds, P60).  Pads /
+    truncates to ``n_action`` channels exactly as the legacy path did.
+    """
+    mv_bounds = list(bounds.get('mv_action_range') or [])
+    if not mv_bounds:
+        mv_bounds = list(bounds.get('mv_bounds', []))
+        if len(mv_bounds) < n_action and isinstance(bounds.get('mvs'), dict):
+            mvs = bounds['mvs']
+            mv_bounds = [list(mvs[k]) for k in sorted(mvs)]
+    if len(mv_bounds) < n_action:
+        mv_bounds = mv_bounds + [[0.0, 100.0] for _ in range(n_action - len(mv_bounds))]
+    return mv_bounds[:n_action]
+
+
+def control_to_action(control, bounds):
+    """Inverse of :func:`action_to_control`: engineering-unit MV → ``[-1, 1]``.
+
+    Uses the SAME fixed band as ``action_to_control`` (the ``mv_action_range``
+    physical envelope when present, else the static base bounds), so the
+    round-trip ``env.step(control_to_action(u, bounds))`` reproduces ``u``
+    exactly (modulo any runtime hard-clamp).  This is how the APC expert's
+    engineering-unit MV demonstration is converted to the actor's BC target,
+    guaranteeing the BC anchor stays exact regardless of the mapping basis.
+    """
+    control = np.asarray(control, dtype='float32').reshape(-1)
+    mv_bounds = _mv_action_bounds(bounds, len(control))
+    lo = np.array([b[0] for b in mv_bounds], dtype='float32')
+    hi = np.array([b[1] for b in mv_bounds], dtype='float32')
+    span = np.maximum(hi - lo, 1e-9)
+    a01 = (control - lo) / span
+    return np.clip(2.0 * a01 - 1.0, -1.0, 1.0).astype('float32')

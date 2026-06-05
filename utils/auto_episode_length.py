@@ -60,6 +60,58 @@ def derive_episode_length(
     return int(default_fallback), 'default'
 
 
+def derive_horizon(
+    tau: float,
+    dead_time: float,
+    sample_rate: int,
+    settle_n_tau: float = 4.0,
+    min_h: int = 15,
+    max_h: int = 120,
+) -> Tuple[int, str]:
+    """Return ``(horizon, source)`` — the imagination horizon in AGENT steps.
+
+    The horizon is sized to the identified *time to steady state* so the
+    actor/critic can credit the full settling response of the slowest loop
+    (and, for limit-tracking, see the consequence of riding vs not-riding a
+    moved operator limit over the whole transient).  The settling time uses
+    the textbook first-order 2% criterion ``t_settle = dead_time + 4*tau``
+    (raw sim steps), divided by ``sample_rate`` to convert to agent steps:
+
+        ``H = round((dead_time + settle_n_tau * tau) / sample_rate)``
+
+    Resolution order:
+    - ``source='auto:{n}tau_settle'``: derived from identified dynamics.
+    - ``source='default'``: paper floor (15) when no dynamics are available.
+
+    Floored at ``min_h`` (the DreamerV3/V4 paper default, 15) so fast plants
+    never go below the paper minimum, and capped at ``max_h`` (env
+    ``DREAMER_HORIZON_MAX``) to bound imagination compute / WM-rollout error.
+    ``settle_n_tau`` is overridable via ``DREAMER_HORIZON_SETTLE_NTAU``.  An
+    explicit ``DREAMER_HORIZON`` still hard-overrides downstream via the
+    env-override layer.
+    """
+    try:
+        n_tau = float(os.environ.get('DREAMER_HORIZON_SETTLE_NTAU', '').strip()
+                      or settle_n_tau)
+    except Exception:
+        n_tau = settle_n_tau
+    try:
+        cap = int(float(os.environ.get('DREAMER_HORIZON_MAX', '').strip() or max_h))
+    except Exception:
+        cap = int(max_h)
+    cap = max(int(min_h), cap)
+
+    tau_v = _safe_float(tau, 0.0)
+    dt_v = _safe_float(dead_time, 0.0)
+    sr = max(1, int(sample_rate or 1))
+    t_settle = dt_v + n_tau * tau_v
+    if t_settle > 1e-6:
+        h = int(round(t_settle / sr))
+        h = max(int(min_h), min(cap, h))
+        return h, f'auto:{n_tau:g}tau_settle'
+    return int(min_h), 'default'
+
+
 def trainer_auto_tuned_block(episode_length: int, episode_length_source: str) -> dict:
     """Build the ``auto_tuned`` sub-dict embedded in ``controller_config.json``.
 

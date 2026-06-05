@@ -163,19 +163,25 @@ def initialize_from_plant(out_dir: Path) -> Dict:
 
 
 def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
-    """Imagination horizon (agent steps) — DreamerV3/V4 paper default.
+    """Imagination horizon (agent steps), adaptive to identified dynamics.
 
-    Returns ``15`` unconditionally.  The plant-derived ``(θ+3τ)/sr``
-    formula was removed 2026-05-20 alongside the rest of the short-
-    budget knob cleanup: with ``--steps`` defaulted to 1M (paper
-    minimum for control), the critic settles fine at H=15 on any
-    plant, so the historical safety belt is no longer needed.
+    Parity with ``workflow/single_run.py`` (2026-06-05): delegates to
+    ``utils.auto_episode_length.derive_horizon``, which sizes the horizon to
+    the identified 2%% settling time ``dead_time + 4*tau`` (converted to agent
+    steps via ``sample_rate``) so the actor/critic credit the full settling
+    response of the slowest loop.  Floored at the DreamerV3/V4 paper default
+    (15) and capped by ``DREAMER_HORIZON_MAX``; the settle multiple is tunable
+    via ``DREAMER_HORIZON_SETTLE_NTAU``.  An explicit ``DREAMER_HORIZON`` still
+    hard-overrides downstream via ``apply_dreamer_env_overrides``.
 
+    Returns the paper floor (15) when no usable dynamics are available.
     Signature retained so BO trial code that multiplies the base by
     ``horizon_mult ∈ HORIZON_BAND`` keeps working.
     """
-    del tau, dead_time, sample_rate
-    return 15
+    from utils.auto_episode_length import derive_horizon
+    h, _src = derive_horizon(tau=tau, dead_time=dead_time,
+                             sample_rate=max(1, int(sample_rate or 1)))
+    return int(h)
 
 
 def lookback_grid(plant_lookback: int) -> List[int]:
@@ -334,9 +340,15 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     # therefore has no separate ``lookback`` axis to optimize.
     lookback = int(plant['lookback'])
     model_size = trial.suggest_categorical('model_size', list(MODEL_SIZE_PRESETS))
-    # Horizon pinned to V3/V4 paper default (parity with single_run.py).
-    H_init = 15
-    horizon = 15
+    # Imagination horizon: adaptive to the identified settling time (parity
+    # with workflow/single_run.py — dead_time + 4*tau in agent steps),
+    # floored at the paper default 15.  γ auto-adapts to this horizon inside
+    # train() (P48); an explicit DREAMER_HORIZON still hard-overrides via
+    # apply_dreamer_env_overrides below.
+    horizon = horizon_init(float(plant.get('tau', 0.0)),
+                           float(plant.get('dead_time', 0.0)),
+                           int(base.sample_rate))
+    H_init = horizon
 
     # Empirical per-trial batch sizing (cached on (model_size, seq, lb,
     # horizon) so repeated trials with same shape skip the ~10 s probe).
@@ -468,9 +480,14 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
     # backward-compat with older study summaries that still recorded it.
     lookback = int(best_params.get('lookback', plant['lookback']))
     model_size = str(best_params['model_size'])
-    # Horizon pinned to V3/V4 paper default (parity with single_run.py).
-    H_init = 15
-    horizon = 15
+    # Imagination horizon: adaptive to the identified settling time (parity
+    # with workflow/single_run.py and run_trial).  γ auto-adapts to this
+    # horizon inside train() (P48); an explicit DREAMER_HORIZON still
+    # hard-overrides via apply_dreamer_env_overrides.
+    horizon = horizon_init(float(plant.get('tau', 0.0)),
+                           float(plant.get('dead_time', 0.0)),
+                           int(base.sample_rate))
+    H_init = horizon
 
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
@@ -535,6 +552,9 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         rssm_embed_dim=int(getattr(cfg_loaded, 'rssm_embed_dim', 256)),
         rssm_hidden_dim=int(getattr(cfg_loaded, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg_loaded, 'rssm_unimix', 0.01)),
+        disturbance_head_dim=int(getattr(cfg_loaded, 'disturbance_head_dim', 0) or 0),
+        disturbance_head_hidden=int(getattr(cfg_loaded, 'disturbance_head_hidden', 0) or 0),
+        disturbance_head_layers=int(getattr(cfg_loaded, 'disturbance_head_layers', 2) or 2),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)
@@ -679,7 +699,11 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     # Adaptive batch size SEED (per-trial batch is re-derived in run_trial
     # from the trial's actual model_size + horizon via the empirical
     # probe).  This block only records the seed-config batch in
-    # run_plan.json.
+    # run_plan.json.  Size the probe at the adaptive horizon (parity with
+    # run_trial / single_run) so the recorded seed batch is realistic.
+    seed_horizon = horizon_init(float(plant.get('tau', 0.0)),
+                                float(plant.get('dead_time', 0.0)),
+                                int(base.sample_rate))
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
@@ -689,7 +713,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
             bs_info = pick_batch_size_for_plant(
                 model_size=derived_model_size,
                 seq_len=int(base.seq_len), lookback=int(plant['lookback']),
-                horizon=15, k_max=int(base.k_max),
+                horizon=int(seed_horizon), k_max=int(base.k_max),
                 sample_rate=int(base.sample_rate),
                 episode_length=int(base.episode_length))
             base.batch_size = int(bs_info['batch_size'])
@@ -697,7 +721,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         bs_info = pick_batch_size_for_plant(
             model_size=derived_model_size,
             seq_len=int(base.seq_len), lookback=int(plant['lookback']),
-            horizon=15, k_max=int(base.k_max),
+            horizon=int(seed_horizon), k_max=int(base.k_max),
             sample_rate=int(base.sample_rate),
             episode_length=int(base.episode_length))
         base.batch_size = int(bs_info['batch_size'])
