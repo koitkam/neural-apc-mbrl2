@@ -1963,6 +1963,66 @@ def run_validation(*,
     except Exception as e:
         print(f'[val] diagnostics skipped: {e}', flush=True)
 
+    # ---- WM transfer-function (step-response) matrix ---------------------
+    # DMC-style per-MV/CV step-response curves (WM vs real sim) averaged over
+    # the operating region with a min/max variation band.  Directly measures
+    # whether the world model captured the true GAINS + DYNAMICS (the
+    # correlation-based fidelity probe does NOT).  Gated ON by default; skip
+    # with DREAMER_VAL_WM_TRANSFER=0.
+    if os.environ.get('DREAMER_VAL_WM_TRANSFER', '1').strip() not in ('0', 'false', 'False'):
+        try:
+            from evaluation.wm_transfer_matrix import compute_and_plot
+            tf_env = APCEnv(cfg, np.random.default_rng(77_777))
+            tf_env._disturbance_prob_override = 0.0
+            tf_obs_std = None
+            if obs_norm_state is not None:
+                try:
+                    _var = np.asarray(obs_norm_state.get('var'), dtype='float32')
+                    tf_obs_std = np.clip(np.sqrt(np.maximum(_var, 1e-6)), 1e-3, None)
+                    tf_env.set_obs_norm_stats(
+                        mean=np.asarray(obs_norm_state.get('mean')), var=_var,
+                        count=float(obs_norm_state.get('count', 1.0)),
+                        learn=False)
+                except Exception:
+                    pass
+            tf_result = compute_and_plot(
+                model, tf_env, cfg, device, out_dir, obs_std=tf_obs_std,
+                title=f'{controller_dir.name}  WM transfer matrix')
+            # GAIN-FIDELITY GATE (control-relevant; the correlation-based
+            # wm_next_state_r does NOT measure gain).  Mean relative SS-gain
+            # error across MV/CV pairs; a WM usable for control needs the gain
+            # within ~2× of the real plant (rel_err < 1.0; healthy < 0.35).
+            try:
+                pairs = (tf_result or {}).get('pairs', {}) if tf_result else {}
+                rel_errs = []
+                for v in pairs.values():
+                    rg = abs(float(v.get('real_ss_gain', 0.0)))
+                    if rg > 1e-6:
+                        rel_errs.append(abs(float(v.get('ss_gain_abs_err', 0.0))) / rg)
+                if rel_errs:
+                    gain_rel_err = float(np.mean(rel_errs))
+                    gate = {
+                        'wm_gain_rel_err': gain_rel_err,
+                        'wm_gain_rel_err_max': float(np.max(rel_errs)),
+                        'wm_gain_pass': bool(gain_rel_err < 1.0),
+                        'wm_gain_healthy': bool(gain_rel_err < 0.35),
+                        'n_pairs': len(rel_errs),
+                    }
+                    if isinstance(locals().get('fidelity_gates'), dict):
+                        fidelity_gates.update(gate)
+                    else:
+                        fidelity_gates = gate
+                    status = ('HEALTHY' if gate['wm_gain_healthy']
+                              else ('PASS' if gate['wm_gain_pass'] else 'FAIL'))
+                    print(f'[val] WM gain fidelity: rel_err={gain_rel_err:.2f} '
+                          f'({status}; correlation gates can pass while this '
+                          f'fails — gain is the control-relevant metric)',
+                          flush=True)
+            except Exception as _ge:
+                print(f'[val] WM gain-gate skipped: {_ge!r}', flush=True)
+        except Exception as e:
+            print(f'[val] WM transfer matrix skipped: {e!r}', flush=True)
+
     cum = np.array([m['cum_raw_reward'] for m in metrics_records])
     cv_v = np.array([m['mean_cv_violation'] for m in metrics_records])
     mv_v = np.array([m['mean_mv_violation'] for m in metrics_records])

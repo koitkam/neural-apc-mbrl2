@@ -543,6 +543,21 @@ def _critic_calibration(model, env, device, *,
         r = float('nan')
     else:
         r = float(np.corrcoef(v_pred, g_real)[0, 1])
+    # Calibration SLOPE: OLS slope of realized return-to-go regressed on the
+    # critic prediction (V -> G).  A correctly-CALIBRATED critic has slope≈1.0;
+    # a critic that is highly CORRELATED (r≈1) can still be badly miscalibrated
+    # (e.g. systematically compressed V => slope≈0.1, or sign-flipped =>
+    # slope<0).  ``r_pearson`` alone (scale-invariant) HIDES this — the slope is
+    # the control-relevant value-accuracy metric.  ``slope_inv`` (G -> V) is the
+    # complementary regression; both ≈1 ⇔ well-calibrated.
+    if v_pred.std() < 1e-8 or g_real.std() < 1e-8:
+        slope = float('nan')
+        slope_inv = float('nan')
+    else:
+        vc = v_pred - v_pred.mean()
+        gc = g_real - g_real.mean()
+        slope = float((vc * gc).sum() / (vc * vc).sum())      # G on V
+        slope_inv = float((vc * gc).sum() / (gc * gc).sum())  # V on G
     return {
         'gamma': float(gamma),
         'n_points': int(starts.size),
@@ -551,7 +566,13 @@ def _critic_calibration(model, env, device, *,
         'g_mean': float(g_real.mean()),
         'g_std': float(g_real.std()),
         'mae': float(np.mean(np.abs(v_pred - g_real))),
+        # Scale-FREE calibration error: MAE normalised by the spread of the
+        # realized return (so it is comparable across plants / reward scales).
+        'nmae': float(np.mean(np.abs(v_pred - g_real))
+                      / (g_real.std() + 1e-8)),
         'r_pearson': r,
+        'slope_g_on_v': slope,
+        'slope_v_on_g': slope_inv,
     }
 
 
