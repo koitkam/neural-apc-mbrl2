@@ -740,6 +740,12 @@ class TrainConfig:
     wm_overshoot_coef: float = 0.0
     wm_overshoot_len: int = 15            # K open-loop prior steps to supervise
     wm_overshoot_max_starts: int = 24     # cap start positions (stride) for cost
+    # Soft recon-fidelity gate (mirrors the disturbance head): the overshoot
+    # term is scaled by ``min(1, gate_recon / recon_loss)`` so it RAMPS IN only
+    # as 1-step reconstruction converges — early in P1 the WM cannot predict
+    # multi-step at all, and an ungated overshoot loss would dominate and stall
+    # encoder/decoder convergence.  ``<=0`` disables the gate (always full).
+    wm_overshoot_gate_recon: float = 0.1
 
     # ----- MTP -----
     # mtp_length: bumped 8 → 32 on 2026-05-21 (p31 RCA).  The MTP head
@@ -2699,6 +2705,7 @@ def _disturbance_head_loss(model: DreamerV4, feat: torch.Tensor,
 def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
                                obs: torch.Tensor, act: torch.Tensor,
                                cfg: TrainConfig,
+                               recon_loss: Optional[torch.Tensor] = None,
                                ) -> Tuple[torch.Tensor, float]:
     """Option #2 (P88): multi-step LATENT OVERSHOOTING — open-loop prior
     rollout accuracy.
@@ -2760,6 +2767,13 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
         tgt = obs[:, a_idx].detach()                             # (B, S, D)
         total = total + (pred - tgt).pow(2).mean()
     loss = total / float(K)
+    # Soft recon-fidelity gate: ramp the term in only as 1-step recon converges
+    # (early P1 the WM can't predict multi-step; an ungated term would swamp the
+    # encoder/decoder).  ``gate_recon<=0`` disables.
+    thr = float(getattr(cfg, 'wm_overshoot_gate_recon', 0.0) or 0.0)
+    if thr > 0.0 and recon_loss is not None:
+        gate = torch.clamp(thr / recon_loss.detach().clamp_min(1e-6), max=1.0)
+        loss = gate * loss
     return loss, float(S)
 
 
@@ -2813,7 +2827,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # ----- (#2, P88) multi-step latent overshooting (RSSM) -----
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
     overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
-        model, feats, obs_cur, act, cfg)
+        model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
     wm_total = wm_total + overshoot_coef * overshoot_loss
 
     losses: Dict[str, torch.Tensor] = {
@@ -2919,7 +2933,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # shortcut-forcing loss is its native multi-step-prediction mechanism) ----
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
     overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
-        model, z_clean, obs_cur, act, cfg)
+        model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
 
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
