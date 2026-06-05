@@ -2929,8 +2929,15 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
         model, agent_hid, batch.get('dist'), recon_loss, cfg)
 
-    # ----- (#2, P88) latent overshooting — RSSM-only (no-op for SF, whose
-    # shortcut-forcing loss is its native multi-step-prediction mechanism) ----
+    # ----- (#2, P88) latent overshooting — RSSM-ONLY BY DESIGN ---------------
+    # Parity decision (not a TODO): the SF-transformer ALREADY trains multi-step
+    # prediction via its shortcut-forcing loss (the flow/x-prediction objective
+    # IS a multi-step term), so an extra open-loop overshoot here would be
+    # redundant.  The helper therefore no-ops for SF (returns 0).  The RSSM path
+    # needs overshoot because DreamerV3 trains the prior ONE step ahead only.
+    # If a future SF run shows a broken gain in ``wm_transfer_matrix`` (the
+    # backbone-agnostic gain metric), add an ``imagine_next_z``-based overshoot
+    # at that point.
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
     overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
         model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)

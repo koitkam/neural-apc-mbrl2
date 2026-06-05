@@ -313,6 +313,33 @@ Recommended next experiment (P39-B): run with
 `diag_latent_cos_mean` + fidelity-probe trajectory to the standing
 P39 baseline.
 
+#### WM gain fidelity, latent overshooting & critic grounding (P88, 2026-06-05)
+
+The correlation-based fidelity probe (`per_offset` Pearson r, `best_h`,
+`wm_next_state_r`) is **scale-invariant**: it confirms the WM moves the
+right *direction* but says nothing about the **gain** (ΔCV per ΔMV) or
+settling dynamics — the property that actually matters for control. A run
+can score `wm_r ≈ 0.75` while its steady-state gain is 3–4× too small.
+Validation now also emits a **DMC-style transfer-function matrix**
+(`validation/wm_transfer_matrix.{png,json}`, `evaluation/wm_transfer_matrix.py`):
+per MV→CV pair it steps the MV from settled operating points across the
+region and overlays the **world-model vs real-sim** engineering-gain curves
+(mean + min/max band), with a `wm_gain_rel_err` gate in `fidelity_gates`
+(healthy < 0.35, pass < 1.0). The critic calibration diagnostic now reports
+`slope_g_on_v` (OLS slope; ≈1 = calibrated, ≈0 = compressed, <0 = sign-flipped)
+and `nmae` alongside the (scale-free-blind) `r_pearson`.
+
+Two training levers target the two failure modes those metrics expose — both
+default-OFF (paper-faithful) and apply to both entry points (single run + BO):
+
+| Var | Effect |
+|---|---|
+| `DREAMER_WM_OVERSHOOT_COEF` | **(#2) Multi-step latent overshooting (RSSM).** Roll the prior open-loop `LEN` steps under real actions with no obs and penalise decode-vs-real-obs, directly training multi-step **gain/dynamics** accuracy (DreamerV3 trains the prior 1-step only). `0` = off. The SF-transformer no-ops (its shortcut-forcing loss is the native multi-step term). |
+| `DREAMER_WM_OVERSHOOT_LEN` | Open-loop horizon K to supervise (default 15; set to the imagination horizon for long-H runs). |
+| `DREAMER_WM_OVERSHOOT_MAX_STARTS` | Cap on strided start positions per batch (default 24) — bounds the added GRU cost. |
+| `DREAMER_WM_OVERSHOOT_GATE_RECON` | Soft recon-fidelity gate (default 0.1): scales the term by `min(1, gate/recon_loss)` so it ramps in only as 1-step reconstruction converges (no early-P1 destabilisation). |
+| `DREAMER_CRITIC_IMAG_LOSS_COEF` | **(#1) Critic real-grounding rebalance.** Weight on the *imagined* critic CE (default 1.0 = legacy). `<1.0` lets the real-return replay anchor (`critic_replay_anchor_coef`, `critic_anchor_lambda`) dominate the value target, breaking the bootstrap self-dominance (`critic_rew_to_tgt_var → ~0.001`) that freezes the actor. Both backbones. |
+
 ## Single training run (no BO)
 
 ```bash
