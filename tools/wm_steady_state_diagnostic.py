@@ -172,6 +172,9 @@ def _load_model(ckpt_path: Path, device: torch.device):
         rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
+        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
+        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
         # 'sdpa' is significantly faster on CPU than 'manual' (uses torch's
         # fused scaled_dot_product_attention which has a vectorised CPU path).
         attn_impl='sdpa',
@@ -358,6 +361,11 @@ def _run_protocol(env, model, cfg, device: torch.device,
     L = lookback_steps
     obs_dim = env.obs_dim
     action_dim = env.action_dim
+    # (c) value-equivalence: also evaluate convergence / MAE truncated to the
+    # TRAINING horizon H, where the policy actually queries the WM.  The full
+    # ``horizon`` (≫ H) probe is a structural drift signal, not the metric the
+    # cascade depends on; reporting at H removes the false-alarm 0% headline.
+    H_train = int(max(2, min(int(getattr(cfg, 'horizon', 15)), horizon)))
 
     # Collect a single long real episode under small noise to seed
     # the lookback windows for all starts.
@@ -443,8 +451,11 @@ def _run_protocol(env, model, cfg, device: torch.device,
             'mae_step42': float(err_per_step[min(41, horizon - 1)])
                             if horizon > 41 else None,
             'mae_final': float(err_per_step[-1]),
+            'mae_at_H_train': float(err_per_step[min(H_train - 1, horizon - 1)]),
             'pred_convergence': _convergence_stats(pred_obs),
             'real_convergence': _convergence_stats(real_obs),
+            'pred_convergence_at_H_train': _convergence_stats(pred_obs[:H_train]),
+            'real_convergence_at_H_train': _convergence_stats(real_obs[:H_train]),
             'pred_final': pred_obs[-1].tolist(),
             'real_final': real_obs[-1].tolist(),
             'pred_traj': pred_obs.astype('float32').tolist(),
@@ -463,6 +474,12 @@ def _run_protocol(env, model, cfg, device: torch.device,
     real_conv_rate = float(np.mean(
         [1.0 if r['real_convergence']['converged'] else 0.0
          for r in per_start_records]))
+    pred_conv_rate_H = float(np.mean(
+        [1.0 if r['pred_convergence_at_H_train']['converged'] else 0.0
+         for r in per_start_records]))
+    real_conv_rate_H = float(np.mean(
+        [1.0 if r['real_convergence_at_H_train']['converged'] else 0.0
+         for r in per_start_records]))
     ss_err = float(np.mean(
         [np.abs(np.asarray(r['pred_final'])
                  - np.asarray(r['real_final'])).mean()
@@ -472,15 +489,19 @@ def _run_protocol(env, model, cfg, device: torch.device,
         'protocol': protocol,
         'n_starts': len(per_start_records),
         'horizon': horizon,
+        'horizon_train': H_train,
         'agg': {
             'mae_step1': _agg('mae_step1'),
             'mae_step5': _agg('mae_step5'),
             'mae_step15': _agg('mae_step15'),
             'mae_step42': _agg('mae_step42'),
             'mae_final': _agg('mae_final'),
+            'mae_at_H_train': _agg('mae_at_H_train'),
             'steady_state_err_mean': ss_err,
             'pred_convergence_rate': pred_conv_rate,
             'real_convergence_rate': real_conv_rate,
+            'pred_convergence_rate_at_H_train': pred_conv_rate_H,
+            'real_convergence_rate_at_H_train': real_conv_rate_H,
         },
         'per_start': per_start_records,
     }
@@ -584,6 +605,17 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
             results.get('zero', {}).get('agg', {}).get('pred_convergence_rate'),
         'wm_pred_converges_under_constant_action':
             results.get('constant', {}).get('agg', {}).get('pred_convergence_rate'),
+        # (c) value-equivalence: convergence judged at the TRAINING horizon H
+        # (where the policy queries the WM) — the cascade-relevant metric.
+        # The full-horizon rates above remain a structural drift signal.
+        'wm_pred_converges_under_zero_action_at_H_train':
+            results.get('zero', {}).get('agg', {})
+                   .get('pred_convergence_rate_at_H_train'),
+        'wm_pred_converges_under_constant_action_at_H_train':
+            results.get('constant', {}).get('agg', {})
+                   .get('pred_convergence_rate_at_H_train'),
+        'per_protocol_mae_at_H_train_step':
+            {p: results[p]['agg'].get('mae_at_H_train') for p in results},
     }
     out = {'verdict': verdict, 'results': results}
     out_path = run_dir / 'wm_steady_state_diagnostic.json'
@@ -672,13 +704,18 @@ def _print_summary(verdict: Dict, results: Dict) -> None:
         ss = a.get('steady_state_err_mean')
         wm_conv = a.get('pred_convergence_rate', 0.0)
         sim_conv = a.get('real_convergence_rate', 0.0)
-        print(f'  {p:9s} action: WM converged in {wm_conv*100:5.1f}% of starts, '
+        wm_conv_H = a.get('pred_convergence_rate_at_H_train', 0.0) or 0.0
+        print(f'  {p:9s} action: WM converged in {wm_conv*100:5.1f}% of starts '
+              f'(@H={H}: {wm_conv_H*100:5.1f}%), '
               f'sim converged in {sim_conv*100:5.1f}%, '
               f'steady-state err = {ss:.4f}' if ss is not None else '')
     print()
-    # Verdict heuristic
+    # Verdict heuristic.  Judged at the TRAINING horizon H (value-equivalence:
+    # the WM only needs to be accurate where the policy queries it); the full-
+    # horizon rate is reported above as a structural-drift signal.
     ss_zero = verdict.get('steady_state_err_zero_action') or float('inf')
-    wm_conv_zero = verdict.get('wm_pred_converges_under_zero_action') or 0.0
+    wm_conv_zero = (verdict.get('wm_pred_converges_under_zero_action_at_H_train')
+                    or verdict.get('wm_pred_converges_under_zero_action') or 0.0)
     if wm_conv_zero >= 0.8 and ss_zero < 0.2:
         print('  VERDICT: WM steady-state representation HEALTHY '
               '(converges, low SS error)')

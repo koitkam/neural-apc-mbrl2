@@ -142,6 +142,9 @@ if __name__ == '__main__':
         rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
+        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
+        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)

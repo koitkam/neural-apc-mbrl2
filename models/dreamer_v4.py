@@ -1232,6 +1232,13 @@ class DreamerV4Config:
     rssm_embed_dim: int = 256
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01
+    # ===== WM disturbance-estimator head (P87, 2026-06-05) =====
+    # Auxiliary supervised head: predicts the hidden/unmeasured disturbance
+    # (per CV channel) from the RSSM posterior feature ``[h, z]``.  ``0`` ⇒
+    # head not built (pre-P87 model).  Sized at runtime to ``len(cv_indices)``.
+    disturbance_head_dim: int = 0
+    disturbance_head_hidden: int = 0
+    disturbance_head_layers: int = 2
 
 
 class DreamerV4(nn.Module):
@@ -1314,6 +1321,20 @@ class DreamerV4(nn.Module):
             p.requires_grad_(False)
         # Return-scale EMA (used for diagnostic logging; PMPO does not need it).
         self.register_buffer('ret_scale', torch.ones(1))
+        # P87: auxiliary WM disturbance-estimator head.  Reads the same
+        # latent feature ``D`` the policy/value heads consume and is supervised
+        # to regress the hidden unmeasured disturbance (per CV channel).  Last
+        # layer zero-init so it contributes no gradient at step 0 (the latent
+        # is shaped gradually, never shocked).  ``None`` ⇒ disabled.
+        dist_dim = int(getattr(cfg, 'disturbance_head_dim', 0) or 0)
+        if dist_dim > 0:
+            dist_hidden = int(getattr(cfg, 'disturbance_head_hidden', 0) or 0) \
+                or cfg.head_hidden
+            dist_layers = int(getattr(cfg, 'disturbance_head_layers', 2) or 2)
+            self.disturbance = MLP(D, dist_hidden, dist_dim,
+                                   n_layers=dist_layers, zero_init_last=True)
+        else:
+            self.disturbance = None
 
     # ---------------------------------------------------------- compile
     def maybe_compile(self, mode: str = 'default') -> None:

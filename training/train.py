@@ -63,7 +63,7 @@ from utils.derived_observations import (
 )
 from utils.agent_utils import (
     load_objective_weights, load_objective_bounds, load_full_objective_spec,
-    action_to_control,
+    action_to_control, control_to_action,
 )
 
 
@@ -350,6 +350,99 @@ class TrainConfig:
     # to disable (legacy pure-imagination critic).
     critic_replay_anchor_coef: float = 0.5
 
+    # ---- B : long-horizon critic-anchor grounding (P85, 2026-06-04) ----
+    # The replay anchor above computes its TD-λ target over the FULL real
+    # context (``Treal = seq_len`` steps), which spans MANY plant time
+    # constants — but it reuses the myopic imagination ``gae_lambda`` (0.90)
+    # in its backward recursion, giving it an effective credit horizon of
+    # only ~1/(1-γλ) ≈ 10 steps.  A constraint-riding limit cycle whose
+    # period (~40 steps) EXCEEDS that horizon is therefore invisible to the
+    # critic target even though the real buffer data contains several full
+    # cycles: the delayed overshoot a too-aggressive action causes is
+    # down-weighted to ~1 % and never co-occurs with its cause in the
+    # value target.  ``critic_anchor_lambda`` decouples the ANCHOR's λ from
+    # the imagination λ so the anchor can use a near-Monte-Carlo
+    # return-to-go (λ→1) over the real sequence — injecting the FULL
+    # realised multi-cycle cost into the critic target, GROUNDED IN REAL
+    # DATA (not a long WM rollout).  The actor still trains purely on H-step
+    # imagination; only the critic's real-grounding horizon changes, so the
+    # value bootstrap V(s_H) the actor reads becomes calibrated to the
+    # long-horizon cost.  ``None`` (default) ⇒ fall back to ``gae_lambda``
+    # (exact legacy behaviour).  Set ~0.97–1.0 to engage.  Does NOT touch
+    # the cascade-sensitive imagination λ.
+    critic_anchor_lambda: Optional[float] = None
+    # Raise the anchor's pull when its long-horizon target must overcome the
+    # myopic imagined critic loss that keeps dragging V back to a ~10-step
+    # estimate.  ``None`` ⇒ use ``critic_replay_anchor_coef`` unchanged.
+    critic_anchor_coef_long: Optional[float] = None
+
+    # ---- MV / limit consistency (P86, 2026-06-05) ----
+    # (1) Action→MV mapping basis.  The normalised actor action is mapped to an
+    # engineering-unit MV over a FIXED reference band.  Historically (pre-P60)
+    # that band was the moving ``current_mv_bounds`` — which warped the mapping
+    # on every operator-limit step (spurious MV jump).  P60 fixed the jump by
+    # mapping against the STATIC base bounds instead, but that introduced two
+    # defects: (a) the agent can never command an MV outside the base box, so
+    # when an active limit steps ABOVE ``base_hi`` the agent physically cannot
+    # track it; (b) action=0 always lands on ``base_lo``, baking a fixed
+    # "rest on the base floor" point into the actuator that the agent then
+    # rides even when the active floor has stepped up → MV violations.
+    #
+    # The fix: map the action over the FIXED PHYSICAL ENVELOPE (the simulator's
+    # MV normalisation range), which never moves with the operator limits.
+    # This keeps the P60 jump fix (fixed band ⇒ no warp), gives the agent full
+    # reach over every attainable active limit, and removes the baked-in base
+    # floor so the agent must LEARN the (moving) active limits from the bounds
+    # observation channels + the violation penalty — there is now a single
+    # consistent operating-limit set (the active limits) that the agent learns,
+    # rather than a base-vs-active mapping/penalty split.  Env
+    # ``DREAMER_MV_ACTION_FULL_RANGE=0`` restores the P60 base-bounds mapping.
+    mv_action_map_full_range: bool = True
+    # (2) Hard-clamp the engineering-unit MV to the CURRENT (active) operator
+    # limits before it reaches the plant.  This is a DCS-style RUNTIME SAFETY
+    # limiter only — it is OFF during training/validation so the agent must
+    # genuinely LEARN to respect the limits (a clamp would mask whether it
+    # learned).  Enable at deployment via ``DREAMER_MV_HARD_CLAMP=1``.
+    mv_hard_clamp: bool = False
+    # (3) Runtime operator-limit variation (the RuntimeSetpointManager that
+    # steps the MV/CV limits mid-episode to teach operator-limit tracking).
+    # Kept ON: the agent is SUPPOSED to learn to track changing operator
+    # limits.  The ACTIVE limits are the single operating-limit set; BASE is
+    # only their nominal starting value.  Set False (``DREAMER_RUNTIME_SETPOINT
+    # _VARIATION=0``) only to freeze active≡base for a no-limit-step ablation.
+    runtime_setpoint_variation: bool = True
+
+    # ---- WM disturbance-estimator head (P87, 2026-06-05) ----
+    # ML analogue of an APC disturbance observer / "prediction-error
+    # feedforward".  A small auxiliary head reads the RSSM posterior feature
+    # ``[h, z]`` and is supervised to predict the hidden, unmeasured OU
+    # disturbance (ground truth from ``utils/hidden_disturbance.py``, which is
+    # invisible to the agent + dynamics).  Two effects: (a) it forces the
+    # latent to EXPLICITLY encode the unmeasured-load state, so the policy —
+    # which already reads the same feature — becomes disturbance-aware and can
+    # react/feed-forward; (b) the smooth slow-OU target regularises the latent
+    # toward a stable held-action representation, improving WM steady-state
+    # prediction.  Imagination-safe: the head reads only the latent (no
+    # measured-vs-predicted innovation that would be undefined inside a dream).
+    # Default ON; sized per-simulator (output dim = number of CV channels).
+    # Disable with ``DREAMER_DISTURBANCE_HEAD=0``.
+    disturbance_head: bool = True
+    # Output width — resolved at runtime to ``len(env.cv_indices)``; 0 ⇒ no
+    # head is built (byte-identical to the pre-P87 model).  Do not set by hand.
+    disturbance_head_dim: int = 0
+    # Head MLP width / depth.  ``disturbance_head_hidden=0`` ⇒ reuse
+    # ``head_hidden``.
+    disturbance_head_hidden: int = 0
+    disturbance_head_layers: int = 2
+    # Supervised-loss weight added to the world-model total.
+    # ``DREAMER_DISTURBANCE_LOSS_SCALE``.
+    disturbance_loss_scale: float = 1.0
+    # Soft WM-fidelity gate: the disturbance term is scaled by
+    # ``min(1, gate_recon / recon_loss)`` so a not-yet-converged world model is
+    # not destabilised by the auxiliary target early in P1.  ``<=0`` disables
+    # the gate (weight always full).
+    disturbance_loss_gate_recon: float = 1.0
+
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
     # default: its deterministic GRU core can learn a held-action fixed
@@ -585,6 +678,36 @@ class TrainConfig:
     # bc_p3/pg grad ratio shows the anchor being drowned as return_scale
     # grows (then bc_weight_eff = w * advantage_clip / max(return_scale,1)).
     expert_bc_p3_adaptive_scale: bool = False
+
+    # ----- (a) adaptive bounded-return envelope (WM-drift mitigation) -----
+    # With per-step reward bounded to [-B, B] (P77 linear remap), the λ-return
+    # over the effective GAE credit horizon 1/(1-γλ) cannot legitimately
+    # exceed ~B/(1-γλ).  But the BOOTSTRAP critic value V is unbounded, so a
+    # biased H-step bootstrap (from a drifting world model) can still drive a
+    # self-consistent return_scale runaway (3→101 observed; critic_rew_to_
+    # tgt_var collapse).  Clamping the bootstrap target-values AND the λ-return
+    # targets (imagined + the replay anchor) to ±k·B/(1-γλ) makes "bounded
+    # reward ⇒ bounded return" actually bind, decoupling the cascade from WM
+    # steady-state fidelity (the Cursor #1 mechanism, made adaptive).
+    # Sim-agnostic: B, γ, λ are all config; backbone-independent (shared tail).
+    # DEFAULT ON; disable via DREAMER_RETURN_VALUE_ADAPTIVE_CAP=0.  k=2 spares
+    # a healthy return spread (~45) and clips the runaway (~102).
+    return_value_adaptive_cap: bool = True
+    return_value_cap_k: float = 2.0
+
+    # ----- (b) world-model held-action steady-state consistency loss -----
+    # The RSSM has no explicit held-action fixed point (wm_pred_converges_
+    # under_constant_action≈0): under a constant action at a settled state the
+    # one-step prior keeps drifting.  This term penalises that drift at
+    # SETTLED + HELD steps detected adaptively from the batch (P64 failed with
+    # ABSOLUTE thresholds defeated by OU+meas noise → here the settled mask is
+    # a RELATIVE fraction of each channel's batch std).  Added to wm_total in
+    # BOTH backbones (RSSM: img_step fixed point; transformer: explicit held-
+    # action anchor on top of its native sf_bootstrap self-consistency).
+    # DEFAULT ON (modest coef); disable via DREAMER_WM_STEADY_CONSISTENCY_COEF=0.
+    wm_steady_consistency_coef: float = 0.5
+    wm_steady_settle_frac: float = 0.15   # settled if |Δobs| < frac·channel_std
+    wm_steady_held_eps: float = 0.02      # action held if |Δact| ≤ eps (norm)
 
     # ----- MTP -----
     # mtp_length: bumped 8 → 32 on 2026-05-21 (p31 RCA).  The MTP head
@@ -868,6 +991,17 @@ class APCEnv:
         self.obj_w = load_objective_weights() or {}
         self.obj_spec = load_full_objective_spec() or {}
 
+        # P86: action→MV maps over the FIXED physical envelope (the MV
+        # normalisation range) rather than the static base bounds, so the
+        # agent can reach & learn every attainable active operator limit and
+        # no fixed "base floor" is baked into the actuator (see
+        # TrainConfig.mv_action_map_full_range).  ``action_to_control`` /
+        # ``control_to_action`` read this key from the bounds dict; when it is
+        # absent they fall back to the P60 static-base-bounds mapping.
+        if (bool(getattr(self.cfg, 'mv_action_map_full_range', True))
+                and self.mv_norm_ranges):
+            self.bounds['mv_action_range'] = [list(b) for b in self.mv_norm_ranges]
+
         # Setpoint manager — packed aug-obs.
         mvs_raw = self.bounds.get('mvs')
         if isinstance(mvs_raw, dict) and mvs_raw:
@@ -898,8 +1032,11 @@ class APCEnv:
         n_cv = cvb.shape[0]
 
         # Engineering-unit base bounds, exposed for the APC expert (BC anchor).
-        # These are the STATIC base bounds the action mapping uses (P60), so the
-        # expert's ``action_norm`` round-trips exactly through ``env.step``.
+        # The expert reasons in engineering units and respects these base
+        # operating limits; its demonstration MV is converted to the actor's
+        # BC target via ``control_to_action`` over the env's action-mapping
+        # band (P86), so the round-trip through ``env.step`` is exact whatever
+        # the mapping basis (physical envelope or base bounds).
         self.mv_bounds_eu = np.asarray(mvb, dtype='float64').reshape(-1, 2)
         self.cv_bounds_eu = np.asarray(cvb, dtype='float64').reshape(-1, 2)
 
@@ -919,6 +1056,14 @@ class APCEnv:
             base_cv_bounds=cvb,
             base_cv_targets=cv_targets,
             cv_target_enabled=cv_target_enabled,
+            cfg=RuntimeSetpointConfig(
+                # P86: allow training/validation on a single consistent limit
+                # set (active ≡ base) by disabling mid-episode limit-step
+                # variation.  Default True preserves the legacy operator-limit
+                # tracking curriculum.
+                bounds_enabled=bool(getattr(
+                    self.cfg, 'runtime_setpoint_variation', True)),
+            ),
             mv_norm_bounds=np.asarray(self.mv_norm_ranges, dtype='float32')
                 if self.mv_norm_ranges else np.zeros((0, 2), dtype='float32'),
             cv_norm_bounds=np.asarray(self.cv_norm_ranges, dtype='float32')
@@ -1223,9 +1368,28 @@ class APCEnv:
             progress=float(self._training_progress),
             phase=int(self._current_phase),
         )
+        # Fresh per-episode trace for the WM disturbance-estimator head target.
+        self._hidden_disturbance_trace = []
         obs_vec = self._build_obs_vec(state)
         self._window = np.tile(obs_vec, (self.cfg.lookback, 1)).astype('float32')
         return self._window.copy()
+
+    def pop_episode_disturbance(self, T: int) -> np.ndarray:
+        """Return the recorded hidden-disturbance trace for the just-finished
+        episode as a ``(T, n_cv)`` float32 array (zero-padded / truncated to
+        ``T`` steps), then clear it.  Consumed by ``TrajectoryBuffer`` to build
+        the WM disturbance-estimator head's supervised target.  When no trace
+        was recorded (head disabled) an all-zero array is returned."""
+        n_cv = len(self.cv_indices)
+        out = np.zeros((int(T), n_cv), dtype='float32')
+        trace = getattr(self, '_hidden_disturbance_trace', None)
+        if trace:
+            arr = np.asarray(trace, dtype='float32')
+            if arr.ndim == 2 and arr.shape[1] == n_cv:
+                m = min(int(T), arr.shape[0])
+                out[:m] = arr[:m]
+        self._hidden_disturbance_trace = []
+        return out
 
     def _shaping_potential(self, state: np.ndarray) -> float:
         """Dense band-keeping potential Φ(s) ∈ [0, 1] for reward shaping.
@@ -1267,6 +1431,20 @@ class APCEnv:
         action_01 = 0.5 * (np.clip(action_norm, -1.0, 1.0) + 1.0)
         control = action_to_control(action_01, self.bounds, self.setpoint_mgr)
         self.setpoint_mgr.step(self._t)
+        # P86 MV hard-clamp: DCS-style RUNTIME SAFETY limiter only.  Default
+        # OFF during training/validation so the agent must LEARN to respect the
+        # (moving) active operator limits — a clamp here would mask whether it
+        # actually learned.  Enable at deployment via ``DREAMER_MV_HARD_CLAMP=1``.
+        if bool(getattr(self.cfg, 'mv_hard_clamp', False)):
+            try:
+                cmb = np.asarray(self.setpoint_mgr.current_mv_bounds,
+                                 dtype='float32').reshape(-1, 2)
+                control = np.asarray(control, dtype='float32').reshape(-1)
+                k = min(cmb.shape[0], control.shape[0])
+                if k > 0:
+                    control[:k] = np.clip(control[:k], cmb[:k, 0], cmb[:k, 1])
+            except Exception:
+                pass
         next_state = self.sim.step(control)
         if isinstance(next_state, tuple):
             next_state = next_state[0]
@@ -1287,9 +1465,21 @@ class APCEnv:
         # Hidden (truly unmeasured) CV disturbance: advance OU and add to
         # CV state channels.  Only active on episodes where the per-episode
         # Bernoulli toggle (or force flag) fired in reset().
+        hidden_applied = np.zeros(len(self.cv_indices), dtype='float32')
         if self._hidden_disturbance is not None:
             try:
                 self._hidden_disturbance.step(next_state)
+                # Record the per-CV offset just injected (aligned to
+                # cv_indices) so evaluation can surface the otherwise-
+                # invisible unmeasured disturbance on its plots/npz.
+                la = np.asarray(getattr(self._hidden_disturbance,
+                                        'last_applied', []),
+                                dtype='float32').reshape(-1)
+                proc_idx = list(getattr(self._hidden_disturbance,
+                                        'cv_indices', []))
+                for p, idx in enumerate(proc_idx):
+                    if p < la.shape[0] and idx in self.cv_indices:
+                        hidden_applied[self.cv_indices.index(idx)] = la[p]
             except Exception as _hde:
                 if not getattr(self, '_hidden_dist_err_logged', False):
                     import traceback
@@ -1297,6 +1487,12 @@ class APCEnv:
                           f'(further occurrences silenced): {_hde!r}', flush=True)
                     traceback.print_exc()
                     self._hidden_dist_err_logged = True
+        # Accumulate the per-step hidden-disturbance offset for the WM
+        # disturbance-estimator head's supervised target (env-bound capture;
+        # the TrajectoryBuffer pulls the episode trace in add_episode()).
+        trace = getattr(self, '_hidden_disturbance_trace', None)
+        if trace is not None:
+            trace.append(hidden_applied.copy())
         comps = compute_objective_components(
             state=next_state, sim=self.sim,
             control=control, prev_control=self._prev_control,
@@ -1386,6 +1582,7 @@ class APCEnv:
         self._last_mv_violation_sum += float(comps.get('mv_violation_penalty', 0.0))
         info = {'reward_components': comps, 't': self._t,
                 'raw_reward': raw_reward,
+                'hidden_disturbance': hidden_applied,
                 'raw_state': np.asarray(next_state, dtype='float32').copy()}
         return self._window.copy(), reward, done, info
 
@@ -1397,7 +1594,7 @@ class APCEnv:
 class TrajectoryBuffer:
     def __init__(self, capacity_eps: int, episode_length: int,
                  obs_dim: int, action_dim: int,
-                 lookback: int = 0):
+                 lookback: int = 0, n_dist: int = 0):
         # ``lookback`` is accepted for backward-compat with callers that
         # still pass it but is no longer used — the replay buffer stores
         # per-step observations ``(N, T, D)`` rather than per-step
@@ -1423,11 +1620,21 @@ class TrajectoryBuffer:
         # applied ONLY where this is 1.0 (avoids the documented "clone the
         # whole replay buffer → policy collapse" trap).
         self.expert = np.zeros((capacity_eps, self.T), dtype='float32')
+        # Per-step hidden-disturbance target for the WM disturbance-estimator
+        # head (P87).  Allocated only when ``n_dist > 0``; otherwise the
+        # buffer is byte-identical to the pre-P87 layout.  ``_dist_source``
+        # (bound to the single APCEnv) supplies each episode's recorded trace
+        # so the ~10 add_episode call sites need no edits.
+        self.n_dist = int(n_dist)
+        self.dist = (np.zeros((capacity_eps, self.T, self.n_dist), dtype='float32')
+                     if self.n_dist > 0 else None)
+        self._dist_source = None
         self.filled = 0
         self.write = 0
 
     def add_episode(self, obs: np.ndarray, act: np.ndarray, rew: np.ndarray,
-                    cont: np.ndarray, expert: Optional[np.ndarray] = None) -> None:
+                    cont: np.ndarray, expert: Optional[np.ndarray] = None,
+                    dist: Optional[np.ndarray] = None) -> None:
         T = obs.shape[0]
         assert T == self.T, f"episode length mismatch: {T} vs {self.T}"
         assert obs.ndim == 2 and obs.shape[1] == self.obs_dim, (
@@ -1439,6 +1646,20 @@ class TrajectoryBuffer:
         self.cont[i] = cont
         self.expert[i] = (expert if expert is not None
                           else np.zeros(self.T, dtype='float32'))
+        if self.dist is not None:
+            if dist is None and self._dist_source is not None:
+                try:
+                    dist = self._dist_source.pop_episode_disturbance(self.T)
+                except Exception:
+                    dist = None
+            if dist is not None:
+                d = np.asarray(dist, dtype='float32')
+                if d.shape == self.dist.shape[1:]:
+                    self.dist[i] = d
+                else:
+                    self.dist[i] = 0.0
+            else:
+                self.dist[i] = 0.0
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
@@ -1459,6 +1680,8 @@ class TrajectoryBuffer:
         out_rew = np.zeros((batch_size, seq_len), dtype='float32')
         out_cont = np.zeros((batch_size, seq_len), dtype='float32')
         out_expert = np.zeros((batch_size, seq_len), dtype='float32')
+        out_dist = (np.zeros((batch_size, seq_len, self.n_dist), dtype='float32')
+                    if self.dist is not None else None)
         for b in range(batch_size):
             s = starts[b]
             out_obs[b] = self.obs[ep_idx[b], s:s + seq_len]
@@ -1466,8 +1689,13 @@ class TrajectoryBuffer:
             out_rew[b] = self.rew[ep_idx[b], s:s + seq_len]
             out_cont[b] = self.cont[ep_idx[b], s:s + seq_len]
             out_expert[b] = self.expert[ep_idx[b], s:s + seq_len]
-        return {'obs': out_obs, 'act': out_act, 'rew': out_rew,
-                'cont': out_cont, 'expert': out_expert}
+            if out_dist is not None:
+                out_dist[b] = self.dist[ep_idx[b], s:s + seq_len]
+        out = {'obs': out_obs, 'act': out_act, 'rew': out_rew,
+               'cont': out_cont, 'expert': out_expert}
+        if out_dist is not None:
+            out['dist'] = out_dist
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1857,9 +2085,10 @@ def collect_expert_episode(env: APCEnv, cfg: TrainConfig, *,
 
     The expert (``utils.apc_expert.SteadyStateExpert``) emits an engineering
     MV target each step; we map it to the actor's normalised ``[-1, 1]`` space
-    via ``expert.action_norm`` (which uses the STATIC base MV bounds, matching
-    ``env.step``'s action mapping, so the round-trip is exact) and feed that to
-    ``env.step``.  CV/DV feedback is read in engineering units from
+    via ``control_to_action`` (the exact inverse of ``env.step``'s action
+    mapping over the same fixed band — physical envelope or base bounds — so
+    the round-trip is exact) and feed that to ``env.step``.  CV/DV feedback is
+    read in engineering units from
     ``info['raw_state']`` via the simulator metadata denormaliser.
 
     Every transition is flagged ``expert=1`` so the BC loss anchors the policy
@@ -1898,8 +2127,11 @@ def collect_expert_episode(env: APCEnv, cfg: TrainConfig, *,
 
     for t in range(T):
         obs_buf[t] = obs_window[-1]
-        expert.step_eu(last_cv, cv_bounds=cv_bounds_eu, dv_eu=last_dv)
-        a_norm = expert.action_norm().astype('float32').reshape(-1)
+        u_eu = expert.step_eu(last_cv, cv_bounds=cv_bounds_eu, dv_eu=last_dv)
+        # Invert through the SAME mapping basis ``env.step`` uses (physical
+        # envelope when active, else base bounds), so the BC target round-trips
+        # exactly regardless of mapping basis (P86).
+        a_norm = control_to_action(u_eu, env.bounds).astype('float32').reshape(-1)
         if action_jitter > 0.0:
             a_norm = np.clip(
                 a_norm + rng.normal(0.0, action_jitter, size=a_norm.shape),
@@ -2247,8 +2479,194 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
 # Phase 1 / 2 — World model loss (tokenizer recon + shortcut forcing)
 # ---------------------------------------------------------------------------
 
+def _adaptive_return_cap(cfg: TrainConfig) -> Optional[float]:
+    """Option (a): adaptive bounded-return envelope ``k·B/(1-γλ)``.
+
+    Returns the symmetric clamp magnitude for bootstrap target-values and
+    λ-return targets, or ``None`` when disabled / the reward is unbounded
+    (no ``B`` envelope to derive a bound from).  Sim-agnostic: derived purely
+    from ``cfg.bound_training_reward_max``, ``gamma`` and ``gae_lambda``;
+    backbone-independent (applied in the shared λ-return tail of both paths).
+    """
+    if not bool(getattr(cfg, 'return_value_adaptive_cap', True)):
+        return None
+    if not bool(getattr(cfg, 'bound_training_reward', False)):
+        return None
+    B = float(getattr(cfg, 'bound_training_reward_max', 0.0) or 0.0)
+    k = float(getattr(cfg, 'return_value_cap_k', 2.0) or 0.0)
+    if B <= 0.0 or k <= 0.0:
+        return None
+    gamma = float(getattr(cfg, 'gamma', 0.997))
+    lam = float(getattr(cfg, 'gae_lambda', 0.95))
+    gl = max(0.0, min(0.999999, gamma * lam))
+    return k * B / (1.0 - gl)
+
+
+def _critic_anchor_lambda(cfg: TrainConfig) -> float:
+    """Option (B): the λ used by the REPLAY critic anchor's TD-λ recursion.
+
+    Defaults to the imagination ``gae_lambda`` (exact legacy behaviour) when
+    ``critic_anchor_lambda`` is unset.  Setting it ~0.97–1.0 turns the anchor
+    into a near-Monte-Carlo return-to-go over the real context so the critic
+    target sees the FULL long-horizon (multi-cycle) cost contained in the real
+    buffer data.  Decoupled from the cascade-sensitive imagination λ.
+    Clamped to [0, 1].
+    """
+    v = getattr(cfg, 'critic_anchor_lambda', None)
+    if v is None:
+        return float(getattr(cfg, 'gae_lambda', 0.95))
+    return float(max(0.0, min(1.0, float(v))))
+
+
+def _critic_anchor_coef(cfg: TrainConfig) -> float:
+    """Option (B): the anchor weight, optionally raised above the base
+    ``critic_replay_anchor_coef`` so the long-horizon real target can overcome
+    the myopic imagined critic loss.  ``critic_anchor_coef_long=None`` ⇒ use
+    the base coef unchanged (legacy)."""
+    base = float(getattr(cfg, 'critic_replay_anchor_coef', 0.0) or 0.0)
+    long = getattr(cfg, 'critic_anchor_coef_long', None)
+    if long is None:
+        return base
+    return float(max(0.0, float(long)))
+
+
+def _steady_held_mask(obs: torch.Tensor, act: torch.Tensor,
+                       cfg: TrainConfig) -> Optional[torch.Tensor]:
+    """Option (b): adaptive SETTLED + HELD step mask, backbone-independent.
+
+    ``obs`` (B, T, D), ``act`` (B, T, A).  Returns a (B, T-1) float mask that
+    is 1 at step ``t`` when the action is HELD over ``[t, t+1]`` (|Δa| ≤ eps)
+    AND the observation has SETTLED (|Δo| < settle_frac · per-channel batch
+    std — RELATIVE, the fix for the P64 absolute-threshold failure).  Returns
+    ``None`` when the window is too short.  Never NaN.
+    """
+    if obs.dim() != 3 or obs.shape[1] < 2:
+        return None
+    held_eps = float(getattr(cfg, 'wm_steady_held_eps', 0.02))
+    settle_frac = float(getattr(cfg, 'wm_steady_settle_frac', 0.15))
+    da = (act[:, 1:] - act[:, :-1]).abs().amax(dim=-1)            # (B, T-1)
+    held = (da <= held_eps).float()
+    do = (obs[:, 1:] - obs[:, :-1]).abs()                        # (B, T-1, D)
+    ch_std = obs.reshape(-1, obs.shape[-1]).float().std(dim=0).clamp_min(1e-6)
+    settled = (do <= (settle_frac * ch_std)).all(dim=-1).float()  # (B, T-1)
+    return held * settled
+
+
+def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
+                              obs: torch.Tensor, act: torch.Tensor,
+                              cfg: TrainConfig,
+                              ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Option (b), RSSM: held-action one-step fixed-point penalty.
+
+    Reconstructs the posterior RSSMState at each step ``t`` from ``feats``,
+    advances ONE prior step under the action driving ``t+1`` (no sampling),
+    decodes, and penalises ``MSE(pred_obs_{t+1}, obs_{t+1})`` at SETTLED+HELD
+    steps.  Trains the gru+prior+decoder toward a held-action fixed point at
+    observed settled states.  Graceful zero fallback (never NaN).
+    """
+    device = obs.device
+    zero = torch.zeros((), device=device, dtype=feats.dtype)
+    mask = _steady_held_mask(obs, act, cfg)
+    if mask is None or float(mask.sum()) <= 0.0:
+        return zero, {'wm_steady_held_frac': 0.0}
+    from models.dreamer_v4_rssm import RSSMState
+    rssm = model.dynamics
+    B, T = obs.shape[:2]
+    f = feats[:, :-1]                                  # (B, T-1, F)
+    Bm = B * (T - 1)
+    h = f[..., :rssm.deter_dim].reshape(Bm, -1)
+    z_flat = f[..., rssm.deter_dim:]
+    z = z_flat.reshape(Bm, rssm.n_categoricals, rssm.n_classes)
+    state = RSSMState(
+        h=h,
+        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
+                             device=device, dtype=f.dtype),
+        z=z)
+    a_next = act[:, 1:].reshape(Bm, -1)                # action driving t+1
+    nxt = rssm.img_step(state, a_next, sample=False)
+    pred_obs = rssm.decode(nxt.feat).reshape(B, T - 1, -1)
+    tgt = obs[:, 1:].detach()
+    se = (pred_obs - tgt).pow(2).mean(dim=-1)          # (B, T-1)
+    denom = mask.sum().clamp_min(1.0)
+    loss = (se * mask).sum() / denom
+    return loss, {'wm_steady_held_frac': float(mask.mean())}
+
+
+def _sf_steady_consistency(model: DreamerV4, z_clean: torch.Tensor,
+                            obs: torch.Tensor, act: torch.Tensor,
+                            cfg: TrainConfig,
+                            ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Option (b), transformer: explicit held-action anchor at the rollout
+    boundary, complementing the dynamics' native ``sf_bootstrap`` self-
+    consistency (the transformer's intrinsic steady-state mechanism).
+
+    At the final context position, if the action is HELD and the obs has
+    SETTLED, the K-step imagined next-z must decode back to the same settled
+    obs.  One extra (differentiable) ``imagine_next_z`` forward; cheap.
+    Graceful zero fallback (never NaN).
+    """
+    device = obs.device
+    zero = torch.zeros((), device=device, dtype=z_clean.dtype)
+    B, T = obs.shape[:2]
+    if T < 2:
+        return zero, {'wm_steady_held_frac': 0.0}
+    held_eps = float(getattr(cfg, 'wm_steady_held_eps', 0.02))
+    settle_frac = float(getattr(cfg, 'wm_steady_settle_frac', 0.15))
+    da = (act[:, -1] - act[:, -2]).abs().amax(dim=-1)            # (B,)
+    held = (da <= held_eps).float()
+    do = (obs[:, -1] - obs[:, -2]).abs()                        # (B, D)
+    ch_std = obs.reshape(-1, obs.shape[-1]).float().std(dim=0).clamp_min(1e-6)
+    settled = (do <= (settle_frac * ch_std)).all(dim=-1).float()  # (B,)
+    mask = held * settled                                       # (B,)
+    if float(mask.sum()) <= 0.0:
+        return zero, {'wm_steady_held_frac': 0.0}
+    z_next = model.imagine_next_z(z_clean, act[:, -1], k_steps=int(cfg.k_max),
+                                  action_history=act)           # (B, z)
+    pred_obs = model.tokenizer.decode(z_next)                   # (B, D)
+    tgt = obs[:, -1].detach()
+    se = (pred_obs - tgt).pow(2).mean(dim=-1)                   # (B,)
+    denom = mask.sum().clamp_min(1.0)
+    loss = (se * mask).sum() / denom
+    return loss, {'wm_steady_held_frac': float(mask.mean())}
+
+
+def _disturbance_head_loss(model: DreamerV4, feat: torch.Tensor,
+                            dist_target: Optional[torch.Tensor],
+                            recon_loss: torch.Tensor, cfg: TrainConfig,
+                            ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Auxiliary WM disturbance-estimator loss (P87), backbone-agnostic.
+
+    Regresses the hidden/unmeasured disturbance from the world-model feature
+    ``feat`` (RSSM posterior ``[h, z]`` or the transformer agent-register
+    hidden state).  Returns ``(weighted_term, loss_detached, rmse)`` where
+    ``weighted_term`` is what to add to ``wm_total`` (zero when the head is
+    disabled / no target).  Scaled by a soft WM-fidelity gate so a not-yet-
+    converged decoder is not destabilised early in P1.
+    """
+    zero = torch.zeros((), device=feat.device, dtype=feat.dtype)
+    dist_coef = float(getattr(cfg, 'disturbance_loss_scale', 0.0) or 0.0)
+    dist_head = getattr(model, 'disturbance', None)
+    if dist_head is None or dist_target is None or dist_coef <= 0.0:
+        return zero, zero, 0.0
+    dpred = dist_head(feat)
+    if dpred.shape != dist_target.shape:
+        return zero, zero, 0.0
+    dt = dist_target.to(dpred.dtype)
+    dist_loss = F.mse_loss(dpred.float(), dt.float())
+    thr = float(getattr(cfg, 'disturbance_loss_gate_recon', 0.0) or 0.0)
+    if thr > 0.0:
+        gate = torch.clamp(thr / recon_loss.detach().clamp_min(1e-6), max=1.0)
+    else:
+        gate = torch.ones((), device=feat.device)
+    term = dist_coef * gate * dist_loss
+    with torch.no_grad():
+        rmse = float(dist_loss.clamp_min(0.0).sqrt())
+    return term, dist_loss.detach(), rmse
+
+
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                             act: torch.Tensor, cfg: TrainConfig,
+                            dist_target: Optional[torch.Tensor] = None,
                             ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor,
                                         torch.Tensor]:
     """RSSM world-model loss: reconstruction + KL-balanced free-bits.
@@ -2273,11 +2691,36 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
     wm_total = cfg.recon_scale * recon_loss + kl_loss
 
+    # ----- (b) held-action steady-state consistency (RSSM) -----
+    steady_coef = float(getattr(cfg, 'wm_steady_consistency_coef', 0.0) or 0.0)
+    steady_loss = torch.zeros((), device=feats.device)
+    steady_held_frac = 0.0
+    if steady_coef > 0.0:
+        steady_loss, steady_diag = _rssm_steady_consistency(
+            model, feats, obs_cur, act, cfg)
+        steady_held_frac = float(steady_diag.get('wm_steady_held_frac', 0.0))
+        wm_total = wm_total + steady_coef * steady_loss
+
+    # ----- (P87) auxiliary disturbance-estimator head -----
+    # Supervised regression of the hidden/unmeasured disturbance from the
+    # posterior feature, shaping the latent to encode the load state (the
+    # policy reads the same feature) and regularising it toward the smooth
+    # slow-OU target.  Scaled by a soft WM-fidelity gate so a not-yet-
+    # converged decoder is not destabilised early in P1.
+    dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
+        model, feats, dist_target, recon_loss, cfg)
+    wm_total = wm_total + dist_term
+
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
         'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
         'kl_loss': kl_loss,
         'wm_total': wm_total,
+        'wm_steady_loss': steady_loss.detach(),
+        'wm_steady_held_frac': torch.tensor(steady_held_frac,
+                                            device=feats.device),
+        'disturbance_loss': dist_loss,
+        'disturbance_rmse': torch.tensor(dist_rmse, device=feats.device),
     }
     losses.update(kl_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
@@ -2317,7 +2760,8 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # ===== RSSM world-model branch =====
     if getattr(model, 'world_model_type', 'sf_transformer') == 'rssm':
-        return _rssm_world_model_loss(model, obs_cur, act, cfg)
+        return _rssm_world_model_loss(model, obs_cur, act, cfg,
+                                      dist_target=batch.get('dist'))
 
     # Tokenizer with MAE: recon the masked obs.
     z_mae, recon = model.tokenizer.forward_with_mae(obs_cur)
@@ -2347,10 +2791,31 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     out_clean = model.dynamics(z_clean, tau_clean, d_min, act)
     agent_hid = out_clean['agent_hid']
 
+    # ----- (b) held-action steady-state consistency (transformer) -----
+    steady_coef = float(getattr(cfg, 'wm_steady_consistency_coef', 0.0) or 0.0)
+    steady_loss = torch.zeros((), device=device)
+    steady_held_frac = 0.0
+    if steady_coef > 0.0:
+        steady_loss, steady_diag = _sf_steady_consistency(
+            model, z_clean, obs_cur, act, cfg)
+        steady_held_frac = float(steady_diag.get('wm_steady_held_frac', 0.0))
+
+    # ----- (P87) auxiliary disturbance-estimator head (transformer) -----
+    # Same auxiliary supervised head as the RSSM path, reading the agent-
+    # register hidden state ``agent_hid`` (the feature the BC/reward heads
+    # use).  Recon proxy for the fidelity gate is the tokenizer recon loss.
+    dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
+        model, agent_hid, batch.get('dist'), recon_loss, cfg)
+
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
         'sf_loss': sf_loss,
-        'wm_total': cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss,
+        'wm_total': (cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss
+                     + steady_coef * steady_loss + dist_term),
+        'wm_steady_loss': steady_loss.detach(),
+        'wm_steady_held_frac': torch.tensor(steady_held_frac, device=device),
+        'disturbance_loss': dist_loss,
+        'disturbance_rmse': torch.tensor(dist_rmse, device=device),
     }
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away
@@ -2607,12 +3072,20 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # ----- shared tail: λ-returns (eq. 10) -----
     gamma = cfg.gamma
     lam = cfg.gae_lambda
+    # (a) adaptive bounded-return envelope: clamp the bootstrap target-values
+    # so a biased H-step bootstrap from a drifting WM cannot seed a return
+    # runaway (sim-agnostic ±k·B/(1-γλ); None = disabled / unbounded reward).
+    _ret_cap = _adaptive_return_cap(cfg)
+    if _ret_cap is not None:
+        target_values = target_values.clamp(-_ret_cap, _ret_cap)
     returns = torch.zeros_like(target_values)
     returns[:, -1] = target_values[:, -1]
     for t in reversed(range(H - 1)):
         bootstrap = (1.0 - lam) * target_values[:, t + 1] + lam * returns[:, t + 1]
         returns[:, t] = rewards[:, t] + gamma * bootstrap
     target_returns = returns.detach()
+    if _ret_cap is not None:
+        target_returns = target_returns.clamp(-_ret_cap, _ret_cap)
 
     # Critic loss (twohot CE).
     val_logits_flat = value_logits_seq.reshape(-1, value_logits_seq.shape[-1])
@@ -2622,7 +3095,12 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Replay-grounded critic anchor (C) — pin the critic to a TD-λ target
     # built from REAL rewards + slow-target bootstrap on REAL posterior
     # features, preventing the imagined-only growing-negative fixed point.
-    anchor_coef = float(getattr(cfg, 'critic_replay_anchor_coef', 0.0) or 0.0)
+    # (B) The anchor uses its OWN λ (``_critic_anchor_lambda`` — near-MC by
+    # default-off, ~0.97–1.0 when engaged) over the full real context so the
+    # long-horizon (multi-cycle) cost in the real buffer reaches the critic
+    # target; decoupled from the cascade-sensitive imagination ``lam``.
+    anchor_coef = _critic_anchor_coef(cfg)
+    lam_anchor = _critic_anchor_lambda(cfg)
     critic_anchor_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
     if anchor_coef > 0.0:
         rew_real = batch['rew'].to(device=device, dtype=target_returns.dtype)
@@ -2635,13 +3113,17 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         with torch.no_grad():
             tv_real = model.target_value.expectation(
                 model.target_value(feat_real)).view(B, Treal)
+            if _ret_cap is not None:
+                tv_real = tv_real.clamp(-_ret_cap, _ret_cap)
             ret_real = torch.zeros_like(tv_real)
             ret_real[:, -1] = tv_real[:, -1]
             for t in reversed(range(Treal - 1)):
-                boot = (1.0 - lam) * tv_real[:, t + 1] + lam * ret_real[:, t + 1]
+                boot = (1.0 - lam_anchor) * tv_real[:, t + 1] + lam_anchor * ret_real[:, t + 1]
                 ret_real[:, t] = (rew_real[:, t]
                                   + gamma * cont_real[:, t] * boot)
             y_real = ret_real.reshape(-1).detach()
+            if _ret_cap is not None:
+                y_real = y_real.clamp(-_ret_cap, _ret_cap)
         critic_anchor_loss = model.value.loss(val_real_logits, y_real).mean()
         critic_loss = critic_loss + anchor_coef * critic_anchor_loss
 
@@ -2876,12 +3358,18 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # λ-returns (eq. 10).
     gamma = cfg.gamma
     lam = cfg.gae_lambda
+    # (a) adaptive bounded-return envelope (same clamp as the RSSM path).
+    _ret_cap = _adaptive_return_cap(cfg)
+    if _ret_cap is not None:
+        target_values = target_values.clamp(-_ret_cap, _ret_cap)
     returns = torch.zeros_like(target_values)
     returns[:, -1] = target_values[:, -1]
     for t in reversed(range(H - 1)):
         bootstrap = (1.0 - lam) * target_values[:, t + 1] + lam * returns[:, t + 1]
         returns[:, t] = rewards[:, t] + gamma * bootstrap
     target_returns = returns.detach()
+    if _ret_cap is not None:
+        target_returns = target_returns.clamp(-_ret_cap, _ret_cap)
 
     # Critic loss (twohot CE).
     val_logits_flat = value_logits_seq.reshape(-1, value_logits_seq.shape[-1])
@@ -2893,7 +3381,11 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # REAL latents, so the imagined-only targets can't drift into the
     # self-referential growing-negative fixed point that drives the
     # bootstrap cascade (critic_target_v_r→0.95, reward <1% of target var).
-    anchor_coef = float(getattr(cfg, 'critic_replay_anchor_coef', 0.0) or 0.0)
+    # (B) Long-horizon anchor λ (``_critic_anchor_lambda``) decoupled from
+    # the imagination ``lam`` — near-MC return-to-go over the full real
+    # context so the multi-cycle cost reaches the critic target.
+    anchor_coef = _critic_anchor_coef(cfg)
+    lam_anchor = _critic_anchor_lambda(cfg)
     critic_anchor_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
     if anchor_coef > 0.0:
         rew_real = batch['rew'].to(device=device, dtype=target_returns.dtype)
@@ -2906,13 +3398,17 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         with torch.no_grad():
             tv_real = model.target_value.expectation(
                 model.target_value(feat_real)).view(B, Treal)
+            if _ret_cap is not None:
+                tv_real = tv_real.clamp(-_ret_cap, _ret_cap)
             ret_real = torch.zeros_like(tv_real)
             ret_real[:, -1] = tv_real[:, -1]
             for t in reversed(range(Treal - 1)):
-                boot = (1.0 - lam) * tv_real[:, t + 1] + lam * ret_real[:, t + 1]
+                boot = (1.0 - lam_anchor) * tv_real[:, t + 1] + lam_anchor * ret_real[:, t + 1]
                 ret_real[:, t] = (rew_real[:, t]
                                   + gamma * cont_real[:, t] * boot)
             y_real = ret_real.reshape(-1).detach()
+            if _ret_cap is not None:
+                y_real = y_real.clamp(-_ret_cap, _ret_cap)
         critic_anchor_loss = model.value.loss(val_real_logits, y_real).mean()
         critic_loss = critic_loss + anchor_coef * critic_anchor_loss
 
@@ -3065,6 +3561,9 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
+        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
+        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
     )
     model = DreamerV4(model_cfg)
     # Optional torch.compile (set via TrainConfig.compile_mode or env var).
@@ -4097,6 +4596,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     cfg.state_dim = env.state_dim
     cfg.aug_obs_dim = env.aug_obs_dim
     cfg.obs_dim = env.obs_dim
+    # P87: size the WM disturbance-estimator head per-simulator (one output
+    # per CV channel).  0 ⇒ no head (pre-P87 model).  Resolved here so every
+    # downstream builder (build_model) and the replay buffer agree.
+    cfg.disturbance_head_dim = (int(len(env.cv_indices))
+                                if bool(getattr(cfg, 'disturbance_head', True))
+                                else 0)
 
     # A' : enable potential-based reward shaping on the TRAINING env only.
     # Validation builds its own APCEnv instances (evaluation/validate.py)
@@ -4535,7 +5040,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     capacity_eps = max(1, cfg.buffer_capacity_steps // cfg.episode_length)
     buf = TrajectoryBuffer(capacity_eps, cfg.episode_length,
-                            cfg.obs_dim, cfg.action_dim)
+                            cfg.obs_dim, cfg.action_dim,
+                            n_dist=int(getattr(cfg, 'disturbance_head_dim', 0) or 0))
+    # P87: bind the single training env so add_episode() can pull each
+    # episode's recorded hidden-disturbance trace (zero call-site edits).
+    if buf.dist is not None:
+        buf._dist_source = env
 
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -6339,7 +6849,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             from tools.wm_steady_state_diagnostic import (
                 run_wm_steady_state_diagnostic)
             n_starts = int(os.environ.get('DREAMER_WM_DIAG_N_STARTS', '8'))
-            horizon = int(os.environ.get('DREAMER_WM_DIAG_HORIZON', '200'))
+            # (c) value-equivalence: probe horizon adaptive to the training
+            # horizon H (default max(200, 8·H)) so large-H sims aren't under-
+            # probed and small-H sims still get the long structural drift
+            # signal; the diagnostic separately reports convergence AT H.
+            _H_train = int(getattr(cfg, 'horizon', 15))
+            _diag_h_default = max(200, 8 * _H_train)
+            horizon = int(os.environ.get('DREAMER_WM_DIAG_HORIZON',
+                                          str(_diag_h_default)))
             # Force CUDA for inline diagnostics: the auto-picker reads
             # nvidia-smi util, which sees *our own* training process as
             # "GPU busy" and falls back to CPU — making the WM rollout

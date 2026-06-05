@@ -320,6 +320,7 @@ class HiddenDisturbanceProcess:
             self.d: np.ndarray = np.zeros(0, dtype='float64')
             self.tau_dist: np.ndarray = np.zeros(0, dtype='float64')
             self.drift: np.ndarray = np.zeros(0, dtype='float64')
+            self.last_applied: np.ndarray = np.zeros(0, dtype='float64')
             self._is_normalized: bool = bool(getattr(sim, 'state_is_normalized', False))
             return
 
@@ -382,6 +383,10 @@ class HiddenDisturbanceProcess:
         # always within the authority cap.
         self.drift = float(drift_frac) * self.amp
         self._rng = rng
+        # Per-step CV offset actually injected (d + drift), aligned to
+        # ``cv_indices`` order.  Exposed so evaluation can record/plot the
+        # otherwise-invisible unmeasured disturbance the agent rejected.
+        self.last_applied = np.zeros(n_cv, dtype='float64')
 
     def is_empty(self) -> bool:
         return len(self.cv_indices) == 0
@@ -401,6 +406,7 @@ class HiddenDisturbanceProcess:
         eps = self._rng.normal(0.0, 1.0, size=self.d.shape)
         sigma_drive = np.sqrt(np.maximum(2.0 * a - a * a, 1e-12)) * self.amp
         self.d = (1.0 - a) * self.d + sigma_drive * eps
+        self.last_applied = (self.d + self.drift).astype('float64')
         for pos, idx in enumerate(self.cv_indices):
             state[int(idx)] = float(state[int(idx)]) + float(self.d[pos]) + float(self.drift[pos])
         # If the sim publishes state in normalized [0,1] space, clip back

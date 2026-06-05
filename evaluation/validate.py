@@ -35,7 +35,7 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -327,6 +327,11 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     current_mv_bounds_t = np.zeros((T, n_mv_aux, 2), dtype='float32')
     current_cv_bounds_t = np.zeros((T, n_cv_aux, 2), dtype='float32')
     current_cv_targets_t = np.zeros((T, n_cv_aux), dtype='float32')
+    # Per-step hidden (unmeasured) OU disturbance offset injected into each
+    # CV channel (aligned to ``env.cv_indices``).  Surfaces the otherwise-
+    # invisible disturbance the agent had to reject.
+    n_cv_h = len(env.cv_indices)
+    hidden_dist_t = np.zeros((T, n_cv_h), dtype='float32')
 
     # V4 streaming inference: maintain a rolling action history alongside
     # the env-provided observation window. At each step we encode the
@@ -391,6 +396,10 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         scaled_rewards[t] = float(scaled_r)
         cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
         mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
+        hd = info.get('hidden_disturbance')
+        if hd is not None:
+            hd = np.asarray(hd, dtype='float32').reshape(-1)
+            hidden_dist_t[t, :min(n_cv_h, hd.shape[0])] = hd[:n_cv_h]
         if n_mv_aux > 0:
             current_mv_bounds_t[t] = np.asarray(
                 env.setpoint_mgr.current_mv_bounds, dtype='float32')
@@ -437,6 +446,7 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         'current_mv_bounds_t': current_mv_bounds_t[:t + 1],
         'current_cv_bounds_t': current_cv_bounds_t[:t + 1],
         'current_cv_targets_t': current_cv_targets_t[:t + 1],
+        'hidden_disturbance_t': hidden_dist_t[:t + 1],
         'reward_scale': float(env.reward_scale),
     }
 
@@ -1079,6 +1089,7 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
     cur_mv_b_t = _arr_t('current_mv_bounds_t')
     cur_cv_b_t = _arr_t('current_cv_bounds_t')
     cur_cv_tgt_t = _arr_t('current_cv_targets_t')
+    hidden_dist_t = _arr_t('hidden_disturbance_t')
     schedule = ep['schedule']
     T = ep['episode_length']
     t_arr = np.arange(T)
@@ -1130,6 +1141,7 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
                          'bounds_t': bounds_t,
                          'norm': norm, 'target': target,
                          'target_t': target_t,
+                         'cv_ord': k,
                          'color': '#2ca02c'})
 
     n_rows = max(1, len(channels)) + 2  # + cum reward + reward/violation companion
@@ -1290,7 +1302,39 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
             ax.axhline(float(target), color='#1b5e20', linestyle='-.',
                         linewidth=1.4, label=f'Target ({float(target):g})')
 
-        # Pad y-limits to include bounds + norm so steps stay visible.
+        # Unmeasured (hidden OU) disturbance overlay — only on CV rows.
+        # The disturbance is added to the CV state and is invisible to the
+        # agent/WM; plotting ``ref + offset`` lets the operator see the
+        # magnitude/shape of what the controller had to reject.  ``ref`` is
+        # the active target if enabled, else the active-band centre, else
+        # the series mean, so the dotted trace sits on the CV's own scale.
+        cv_ord = ch.get('cv_ord')
+        if (ch.get('group') == 'cv' and cv_ord is not None
+                and hidden_dist_t.ndim == 2
+                and cv_ord < hidden_dist_t.shape[1]
+                and np.any(np.abs(hidden_dist_t[:, cv_ord]) > 1e-9)):
+            hcol = np.asarray(hidden_dist_t[:, cv_ord], dtype='float32')
+            nH = min(hcol.shape[0], len(t_arr))
+            # Reference level the offset is drawn relative to.
+            if (target_t is not None and isinstance(target_t, np.ndarray)
+                    and target_t.ndim == 1 and target_t.size >= 1
+                    and np.any(np.isfinite(target_t))):
+                ref = np.asarray(target_t[:nH], dtype='float32')
+            elif target is not None and np.isfinite(target):
+                ref = np.full(nH, float(target), dtype='float32')
+            elif (bounds is not None and len(bounds) >= 2
+                    and np.isfinite(bounds[0]) and np.isfinite(bounds[1])):
+                ref = np.full(nH, 0.5 * (float(bounds[0]) + float(bounds[1])),
+                              dtype='float32')
+            else:
+                fin = series[np.isfinite(series)] if isinstance(series, np.ndarray) else None
+                ref = np.full(nH, float(np.mean(fin)) if fin is not None and fin.size else 0.0,
+                              dtype='float32')
+            ax.plot(t_arr[:nH], ref + hcol[:nH], color='#ff7f0e',
+                     lw=1.1, ls=':', alpha=0.85,
+                     label='unmeasured disturbance (hidden)')
+
+
         finite = series[np.isfinite(series)] if isinstance(series, np.ndarray) else None
         lo = float(np.min(finite)) if finite is not None and finite.size else None
         hi = float(np.max(finite)) if finite is not None and finite.size else None
@@ -1553,6 +1597,9 @@ def run_validation(*,
         rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
+        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
+        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
         attn_impl=getattr(cfg, 'attn_impl', 'auto'),
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1578,13 +1625,28 @@ def run_validation(*,
     # default (mean=0, var=1) stats — which is also what those models
     # were effectively trained with.
     obs_norm_state = ckpt_obj.get('obs_norm') if isinstance(ckpt_obj, dict) else None
-    for s in range(int(seeds)):
-        seed = 10_000 + s  # held-out from training (which used SEED=0..N).
+    # Seed plan: the standard held-out seeds at the curriculum-suppressed
+    # hidden-disturbance amplitude (phase=1/progress=0, ~10% of nominal —
+    # keeps these comparable across runs), PLUS one dedicated seed at the
+    # FULL phase-3 unmeasured-disturbance magnitude so the operator can see
+    # how the agent rejects a realistic unmeasured load.  Gated by
+    # ``DREAMER_VAL_UNMEASURED_SEED`` (default ON).
+    seed_plan: List[Tuple[int, bool]] = [(10_000 + s, False)
+                                          for s in range(int(seeds))]
+    if str(os.environ.get('DREAMER_VAL_UNMEASURED_SEED', '1')).strip().lower() \
+            not in ('0', 'false', 'no', 'off'):
+        seed_plan.append((10_000 + int(seeds), True))
+    for seed, unmeasured_full in seed_plan:
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
         # Force the hidden OU disturbance on every validation episode so
         # the agent is always tested on its disturbance-rejection skill.
         env._hidden_disturbance_force = True
+        if unmeasured_full:
+            # Lift the curriculum so the hidden OU runs at full phase-3
+            # amplitude (curriculum_amp_scale cap 1.0, ramp at progress=1).
+            env._current_phase = 3
+            env._training_progress = 1.0
         if obs_norm_state is not None:
             try:
                 env.set_obs_norm_stats(
@@ -1604,8 +1666,10 @@ def run_validation(*,
             except Exception:
                 env.reward_scale = 1.0
 
-        per_seed_dir = out_dir / f'seed_{seed:05d}'
+        per_seed_dir = out_dir / (f'seed_{seed:05d}_unmeasured'
+                                   if unmeasured_full else f'seed_{seed:05d}')
         per_seed_dir.mkdir(parents=True, exist_ok=True)
+        _ttl_sfx = '  [FULL unmeasured disturbance]' if unmeasured_full else ''
 
         eps = []
         for e in range(int(episodes)):
@@ -1613,7 +1677,7 @@ def run_validation(*,
             title = (f'seed={seed} ep={e}  T={ep["episode_length"]}  '
                      f'cum_raw={ep["cum_raw_reward"]:+.2f}  '
                      f'mean_cv_v={ep["mean_cv_violation"]:.4f}  '
-                     f'mean_mv_v={ep["mean_mv_violation"]:.4f}')
+                     f'mean_mv_v={ep["mean_mv_violation"]:.4f}{_ttl_sfx}')
             plot_episode(ep, per_seed_dir / f'ep_{e:02d}.png', title=title)
             eps.append(ep)
             metrics_records.append({
@@ -1658,6 +1722,9 @@ def run_validation(*,
                     ev.pop('_hold_value_raw', None)
                 env_b = APCEnv(cfg, np.random.default_rng(seed + 1))
                 env_b._hidden_disturbance_force = True
+                if unmeasured_full:
+                    env_b._current_phase = 3
+                    env_b._training_progress = 1.0
                 if obs_norm_state is not None:
                     try:
                         env_b.set_obs_norm_stats(
@@ -1701,7 +1768,8 @@ def run_validation(*,
                        f'IAE={ep_metrics["iae_normed_mean"]:.2f}  '
                        f'overshoot_max={ev_metrics["overshoot_normed"]["max"]:.3f}'
                        + (f'   |  baseline IAE={base_metrics["iae_normed_mean"]:.2f}'
-                          if base_metrics is not None else ''))
+                          if base_metrics is not None else '')
+                       + _ttl_sfx)
             ann = plot_disturbance_rejection(
                 ep_d, per_seed_dir / 'disturbance_rejection.png',
                 title=d_title, ep_baseline=ep_b, event_metrics=ev_metrics)
@@ -1763,6 +1831,9 @@ def run_validation(*,
                     current_cv_targets_t=np.asarray(
                         ep_d.get('current_cv_targets_t',
                                    np.zeros((0, 0))), dtype='float32'),
+                    hidden_disturbance_t=np.asarray(
+                        ep_d.get('hidden_disturbance_t',
+                                   np.zeros((0, 0))), dtype='float32'),
                     sample_rate=np.asarray([int(ep_d.get('sample_rate', 1))],
                                              dtype='int64'),
                     episode_length=np.asarray([int(ep_d.get('episode_length',
@@ -1801,7 +1872,7 @@ def run_validation(*,
 
     plot_summary(seed_results, out_dir / 'summary.png',
                   title=f'{controller_dir.name}  validation summary  '
-                        f'({seeds} seeds × {episodes} eps)')
+                        f'({len(seed_results)} seeds × {episodes} eps)')
 
     # ---- Training-stage + WM-fidelity diagnostics ------------------------
     # Run once per validation invocation on a fresh env so we don't pay

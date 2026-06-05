@@ -182,6 +182,15 @@ def _as_bool(s: str) -> bool:
     return str(s).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')
 
 
+def _as_opt_float(s: str):
+    """Parse an env-var string into Optional[float].  Empty / ``none`` /
+    ``null`` -> None (use the TrainConfig default); otherwise float."""
+    v = str(s).strip().lower()
+    if v in ('', 'none', 'null', 'na', 'default'):
+        return None
+    return float(s)
+
+
 ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAE_LAMBDA':         ('gae_lambda',                 float),
     'DREAMER_PHASE1_FRAC':        ('phase1_frac',                float),
@@ -296,6 +305,19 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Both sim-agnostic dimensionless coefficients.
     'DREAMER_REWARD_SHAPING_COEF':        ('reward_shaping_coef',            float),
     'DREAMER_CRITIC_REPLAY_ANCHOR_COEF':  ('critic_replay_anchor_coef',      float),
+    # (B) P85 (2026-06-04): long-horizon critic-anchor grounding.  The
+    # replay anchor's own λ (decoupled from the cascade-sensitive
+    # imagination ``gae_lambda``) — ~0.97–1.0 turns it into a near-MC
+    # return-to-go over the real context so a constraint-riding limit cycle
+    # whose period exceeds the myopic ~10-step credit horizon becomes
+    # visible in the critic target.  ``_LONG`` optionally raises the anchor
+    # weight so the long target overcomes the myopic imagined critic loss.
+    # Both None (unset) ⇒ exact legacy behaviour.  Sim-agnostic.
+    'DREAMER_CRITIC_ANCHOR_LAMBDA':       ('critic_anchor_lambda',           _as_opt_float),
+    'DREAMER_CRITIC_ANCHOR_COEF_LONG':    ('critic_anchor_coef_long',        _as_opt_float),
+    'DREAMER_MV_HARD_CLAMP':              ('mv_hard_clamp',                  _as_bool),
+    'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
+    'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``rssm`` (default) vs ``sf_transformer``; RSSM categorical-latent
     # sizes and KL-balance knobs.  See TrainConfig for paper rationale.
@@ -341,6 +363,19 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_EXPERT_BC_P3':               ('expert_bc_p3',                   _as_bool),
     'DREAMER_EXPERT_BC_P3_FLOOR':         ('expert_bc_p3_floor',             float),
     'DREAMER_EXPERT_BC_P3_ADAPTIVE_SCALE': ('expert_bc_p3_adaptive_scale',   _as_bool),
+    # (a) adaptive bounded-return envelope (default ON; both backbones).
+    'DREAMER_RETURN_VALUE_ADAPTIVE_CAP':  ('return_value_adaptive_cap',      _as_bool),
+    'DREAMER_RETURN_VALUE_CAP_K':         ('return_value_cap_k',             float),
+    # (b) WM held-action steady-state consistency loss (default ON; both backbones).
+    'DREAMER_WM_STEADY_CONSISTENCY_COEF': ('wm_steady_consistency_coef',     float),
+    'DREAMER_WM_STEADY_SETTLE_FRAC':      ('wm_steady_settle_frac',          float),
+    'DREAMER_WM_STEADY_HELD_EPS':         ('wm_steady_held_eps',             float),
+    # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
+    'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
+    'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),
+    'DREAMER_DISTURBANCE_LOSS_GATE_RECON':('disturbance_loss_gate_recon',    float),
+    'DREAMER_DISTURBANCE_HEAD_HIDDEN':    ('disturbance_head_hidden',        int),
+    'DREAMER_DISTURBANCE_HEAD_LAYERS':    ('disturbance_head_layers',        int),
 }
 
 
