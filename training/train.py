@@ -741,6 +741,19 @@ class TrainConfig:
     clean_steady_seeds: bool = True
     process_noise_curriculum: bool = True
 
+    # ---- (P90, 2026-06-06) freeze WM after P1 (critic/WM coherence) ----
+    # The WM's held-action fixed point is UNSTABLE — it converges mid-P1 then
+    # RE-DRIFTS during continued P2 training (P90 probe: conv 1.0->0.0).  With
+    # this ON, the WM CORE (dynamics + encoder/decoder; tokenizer for SF) is
+    # frozen (requires_grad=False) at the P1->P2 boundary AFTER the wm_best
+    # warm-restore, and stays frozen through P2 and P3.  The REWARD head keeps
+    # training (it is in parameters_world but must warm up in P2), the policy
+    # (P2 BC) and value (P3) train normally.  Result: the critic warms up on
+    # EXACTLY the WM that P3 + the post-training diagnostics use, and the
+    # fixed point cannot re-drift.  Default OFF (paper co-trains the WM
+    # throughout); opt-in via DREAMER_WM_FREEZE_AFTER_P1=1.
+    wm_freeze_after_p1: bool = False
+
     # ---- #2 (P88, 2026-06-05): multi-step latent overshooting ----
     # Dreamer-v3 trains the prior ONLY one step ahead (the KL term), so the
     # open-loop imagination rollout the actor depends on compounds error every
@@ -5702,13 +5715,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # shows it converges mid-P1 (conv=1.0) then RE-DRIFTS during P2 (conv→0).
     # The WM is then FROZEN at the end-of-P2 (drifted) state for all of P3 and
     # for the post-training steady-state/transfer diagnostics, so a genuinely
-    # converged WM that existed earlier is silently discarded (P90 RCA: wm_best
-    # held iter-60 conv=1.0 but final.pt measured 0% convergence).  Restoring
-    # the conv-aware wm_best at the P2→P3 freeze hands P3 + validation the BEST
-    # (most-converged) WM, not the last one.  Disable with
-    # DREAMER_WM_BEST_RESTORE_AT_P3=0.
+    # converged WM that existed earlier is silently discarded (P90 RCA).
+    # CAVEAT (default OFF): this is a FULL-model reload, so it ALSO resets the
+    # reward head + policy to the wm_best (early) checkpoint — wiping P2's
+    # reward-MTP + policy-BC warmup.  Prefer ``wm_freeze_after_p1`` (surgical:
+    # freezes only the WM CORE via requires_grad, preserving reward/policy
+    # training).  Opt in with DREAMER_WM_BEST_RESTORE_AT_P3=1 only if not using
+    # the freeze.
     wm_best_restore_at_p3 = bool(int(
-        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P3', '1') or 0))
+        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P3', '0') or 0))
+    # P90: freeze the WM core after P1 (restore best at P1→P2, then no WM-core
+    # training in P2/P3) for critic/WM coherence + drift immunity.  cfg flag,
+    # env-overridable via DREAMER_WM_FREEZE_AFTER_P1.
+    wm_freeze_after_p1 = bool(getattr(cfg, 'wm_freeze_after_p1', False))
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
@@ -6204,6 +6223,25 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         print(f"[p1→p2] WM warm-restore failed: {_e} "
                               f"— continuing with current weights",
                               flush=True)
+                # P90: freeze the WM CORE for P2+P3 (after the restore) so the
+                # critic warms up on the exact WM P3 uses and the fixed point
+                # can't re-drift.  Freeze dynamics (+ tokenizer for SF); KEEP
+                # the reward head trainable (it is in parameters_world but must
+                # warm up in P2).
+                if wm_freeze_after_p1:
+                    _nfz = 0
+                    for _p in model.dynamics.parameters():
+                        _p.requires_grad_(False)
+                        _nfz += 1
+                    if (getattr(model, 'world_model_type', 'sf_transformer')
+                            != 'rssm'
+                            and getattr(model, 'tokenizer', None) is not None):
+                        for _p in model.tokenizer.parameters():
+                            _p.requires_grad_(False)
+                            _nfz += 1
+                    print(f"[p1→p2] WM CORE FROZEN ({_nfz} param tensors) "
+                          f"for P2+P3 — reward/policy/value still train; "
+                          f"critic warms up on the P3 WM", flush=True)
             if es_enable and current_phase == 2 and new_phase == 3:
                 # End of P2: is reward MTP head learning?
                 max_rmtp = float(getattr(cfg, 'early_stop_p2_max_reward_mtp_loss',
@@ -6470,7 +6508,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                               enabled=(device.type == 'cuda')):
                         ag_losses = agent_finetune_loss(model, batch,
                                                           agent_hid, cfg)
-                    total_loss = wm_losses['wm_total'] + ag_losses['agent_total']
+                    if wm_freeze_after_p1:
+                        # P90: WM core frozen in P2 — drop wm_total (its grads
+                        # would hit frozen params).  The reward head still
+                        # trains via agent_total→reward-MTP (it is NOT frozen).
+                        total_loss = ag_losses['agent_total']
+                    else:
+                        total_loss = wm_losses['wm_total'] + ag_losses['agent_total']
                 elif current_phase == 1:
                     # P1: WM losses + (optional) reward-head MTP.
                     # Paper default: reward_scale_loss_p1 = 0 (reward

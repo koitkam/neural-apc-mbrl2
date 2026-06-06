@@ -383,6 +383,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # SHAPE_WEIGHTS}.  These two booleans gate the cfg-level behaviour.
     'DREAMER_CLEAN_STEADY_SEEDS':         ('clean_steady_seeds',             _as_bool),
     'DREAMER_PROCESS_NOISE_CURRICULUM':   ('process_noise_curriculum',       _as_bool),
+    'DREAMER_WM_FREEZE_AFTER_P1':         ('wm_freeze_after_p1',             _as_bool),
     # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),

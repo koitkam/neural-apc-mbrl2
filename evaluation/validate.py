@@ -1144,6 +1144,27 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
                          'cv_ord': k,
                          'color': '#2ca02c'})
 
+    # Dedicated UNMEASURED (hidden) disturbance INPUT rows — one per CV that
+    # actually received a hidden disturbance.  Plots the raw injected offset
+    # (engineering units, zero baseline) as its OWN panel so the operator can
+    # directly SEE the unmeasured load the controller had to reject and line
+    # it up against the CV-response panel above (the agent/WM never observe
+    # this signal).  With the P90 realistic schedule this reveals the event
+    # SHAPE (step / ramp / pulse / drift), timing, and persistence.
+    if hidden_dist_t.ndim == 2 and hidden_dist_t.shape[0] > 0:
+        for k, i in enumerate(cv_idx):
+            if k >= hidden_dist_t.shape[1]:
+                continue
+            col = np.asarray(hidden_dist_t[:, k], dtype='float32')
+            if not np.any(np.abs(col) > 1e-9):
+                continue
+            channels.append({'group': 'hidden', 'series': col,
+                             'label': f'{_name(i, f"CV[{i}]")} — unmeasured '
+                                       f'disturbance input (hidden)',
+                             'bounds': None, 'bounds_t': None, 'norm': None,
+                             'target': None, 'target_t': None,
+                             'color': '#e76f51'})
+
     n_rows = max(1, len(channels)) + 2  # + cum reward + reward/violation companion
     fig, axes = plt.subplots(n_rows, 1,
                               figsize=(13, max(4.0, 2.0 * n_rows)),
@@ -1197,6 +1218,20 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
             continue
         ax.plot(t_arr[:len(series)], series, color=ch['color'], lw=1.2,
                 label=ch['label'])
+
+        # Dedicated unmeasured-disturbance INPUT panel: zero baseline + fill
+        # so the injected load's shape/magnitude is unmistakable.  No bounds/
+        # target/baseline overlays apply (the rest of the loop no-ops for this
+        # group since bounds/norm/target are None).
+        if ch.get('group') == 'hidden':
+            m = len(series)
+            ax.axhline(0.0, color='#6c757d', lw=0.8, ls='-', alpha=0.6)
+            ax.fill_between(t_arr[:m], 0.0, series[:m],
+                             color=ch['color'], alpha=0.20)
+            ax.set_ylabel('Δ disturbance\n(eng. units)', fontsize=8)
+            ax.legend(loc='upper right', fontsize=7, framealpha=0.6)
+            ax.grid(True, alpha=0.3)
+            continue
 
         # Baseline overlay (constant-MV episode under same schedule).
         # The baseline is the same for every seed and channel: it shows
