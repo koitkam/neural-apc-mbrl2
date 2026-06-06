@@ -1369,6 +1369,13 @@ class DreamerV4(nn.Module):
                     int(getattr(_dynamo.config, 'cache_size_limit', 8)), 128)
             except Exception:
                 pass
+            # Production safety net: if ANY graph fails to compile at runtime
+            # (e.g. an un-warmed branch hit only deep into a long run), fall
+            # back to eager for that graph instead of crashing the whole run.
+            try:
+                _dynamo.config.suppress_errors = True
+            except Exception:
+                pass
             if self.world_model_type == 'rssm':
                 # RSSM hot path is ``rollout_observed`` (always called with a
                 # static (B, seq_len) batch in every phase — the SF-transformer's
@@ -1382,9 +1389,24 @@ class DreamerV4(nn.Module):
                 # keeps the WM launch-bound at ~16% GPU util.
                 self.dynamics.rollout_observed = torch.compile(
                     self.dynamics.rollout_observed, mode=mode, dynamic=False)
+                # img_step is the per-step hot path in BOTH P3 imagination and
+                # the #2 latent-overshoot loop (max_starts x len calls/iter) —
+                # the dominant compute cost the imagination/overshoot loops
+                # incur OUTSIDE rollout_observed (which they bypass).  Static
+                # (B, ...) shape so dynamic=False captures it cleanly.  Wrapped
+                # separately so a failure here does not lose the proven
+                # rollout_observed compile.
+                try:
+                    self.dynamics.img_step = torch.compile(
+                        self.dynamics.img_step, mode=mode, dynamic=False)
+                    _imgs = '+ img_step'
+                except Exception as _e2:
+                    _imgs = '(img_step skipped)'
+                    print(f'[dreamer_v4] img_step compile skipped ({_e2!r})',
+                          flush=True)
                 self._compiled = True
                 print(f'[dreamer_v4] torch.compile(mode={mode}, dynamic=False) '
-                      f'enabled on RSSM rollout_observed', flush=True)
+                      f'enabled on RSSM rollout_observed {_imgs}', flush=True)
             else:
                 self.dynamics = torch.compile(self.dynamics, mode=mode,
                                                 dynamic=True)

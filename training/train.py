@@ -3716,14 +3716,22 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
     )
     model = DreamerV4(model_cfg)
-    # Optional torch.compile (set via TrainConfig.compile_mode or env var).
+    # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths
+    # (RSSM rollout_observed + img_step; transformer dynamics + tokenizer);
+    # ``maybe_compile`` falls back to eager on any failure.  Precedence:
+    # ``cfg.compile_mode`` (``DREAMER_COMPILE_MODE``) > ``DREAMER_COMPILE`` env
+    # > default-on.  Disable with ``DREAMER_COMPILE=0`` / ``off`` / ``false``.
     cm = (cfg.compile_mode or '').strip()
-    if not cm:
-        env_cm = os.environ.get('DREAMER_COMPILE', '').strip()
-        if env_cm in ('1', 'true', 'True'):
-            cm = 'default'
-        elif env_cm:
-            cm = env_cm
+    if cm.lower() in ('0', 'off', 'false', 'none', 'no'):
+        cm = ''                                   # explicit cfg/env-mode disable
+    elif not cm:
+        env_cm = os.environ.get('DREAMER_COMPILE', '').strip().lower()
+        if env_cm in ('0', 'off', 'false', 'no'):
+            cm = ''                               # explicitly disabled
+        elif env_cm and env_cm not in ('1', 'true', 'yes'):
+            cm = env_cm                           # explicit mode string
+        else:
+            cm = 'default'                        # DEFAULT ON (unset / 1 / true)
     if cm:
         model.maybe_compile(mode=cm)
     return model

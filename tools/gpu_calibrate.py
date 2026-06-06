@@ -110,7 +110,7 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
                                horizon: int, k_max: int, sample_rate: int,
                                obs_dim: int, action_dim: int,
                                paper_default: int = 16, max_bs: int = 512,
-                               target_util: float = 0.65,
+                               target_util: float = 0.80,
                                bs_probe: int = 4,
                                wm_overhead_factor: float = 1.0) -> dict:
     """Empirically size the batch by measuring actual WM fwd+bwd peak
@@ -154,6 +154,11 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
     # Mirror the world-model backbone the run will actually build so the
     # measured per-sample memory matches.  Env overrides take precedence
     # over the TrainConfig defaults (which already select the RSSM).
+    # Disable torch.compile for the probe: build_model() now compiles by
+    # default, but the probe only needs a quick EAGER fwd+bwd to measure
+    # memory — compiling would add ~2 min of inductor warmup to startup and
+    # the eager-peak + overhead_factor already sizes the batch conservatively.
+    cfg.compile_mode = 'off'
     wmt = (os.environ.get('DREAMER_WORLD_MODEL_TYPE', '').strip()
            or str(getattr(cfg, 'world_model_type', 'rssm')))
     cfg.world_model_type = wmt
@@ -279,7 +284,7 @@ def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
                                horizon: int, k_max: int, sample_rate: int,
                                episode_length: int,
                                paper_default: int = 16, max_bs: int = 512,
-                               target_util: float = 0.65,
+                               target_util: float = 0.80,
                                bs_probe: int = 4,
                                wm_overhead_factor: float = 1.0) -> dict:
     """High-level entry: discover ``(obs_dim, action_dim)`` from the
