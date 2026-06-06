@@ -18,7 +18,8 @@ Run (CPU, do not disturb a live GPU run):
 import torch
 
 from training.train import (TrainConfig, build_model, world_model_loss,
-                            imagination_step, _wm_latent_overshoot_loss)
+                            imagination_step, _wm_latent_overshoot_loss,
+                            _wm_held_rollout_stationarity_loss)
 
 
 def _mk(obs_dim=6, action_dim=2, wm_type='rssm'):
@@ -60,6 +61,8 @@ def _run(wm_type):
     assert 'wm_overshoot_loss' in losses, 'overshoot key missing'
     ov0 = float(losses['wm_overshoot_loss'])
     assert ov0 == 0.0, f'overshoot must be 0 by default, got {ov0}'
+    assert float(losses.get('wm_held_rollout_loss', 0.0)) == 0.0, \
+        'held-rollout must be 0 by default'
     print(f'[smoke] OK  default wm_overshoot_loss == 0 ({wm_type})')
 
     diag = imagination_step(model, batch, cfg)
@@ -121,6 +124,39 @@ def _run(wm_type):
         assert ov2 == 0.0, f'SF overshoot must be 0 (no-op), got {ov2}'
         print('[smoke] OK  #2 SF no-op (overshoot == 0)')
     cfg.wm_overshoot_coef = 0.0
+
+    # ---- (b2) held-action rollout stationarity (RSSM real; SF no-op) ----
+    cfg.wm_held_rollout_coef = 0.5
+    cfg.wm_held_rollout_len = 12
+    cfg.wm_held_rollout_settle_frac = 0.5
+    cfg.wm_held_rollout_win = 2
+    cfg.wm_held_rollout_max_starts = 6
+    lossesh, _, _ = world_model_loss(model, batch, cfg)
+    assert 'wm_held_rollout_loss' in lossesh, 'held key missing'
+    hv = float(lossesh['wm_held_rollout_loss'])
+    assert torch.isfinite(lossesh['wm_total']).all()
+    lossesh['wm_total'].backward()
+    if wm_type == 'rssm':
+        assert hv > 0.0, f'RSSM held-rollout loss must be > 0, got {hv}'
+        print(f'[smoke] OK  (b2) RSSM held-rollout loss={hv:.4f}')
+        # KEY: the held-rollout gradient must reach the PRIOR (sample=True ST).
+        feats, *_ = model.dynamics.rollout_observed(
+            batch['obs'], batch['act'], sample=True)
+        model.zero_grad(set_to_none=True)
+        h_loss, S = _wm_held_rollout_stationarity_loss(
+            model, feats, batch['obs'], batch['act'], cfg)
+        h_loss.backward()
+        prior_grad = sum(
+            float(p.grad.abs().sum()) for p in model.dynamics.prior_net.parameters()
+            if p.grad is not None)
+        assert prior_grad > 0.0, \
+            'held-rollout gradient did NOT reach prior_net (sample path broken)'
+        print(f'[smoke] OK  (b2) held-rollout grad reaches prior_net '
+              f'(|g|={prior_grad:.4f}, S={S:.0f})')
+    else:
+        assert hv == 0.0, f'SF held-rollout must be 0 (no-op), got {hv}'
+        print('[smoke] OK  (b2) SF no-op (held-rollout == 0)')
+    cfg.wm_held_rollout_coef = 0.0
 
     print(f'[smoke] ALL OVERSHOOT/CRITIC CHECKS PASSED ({wm_type})')
 

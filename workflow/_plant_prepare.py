@@ -370,6 +370,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_STEADY_CONSISTENCY_COEF': ('wm_steady_consistency_coef',     float),
     'DREAMER_WM_STEADY_SETTLE_FRAC':      ('wm_steady_settle_frac',          float),
     'DREAMER_WM_STEADY_HELD_EPS':         ('wm_steady_held_eps',             float),
+    'DREAMER_WM_HELD_ROLLOUT_COEF':       ('wm_held_rollout_coef',           float),
+    'DREAMER_WM_HELD_ROLLOUT_LEN':        ('wm_held_rollout_len',            int),
+    'DREAMER_WM_HELD_ROLLOUT_SETTLE_FRAC':('wm_held_rollout_settle_frac',    float),
+    'DREAMER_WM_HELD_ROLLOUT_WIN':        ('wm_held_rollout_win',            int),
+    'DREAMER_WM_HELD_ROLLOUT_MAX_STARTS': ('wm_held_rollout_max_starts',     int),
+    'DREAMER_WM_HELD_ROLLOUT_GATE_RECON': ('wm_held_rollout_gate_recon',     float),
     # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),

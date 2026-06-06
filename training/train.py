@@ -747,6 +747,29 @@ class TrainConfig:
     # encoder/decoder convergence.  ``<=0`` disables the gate (always full).
     wm_overshoot_gate_recon: float = 0.1
 
+    # ---- (b2, P89, 2026-06-06): multi-step HELD-ACTION rollout stationarity --
+    # The existing ``wm_steady_consistency`` term only fires on NATURALLY held+
+    # settled replay segments (p88c: held_frac mean 0.84%, max 6.3%) and is a
+    # single-step ``sample=False`` fixed point — far too starved/shallow to stop
+    # the MULTI-step compounding drift the steady-state diagnostic shows (0% WM
+    # convergence under a held action at H_train).  This term ACTIVELY CREATES
+    # the held condition: from strided starts it rolls the PRIOR forward ``len``
+    # steps under the action HELD CONSTANT (``sample=True`` straight-through so
+    # the stochastic prior is trained), then penalises the NET DRIFT of the
+    # deterministic state ``h`` between an early post-transient window and the
+    # final window — "once you stop changing the action, you must stop moving".
+    # GAIN-NEUTRAL by construction (penalises tail DISPLACEMENT, not magnitude;
+    # the transient ``[0, settle)`` is unconstrained so overshoot/recon still set
+    # the gain) and RSSM-only (the SF backbone uses its native sf_bootstrap plus
+    # the ``_sf_steady_consistency`` anchor).  ``coef=0`` = OFF.  Env
+    # DREAMER_WM_HELD_ROLLOUT_{COEF,LEN,SETTLE_FRAC,WIN,MAX_STARTS,GATE_RECON}.
+    wm_held_rollout_coef: float = 0.0
+    wm_held_rollout_len: int = 64          # K prior steps under the HELD action
+    wm_held_rollout_settle_frac: float = 0.5   # early window starts at frac·K
+    wm_held_rollout_win: int = 8           # window length for drift averaging
+    wm_held_rollout_max_starts: int = 12   # cap start positions (stride) for cost
+    wm_held_rollout_gate_recon: float = 0.1    # soft recon-fidelity ramp gate
+
     # ----- MTP -----
     # mtp_length: bumped 8 → 32 on 2026-05-21 (p31 RCA).  The MTP head
     # provides the only training pressure that asks the WM to predict
@@ -2777,6 +2800,84 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     return loss, float(S)
 
 
+def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
+                                        obs: torch.Tensor, act: torch.Tensor,
+                                        cfg: TrainConfig,
+                                        recon_loss: Optional[torch.Tensor] = None,
+                                        ) -> Tuple[torch.Tensor, float]:
+    """Option (b2, P89): multi-step HELD-ACTION rollout stationarity.
+
+    Complements the 1-step ``_rssm_steady_consistency`` (which only fires on the
+    rare naturally held+settled replay steps — p88c held_frac≈0.84%) by ACTIVELY
+    creating the held condition: from a strided set of start positions ``t`` we
+    reconstruct the posterior RSSMState, hold the action at ``a_t`` CONSTANT and
+    roll the PRIOR forward ``K`` steps (``sample=True`` straight-through so the
+    stochastic prior receives gradient), then penalise the NET DRIFT of the
+    deterministic state ``h`` between an early post-transient window
+    ``[s, s+win)`` (``s = settle_frac·K``) and the final window ``[K-win, K)``.
+
+    Rationale: the steady-state diagnostic shows the WM imagination DRIFTS under
+    a held action (0% convergence) instead of reaching a fixed point.  Measuring
+    the net displacement of ``h`` between two late windows (a) averages out the
+    categorical sampling noise, (b) is GAIN-NEUTRAL — it constrains only the
+    tail DISPLACEMENT, never the response magnitude, and leaves the transient
+    ``[0, s)`` free so the overshoot/recon terms still set the gain — and (c) is
+    scale-robust (normalised by the rollout's own ``h`` std).  RSSM-only;
+    returns ``(0, 0.0)`` for the SF backbone.  Cost ~ O(B·max_starts·K) GRU
+    steps, bounded by ``wm_held_rollout_max_starts``.  ``sample=True`` so the
+    straight-through categorical grad trains the PRIOR (the drift source).
+    """
+    coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
+    K = int(getattr(cfg, 'wm_held_rollout_len', 0) or 0)
+    device = obs.device
+    zero = torch.zeros((), device=device, dtype=obs.dtype)
+    if coef <= 0.0 or K < 4:
+        return zero, 0.0
+    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+        return zero, 0.0
+    from models.dreamer_v4_rssm import RSSMState
+    rssm = model.dynamics
+    B, T = obs.shape[:2]
+    win = max(1, int(getattr(cfg, 'wm_held_rollout_win', 8) or 8))
+    s = int(float(getattr(cfg, 'wm_held_rollout_settle_frac', 0.5) or 0.5) * K)
+    # keep the two averaging windows non-overlapping inside [0, K)
+    s = max(win, min(s, K - 2 * win))
+    if s < win or K - win <= s + win:
+        return zero, 0.0
+    max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 12) or 12))
+    stride = max(1, T // max_starts)
+    starts = torch.arange(0, T, stride, device=device)            # (S,)
+    S = int(starts.numel())
+    f0 = feats[:, starts]                                         # (B, S, F)
+    Bm = B * S
+    h = f0[..., :rssm.deter_dim].reshape(Bm, -1)
+    z = f0[..., rssm.deter_dim:].reshape(
+        Bm, rssm.n_categoricals, rssm.n_classes)
+    state = RSSMState(
+        h=h,
+        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
+                             device=device, dtype=f0.dtype),
+        z=z)
+    a_hold = act[:, starts].reshape(Bm, -1).detach()              # HELD action a_t
+    hs = []
+    for _ in range(K):
+        state = rssm.img_step(state, a_hold, sample=True)
+        hs.append(state.h)                                       # (B*S, deter)
+    Hroll = torch.stack(hs, dim=1)                               # (B*S, K, deter)
+    h_scale = Hroll.detach().std().clamp_min(1e-3)
+    early = Hroll[:, s:s + win].mean(dim=1)                      # (B*S, deter)
+    late = Hroll[:, K - win:].mean(dim=1)                        # (B*S, deter)
+    loss = ((late - early) / h_scale).pow(2).mean()
+    # Soft recon-fidelity gate (mirror overshoot): ramp the term in only as
+    # 1-step recon converges so an untrained decoder/prior is not destabilised
+    # early in P1.  ``gate_recon<=0`` disables.
+    thr = float(getattr(cfg, 'wm_held_rollout_gate_recon', 0.0) or 0.0)
+    if thr > 0.0 and recon_loss is not None:
+        gate = torch.clamp(thr / recon_loss.detach().clamp_min(1e-6), max=1.0)
+        loss = gate * loss
+    return loss, float(S)
+
+
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                             act: torch.Tensor, cfg: TrainConfig,
                             dist_target: Optional[torch.Tensor] = None,
@@ -2830,6 +2931,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
     wm_total = wm_total + overshoot_coef * overshoot_loss
 
+    # ----- (b2, P89) multi-step held-action rollout stationarity (RSSM) -----
+    held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
+    held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
+        model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+    wm_total = wm_total + held_coef * held_loss
+
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
         'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
@@ -2843,6 +2950,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'wm_overshoot_loss': overshoot_loss.detach(),
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=feats.device),
+        'wm_held_rollout_loss': held_loss.detach(),
     }
     losses.update(kl_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
@@ -2942,12 +3050,18 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
         model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
 
+    # ----- (b2, P89) held-action rollout stationarity — RSSM-ONLY (SF no-op) --
+    held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
+    held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
+        model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
+
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
         'sf_loss': sf_loss,
         'wm_total': (cfg.recon_scale * recon_loss + cfg.sf_scale * sf_loss
                      + steady_coef * steady_loss + dist_term
-                     + overshoot_coef * overshoot_loss),
+                     + overshoot_coef * overshoot_loss
+                     + held_coef * held_loss),
         'wm_steady_loss': steady_loss.detach(),
         'wm_steady_held_frac': torch.tensor(steady_held_frac, device=device),
         'disturbance_loss': dist_loss,
@@ -2955,6 +3069,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'wm_overshoot_loss': overshoot_loss.detach(),
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=device),
+        'wm_held_rollout_loss': held_loss.detach(),
     }
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away
