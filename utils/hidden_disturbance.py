@@ -50,6 +50,14 @@ from typing import Dict, List, Optional
 import numpy as np
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var with a fallback (never raises)."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+
+
 def hidden_disturbance_enabled(default: bool = True) -> bool:
     """Whether the hidden CV disturbance is active.
 
@@ -193,7 +201,10 @@ def get_phase_disturbance_prob(
         gradually broadens buffer coverage without destabilising the
         still-updating WM.
       - **P3 (actor + critic)**: ramp on ``phase_progress`` from the P2
-        cap (0.20) to ``DREAMER_DISTURBANCE_PROB_AGENT`` (default 0.50).
+        cap (0.20) to ``DREAMER_DISTURBANCE_PROB_AGENT`` (default 0.30,
+        P89: was 0.50 — 50 % hidden-upset episodes corrupted too much of
+        the actor's gradient and never let the CV settle; a realistic
+        plant sees occasional upsets, ~20-30 % of the time).
         Reaches the P3 cap by ``DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH``
         (default 0.5 = midpoint of P3). Rationale: actor needs to learn
         observable tracking before robust rejection; a step to 0.50 from
@@ -207,10 +218,10 @@ def get_phase_disturbance_prob(
     if int(phase) >= 3:
         try:
             p3_cap = float(np.clip(
-                float(os.environ.get('DREAMER_DISTURBANCE_PROB_AGENT', '0.5')),
+                float(os.environ.get('DREAMER_DISTURBANCE_PROB_AGENT', '0.3')),
                 0.0, 1.0))
         except Exception:
-            p3_cap = 0.5
+            p3_cap = 0.3
         try:
             p3_floor = float(np.clip(
                 float(os.environ.get('DREAMER_DISTURBANCE_PROB_P2', '0.2')),
@@ -425,6 +436,239 @@ class HiddenDisturbanceProcess:
         }
 
 
+def _cv_amp_caps(sim, amp_frac: float,
+                  identifier_ctx: Optional[Dict] = None):
+    """Per-CV steady-state disturbance amplitude cap.
+
+    Returns ``(amp, is_normalized, spans)`` with ``amp`` aligned to
+    ``sim.cv_indices``: ``amp[pos] = amp_frac * min(cv_span, MV->CV
+    authority)`` so a hidden disturbance never exceeds a fraction of what
+    the agent can rebalance by moving the MV across its op-band.  Converted
+    to normalized units when the sim publishes normalized state.  Shared by
+    the legacy OU process and the realistic event schedule.
+    """
+    cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
+    is_norm = bool(getattr(sim, 'state_is_normalized', False))
+    n_cv = len(cv_indices)
+    if n_cv == 0:
+        return np.zeros(0, dtype='float64'), is_norm, np.zeros(0, dtype='float64')
+    cv_ranges = list(getattr(sim, 'cv_normalization_ranges', []))
+    spans = np.ones(n_cv, dtype='float64')
+    for pos in range(n_cv):
+        if 0 <= pos < len(cv_ranges):
+            lo, hi = float(cv_ranges[pos][0]), float(cv_ranges[pos][1])
+            if hi > lo:
+                spans[pos] = hi - lo
+    mv_authority_cv = 0.0
+    try:
+        from utils.training_disturbance import compute_mv_authority_to_cv
+        mv_authority_cv = float(
+            compute_mv_authority_to_cv(sim, identifier_ctx) or 0.0)
+    except Exception:
+        mv_authority_cv = 0.0
+    amp_eng = np.empty(n_cv, dtype='float64')
+    for pos in range(n_cv):
+        cap_authority = (amp_frac * mv_authority_cv
+                          if mv_authority_cv > 1e-9 else float('inf'))
+        amp_eng[pos] = min(amp_frac * spans[pos], cap_authority)
+    if is_norm:
+        amp = amp_eng / np.maximum(spans, 1e-9)
+    else:
+        amp = amp_eng
+    return amp.astype('float64'), is_norm, spans
+
+
+class HiddenDisturbanceSchedule:
+    """Per-episode schedule of realistic, sim-adaptive unmeasured-CV events.
+
+    Replaces the single always-on OU drift (``HiddenDisturbanceProcess``)
+    with a sequence of discrete disturbance EVENTS of varied:
+
+      * **shape** — ``step`` (instant load change), ``ramp`` (gradual
+        drift to a new level), ``pulse`` (temporary excursion that returns),
+        ``ou_drift`` (a noisy/rough patch);
+      * **timing** — sometimes ISOLATED with ≥ settling-time gaps (each
+        event reaches steady state before the next), sometimes OVERLAPPING /
+        serial (a new upset arrives before the previous settles);
+      * **persistence** — some events REVERT to baseline (ramp back down),
+        some HOLD permanently (a lasting operating-point shift).
+
+    This mimics how a real chemical plant experiences unmeasured upsets
+    (feed-composition shifts, ambient changes, fouling, slugs) instead of a
+    constant high-frequency wiggle.  Every timescale is sim-adaptive: derived
+    from the identified dead time + dominant time constant (settling time);
+    every magnitude is capped by the agent's MV->CV authority.  The schedule
+    is **never exposed** to the agent or WM (truly unmeasured).
+
+    Drop-in for ``HiddenDisturbanceProcess``: ``is_empty()``, ``step(state)``
+    (in place; advances an internal step counter), ``last_applied`` (per
+    ``cv_indices``), ``summary()``.
+
+    Env knobs (all optional; sim-adaptive defaults):
+      ``DREAMER_HIDDEN_DIST_SETTLE_NTAU``   settle = dead + N·tau   (default 4)
+      ``DREAMER_HIDDEN_DIST_MAX_EVENTS``    cap on events/episode   (default 6)
+      ``DREAMER_HIDDEN_DIST_P_ISOLATED``    P(gap ≥ settle)         (default 0.5)
+      ``DREAMER_HIDDEN_DIST_P_REVERT``      P(event reverts)        (default 0.5)
+      ``DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS`` "step,ramp,pulse,ou"    (default 0.3,0.3,0.2,0.2)
+    """
+
+    def __init__(self, rng: np.random.Generator, sim, *,
+                 tau_dom: float, sample_rate: float, dead_time: float,
+                 episode_length: int, amp_frac: float = 0.10,
+                 identifier_ctx: Optional[Dict] = None) -> None:
+        self.sim = sim
+        self.cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
+        n_cv = len(self.cv_indices)
+        self._rng = rng
+        self._t = -1
+        self.last_applied = np.zeros(max(n_cv, 0), dtype='float64')
+        amp, is_norm, _spans = _cv_amp_caps(sim, float(amp_frac), identifier_ctx)
+        self._is_norm = is_norm
+        self.amp_cap = amp
+        self.events: List[Dict] = []
+        self._settle = 0.0
+        self._tau_steps = 0.0
+        if n_cv == 0 or (amp.size and float(np.max(np.abs(amp))) <= 0.0):
+            return
+
+        sr = max(1e-6, float(sample_rate))
+        tau_steps = max(1.0, float(tau_dom) / sr)         # agent steps
+        dead_steps = max(0.0, float(dead_time) / sr)
+        n_settle = _env_float('DREAMER_HIDDEN_DIST_SETTLE_NTAU', 4.0)
+        settle = max(2.0, dead_steps + n_settle * tau_steps)
+        self._settle = float(settle)
+        self._tau_steps = float(tau_steps)
+        T = int(episode_length)
+        max_events = int(_env_float('DREAMER_HIDDEN_DIST_MAX_EVENTS', 6.0))
+        p_isolated = float(np.clip(
+            _env_float('DREAMER_HIDDEN_DIST_P_ISOLATED', 0.5), 0.0, 1.0))
+        p_revert = float(np.clip(
+            _env_float('DREAMER_HIDDEN_DIST_P_REVERT', 0.5), 0.0, 1.0))
+        shapes = ['step', 'ramp', 'pulse', 'ou_drift']
+        weights = self._shape_weights()
+
+        n_budget = int(np.clip(round(T / (1.5 * settle)), 1, max(1, max_events)))
+        events: List[Dict] = []
+        t = float(rng.uniform(0.0, settle))
+        while len(events) < n_budget and t < (T - tau_steps):
+            pos = int(rng.integers(0, n_cv))
+            shape = str(rng.choice(shapes, p=weights))
+            sign = 1.0 if rng.uniform() < 0.5 else -1.0
+            mag = sign * float(rng.uniform(0.4, 1.0)) * float(self.amp_cap[pos])
+            if shape == 'step':
+                rise = 0.0
+            elif shape == 'pulse':
+                rise = float(rng.uniform(0.3, 0.8)) * tau_steps
+            else:  # ramp / ou_drift
+                rise = float(rng.uniform(0.5, 1.5)) * tau_steps
+            if shape == 'pulse':
+                hold = float(rng.uniform(0.5, 1.5)) * tau_steps
+                revert = True
+            elif shape == 'ou_drift':
+                hold = float(rng.uniform(1.0, 3.0)) * tau_steps
+                revert = bool(rng.uniform() < p_revert)
+            else:  # step / ramp held toward steady state
+                hold = float(rng.uniform(0.5, 2.0)) * settle
+                revert = bool(rng.uniform() < p_revert)
+            fall = (float(rng.uniform(0.5, 1.5)) * tau_steps) if revert else 0.0
+            tau_dist = float(rng.uniform(0.15, 0.5)) * tau_steps
+            alpha = (float(np.clip(1.0 / max(tau_dist, 1.0), 1e-3, 1.0))
+                     if shape == 'ou_drift' else 0.0)
+            events.append({
+                'pos': pos, 'shape': shape, 'mag': float(mag),
+                'start': float(t), 'rise': float(rise), 'hold': float(hold),
+                'fall': float(fall), 'revert': bool(revert),
+                'alpha': float(alpha), 'ou': 0.0,
+            })
+            dur = rise + hold + fall
+            if rng.uniform() < p_isolated:
+                gap = settle * (1.0 + float(rng.uniform(0.0, 1.0)))
+            else:
+                gap = settle * float(rng.uniform(0.2, 0.8))
+            t = t + dur + gap
+        self.events = events
+
+    def _shape_weights(self) -> np.ndarray:
+        default = np.array([0.30, 0.30, 0.20, 0.20], dtype='float64')
+        raw = os.environ.get('DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS', '').strip()
+        if raw:
+            try:
+                w = np.array([float(x) for x in raw.split(',')], dtype='float64')
+                if w.size == 4 and w.sum() > 0:
+                    return w / w.sum()
+            except Exception:
+                pass
+        return default
+
+    def is_empty(self) -> bool:
+        return len(self.cv_indices) == 0 or len(self.events) == 0
+
+    def _event_value(self, ev: Dict, local: float) -> float:
+        """Signed offset contributed by ``ev`` at local time ``local`` (≥0)."""
+        shape = ev['shape']
+        mag = ev['mag']
+        rise = ev['rise']
+        hold = ev['hold']
+        fall = ev['fall']
+        if shape == 'ou_drift':
+            active_len = rise + hold
+            if local >= active_len:
+                ev['ou'] = 0.0
+                return 0.0
+            a = ev['alpha']
+            eps = self._rng.normal(0.0, 1.0)
+            sigma_drive = np.sqrt(max(2.0 * a - a * a, 1e-12)) * abs(mag)
+            ev['ou'] = (1.0 - a) * ev['ou'] + sigma_drive * eps
+            env_scale = min(1.0, local / rise) if rise > 0 else 1.0
+            return float(ev['ou']) * env_scale
+        # deterministic step / ramp / pulse
+        if local < rise:
+            return mag * (local / rise) if rise > 0 else mag
+        if local < rise + hold:
+            return mag
+        if ev['revert']:
+            f = local - (rise + hold)
+            if f < fall:
+                return mag * (1.0 - f / fall) if fall > 0 else 0.0
+            return 0.0
+        return mag  # permanent hold (non-reverting step/ramp)
+
+    def step(self, state: np.ndarray) -> None:
+        """Advance one step; add the active events' offsets to CV channels."""
+        n_cv = len(self.cv_indices)
+        if n_cv == 0:
+            return
+        self._t += 1
+        t = self._t
+        off = np.zeros(n_cv, dtype='float64')
+        for ev in self.events:
+            local = t - ev['start']
+            if local < 0:
+                continue
+            off[ev['pos']] += self._event_value(ev, float(local))
+        self.last_applied = off
+        for pos, idx in enumerate(self.cv_indices):
+            if off[pos] != 0.0:
+                state[int(idx)] = float(state[int(idx)]) + float(off[pos])
+        if self._is_norm:
+            for idx in self.cv_indices:
+                state[int(idx)] = float(np.clip(state[int(idx)], 0.0, 1.0))
+
+    def summary(self) -> Dict:
+        return {
+            'mode': 'schedule',
+            'n_events': len(self.events),
+            'cv_indices': list(self.cv_indices),
+            'settle_steps': float(self._settle),
+            'tau_steps': float(self._tau_steps),
+            'events': [
+                {k: ev[k] for k in ('pos', 'shape', 'mag', 'start',
+                                     'rise', 'hold', 'fall', 'revert')}
+                for ev in self.events
+            ],
+        }
+
+
 def maybe_build_hidden_disturbance(
     rng: np.random.Generator,
     sim,
@@ -437,7 +681,9 @@ def maybe_build_hidden_disturbance(
     force: bool = False,
     progress: float = 0.0,
     phase: Optional[int] = None,
-) -> Optional[HiddenDisturbanceProcess]:
+    dead_time: float = 0.0,
+    episode_length: int = 0,
+):
     """Bernoulli-toggle the per-episode hidden disturbance process.
 
     Returns ``None`` for clean episodes so the WM also sees some clean
@@ -449,6 +695,14 @@ def maybe_build_hidden_disturbance(
     per-episode jitter / drift DR knobs (Stage C #5) to produce the
     effective ``amp_frac`` and ``drift_frac`` for this episode.
     ``phase`` (optional) selects the phase-aware amp cap (P1/P2 vs P3).
+
+    Two models (``DREAMER_HIDDEN_DIST_MODE``):
+      * ``schedule`` (default, P89): a realistic sim-adaptive EVENT schedule
+        with varied shapes (step/ramp/pulse/ou_drift), realistic timing
+        (sometimes isolated + held to steady state, sometimes overlapping)
+        and persistence (revert vs hold).  Needs ``episode_length``.
+      * ``ou``: legacy always-on per-episode OU drift
+        (``HiddenDisturbanceProcess``).
     """
     if not hidden_disturbance_enabled(default=True):
         return None
@@ -461,6 +715,24 @@ def maybe_build_hidden_disturbance(
     curr_scale = curriculum_amp_scale(float(progress), phase=phase)
     jitter = _sample_amp_jitter(rng)
     eff_amp_frac = float(amp_frac) * float(curr_scale) * float(jitter)
+
+    mode = os.environ.get('DREAMER_HIDDEN_DIST_MODE', 'schedule').strip().lower()
+    if mode in ('schedule', 'events', 'realistic') and int(episode_length) > 0:
+        sched = HiddenDisturbanceSchedule(
+            rng=rng,
+            sim=sim,
+            tau_dom=float(tau_dom),
+            sample_rate=float(sample_rate),
+            dead_time=float(dead_time),
+            episode_length=int(episode_length),
+            amp_frac=eff_amp_frac,
+            identifier_ctx=identifier_ctx,
+        )
+        if sched.is_empty():
+            return None
+        return sched
+
+    # ----- legacy OU drift -----
     drift_frac = _sample_drift_frac(rng)
     proc = HiddenDisturbanceProcess(
         rng=rng,

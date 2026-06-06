@@ -51,6 +51,49 @@ def _span(bounds):
     return max(1e-6, abs(hi - lo))
 
 
+def noise_curriculum_scale(progress: float,
+                            phase: Optional[int] = None) -> float:
+    """P1 process+measurement noise amplitude curriculum (P89, 2026-06-06).
+
+    Returns a multiplier in ``[0, 1]`` applied to BOTH the OU process noise
+    and the white measurement noise (via ``SimNoiseWrapper.set_noise_scale``)
+    so the world model can learn the clean base dynamics + a held-action
+    fixed point first, then face progressively realistic noise.
+
+    Rationale (P89 RCA): the WM never converged under a held action because
+    its training data never contained a clean settled trajectory \u2014 process
+    OU (≈1.3 % span, ~133-step correlation) + measurement noise are on in
+    100 % of episodes, so the plant never sits still.  Ramping noise from ~0
+    lets P1 establish the attractor before noise is added.
+
+    Schedule: ``DREAMER_PROCESS_NOISE_AMP_RAMP="<start>:<reach>"`` (default
+    ``"0.0:0.4"`` \u2014 start fully clean, reach full noise by 40 % progress).
+    ``start``: scale at ``progress=0``.  ``reach``: progress fraction at which
+    the scale reaches 1.0.  Phase-aware: **P3 always returns 1.0** (the WM is
+    frozen and the actor must learn to reject realistic-magnitude noise);
+    P1/P2 follow the ramp.  Disable the curriculum entirely (full noise from
+    step 0, legacy behaviour) with ``DREAMER_PROCESS_NOISE_AMP_RAMP=1.0:1e-6``
+    or by setting ``process_noise_curriculum=False`` on the cfg.
+    """
+    if phase is not None and int(phase) >= 3:
+        return 1.0
+    raw = os.environ.get('DREAMER_PROCESS_NOISE_AMP_RAMP', '0.0:0.4').strip()
+    if not raw:
+        return 1.0
+    try:
+        start_str, reach_str = raw.split(':')
+        start = float(start_str)
+        reach = float(reach_str)
+    except Exception:
+        return 1.0
+    p = float(np.clip(progress, 0.0, 1.0))
+    start = float(np.clip(start, 0.0, 1.0))
+    reach = float(np.clip(reach, 1e-6, 1.0))
+    if p >= reach:
+        return 1.0
+    return float(min(1.0, start + (1.0 - start) * (p / reach)))
+
+
 def _theta_from_tau(tau_dominant: float, sample_rate: int = 1) -> float:
     """Derive OU mean-reversion rate from the dominant time constant.
 

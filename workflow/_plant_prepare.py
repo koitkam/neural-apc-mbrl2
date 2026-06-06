@@ -376,6 +376,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_HELD_ROLLOUT_WIN':        ('wm_held_rollout_win',            int),
     'DREAMER_WM_HELD_ROLLOUT_MAX_STARTS': ('wm_held_rollout_max_starts',     int),
     'DREAMER_WM_HELD_ROLLOUT_GATE_RECON': ('wm_held_rollout_gate_recon',     float),
+    # (P89) noise curriculum + clean steady-state seeds (default ON).  The
+    # process-noise ramp + per-event hidden-disturbance schedule knobs are read
+    # straight from os.environ (not cfg fields): DREAMER_PROCESS_NOISE_AMP_RAMP,
+    # DREAMER_HIDDEN_DIST_{MODE,SETTLE_NTAU,MAX_EVENTS,P_ISOLATED,P_REVERT,
+    # SHAPE_WEIGHTS}.  These two booleans gate the cfg-level behaviour.
+    'DREAMER_CLEAN_STEADY_SEEDS':         ('clean_steady_seeds',             _as_bool),
+    'DREAMER_PROCESS_NOISE_CURRICULUM':   ('process_noise_curriculum',       _as_bool),
     # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),

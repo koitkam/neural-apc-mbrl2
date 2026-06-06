@@ -570,6 +570,15 @@ class SimNoiseWrapper:
 
         self._has_noise = bool(self._ou_sources or self._meas_noise)
 
+        # Global per-episode noise amplitude scale (P89, 2026-06-06).
+        # Multiplies BOTH OU process noise and white measurement noise on
+        # every step.  Set to 0.0 to make an episode fully noise-free (the
+        # clean held-action steady-state seeds need this so the WM gets pure
+        # fixed-point supervision), or to a curriculum value in (0, 1] to ramp
+        # noise in over P1 (``noise_curriculum_scale``).  Default 1.0 = full
+        # configured noise (legacy behaviour).
+        self._noise_scale: float = 1.0
+
         # --- Apply domain-randomization % to sim's randomizer -------------
         dr_cfg = cfg.get('domain_randomization')
         if isinstance(dr_cfg, dict):
@@ -586,6 +595,21 @@ class SimNoiseWrapper:
 
     # -- Intercepted methods -----------------------------------------------
 
+    def set_noise_scale(self, scale: float) -> None:
+        """Set the global noise amplitude multiplier for subsequent steps.
+
+        ``scale=0.0`` → fully noise-free (clean steady-state seeds);
+        ``scale=1.0`` → full configured noise.  Values in between ramp the
+        process-OU + measurement noise together (P1 noise curriculum).
+        Persists until changed; ``reset()`` does NOT clear it (the caller
+        — APCEnv.reset — re-sets it every episode), so a value set after a
+        reset stays in force for that episode.
+        """
+        try:
+            self._noise_scale = float(max(0.0, scale))
+        except Exception:
+            self._noise_scale = 1.0
+
     def _jitter_noise_amplitudes(self):
         """Randomize noise gains/sigmas within ±jitter_pct of base values."""
         pct = self._noise_jitter_pct
@@ -598,15 +622,17 @@ class SimNoiseWrapper:
 
     def step(self, action):
         state, done = self._sim.step(action)
-        if self._has_noise and not done:
+        scale = self._noise_scale
+        if self._has_noise and not done and scale > 0.0:
             for ou in self._ou_sources:
                 state[ou.index] = float(np.clip(
-                    float(state[ou.index]) + ou.sample(),
+                    float(state[ou.index]) + ou.sample() * scale,
                     ou.lo, ou.hi,
                 ))
             for mn in self._meas_noise:
                 state[mn.index] = float(np.clip(
-                    float(state[mn.index]) + self._rng.standard_normal() * mn.sigma,
+                    float(state[mn.index])
+                    + self._rng.standard_normal() * mn.sigma * scale,
                     mn.lo, mn.hi,
                 ))
             if hasattr(self._sim, 'episode_array'):

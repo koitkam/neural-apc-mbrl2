@@ -518,10 +518,16 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
                                      seed: int = 20260520,
                                      protocols: Optional[Tuple[str, ...]] = None,
                                      noise_free: bool = True,
+                                     output_dir: Optional[Path] = None,
                                      ) -> Dict:
     """Run the diagnostic; write JSON (+ plot if matplotlib available).
 
     Args:
+        output_dir: directory the ``wm_steady_state_diagnostic.{json,png}``
+            are written to.  Defaults to ``run_dir`` (legacy/CLI).  The inline
+            training caller passes ``run_dir/'validation'`` so the WM probes
+            live alongside the other validation artifacts (P89).  The ckpt is
+            still located under ``run_dir``.
         noise_free: when True (default), zero out all stochastic sources
             on the env (OU process noise, measurement noise, curriculum
             disturbances, domain randomization) so the probe measures a
@@ -534,6 +540,8 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
     Returns the result dict.
     """
     run_dir = Path(run_dir)
+    out_dir = Path(output_dir) if output_dir is not None else run_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
     device, dev_reason = _pick_device()
     ckpt_path = _find_ckpt(run_dir, ckpt_name)
     print(f'[wm-ss-diag] ckpt={ckpt_path.name}  device={device}  ({dev_reason})',
@@ -618,14 +626,14 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
             {p: results[p]['agg'].get('mae_at_H_train') for p in results},
     }
     out = {'verdict': verdict, 'results': results}
-    out_path = run_dir / 'wm_steady_state_diagnostic.json'
+    out_path = out_dir / 'wm_steady_state_diagnostic.json'
     with open(out_path, 'w') as f:
         json.dump(out, f, indent=2)
     print(f'[wm-ss-diag] wrote {out_path}', flush=True)
 
     # Optional plot.
     try:
-        _save_plot(run_dir, out)
+        _save_plot(out_dir, out)
     except Exception as e:
         print(f'[wm-ss-diag] plot skipped: {e!r}', flush=True)
 

@@ -56,6 +56,7 @@ from utils.hidden_disturbance import (
     get_phase_disturbance_prob,
     maybe_build_hidden_disturbance,
 )
+from utils.noise_config import noise_curriculum_scale
 from utils.derived_observations import (
     DerivedFeatures,
     derived_observables_enabled,
@@ -724,6 +725,22 @@ class TrainConfig:
     wm_steady_settle_frac: float = 0.15   # settled if |Δobs| < frac·channel_std
     wm_steady_held_eps: float = 0.02      # action held if |Δact| ≤ eps (norm)
 
+    # ---- (P89, 2026-06-06) noise curriculum + clean steady-state seeds ----
+    # P89 RCA: the WM never learned a held-action fixed point because its
+    # training data never contained a clean settled trajectory — process OU
+    # (~1.3 % span, ~133-step correlation) + measurement noise are on in 100 %
+    # of episodes (incl. the const-action steady-state seeds).  Two fixes:
+    #  (A) ``clean_steady_seeds`` — fully disable process OU + measurement
+    #      noise for the held-action steady-state seed episodes so the WM gets
+    #      pure fixed-point supervision (DREAMER_CLEAN_STEADY_SEEDS=0 to off).
+    #  (B) ``process_noise_curriculum`` — ramp process+measurement noise from
+    #      ~0 to full over P1 (DREAMER_PROCESS_NOISE_AMP_RAMP="start:reach",
+    #      default 0.0:0.4) so the WM learns base dynamics + the attractor
+    #      first.  P3 always full noise (robust rejection).  Set False / ramp
+    #      "1.0:1e-6" for legacy full-noise-from-step-0.
+    clean_steady_seeds: bool = True
+    process_noise_curriculum: bool = True
+
     # ---- #2 (P88, 2026-06-05): multi-step latent overshooting ----
     # Dreamer-v3 trains the prior ONLY one step ahead (the KL term), so the
     # open-loop imagination rollout the actor depends on compounds error every
@@ -1309,6 +1326,19 @@ class APCEnv:
         except Exception:
             self._training_progress = 0.0
 
+    def set_sim_noise_scale(self, scale: float) -> None:
+        """Set the global process+measurement noise multiplier on the sim
+        noise wrapper (P89).  ``0.0`` = fully clean episode (steady-state
+        seeds); ``1.0`` = full configured noise.  No-op when the underlying
+        sim has no ``SimNoiseWrapper`` (e.g. a noise-free test double).
+        """
+        s = self.sim
+        try:
+            if hasattr(s, 'set_noise_scale'):
+                s.set_noise_scale(float(scale))
+        except Exception:
+            pass
+
     def set_obs_norm_stats(self, mean: np.ndarray, var: np.ndarray,
                             count: float = 1.0, *, learn: bool = False) -> None:
         m = np.asarray(mean, dtype='float64').reshape(-1)
@@ -1419,6 +1449,7 @@ class APCEnv:
                 else get_phase_disturbance_prob(phase=1))
         tau_dom = float(getattr(self.cfg, 'tau', 0.0) or 0.0)
         sample_rate = float(getattr(self.cfg, 'sample_rate', 1.0) or 1.0)
+        dead_time = float(getattr(self.cfg, 'dead_time', 0.0) or 0.0)
         self._hidden_disturbance = maybe_build_hidden_disturbance(
             rng=self.rng,
             sim=self.sim,
@@ -1428,7 +1459,18 @@ class APCEnv:
             force=bool(self._hidden_disturbance_force),
             progress=float(self._training_progress),
             phase=int(self._current_phase),
+            dead_time=dead_time,
+            episode_length=int(self.cfg.episode_length),
         )
+        # P89 noise-amplitude curriculum: ramp process+measurement noise from
+        # ~0 at progress=0 to full by ~40 % (P1), full in P3.  Applied every
+        # reset so the live training_progress/phase is reflected.  Clean
+        # steady-state seeds override this to 0.0 after their own reset().
+        if bool(getattr(self.cfg, 'process_noise_curriculum', True)):
+            self.set_sim_noise_scale(noise_curriculum_scale(
+                float(self._training_progress), int(self._current_phase)))
+        else:
+            self.set_sim_noise_scale(1.0)
         # Fresh per-episode trace for the WM disturbance-estimator head target.
         self._hidden_disturbance_trace = []
         obs_vec = self._build_obs_vec(state)
@@ -2116,6 +2158,14 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     # signal).  Sim-agnostic: ``_hidden_disturbance`` lives on APCEnv.
     env._schedule = []
     env._hidden_disturbance = None
+    # P89 Fix A: make this held-action steady-state seed fully NOISE-FREE
+    # (disable process OU + measurement noise) so the WM gets pure
+    # fixed-point supervision.  The P89 RCA showed the WM never learned a
+    # held-action fixed point because EVERY training trajectory (incl. these
+    # seeds) carried persistent OU + measurement noise so the plant never
+    # truly settled.  Off-switch: DREAMER_CLEAN_STEADY_SEEDS=0.
+    if bool(getattr(cfg, 'clean_steady_seeds', True)):
+        env.set_sim_noise_scale(0.0)
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
@@ -2256,6 +2306,10 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     # transient is unambiguous (see ``collect_constant_action_episode``
     # rationale).  Sim-agnostic.
     env._hidden_disturbance = None
+    # P89 Fix A: noise-free so the step transient + settled tail give the WM
+    # clean gain + fixed-point supervision (DREAMER_CLEAN_STEADY_SEEDS=0 off).
+    if bool(getattr(cfg, 'clean_steady_seeds', True)):
+        env.set_sim_noise_scale(0.0)
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
@@ -7273,7 +7327,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
             run_wm_steady_state_diagnostic(
                 out_dir, ckpt_name='final.pt',
-                n_starts=n_starts, horizon=horizon)
+                n_starts=n_starts, horizon=horizon,
+                output_dir=(out_dir / 'validation'))
         except Exception as e:
             print(f'[train] wm_steady_state_diagnostic skipped: {e!r}',
                    flush=True)
