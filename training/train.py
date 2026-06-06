@@ -5696,6 +5696,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # with DREAMER_WM_BEST_RESTORE_AT_P2=0.
     wm_best_restore_at_p2 = bool(int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P2', '1') or 0))
+    # ----- wm_best.pt warm-restore at P2→P3 (P90, 2026-06-06) -----
+    # The WM keeps training through P2 (paper Algorithm 1 co-trains it during
+    # critic warmup), but its held-action fixed point is UNSTABLE — the probe
+    # shows it converges mid-P1 (conv=1.0) then RE-DRIFTS during P2 (conv→0).
+    # The WM is then FROZEN at the end-of-P2 (drifted) state for all of P3 and
+    # for the post-training steady-state/transfer diagnostics, so a genuinely
+    # converged WM that existed earlier is silently discarded (P90 RCA: wm_best
+    # held iter-60 conv=1.0 but final.pt measured 0% convergence).  Restoring
+    # the conv-aware wm_best at the P2→P3 freeze hands P3 + validation the BEST
+    # (most-converged) WM, not the last one.  Disable with
+    # DREAMER_WM_BEST_RESTORE_AT_P3=0.
+    wm_best_restore_at_p3 = bool(int(
+        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P3', '1') or 0))
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
@@ -6202,6 +6215,36 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             f'{max_rmtp:.3f} — reward head not learning')
                     print(f'[early-stop-flag] {msg}', flush=True)
                     mid_check_flags.append(msg)
+                # P90: warm-restore WM to its conv-aware fidelity peak before
+                # the P2→P3 FREEZE so P3 + the post-training diagnostics use the
+                # best-converged WM, not the drifted end-of-P2 one.
+                if (wm_best_restore_at_p3
+                        and wm_best_ckpt_path is not None
+                        and wm_best_iter > 0
+                        and (total_iters - wm_best_iter)
+                                >= wm_best_restore_min_gap
+                        and wm_best_ckpt_path.exists()):
+                    try:
+                        _blob = torch.load(wm_best_ckpt_path,
+                                            map_location=device,
+                                            weights_only=False)
+                        model.load_state_dict(_blob['model'])
+                        _cf = None
+                        try:
+                            _cf = _blob.get('wm_fidelity_probe', {}).get(
+                                'wm_converge_frac')
+                        except Exception:
+                            _cf = None
+                        print(f"[p2→p3] WM freeze warm-restore: loaded "
+                              f"wm_best.pt (iter {wm_best_iter}, "
+                              f"score {wm_best_score:.3f}, "
+                              f"conv={_cf}) — discarded "
+                              f"{total_iters - wm_best_iter} iters of "
+                              f"post-peak P2 drift", flush=True)
+                    except Exception as _e:
+                        print(f"[p2→p3] WM freeze warm-restore failed: {_e} "
+                              f"— continuing with current weights",
+                              flush=True)
             current_phase = new_phase
             if current_phase == 3:
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
