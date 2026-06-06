@@ -172,6 +172,24 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
         cfg.rssm_embed_dim = _envint('DREAMER_RSSM_EMBED_DIM', cfg.rssm_embed_dim)
         cfg.rssm_hidden_dim = _envint(
             'DREAMER_RSSM_HIDDEN_DIM', cfg.rssm_hidden_dim)
+        # Mirror the #2 latent-overshooting knobs (P88) so the probe's
+        # ``world_model_loss`` builds the SAME open-loop prior-rollout graph
+        # the run will (B x max_starts x len GRU steps retained for backward
+        # = the dominant new activation cost).  Without this the probe runs
+        # overshoot OFF and under-measures per-sample memory -> oversized batch
+        # near the OOM ceiling.  RSSM-only (SF no-ops the term).
+        def _envfloat(name: str, cur) -> float:
+            v = os.environ.get(name, '').strip()
+            try:
+                return float(v) if v else float(cur)
+            except ValueError:
+                return float(cur)
+        cfg.wm_overshoot_coef = _envfloat(
+            'DREAMER_WM_OVERSHOOT_COEF', cfg.wm_overshoot_coef)
+        cfg.wm_overshoot_len = _envint(
+            'DREAMER_WM_OVERSHOOT_LEN', cfg.wm_overshoot_len)
+        cfg.wm_overshoot_max_starts = _envint(
+            'DREAMER_WM_OVERSHOOT_MAX_STARTS', cfg.wm_overshoot_max_starts)
     info = {'model_size': model_size, 'seq_len': seq_len, 'lookback': lookback,
             'horizon': horizon, 'paper_default': paper_default,
             'target_util': target_util, 'min_bs': paper_default, 'max_bs': max_bs,
@@ -278,6 +296,9 @@ def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
                  os.environ.get('DREAMER_RSSM_DETER_DIM', ''),
                  os.environ.get('DREAMER_RSSM_N_CATEGORICALS', ''),
                  os.environ.get('DREAMER_RSSM_N_CLASSES', ''),
+                 os.environ.get('DREAMER_WM_OVERSHOOT_COEF', ''),
+                 os.environ.get('DREAMER_WM_OVERSHOOT_LEN', ''),
+                 os.environ.get('DREAMER_WM_OVERSHOOT_MAX_STARTS', ''),
                  float(wm_overhead_factor))
     if cache_key in _PROBE_CACHE:
         info = dict(_PROBE_CACHE[cache_key])
