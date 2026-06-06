@@ -2906,10 +2906,18 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     wm_total = cfg.recon_scale * recon_loss + kl_loss
 
     # ----- (b) held-action steady-state consistency (RSSM) -----
+    # P89 consolidation: the multi-step held-action ROLLOUT stationarity loss
+    # (wm_held_rollout_*) supersedes this starved 1-step fixed-point term for
+    # RSSM — the 1-step term only fires on NATURALLY held+settled replay steps
+    # (p88c held_frac mean ~0.84%).  When held-rollout is active don't double
+    # up; when it's off (legacy/paper) the 1-step term still runs unchanged.
+    # The SF backbone keeps its own _sf_steady_consistency (held-rollout is a
+    # no-op there), so SF is unaffected by this gate.
     steady_coef = float(getattr(cfg, 'wm_steady_consistency_coef', 0.0) or 0.0)
+    _held_active = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0) > 0.0
     steady_loss = torch.zeros((), device=feats.device)
     steady_held_frac = 0.0
-    if steady_coef > 0.0:
+    if steady_coef > 0.0 and not _held_active:
         steady_loss, steady_diag = _rssm_steady_consistency(
             model, feats, obs_cur, act, cfg)
         steady_held_frac = float(steady_diag.get('wm_steady_held_frac', 0.0))
@@ -3852,6 +3860,94 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
     return model
 
 
+def _probe_wm_held_convergence(model, env, device, cfg: 'TrainConfig'):
+    """Probe WM held-action CONVERGENCE (anti-drift) — companion to the
+    correlation probe.
+
+    The ``wm_best.pt`` fidelity score is otherwise PURELY correlation (sum of
+    per-offset Pearson r + depth bonus), which is SCALE-INVARIANT: it cannot
+    distinguish a WM whose imagination settles to a fixed point under a held
+    action from one that DRIFTS (the exact failure the steady-state diagnostic
+    reports as 0% convergence and the held-rollout loss targets).  Selecting /
+    restoring ``wm_best`` on correlation alone can therefore DISCARD a drift-
+    fixed WM.  This measures held-action convergence cheaply at probe cadence
+    so the best-ckpt selection + the P1->P2 restore are not blind to it.
+
+    Protocol: collect a short real segment, then from a few starts warm the
+    posterior over the lookback and roll the PRIOR forward H steps under the
+    last action HELD CONSTANT; a trajectory "converges" if its tail std is
+    small (reuses the steady-state diagnostic's ``_convergence_stats``).
+    Returns ``{wm_converge_frac, tail_drift_mean, n_starts}`` or ``None``.
+    RSSM only (SF -> None; the held-rollout loss is a no-op for SF anyway).
+    Never fatal — any failure returns ``None`` and the score falls back to
+    correlation-only.
+    """
+    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+        return None
+    H = int(getattr(cfg, 'horizon', 15))
+    if H < 8:
+        return None
+    try:
+        from tools.wm_steady_state_diagnostic import (
+            _imagine_open_loop_rssm, _convergence_stats)
+    except Exception as e:
+        print(f'[wm-converge-probe] import failed: {e!r}', flush=True)
+        return None
+    L = int(getattr(cfg, 'lookback', 8))
+    obs_dim = env.obs_dim
+    action_dim = env.action_dim
+    n_starts = 4
+    stride = 2
+    seg = L + H + n_starts * stride + 2
+    rng = np.random.default_rng(20260606)
+    try:
+        env.reset(exploration=False)
+        real_obs = np.zeros((seg, obs_dim), dtype='float32')
+        real_act = np.zeros((seg, action_dim), dtype='float32')
+        got = 0
+        for t in range(seg):
+            a = rng.uniform(-1.0, 1.0, size=(action_dim,)).astype('float32')
+            ow_next, _, done, _ = env.step(a)
+            real_obs[t] = np.asarray(ow_next)[-1]
+            real_act[t] = a
+            got = t + 1
+            if done:
+                break
+    except Exception as e:
+        print(f'[wm-converge-probe] collection failed: {e!r}', flush=True)
+        return None
+    if got < L + H + 2:
+        return None
+    eps_std = float(os.environ.get('DREAMER_WM_CONVERGE_EPS_STD', '0.05'))
+    conv_flags: List[float] = []
+    drifts: List[float] = []
+    for i in range(n_starts):
+        s = L + i * stride
+        if s + H > got:
+            break
+        lookback_obs = real_obs[s - L:s]
+        lookback_act = real_act[s - L:s]
+        a_hold = real_act[s - 1]
+        action_seq = np.tile(a_hold, (H, 1)).astype('float32')
+        try:
+            with torch.no_grad():
+                traj = _imagine_open_loop_rssm(
+                    model, lookback_obs, lookback_act, action_seq, H, device)
+        except Exception as e:
+            print(f'[wm-converge-probe] rollout failed: {e!r}', flush=True)
+            return None
+        cs = _convergence_stats(traj, tail_frac=0.3, eps_std=eps_std)
+        conv_flags.append(1.0 if cs.get('converged') else 0.0)
+        drifts.append(float(cs.get('tail_drift', float('nan'))))
+    if not conv_flags:
+        return None
+    return {
+        'wm_converge_frac': float(np.mean(conv_flags)),
+        'tail_drift_mean': float(np.nanmean(drifts)),
+        'n_starts': int(len(conv_flags)),
+    }
+
+
 def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     """Probe WM k-step fidelity.  Returns dict or ``None`` on failure.
 
@@ -3899,7 +3995,7 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
         if r >= r_floor:
             best_h = max(best_h, off)
     summary = ' '.join(f'H={o}:r={r:+.3f}' for o, r in candidates)
-    return {
+    result = {
         'H': H,
         'r_floor': r_floor,
         'per_offset': candidates,
@@ -3907,6 +4003,23 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
         'summary': summary,
         'passes_full': best_h >= H,
     }
+    # P89: held-action convergence companion (anti-drift) so the wm_best score
+    # is not blind to imagination drift (the r-terms above are scale-invariant).
+    # Gated (DREAMER_WM_FIDELITY_CONV_PROBE), RSSM-only, never fatal.
+    if os.environ.get('DREAMER_WM_FIDELITY_CONV_PROBE',
+                       '1').lower() not in ('0', 'off', 'false', 'no'):
+        try:
+            _conv = _probe_wm_held_convergence(model, env, device, cfg)
+        except Exception as e:
+            print(f'[wm-converge-probe] failed: {e!r}', flush=True)
+            _conv = None
+        if _conv is not None:
+            result['wm_converge_frac'] = _conv['wm_converge_frac']
+            result['tail_drift_mean'] = _conv['tail_drift_mean']
+            result['summary'] = (
+                f"{summary} conv={_conv['wm_converge_frac']:.2f} "
+                f"drift={_conv['tail_drift_mean']:.3f}")
+    return result
 
 
 def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
@@ -6693,6 +6806,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         _score = (sum(max(0.0, r) for r in _r_vals)
                                    + 0.5 * float(_pbe.get('best_h', 0))
                                             / max(1, int(_pbe.get('H', 1))))
+                        # P89: convergence-aware term so best-ckpt selection +
+                        # P1->P2 restore are not blind to held-action drift (the
+                        # r-terms are scale-invariant — a drifting WM scores as
+                        # high as a converged one).  Gated on best_h>0 so a
+                        # degenerate flat-but-"converged" WM earns no credit.
+                        # Weight via DREAMER_WM_FIDELITY_CONV_WEIGHT (0=off).
+                        _conv_frac = _pbe.get('wm_converge_frac')
+                        _conv_w = float(os.environ.get(
+                            'DREAMER_WM_FIDELITY_CONV_WEIGHT', '1.0'))
+                        if (_conv_w > 0.0 and _conv_frac is not None
+                                and int(_pbe.get('best_h', 0)) > 0):
+                            _score = _score + _conv_w * float(_conv_frac)
                         # Update EMA of the score (used for ES only).
                         if wm_score_ema <= -1e17:
                             wm_score_ema = float(_score)
@@ -6721,6 +6846,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                                     for (o, r) in _per],
                                     'best_h': int(_pbe.get('best_h', 0)),
                                     'H': int(_pbe.get('H', 0)),
+                                    'wm_converge_frac': (
+                                        float(_pbe['wm_converge_frac'])
+                                        if _pbe.get('wm_converge_frac')
+                                        is not None else None),
+                                    'tail_drift_mean': (
+                                        float(_pbe['tail_drift_mean'])
+                                        if _pbe.get('tail_drift_mean')
+                                        is not None else None),
                                 },
                             }, wm_best_ckpt_path)
                             print(f"[wm-best] new best fidelity score "
