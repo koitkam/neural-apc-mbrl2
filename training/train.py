@@ -886,6 +886,29 @@ class TrainConfig:
     # actor that hasn't been updated by imagination yet).
     phase3_pruner_warmup_iters: int = 8
 
+    # ---- (P93, 2026-06-06) critic warmup at P3 start (re-added) ----
+    # The value head trains ONLY in P3 (P2 does WM + BC + reward-MTP, no value).
+    # So the critic enters P3 COLD and its first imagined-return targets are
+    # noisy → a documented cascade trigger (rew_to_tgt_var collapse).  This
+    # trains the critic ALONE (actor frozen at the snapshot prior) for the
+    # first ``p3_critic_warmup_iters`` P3 iters so it is CALIBRATED before it
+    # is coupled to the actor — i.e. "critic converges before actor coupling"
+    # (functionally = warming it at the end of P2).  An earlier short-budget
+    # version was removed 2026-05-20; re-added P93 as an env-gated, properly
+    # placed warmup.  Default 0 = OFF (paper co-trains from P3 start).
+    p3_critic_warmup_iters: int = 0
+    # ---- (P93, 2026-06-06) protect the WM trunk from agent grads in P2 ----
+    # At P1→P2 the BC + reward-MTP losses (agent_finetune_loss, read off
+    # ``agent_hid`` = the dynamics' own feature) are added; their gradient
+    # flows back into the shared WM dynamics trunk and destabilises it (P90:
+    # recon spikes 0.13→0.57 exactly at the P1→P2 boundary, then slowly
+    # recovers).  With this ON, ``agent_hid`` is detached before the P2 agent
+    # losses so the reward/BC heads still train but the WM dynamics keeps
+    # converging on its OWN losses (recon/kl/overshoot/held) — the WM then
+    # cleanly converges + plateaus by end of P2 without needing the wm_best
+    # restore crutch.  Default OFF.  DREAMER_WM_TRUNK_STOPGRAD_IN_P2.
+    wm_trunk_stopgrad_in_p2: bool = False
+
     # NOTE: ``p3_critic_warmup_iters`` and the ``p3_critic_stability_*``
     # gate (introduced 2026-05-06 and 2026-05-08) were removed on
     # 2026-05-20 along with the entropy-decay belt.  They were
@@ -5728,6 +5751,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # training in P2/P3) for critic/WM coherence + drift immunity.  cfg flag,
     # env-overridable via DREAMER_WM_FREEZE_AFTER_P1.
     wm_freeze_after_p1 = bool(getattr(cfg, 'wm_freeze_after_p1', False))
+    # P93: critic warmup at P3 start + WM-trunk protection in P2.
+    p3_critic_warmup_iters = int(getattr(cfg, 'p3_critic_warmup_iters', 0) or 0)
+    wm_trunk_stopgrad_in_p2 = bool(getattr(cfg, 'wm_trunk_stopgrad_in_p2', False))
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
@@ -6473,6 +6499,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                           enabled=(device.type == 'cuda')):
                     wm_losses, _, agent_hid = world_model_loss(
                         model, batch, cfg)
+                    # P93: optionally detach the agent feature in P2 so the BC +
+                    # reward-MTP gradients train the heads but DON'T flow back
+                    # into the WM dynamics trunk (which destabilises recon at
+                    # the P1→P2 boundary).  The WM then keeps converging on its
+                    # own losses.  P1 is unaffected (reward-MTP weight ~0 there).
+                    if (wm_trunk_stopgrad_in_p2 and current_phase == 2
+                            and isinstance(agent_hid, torch.Tensor)):
+                        agent_hid = agent_hid.detach()
                     # P1 + P2 both train the reward MTP head (paper
                     # Algorithm 1: tokenizer + dynamics + reward + value
                     # are co-trained throughout WM pretraining).
@@ -6751,8 +6785,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     opt_actor.zero_grad(set_to_none=True)
                     opt_critic.zero_grad(set_to_none=True)
                 else:
-                    opt_actor.step()
-                    opt_critic.step()
+                    # P93 critic warmup: for the first
+                    # ``p3_critic_warmup_iters`` P3 iters, train the CRITIC only
+                    # (actor frozen at the snapshot prior) so the value head is
+                    # CALIBRATED before it is coupled to the actor — stops the
+                    # cold-critic cascade.
+                    if (p3_critic_warmup_iters > 0
+                            and p3_iters < p3_critic_warmup_iters):
+                        opt_critic.step()
+                        if p3_iters == 0:
+                            print(f"[p3-critic-warmup] training critic only for "
+                                  f"{p3_critic_warmup_iters} iters "
+                                  f"(actor frozen)", flush=True)
+                    else:
+                        opt_actor.step()
+                        opt_critic.step()
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
 
