@@ -6959,6 +6959,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         if (_conv_w > 0.0 and _conv_frac is not None
                                 and int(_pbe.get('best_h', 0)) > 0):
                             _score = _score + _conv_w * float(_conv_frac)
+                        # P92 RCA (2026-06-06): the correlation + conv terms
+                        # above are SHAPE/scale-invariant and PEAK EARLY — p92's
+                        # score peaked at iter 30 (recon 0.247) and never
+                        # improved, so the freeze/restore grabbed an UNDER-
+                        # TRAINED WM even though recon kept falling to 0.145 by
+                        # iter 100 (a strictly better-reconstructing, higher-
+                        # gain WM that scored LOWER on shape alone).  Add an
+                        # ABSOLUTE one-step-fidelity term: reward lower recon so
+                        # the "best" tracks a genuinely better-trained WM (lower
+                        # recon ⇒ better gain, the control-relevant property).
+                        # Weight via DREAMER_WM_FIDELITY_RECON_WEIGHT (0=off,
+                        # legacy).  Uses the most recent training recon_loss.
+                        _recon_w = float(os.environ.get(
+                            'DREAMER_WM_FIDELITY_RECON_WEIGHT', '3.0'))
+                        if _recon_w > 0.0:
+                            try:
+                                _rl = wm_losses.get('recon_loss')
+                                _rlv = float(_rl.detach().item()
+                                              if torch.is_tensor(_rl)
+                                              else _rl)
+                                if np.isfinite(_rlv):
+                                    _score = _score - _recon_w * _rlv
+                            except Exception:
+                                pass
                         # Update EMA of the score (used for ES only).
                         if wm_score_ema <= -1e17:
                             wm_score_ema = float(_score)
