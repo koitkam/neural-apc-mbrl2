@@ -15,6 +15,7 @@ optuna>=4.0.0
 numpy>=1.24.0
 scipy>=1.10.0
 matplotlib>=3.7.0
+pandas>=2.0.0          # used by simulation/*/*.py plant models (e.g. test_sim)
 
 # Utilities
 tqdm>=4.65.0
