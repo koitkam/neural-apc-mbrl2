@@ -1,19 +1,27 @@
-"""Transformer state-space world-model backbone (TSSM) — DESIGN SCAFFOLD (WIP).
+"""Transformer state-space world-model backbone (TSSM) — neural-apc-mbrl.
 
-neural-apc-mbrl, 2026-06-06.  This is the "RSSM-training-structure + transformer
-dynamics-core" backbone the user asked for: keep the *entire* proven phased/joint
-training pipeline (clean steady-state seeds, noise + DR curriculum, realistic
-hidden disturbances, overshoot + held-rollout losses, critic warmup, joint mode)
-and swap ONLY the recurrent dynamics core (GRU + 32x32 categorical RSSM) for a
-**causal transformer sequence model** that performs IN-CONTEXT SYSTEM
-IDENTIFICATION over the lookback window.
+The "RSSM-training-structure + transformer dynamics-core" backbone: keep the
+*entire* proven phased/joint training pipeline (clean steady-state seeds, noise +
+DR curriculum, realistic hidden disturbances, overshoot + held-rollout losses,
+critic warmup, joint mode) and swap ONLY the recurrent dynamics core (GRU + 32x32
+categorical RSSM) for a **causal transformer sequence model** that performs
+IN-CONTEXT SYSTEM IDENTIFICATION over the lookback window.
 
-This is deliberately a SCAFFOLD: the shared, low-risk pieces (config, state,
-encoder/decoder, initial_state) are implemented; the three transition methods
-(``rollout_observed`` / ``obs_step`` / ``img_step``) carry the full design spec
-and raise ``NotImplementedError`` so selecting this backbone fails LOUDLY rather
-than misbehaving silently.  It is NOT yet wired into ``build_model`` dispatch, so
-the default RSSM path is untouched.  See "Wiring plan" + "Open design decisions"
+STATUS (2026-06-06): FUNCTIONAL + wired (build_model 'tssm' branch, dispatch,
+diagnostics, collection, gpu-calib all route it as an rssm-interface backbone).
+Transitions implemented with a **per-layer KV-CACHE** (``_step`` advances one
+token in O(window) vs O(window^2) recompute); the cached path is validated EQUAL
+to the full-sequence forward by tools/_smoke_tssm.py (max_err ~5e-7).  Custom
+causal transformer (``_CausalSelfAttention`` + ``_Block``, pre-LN) supports both
+a full forward (``forward_full`` — training / reference) and a cached single-step
+(``forward_step`` — imagination) on the SAME weights.  REMAINING: a GPU A/B run
+vs RSSM (ideally under DR), and consumer-compat for the overshoot/held-rollout
+losses (currently no-op for TSSM — feat-only Markovian reconstruction loses the
+transformer context; windowed attention already supervises multi-step natively).
+NOTE the KV-cache assumes a single imagination rollout stays within
+``max_seq_len`` (true for H<=horizon from a lookback-sized context); it does not
+slide the cache, so absolute positional encoding stays exact.  ``NotImplemented``
+no longer applies.  See "Wiring plan" + "Open design decisions"
 below.
 
 WHY a transformer core (vs the current SF/flow transformer):
@@ -108,10 +116,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Reuse the proven RSSM building blocks so the categorical latent + KL are
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
@@ -138,14 +147,18 @@ class TransformerSSMConfig:
 @dataclass
 class TSSMState:
     """Duck-compatible with RSSMState (.h, .z_logits, .z, .feat, .stoch_flat)
-    PLUS the transformer's token ``window`` (B, t, d_model) needed to continue
-    the causal rollout.  ``window=None`` => no history (feat-only reconstruction
-    by a Markovian consumer; the next step starts a fresh single-token context).
+    PLUS the transformer continuation context: a per-layer KV-CACHE and the
+    absolute position ``pos``, so ``img_step`` advances in O(window) (attend the
+    new token against the cached K/V) instead of O(window²) recompute.
+    ``kv_cache=None`` => no history (feat-only reconstruction by a Markovian
+    consumer; the next step starts a fresh single-token context).
     """
     h: torch.Tensor             # (..., deter_dim) transformer output at step t
     z_logits: torch.Tensor      # (..., n_categoricals, n_classes)
     z: torch.Tensor             # (..., n_categoricals, n_classes) one-hot (ST)
-    window: Optional[torch.Tensor] = None   # (..., t, deter_dim) token history
+    # per-layer (k, v) each (B, n_heads, pos, head_dim); None = empty context.
+    kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+    pos: int = 0                # number of tokens already in the cache
 
     @property
     def stoch_flat(self) -> torch.Tensor:
@@ -154,6 +167,86 @@ class TSSMState:
     @property
     def feat(self) -> torch.Tensor:
         return torch.cat([self.h, self.stoch_flat], dim=-1)
+
+
+class _CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention with an optional KV-cache.
+
+    ``forward_full`` (training / reference): standard causal attention over a
+    full (B, S, d) sequence.  ``forward_step`` (imagination): attend ONE new
+    token against the cached past K/V (+ its own), returning the updated cache.
+    Both share the SAME weights so the cached path is provably equal to the
+    full recompute (validated by tools/_smoke_tssm.py equivalence test).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.dropout = float(dropout)
+
+    def _split(self, t: torch.Tensor) -> torch.Tensor:
+        B, S, _ = t.shape
+        return t.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def forward_full(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, d = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = self._split(q), self._split(k), self._split(v)
+        p = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                             dropout_p=p)
+        out = out.transpose(1, 2).reshape(B, S, d)
+        return self.proj(out)
+
+    def forward_step(self, x_t: torch.Tensor,
+                     cache: Optional[Tuple[torch.Tensor, torch.Tensor]]
+                     ) -> Tuple[torch.Tensor,
+                                Tuple[torch.Tensor, torch.Tensor]]:
+        B, _, d = x_t.shape                              # x_t: (B, 1, d)
+        q, k, v = self.qkv(x_t).chunk(3, dim=-1)
+        q, k, v = self._split(q), self._split(k), self._split(v)  # (B,H,1,hd)
+        if cache is not None:
+            pk, pv = cache
+            k = torch.cat([pk, k], dim=2)
+            v = torch.cat([pv, v], dim=2)
+        new_cache = (k, v)
+        # q (the single new token) attends to ALL of k (past + self) => exactly
+        # the causal pattern for the last position.  No mask needed.
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, 1, d)
+        return self.proj(out), new_cache
+
+
+class _Block(nn.Module):
+    """Pre-LayerNorm transformer block (matches norm_first=True semantics)."""
+
+    def __init__(self, d_model: int, n_heads: int, ffn_mult: int,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = _CausalSelfAttention(d_model, n_heads, dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * ffn_mult), nn.GELU(),
+            nn.Linear(d_model * ffn_mult, d_model))
+
+    def forward_full(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn.forward_full(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        return x
+
+    def forward_step(self, x_t: torch.Tensor,
+                     cache: Optional[Tuple[torch.Tensor, torch.Tensor]]
+                     ) -> Tuple[torch.Tensor,
+                                Tuple[torch.Tensor, torch.Tensor]]:
+        a, new_cache = self.attn.forward_step(self.norm1(x_t), cache)
+        x_t = x_t + a
+        x_t = x_t + self.ff(self.norm2(x_t))
+        return x_t, new_cache
 
 
 def _sinusoidal_pos(n: int, d: int, device, dtype) -> torch.Tensor:
@@ -199,14 +292,11 @@ class TransformerSSMDynamics(nn.Module):
         # Token projection: [z_{t-1}_flat ; a_t] -> d_model.
         self.token_proj = nn.Linear(self.stoch_flat_dim + self.action_dim,
                                     self.deter_dim)
-        # Causal transformer encoder (the dynamics core).
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=self.deter_dim, nhead=cfg.n_heads,
-            dim_feedforward=self.deter_dim * cfg.ffn_mult,
-            dropout=cfg.dropout, batch_first=True, activation='gelu',
-            norm_first=True)
-        self.transformer = nn.TransformerEncoder(enc_layer,
-                                                 num_layers=cfg.n_layers)
+        # Causal transformer (custom blocks: support full + KV-cached step).
+        self.n_heads = int(cfg.n_heads)
+        self.blocks = nn.ModuleList([
+            _Block(self.deter_dim, cfg.n_heads, cfg.ffn_mult, cfg.dropout)
+            for _ in range(cfg.n_layers)])
         # Categorical latent heads (reuse RSSM block: prior from h, post from
         # [h, embed]).  prior_net is read by the smoke tests + the overshoot /
         # held-rollout losses, so the attribute name MUST match the RSSM.
@@ -235,9 +325,9 @@ class TransformerSSMDynamics(nn.Module):
                                self.n_classes, device=device)
         z = torch.zeros_like(z_logits)
         z[..., 0] = 1.0
-        return TSSMState(h=h, z_logits=z_logits, z=z, window=None)
+        return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0)
 
-    # ----- internal: token build + causal-window encode -----
+    # ----- internal: token build + causal encode -----
     def _build_token(self, z: torch.Tensor,
                      action: torch.Tensor) -> torch.Tensor:
         """token = proj([z_flat ; action]) -> (B, d_model)."""
@@ -245,48 +335,60 @@ class TransformerSSMDynamics(nn.Module):
         return self.token_proj(torch.cat([z_flat, action], dim=-1))
 
     def _encode_window(self, window: torch.Tensor) -> torch.Tensor:
-        """Causal transformer over (B, S, d_model); returns (B, S, d_model)."""
+        """Full-sequence causal forward over (B, S, d_model) -> (B, S, d_model).
+        The reference path (training-free) the KV-cached step is validated
+        against; also reused by callers that have the whole token window."""
         S = window.shape[1]
         pe = _sinusoidal_pos(S, self.deter_dim, window.device, window.dtype)
         x = window + pe.unsqueeze(0)
-        mask = torch.triu(
-            torch.ones(S, S, device=window.device, dtype=torch.bool),
-            diagonal=1)  # True = disallow attending to the future
-        return self.transformer(x, mask=mask)
+        for blk in self.blocks:
+            x = blk.forward_full(x)
+        return x
 
-    def _append(self, window: Optional[torch.Tensor],
-                token: torch.Tensor) -> torch.Tensor:
-        """Append one (B, d_model) token; cap the window at max_seq_len."""
-        tok = token.unsqueeze(1)                         # (B, 1, d)
-        win = tok if window is None else torch.cat([window, tok], dim=1)
-        if win.shape[1] > self.max_seq_len:
-            win = win[:, -self.max_seq_len:]
-        return win
+    def _step(self, token: torch.Tensor,
+              kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+              pos: int
+              ) -> Tuple[torch.Tensor,
+                         List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """KV-cached single-token advance.  ``token`` (B, d_model) at absolute
+        position ``pos``; returns ``(h (B, d_model), new_kv_cache)``.  O(window)
+        instead of the O(window²) full recompute."""
+        pe = _sinusoidal_pos(pos + 1, self.deter_dim, token.device,
+                             token.dtype)[pos]            # (d_model,)
+        x = (token + pe.unsqueeze(0)).unsqueeze(1)        # (B, 1, d)
+        new_cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for li, blk in enumerate(self.blocks):
+            layer_cache = None if kv_cache is None else kv_cache[li]
+            x, lc = blk.forward_step(x, layer_cache)
+            new_cache.append(lc)
+        return x[:, 0], new_cache
 
     # ----- transitions -----
     def img_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  sample: bool = True) -> TSSMState:
         """Imagined (prior-only) step: build the token from (prev.z, action),
-        append to the window, recompute the causal transformer, read the prior
-        off the last position.  ``window=None`` (feat-only reconstruction by a
-        Markovian consumer) starts a fresh single-token context."""
+        advance the KV-cached transformer ONE step, read the prior off the new
+        position.  ``kv_cache=None`` (feat-only reconstruction by a Markovian
+        consumer) starts a fresh single-token context."""
         token = self._build_token(prev.z, prev_action)
-        window = self._append(getattr(prev, 'window', None), token)
-        h = self._encode_window(window)[:, -1]           # (B, d_model)
+        cache = getattr(prev, 'kv_cache', None)
+        pos = int(getattr(prev, 'pos', 0) or 0)
+        h, new_cache = self._step(token, cache, pos)
         z_logits, z = self.prior_net(h, sample=sample)
-        return TSSMState(h=h, z_logits=z_logits, z=z, window=window)
+        return TSSMState(h=h, z_logits=z_logits, z=z,
+                         kv_cache=new_cache, pos=pos + 1)
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, sample: bool = True
                  ) -> Tuple[TSSMState, TSSMState]:
         """Observation step -> (posterior, prior).  Prior is needed for KL; both
         share ``h``; the posterior conditions on the obs embedding and is the z
-        carried forward."""
+        carried forward (with the prior's KV-cache + position)."""
         prior = self.img_step(prev, prev_action, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
         post = TSSMState(h=prior.h, z_logits=post_logits, z=post_z,
-                         window=prior.window)
+                         kv_cache=prior.kv_cache, pos=prior.pos)
         return post, prior
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,

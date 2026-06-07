@@ -70,7 +70,7 @@ def test_st_grad_reaches_prior_and_transformer():
     total.backward()
     prior_g = sum(float(p.grad.abs().sum()) for p in m.prior_net.parameters()
                   if p.grad is not None)
-    tf_g = sum(float(p.grad.abs().sum()) for p in m.transformer.parameters()
+    tf_g = sum(float(p.grad.abs().sum()) for p in m.blocks.parameters()
                if p.grad is not None)
     tok_g = sum(float(p.grad.abs().sum()) for p in m.token_proj.parameters()
                 if p.grad is not None)

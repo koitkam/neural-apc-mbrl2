@@ -1441,19 +1441,23 @@ class DreamerV4(nn.Module):
                       f'enabled on RSSM rollout_observed {_imgs}', flush=True)
             elif self.world_model_type == 'tssm':
                 # TSSM: compile the teacher-forced ``rollout_observed`` (T is
-                # fixed = seq_len in WM training, so a static graph captures it).
-                # ``img_step`` is NOT compiled: its causal window grows by one
-                # token per imagination step, so a static graph would recompile
-                # every step — leave it eager until the KV-cache lands.
-                # ``dynamic=True`` tolerates the seq_len differences between WM
-                # training and the diagnostics probes.
+                # fixed = seq_len in WM training, so dynamo unrolls the T-step
+                # posterior loop into one graph — the per-step KV-cache makes
+                # each step O(window) so the unrolled graph is the TSSM analogue
+                # of the RSSM GRU-rollout CUDA graph).  ``img_step`` stays EAGER:
+                # in imagination it is driven one step at a time from the Python
+                # loop in train.py with a KV-cache that GROWS by a token each
+                # call, so compiling the single step would churn recompiles for
+                # little gain — revisit with a GPU benchmark.  ``dynamic=True``
+                # tolerates the seq_len differences between WM training and the
+                # diagnostics probes.
                 try:
                     self.dynamics.rollout_observed = torch.compile(
                         self.dynamics.rollout_observed, mode=mode, dynamic=True)
                     self._compiled = True
                     print('[dreamer_v4] torch.compile(mode='
                           f'{mode}, dynamic=True) enabled on TSSM '
-                          'rollout_observed (img_step eager: variable window)',
+                          'rollout_observed (img_step eager: growing KV-cache)',
                           flush=True)
                 except Exception as _et:
                     print(f'[dreamer_v4] TSSM compile skipped ({_et!r})',
