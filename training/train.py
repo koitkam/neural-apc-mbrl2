@@ -6091,17 +6091,28 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # at every episode reset.  No-op when curriculum env var unset.
         env.set_training_progress(total_env_steps / max(1, int(cfg.total_steps)))
         # Compute per-phase progress for phase-aware OU trigger ramps.
-        if current_phase == 1:
+        if joint_mode:
+            # No phases in joint mode: drive the disturbance ramp off GLOBAL
+            # progress (env_steps / total_steps) so it ramps over the whole
+            # run instead of being pinned at 0 until env_steps passes the
+            # dead p1+p2 budget (the phased _phase_start would mis-scale it).
+            _phase_progress = float(np.clip(
+                total_env_steps / max(1, int(cfg.total_steps)), 0.0, 1.0))
+        elif current_phase == 1:
             _phase_start = 0
             _phase_len = max(1, int(p1))
+            _phase_progress = float(np.clip(
+                (total_env_steps - _phase_start) / _phase_len, 0.0, 1.0))
         elif current_phase == 2:
             _phase_start = int(p1)
             _phase_len = max(1, int(p2))
+            _phase_progress = float(np.clip(
+                (total_env_steps - _phase_start) / _phase_len, 0.0, 1.0))
         else:
             _phase_start = int(p1 + p2)
             _phase_len = max(1, int(p3))
-        _phase_progress = float(np.clip(
-            (total_env_steps - _phase_start) / _phase_len, 0.0, 1.0))
+            _phase_progress = float(np.clip(
+                (total_env_steps - _phase_start) / _phase_len, 0.0, 1.0))
         env._current_phase = int(current_phase)
         # Refresh adaptive hidden-OU per-episode probability (P38):
         # P1: interpolated on wm_best_score.
@@ -6386,6 +6397,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # coverage doesn't get evicted as on-policy episodes fill the
         # buffer (was the root cause of persistent 0% WM steady-state
         # convergence under zero/constant action protocols).
+        # JOINT mode (neural-apc-mbrl): current_phase is always 3, so this is
+        # gated by ``const_inject_in_p3`` (default OFF) — deliberately, because
+        # the critic trains from step 1 in joint mode and the P50 RCA showed
+        # injecting low-reward-variance const-action episodes during critic
+        # training collapses Var(r) and triggers the very bootstrap cascade
+        # joint mode exists to avoid.  Opt in with DREAMER_CONST_ACTION_INJECT_
+        # IN_P3=1 only if a run needs the WM steady-state coverage.
         _inject_active = (
             (current_phase == 1)
             or (current_phase == 2 and const_inject_in_p2)
