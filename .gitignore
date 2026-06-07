@@ -29,6 +29,10 @@ experiment_runs_*/
 .idea/
 .DS_Store
 *.swp
+
+# Transient build / install logs (e.g. venv pip-install output)
+.venv_build.log
+*.build.log
 # Smoke-test SCRATCH artifacts (output dirs / images), but keep the .py harnesses
 _smoke_*
 !tools/_smoke_*.py
