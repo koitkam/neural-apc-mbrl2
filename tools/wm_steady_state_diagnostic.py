@@ -229,7 +229,10 @@ def _imagine_open_loop(model, z_history: torch.Tensor,
 
 
 def _is_rssm_model(model) -> bool:
-    return getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    # 'tssm' (transformer-SSM, neural-apc-mbrl) implements the SAME interface as
+    # the RSSM (initial_state/obs_step/img_step/decode/feat), so the RSSM
+    # open-loop rollout protocol applies to it unchanged.
+    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
 
 
 @torch.no_grad()

@@ -1896,11 +1896,12 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
     tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
 
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
     # RSSM streaming inference: carry a running recurrent state across the
     # episode.  Each step advances the posterior with (prev_action, obs)
     # and the posterior feature drives the policy — the GRU holds the
     # plant context, so the lookback-window encode is not needed.
+    # ('tssm' uses the same interface; its state carries the token window.)
     #
     # Collection is pure inference, so the whole rollout runs under
     # ``torch.inference_mode()``: no autograd graph is built (lower memory
@@ -3997,11 +3998,11 @@ def _probe_wm_held_convergence(model, env, device, cfg: 'TrainConfig'):
     last action HELD CONSTANT; a trajectory "converges" if its tail std is
     small (reuses the steady-state diagnostic's ``_convergence_stats``).
     Returns ``{wm_converge_frac, tail_drift_mean, n_starts}`` or ``None``.
-    RSSM only (SF -> None; the held-rollout loss is a no-op for SF anyway).
-    Never fatal — any failure returns ``None`` and the score falls back to
-    correlation-only.
+    RSSM-interface only (rssm + tssm; SF -> None, the held-rollout loss is a
+    no-op there anyway).  Never fatal — any failure returns ``None`` and the
+    score falls back to correlation-only.
     """
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+    if getattr(model, 'world_model_type', 'sf_transformer') not in ('rssm', 'tssm'):
         return None
     H = int(getattr(cfg, 'horizon', 15))
     if H < 8:

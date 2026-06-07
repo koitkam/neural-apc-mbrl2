@@ -57,6 +57,15 @@ import numpy as np
 import torch
 
 
+def _is_rssm_like(model) -> bool:
+    """True for backbones using the RSSM interface (initial_state / obs_step /
+    img_step / decode / feat).  ``'rssm'`` and ``'tssm'`` (transformer-SSM,
+    neural-apc-mbrl) both implement it, so the RSSM rollout protocol in these
+    probes applies to both; only the SF-transformer uses the tokenizer path.
+    """
+    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+
+
 # ---------------------------------------------------------------------------
 # Stage metrics from train_log.jsonl
 # ---------------------------------------------------------------------------
@@ -258,7 +267,7 @@ def _wm_kstep_rollout(model, env, device, *, k_max: int = 32,
     #    using the proper iterative-denoising protocol.
     pred_obs_all: List[np.ndarray] = []      # per start: (k, obs_dim)
     real_obs_all: List[np.ndarray] = []
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    _is_rssm = _is_rssm_like(model)
     for s in starts:
         s = int(s)
         ow_window = real_obs[s - L:s].copy()             # (L, D)
@@ -418,7 +427,7 @@ def _reward_mtp_fidelity(model, env, device, *,
 
     pred_rew = np.zeros((len(starts), L_mtp), dtype='float32')
     targ_rew = np.zeros((len(starts), L_mtp), dtype='float32')
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    _is_rssm = _is_rssm_like(model)
     for i, s in enumerate(starts):
         s = int(s)
         ow_window = real_obs[s - L:s]
@@ -516,7 +525,7 @@ def _critic_calibration(model, env, device, *,
 
     v_pred = np.zeros((starts.size,), dtype='float32')
     g_real = np.zeros((starts.size,), dtype='float32')
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    _is_rssm = _is_rssm_like(model)
     for i, s in enumerate(starts):
         s = int(s)
         ow_window = real_obs[s - L:s]
@@ -594,7 +603,7 @@ def _policy_distribution(model, env, device, *, deterministic: bool,
     actions = np.zeros((T, action_dim), dtype='float32')
     d_min = 1.0 / cfg.k_max
     tau_ctx_val = 1.0 - cfg.tau_ctx
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    _is_rssm = _is_rssm_like(model)
     if _is_rssm:
         _rssm = model.dynamics
         _state = _rssm.initial_state(1, device)

@@ -195,6 +195,29 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
             'DREAMER_WM_OVERSHOOT_LEN', cfg.wm_overshoot_len)
         cfg.wm_overshoot_max_starts = _envint(
             'DREAMER_WM_OVERSHOOT_MAX_STARTS', cfg.wm_overshoot_max_starts)
+    elif wmt == 'tssm':
+        # TSSM (transformer-SSM): thread the transformer dims so the probe
+        # builds the right-sized model and measures faithful per-sample memory.
+        # Overshoot/held are no-ops for TSSM (windowed attention is the native
+        # multi-step term), so only the architecture dims matter here.
+        def _envint_t(name: str, cur) -> int:
+            v = os.environ.get(name, '').strip()
+            try:
+                return int(v) if v else int(cur)
+            except ValueError:
+                return int(cur)
+        cfg.tssm_d_model = _envint_t('DREAMER_TSSM_D_MODEL', cfg.tssm_d_model)
+        cfg.tssm_n_layers = _envint_t('DREAMER_TSSM_N_LAYERS', cfg.tssm_n_layers)
+        cfg.tssm_n_heads = _envint_t('DREAMER_TSSM_N_HEADS', cfg.tssm_n_heads)
+        cfg.tssm_max_seq_len = _envint_t(
+            'DREAMER_TSSM_MAX_SEQ_LEN', cfg.tssm_max_seq_len)
+        # Reuse the rssm_* categorical-latent dims (shared by TSSM).
+        cfg.rssm_n_categoricals = _envint_t(
+            'DREAMER_RSSM_N_CATEGORICALS', cfg.rssm_n_categoricals)
+        cfg.rssm_n_classes = _envint_t(
+            'DREAMER_RSSM_N_CLASSES', cfg.rssm_n_classes)
+        cfg.rssm_embed_dim = _envint_t(
+            'DREAMER_RSSM_EMBED_DIM', cfg.rssm_embed_dim)
     info = {'model_size': model_size, 'seq_len': seq_len, 'lookback': lookback,
             'horizon': horizon, 'paper_default': paper_default,
             'target_util': target_util, 'min_bs': paper_default, 'max_bs': max_bs,

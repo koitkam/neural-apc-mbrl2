@@ -344,7 +344,9 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     d_min = 1.0 / cfg.k_max
     tau_ctx_val = 1.0 - cfg.tau_ctx
 
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') == 'rssm'
+    # 'tssm' (transformer-SSM) shares the RSSM interface (initial_state/obs_step
+    # /img_step/decode), so it uses the same open-loop rollout path here.
+    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
     _rssm_state = (model.dynamics.initial_state(1, device)
                    if _is_rssm else None)
     _rssm_prev_a = (torch.zeros(1, action_dim, device=device)

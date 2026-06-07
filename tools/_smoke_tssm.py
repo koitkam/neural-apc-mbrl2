@@ -165,10 +165,40 @@ def test_end_to_end_dreamer_tssm():
           "disturbance head built, overshoot/held no-op (compat)")
 
 
+def test_diagnostics_probes_route_tssm():
+    """The WM fidelity / critic-calibration / feat-from-window probes must treat
+    TSSM as rssm-interface (not route it into the SF tokenizer path, which would
+    AttributeError on model.tokenizer=None)."""
+    from evaluation.diagnostics import _is_rssm_like, _rssm_feat_from_window
+    from tools.wm_steady_state_diagnostic import _is_rssm_model
+    from training.train import TrainConfig, build_model
+    import numpy as np
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 2
+    cfg.world_model_type = 'tssm'
+    cfg.tssm_d_model, cfg.tssm_n_layers, cfg.tssm_n_heads = 48, 2, 4
+    cfg.rssm_n_categoricals, cfg.rssm_n_classes, cfg.rssm_embed_dim = 4, 4, 16
+    cfg.compile_mode = 'off'
+    model = build_model(cfg)
+    assert _is_rssm_like(model), "diagnostics._is_rssm_like(tssm) should be True"
+    assert _is_rssm_model(model), "steady_state._is_rssm_model(tssm) should be True"
+    # _rssm_feat_from_window uses only interface methods -> must work for TSSM.
+    L = 8
+    feat = _rssm_feat_from_window(
+        model, np.random.randn(L, cfg.obs_dim).astype('float32'),
+        (np.random.rand(L, cfg.action_dim) * 2 - 1).astype('float32'),
+        torch.device('cpu'))
+    assert feat.shape == (1, model.dynamics.feat_dim), feat.shape
+    print("[smoke] OK diagnostics probes route TSSM as rssm-interface "
+          "(_is_rssm_like + _is_rssm_model True; feat_from_window works)")
+
+
 if __name__ == '__main__':
     test_interface_shapes()
     test_st_grad_reaches_prior_and_transformer()
     test_determinism_mode()
     test_stepwise_equals_full_sequence()
     test_end_to_end_dreamer_tssm()
+    test_diagnostics_probes_route_tssm()
     print("\n[smoke] ALL TSSM checks PASSED")
