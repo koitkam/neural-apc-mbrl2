@@ -400,6 +400,16 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_TRUNK_STOPGRAD_IN_P2':    ('wm_trunk_stopgrad_in_p2',        _as_bool),
     'DREAMER_TRAIN_MODE':                 ('train_mode',                     str),
     'DREAMER_JOINT_PRIOR_REFRESH_ITERS':  ('joint_prior_refresh_iters',      int),
+    # Early-stop knobs (mirror train.py _cfg_from_env names) so single_run/bo
+    # runs can relax/disable the stops for diagnostic runs (e.g. let a run
+    # continue PAST the entropy-collapse stop to observe the cascade trajectory).
+    'DREAMER_EARLY_STOP':                 ('early_stop_enable',              _as_bool),
+    'DREAMER_ES_P3_PATIENCE':             ('early_stop_p3_patience_iters',   int),
+    'DREAMER_ES_P3_MIN_IMPROVEMENT':      ('early_stop_p3_min_improvement',  float),
+    'DREAMER_ES_ENT_FRAC':                ('early_stop_entropy_collapse_frac',          float),
+    'DREAMER_ES_ENT_PATIENCE':            ('early_stop_entropy_collapse_patience_iters', int),
+    'DREAMER_ES_ENT_WINDOW':              ('early_stop_entropy_collapse_window_iters',   int),
+    'DREAMER_ES_ENT_MIN_BELOW':           ('early_stop_entropy_collapse_min_frac_below', float),
     # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),
