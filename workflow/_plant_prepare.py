@@ -225,6 +225,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # (reward head trains only from P2).  Override >0 to re-enable a
     # small P1 weight for experiments.
     'DREAMER_REWARD_MTP_WEIGHT_P1': ('reward_scale_loss_p1',     float),
+    # 2026-06-07: exclude expert-injected steps from the reward-head (reward-MTP)
+    # supervision so it stays calibrated on the policy's true distribution.
+    'DREAMER_REWARD_HEAD_EXCLUDE_EXPERT': ('reward_head_exclude_expert',  _as_bool),
     # 2026-05-22: number of constant-action seed episodes (steady-state
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.

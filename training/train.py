@@ -239,6 +239,19 @@ class TrainConfig:
     # (P5) → 1.0 (P40, 2026-05-22) → 0.3 (P43 root-cause).  Override
     # with DREAMER_REWARD_SCALE_LOSS.
     reward_scale_loss: float = 0.3
+    # (2026-06-07) Exclude EXPERT-injected transitions from the reward-head
+    # (reward-MTP) supervision.  The expert seeds + P3 re-injection ride the
+    # economic constraint edge in a NARROW, low-variance reward region; with
+    # them in the reward-MTP target the head fits that shifted distribution and
+    # ANTI-correlates on the broader on-policy/validation distribution
+    # (reward_head_r dropped 0.96->0.20 in the original repo's P83, -0.30 in the
+    # mbrl p95 joint run) -> miscalibrated imagined reward -> the critic's
+    # flat-pessimistic value (img_ret pinned at -H) -> no actor advantage
+    # gradient.  With this ON the reward head trains ONLY on non-expert steps
+    # (on-policy + exploration + PRBS + baseline) so it stays calibrated across
+    # the policy's TRUE distribution.  BC still clones the expert (separate
+    # mask) — only the REWARD supervision drops them.  DREAMER_REWARD_HEAD_EXCLUDE_EXPERT.
+    reward_head_exclude_expert: bool = False
     # P1 (WM pretrain) reward-MTP loss weight.  Paper default 0.0:
     # Dreamer-V4 §3 trains the WM (tokenizer + dynamics) without the
     # reward head in pretrain.  The reward head joins in agent
@@ -3302,7 +3315,16 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     if L_mtp_eff < model.reward.mtp_length:
         rew_logits_all = rew_logits_all[:, :L_mtp_eff]
     rew_loss_per = model.reward.loss_mtp(rew_logits_all, fut_rew)  # (BT, L)
-    reward_mtp_loss = rew_loss_per.mean()
+    if bool(getattr(cfg, 'reward_head_exclude_expert', False)):
+        # Train the reward head ONLY on non-expert steps so it stays
+        # calibrated on the policy's true distribution (see TrainConfig).
+        # ``em`` flags expert context positions; (1-em) selects the rest.
+        # denom>=1 keeps it well-defined if a batch were all-expert.
+        nem = (1.0 - em)                                       # (BT,)
+        rew_denom = nem.sum().clamp_min(1.0)
+        reward_mtp_loss = (rew_loss_per.mean(dim=1) * nem).sum() / rew_denom
+    else:
+        reward_mtp_loss = rew_loss_per.mean()
 
     total = cfg.bc_scale * bc_loss + cfg.reward_scale_loss * reward_mtp_loss
     return {
