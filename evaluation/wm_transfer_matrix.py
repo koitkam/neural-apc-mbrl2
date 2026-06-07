@@ -119,6 +119,167 @@ def _wm_rollout(model, lookback_obs, lookback_act, act_seq, horizon, device,
                               k_max, device)
 
 
+def _dv_settle_step_rollout(env, base_action: np.ndarray, dv_pos: int,
+                            dv_offset_eng: float, settle_steps: int,
+                            horizon: int, L: int,
+                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
+                                       np.ndarray, bool]:
+    """Settle the env at ``base_action`` with the DV at nominal, capture the
+    lookback, then STEP the measured DV (``set_disturbance_offset('dv', pos,
+    offset_eng)``) and roll out ``horizon`` steps holding ``base_action``.
+
+    Returns ``(lookback_obs (L,O), lookback_act (L,A), pre_obs (O,),
+    real_obs (horizon,O), applied)`` where ``applied`` is False if the sim has
+    no ``set_disturbance_offset`` (DV→CV then skipped for that sim).
+    """
+    obs_dim = env.obs_dim
+
+    def _nominal():
+        _quiet_env(env)
+        env.reset(exploration=False)
+        env._schedule = []
+        env._hidden_disturbance = None
+        try:
+            env.sim.set_disturbance_offset('dv', dv_pos, 0.0)
+        except Exception:
+            return False
+        return True
+
+    if not _nominal():
+        return (np.zeros((0, obs_dim), 'float32'), np.zeros((0, env.action_dim),
+                'float32'), np.zeros(obs_dim, 'float32'),
+                np.zeros((horizon, obs_dim), 'float32'), False)
+    obs_hist: List[np.ndarray] = []
+    for _ in range(settle_steps):
+        ow, _, done, _ = env.step(base_action)
+        obs_hist.append(ow[-1].copy())
+        if done:
+            _nominal()
+    obs_arr = np.asarray(obs_hist, dtype='float32')
+    Lc = min(L, obs_arr.shape[0])
+    lookback_obs = obs_arr[-Lc:].copy()
+    lookback_act = np.tile(base_action.astype('float32'), (Lc, 1))
+    pre = obs_arr[-1].copy()
+    # Step the measured DV (engineering units) and roll out.
+    try:
+        env.sim.set_disturbance_offset('dv', dv_pos, float(dv_offset_eng))
+    except Exception:
+        return lookback_obs, lookback_act, pre, np.tile(pre, (horizon, 1)), False
+    real = np.zeros((horizon, obs_dim), dtype='float32')
+    for kk in range(horizon):
+        ow, _, done, _ = env.step(base_action)
+        real[kk] = ow[-1]
+        if done:
+            real[kk + 1:] = real[kk]
+            break
+    return lookback_obs, lookback_act, pre, real, True
+
+
+def compute_dv_transfer_matrix(model, env, cfg, device, *,
+                               obs_std: Optional[np.ndarray] = None,
+                               n_levels: int = 3, step_frac: float = 0.4,
+                               horizon: int = 0, settle_steps: int = 0,
+                               seed: int = 20260607) -> Dict:
+    """WM-vs-real **DV→CV** step-response matrix (Option B DV-as-input only).
+
+    Mirrors ``compute_transfer_matrix`` but the exogenous input is a measured
+    DV (stepped via the sim disturbance offset), not an MV action.  The WM side
+    holds the stepped DV constant over imagination via ``dv_hold_override`` —
+    so this measures whether the world model learned ∂CV/∂DV.  Only meaningful
+    when the WM was built with DV-as-input (``dynamics.dv_dim > 0``); returns an
+    empty result otherwise.  Sim-agnostic: needs ``sim.set_disturbance_offset``
+    and ``sim.dv_normalization_ranges`` (skips DVs lacking them).
+    """
+    rssm = getattr(model, 'dynamics', None)
+    dv_dim = int(getattr(rssm, 'dv_dim', 0) or 0)
+    result: Dict = {'cv_names': [], 'dv_names': [], 'pairs': {}, 'enabled': False}
+    if dv_dim <= 0 or not _is_rssm_model(model):
+        return result
+    dv_obs_idx = [int(x) for x in list(getattr(rssm, 'dv_index_t', []))]
+    if not dv_obs_idx:
+        return result
+    cv_idx = list(env.cv_indices)
+    n_mv = int(env.action_dim)
+    obs_dim = int(env.obs_dim)
+    H = int(horizon) if horizon > 0 else max(40, int(1.5 * int(getattr(cfg, 'horizon', 30))))
+    S = int(settle_steps) if settle_steps > 0 else H
+    L = min(int(getattr(cfg, 'lookback', 64)), S)
+    if obs_std is None:
+        obs_std = np.ones(obs_dim, dtype='float32')
+    dv_ranges = list(getattr(env.sim, 'dv_normalization_ranges', []) or [])
+    cv_names = list(env.meta.get('cv_names') or [f'CV{c}' for c in cv_idx])
+    dv_names = list(env.meta.get('dv_names') or
+                    [f'DV{p}' for p in range(len(dv_obs_idx))])
+    rng = np.random.default_rng(seed)
+    # Operating points: a few MV levels (region coverage), DV stepped +/-.
+    levels = np.linspace(-0.4, 0.4, max(1, n_levels))
+    cells: Dict[str, Dict] = {}
+    t_axis = list(range(H))
+    for p, dv_oi in enumerate(dv_obs_idx):
+        span = 1.0
+        if p < len(dv_ranges) and len(dv_ranges[p]) == 2:
+            span = float(dv_ranges[p][1]) - float(dv_ranges[p][0])
+        step_eng = step_frac * abs(span)
+        for lev in levels:
+            base_action = np.full(n_mv, float(lev), dtype='float32')
+            for d in (+1.0, -1.0):
+                lb_obs, lb_act, pre, real, ok = _dv_settle_step_rollout(
+                    env, base_action, p, d * step_eng, S, H, L)
+                if not ok or lb_obs.shape[0] == 0:
+                    continue
+                d_dv_eng = float((real[-1, dv_oi] - pre[dv_oi])
+                                 * (obs_std[dv_oi] if dv_oi < len(obs_std) else 1.0))
+                if abs(d_dv_eng) < 1e-9:
+                    continue
+                # WM: hold ALL DVs at base, set the stepped one to its realized
+                # normalized value, imagine under the held base action.
+                dv_override = lb_obs[-1, dv_obs_idx].astype('float32').copy()
+                dv_override[p] = float(real[-1, dv_oi])
+                act_seq = np.tile(base_action, (H, 1)).astype('float32')
+                pred = _imagine_open_loop_rssm(
+                    model, lb_obs, lb_act, act_seq, H, device,
+                    dv_hold_override=dv_override)
+                for ci, c in enumerate(cv_idx):
+                    sd = float(obs_std[c]) if c < len(obs_std) else 1.0
+                    g_wm = (pred[:, c] - pre[c]) * sd / d_dv_eng
+                    g_real = (real[:, c] - pre[c]) * sd / d_dv_eng
+                    key = f'{cv_names[ci]}<-{dv_names[p]}'
+                    cells.setdefault(key, {'wm': [], 'real': []})
+                    cells[key]['wm'].append(g_wm.astype('float32'))
+                    cells[key]['real'].append(g_real.astype('float32'))
+    # restore nominal DV before returning
+    for p in range(len(dv_obs_idx)):
+        try:
+            env.sim.set_disturbance_offset('dv', p, 0.0)
+        except Exception:
+            pass
+
+    def _agg(curves: List[np.ndarray]) -> Dict[str, object]:
+        arr = np.stack(curves, axis=0)
+        ss = arr[:, max(1, int(0.8 * arr.shape[1])):].mean(axis=1)
+        return {'mean': arr.mean(axis=0).tolist(), 'lo': arr.min(axis=0).tolist(),
+                'hi': arr.max(axis=0).tolist(), 'ss_gain_mean': float(ss.mean()),
+                'n': int(arr.shape[0])}
+
+    result['cv_names'] = cv_names
+    result['dv_names'] = dv_names
+    result['t'] = t_axis
+    result['horizon'] = H
+    result['enabled'] = bool(cells)
+    for key, cur in cells.items():
+        if not cur['wm'] or not cur['real']:
+            continue
+        wm = _agg(cur['wm'])
+        real = _agg(cur['real'])
+        rg = real['ss_gain_mean']
+        wg = wm['ss_gain_mean']
+        result['pairs'][key] = {
+            'wm': wm, 'real': real, 'wm_ss_gain': wg, 'real_ss_gain': rg,
+            'ss_gain_ratio_wm_over_real': (wg / rg) if abs(rg) > 1e-9 else float('nan'),
+            'ss_gain_abs_err': abs(wg - rg)}
+    return result
+
+
 def compute_transfer_matrix(model, env, cfg, device, *,
                             obs_std: Optional[np.ndarray] = None,
                             n_levels: int = 5, level_span: float = 0.6,
@@ -298,6 +459,74 @@ def plot_transfer_matrix(result: Dict, out_path: Path, title: str = '') -> None:
     plt.close(fig)
 
 
+def plot_dv_transfer_matrix(result: Dict, out_path: Path,
+                            title: str = '') -> None:
+    """Render the WM-vs-real **DV→CV** step-response matrix (CV rows × DV cols).
+
+    Same colour key as the MV plot: black solid = real sim, blue dashed = world
+    model, shaded = min–max across operating points.  Gains are ΔCV/ΔDV (eng).
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    cv_names = result['cv_names']
+    dv_names = result['dv_names']
+    t = np.asarray(result.get('t', []), dtype='float32')
+    n_cv, n_dv = len(cv_names), len(dv_names)
+    fig_w = max(7.0, 4.2 * n_dv)
+    fig_h = max(4.8, 3.0 * n_cv + 1.3)
+    fig, axes = plt.subplots(n_cv, n_dv, figsize=(fig_w, fig_h), squeeze=False)
+    for ci, cvn in enumerate(cv_names):
+        for j, dvn in enumerate(dv_names):
+            ax = axes[ci][j]
+            cell = result['pairs'].get(f'{cvn}<-{dvn}')
+            if not cell:
+                ax.set_visible(False)
+                continue
+            for who, color in (('real', 'k'), ('wm', 'C0')):
+                m = np.asarray(cell[who]['mean'], dtype='float32')
+                lo = np.asarray(cell[who]['lo'], dtype='float32')
+                hi = np.asarray(cell[who]['hi'], dtype='float32')
+                ax.plot(t, m, color=color, lw=1.8,
+                        ls='-' if who == 'real' else '--',
+                        label='real sim' if who == 'real' else 'world model')
+                ax.fill_between(t, lo, hi, color=color, alpha=0.15, linewidth=0)
+            ax.axhline(0.0, color='grey', lw=0.6, alpha=0.6)
+            ratio = cell.get('ss_gain_ratio_wm_over_real', float('nan'))
+            ax.set_title(f'{cvn}<-{dvn}\nSS gain  real={cell["real_ss_gain"]:+.3g}  '
+                         f'wm={cell["wm_ss_gain"]:+.3g}  (wm/real={ratio:.2f})',
+                         fontsize=8)
+            if ci == n_cv - 1:
+                ax.set_xlabel('step (samples after the DV step)')
+            if j == 0:
+                ax.set_ylabel('ΔCV / ΔDV  (eng units)')
+            ax.grid(alpha=0.25)
+    legend_handles = [
+        Line2D([0], [0], color='k', lw=1.8, ls='-', label='real sim (ground truth)'),
+        Line2D([0], [0], color='C0', lw=1.8, ls='--', label='world model (DV held)'),
+        Patch(facecolor='grey', alpha=0.2, label='shaded = min–max across operating region'),
+        Line2D([0], [0], color='grey', lw=0.6, label='zero gain'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center', ncol=4, fontsize=8,
+               framealpha=0.9, bbox_to_anchor=(0.5, 0.085))
+    sup = title or ('World-model vs real-plant DV→CV transfer matrix '
+                    '(measured-disturbance step response)')
+    fig.suptitle(sup, fontsize=11, y=0.99)
+    fig.text(0.5, 0.02,
+             'How to read: world model (blue dashed) should OVERLAP real sim '
+             '(black solid).\nThe WM holds the stepped DV constant (Option B '
+             'feedforward); flatter/smaller ⇒ WM ∂CV/∂DV too small.',
+             ha='center', va='bottom', fontsize=8)
+    fig.tight_layout(rect=(0, 0.16, 1, 0.95))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
 def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
                      obs_std: Optional[np.ndarray] = None,
                      title: str = '') -> Optional[Dict]:
@@ -322,6 +551,24 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
                              title=title)
         with open(out_dir / 'wm_transfer_matrix.json', 'w') as f:
             json.dump(result, f, indent=2)
+        # DV→CV matrix (Option B DV-as-input only; empty/no-op otherwise).
+        # Separately guarded so a DV-side failure never loses the MV result.
+        try:
+            dv_result = compute_dv_transfer_matrix(
+                model, env, cfg, device, obs_std=obs_std, n_levels=3,
+                step_frac=step_frac, horizon=horizon, settle_steps=settle)
+            if dv_result.get('enabled') and dv_result.get('pairs'):
+                plot_dv_transfer_matrix(
+                    dv_result, out_dir / 'wm_dv_transfer_matrix.png', title=title)
+                with open(out_dir / 'wm_dv_transfer_matrix.json', 'w') as f:
+                    json.dump(dv_result, f, indent=2)
+                _dvp = dv_result['pairs']
+                print(f'[val] WM DV→CV transfer matrix: {len(_dvp)} DV/CV '
+                      f'pair(s) -> {out_dir}/wm_dv_transfer_matrix.png',
+                      flush=True)
+        except Exception as _dve:
+            print(f'[val] WM DV→CV transfer matrix skipped ({_dve!r})',
+                  flush=True)
         # Concise fidelity summary to the log.
         pairs = result.get('pairs', {})
         worst = None
