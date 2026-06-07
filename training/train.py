@@ -5783,6 +5783,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_freeze_after_p1 = bool(getattr(cfg, 'wm_freeze_after_p1', False))
     # P93: critic warmup at P3 start + WM-trunk protection in P2.
     p3_critic_warmup_iters = int(getattr(cfg, 'p3_critic_warmup_iters', 0) or 0)
+    # One-shot guard so the critic-warmup banner logs EXACTLY once.  The print
+    # sits inside the inner train-steps loop, which would otherwise repeat it
+    # once per step for the whole first warmup iter (~25x).
+    _critic_warmup_logged = False
     wm_trunk_stopgrad_in_p2 = bool(getattr(cfg, 'wm_trunk_stopgrad_in_p2', False))
     # neural-apc-mbrl JOINT training mode (DreamerV1/V2/V3 style).
     joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
@@ -6870,10 +6874,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     if (p3_critic_warmup_iters > 0
                             and p3_iters < p3_critic_warmup_iters):
                         opt_critic.step()
-                        if p3_iters == 0:
-                            print(f"[p3-critic-warmup] training critic only for "
+                        if not _critic_warmup_logged:
+                            print(f"[critic-warmup] training critic only for "
                                   f"{p3_critic_warmup_iters} iters "
                                   f"(actor frozen)", flush=True)
+                            _critic_warmup_logged = True
                     else:
                         opt_actor.step()
                         opt_critic.step()
@@ -7011,7 +7016,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             rwm_str = f"{rwm:+.2f}" if rwm is not None else 'n/a'
             ema_str = (f"{row['ema_return']:.2f}"
                         if row['ema_return'] is not None else 'n/a')
-            print(f"[{row['timestamp']}] P{current_phase} iter {total_iters:4d} "
+            # JOINT mode has no phases -> tag rows 'joint' instead of 'P3';
+            # phased mode keeps the informative P1/P2/P3 label.
+            phase_tag = 'joint' if joint_mode else f'P{current_phase}'
+            print(f"[{row['timestamp']}] {phase_tag} iter {total_iters:4d} "
                   f"steps {total_env_steps:6d} sps {sps:5.1f} "
                   f"ret_ema {ema_str} ret_w {rwm_str} "
                   f"recon {row.get('recon_loss', 0.0):.4f} "
