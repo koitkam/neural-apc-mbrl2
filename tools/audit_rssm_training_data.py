@@ -168,6 +168,11 @@ for k, v in auto_applied.items():
 # Raw-state tap (reuse v2 pattern): capture pre-normalization sim state.
 # --------------------------------------------------------------------------
 _raw_states: List[List[np.ndarray]] = []
+# Per-step UNMEASURED (hidden) disturbance signal, captured parallel to
+# _raw_states so it can be correlated against MV / DV.  The WM must be able to
+# tell the measured DV apart from the unmeasured load -> they must be
+# uncorrelated; likewise disturbances vs MV, and MV vs MV (MIMO gain ID).
+_hidden_states: List[List[np.ndarray]] = []
 _orig_reset = env.reset
 _orig_build_obs = env._build_obs_vec
 _ep_meta: List[Dict] = []
@@ -178,6 +183,17 @@ def _build_obs_hook(state):
         s = np.asarray(state, dtype='float32').reshape(-1).copy()
         if _raw_states:
             _raw_states[-1].append(s)
+        # tap the per-step hidden-disturbance offset (aligned to env.cv_indices)
+        if _hidden_states:
+            h = np.zeros(len(env.cv_indices), dtype='float32')
+            hd = getattr(env, '_hidden_disturbance', None)
+            if hd is not None:
+                la = np.asarray(getattr(hd, 'last_applied', []),
+                                dtype='float32').reshape(-1)
+                for p, idx in enumerate(getattr(hd, 'cv_indices', [])):
+                    if p < la.shape[0] and idx in env.cv_indices:
+                        h[env.cv_indices.index(idx)] = la[p]
+            _hidden_states[-1].append(h)
     except Exception:
         pass
     return _orig_build_obs(state)
@@ -185,6 +201,7 @@ def _build_obs_hook(state):
 
 def _reset_hook(*a, **kw):
     _raw_states.append([])
+    _hidden_states.append([])
     out = _orig_reset(*a, **kw)
     _ep_meta.append({
         'sched_len': len(env._schedule or []),
@@ -266,15 +283,22 @@ def _mv_phys(a_col: np.ndarray, j: int) -> np.ndarray:
 # Each entry: (episode_type, episode_dict, raw_state_array).
 # --------------------------------------------------------------------------
 EPISODES: List[Tuple[str, Dict, Optional[np.ndarray]]] = []
+# Per-episode hidden-disturbance signal array (T, n_cv), index-aligned w/ EPISODES.
+HIDDEN_BY_EP: List[Optional[np.ndarray]] = []
 
 
 def _harvest(ep_type: str, ep: Dict):
     raw_list = _raw_states[-1] if _raw_states else []
-    # First captured frame is the reset state; drop so raw aligns with act.
+    hid_list = _hidden_states[-1] if _hidden_states else []
+    # First captured frame is the reset state; drop so signals align with act.
     if len(raw_list) > ep['act'].shape[0]:
         raw_list = raw_list[1:]
+    if len(hid_list) > ep['act'].shape[0]:
+        hid_list = hid_list[1:]
     raw = np.stack(raw_list, axis=0) if raw_list else None
+    hid = np.stack(hid_list, axis=0) if hid_list else None
     EPISODES.append((ep_type, ep, raw))
+    HIDDEN_BY_EP.append(hid)
 
 
 n_baseline = int(getattr(cfg, 'baseline_seed_episodes', 0))
@@ -600,22 +624,85 @@ for j, di in enumerate(dv_idx):
         'n_step_events_step_test': n_dv_events,
     })
 
-# (c) MV-DV decorrelation (separability of ∂CV/∂MV from ∂CV/∂DV).
-mv_dv_corr = None
-if dv_idx:
-    mv_series = []
-    dv_series = []
-    for et, ep, raw in EPISODES:
-        if raw is None or dv_idx[0] >= raw.shape[1]:
-            continue
-        mv_series.append(_mv_phys(ep['act'][:, 0], 0))
-        dv_series.append(raw[:, dv_idx[0]])
-    if mv_series:
-        m = _cat(mv_series)
-        dvv = _cat(dv_series)
-        n = min(m.size, dvv.size)
-        if n > 10 and m[:n].std() > 1e-9 and dvv[:n].std() > 1e-9:
-            mv_dv_corr = float(np.corrcoef(m[:n], dvv[:n])[0, 1])
+# (c) Excitation DECORRELATION: for the WM to identify ∂CV/∂MV vs ∂CV/∂DV vs
+# the unmeasured-disturbance signature, the excitation sources must be mutually
+# UNCORRELATED (and MVs mutually uncorrelated for per-MV gain identifiability).
+# Build per-step physical series for every MV / DV / hidden channel, concatenate
+# across the whole seed buffer, then Pearson-correlate every cross-group pair.
+def _series_or_none(parts):
+    if not parts:
+        return None
+    v = _cat(parts)
+    return v if (v.size > 10 and float(v.std()) > 1e-9) else None
+
+
+_mv_series = {
+    f'MV{j}': _series_or_none([_mv_phys(ep['act'][:, j], j)
+                              for et, ep, raw in EPISODES
+                              if ep['act'].shape[1] > j])
+    for j in range(A)}
+_dv_series = {
+    f'DV{k}': _series_or_none([raw[:, di] for et, ep, raw in EPISODES
+                              if raw is not None and di < raw.shape[1]])
+    for k, di in enumerate(dv_idx)}
+_hid_series = {
+    f'HID_CV{c}': _series_or_none(
+        [HIDDEN_BY_EP[i][:, c] for i in range(len(EPISODES))
+         if HIDDEN_BY_EP[i] is not None and c < HIDDEN_BY_EP[i].shape[1]])
+    for c in range(len(cv_idx))}
+
+
+def _corr_between(a, b):
+    if a is None or b is None:
+        return None
+    n = min(a.size, b.size)
+    if n <= 10:
+        return None
+    aa, bb = a[:n], b[:n]
+    if float(aa.std()) < 1e-9 or float(bb.std()) < 1e-9:
+        return None
+    return float(np.corrcoef(aa, bb)[0, 1])
+
+
+def _max_abs_cross(group_a, group_b, same=False):
+    keys_a, keys_b = list(group_a), list(group_b)
+    best, best_pair = None, None
+    for ia, ka in enumerate(keys_a):
+        for ib, kb in enumerate(keys_b):
+            if same and ib <= ia:
+                continue
+            c = _corr_between(group_a[ka], group_b[kb])
+            if c is None:
+                continue
+            if best is None or abs(c) > abs(best):
+                best, best_pair = c, [ka, kb]
+    return best, best_pair
+
+
+# back-compat scalar (MV0 x DV0) still drives the occupancy plot title
+mv_dv_corr = _corr_between(_mv_series.get('MV0'), _dv_series.get('DV0'))
+mv_dv_max, mv_dv_pair = _max_abs_cross(_mv_series, _dv_series)
+mv_hid_max, mv_hid_pair = _max_abs_cross(_mv_series, _hid_series)
+dv_hid_max, dv_hid_pair = _max_abs_cross(_dv_series, _hid_series)
+mv_mv_max, mv_mv_pair = _max_abs_cross(_mv_series, _mv_series, same=True)
+
+_hid_all = [HIDDEN_BY_EP[i] for i in range(len(EPISODES))
+            if HIDDEN_BY_EP[i] is not None]
+if _hid_all:
+    _hid_cat = np.concatenate(
+        [h.reshape(h.shape[0], -1) for h in _hid_all], axis=0)
+    hidden_active_step_frac = float(np.mean(np.abs(_hid_cat) > 1e-6))
+else:
+    hidden_active_step_frac = 0.0
+
+excitation_corr = {
+    'mv_dv_max_abs': mv_dv_max, 'mv_dv_pair': mv_dv_pair,
+    'mv_hidden_max_abs': mv_hid_max, 'mv_hidden_pair': mv_hid_pair,
+    'dv_hidden_max_abs': dv_hid_max, 'dv_hidden_pair': dv_hid_pair,
+    'mv_mv_max_abs': mv_mv_max, 'mv_mv_pair': mv_mv_pair,
+    'hidden_active_step_frac': hidden_active_step_frac,
+    'n_mv': A, 'n_dv': len(dv_idx), 'n_cv': len(cv_idx),
+}
 
 # (d) Steady-state gain sampling: held-MV vs settled-CV scatter
 # (const_action late-window SS).
@@ -664,6 +751,7 @@ summary = {
     'mv_step_inventory': mv_step_inventory,
     'dv_excitation': dv_excitation,
     'mv_dv_corr': mv_dv_corr,
+    'excitation_corr': excitation_corr,
     'n_ss_gain_samples': int(ss_pairs.shape[0]),
 }
 (OUT / 'summary.json').write_text(json.dumps(summary, indent=2, default=float))
@@ -846,8 +934,19 @@ lines.append(f"- Excitation PSD low-frequency power (<= plant corner "
 lines.append('')
 
 # Q3
+_xc = excitation_corr
+
+
+def _decorr_ok(v):
+    return v is None or abs(v) < 0.5
+
+
+decorr_ok = (_decorr_ok(_xc['mv_dv_max_abs'])
+             and _decorr_ok(_xc['mv_hidden_max_abs'])
+             and _decorr_ok(_xc['dv_hidden_max_abs'])
+             and _decorr_ok(_xc['mv_mv_max_abs']))
 gain_ok = (mv_step_inventory['n_steps'] >= 10
-           and (mv_dv_corr is None or abs(mv_dv_corr) < 0.3)
+           and decorr_ok
            and ss_pairs.shape[0] >= 5)
 lines.append(f'## Q3 — Gain & dynamics learnability: {_verdict(gain_ok)}\n')
 lines.append(f"- Clean isolated MV steps: {mv_step_inventory['n_steps']} "
@@ -859,9 +958,27 @@ for d in dv_excitation:
     lines.append(f"- DV {d['name']}: range_cov={d['range_cov_frac']:.2f}, "
                  f"bin_cov={d['bin_cov']:.2f}, "
                  f"explicit step events (step-test)={d['n_step_events_step_test']}")
-lines.append(f"- MV–DV correlation: "
-             f"{mv_dv_corr:.3f} (|corr|<0.3 => DV separable from MV)"
-             if mv_dv_corr is not None else "- MV–DV correlation: n/a (no DV)")
+
+
+def _fc(v):
+    return f"{v:+.3f}" if v is not None else "n/a"
+
+
+lines.append("- Excitation decorrelation (|corr|<0.3 good, >=0.5 CONCERN — "
+             "sources must be uncorrelated so the WM can attribute ∂CV to the "
+             "right cause):")
+lines.append(f"    MV–DV      max|corr|={_fc(_xc['mv_dv_max_abs'])} "
+             f"{_xc['mv_dv_pair'] or ''}")
+lines.append(f"    MV–hidden  max|corr|={_fc(_xc['mv_hidden_max_abs'])} "
+             f"{_xc['mv_hidden_pair'] or ''}")
+lines.append(f"    DV–hidden  max|corr|={_fc(_xc['dv_hidden_max_abs'])} "
+             f"{_xc['dv_hidden_pair'] or ''}")
+lines.append(f"    MV–MV      max|corr|={_fc(_xc['mv_mv_max_abs'])} "
+             f"{_xc['mv_mv_pair'] or '(SISO / n/a)'}")
+lines.append(f"    hidden active in {_xc['hidden_active_step_frac'] * 100:.1f}% "
+             f"of seed steps (if ~0 the DV/hidden decorrelation is trivial — "
+             f"they rarely co-excite in the SEED buffer; on-policy data not "
+             f"audited here)")
 lines.append(f"- Steady-state gain samples (const-action): {ss_pairs.shape[0]}")
 lines.append('')
 
