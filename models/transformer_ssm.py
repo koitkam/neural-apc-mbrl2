@@ -98,22 +98,24 @@ OPEN DESIGN DECISIONS (resolve before implementing):
     SAME actions as a teacher-forced rollout must match within tol (proves the
     KV-cache path == the full-attention path).
 
-Until the transition methods are implemented, ``build_model`` must NOT dispatch
-to this class; selecting world_model_type='tssm' should raise the clear error
-below.
+Until the transition methods' KV-cache + dispatch wiring are done, ``build_model``
+must NOT dispatch to this class.  STATUS: transitions IMPLEMENTED (naive windowed
+recompute, CPU-tested via tools/_smoke_tssm.py); KV-cache + consumer-compat +
+dispatch remain (see top-of-file STATUS).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 # Reuse the proven RSSM building blocks so the categorical latent + KL are
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
-from models.dreamer_v4_rssm import _CategoricalLatent, RSSMState
+from models.dreamer_v4_rssm import _CategoricalLatent
 
 
 @dataclass
@@ -130,14 +132,46 @@ class TransformerSSMConfig:
     ffn_mult: int = 4
     dropout: float = 0.0
     unimix: float = 0.01          # match RSSM categorical mixing
-    max_seq_len: int = 256        # >= lookback + imagination horizon
+    max_seq_len: int = 256        # context window cap (>= lookback + horizon)
+
+
+@dataclass
+class TSSMState:
+    """Duck-compatible with RSSMState (.h, .z_logits, .z, .feat, .stoch_flat)
+    PLUS the transformer's token ``window`` (B, t, d_model) needed to continue
+    the causal rollout.  ``window=None`` => no history (feat-only reconstruction
+    by a Markovian consumer; the next step starts a fresh single-token context).
+    """
+    h: torch.Tensor             # (..., deter_dim) transformer output at step t
+    z_logits: torch.Tensor      # (..., n_categoricals, n_classes)
+    z: torch.Tensor             # (..., n_categoricals, n_classes) one-hot (ST)
+    window: Optional[torch.Tensor] = None   # (..., t, deter_dim) token history
+
+    @property
+    def stoch_flat(self) -> torch.Tensor:
+        return self.z.flatten(start_dim=-2)
+
+    @property
+    def feat(self) -> torch.Tensor:
+        return torch.cat([self.h, self.stoch_flat], dim=-1)
+
+
+def _sinusoidal_pos(n: int, d: int, device, dtype) -> torch.Tensor:
+    """(n, d) sinusoidal positional encoding (Vaswani et al.)."""
+    pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)
+    div = torch.exp(torch.arange(0, d, 2, device=device, dtype=torch.float32)
+                    * (-math.log(10000.0) / d))
+    pe = torch.zeros(n, d, device=device, dtype=torch.float32)
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)
+    return pe.to(dtype)
 
 
 class TransformerSSMDynamics(nn.Module):
     """Causal-transformer dynamics core implementing the RSSMDynamics interface.
 
-    SCAFFOLD: shared pieces are real; the three transition methods raise
-    NotImplementedError with the design spec in the module docstring.
+    Naive (recompute) transitions — correct + CPU-tested.  KV-cache is a future
+    pure-speed optimization gated by the equivalence test (see module docstring).
     """
 
     def __init__(self, cfg: TransformerSSMConfig):
@@ -148,8 +182,10 @@ class TransformerSSMDynamics(nn.Module):
         self.deter_dim = int(cfg.deter_dim)
         self.n_categoricals = int(cfg.n_categoricals)
         self.n_classes = int(cfg.n_classes)
+        self.embed_dim = int(cfg.embed_dim)
+        self.unimix = float(cfg.unimix)
+        self.max_seq_len = int(cfg.max_seq_len)
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
-        self.feat_dim = self.deter_dim + self.stoch_flat_dim
 
         # ----- shared, low-risk pieces (real implementations) -----
         self.encoder = nn.Sequential(
@@ -181,6 +217,10 @@ class TransformerSSMDynamics(nn.Module):
             self.deter_dim + cfg.embed_dim, self.n_categoricals,
             self.n_classes, unimix=cfg.unimix)
 
+    @property
+    def feat_dim(self) -> int:
+        return self.deter_dim + self.stoch_flat_dim
+
     # ----- shared pieces (real) -----
     def embed(self, obs: torch.Tensor) -> torch.Tensor:
         return self.encoder(obs)
@@ -189,34 +229,87 @@ class TransformerSSMDynamics(nn.Module):
         return self.decoder(feat)
 
     def initial_state(self, batch_size: int,
-                      device: torch.device) -> RSSMState:
+                      device: torch.device) -> TSSMState:
         h = torch.zeros(batch_size, self.deter_dim, device=device)
         z_logits = torch.zeros(batch_size, self.n_categoricals,
                                self.n_classes, device=device)
         z = torch.zeros_like(z_logits)
         z[..., 0] = 1.0
-        return RSSMState(h=h, z_logits=z_logits, z=z)
+        return TSSMState(h=h, z_logits=z_logits, z=z, window=None)
 
-    # ----- transitions (TO IMPLEMENT — see module docstring "CORE ARCHITECTURE") -----
-    def img_step(self, prev: RSSMState, prev_action: torch.Tensor,
-                 sample: bool = True) -> RSSMState:
-        raise NotImplementedError(
-            "TransformerSSMDynamics.img_step: implement the KV-cached single-step "
-            "prior advance (see models/transformer_ssm.py docstring). Must pass "
-            "the numerical-equivalence test vs rollout_observed before use.")
+    # ----- internal: token build + causal-window encode -----
+    def _build_token(self, z: torch.Tensor,
+                     action: torch.Tensor) -> torch.Tensor:
+        """token = proj([z_flat ; action]) -> (B, d_model)."""
+        z_flat = z.flatten(start_dim=-2)
+        return self.token_proj(torch.cat([z_flat, action], dim=-1))
 
-    def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
+    def _encode_window(self, window: torch.Tensor) -> torch.Tensor:
+        """Causal transformer over (B, S, d_model); returns (B, S, d_model)."""
+        S = window.shape[1]
+        pe = _sinusoidal_pos(S, self.deter_dim, window.device, window.dtype)
+        x = window + pe.unsqueeze(0)
+        mask = torch.triu(
+            torch.ones(S, S, device=window.device, dtype=torch.bool),
+            diagonal=1)  # True = disallow attending to the future
+        return self.transformer(x, mask=mask)
+
+    def _append(self, window: Optional[torch.Tensor],
+                token: torch.Tensor) -> torch.Tensor:
+        """Append one (B, d_model) token; cap the window at max_seq_len."""
+        tok = token.unsqueeze(1)                         # (B, 1, d)
+        win = tok if window is None else torch.cat([window, tok], dim=1)
+        if win.shape[1] > self.max_seq_len:
+            win = win[:, -self.max_seq_len:]
+        return win
+
+    # ----- transitions -----
+    def img_step(self, prev: TSSMState, prev_action: torch.Tensor,
+                 sample: bool = True) -> TSSMState:
+        """Imagined (prior-only) step: build the token from (prev.z, action),
+        append to the window, recompute the causal transformer, read the prior
+        off the last position.  ``window=None`` (feat-only reconstruction by a
+        Markovian consumer) starts a fresh single-token context."""
+        token = self._build_token(prev.z, prev_action)
+        window = self._append(getattr(prev, 'window', None), token)
+        h = self._encode_window(window)[:, -1]           # (B, d_model)
+        z_logits, z = self.prior_net(h, sample=sample)
+        return TSSMState(h=h, z_logits=z_logits, z=z, window=window)
+
+    def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, sample: bool = True
-                 ) -> Tuple[RSSMState, RSSMState]:
-        raise NotImplementedError(
-            "TransformerSSMDynamics.obs_step: implement posterior+prior step "
-            "(see module docstring).")
+                 ) -> Tuple[TSSMState, TSSMState]:
+        """Observation step -> (posterior, prior).  Prior is needed for KL; both
+        share ``h``; the posterior conditions on the obs embedding and is the z
+        carried forward."""
+        prior = self.img_step(prev, prev_action, sample=sample)
+        post_in = torch.cat([prior.h, embed], dim=-1)
+        post_logits, post_z = self.post_net(post_in, sample=sample)
+        post = TSSMState(h=prior.h, z_logits=post_logits, z=post_z,
+                         window=prior.window)
+        return post, prior
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
                          sample: bool = True
                          ) -> Tuple[torch.Tensor, torch.Tensor,
-                                    torch.Tensor, RSSMState]:
-        raise NotImplementedError(
-            "TransformerSSMDynamics.rollout_observed: implement teacher-forced "
-            "causal-transformer rollout (see module docstring). Returns "
-            "(feats, post_logits, prior_logits, last_state).")
+                                    torch.Tensor, TSSMState]:
+        """Teacher-forced posterior rollout over (B, T, *).  ``act[:, t]`` drives
+        the transition INTO ``obs[:, t]`` (contemporaneous-action convention, as
+        in RSSMDynamics).  Returns (feats, post_logits, prior_logits,
+        last_state) with shapes (B, T, F), (B, T, K, C), (B, T, K, C)."""
+        B, T = obs.shape[:2]
+        device = obs.device
+        embeds = self.embed(obs)                         # (B, T, embed_dim)
+        state = self.initial_state(B, device)
+        feats_l, post_l, prior_l = [], [], []
+        for t in range(T):
+            post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                                        sample=sample)
+            state = post
+            feats_l.append(post.feat)
+            post_l.append(post.z_logits)
+            prior_l.append(prior.z_logits)
+        feats = torch.stack(feats_l, dim=1)
+        post_logits = torch.stack(post_l, dim=1)
+        prior_logits = torch.stack(prior_l, dim=1)
+        return feats, post_logits, prior_logits, state
