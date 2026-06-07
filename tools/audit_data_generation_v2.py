@@ -28,7 +28,7 @@ import numpy as np
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-REPO = Path('/home/koitkam/neural-apc-dreamerV4')
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 # ---------- CLI / sim-agnostic config -------------------------------------

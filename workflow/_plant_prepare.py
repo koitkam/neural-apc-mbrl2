@@ -386,6 +386,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_FREEZE_AFTER_P1':         ('wm_freeze_after_p1',             _as_bool),
     'DREAMER_P3_CRITIC_WARMUP_ITERS':     ('p3_critic_warmup_iters',         int),
     'DREAMER_WM_TRUNK_STOPGRAD_IN_P2':    ('wm_trunk_stopgrad_in_p2',        _as_bool),
+    'DREAMER_TRAIN_MODE':                 ('train_mode',                     str),
+    'DREAMER_JOINT_PRIOR_REFRESH_ITERS':  ('joint_prior_refresh_iters',      int),
     # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),

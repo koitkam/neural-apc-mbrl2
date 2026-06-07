@@ -35,7 +35,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # ---- Repo setup (mirror single_run.py prelude) -----------------------------
-REPO = Path('/home/koitkam/neural-apc-dreamerV4')
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 SIM_DIR = REPO / 'simulation' / 'test_sim'

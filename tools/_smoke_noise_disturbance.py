@@ -12,8 +12,8 @@ Verifies WITHOUT a real sim / GPU:
     the legacy OU when DREAMER_HIDDEN_DIST_MODE=ou.
 
 Run (CPU):
-  PYTHONPATH=/home/koitkam/neural-apc-dreamerV4 \
-  /home/koitkam/neural-apc-dreamerV4-env/bin/python tools/_smoke_noise_disturbance.py
+  PYTHONPATH=$PWD \
+  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_noise_disturbance.py
 """
 import os
 

@@ -10,8 +10,8 @@ env:
   * train.imagination_step    (P3 actor/critic via RSSM imagination)
 
 All outputs must be finite.  Run:
-  CONTROL_SETUP_JSON=... PYTHONPATH=/home/koitkam/neural-apc-dreamerV4 \
-  /home/koitkam/neural-apc-dreamerV4-env/bin/python tools/_smoke_rssm.py
+  CONTROL_SETUP_JSON=... PYTHONPATH=$PWD \
+  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_rssm.py
 """
 import torch
 

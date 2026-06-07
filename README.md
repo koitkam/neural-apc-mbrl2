@@ -1,14 +1,20 @@
-# neural-apc-dreamerV4
+# neural-apc-mbrl
 
-Paper-faithful **Dreamer 4** controller for Advanced Process Control (APC).
+**Model-based reinforcement-learning controller for Advanced Process Control
+(APC).** Forked from `neural-apc-dreamerV4` (2026-06-06) to pursue a
+paper-faithful **joint** training loop (DreamerV1/V2/V3 style) and a
+multi-backbone world model (RSSM default; transformer opt-in), beyond the
+staged Dreamer-4 curriculum. Sibling of `neural-apc-pytorch` (model-FREE
+SAC/PPO/TD3); this repo is the model-BASED line.
 
 Reference: Hafner, Yan, Lillicrap (2025), "Training Agents Inside of Scalable
-World Models" (Dreamer 4), [arXiv:2509.24527](https://arxiv.org/abs/2509.24527).
+World Models" (Dreamer 4), [arXiv:2509.24527](https://arxiv.org/abs/2509.24527),
+plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
 
 ## Goals
 
-- Single algorithm (Dreamer 4) — no TD3/PPO/SAC scaffolding.
-- Stay close to the paper. Add adaptive knobs only when they remain a strict
+- Model-based control with a learned world model (RSSM default, transformer opt-in).
+- Stay close to the Dreamer papers. Add adaptive knobs only when they remain a strict
   superset of the paper recipe (paper defaults as floors / minimums).
 - Simulator-agnostic via small, focused Bayesian Optimization on two axes
   only: `model_size`, `horizon` (initialized from plant ID; lookback is
@@ -16,6 +22,22 @@ World Models" (Dreamer 4), [arXiv:2509.24527](https://arxiv.org/abs/2509.24527).
 - One ONNX artifact per workflow: a single integrated graph
   `(obs_window, prev_actions) → action`. No separate observer model — the
   causal tokenizer + dynamics transformer *is* the observer.
+
+## Training modes (`DREAMER_TRAIN_MODE`)
+
+- **`phased`** (default): the staged Dreamer-4 curriculum — P1 world-model
+  pretraining → P2 reward-head + policy-BC warmup → P3 actor+critic via
+  imagination, with phase boundaries. Best when the world model is expensive
+  to train (transformer backbone) and benefits from amortized pretraining.
+- **`joint`** (DreamerV1/V2/V3 style): after the seed-buffer **prefill**,
+  co-train the world model, actor, and critic **every step from step 1** — no
+  phase boundaries. This eliminates the phase-boundary failure modes (recon
+  destabilization at P1→P2 from gradient bleed, cold-critic cascade at P2→P3,
+  checkpoint-discard) because all three components co-adapt. Recommended for
+  the cheap RSSM backbone. The critic warmup (`DREAMER_P3_CRITIC_WARMUP_ITERS`)
+  still runs at the very start so the value head calibrates before actor
+  coupling; `DREAMER_JOINT_PRIOR_REFRESH_ITERS` periodically refreshes the
+  PMPO prior.
 
 ## Architecture (paper-faithful, adapted to vector APC observations)
 
@@ -124,7 +146,7 @@ Both share the same plant-derivation chain:
 ## Quick start — full workflow (recommended)
 
 ```bash
-source ../neural-apc-dreamerV4-env/bin/activate
+source ../neural-apc-mbrl-env/bin/activate
 python -m workflow.bo_runner --simulation-dir simulation/test_sim
 ```
 
@@ -492,8 +514,8 @@ rationale here.
 ## Setup
 
 ```bash
-python3 -m venv ../neural-apc-dreamerV4-env
-source ../neural-apc-dreamerV4-env/bin/activate
+python3 -m venv ../neural-apc-mbrl-env
+source ../neural-apc-mbrl-env/bin/activate
 pip install -r requirements.txt
 ```
 

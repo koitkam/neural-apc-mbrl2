@@ -171,6 +171,22 @@ class TrainConfig:
     phase2_frac: Optional[float] = None
     phase3_frac: Optional[float] = None
 
+    # ----- Training mode (neural-apc-mbrl fork, 2026-06-06) -----
+    # ``phased`` (default, legacy Dreamer-4 curriculum): P1 WM -> P2 reward+BC
+    # -> P3 actor+critic, with phase boundaries.  ``joint`` (DreamerV1/V2/V3
+    # style): after the seed-buffer PREFILL, co-train WM + actor + critic EVERY
+    # step from step 1 (no phase boundaries) by running the P3 update path for
+    # the entire run.  Joint mode eliminates the phase-boundary pathologies
+    # (recon spike at P1->P2 grad-bleed, cold-critic cascade at P2->P3,
+    # checkpoint-discard) since WM/actor/critic co-adapt from the start.  The
+    # critic warmup (p3_critic_warmup_iters) still runs at the very start so
+    # the value head calibrates before actor coupling.  DREAMER_TRAIN_MODE.
+    train_mode: str = 'phased'
+    # joint mode: re-snapshot the PMPO prior policy every N iters (0 = once at
+    # start, like phased P3).  A slowly-refreshed prior keeps the KL anchor
+    # from going stale over a long single-phase run.
+    joint_prior_refresh_iters: int = 0
+
     # ----- Optimizers -----
     lr_world: float = 1e-4
     lr_actor: float = 3e-5    # DreamerV3 §3; auto-bumped to 1e-4 for
@@ -5754,6 +5770,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # P93: critic warmup at P3 start + WM-trunk protection in P2.
     p3_critic_warmup_iters = int(getattr(cfg, 'p3_critic_warmup_iters', 0) or 0)
     wm_trunk_stopgrad_in_p2 = bool(getattr(cfg, 'wm_trunk_stopgrad_in_p2', False))
+    # neural-apc-mbrl JOINT training mode (DreamerV1/V2/V3 style).
+    joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
+    joint_prior_refresh_iters = int(
+        getattr(cfg, 'joint_prior_refresh_iters', 0) or 0)
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
@@ -5801,6 +5821,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     ac_losses: Dict = {}
 
     def _phase_for(env_steps: int) -> int:
+        # neural-apc-mbrl JOINT mode: no phase boundaries — co-train WM +
+        # actor + critic every step via the P3 update path for the whole run.
+        if joint_mode:
+            return 3
         # 2026-05-26 (P52 RCA): boundaries are dynamic — the P1/P2
         # quality gates can extend the phase by up to
         # ``p{1,2}_gate_max_ext_steps`` if convergence criteria aren't
@@ -6040,6 +6064,27 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # Initialize hidden-disturbance probability for the starting phase
     # (hidden CV disturbance is the default unmeasured-disturbance model).
     env._disturbance_prob_override = get_phase_disturbance_prob(phase=1)
+    # neural-apc-mbrl JOINT mode: skip the P1/P2 curriculum entirely.  The
+    # seed-buffer fill above is the random PREFILL (DreamerV3 prefill);
+    # from here co-train WM + actor + critic every step via the P3 path.
+    # Run the P3-entry setup ONCE (snapshot the PMPO prior, anchor the BC
+    # decay + cascade canary) since we never hit the phase-transition block.
+    if joint_mode:
+        current_phase = 3
+        model.snapshot_prior_policy()
+        p3_start_steps = total_env_steps
+        try:
+            _rs0 = float(model.ret_scale.detach().item())
+            if _rs0 > 0.0 and np.isfinite(_rs0):
+                p3_start_return_scale = _rs0
+        except Exception:
+            pass
+        env._current_phase = 3
+        env._disturbance_prob_override = get_phase_disturbance_prob(phase=3)
+        print(f"[joint] DreamerV3-style joint training: WM+actor+critic "
+              f"co-trained every step from prefill "
+              f"(critic_warmup={p3_critic_warmup_iters} iters, "
+              f"prior_refresh={joint_prior_refresh_iters})", flush=True)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value
@@ -6802,6 +6847,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         opt_critic.step()
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
+
+        # neural-apc-mbrl JOINT mode: periodically refresh the PMPO prior
+        # policy so the KL anchor tracks a slowly-moving target over the long
+        # single-phase run (0 = keep the once-at-start snapshot).
+        if (joint_mode and joint_prior_refresh_iters > 0
+                and current_phase == 3 and p3_iters > 0
+                and (p3_iters % joint_prior_refresh_iters) == 0):
+            model.snapshot_prior_policy()
 
         total_iters += 1
         if current_phase == 3:

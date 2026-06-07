@@ -28,8 +28,8 @@ for a follow-up (DV steps must be injected through the env disturbance schedule,
 not the action vector).  Sim-agnostic: any MV/CV count.
 
 Standalone use:
-  PYTHONPATH=/home/koitkam/neural-apc-dreamerV4 \
-  /home/koitkam/neural-apc-dreamerV4-env/bin/python -m evaluation.wm_transfer_matrix \
+  PYTHONPATH=$PWD \
+  $PWD/../neural-apc-mbrl-env/bin/python -m evaluation.wm_transfer_matrix \
       --run-dir output/test_sim/run_XXXX
 """
 from __future__ import annotations

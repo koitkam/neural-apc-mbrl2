@@ -12,9 +12,9 @@ Verifies, WITHOUT a real env/sim (a minimal fake env + the real RSSM model):
     for the RSSM backbone.
 
 Run (CPU; does not disturb a live GPU run):
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=/home/koitkam/neural-apc-dreamerV4 \
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
   DREAMER_COMPILE=0 \
-  /home/koitkam/neural-apc-dreamerV4-env/bin/python tools/_smoke_wm_best_score.py
+  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_wm_best_score.py
 """
 import numpy as np
 import torch

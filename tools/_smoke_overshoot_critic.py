@@ -12,8 +12,8 @@ Verifies, for both backbones, WITHOUT a real env:
   * everything stays finite and backprops.
 
 Run (CPU, do not disturb a live GPU run):
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=/home/koitkam/neural-apc-dreamerV4 \
-  /home/koitkam/neural-apc-dreamerV4-env/bin/python tools/_smoke_overshoot_critic.py
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
+  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_overshoot_critic.py
 """
 import torch
 

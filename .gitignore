@@ -1,5 +1,5 @@
 # Virtualenvs (kept outside repo, but guard anyway)
-neural-apc-dreamerV4-env/
+neural-apc-mbrl-env/
 venv/
 .venv/
 
