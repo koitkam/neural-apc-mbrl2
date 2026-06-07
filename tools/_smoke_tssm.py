@@ -121,9 +121,54 @@ def test_stepwise_equals_full_sequence():
           f"(max_err={max_err:.2e}) -- KV-cache target validated")
 
 
+def test_end_to_end_dreamer_tssm():
+    """Build a full DreamerV4(world_model_type='tssm') and confirm the whole
+    RSSM pipeline works on it: WM loss + imagination step run + finite + the
+    disturbance estimator head is present (granted automatically by the
+    feat-dim build branch)."""
+    from training.train import (TrainConfig, build_model, world_model_loss,
+                                imagination_step)
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 2
+    cfg.world_model_type = 'tssm'
+    cfg.tssm_d_model, cfg.tssm_n_layers, cfg.tssm_n_heads = 48, 2, 4
+    cfg.rssm_n_categoricals, cfg.rssm_n_classes, cfg.rssm_embed_dim = 4, 4, 16
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
+    cfg.mtp_length = 4
+    cfg.disturbance_head_dim = 1          # unmeasured-disturbance estimator
+    cfg.compile_mode = 'off'
+    model = build_model(cfg)
+    assert model.world_model_type == 'tssm'
+    assert type(model.dynamics).__name__ == 'TransformerSSMDynamics'
+    assert model.disturbance is not None, "disturbance head NOT built for TSSM"
+    B, T = 3, cfg.seq_len
+    batch = {
+        'obs': torch.randn(B, T, cfg.obs_dim),
+        'act': torch.rand(B, T, cfg.action_dim) * 2 - 1,
+        'rew': torch.randn(B, T),
+        'cont': torch.ones(B, T),
+        'expert': torch.zeros(B, T),
+        'dist': torch.randn(B, T, 1),
+    }
+    losses, _, _ = world_model_loss(model, batch, cfg)
+    assert torch.isfinite(losses['wm_total']).all()
+    assert 'disturbance_loss' in losses, "disturbance loss missing for TSSM"
+    # overshoot/held-rollout no-op for TSSM (documented compat decision)
+    assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0
+    assert float(losses.get('wm_held_rollout_loss', 0.0)) == 0.0
+    losses['wm_total'].backward()
+    diag = imagination_step(model, batch, cfg)
+    assert torch.isfinite(diag['critic_loss']).all()
+    assert torch.isfinite(diag['actor_loss']).all()
+    print("[smoke] OK end-to-end DreamerV4(tssm): WM loss + imagination run, "
+          "disturbance head built, overshoot/held no-op (compat)")
+
+
 if __name__ == '__main__':
     test_interface_shapes()
     test_st_grad_reaches_prior_and_transformer()
     test_determinism_mode()
     test_stepwise_equals_full_sequence()
+    test_end_to_end_dreamer_tssm()
     print("\n[smoke] ALL TSSM checks PASSED")

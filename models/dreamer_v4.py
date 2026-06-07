@@ -1232,6 +1232,17 @@ class DreamerV4Config:
     rssm_embed_dim: int = 256
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01
+    # ===== TSSM (transformer-SSM) backbone (neural-apc-mbrl) =====
+    # ``'tssm'`` swaps the GRU recurrent core for a causal transformer that does
+    # in-context system-ID over the lookback (sharp per-domain fixed point for
+    # wide-DR generalization).  Implements the SAME RSSMDynamics interface, so it
+    # reuses the entire RSSM pipeline (heads, disturbance estimator, losses,
+    # imagination).  Reuses the rssm_* categorical-latent dims (n_categoricals/
+    # n_classes/embed_dim/unimix); these are the transformer-specific dims.
+    tssm_d_model: int = 512            # transformer width == deter_dim (h_t)
+    tssm_n_layers: int = 4
+    tssm_n_heads: int = 8
+    tssm_max_seq_len: int = 256        # context window cap (>= lookback + horizon)
     # ===== WM disturbance-estimator head (P87, 2026-06-05) =====
     # Auxiliary supervised head: predicts the hidden/unmeasured disturbance
     # (per CV channel) from the RSSM posterior feature ``[h, z]``.  ``0`` ⇒
@@ -1263,6 +1274,27 @@ class DreamerV4(nn.Module):
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
+            D = self.dynamics.feat_dim
+        elif self.world_model_type == 'tssm':
+            # neural-apc-mbrl: transformer-SSM core implementing the SAME
+            # RSSMDynamics interface (feat=[h, z_flat]).  No tokenizer; heads +
+            # disturbance estimator read the feature of width ``feat_dim`` just
+            # like the RSSM path.  Reuses rssm_* categorical-latent dims.
+            from models.transformer_ssm import (TransformerSSMDynamics,
+                                                TransformerSSMConfig)
+            self.tokenizer = None
+            tssm_cfg = TransformerSSMConfig(
+                obs_dim=cfg.obs_dim, action_dim=cfg.action_dim,
+                deter_dim=int(getattr(cfg, 'tssm_d_model', 512)),
+                n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+                n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+                embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+                n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
+                n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
+                unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+                max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
+            )
+            self.dynamics = TransformerSSMDynamics(tssm_cfg)
             D = self.dynamics.feat_dim
         else:
             self.tokenizer = Tokenizer(cfg.obs_dim, cfg.tok_hidden, cfg.z_dim,
@@ -1407,6 +1439,26 @@ class DreamerV4(nn.Module):
                 self._compiled = True
                 print(f'[dreamer_v4] torch.compile(mode={mode}, dynamic=False) '
                       f'enabled on RSSM rollout_observed {_imgs}', flush=True)
+            elif self.world_model_type == 'tssm':
+                # TSSM: compile the teacher-forced ``rollout_observed`` (T is
+                # fixed = seq_len in WM training, so a static graph captures it).
+                # ``img_step`` is NOT compiled: its causal window grows by one
+                # token per imagination step, so a static graph would recompile
+                # every step — leave it eager until the KV-cache lands.
+                # ``dynamic=True`` tolerates the seq_len differences between WM
+                # training and the diagnostics probes.
+                try:
+                    self.dynamics.rollout_observed = torch.compile(
+                        self.dynamics.rollout_observed, mode=mode, dynamic=True)
+                    self._compiled = True
+                    print('[dreamer_v4] torch.compile(mode='
+                          f'{mode}, dynamic=True) enabled on TSSM '
+                          'rollout_observed (img_step eager: variable window)',
+                          flush=True)
+                except Exception as _et:
+                    print(f'[dreamer_v4] TSSM compile skipped ({_et!r})',
+                          flush=True)
+                    self._compiled = False
             else:
                 self.dynamics = torch.compile(self.dynamics, mode=mode,
                                                 dynamic=True)

@@ -493,6 +493,13 @@ class TrainConfig:
     rssm_free_bits: float = 1.0        # paper free-bits floor (nats)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
     rssm_kl_repr_w: float = 0.1        # paper KL-balance repr weight
+    # ===== TSSM (transformer-SSM) backbone dims (neural-apc-mbrl) =====
+    # Used only when world_model_type='tssm'.  Reuses the rssm_* categorical-
+    # latent dims (n_categoricals/n_classes/embed_dim/unimix/free_bits/kl_*).
+    tssm_d_model: int = 512
+    tssm_n_layers: int = 4
+    tssm_n_heads: int = 8
+    tssm_max_seq_len: int = 256
     # P70 (2026-05-30) imagination steady-state fixes.  The trained RSSM
     # prior map CONTRACTS to a fixed point under a held action (offline
     # probe: deterministic-mode tail_std ~0.01), but per-step categorical
@@ -3103,7 +3110,9 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     obs_cur = obs                          # (B, T, D)
 
     # ===== RSSM world-model branch =====
-    if getattr(model, 'world_model_type', 'sf_transformer') == 'rssm':
+    # neural-apc-mbrl: 'tssm' (transformer-SSM) shares the RSSM-interface path
+    # (feat=[h,z_flat], rollout_observed/img_step/decode) so it routes here too.
+    if getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm'):
         return _rssm_world_model_loss(model, obs_cur, act, cfg,
                                       dist_target=batch.get('dist'))
 
@@ -3605,7 +3614,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     H = int(cfg.horizon)
     device = obs.device
 
-    if getattr(model, 'world_model_type', 'sf_transformer') == 'rssm':
+    if getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm'):
         return _imagination_step_rssm(model, batch, cfg)
 
     # Encode the buffered context (frozen tokenizer).
@@ -3940,6 +3949,10 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
+        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
+        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
+        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
         disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
         disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
         disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
