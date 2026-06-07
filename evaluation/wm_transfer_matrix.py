@@ -229,7 +229,11 @@ def plot_transfer_matrix(result: Dict, out_path: Path, title: str = '') -> None:
     t = np.asarray(result['t'], dtype='float32')
     n_cv = len(cv_names)
     n_mv = len(mv_names)
-    fig, axes = plt.subplots(n_cv, n_mv, figsize=(4.2 * n_mv, 3.0 * n_cv),
+    # Floor the figure size so the title / legend / caption always have room
+    # (a 1×1 SISO grid is otherwise too small and clips the suptitle).
+    fig_w = max(7.0, 4.2 * n_mv)
+    fig_h = max(4.8, 3.0 * n_cv + 1.3)
+    fig, axes = plt.subplots(n_cv, n_mv, figsize=(fig_w, fig_h),
                              squeeze=False)
     for ci, cvn in enumerate(cv_names):
         for j, mvn in enumerate(mv_names):
@@ -249,22 +253,45 @@ def plot_transfer_matrix(result: Dict, out_path: Path, title: str = '') -> None:
                 ax.fill_between(t, lo, hi, color=color, alpha=0.15,
                                 linewidth=0)
             ax.axhline(0.0, color='grey', lw=0.6, alpha=0.6)
+            ratio = cell.get('ss_gain_ratio_wm_over_real', float('nan'))
             ax.set_title(
                 f'{key}\n'
-                f'gain real={cell["real_ss_gain"]:+.3g}  '
-                f'wm={cell["wm_ss_gain"]:+.3g}',
-                fontsize=9)
+                f'SS gain  real={cell["real_ss_gain"]:+.3g}  '
+                f'wm={cell["wm_ss_gain"]:+.3g}  (wm/real={ratio:.2f})',
+                fontsize=8)
             if ci == n_cv - 1:
-                ax.set_xlabel('step')
+                ax.set_xlabel('step (samples after the MV step)')
             if j == 0:
-                ax.set_ylabel('ΔCV/ΔMV (eng)')
-            if ci == 0 and j == 0:
-                ax.legend(fontsize=8, loc='best')
+                ax.set_ylabel('ΔCV / ΔMV  (eng units)')
             ax.grid(alpha=0.25)
-    sup = title or 'World-model transfer-function matrix (step response)'
-    fig.suptitle(sup + '   — shaded band = variation across operating region',
-                 fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    # One shared, explicit colour-coding legend (proxy handles) so every
+    # subplot is unambiguous — replaces the single per-axis legend that left
+    # the shaded band undefined.
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Line2D([0], [0], color='k', lw=1.8, ls='-',
+               label='real sim (ground truth)'),
+        Line2D([0], [0], color='C0', lw=1.8, ls='--',
+               label='world model (imagination)'),
+        Patch(facecolor='grey', alpha=0.2,
+              label='shaded = min–max across operating region'),
+        Line2D([0], [0], color='grey', lw=0.6, label='zero gain'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center', ncol=4,
+               fontsize=8, framealpha=0.9, bbox_to_anchor=(0.5, 0.085))
+    sup = title or ('World-model vs real-plant transfer-function matrix '
+                    '(MV→CV step response)')
+    fig.suptitle(sup, fontsize=11, y=0.99)
+    # Two-line "how to read it" caption (the colour key lives in the legend
+    # above).  Kept short per line so it never overflows a small SISO figure.
+    fig.text(
+        0.5, 0.02,
+        'How to read: world model (blue dashed) should OVERLAP real sim '
+        '(black solid).\nFlatter/smaller ⇒ WM gain too small; opposite sign ⇒ '
+        'wrong direction.  Cell titles: SS gains + wm/real ratio (1.0 = exact).',
+        ha='center', va='bottom', fontsize=8)
+    fig.tight_layout(rect=(0, 0.16, 1, 0.95))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=110)
