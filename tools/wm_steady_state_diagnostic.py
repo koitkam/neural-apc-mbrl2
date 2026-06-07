@@ -239,7 +239,9 @@ def _is_rssm_model(model) -> bool:
 def _imagine_open_loop_rssm(model, lookback_obs: np.ndarray,
                              lookback_act: np.ndarray,
                              action_seq: np.ndarray, n_steps: int,
-                             device: torch.device) -> np.ndarray:
+                             device: torch.device,
+                             dv_hold_override: Optional[np.ndarray] = None,
+                             ) -> np.ndarray:
     """RSSM open-loop rollout (mirrors training warmup + imagination).
 
     Warm-start the posterior over the real lookback via teacher-forced
@@ -247,21 +249,40 @@ def _imagine_open_loop_rssm(model, lookback_obs: np.ndarray,
     then advance the PRIOR with ``img_step`` under ``action_seq`` and
     decode each imagined feature.  Operates entirely in normalized-obs
     space (decoder output is directly comparable to ``env.step`` obs).
+
+    DV-as-input (Option B): when the WM has ``dv_dim > 0`` the measured-DV
+    channels are teacher-forced from the lookback during warm-start and HELD
+    CONSTANT over imagination (MPC persistence) — matching training.
+    ``dv_hold_override`` (dv_dim,) replaces the held DV value (used by the
+    transfer matrix for the DV→CV step response); ``None`` holds the DV at its
+    last lookback value.
     """
     rssm = model.dynamics
     obs_dim = rssm.obs_dim
     L = lookback_obs.shape[0]
+    _dv_on = int(getattr(rssm, 'dv_dim', 0) or 0) > 0
     state = rssm.initial_state(1, device)
     for l in range(L):
         o = torch.from_numpy(lookback_obs[l]).to(device).unsqueeze(0)
         a = torch.from_numpy(lookback_act[l]).to(device).unsqueeze(0)
         emb = rssm.embed(o)
-        post, _ = rssm.obs_step(state, a, emb, sample=True)
+        dv = o.index_select(-1, rssm.dv_index_t) if _dv_on else None
+        post, _ = rssm.obs_step(state, a, emb, dv=dv, sample=True)
         state = post
+    # Held DV over imagination: override (DV→CV step) else last-lookback value.
+    dv_hold = None
+    if _dv_on:
+        if dv_hold_override is not None:
+            dv_hold = torch.from_numpy(
+                np.asarray(dv_hold_override, dtype='float32')
+            ).to(device).reshape(1, -1)
+        else:
+            dv_hold = (torch.from_numpy(lookback_obs[L - 1]).to(device)
+                       .unsqueeze(0).index_select(-1, rssm.dv_index_t))
     out = np.zeros((n_steps, obs_dim), dtype='float32')
     for kk in range(n_steps):
         a_step = torch.from_numpy(action_seq[kk]).to(device).unsqueeze(0)
-        state = rssm.img_step(state, a_step, sample=True)
+        state = rssm.img_step(state, a_step, dv=dv_hold, sample=True)
         obs_hat = rssm.decode(state.feat).squeeze(0).float().cpu().numpy()
         out[kk] = obs_hat[:obs_dim]
     return out

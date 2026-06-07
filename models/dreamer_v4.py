@@ -1250,6 +1250,13 @@ class DreamerV4Config:
     disturbance_head_dim: int = 0
     disturbance_head_hidden: int = 0
     disturbance_head_layers: int = 2
+    # ===== DV-as-input (Option B, 2026-06-07) =====
+    # Feed the measured disturbance-variable channels (at ``dv_indices`` within
+    # the obs vector) as an EXOGENOUS input to the WM transition instead of
+    # predicting them forward.  ``dv_dim = 0`` ⇒ disabled (paper behaviour).
+    # Resolved at runtime to ``len(dv_indices)`` when ``cfg.dv_as_input``.
+    dv_dim: int = 0
+    dv_indices: Tuple[int, ...] = ()
 
 
 class DreamerV4(nn.Module):
@@ -1272,6 +1279,8 @@ class DreamerV4(nn.Module):
                 embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
                 hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+                dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
+                dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
             D = self.dynamics.feat_dim
@@ -1293,6 +1302,8 @@ class DreamerV4(nn.Module):
                 n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
                 max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
+                dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
+                dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
             )
             self.dynamics = TransformerSSMDynamics(tssm_cfg)
             D = self.dynamics.feat_dim

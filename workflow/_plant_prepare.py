@@ -228,6 +228,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # 2026-06-07: exclude expert-injected steps from the reward-head (reward-MTP)
     # supervision so it stays calibrated on the policy's true distribution.
     'DREAMER_REWARD_HEAD_EXCLUDE_EXPERT': ('reward_head_exclude_expert',  _as_bool),
+    # 2026-06-07 (Option B): feed measured DV channels as an exogenous WM
+    # transition input (held constant in imagination = MPC feedforward) instead
+    # of predicting them.  Default ON; DREAMER_DV_AS_INPUT=0 reverts to paper.
+    'DREAMER_DV_AS_INPUT':                ('dv_as_input',                _as_bool),
     # 2026-05-22: number of constant-action seed episodes (steady-state
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.

@@ -142,6 +142,11 @@ class TransformerSSMConfig:
     dropout: float = 0.0
     unimix: float = 0.01          # match RSSM categorical mixing
     max_seq_len: int = 256        # context window cap (>= lookback + horizon)
+    # DV-as-input (Option B, 2026-06-07) — mirror of RSSMConfig: measured DV
+    # channels (at ``dv_indices`` in the obs vector) become an exogenous token
+    # input instead of being predicted forward.  ``dv_dim = 0`` = paper default.
+    dv_dim: int = 0
+    dv_indices: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -279,6 +284,14 @@ class TransformerSSMDynamics(nn.Module):
         self.unimix = float(cfg.unimix)
         self.max_seq_len = int(cfg.max_seq_len)
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
+        # DV-as-input (Option B): exogenous measured-DV channels appended to the
+        # token input; ``dv_index_t`` selects them out of the obs vector.
+        self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
+        self.register_buffer(
+            'dv_index_t',
+            torch.tensor(list(getattr(cfg, 'dv_indices', ()) or ()),
+                         dtype=torch.long),
+            persistent=False)
 
         # ----- shared, low-risk pieces (real implementations) -----
         self.encoder = nn.Sequential(
@@ -289,9 +302,10 @@ class TransformerSSMDynamics(nn.Module):
             nn.Linear(self.feat_dim, cfg.embed_dim), nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
-        # Token projection: [z_{t-1}_flat ; a_t] -> d_model.
-        self.token_proj = nn.Linear(self.stoch_flat_dim + self.action_dim,
-                                    self.deter_dim)
+        # Token projection: [z_{t-1}_flat ; a_t ; (dv_t)] -> d_model.
+        self.token_proj = nn.Linear(
+            self.stoch_flat_dim + self.action_dim + self.dv_dim,
+            self.deter_dim)
         # Causal transformer (custom blocks: support full + KV-cached step).
         self.n_heads = int(cfg.n_heads)
         self.blocks = nn.ModuleList([
@@ -329,9 +343,15 @@ class TransformerSSMDynamics(nn.Module):
 
     # ----- internal: token build + causal encode -----
     def _build_token(self, z: torch.Tensor,
-                     action: torch.Tensor) -> torch.Tensor:
-        """token = proj([z_flat ; action]) -> (B, d_model)."""
+                     action: torch.Tensor,
+                     dv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """token = proj([z_flat ; action ; (dv)]) -> (B, d_model)."""
         z_flat = z.flatten(start_dim=-2)
+        if self.dv_dim > 0:
+            if dv is None:
+                dv = torch.zeros(action.shape[0], self.dv_dim,
+                                 device=action.device, dtype=action.dtype)
+            return self.token_proj(torch.cat([z_flat, action, dv], dim=-1))
         return self.token_proj(torch.cat([z_flat, action], dim=-1))
 
     def _encode_window(self, window: torch.Tensor) -> torch.Tensor:
@@ -365,12 +385,14 @@ class TransformerSSMDynamics(nn.Module):
 
     # ----- transitions -----
     def img_step(self, prev: TSSMState, prev_action: torch.Tensor,
+                 dv: Optional[torch.Tensor] = None,
                  sample: bool = True) -> TSSMState:
-        """Imagined (prior-only) step: build the token from (prev.z, action),
-        advance the KV-cached transformer ONE step, read the prior off the new
-        position.  ``kv_cache=None`` (feat-only reconstruction by a Markovian
-        consumer) starts a fresh single-token context."""
-        token = self._build_token(prev.z, prev_action)
+        """Imagined (prior-only) step: build the token from (prev.z, action,
+        dv), advance the KV-cached transformer ONE step, read the prior off the
+        new position.  ``dv`` (B, dv_dim) is the exogenous measured-DV input
+        when DV-as-input is on; ``None`` -> zeros.  ``kv_cache=None`` (feat-only
+        reconstruction by a Markovian consumer) starts a fresh context."""
+        token = self._build_token(prev.z, prev_action, dv)
         cache = getattr(prev, 'kv_cache', None)
         pos = int(getattr(prev, 'pos', 0) or 0)
         h, new_cache = self._step(token, cache, pos)
@@ -379,12 +401,13 @@ class TransformerSSMDynamics(nn.Module):
                          kv_cache=new_cache, pos=pos + 1)
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
-                 embed: torch.Tensor, sample: bool = True
+                 embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
+                 sample: bool = True
                  ) -> Tuple[TSSMState, TSSMState]:
         """Observation step -> (posterior, prior).  Prior is needed for KL; both
         share ``h``; the posterior conditions on the obs embedding and is the z
         carried forward (with the prior's KV-cache + position)."""
-        prior = self.img_step(prev, prev_action, sample=sample)
+        prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
         post = TSSMState(h=prior.h, z_logits=post_logits, z=post_z,
@@ -402,11 +425,14 @@ class TransformerSSMDynamics(nn.Module):
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                         # (B, T, embed_dim)
+        dvs = (obs.index_select(-1, self.dv_index_t)
+               if self.dv_dim > 0 else None)             # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         feats_l, post_l, prior_l = [], [], []
         for t in range(T):
+            dv_t = dvs[:, t] if dvs is not None else None
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        sample=sample)
+                                        dv=dv_t, sample=sample)
             state = post
             feats_l.append(post.feat)
             post_l.append(post.z_logits)

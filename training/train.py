@@ -506,6 +506,20 @@ class TrainConfig:
     rssm_free_bits: float = 1.0        # paper free-bits floor (nats)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
     rssm_kl_repr_w: float = 0.1        # paper KL-balance repr weight
+    # DV-as-input (Option B, 2026-06-07): feed the measured disturbance-variable
+    # channels as an EXOGENOUS transition input (teacher-forced from the real
+    # obs in WM training; HELD CONSTANT over the imagination horizon = the MPC
+    # feedforward persistence assumption) instead of letting the WM PREDICT
+    # (hallucinate) them forward.  The agent reacts to a real DV change by
+    # closed-loop feedback (observes it next step, re-plans).  Frees WM capacity
+    # + removes DV-misprediction rollout error (also tightens held-action
+    # steady-state, since DV no longer drifts in the held rollout).  DEFAULT ON;
+    # opt out with DREAMER_DV_AS_INPUT=0.  ``dv_dim``/``dv_indices`` are resolved
+    # at runtime from ``env.meta['dv_indices']`` (sims with 0 DVs -> dv_dim=0 =
+    # paper behaviour).  Backbone-agnostic (RSSM + TSSM both thread ``dv``).
+    dv_as_input: bool = True
+    dv_dim: int = 0
+    dv_indices: Tuple[int, ...] = ()
     # ===== TSSM (transformer-SSM) backbone dims (neural-apc-mbrl) =====
     # Used only when world_model_type='tssm'.  Reuses the rssm_* categorical-
     # latent dims (n_categoricals/n_classes/embed_dim/unimix/free_bits/kl_*).
@@ -2912,7 +2926,11 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     for k in range(1, K + 1):
         a_idx = starts + k                                        # (S,)
         a_k = act[:, a_idx].reshape(Bm, -1)                       # (B*S, A)
-        state = rssm.img_step(state, a_k, sample=True)
+        # DV-as-input: teacher-force the REAL DV at each predicted step so the
+        # WM learns dCV/dDV (consistent with rollout_observed).  None = off.
+        dv_k = (obs[:, a_idx].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+                if getattr(rssm, 'dv_dim', 0) > 0 else None)
+        state = rssm.img_step(state, a_k, dv=dv_k, sample=True)
         pred = rssm.decode(state.feat).reshape(B, S, -1)
         tgt = obs[:, a_idx].detach()                             # (B, S, D)
         total = total + (pred - tgt).pow(2).mean()
@@ -2986,9 +3004,15 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
                              device=device, dtype=f0.dtype),
         z=z)
     a_hold = act[:, starts].reshape(Bm, -1).detach()              # HELD action a_t
+    # DV-as-input: hold the measured DV CONSTANT at its start value across the
+    # rollout too — so this probes true held-(action+DV) stationarity and the
+    # WM no longer needs to hallucinate a drifting DV (the steady-state win).
+    dv_hold = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+               .detach()
+               if getattr(rssm, 'dv_dim', 0) > 0 else None)
     hs = []
     for _ in range(K):
-        state = rssm.img_step(state, a_hold, sample=True)
+        state = rssm.img_step(state, a_hold, dv=dv_hold, sample=True)
         hs.append(state.h)                                       # (B*S, deter)
     Hroll = torch.stack(hs, dim=1)                               # (B*S, K, deter)
     h_scale = Hroll.detach().std().clamp_min(1e-3)
@@ -3419,6 +3443,13 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         agent_hid_real = feats_real                          # (B, T, F)
 
     state = last_state
+    # DV-as-input feedforward: hold the measured DV at its LAST observed value
+    # across the H-step planning horizon (the actor has no DV forecast at deploy
+    # time -> MPC persistence assumption).  ``None`` when DV-as-input is off
+    # (dv_dim=0) so the WM falls back to predicting the DV.  Works for RSSM +
+    # TSSM (both expose dv_dim + dv_index_t).
+    _dv_hold = (obs[:, -1].index_select(-1, rssm.dv_index_t)
+                if getattr(rssm, 'dv_dim', 0) > 0 else None)   # (B, dv_dim)|None
 
     imagined_rewards: List[torch.Tensor] = []
     imagined_entropy: List[torch.Tensor] = []
@@ -3438,7 +3469,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         #    use the categorical MODE (sample=False) when latent-mode is on
         #    so imagination follows the contracting deterministic path.
         with torch.no_grad():
-            next_state = rssm.img_step(state, action_t,
+            next_state = rssm.img_step(state, action_t, dv=_dv_hold,
                                        sample=not _imag_mode)
         feat_post = next_state.feat                          # (B, F) — sees a_h
 
@@ -3979,6 +4010,8 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
         disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
         disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
+        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
+        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
     )
     model = DreamerV4(model_cfg)
     # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths
@@ -5130,6 +5163,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     cfg.disturbance_head_dim = (int(len(env.cv_indices))
                                 if bool(getattr(cfg, 'disturbance_head', True))
                                 else 0)
+    # DV-as-input (Option B): resolve the measured-DV obs indices per-simulator.
+    # State channels lead the obs vector (obs = [state, aug, derived, integral]),
+    # so the state-space ``dv_indices`` are valid OBS-vector indices.  Default ON
+    # (cfg.dv_as_input); 0-DV sims or opt-out (DREAMER_DV_AS_INPUT=0) -> dv_dim=0
+    # = paper behaviour (WM predicts the DV).  Resolved here so build_model + the
+    # WM transition agree.
+    _dv_idx_obs = [int(x) for x in (env.meta.get('dv_indices') or [])
+                   if x is not None]
+    if bool(getattr(cfg, 'dv_as_input', True)) and _dv_idx_obs:
+        cfg.dv_indices = tuple(_dv_idx_obs)
+        cfg.dv_dim = len(_dv_idx_obs)
+        print(f'[dv-as-input] ENABLED: feeding measured DV channels '
+              f'{cfg.dv_indices} as exogenous WM input (held constant in '
+              f'imagination).', flush=True)
+    else:
+        cfg.dv_indices = ()
+        cfg.dv_dim = 0
 
     # A' : enable potential-based reward shaping on the TRAINING env only.
     # Validation builds its own APCEnv instances (evaluation/validate.py)

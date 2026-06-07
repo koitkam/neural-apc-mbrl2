@@ -81,6 +81,16 @@ class RSSMConfig:
     embed_dim: int = 256
     hidden_dim: int = 256
     unimix: float = 0.01            # paper 1% uniform mixture
+    # DV-as-input (Option B, 2026-06-07).  When ``dv_dim > 0`` the measured
+    # disturbance-variable channels (at ``dv_indices`` within the obs vector)
+    # are fed as an EXOGENOUS input to the transition (concatenated with the
+    # action) instead of being PREDICTED forward by the latent.  In imagination
+    # the DV is held at its last measured value (MPC feedforward persistence);
+    # in teacher-forced training the real per-step DV is supplied so the WM
+    # learns dCV/dDV directly.  ``dv_dim = 0`` (no-DV sims / opt-out) is
+    # bit-identical to the paper behaviour.
+    dv_dim: int = 0
+    dv_indices: Tuple[int, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +187,16 @@ class RSSMDynamics(nn.Module):
         self.embed_dim = int(cfg.embed_dim)
         self.hidden_dim = int(cfg.hidden_dim)
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
+        # DV-as-input (Option B): exogenous measured-DV channels fed into the
+        # transition.  ``dv_index_t`` selects them out of the obs vector.
+        self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
+        self.register_buffer(
+            'dv_index_t',
+            torch.tensor(list(getattr(cfg, 'dv_indices', ()) or ()),
+                         dtype=torch.long),
+            persistent=False)
+        # Transition input = [z_flat ; action ; (dv)].
+        trans_in = self.stoch_flat_dim + self.action_dim + self.dv_dim
 
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
@@ -185,11 +205,9 @@ class RSSMDynamics(nn.Module):
         self.decoder = _MLP(self.feat_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
         # Recurrent dynamics: pre-GRU projection then GRUCell.
-        self.pre_gru = _MLP(self.stoch_flat_dim + self.action_dim,
-                            self.stoch_flat_dim + self.action_dim,
+        self.pre_gru = _MLP(trans_in, trans_in,
                             hidden_dim=self.hidden_dim, num_layers=1)
-        self.gru = nn.GRUCell(self.stoch_flat_dim + self.action_dim,
-                              self.deter_dim)
+        self.gru = nn.GRUCell(trans_in, self.deter_dim)
         # Prior p(z'|h') and posterior q(z'|h', embed).
         self.prior_net = _CategoricalLatent(
             self.deter_dim, self.n_categoricals, self.n_classes,
@@ -218,19 +236,32 @@ class RSSMDynamics(nn.Module):
 
     # ----- transitions --------------------------------------------------
     def img_step(self, prev: RSSMState, prev_action: torch.Tensor,
+                 dv: Optional[torch.Tensor] = None,
                  sample: bool = True) -> RSSMState:
-        """Imagined (prior-only) step: advance the state with no obs."""
-        x = torch.cat([prev.stoch_flat, prev_action], dim=-1)
+        """Imagined (prior-only) step: advance the state with no obs.
+
+        ``dv`` (B, dv_dim) is the exogenous measured-DV input when DV-as-input
+        is enabled (``dv_dim > 0``); ``None`` is filled with zeros.  Ignored
+        entirely when ``dv_dim == 0`` (paper behaviour)."""
+        if self.dv_dim > 0:
+            if dv is None:
+                dv = torch.zeros(prev_action.shape[0], self.dv_dim,
+                                 device=prev_action.device,
+                                 dtype=prev_action.dtype)
+            x = torch.cat([prev.stoch_flat, prev_action, dv], dim=-1)
+        else:
+            x = torch.cat([prev.stoch_flat, prev_action], dim=-1)
         x = self.pre_gru(x)
         h = self.gru(x, prev.h)
         z_logits, z = self.prior_net(h, sample=sample)
         return RSSMState(h=h, z_logits=z_logits, z=z)
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
-                 embed: torch.Tensor, sample: bool = True
+                 embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
+                 sample: bool = True
                  ) -> Tuple[RSSMState, RSSMState]:
         """Observation step → (posterior, prior).  Prior is needed for KL."""
-        prior = self.img_step(prev, prev_action, sample=sample)
+        prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
         post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z)
@@ -255,11 +286,15 @@ class RSSMDynamics(nn.Module):
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                       # (B, T, embed_dim)
+        # Exogenous DV input per step (teacher-forced from the real obs).
+        dvs = (obs.index_select(-1, self.dv_index_t)
+               if self.dv_dim > 0 else None)           # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         feats_l, post_l, prior_l = [], [], []
         for t in range(T):
+            dv_t = dvs[:, t] if dvs is not None else None
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        sample=sample)
+                                        dv=dv_t, sample=sample)
             state = post
             feats_l.append(post.feat)
             post_l.append(post.z_logits)
