@@ -1265,7 +1265,7 @@ class APCEnv:
             self._derived_features = DerivedFeatures(
                 n_cv=n_cv,
                 window=derived_observables_window(
-                    tau=float(getattr(self.cfg, 'tau', 0.0) or 0.0) or None,
+                    tau=(self._resolve_plant_timing()[0] or None),
                     sample_rate=float(getattr(self.cfg, 'sample_rate', 1.0)
                                        or 1.0),
                 ),
@@ -1515,6 +1515,46 @@ class APCEnv:
             self._update_obs_norm(raw)
         return self._normalize_obs(raw)
 
+    def _resolve_plant_timing(self) -> "tuple[float, float]":
+        """Resolve ``(tau_dominant, dead_time)`` in plant time units.
+
+        ``TrainConfig`` carries NO plant-timing fields, so reading
+        ``cfg.tau`` / ``cfg.dead_time`` always yielded 0.0 — which collapsed
+        the hidden-disturbance schedule to a 1-sample timescale (settle≈4):
+        ``ou_drift`` became α=1 white noise and step/ramp events became
+        sub-settling spikes crammed into the first ~50 steps (front-loaded,
+        high-frequency, never reaching steady state).  Both ``single_run.py``
+        and ``evaluation.validate`` export the identified plant timing as
+        ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME`` env vars, so
+        source from there (with the legacy ``SIM_`` prefix and the sim's own
+        attributes as fallbacks).  Fixed 2026-06-08.
+        """
+        def _envf(*names: str) -> float:
+            for n in names:
+                v = str(os.environ.get(n, '')).strip()
+                if not v:
+                    continue
+                try:
+                    x = float(v)
+                except Exception:
+                    continue
+                if x > 0:
+                    return x
+            return 0.0
+        sim = getattr(self, 'sim', None)
+        tau = float(getattr(self.cfg, 'tau', 0.0) or 0.0)
+        if tau <= 0:
+            tau = _envf('IDENTIFIED_TAU_DOMINANT', 'SIM_IDENTIFIED_TAU_DOMINANT')
+        if tau <= 0 and sim is not None:
+            tau = float(getattr(sim, 'tau_dominant', 0.0)
+                        or getattr(sim, 'tau', 0.0) or 0.0)
+        dead = float(getattr(self.cfg, 'dead_time', 0.0) or 0.0)
+        if dead <= 0:
+            dead = _envf('IDENTIFIED_DEAD_TIME', 'SIM_IDENTIFIED_DEAD_TIME')
+        if dead <= 0 and sim is not None:
+            dead = float(getattr(sim, 'dead_time', 0.0) or 0.0)
+        return float(tau), float(dead)
+
     def reset(self, *, exploration: bool = False) -> np.ndarray:
         state = self.sim.reset()
         if isinstance(state, tuple):
@@ -1549,9 +1589,8 @@ class APCEnv:
         prob = (self._disturbance_prob_override
                 if self._disturbance_prob_override is not None
                 else get_phase_disturbance_prob(phase=1))
-        tau_dom = float(getattr(self.cfg, 'tau', 0.0) or 0.0)
+        tau_dom, dead_time = self._resolve_plant_timing()
         sample_rate = float(getattr(self.cfg, 'sample_rate', 1.0) or 1.0)
-        dead_time = float(getattr(self.cfg, 'dead_time', 0.0) or 0.0)
         self._hidden_disturbance = maybe_build_hidden_disturbance(
             rng=self.rng,
             sim=self.sim,

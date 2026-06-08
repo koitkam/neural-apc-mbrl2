@@ -543,18 +543,18 @@ class HiddenDisturbanceSchedule:
         p_isolated = float(np.clip(
             _env_float('DREAMER_HIDDEN_DIST_P_ISOLATED', 0.5), 0.0, 1.0))
         p_revert = float(np.clip(
-            _env_float('DREAMER_HIDDEN_DIST_P_REVERT', 0.5), 0.0, 1.0))
+            _env_float('DREAMER_HIDDEN_DIST_P_REVERT', 0.7), 0.0, 1.0))
         shapes = ['step', 'ramp', 'pulse', 'ou_drift']
         weights = self._shape_weights()
 
         n_budget = int(np.clip(round(T / (1.5 * settle)), 1, max(1, max_events)))
-        # Spread mode (validation): distribute event starts UNIFORMLY across the
-        # whole episode (mirrors the measured-DV validation schedule) so the
-        # unmeasured disturbance is active start->end instead of a few
-        # front-loaded events that then hold a DC offset.  Default OFF: the
-        # sequential dur+gap placement below is unchanged for training (keeps
-        # the training RNG stream byte-identical).
-        spread = str(os.environ.get('DREAMER_HIDDEN_DIST_SPREAD', '0')).strip() \
+        # Spread mode (DEFAULT 2026-06-08): distribute event starts UNIFORMLY
+        # across the whole episode so the unmeasured disturbance is active
+        # start->end (a realistic sequence of distinct plant upsets) instead of
+        # the legacy front-loaded sequential placement, which — once the plant
+        # timescale is correct — still ends well before the episode does.  Set
+        # ``DREAMER_HIDDEN_DIST_SPREAD=0`` to restore the legacy placement.
+        spread = str(os.environ.get('DREAMER_HIDDEN_DIST_SPREAD', '1')).strip() \
             .lower() not in ('0', 'false', 'no', 'off', '')
         events: List[Dict] = []
         if spread:
@@ -627,7 +627,14 @@ class HiddenDisturbanceSchedule:
         }
 
     def _shape_weights(self) -> np.ndarray:
-        default = np.array([0.30, 0.30, 0.20, 0.20], dtype='float64')
+        # Default 2026-06-08: NO ``ou_drift`` (weight 0).  ou_drift injects a
+        # per-step OU random walk that reads as high-frequency noise on top of
+        # the plant measurement noise — not a "reasonable plant disturbance".
+        # The unmeasured disturbance is now built from smooth, persistent
+        # step / ramp / pulse events only (each ramps to a level, holds —
+        # sometimes to steady state — then mostly reverts).  Re-enable ou_drift
+        # for ablations via ``DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS``.
+        default = np.array([0.40, 0.35, 0.25, 0.00], dtype='float64')
         raw = os.environ.get('DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS', '').strip()
         if raw:
             try:
