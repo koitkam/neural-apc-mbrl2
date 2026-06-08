@@ -529,14 +529,13 @@ def plot_dv_transfer_matrix(result: Dict, out_path: Path,
 
 def plot_combined_transfer_matrix(mv_result: Dict, dv_result: Optional[Dict],
                                   out_path: Path, title: str = '') -> None:
-    """DMC-style COMBINED step-response matrix: CV rows × (MV cols │ DV cols).
+    """DMC-style COMBINED step-response matrix: INPUT rows × CV cols.
 
-    One figure laying every CV's response to every input (manipulated + measured
-    disturbance) side by side, like a real DMC model.  Black solid = real sim,
-    blue dashed = world model; the shaded band is the min–max across operating
-    points (drawn light so the MEAN lines read clearly — addresses "several
-    shaded areas I can't tell apart").  A vertical divider separates the MV
-    block from the DV block.
+    Rows = every input (manipulated MVs, then measured-disturbance DVs);
+    columns = every CV.  Like a real DMC model laid input-by-output.  Black
+    solid = real sim, blue dashed = world model; the shaded band is the min–max
+    across operating points (light so the MEAN lines read clearly).  A
+    horizontal divider separates the MV block (top) from the DV block (bottom).
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -550,27 +549,23 @@ def plot_combined_transfer_matrix(mv_result: Dict, dv_result: Optional[Dict],
     t_mv = np.asarray(mv_result.get('t', []), dtype='float32')
     t_dv = np.asarray((dv_result or {}).get('t', mv_result.get('t', [])),
                       dtype='float32')
-    # Columns = MV inputs then DV inputs; tag each with its source group.
-    cols = ([('mv', m) for m in mv_names]
+    # Rows = MV inputs then DV inputs; tag each with its source group.
+    rows = ([('mv', m) for m in mv_names]
             + [('dv', d) for d in dv_names])
-    n_cv, n_col = len(cv_names), len(cols)
-    if n_cv == 0 or n_col == 0:
+    n_cv, n_row = len(cv_names), len(rows)
+    if n_cv == 0 or n_row == 0:
         return
-    fig_w = max(7.0, 3.7 * n_col)
-    fig_h = max(4.8, 3.0 * n_cv + 1.4)
-    fig, axes = plt.subplots(n_cv, n_col, figsize=(fig_w, fig_h), squeeze=False)
+    fig_w = max(7.0, 3.7 * n_cv)
+    fig_h = max(4.8, 3.0 * n_row + 1.4)
+    fig, axes = plt.subplots(n_row, n_cv, figsize=(fig_w, fig_h), squeeze=False)
     n_mv = len(mv_names)
-    for ci, cvn in enumerate(cv_names):
-        for j, (grp, inp) in enumerate(cols):
-            ax = axes[ci][j]
-            if grp == 'mv':
-                cell = mv_result.get('pairs', {}).get(f'{cvn}<-{inp}')
-                t = t_mv
-                ylab = 'ΔCV / ΔMV'
-            else:
-                cell = (dv_result or {}).get('pairs', {}).get(f'{cvn}<-{inp}')
-                t = t_dv
-                ylab = 'ΔCV / ΔDV'
+    for ri, (grp, inp) in enumerate(rows):
+        ylab = 'ΔCV / ΔMV' if grp == 'mv' else 'ΔCV / ΔDV'
+        t = t_mv if grp == 'mv' else t_dv
+        src = mv_result if grp == 'mv' else (dv_result or {})
+        for cj, cvn in enumerate(cv_names):
+            ax = axes[ri][cj]
+            cell = src.get('pairs', {}).get(f'{cvn}<-{inp}')
             if not cell:
                 ax.text(0.5, 0.5, '(no data)', ha='center', va='center',
                         fontsize=8, color='grey', transform=ax.transAxes)
@@ -590,37 +585,39 @@ def plot_combined_transfer_matrix(mv_result: Dict, dv_result: Optional[Dict],
                              f'wm={cell["wm_ss_gain"]:+.3g} (×{ratio:.2f})',
                              fontsize=8)
                 ax.grid(alpha=0.25)
-            if ci == n_cv - 1:
+            if ri == n_row - 1:
                 ax.set_xlabel('step')
-            if j == 0:
-                ax.set_ylabel(ylab, fontsize=8)
-    # Vertical divider between the MV block and the DV block.
-    if 0 < n_mv < n_col:
-        x_div = (axes[0][n_mv - 1].get_position().x1
-                 + axes[0][n_mv].get_position().x0) / 2.0
-        line = plt.Line2D([x_div, x_div], [0.10, 0.92], transform=fig.transFigure,
+            if cj == 0:
+                ax.set_ylabel(f'{inp}\n{ylab}', fontsize=8)
+    # Horizontal divider between the MV block (top) and the DV block (bottom).
+    if 0 < n_mv < n_row:
+        y_div = (axes[n_mv - 1][0].get_position().y0
+                 + axes[n_mv][0].get_position().y1) / 2.0
+        line = plt.Line2D([0.06, 0.97], [y_div, y_div], transform=fig.transFigure,
                           color='0.4', lw=1.4, ls=':')
         fig.add_artist(line)
-        fig.text(axes[0][0].get_position().x0, 0.945, 'MANIPULATED (MV)',
-                 fontsize=9, fontweight='bold', color='0.25')
-        fig.text(axes[0][n_mv].get_position().x0, 0.945, 'DISTURBANCE (DV)',
-                 fontsize=9, fontweight='bold', color='0.25')
+        fig.text(0.015, axes[0][0].get_position().y1, 'MANIPULATED (MV)',
+                 fontsize=9, fontweight='bold', color='0.25', rotation=90,
+                 va='top', ha='left')
+        fig.text(0.015, axes[n_mv][0].get_position().y1, 'DISTURBANCE (DV)',
+                 fontsize=9, fontweight='bold', color='0.25', rotation=90,
+                 va='top', ha='left')
     legend_handles = [
         Line2D([0], [0], color='k', lw=2.2, ls='-', label='real sim (ground truth)'),
         Line2D([0], [0], color='C0', lw=2.2, ls='--', label='world model'),
         Patch(facecolor='grey', alpha=0.2, label='shaded = min–max over operating region'),
     ]
     fig.legend(handles=legend_handles, loc='lower center', ncol=3, fontsize=8,
-               framealpha=0.9, bbox_to_anchor=(0.5, 0.085))
+               framealpha=0.9, bbox_to_anchor=(0.5, 0.075))
     sup = title or ('World-model vs real-plant transfer matrix '
-                    '(DMC-style: CV rows × input cols)')
+                    '(DMC-style: input rows × CV cols)')
     fig.suptitle(sup, fontsize=12, y=0.99)
-    fig.text(0.5, 0.02,
+    fig.text(0.5, 0.018,
              'How to read: each cell = step response of that CV to that input '
              '(engineering gain).\nWM (blue dashed) should overlap real (black '
              'solid); bold = mean, light shading = operating-range spread.',
              ha='center', va='bottom', fontsize=8)
-    fig.tight_layout(rect=(0, 0.14, 1, 0.94))
+    fig.tight_layout(rect=(0.04, 0.12, 1, 0.94))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=110)
@@ -647,8 +644,9 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
             level_span=span, step_frac=step_frac, horizon=horizon,
             settle_steps=settle)
         out_dir = Path(out_dir)
-        plot_transfer_matrix(result, out_dir / 'wm_transfer_matrix.png',
-                             title=title)
+        # Keep the MV→CV JSON (feeds the combined plot + the gain summary), but
+        # the standalone MV-only PNG is dropped — the combined matrix is the
+        # single comparison view we want.
         with open(out_dir / 'wm_transfer_matrix.json', 'w') as f:
             json.dump(result, f, indent=2)
         # DV→CV matrix (Option B DV-as-input only; empty/no-op otherwise).
@@ -659,18 +657,12 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
                 model, env, cfg, device, obs_std=obs_std, n_levels=3,
                 step_frac=step_frac, horizon=horizon, settle_steps=settle)
             if dv_result.get('enabled') and dv_result.get('pairs'):
-                plot_dv_transfer_matrix(
-                    dv_result, out_dir / 'wm_dv_transfer_matrix.png', title=title)
                 with open(out_dir / 'wm_dv_transfer_matrix.json', 'w') as f:
                     json.dump(dv_result, f, indent=2)
-                _dvp = dv_result['pairs']
-                print(f'[val] WM DV→CV transfer matrix: {len(_dvp)} DV/CV '
-                      f'pair(s) -> {out_dir}/wm_dv_transfer_matrix.png',
-                      flush=True)
         except Exception as _dve:
             print(f'[val] WM DV→CV transfer matrix skipped ({_dve!r})',
                   flush=True)
-        # COMBINED DMC-style matrix (CV rows × MV|DV cols) — the single
+        # COMBINED DMC-style matrix (input rows × CV cols) — the SINGLE
         # comparison view.  Guarded so it never breaks validation.
         try:
             plot_combined_transfer_matrix(
@@ -689,8 +681,8 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
             if worst is None or err > worst[1]:
                 worst = (k, err)
         n = len(pairs)
-        msg = (f'[val] WM transfer matrix: {n} MV/CV pair(s) -> '
-               f'{out_dir}/wm_transfer_matrix.png')
+        msg = (f'[val] WM transfer matrix: {n} MV/CV pair(s) '
+               f'(see wm_transfer_matrix_combined.png)')
         if worst is not None:
             wk = worst[0]
             wv = pairs[wk]
