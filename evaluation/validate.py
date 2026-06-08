@@ -1668,28 +1668,33 @@ def run_validation(*,
     # default (mean=0, var=1) stats — which is also what those models
     # were effectively trained with.
     obs_norm_state = ckpt_obj.get('obs_norm') if isinstance(ckpt_obj, dict) else None
-    # Seed plan: the standard held-out seeds at the curriculum-suppressed
-    # hidden-disturbance amplitude (phase=1/progress=0, ~10% of nominal —
-    # keeps these comparable across runs), PLUS one dedicated seed at the
-    # FULL phase-3 unmeasured-disturbance magnitude so the operator can see
-    # how the agent rejects a realistic unmeasured load.  Gated by
-    # ``DREAMER_VAL_UNMEASURED_SEED`` (default ON).
-    seed_plan: List[Tuple[int, bool]] = [(10_000 + s, False)
-                                          for s in range(int(seeds))]
-    if str(os.environ.get('DREAMER_VAL_UNMEASURED_SEED', '1')).strip().lower() \
-            not in ('0', 'false', 'no', 'off'):
-        seed_plan.append((10_000 + int(seeds), True))
+    # Seed plan: FOUR consolidated disturbance-rejection plots (one per seed,
+    # ``int(seeds)+1`` total = 4 by default), each with the FULL feature set:
+    #   * the measured-DV scripted schedule (events spread across the episode), and
+    #   * the unmeasured/hidden disturbance at FULL phase-3 amplitude, ALSO spread
+    #     across the whole episode (``DREAMER_HIDDEN_DIST_SPREAD``) so it reads as a
+    #     realistic load active start->end instead of a few front-loaded events
+    #     holding a DC offset.
+    # The seeds differ only by RNG draw, so the four plots show the same realistic
+    # operating regime under different disturbance realisations.  The PASS/FAIL
+    # fidelity gates run on a separate CLEAN env (``_disturbance_prob_override=0``)
+    # and are unaffected by this.
+    n_plots = int(seeds) + 1
+    seed_plan: List[Tuple[int, bool]] = [(10_000 + s, True) for s in range(n_plots)]
+    # Spread the hidden disturbance across the whole episode for validation only
+    # (training keeps the front-loaded sequential placement).  Saved/restored
+    # around the seed loop so we never leak the override.
+    _hd_spread_prev = os.environ.get('DREAMER_HIDDEN_DIST_SPREAD')
+    os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '1'
     for seed, unmeasured_full in seed_plan:
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
-        # Force the hidden OU disturbance on every validation episode so
-        # the agent is always tested on its disturbance-rejection skill.
+        # Force the hidden disturbance on every validation episode (always test
+        # the agent's rejection skill) and lift the curriculum so it runs at full
+        # phase-3 amplitude (curriculum_amp_scale cap 1.0, ramp at progress=1).
         env._hidden_disturbance_force = True
-        if unmeasured_full:
-            # Lift the curriculum so the hidden OU runs at full phase-3
-            # amplitude (curriculum_amp_scale cap 1.0, ramp at progress=1).
-            env._current_phase = 3
-            env._training_progress = 1.0
+        env._current_phase = 3
+        env._training_progress = 1.0
         if obs_norm_state is not None:
             try:
                 env.set_obs_norm_stats(
@@ -1709,19 +1714,17 @@ def run_validation(*,
             except Exception:
                 env.reward_scale = 1.0
 
-        per_seed_dir = out_dir / (f'seed_{seed:05d}_unmeasured'
-                                   if unmeasured_full else f'seed_{seed:05d}')
+        per_seed_dir = out_dir / f'seed_{seed:05d}'
         per_seed_dir.mkdir(parents=True, exist_ok=True)
-        _ttl_sfx = '  [FULL unmeasured disturbance]' if unmeasured_full else ''
+        _ttl_sfx = ''
 
         eps = []
         for e in range(int(episodes)):
             ep = run_episode(env, model, device, deterministic=deterministic)
-            title = (f'seed={seed} ep={e}  T={ep["episode_length"]}  '
-                     f'cum_raw={ep["cum_raw_reward"]:+.2f}  '
-                     f'mean_cv_v={ep["mean_cv_violation"]:.4f}  '
-                     f'mean_mv_v={ep["mean_mv_violation"]:.4f}{_ttl_sfx}')
-            plot_episode(ep, per_seed_dir / f'ep_{e:02d}.png', title=title)
+            # Per-episode rollouts feed the cross-seed summary + metrics.json;
+            # the barebones per-episode plot (CV/MV/reward only, no DV/hidden
+            # rows) is intentionally NOT emitted — the consolidated, full-feature
+            # ``disturbance_rejection.png`` below is the single per-seed plot.
             eps.append(ep)
             metrics_records.append({
                 'seed': seed, 'episode': e,
@@ -1912,6 +1915,12 @@ def run_validation(*,
 
         seed_results.append(eps)
         print(f'[val] seed {seed}: {len(eps)} episodes done', flush=True)
+
+    # Restore the hidden-disturbance spread override (validation-scoped).
+    if _hd_spread_prev is None:
+        os.environ.pop('DREAMER_HIDDEN_DIST_SPREAD', None)
+    else:
+        os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = _hd_spread_prev
 
     plot_summary(seed_results, out_dir / 'summary.png',
                   title=f'{controller_dir.name}  validation summary  '

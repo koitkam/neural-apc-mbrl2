@@ -548,45 +548,83 @@ class HiddenDisturbanceSchedule:
         weights = self._shape_weights()
 
         n_budget = int(np.clip(round(T / (1.5 * settle)), 1, max(1, max_events)))
+        # Spread mode (validation): distribute event starts UNIFORMLY across the
+        # whole episode (mirrors the measured-DV validation schedule) so the
+        # unmeasured disturbance is active start->end instead of a few
+        # front-loaded events that then hold a DC offset.  Default OFF: the
+        # sequential dur+gap placement below is unchanged for training (keeps
+        # the training RNG stream byte-identical).
+        spread = str(os.environ.get('DREAMER_HIDDEN_DIST_SPREAD', '0')).strip() \
+            .lower() not in ('0', 'false', 'no', 'off', '')
         events: List[Dict] = []
-        t = float(rng.uniform(0.0, settle))
-        while len(events) < n_budget and t < (T - tau_steps):
-            pos = int(rng.integers(0, n_cv))
-            shape = str(rng.choice(shapes, p=weights))
-            sign = 1.0 if rng.uniform() < 0.5 else -1.0
-            mag = sign * float(rng.uniform(0.4, 1.0)) * float(self.amp_cap[pos])
-            if shape == 'step':
-                rise = 0.0
-            elif shape == 'pulse':
-                rise = float(rng.uniform(0.3, 0.8)) * tau_steps
-            else:  # ramp / ou_drift
-                rise = float(rng.uniform(0.5, 1.5)) * tau_steps
-            if shape == 'pulse':
-                hold = float(rng.uniform(0.5, 1.5)) * tau_steps
-                revert = True
-            elif shape == 'ou_drift':
-                hold = float(rng.uniform(1.0, 3.0)) * tau_steps
-                revert = bool(rng.uniform() < p_revert)
-            else:  # step / ramp held toward steady state
-                hold = float(rng.uniform(0.5, 2.0)) * settle
-                revert = bool(rng.uniform() < p_revert)
-            fall = (float(rng.uniform(0.5, 1.5)) * tau_steps) if revert else 0.0
-            tau_dist = float(rng.uniform(0.15, 0.5)) * tau_steps
-            alpha = (float(np.clip(1.0 / max(tau_dist, 1.0), 1e-3, 1.0))
-                     if shape == 'ou_drift' else 0.0)
-            events.append({
-                'pos': pos, 'shape': shape, 'mag': float(mag),
-                'start': float(t), 'rise': float(rise), 'hold': float(hold),
-                'fall': float(fall), 'revert': bool(revert),
-                'alpha': float(alpha), 'ou': 0.0,
-            })
-            dur = rise + hold + fall
-            if rng.uniform() < p_isolated:
-                gap = settle * (1.0 + float(rng.uniform(0.0, 1.0)))
-            else:
-                gap = settle * float(rng.uniform(0.2, 0.8))
-            t = t + dur + gap
+        if spread:
+            earliest = float(rng.uniform(0.0, settle))
+            latest = max(earliest + 1.0, 0.92 * T - tau_steps)
+            min_gap = max(2.0, 0.6 * settle)
+            starts: List[float] = []
+            for _ in range(max(40, 12 * n_budget)):
+                if len(starts) >= n_budget:
+                    break
+                s = float(rng.uniform(earliest, latest))
+                if all(abs(s - s0) >= min_gap for s0 in starts):
+                    starts.append(s)
+            starts.sort()
+            for t in starts:
+                events.append(self._make_event(
+                    rng, float(t), n_cv, shapes, weights, tau_steps,
+                    settle, p_revert))
+        else:
+            t = float(rng.uniform(0.0, settle))
+            while len(events) < n_budget and t < (T - tau_steps):
+                ev = self._make_event(
+                    rng, float(t), n_cv, shapes, weights, tau_steps,
+                    settle, p_revert)
+                events.append(ev)
+                dur = ev['rise'] + ev['hold'] + ev['fall']
+                if rng.uniform() < p_isolated:
+                    gap = settle * (1.0 + float(rng.uniform(0.0, 1.0)))
+                else:
+                    gap = settle * float(rng.uniform(0.2, 0.8))
+                t = t + dur + gap
         self.events = events
+
+    def _make_event(self, rng: np.random.Generator, t: float, n_cv: int,
+                     shapes: List[str], weights: np.ndarray, tau_steps: float,
+                     settle: float, p_revert: float) -> Dict:
+        """Draw one disturbance event (shape/magnitude/timing) starting at ``t``.
+
+        Draw order is identical to the original inline body so the training
+        RNG stream is unchanged when ``DREAMER_HIDDEN_DIST_SPREAD`` is off.
+        """
+        pos = int(rng.integers(0, n_cv))
+        shape = str(rng.choice(shapes, p=weights))
+        sign = 1.0 if rng.uniform() < 0.5 else -1.0
+        mag = sign * float(rng.uniform(0.4, 1.0)) * float(self.amp_cap[pos])
+        if shape == 'step':
+            rise = 0.0
+        elif shape == 'pulse':
+            rise = float(rng.uniform(0.3, 0.8)) * tau_steps
+        else:  # ramp / ou_drift
+            rise = float(rng.uniform(0.5, 1.5)) * tau_steps
+        if shape == 'pulse':
+            hold = float(rng.uniform(0.5, 1.5)) * tau_steps
+            revert = True
+        elif shape == 'ou_drift':
+            hold = float(rng.uniform(1.0, 3.0)) * tau_steps
+            revert = bool(rng.uniform() < p_revert)
+        else:  # step / ramp held toward steady state
+            hold = float(rng.uniform(0.5, 2.0)) * settle
+            revert = bool(rng.uniform() < p_revert)
+        fall = (float(rng.uniform(0.5, 1.5)) * tau_steps) if revert else 0.0
+        tau_dist = float(rng.uniform(0.15, 0.5)) * tau_steps
+        alpha = (float(np.clip(1.0 / max(tau_dist, 1.0), 1e-3, 1.0))
+                 if shape == 'ou_drift' else 0.0)
+        return {
+            'pos': pos, 'shape': shape, 'mag': float(mag),
+            'start': float(t), 'rise': float(rise), 'hold': float(hold),
+            'fall': float(fall), 'revert': bool(revert),
+            'alpha': float(alpha), 'ou': 0.0,
+        }
 
     def _shape_weights(self) -> np.ndarray:
         default = np.array([0.30, 0.30, 0.20, 0.20], dtype='float64')
