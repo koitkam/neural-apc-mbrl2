@@ -378,6 +378,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # (a) adaptive bounded-return envelope (default ON; both backbones).
     'DREAMER_RETURN_VALUE_ADAPTIVE_CAP':  ('return_value_adaptive_cap',      _as_bool),
     'DREAMER_RETURN_VALUE_CAP_K':         ('return_value_cap_k',             float),
+    'DREAMER_RETURN_VALUE_CAP_GAMMA_HORIZON': ('return_value_cap_gamma_horizon', _as_bool),
     # (b) WM held-action steady-state consistency loss (default ON; both backbones).
     'DREAMER_WM_STEADY_CONSISTENCY_COEF': ('wm_steady_consistency_coef',     float),
     'DREAMER_WM_STEADY_SETTLE_FRAC':      ('wm_steady_settle_frac',          float),

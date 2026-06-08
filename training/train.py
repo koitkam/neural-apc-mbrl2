@@ -251,7 +251,11 @@ class TrainConfig:
     # (on-policy + exploration + PRBS + baseline) so it stays calibrated across
     # the policy's TRUE distribution.  BC still clones the expert (separate
     # mask) — only the REWARD supervision drops them.  DREAMER_REWARD_HEAD_EXCLUDE_EXPERT.
-    reward_head_exclude_expert: bool = False
+    # PROMOTED to default ON (2026-06-07): p98/p99 confirmed it lifts the
+    # validation reward_head_r from -0.30 (anti-correlated) to +0.30 with no
+    # downside (BC still clones the expert via a separate mask).  Orthogonal to
+    # the return-cap cascade fix.  Set DREAMER_REWARD_HEAD_EXCLUDE_EXPERT=0 to revert.
+    reward_head_exclude_expert: bool = True
     # P1 (WM pretrain) reward-MTP loss weight.  Paper default 0.0:
     # Dreamer-V4 §3 trains the WM (tokenizer + dynamics) without the
     # reward head in pretrain.  The reward head joins in agent
@@ -760,6 +764,18 @@ class TrainConfig:
     # a healthy return spread (~45) and clips the runaway (~102).
     return_value_adaptive_cap: bool = True
     return_value_cap_k: float = 2.0
+    # (2026-06-07) STRUCTURAL CASCADE-ROOT FIX.  The cap clamps the bootstrap
+    # target-VALUES + λ-return TARGETS, which live on the γ VALUE-horizon
+    # (|V| ≤ B/(1-γ)).  The legacy denominator (1-γλ) is the λ CREDIT-horizon
+    # (~9 steps at γλ=0.89), making the cap ~10× too tight: at γ=0.99,B=3,k=2
+    # the cap is 55 but a -1/step policy's true value is -100 -> the cap
+    # FLATTENS the whole legitimate value range [-50..-300] into a wall at -55
+    # (the exact ``img_ret`` pin seen in p94-p99) -> zero advantage spread ->
+    # the critic/actor cascade.  With this ON the cap uses 1/(1-γ) (the value
+    # horizon): at γ=0.99 -> cap=600 = 2× the theoretical max |V|, so it ONLY
+    # catches a true runaway and never flattens a legitimate value.  Default
+    # OFF pending p100 validation; DREAMER_RETURN_VALUE_CAP_GAMMA_HORIZON=1.
+    return_value_cap_gamma_horizon: bool = False
 
     # ----- (b) world-model held-action steady-state consistency loss -----
     # The RSSM has no explicit held-action fixed point (wm_pred_converges_
@@ -2700,8 +2716,14 @@ def _adaptive_return_cap(cfg: TrainConfig) -> Optional[float]:
         return None
     gamma = float(getattr(cfg, 'gamma', 0.997))
     lam = float(getattr(cfg, 'gae_lambda', 0.95))
-    gl = max(0.0, min(0.999999, gamma * lam))
-    return k * B / (1.0 - gl)
+    if bool(getattr(cfg, 'return_value_cap_gamma_horizon', False)):
+        # Cap the VALUE-horizon (1/(1-γ)); see TrainConfig note — the legacy
+        # λ-horizon below made the cap ~10× too tight and flattened the value.
+        denom = max(1e-6, 1.0 - gamma)
+    else:
+        gl = max(0.0, min(0.999999, gamma * lam))
+        denom = 1.0 - gl
+    return k * B / denom
 
 
 def _critic_anchor_lambda(cfg: TrainConfig) -> float:

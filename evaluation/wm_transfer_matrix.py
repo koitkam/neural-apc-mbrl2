@@ -527,6 +527,106 @@ def plot_dv_transfer_matrix(result: Dict, out_path: Path,
     plt.close(fig)
 
 
+def plot_combined_transfer_matrix(mv_result: Dict, dv_result: Optional[Dict],
+                                  out_path: Path, title: str = '') -> None:
+    """DMC-style COMBINED step-response matrix: CV rows × (MV cols │ DV cols).
+
+    One figure laying every CV's response to every input (manipulated + measured
+    disturbance) side by side, like a real DMC model.  Black solid = real sim,
+    blue dashed = world model; the shaded band is the min–max across operating
+    points (drawn light so the MEAN lines read clearly — addresses "several
+    shaded areas I can't tell apart").  A vertical divider separates the MV
+    block from the DV block.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    cv_names = list(mv_result.get('cv_names') or [])
+    mv_names = list(mv_result.get('mv_names') or [])
+    dv_names = list((dv_result or {}).get('dv_names') or [])
+    t_mv = np.asarray(mv_result.get('t', []), dtype='float32')
+    t_dv = np.asarray((dv_result or {}).get('t', mv_result.get('t', [])),
+                      dtype='float32')
+    # Columns = MV inputs then DV inputs; tag each with its source group.
+    cols = ([('mv', m) for m in mv_names]
+            + [('dv', d) for d in dv_names])
+    n_cv, n_col = len(cv_names), len(cols)
+    if n_cv == 0 or n_col == 0:
+        return
+    fig_w = max(7.0, 3.7 * n_col)
+    fig_h = max(4.8, 3.0 * n_cv + 1.4)
+    fig, axes = plt.subplots(n_cv, n_col, figsize=(fig_w, fig_h), squeeze=False)
+    n_mv = len(mv_names)
+    for ci, cvn in enumerate(cv_names):
+        for j, (grp, inp) in enumerate(cols):
+            ax = axes[ci][j]
+            if grp == 'mv':
+                cell = mv_result.get('pairs', {}).get(f'{cvn}<-{inp}')
+                t = t_mv
+                ylab = 'ΔCV / ΔMV'
+            else:
+                cell = (dv_result or {}).get('pairs', {}).get(f'{cvn}<-{inp}')
+                t = t_dv
+                ylab = 'ΔCV / ΔDV'
+            if not cell:
+                ax.text(0.5, 0.5, '(no data)', ha='center', va='center',
+                        fontsize=8, color='grey', transform=ax.transAxes)
+                ax.set_xticks([]); ax.set_yticks([])
+            else:
+                for who, color in (('real', 'k'), ('wm', 'C0')):
+                    m = np.asarray(cell[who]['mean'], dtype='float32')
+                    lo = np.asarray(cell[who]['lo'], dtype='float32')
+                    hi = np.asarray(cell[who]['hi'], dtype='float32')
+                    ax.fill_between(t, lo, hi, color=color, alpha=0.12,
+                                    linewidth=0)
+                    ax.plot(t, m, color=color, lw=2.2,
+                            ls='-' if who == 'real' else '--')
+                ax.axhline(0.0, color='grey', lw=0.6, alpha=0.6)
+                ratio = cell.get('ss_gain_ratio_wm_over_real', float('nan'))
+                ax.set_title(f'{cvn} ← {inp}\nSS real={cell["real_ss_gain"]:+.3g} '
+                             f'wm={cell["wm_ss_gain"]:+.3g} (×{ratio:.2f})',
+                             fontsize=8)
+                ax.grid(alpha=0.25)
+            if ci == n_cv - 1:
+                ax.set_xlabel('step')
+            if j == 0:
+                ax.set_ylabel(ylab, fontsize=8)
+    # Vertical divider between the MV block and the DV block.
+    if 0 < n_mv < n_col:
+        x_div = (axes[0][n_mv - 1].get_position().x1
+                 + axes[0][n_mv].get_position().x0) / 2.0
+        line = plt.Line2D([x_div, x_div], [0.10, 0.92], transform=fig.transFigure,
+                          color='0.4', lw=1.4, ls=':')
+        fig.add_artist(line)
+        fig.text(axes[0][0].get_position().x0, 0.945, 'MANIPULATED (MV)',
+                 fontsize=9, fontweight='bold', color='0.25')
+        fig.text(axes[0][n_mv].get_position().x0, 0.945, 'DISTURBANCE (DV)',
+                 fontsize=9, fontweight='bold', color='0.25')
+    legend_handles = [
+        Line2D([0], [0], color='k', lw=2.2, ls='-', label='real sim (ground truth)'),
+        Line2D([0], [0], color='C0', lw=2.2, ls='--', label='world model'),
+        Patch(facecolor='grey', alpha=0.2, label='shaded = min–max over operating region'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center', ncol=3, fontsize=8,
+               framealpha=0.9, bbox_to_anchor=(0.5, 0.085))
+    sup = title or ('World-model vs real-plant transfer matrix '
+                    '(DMC-style: CV rows × input cols)')
+    fig.suptitle(sup, fontsize=12, y=0.99)
+    fig.text(0.5, 0.02,
+             'How to read: each cell = step response of that CV to that input '
+             '(engineering gain).\nWM (blue dashed) should overlap real (black '
+             'solid); bold = mean, light shading = operating-range spread.',
+             ha='center', va='bottom', fontsize=8)
+    fig.tight_layout(rect=(0, 0.14, 1, 0.94))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
 def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
                      obs_std: Optional[np.ndarray] = None,
                      title: str = '') -> Optional[Dict]:
@@ -553,6 +653,7 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
             json.dump(result, f, indent=2)
         # DV→CV matrix (Option B DV-as-input only; empty/no-op otherwise).
         # Separately guarded so a DV-side failure never loses the MV result.
+        dv_result = None
         try:
             dv_result = compute_dv_transfer_matrix(
                 model, env, cfg, device, obs_std=obs_std, n_levels=3,
@@ -568,6 +669,17 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
                       flush=True)
         except Exception as _dve:
             print(f'[val] WM DV→CV transfer matrix skipped ({_dve!r})',
+                  flush=True)
+        # COMBINED DMC-style matrix (CV rows × MV|DV cols) — the single
+        # comparison view.  Guarded so it never breaks validation.
+        try:
+            plot_combined_transfer_matrix(
+                result, dv_result, out_dir / 'wm_transfer_matrix_combined.png',
+                title=title)
+            print(f'[val] WM combined (DMC-style) transfer matrix -> '
+                  f'{out_dir}/wm_transfer_matrix_combined.png', flush=True)
+        except Exception as _ce:
+            print(f'[val] WM combined transfer matrix skipped ({_ce!r})',
                   flush=True)
         # Concise fidelity summary to the log.
         pairs = result.get('pairs', {})
