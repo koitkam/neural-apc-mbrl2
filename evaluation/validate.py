@@ -1637,6 +1637,12 @@ def run_validation(*,
         disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
         disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
         disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
+        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
+        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
+        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
+        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
+        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
+        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
         attn_impl=getattr(cfg, 'attn_impl', 'auto'),
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
