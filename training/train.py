@@ -3677,6 +3677,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # decisive, less-noisy actor.  Default-off (``critic_mc_grounding_coef=0``).
     mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
     critic_mc_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
+    mc_rew_to_tgt_var = torch.zeros((), device=device, dtype=critic_loss.dtype)
     if mc_coef > 0.0:
         rew_mc = batch['rew'].to(device=device, dtype=critic_loss.dtype)
         cont_mc = batch.get('cont', None)
@@ -3702,6 +3703,13 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
             y_mc = ret_mc.reshape(-1).detach()
             if _ret_cap is not None:
                 y_mc = y_mc.clamp(-_ret_cap, _ret_cap)
+            # Canary on the REAL MC target (the imagined-target
+            # ``critic_rew_to_tgt_var`` does NOT reflect MC grounding):
+            # Var(real reward) / Var(MC return-to-go).  >0.015 = the MC target
+            # carries real economic variance (the grounded-critic goal).
+            _mc_rv = rew_mc.float().var().clamp_min(1e-8)
+            _mc_tv = y_mc.float().var().clamp_min(1e-8)
+            mc_rew_to_tgt_var = (_mc_rv / _mc_tv).clamp_max(10.0).detach()
         critic_mc_loss = model.value.loss(val_mc_logits, y_mc).mean()
         critic_loss = critic_loss + mc_coef * critic_mc_loss
 
@@ -3766,6 +3774,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_loss': critic_loss,
         'critic_imag_loss': critic_imag_loss.detach(),
         'critic_mc_loss': critic_mc_loss.detach(),
+        'critic_mc_rew_to_tgt_var': mc_rew_to_tgt_var.detach() if torch.is_tensor(mc_rew_to_tgt_var) else mc_rew_to_tgt_var,
         'imagined_return_mean': target_returns.mean().detach(),
         'imagined_reward_mean': rewards.mean().detach(),
         'imagined_reward_std': rewards.std().detach(),
@@ -4002,6 +4011,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # economics so it cannot inflate on its own slow-target fiction.
     mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
     critic_mc_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
+    mc_rew_to_tgt_var = torch.zeros((), device=device, dtype=critic_loss.dtype)
     if mc_coef > 0.0:
         rew_mc = batch['rew'].to(device=device, dtype=critic_loss.dtype)
         cont_mc = batch.get('cont', None)
@@ -4027,6 +4037,10 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             y_mc = ret_mc.reshape(-1).detach()
             if _ret_cap is not None:
                 y_mc = y_mc.clamp(-_ret_cap, _ret_cap)
+            # Canary on the REAL MC target (see RSSM path note).
+            _mc_rv = rew_mc.float().var().clamp_min(1e-8)
+            _mc_tv = y_mc.float().var().clamp_min(1e-8)
+            mc_rew_to_tgt_var = (_mc_rv / _mc_tv).clamp_max(10.0).detach()
         critic_mc_loss = model.value.loss(val_mc_logits, y_mc).mean()
         critic_loss = critic_loss + mc_coef * critic_mc_loss
 
@@ -4136,6 +4150,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_loss': critic_loss,
         'critic_imag_loss': critic_imag_loss.detach(),
         'critic_mc_loss': critic_mc_loss.detach(),
+        'critic_mc_rew_to_tgt_var': mc_rew_to_tgt_var.detach() if torch.is_tensor(mc_rew_to_tgt_var) else mc_rew_to_tgt_var,
         'imagined_return_mean': target_returns.mean().detach(),        'imagined_reward_mean': rewards.mean().detach(),
         'imagined_reward_std': rewards.std().detach(),
         'entropy_mean': entropies.mean().detach(),
