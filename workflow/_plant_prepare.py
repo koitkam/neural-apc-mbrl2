@@ -204,6 +204,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_TARGET_CRITIC_TAU':  ('target_critic_tau',          float),
     'DREAMER_P3_COLLECT_EVERY':   ('phase3_collect_every_iters', int),
     'DREAMER_BUFFER_CAP_STEPS':   ('buffer_capacity_steps',      int),
+    'DREAMER_EXCITATION_REINJECT_EVERY': ('excitation_reinject_every_iters', int),
     # 2026-05-19 paper-strip-back knobs (p28 A/B): expose the remaining
     # auto-tuned cfg fields so a fully paper-faithful baseline can be
     # launched purely via env vars.

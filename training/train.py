@@ -943,6 +943,19 @@ class TrainConfig:
     # fraction is too small to retrain the head between P3 iters. K=1
     # restores paper behaviour at the cost of ~30% throughput.
     phase3_collect_every_iters: int = 1
+    # ----- Persistent open-loop excitation re-injection (2026-06-08) -----
+    # The co-train loop otherwise feeds the WM ONLY on-policy CLOSED-LOOP
+    # episodes (the actor holding CV at setpoint), under which the naive
+    # ∂CV/∂MV reads small -> the WM's open-loop steady-state gain regresses
+    # toward zero and its dynamics get sluggish (WM-gain RCA 2026-06-08).
+    # The gain-rich step-test / PRBS episodes only exist in the one-time seed
+    # fill and get diluted then FIFO-evicted as training proceeds.  When
+    # ``excitation_reinject_every_iters > 0`` the loop re-collects ONE clean
+    # open-loop excitation episode (alternating step-test / PRBS) every N
+    # iters and appends it to the buffer, so clean step-response data stays
+    # continuously present.  Default 0 = OFF (opt-in via
+    # ``DREAMER_EXCITATION_REINJECT_EVERY``).
+    excitation_reinject_every_iters: int = 0
     # Reduce inner train steps in P3 so more iters happen per fixed
     # env-step budget — Optuna's pruner gets more samples and we get
     # finer-grained logs of actor / entropy progression.
@@ -6666,6 +6679,46 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 ret = float(ep['rew'].sum())
                 ema_return = (ret if ema_return is None
                                 else 0.95 * ema_return + 0.05 * ret)
+            # Persistent open-loop excitation re-injection (2026-06-08).
+            # On-policy closed-loop episodes under-excite the WM's gain
+            # (the actor holds CV flat -> ∂CV/∂MV reads small), so every
+            # ``excitation_reinject_every_iters`` iters add ONE clean
+            # open-loop excitation episode (alternating step-test / PRBS)
+            # to keep gain-rich step-response data continuously in the
+            # buffer.  Not a policy return -> excluded from ema_return /
+            # return_window.  Guarded so a collection failure never kills
+            # the run.
+            reinj_every = int(getattr(cfg, 'excitation_reinject_every_iters',
+                                       0) or 0)
+            if reinj_every > 0 and (total_iters % reinj_every) == 0:
+                try:
+                    _ob = float(getattr(cfg, 'constant_action_seed_op_band',
+                                         0.6))
+                    _astd = float(getattr(cfg, 'baseline_seed_action_std',
+                                           0.05))
+                    _pob = float(getattr(cfg, 'prbs_seed_op_band', 0.95))
+                    _ndv = int(len(getattr(env.sim, 'dv_indices', []) or []))
+                    if (total_iters // reinj_every) % 2 == 0:
+                        _lvl = float(env.rng.uniform(-_ob, _ob))
+                        _pdv = (int(env.rng.integers(0, _ndv))
+                                if _ndv > 0 else -1)
+                        _xep = collect_step_test_episode(
+                            env, cfg, initial_level=_lvl, primary_dv_pos=_pdv)
+                        _xkind = 'step_test'
+                    else:
+                        _xep = collect_prbs_episode(
+                            env, cfg, action_std=_astd, op_band=_pob)
+                        _xkind = 'prbs'
+                    buf.add_episode(_xep['obs'], _xep['act'], _xep['rew'],
+                                    _xep['cont'])
+                    total_env_steps += cfg.episode_length
+                    if (total_iters % max(1, reinj_every * 10)) == 0:
+                        print(f"[excite] re-injected {_xkind} @iter"
+                              f"{total_iters} (every {reinj_every} iters)",
+                              flush=True)
+                except Exception as _xe:
+                    print(f"[excite] re-injection skipped @iter{total_iters}: "
+                          f"{_xe!r}", flush=True)
             # Periodic deterministic eval (for the BO score window).
             if (total_iters % max(1, cfg.phase3_eval_every_iters)) == 0:
                 ep_eval = collect_episode(env, model, device, cfg,
