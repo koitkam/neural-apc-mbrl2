@@ -425,6 +425,31 @@ class TrainConfig:
     # ``DREAMER_CRITIC_IMAG_LOSS_COEF``.
     critic_imag_loss_coef: float = 1.0
 
+    # ---- Real-return (Monte-Carlo) critic grounding (Option #1 / TD-MPC, 2026-06-09) ----
+    # The replay anchor above (``critic_replay_anchor_coef``) builds a TD-λ
+    # target on REAL states but STILL bootstraps off the slow-target value
+    # ``tv_real`` at every recursion step — so when the value self-inflates the
+    # anchor target inflates WITH it (the cascade through-line: across p79-p105
+    # ``critic_rew_to_tgt_var`` stays <0.015 = realised reward is <1.5% of the
+    # critic target's variance, so the actor's advantages carry almost no real
+    # economic signal -> a noisy, non-economic policy that doesn't ride the
+    # CV limit for profit).  This term adds a PURE Monte-Carlo return-to-go over
+    # the real buffer segment — a discounted sum of the ACTUAL observed rewards
+    # with NO intermediate value bootstrap — so the critic is pinned to realised
+    # economics and cannot float on its own fiction.  ``coef`` weights it
+    # against the imagined critic CE; pair with a REDUCED
+    # ``critic_imag_loss_coef`` (and ``critic_replay_anchor_coef=0``) so the MC
+    # target dominates.  0.0 (default) = off / legacy.  Env
+    # ``DREAMER_CRITIC_MC_GROUNDING_COEF``.
+    critic_mc_grounding_coef: float = 0.0
+    # When True, cap the MC return with a single discounted tail bootstrap
+    # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
+    # (default) the return is PURE MC (truncated at the segment end).  At
+    # ``seq_len`` = 128 / γ = 0.97 the truncation bias γ^128 ≈ 0.02 is
+    # negligible, so pure MC is the cleaner, fully-grounded default.  Env
+    # ``DREAMER_CRITIC_MC_TAIL_BOOTSTRAP``.
+    critic_mc_tail_bootstrap: bool = False
+
     # ---- MV / limit consistency (P86, 2026-06-05) ----
     # (1) Action→MV mapping basis.  The normalised actor action is mapped to an
     # engineering-unit MV over a FIXED reference band.  Historically (pre-P60)
@@ -773,9 +798,13 @@ class TrainConfig:
     # (the exact ``img_ret`` pin seen in p94-p99) -> zero advantage spread ->
     # the critic/actor cascade.  With this ON the cap uses 1/(1-γ) (the value
     # horizon): at γ=0.99 -> cap=600 = 2× the theoretical max |V|, so it ONLY
-    # catches a true runaway and never flattens a legitimate value.  Default
-    # OFF pending p100 validation; DREAMER_RETURN_VALUE_CAP_GAMMA_HORIZON=1.
-    return_value_cap_gamma_horizon: bool = False
+    # catches a true runaway and never flattens a legitimate value.  PROMOTED
+    # to default True (2026-06-09): validated across p100-p105 (the legacy
+    # λ-horizon cap was the structural cascade root; the γ-horizon cap removed
+    # the img_ret pin without ever flattening a legitimate value, and the
+    # observed cascades in that series came from B=6 / γ choices, NOT the cap).
+    # DREAMER_RETURN_VALUE_CAP_GAMMA_HORIZON=0 restores the legacy λ-horizon cap.
+    return_value_cap_gamma_horizon: bool = True
 
     # ----- (b) world-model held-action steady-state consistency loss -----
     # The RSSM has no explicit held-action fixed point (wm_pred_converges_
@@ -3637,6 +3666,45 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         critic_anchor_loss = model.value.loss(val_real_logits, y_real).mean()
         critic_loss = critic_loss + anchor_coef * critic_anchor_loss
 
+    # Real-return (Monte-Carlo) critic grounding (Option #1 / TD-MPC, 2026-06-09).
+    # PURE discounted return-to-go over the REAL buffer segment (actual observed
+    # rewards, NO intermediate value bootstrap), so the critic target is pinned
+    # to realised economics and cannot inflate on its own slow-target fiction the
+    # way the TD-λ anchor above does (its bootstrap term inflates with the value).
+    # Dominates the critic target when paired with a reduced
+    # ``critic_imag_loss_coef``; lifts ``critic_rew_to_tgt_var`` (real reward
+    # variance enters the target) -> economically-grounded advantages -> a
+    # decisive, less-noisy actor.  Default-off (``critic_mc_grounding_coef=0``).
+    mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
+    critic_mc_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
+    if mc_coef > 0.0:
+        rew_mc = batch['rew'].to(device=device, dtype=critic_loss.dtype)
+        cont_mc = batch.get('cont', None)
+        cont_mc = (cont_mc.to(device=device, dtype=critic_loss.dtype)
+                   if cont_mc is not None else torch.ones_like(rew_mc))
+        Treal_mc = agent_hid_real.shape[1]
+        feat_mc = agent_hid_real.reshape(-1, agent_hid_real.shape[-1])
+        val_mc_logits = model.value(feat_mc)            # (B*Treal, nbins) w/ grad
+        with torch.no_grad():
+            ret_mc = torch.zeros((B, Treal_mc), device=device,
+                                 dtype=critic_loss.dtype)
+            if bool(getattr(cfg, 'critic_mc_tail_bootstrap', False)):
+                tv_tail = model.target_value.expectation(
+                    model.target_value(feat_mc)).view(B, Treal_mc)
+                if _ret_cap is not None:
+                    tv_tail = tv_tail.clamp(-_ret_cap, _ret_cap)
+                ret_mc[:, -1] = tv_tail[:, -1]
+            else:
+                ret_mc[:, -1] = rew_mc[:, -1]
+            for t in reversed(range(Treal_mc - 1)):
+                ret_mc[:, t] = (rew_mc[:, t]
+                                + gamma * cont_mc[:, t] * ret_mc[:, t + 1])
+            y_mc = ret_mc.reshape(-1).detach()
+            if _ret_cap is not None:
+                y_mc = y_mc.clamp(-_ret_cap, _ret_cap)
+        critic_mc_loss = model.value.loss(val_mc_logits, y_mc).mean()
+        critic_loss = critic_loss + mc_coef * critic_mc_loss
+
     # Advantage → actor loss.
     with torch.no_grad():
         baseline = model.value.expectation(
@@ -3697,6 +3765,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
         'critic_imag_loss': critic_imag_loss.detach(),
+        'critic_mc_loss': critic_mc_loss.detach(),
         'imagined_return_mean': target_returns.mean().detach(),
         'imagined_reward_mean': rewards.mean().detach(),
         'imagined_reward_std': rewards.std().detach(),
@@ -3927,6 +3996,40 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         critic_anchor_loss = model.value.loss(val_real_logits, y_real).mean()
         critic_loss = critic_loss + anchor_coef * critic_anchor_loss
 
+    # Real-return (Monte-Carlo) critic grounding (Option #1 / TD-MPC, 2026-06-09).
+    # PURE discounted return-to-go over the REAL buffer segment (NO intermediate
+    # value bootstrap) — same as the RSSM path; pins the critic to realised
+    # economics so it cannot inflate on its own slow-target fiction.
+    mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
+    critic_mc_loss = torch.zeros((), device=device, dtype=critic_loss.dtype)
+    if mc_coef > 0.0:
+        rew_mc = batch['rew'].to(device=device, dtype=critic_loss.dtype)
+        cont_mc = batch.get('cont', None)
+        cont_mc = (cont_mc.to(device=device, dtype=critic_loss.dtype)
+                   if cont_mc is not None else torch.ones_like(rew_mc))
+        Treal_mc = agent_hid_real.shape[1]
+        feat_mc = agent_hid_real.reshape(-1, agent_hid_real.shape[-1])
+        val_mc_logits = model.value(feat_mc)            # (B*Treal, nbins) w/ grad
+        with torch.no_grad():
+            ret_mc = torch.zeros((B, Treal_mc), device=device,
+                                 dtype=critic_loss.dtype)
+            if bool(getattr(cfg, 'critic_mc_tail_bootstrap', False)):
+                tv_tail = model.target_value.expectation(
+                    model.target_value(feat_mc)).view(B, Treal_mc)
+                if _ret_cap is not None:
+                    tv_tail = tv_tail.clamp(-_ret_cap, _ret_cap)
+                ret_mc[:, -1] = tv_tail[:, -1]
+            else:
+                ret_mc[:, -1] = rew_mc[:, -1]
+            for t in reversed(range(Treal_mc - 1)):
+                ret_mc[:, t] = (rew_mc[:, t]
+                                + gamma * cont_mc[:, t] * ret_mc[:, t + 1])
+            y_mc = ret_mc.reshape(-1).detach()
+            if _ret_cap is not None:
+                y_mc = y_mc.clamp(-_ret_cap, _ret_cap)
+        critic_mc_loss = model.value.loss(val_mc_logits, y_mc).mean()
+        critic_loss = critic_loss + mc_coef * critic_mc_loss
+
     # Advantage (current critic baseline) → PMPO (eq. 11).
     # Paper-faithful: A_t = R_t - V(s_t), then divide by EMA return scale
     # (model.update_return_scale).  Per-trajectory mean centering was
@@ -4032,6 +4135,7 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
         'critic_imag_loss': critic_imag_loss.detach(),
+        'critic_mc_loss': critic_mc_loss.detach(),
         'imagined_return_mean': target_returns.mean().detach(),        'imagined_reward_mean': rewards.mean().detach(),
         'imagined_reward_std': rewards.std().detach(),
         'entropy_mean': entropies.mean().detach(),

@@ -323,6 +323,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Both None (unset) ⇒ exact legacy behaviour.  Sim-agnostic.
     'DREAMER_CRITIC_ANCHOR_LAMBDA':       ('critic_anchor_lambda',           _as_opt_float),
     'DREAMER_CRITIC_ANCHOR_COEF_LONG':    ('critic_anchor_coef_long',        _as_opt_float),
+    # Real-return (Monte-Carlo) critic grounding (Option #1 / TD-MPC, 2026-06-09):
+    # a PURE discounted return-to-go over the real buffer (no value bootstrap)
+    # added to the critic target so it is pinned to realised economics.  Pair
+    # the coef with a reduced DREAMER_CRITIC_IMAG_LOSS_COEF so the MC target
+    # dominates.  Coef 0 (default) = off; _TAIL_BOOTSTRAP adds a single γ^N tail.
+    'DREAMER_CRITIC_MC_GROUNDING_COEF':   ('critic_mc_grounding_coef',       float),
+    'DREAMER_CRITIC_MC_TAIL_BOOTSTRAP':   ('critic_mc_tail_bootstrap',       _as_bool),
     'DREAMER_MV_HARD_CLAMP':              ('mv_hard_clamp',                  _as_bool),
     'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
     'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),
