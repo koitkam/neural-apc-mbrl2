@@ -2075,6 +2075,45 @@ def run_validation(*,
         except Exception as e:
             print(f'[val] WM transfer matrix skipped: {e!r}', flush=True)
 
+    # ---- WM posterior-vs-prior gain-lag decomposition --------------------
+    # Localises WHERE the WM loses the steady-state gain (autoencoder vs the
+    # prior<->posterior gap vs open-loop compounding) so the right lever is
+    # obvious from the saved artefact alone — no manual probe re-run.  Gated
+    # ON by default (RSSM/TSSM only); skip with DREAMER_VAL_WM_POSTPRIOR=0.
+    # Reuses a fresh disturbance-free env; guarded so it never breaks a run.
+    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+        try:
+            from tools.wm_posterior_prior_probe import compute_posterior_prior_decomp
+            pp_env = APCEnv(cfg, np.random.default_rng(43_210))
+            pp_env._disturbance_prob_override = 0.0
+            if obs_norm_state is not None:
+                try:
+                    pp_env.set_obs_norm_stats(
+                        mean=np.asarray(obs_norm_state.get('mean')),
+                        var=np.asarray(obs_norm_state.get('var')),
+                        count=float(obs_norm_state.get('count', 1.0)),
+                        learn=False)
+                except Exception:
+                    pass
+            _tf_h = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
+            _pp_h = _tf_h if _tf_h > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            pp_res = compute_posterior_prior_decomp(
+                model, pp_env, cfg, device, horizon=_pp_h, settle=_pp_h)
+            with open(out_dir / 'wm_posterior_prior_decomp.json', 'w') as f:
+                json.dump(pp_res, f, indent=2)
+            if pp_res.get('enabled'):
+                print(f'[val] WM posterior/prior gain decomp: '
+                      f'real->post x{pp_res["decomp_real_to_posterior"]:.3f}, '
+                      f'post->1step x{pp_res["decomp_posterior_to_1step"]:.3f}, '
+                      f'1step->openloop x{pp_res["decomp_1step_to_openloop"]:.3f} '
+                      f'| lever={pp_res["dominant_lever"]} -> '
+                      f'{out_dir}/wm_posterior_prior_decomp.json', flush=True)
+            else:
+                print(f'[val] WM posterior/prior decomp: not applicable '
+                      f'({pp_res.get("reason")})', flush=True)
+        except Exception as _ppe:
+            print(f'[val] WM posterior/prior decomp skipped: {_ppe!r}', flush=True)
+
     cum = np.array([m['cum_raw_reward'] for m in metrics_records])
     cv_v = np.array([m['mean_cv_violation'] for m in metrics_records])
     mv_v = np.array([m['mean_mv_violation'] for m in metrics_records])
@@ -2096,6 +2135,7 @@ def run_validation(*,
         'mean_cv_violation_mean': float(cv_v.mean()),
         'mean_mv_violation_mean': float(mv_v.mean()),
         'fidelity_gates': locals().get('fidelity_gates', None),
+        'wm_posterior_prior_decomp': locals().get('pp_res', None),
         'episodes': metrics_records,
         'disturbance_rejection': disturbance_records,
     }

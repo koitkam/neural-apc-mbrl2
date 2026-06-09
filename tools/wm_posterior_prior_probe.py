@@ -98,28 +98,24 @@ def _teacher_forced_post_prior(model, lookback_obs, lookback_act,
     return post_dec, prior_dec, kl
 
 
-def probe(run_dir: Path, ckpt_name: str, levels=(0.0, 0.3, -0.3),
-          step_frac=0.4, horizon=220, settle=220):
-    device, _ = _pick_device()
-    ckpt = _find_ckpt(run_dir, ckpt_name)
-    model, cfg, on = _load_model(ckpt, device)
-    model.eval()
+def compute_posterior_prior_decomp(model, env, cfg, device, *,
+                                   obs_std=None, levels=(0.0, 0.3, -0.3),
+                                   step_frac=0.4, horizon=220, settle=220):
+    """Reusable core: decompose the WM CV step-response gain into
+    real->posterior->prior-1step->open-loop on the given (already-built) model
+    + env.  Returns a JSON-able dict (or ``{'enabled': False, ...}`` when the
+    backbone isn't RSSM/TSSM or no usable step responses exist).
+
+    Used both by the CLI ``probe()`` and by ``evaluation.validate`` so every
+    run saves the localisation (autoencoder vs free_bits vs compounding).
+    """
     if not _is_rssm_model(model):
-        print('[probe] requires an RSSM/TSSM checkpoint (needs obs_step/decode).')
-        return
-    from training.train import APCEnv
-    env = APCEnv(cfg, np.random.default_rng(20260609))
-    if on is not None and on.get('var') is not None:
-        var = np.asarray(on.get('var'), 'float32')
-        env.set_obs_norm_stats(mean=np.asarray(on.get('mean')), var=var,
-                               count=float(on.get('count', 1.0)), learn=False)
+        return {'enabled': False, 'reason': 'not an RSSM/TSSM model'}
     free_bits = float(getattr(cfg, 'rssm_free_bits', 1.0))
     cv_idx = int(env.cv_indices[0])
     L = min(int(getattr(cfg, 'lookback', 64)), settle)
     n_mv = int(env.action_dim)
-
-    rows = []
-    kl_all = []
+    rows, kl_all = [], []
     for lev in levels:
         for d in (+abs(step_frac), -abs(step_frac)):
             base = np.zeros(n_mv, dtype='float32'); base[0] = float(lev)
@@ -135,47 +131,88 @@ def probe(run_dir: Path, ckpt_name: str, levels=(0.0, 0.3, -0.3),
             g_real = _cv_gain(real_obs[:, cv_idx], b)
             if abs(g_real) < 1e-6:
                 continue
-            g_post = _cv_gain(post_dec[:, cv_idx], b)
-            g_prior = _cv_gain(prior_dec[:, cv_idx], b)
-            g_ol = _cv_gain(ol[:, cv_idx], b)
-            rows.append((g_real, g_post, g_prior, g_ol))
+            rows.append((g_real, _cv_gain(post_dec[:, cv_idx], b),
+                         _cv_gain(prior_dec[:, cv_idx], b),
+                         _cv_gain(ol[:, cv_idx], b)))
             kl_all.append(float(kl.mean()))
-
     if not rows:
-        print('[probe] no usable step responses (gain ~0).')
-        return
-    arr = np.asarray(rows)  # (N, 4): real, post, prior1, openloop
+        return {'enabled': False, 'reason': 'no usable step responses (gain ~0)'}
+    arr = np.asarray(rows)
     gr, gp, gpr, gol = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+
     def _ratio(num, den):
         return float(np.mean(num / den))
+    r_post = _ratio(gp, gr)
+    r_prior_step = _ratio(gpr, gp)
+    r_compound = _ratio(gol, gpr)
+    if r_post < 0.9:
+        verdict = ('POSTERIOR already loses the gain -> bottleneck is '
+                   'encoder/decoder/latent (or data); free_bits will NOT help.')
+        lever = 'autoencoder'
+    elif r_prior_step < 0.9:
+        verdict = ('posterior faithful but PRIOR lags it -> free_bits / '
+                   'rssm_kl_dyn_w is the right lever.')
+        lever = 'free_bits'
+    else:
+        verdict = ('posterior + 1-step prior faithful; loss is in COMPOUNDING '
+                   '-> contraction/horizon (overshoot/held-rollout), not free_bits.')
+        lever = 'compounding'
     kl_mean = float(np.mean(kl_all))
+    return {
+        'enabled': True,
+        'n_steps': len(rows),
+        'horizon': int(horizon),
+        'free_bits_floor': free_bits,
+        'kl_post_prior_mean': kl_mean,
+        'kl_pinned_at_floor': bool(abs(kl_mean - free_bits) < 0.08),
+        'gain_ratio_posterior_vs_real': r_post,
+        'gain_ratio_prior1step_vs_real': _ratio(gpr, gr),
+        'gain_ratio_openloop_vs_real': _ratio(gol, gr),
+        'decomp_real_to_posterior': r_post,
+        'decomp_posterior_to_1step': r_prior_step,
+        'decomp_1step_to_openloop': r_compound,
+        'dominant_lever': lever,
+        'verdict': verdict,
+    }
 
+
+def probe(run_dir: Path, ckpt_name: str, levels=(0.0, 0.3, -0.3),
+          step_frac=0.4, horizon=220, settle=220):
+    device, _ = _pick_device()
+    ckpt = _find_ckpt(run_dir, ckpt_name)
+    model, cfg, on = _load_model(ckpt, device)
+    model.eval()
+    if not _is_rssm_model(model):
+        print('[probe] requires an RSSM/TSSM checkpoint (needs obs_step/decode).')
+        return
+    from training.train import APCEnv
+    env = APCEnv(cfg, np.random.default_rng(20260609))
+    if on is not None and on.get('var') is not None:
+        var = np.asarray(on.get('var'), 'float32')
+        env.set_obs_norm_stats(mean=np.asarray(on.get('mean')), var=var,
+                               count=float(on.get('count', 1.0)), learn=False)
+    res = compute_posterior_prior_decomp(
+        model, env, cfg, device, levels=levels, step_frac=step_frac,
+        horizon=horizon, settle=settle)
+    if not res.get('enabled'):
+        print(f'[probe] {res.get("reason")}')
+        return
     print(f'\n=== WM posterior-vs-prior lag probe: {run_dir.name} ({ckpt_name}) ===')
-    print(f'  free_bits floor = {free_bits:.3f} nats/step | '
-          f'observed KL(post||prior) on step-test = {kl_mean:.3f} nats/step '
-          f'({"PINNED at floor" if abs(kl_mean - free_bits) < 0.08 else "above floor"})')
-    print(f'  CV step-response gain ratios vs REAL (n={len(rows)} steps):')
-    print(f'    posterior recon (0-step)   : {_ratio(gp, gr):.3f}   '
+    print(f'  free_bits floor = {res["free_bits_floor"]:.3f} nats/step | '
+          f'observed KL(post||prior) on step-test = {res["kl_post_prior_mean"]:.3f} '
+          f'nats/step ({"PINNED at floor" if res["kl_pinned_at_floor"] else "above floor"})')
+    print(f'  CV step-response gain ratios vs REAL (n={res["n_steps"]} steps):')
+    print(f'    posterior recon (0-step)   : {res["gain_ratio_posterior_vs_real"]:.3f}   '
           f'<- encoder/decoder/latent capacity (free_bits CANNOT help if <~0.9)')
-    print(f'    prior 1-step prediction    : {_ratio(gpr, gr):.3f}   '
+    print(f'    prior 1-step prediction    : {res["gain_ratio_prior1step_vs_real"]:.3f}   '
           f'<- prior vs posterior (free_bits territory)')
-    print(f'    prior open-loop (N-step)   : {_ratio(gol, gr):.3f}   '
+    print(f'    prior open-loop (N-step)   : {res["gain_ratio_openloop_vs_real"]:.3f}   '
           f'<- compounding/contraction over horizon')
     print('  Decomposition (where the gain is lost, multiplicative):')
-    print(f'    real -> posterior   : x{_ratio(gp, gr):.3f}  (autoencoder)')
-    print(f'    posterior -> 1-step : x{_ratio(gpr, gp):.3f}  (prior latent gap = free_bits)')
-    print(f'    1-step -> open-loop : x{_ratio(gol, gpr):.3f}  (compounding)')
-    # Verdict
-    r_post = _ratio(gp, gr)
-    if r_post < 0.9:
-        print('  VERDICT: the POSTERIOR already loses the gain -> bottleneck is '
-              'encoder/decoder/latent (or data). free_bits will NOT fix it.')
-    elif _ratio(gpr, gp) < 0.9:
-        print('  VERDICT: posterior is faithful but the PRIOR lags it -> '
-              'free_bits (tighter prior->posterior KL) is the right lever.')
-    else:
-        print('  VERDICT: posterior + 1-step prior are faithful; the loss is in '
-              'COMPOUNDING -> contraction/horizon issue, not free_bits.')
+    print(f'    real -> posterior   : x{res["decomp_real_to_posterior"]:.3f}  (autoencoder)')
+    print(f'    posterior -> 1-step : x{res["decomp_posterior_to_1step"]:.3f}  (prior latent gap = free_bits)')
+    print(f'    1-step -> open-loop : x{res["decomp_1step_to_openloop"]:.3f}  (compounding)')
+    print(f'  VERDICT [{res["dominant_lever"]}]: {res["verdict"]}')
 
 
 def main() -> int:

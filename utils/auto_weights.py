@@ -419,6 +419,22 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     mv_over_cv_ratio = max(1.0, _env_float('OBJ_AUTO_MV_OVER_CV_RATIO', 2.0))
     tolerance = max(1e-4, _env_float('OBJ_AUTO_VIOLATION_TOLERANCE', 0.02))
     margin = max(0.0, _env_float('OBJ_AUTO_VIOLATION_MARGIN', 2.0))
+    # CV-violation vs economics ratio (2026-06-09).  Sizes the INSTANTANEOUS
+    # CV bound-violation penalty relative to the economic budget.  Default ==
+    # ``margin`` so the historical hierarchy (CV strictly dominates economics)
+    # is byte-identical.  Set BELOW ``margin`` to make the controller
+    # economics-LED: economics can win at the CV limit, so the actor rides /
+    # briefly crosses the CV bound for profit ("I am OK with more CV
+    # violations").  When softened this way:
+    #   * the INTEGRAL (accumulated-dwell) term auto-strengthens by
+    #     ``margin / ratio`` (see ``objective_runtime.resolve_integral_config``)
+    #     so SUSTAINED violation is still punished -> the actor returns to band;
+    #   * MV-limit strictness is UNCHANGED — ``mv_base`` is anchored to the HARD
+    #     CV reference (``cv_base_hard``), never the softened one, so MV
+    #     violations remain strictly dominated regardless of this knob.
+    # The user sets ONLY the economic weights; this ratio + the integral
+    # compensation auto-derive the rest.
+    cv_over_econ_ratio = max(1e-3, _env_float('OBJ_AUTO_CV_OVER_ECON_RATIO', margin))
     econ_over_target_ratio = max(1.0, _env_float('OBJ_AUTO_ECON_OVER_TARGET_RATIO', 2.0))
     target_base_floor = _env_float('OBJ_AUTO_TARGET_BASE', 0.5)
     # Reward clip used to size the violation cap. Quadratic formulation
@@ -561,8 +577,15 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     tail_factor = max(tail_factor, 1e-6)  # avoid div-by-zero for crazy N
 
     cv_base_adaptive = 0.0
+    cv_base_hard = 0.0
     if priority_budget > 0.0:
-        cv_base_adaptive = (margin * priority_budget) / (
+        # SOFT (actual) CV-violation base: sized by ``cv_over_econ_ratio``.
+        cv_base_adaptive = (cv_over_econ_ratio * priority_budget) / (
+            tolerance * tolerance * tail_factor
+        )
+        # HARD CV reference: always uses the default ``margin`` so MV-limit
+        # sizing is INDEPENDENT of the CV-softness knob.
+        cv_base_hard = (margin * priority_budget) / (
             tolerance * tolerance * tail_factor
         )
     cv_base_raw = float(max(cv_base_floor_quadratic, cv_base_adaptive))
@@ -573,7 +596,13 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     cv_base_above_advisory = bool(cv_base > cv_base_advisory + 1e-9)
     cv_base_capped = False  # legacy field, retained for diagnostics
     # Enforce priority #1: MV limits dominate CV limits by construction.
-    mv_base = float(max(mv_base_floor_quadratic, mv_over_cv_ratio * cv_base))
+    # MV is anchored to the HARD CV reference (>= the soft cv_base) so
+    # softening CV via ``cv_over_econ_ratio`` NEVER softens MV — MV-limit
+    # violations stay strictly dominated regardless of the economic-led knob.
+    cv_base_mv_anchor = float(max(cv_base_floor_quadratic,
+                                  cv_base_hard, cv_base_adaptive))
+    mv_base = float(max(mv_base_floor_quadratic,
+                        mv_over_cv_ratio * cv_base_mv_anchor))
 
     # --- Adaptive reward-shape clip (P77) -------------------------------
     # Size the penalty/reward saturation clip from the largest active
@@ -733,6 +762,9 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         'cv_violation_base_floor_quadratic': cv_base_floor_quadratic,
         'mv_violation_base_adaptive': float(mv_over_cv_ratio * cv_base),
         'cv_violation_base_adaptive': float(cv_base_adaptive),
+        'cv_violation_base_hard': float(cv_base_hard),
+        'cv_over_econ_ratio': float(cv_over_econ_ratio),
+        'cv_econ_led': bool(cv_over_econ_ratio < margin - 1e-9),
         'cv_violation_base_raw': float(cv_base_raw),
         'cv_violation_base_advisory': float(cv_base_advisory),
         'cv_violation_base_above_advisory': bool(cv_base_above_advisory),

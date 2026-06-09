@@ -219,6 +219,29 @@ def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
     # "park just outside the bound" attractor. Opt out by setting the coef
     # to 0 (env ``OBJECTIVE_INTEGRAL_COEF`` or spec ``integral_coef``).
     coef = float(_safe_float(_r('OBJECTIVE_INTEGRAL_COEF', 'integral_coef', 0.05), 0.05))
+    # Economic-led CV compensation (2026-06-09): when the INSTANTANEOUS CV
+    # bound-violation penalty is softened relative to economics (``OBJ_AUTO_CV_
+    # OVER_ECON_RATIO`` set BELOW ``OBJ_AUTO_VIOLATION_MARGIN`` in auto_weights),
+    # auto-strengthen the integral (accumulated-dwell) term by the same factor
+    # so SUSTAINED violation stays costly and the actor still returns to band —
+    # the integral becomes the dominant return-to-limit force while economics
+    # is free to win the instantaneous trade-off.  No effect at the default
+    # (ratio == margin -> factor 1.0).  Bounded by ``OBJ_AUTO_INTEGRAL_SOFT_
+    # COMPENSATE_MAX`` (default 10x) for safety; disable with
+    # ``OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE=0``.
+    try:
+        if str(os.environ.get('OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE', '1')).strip() \
+                not in ('0', 'false', 'False', 'no', 'off'):
+            _margin = float(os.environ.get('OBJ_AUTO_VIOLATION_MARGIN', '2.0'))
+            _cv_ratio = float(os.environ.get('OBJ_AUTO_CV_OVER_ECON_RATIO',
+                                             str(_margin)))
+            if _cv_ratio > 1e-6 and _margin > _cv_ratio:
+                _boost_max = float(os.environ.get(
+                    'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX', '10.0'))
+                coef *= float(min(max(1.0, _margin / _cv_ratio),
+                                  max(1.0, _boost_max)))
+    except Exception:
+        pass
     windup = float(_safe_float(_r('OBJECTIVE_INTEGRAL_WINDUP', 'integral_windup', 5.0), 5.0))
     if windup <= 0.0:
         windup = 5.0
