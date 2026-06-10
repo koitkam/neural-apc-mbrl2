@@ -224,6 +224,19 @@ class TrainConfig:
     # with reconstruction loss" in spirit (we deviate only in using a
     # thin linear projection without VQ for low-D vector obs).
     recon_scale: float = 0.1
+    # ---- (WM autoencoder lever, 2026-06-09) per-channel CV recon weight ----
+    # The posterior-prior probe identified the WM's residual gain bias as
+    # dominated by the AUTOENCODER (real→posterior ~0.85), NOT the prior/
+    # free-bits.  The uniform recon MSE drowns the small CV step-gain under the
+    # high-variance MV/DV channels, so the decoder under-fits the very channel
+    # whose gain the controller needs.  When ``!= 1.0`` the CV obs channels'
+    # recon error is scaled by this factor (others stay at 1.0), forcing the
+    # autoencoder to reproduce the CV response faithfully.  Applied in BOTH
+    # backbones (RSSM decode-MSE + SF tokenizer recon) so the fix transfers to
+    # TSSM.  ``1.0`` = uniform = paper / p106-baseline behaviour (identity).
+    # Resolved CV obs indices live in ``cv_obs_indices`` (set at runtime).
+    wm_recon_cv_weight: float = 1.0
+    cv_obs_indices: Tuple[int, ...] = ()
     sf_scale: float = 1.0
     # P2+P3 reward-MTP loss weight (Dreamer-V4 paper Eq. 9).  Lowered
     # 1.0 → 0.3 on 2026-05-23 (P43 RCA, run_20260523_p43_data_fixed):
@@ -773,6 +786,18 @@ class TrainConfig:
     # bc_p3/pg grad ratio shows the anchor being drowned as return_scale
     # grows (then bc_weight_eff = w * advantage_clip / max(return_scale,1)).
     expert_bc_p3_adaptive_scale: bool = False
+    # ---- (BC learning-vs-crutch tracking, 2026-06-09) ----
+    # Diagnostic: is the actor LEARNING beyond the expert, or just being held
+    # at the expert by the permanent BC floor (expert_bc_p3_floor)?  When
+    # ``> 0`` and an expert is active, every ``bc_track_expert_every`` det-eval
+    # cadences roll ONE deterministic expert episode under the SAME eval
+    # protocol and log ``expert_det_return`` + ``agent_minus_expert_return``
+    # to train_log.jsonl.  A persistently ~0 gap = crutch (actor cloning the
+    # expert); a positive, growing gap = the actor is genuinely surpassing the
+    # expert via the real-reward/MC-critic objective.  ``0`` = OFF (no extra
+    # eval cost = p106-baseline behaviour).  To remove the floor confound for a
+    # clean learning test, ALSO set DREAMER_EXPERT_BC_P3_FLOOR=0 (full release).
+    bc_track_expert_every: int = 0
 
     # ----- (a) adaptive bounded-return envelope (WM-drift mitigation) -----
     # With per-step reward bounded to [-B, B] (P77 linear remap), the λ-return
@@ -848,6 +873,19 @@ class TrainConfig:
     # fixed point cannot re-drift.  Default OFF (paper co-trains the WM
     # throughout); opt-in via DREAMER_WM_FREEZE_AFTER_P1=1.
     wm_freeze_after_p1: bool = False
+    # ---- (WM freeze-after-PRETRAIN, 2026-06-09) joint-mode WM freeze ----
+    # ``wm_freeze_after_p1`` only fires at the phased P1→P2 boundary, which
+    # NEVER happens in JOINT mode (``_phase_for`` always returns 3).  This
+    # knob freezes the WM CORE (dynamics + tokenizer for SF) ONCE the WM has
+    # been pretrained for ``wm_freeze_after_iters`` joint iters — the held-
+    # action fixed point + gain converge mid-pretrain then re-drift under
+    # continued co-training (P90), and a controller trained on a moving WM
+    # never sees the WM its diagnostics use.  After the freeze the reward
+    # head, actor (BC) and critic keep training on a STATIC, converged WM.
+    # ``0`` = OFF (co-train WM the whole run = paper / p106-baseline).  Pick a
+    # value past the WM-gain plateau (watch wm_gain_rel_err in validation).
+    # Backbone-agnostic (handles the SF tokenizer); transfers to TSSM.
+    wm_freeze_after_iters: int = 0
 
     # ---- #2 (P88, 2026-06-05): multi-step latent overshooting ----
     # Dreamer-v3 trains the prior ONLY one step ahead (the KL term), so the
@@ -985,6 +1023,21 @@ class TrainConfig:
     # continuously present.  Default 0 = OFF (opt-in via
     # ``DREAMER_EXCITATION_REINJECT_EVERY``).
     excitation_reinject_every_iters: int = 0
+    # ----- WM-loss-only open-loop excitation PARTITION (2026-06-09) -----
+    # ``excitation_reinject_every_iters`` (above) was PROVEN HARMFUL (p105):
+    # appending open-loop excitation to the SHARED buffer also feeds the
+    # actor/critic imagination OFF-DISTRIBUTION start-states (the critic must
+    # start imagination from on-policy states, not step-test transients).
+    # This knob instead keeps the gain-rich seed excitation (PRBS + const/step
+    # + step-test) in a SEPARATE persistent buffer that the actor/critic NEVER
+    # sample — only the WM-update step draws from it.  When ``> 0``, each
+    # joint/P3 WM-update step draws its batch from the excitation buffer with
+    # this probability (else from the on-policy buffer); the actor/critic
+    # imagination ALWAYS uses the on-policy buffer.  The excitation buffer is
+    # never FIFO-evicted by closed-loop data, so the WM's open-loop gain stays
+    # supervised for the whole run.  ``0.0`` = OFF (p106-baseline).  WM-only =
+    # backbone-agnostic (transfers to TSSM).
+    wm_excitation_buffer_frac: float = 0.0
     # Reduce inner train steps in P3 so more iters happen per fixed
     # env-step budget — Optuna's pruner gets more samples and we get
     # finer-grained logs of actor / entropy progression.
@@ -3132,6 +3185,36 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     return loss, float(S)
 
 
+def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
+                        cfg: TrainConfig) -> torch.Tensor:
+    """Reconstruction MSE with optional CV-channel up-weighting.
+
+    WM autoencoder lever (2026-06-09): the uniform per-channel MSE lets the
+    small CV step-gain be drowned by the high-variance MV/DV channels, so the
+    decoder under-fits the very channel whose gain the controller needs (the
+    posterior-prior probe's dominant residual-bias lever, real→posterior~0.85).
+    When ``cfg.wm_recon_cv_weight != 1.0`` the CV obs channels' squared error
+    is scaled by that factor (others stay 1.0), then the weight vector is
+    renormalised to mean 1.0 so the OVERALL recon magnitude is preserved
+    (``recon_scale`` need not be retuned) — only the WITHIN-recon emphasis
+    shifts toward the CV.  ``cv_weight == 1.0`` or no CV indices ⇒ byte-for-byte
+    ``F.mse_loss`` (identity = p106-baseline).  Backbone-agnostic.
+    """
+    cv_w = float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0)
+    cv_idx = tuple(getattr(cfg, 'cv_obs_indices', ()) or ())
+    if cv_w == 1.0 or not cv_idx:
+        return F.mse_loss(recon, target)
+    D = int(target.shape[-1])
+    valid = [int(i) for i in cv_idx if 0 <= int(i) < D]
+    if not valid:
+        return F.mse_loss(recon, target)
+    w = torch.ones(D, device=target.device, dtype=torch.float32)
+    w[torch.tensor(valid, device=target.device, dtype=torch.long)] = cv_w
+    w = w * (float(w.numel()) / w.sum().clamp_min(1e-8))  # renorm: mean→1.0
+    se = (recon.float() - target.float()).pow(2)           # (..., D)
+    return (se * w).mean()
+
+
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                             act: torch.Tensor, cfg: TrainConfig,
                             dist_target: Optional[torch.Tensor] = None,
@@ -3151,7 +3234,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     feats, post_logits, prior_logits, _last = rssm.rollout_observed(
         obs_cur, act, sample=True)               # feats (B,T,F)
     recon = rssm.decode(feats)                    # (B, T, obs_dim)
-    recon_loss = F.mse_loss(recon, obs_cur)
+    recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
     kl_loss, kl_diag = rssm_kl_loss(
         post_logits, prior_logits,
         free_bits=float(getattr(cfg, 'rssm_free_bits', 1.0)),
@@ -3260,6 +3343,12 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Tokenizer with MAE: recon the masked obs.
     z_mae, recon = model.tokenizer.forward_with_mae(obs_cur)
     recon_loss = model.tokenizer.recon_loss(obs_cur, recon)
+    # WM autoencoder lever (2026-06-09): up-weight the CV channels' recon in
+    # symlog space (the SF tokenizer recon_loss is symlog-MSE).  Identity when
+    # wm_recon_cv_weight == 1.0 (default) — keeps the p106 SF path unchanged.
+    if float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0) != 1.0:
+        from models.dreamer_v4 import symlog as _symlog
+        recon_loss = _weighted_recon_mse(_symlog(recon), _symlog(obs_cur), cfg)
 
     # Shortcut forcing target = clean tokenizer output (no MAE).
     z_clean = model.tokenizer.encode(obs_cur)            # (B, T, z_dim)
@@ -5356,6 +5445,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     cfg.disturbance_head_dim = (int(len(env.cv_indices))
                                 if bool(getattr(cfg, 'disturbance_head', True))
                                 else 0)
+    # WM autoencoder lever (2026-06-09): resolve the CV obs indices per-sim so
+    # the per-channel recon weight (cfg.wm_recon_cv_weight) can up-weight the
+    # CV channels' reconstruction.  State channels lead the obs vector, so the
+    # state-space cv_indices are valid OBS-vector indices (same as dv_indices).
+    cfg.cv_obs_indices = tuple(int(i) for i in env.cv_indices)
     # DV-as-input (Option B): resolve the measured-DV obs indices per-simulator.
     # State channels lead the obs vector (obs = [state, aug, derived, integral]),
     # so the state-space ``dv_indices`` are valid OBS-vector indices.  Default ON
@@ -5818,6 +5912,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     if buf.dist is not None:
         buf._dist_source = env
 
+    # WM-loss-only excitation partition (2026-06-09): a SEPARATE persistent
+    # buffer holding ONLY the gain-rich open-loop seed excitation (PRBS +
+    # const/step + step-test).  Never FIFO-evicted by closed-loop data and
+    # NEVER sampled by the actor/critic — only the WM-update step draws from it
+    # (with prob wm_exc_frac).  n_dist=0 so it dodges the single-env
+    # _dist_source double-pop (disturbance head is skipped on these samples).
+    # Allocated only when the partition is on (frac > 0) = p106-baseline off.
+    wm_exc_frac = float(getattr(cfg, 'wm_excitation_buffer_frac', 0.0) or 0.0)
+    wm_exc_buf: Optional[TrajectoryBuffer] = None
+    if wm_exc_frac > 0.0:
+        wm_exc_buf = TrajectoryBuffer(max(1, capacity_eps), cfg.episode_length,
+                                       cfg.obs_dim, cfg.action_dim, n_dist=0)
+        print(f"[wm-exc] WM-only excitation partition ENABLED "
+              f"(frac={wm_exc_frac:.2f}, cap={capacity_eps} eps) — actor/"
+              f"critic never sample it", flush=True)
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / 'train_log.jsonl'
@@ -5852,11 +5961,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     iter_mv_violations: List[float] = []
     iter_raw_returns: List[float] = []
     n_grad_skip = 0
+    n_wm_exc_draws = 0
     current_phase = 1
     t_collect_acc = 0.0
     t_sample_acc = 0.0
     t_wm_acc = 0.0
     t_ac_acc = 0.0
+    # BC learning-vs-crutch tracking (2026-06-09): rolled-expert det-return
+    # baseline + agent-minus-expert gap, refreshed every bc_track_expert_every
+    # det-evals (0 = off).  Stashed here, logged into each train_log row.
+    bc_track_expert_every = int(getattr(cfg, 'bc_track_expert_every', 0) or 0)
+    _expert_eval_count = 0
+    last_expert_det_return: Optional[float] = None
+    last_agent_minus_expert: Optional[float] = None
 
     # ----- Early-stop bookkeeping -----
     es_enable = bool(getattr(cfg, 'early_stop_enable', True))
@@ -6046,7 +6163,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # training in P2/P3) for critic/WM coherence + drift immunity.  cfg flag,
     # env-overridable via DREAMER_WM_FREEZE_AFTER_P1.
     wm_freeze_after_p1 = bool(getattr(cfg, 'wm_freeze_after_p1', False))
-    # P93: critic warmup at P3 start + WM-trunk protection in P2.
+    # WM freeze-after-PRETRAIN (2026-06-09): joint-mode WM-core freeze once the
+    # WM has been pretrained ``wm_freeze_after_iters`` joint iters (the phased
+    # wm_freeze_after_p1 never fires in joint mode).  ``_wm_frozen_now`` is the
+    # one-shot latch so the freeze + banner happen exactly once.
+    wm_freeze_after_iters = int(getattr(cfg, 'wm_freeze_after_iters', 0) or 0)
+    _wm_frozen_now = False
     p3_critic_warmup_iters = int(getattr(cfg, 'p3_critic_warmup_iters', 0) or 0)
     # One-shot guard so the critic-warmup banner logs EXACTLY once.  The print
     # sits inside the inner train-steps loop, which would otherwise repeat it
@@ -6174,6 +6296,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     action_std=baseline_seed_std,
                                     op_band=prbs_op_band)
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+        if wm_exc_buf is not None:
+            wm_exc_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
 
     # Constant-action / step-and-settle seed (run_p31 RCA 2026-05-21
@@ -6225,6 +6349,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                           level=float(lvl),
                                           do_step=bool(do_step_mask[i]))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            if wm_exc_buf is not None:
+                wm_exc_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
+                                        ep['cont'])
             total_env_steps += cfg.episode_length
             if do_step_mask[i]:
                 n_step_emitted += 1
@@ -6264,6 +6391,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                              initial_level=float(lvl),
                                              primary_dv_pos=int(primary))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            if wm_exc_buf is not None:
+                wm_exc_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
+                                        ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] step-test={n_step_test_seed} "
               f"(n_mv={n_mv}, n_dv={n_dv}, per_ch={n_per_ch}, "
@@ -6852,7 +6982,54 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                             '_last_cv_violation_sum', 0.0)))
                 iter_mv_violations.append(float(getattr(env,
                                             '_last_mv_violation_sum', 0.0)))
+                # BC learning-vs-crutch (2026-06-09): periodically roll the
+                # expert under the SAME deterministic protocol (regime-matched,
+                # jitter=0) and log its return + the agent-minus-expert gap.
+                # A persistently ~0 gap = the actor is a crutch (cloning the
+                # expert via the permanent BC floor); a positive, growing gap =
+                # the actor is genuinely surpassing the expert.  Set
+                # DREAMER_EXPERT_BC_P3_FLOOR=0 to remove the floor confound.
+                if (bc_track_expert_every > 0
+                        and bool(getattr(cfg, '_expert_active', False))
+                        and getattr(env, '_apc_expert', None) is not None):
+                    _expert_eval_count += 1
+                    if (_expert_eval_count % bc_track_expert_every) == 0:
+                        try:
+                            _xep = collect_expert_episode(
+                                env, cfg, expert=env._apc_expert,
+                                keep_schedule=True, action_jitter=0.0,
+                                rng=env.rng)
+                            last_expert_det_return = float(_xep['rew'].sum())
+                            last_agent_minus_expert = (
+                                ret_eval - last_expert_det_return)
+                        except Exception as _bce:
+                            print(f"[bc-track] expert eval skipped @iter"
+                                  f"{total_iters}: {_bce!r}", flush=True)
         t_collect_acc += time.time() - _t
+
+        # ----- WM freeze-after-PRETRAIN (joint mode, 2026-06-09) -----
+        # Once the WM has been pretrained ``wm_freeze_after_iters`` joint iters,
+        # freeze its CORE (dynamics + tokenizer for SF) ONCE so the actor/critic
+        # finish training on a STATIC, gain-converged WM (the phased
+        # wm_freeze_after_p1 never fires in joint mode).  Reward head stays
+        # trainable (it is in parameters_world).  Drives the ``_wm_frozen_now``
+        # latch read by the P3 update to drop wm_total from the optimised loss.
+        if (joint_mode and wm_freeze_after_iters > 0 and not _wm_frozen_now
+                and total_iters >= wm_freeze_after_iters):
+            _nfz = 0
+            for _p in model.dynamics.parameters():
+                _p.requires_grad_(False)
+                _nfz += 1
+            if (getattr(model, 'world_model_type', 'sf_transformer') != 'rssm'
+                    and getattr(model, 'tokenizer', None) is not None):
+                for _p in model.tokenizer.parameters():
+                    _p.requires_grad_(False)
+                    _nfz += 1
+            _wm_frozen_now = True
+            print(f"[joint] WM CORE FROZEN at iter {total_iters} "
+                  f"({_nfz} param tensors) after pretrain — reward/actor/"
+                  f"critic keep training on the static WM "
+                  f"(wm_freeze_after_iters={wm_freeze_after_iters})", flush=True)
 
         # ----- Train -----
         wm_grad_norm = torch.tensor(0.0)
@@ -7093,12 +7270,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # via imagination from a possibly different batch.
                 _t = time.time()
                 # ---- (a) WM + reward-head update -----------------
+                # WM-loss-only excitation partition (2026-06-09): draw the
+                # WM-update batch from the persistent open-loop excitation
+                # buffer with prob ``wm_exc_frac`` (else the on-policy batch).
+                # The actor/critic step (b) ALWAYS uses the on-policy ``batch``
+                # so imagination start-states stay in-distribution (the p105
+                # lesson — shared-buffer reinject was harmful).
+                wm_batch = batch
+                if (wm_exc_buf is not None and wm_exc_buf.filled > 0
+                        and wm_exc_frac > 0.0
+                        and float(rng.random()) < wm_exc_frac):
+                    _wb_np = wm_exc_buf.sample(cfg.batch_size, cfg.seq_len, rng)
+                    wm_batch = {}
+                    for _k, _v in _wb_np.items():
+                        _bt = torch.from_numpy(_v)
+                        _bt = (_bt.pin_memory().to(device, non_blocking=True)
+                               if device.type == 'cuda' else _bt.to(device))
+                        wm_batch[_k] = _bt
+                    n_wm_exc_draws += 1
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
-                    wm_losses, _, agent_hid = world_model_loss(model, batch,
+                    wm_losses, _, agent_hid = world_model_loss(model, wm_batch,
                                                                   cfg)
-                    ag_losses = agent_finetune_loss(model, batch,
+                    ag_losses = agent_finetune_loss(model, wm_batch,
                                                       agent_hid, cfg)
                     # Drop BC term in P3 (the actor is now driven by
                     # imagination/PMPO; BC against random-action data
@@ -7107,9 +7302,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # value target depends on.
                     # Use non-detached ``reward_mtp_total`` (see the
                     # P1 comment above for the detach-bug rationale).
-                    p3_total_world = (wm_losses['wm_total']
-                                       + cfg.reward_scale_loss
-                                         * ag_losses['reward_mtp_total'])
+                    if _wm_frozen_now:
+                        # WM core frozen (freeze-after-pretrain): drop wm_total
+                        # (its grads would hit frozen params); only the reward
+                        # head (still trainable) trains via reward-MTP.
+                        p3_total_world = (cfg.reward_scale_loss
+                                          * ag_losses['reward_mtp_total'])
+                    else:
+                        p3_total_world = (wm_losses['wm_total']
+                                           + cfg.reward_scale_loss
+                                             * ag_losses['reward_mtp_total'])
                 opt_world.zero_grad(set_to_none=True)
                 p3_total_world.backward()
                 wm_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -7256,6 +7458,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                             if iter_mv_violations else None),
                 'n_grad_skip': int(n_grad_skip),
                 'buf_fill_pct': float(buf.filled) / max(1, buf.capacity_eps),
+                'n_wm_exc_draws': int(n_wm_exc_draws),
+                'wm_frozen': bool(_wm_frozen_now),
+                'expert_det_return': last_expert_det_return,
+                'agent_minus_expert_return': last_agent_minus_expert,
             }
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
