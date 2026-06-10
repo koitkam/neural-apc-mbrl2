@@ -1534,18 +1534,29 @@ class DreamerV4(nn.Module):
 
     # ------------------------------------------------------- parameter groups
     def parameters_world(self):
-        """World-model + reward head — trained in Phases 1 & 2.
+        """World-model + reward head (+ aux disturbance head) — Phases 1 & 2.
 
         SF-transformer: tokenizer + dynamics + reward head.
         RSSM: dynamics (integrated encoder/decoder/GRU/prior/post) +
         reward head (no separate tokenizer).
+
+        The P87 auxiliary disturbance-estimator head (``self.disturbance``) is
+        supervised inside ``wm_total`` (``_disturbance_head_loss``), so it MUST
+        live in this group or ``opt_world`` never steps it — its gradients
+        would be computed and silently discarded (optimizer-coverage bug fixed
+        2026-06-09).  Included for both backbones; omitted when the head is
+        disabled (``disturbance_head_dim == 0`` ⇒ ``self.disturbance is None``).
         """
         if getattr(self, 'world_model_type', 'sf_transformer') == 'rssm':
-            return (list(self.dynamics.parameters())
-                    + list(self.reward.parameters()))
-        return (list(self.tokenizer.parameters())
-                + list(self.dynamics.parameters())
-                + list(self.reward.parameters()))
+            params = (list(self.dynamics.parameters())
+                      + list(self.reward.parameters()))
+        else:
+            params = (list(self.tokenizer.parameters())
+                      + list(self.dynamics.parameters())
+                      + list(self.reward.parameters()))
+        if getattr(self, 'disturbance', None) is not None:
+            params = params + list(self.disturbance.parameters())
+        return params
 
     def parameters_actor(self):
         """Policy head — trained in Phases 2 (BC) & 3 (PMPO)."""
