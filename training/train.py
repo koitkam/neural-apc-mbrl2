@@ -524,6 +524,25 @@ class TrainConfig:
     # Supervised-loss weight added to the world-model total.
     # ``DREAMER_DISTURBANCE_LOSS_SCALE``.
     disturbance_loss_scale: float = 1.0
+    # Stop-gradient the latent feeding the disturbance head (2026-06-10).
+    # When True (DEFAULT), the head is a pure READ-OUT probe: it trains on the
+    # WM feature but its gradient does NOT flow back into the encoder/dynamics
+    # trunk, so it can never degrade the WM gain/dynamics.  This is the safe
+    # default — it measures how well the latent ALREADY encodes the unmeasured
+    # disturbance (what the validation disturbance-prediction diagnostic reads)
+    # without the head competing with recon/KL for the latent.
+    # RCA (p109, 2026-06-10): the head's optimizer-coverage bug was fixed
+    # (commit 5a31041) so the head finally trained — but at the untuned
+    # ``disturbance_loss_scale=1.0`` its loss term DOMINATED wm_total (10-27x
+    # the recon term) and, while FAILING to predict (loss rising), dragged the
+    # latent toward encoding the disturbance: WM gain rel_err 0.186->0.365,
+    # real->post 0.844->0.783, KL 0.30->0.72, and the actor never sharpened.
+    # Defaulting to stop-grad restores the p106 WM-trunk gradient exactly while
+    # keeping the head trainable.  Set False to OPT IN to latent-SHAPING (the
+    # original P87 feed-forward intent) — but then TUNE ``disturbance_loss_scale``
+    # DOWN (~0.05-0.1) so the auxiliary term does not dominate the WM loss.
+    # ``DREAMER_DISTURBANCE_HEAD_STOP_GRAD``.
+    disturbance_head_stop_grad: bool = True
     # Soft WM-fidelity gate: the disturbance term is scaled by
     # ``min(1, gate_recon / recon_loss)`` so a not-yet-converged world model is
     # not destabilised by the auxiliary target early in P1.  ``<=0`` disables
@@ -3006,7 +3025,15 @@ def _disturbance_head_loss(model: DreamerV4, feat: torch.Tensor,
     dist_head = getattr(model, 'disturbance', None)
     if dist_head is None or dist_target is None or dist_coef <= 0.0:
         return zero, zero, 0.0
-    dpred = dist_head(feat)
+    # Stop-gradient (default ON): the head reads the latent as a pure read-out
+    # probe so its gradient never flows into the encoder/dynamics trunk.  This
+    # is the p109 RCA fix — at scale=1.0 the un-stopped head dominated wm_total
+    # (10-27x recon) and degraded the WM gain.  Set False to opt into the P87
+    # latent-shaping (then tune disturbance_loss_scale down).
+    feat_in = (feat.detach()
+               if bool(getattr(cfg, 'disturbance_head_stop_grad', True))
+               else feat)
+    dpred = dist_head(feat_in)
     if dpred.shape != dist_target.shape:
         return zero, zero, 0.0
     dt = dist_target.to(dpred.dtype)

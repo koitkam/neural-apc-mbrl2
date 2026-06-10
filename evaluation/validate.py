@@ -2114,6 +2114,46 @@ def run_validation(*,
         except Exception as _ppe:
             print(f'[val] WM posterior/prior decomp skipped: {_ppe!r}', flush=True)
 
+    # ----- WM unmeasured-disturbance PREDICTION diagnostic (2026-06-10) -----
+    # How well does the WM disturbance-estimator head (P87 feed-forward model)
+    # predict the TRUE hidden OU disturbance the agent can't see?  Rolls one
+    # forced-disturbance episode, runs the head over the streamed WM posterior,
+    # and scores pred-vs-true per CV channel (NRMSE / r / R² / lead-lag).  Saves
+    # wm_disturbance_prediction.{json,png}.  ON by default (RSSM/TSSM + head);
+    # skip with DREAMER_VAL_WM_DISTPRED=0.
+    if os.environ.get('DREAMER_VAL_WM_DISTPRED', '1').strip() not in ('0', 'false', 'False'):
+        try:
+            from evaluation.wm_disturbance_prediction import (
+                compute_disturbance_prediction, plot_disturbance_prediction)
+            dp_env = APCEnv(cfg, np.random.default_rng(51_234))
+            if obs_norm_state is not None:
+                try:
+                    dp_env.set_obs_norm_stats(
+                        mean=np.asarray(obs_norm_state.get('mean')),
+                        var=np.asarray(obs_norm_state.get('var')),
+                        count=float(obs_norm_state.get('count', 1.0)),
+                        learn=False)
+                except Exception:
+                    pass
+            dp_res = compute_disturbance_prediction(
+                model, dp_env, cfg, device, deterministic=deterministic)
+            with open(out_dir / 'wm_disturbance_prediction.json', 'w') as f:
+                json.dump(dp_res, f, indent=2)
+            if dp_res.get('enabled'):
+                plot_disturbance_prediction(
+                    dp_res, out_dir / 'wm_disturbance_prediction.png')
+                print(f'[val] WM disturbance prediction: '
+                      f'mean NRMSE={dp_res["mean_nrmse"]:.3f} '
+                      f'r={dp_res["mean_pearson_r"]:.3f} '
+                      f'R²={dp_res["mean_r2"]:.3f} '
+                      f'(stop_grad={dp_res["stop_grad"]}) -> '
+                      f'{out_dir}/wm_disturbance_prediction.png', flush=True)
+            else:
+                print(f'[val] WM disturbance prediction: not applicable '
+                      f'({dp_res.get("reason")})', flush=True)
+        except Exception as _dpe:
+            print(f'[val] WM disturbance prediction skipped: {_dpe!r}', flush=True)
+
     cum = np.array([m['cum_raw_reward'] for m in metrics_records])
     cv_v = np.array([m['mean_cv_violation'] for m in metrics_records])
     mv_v = np.array([m['mean_mv_violation'] for m in metrics_records])
@@ -2136,6 +2176,7 @@ def run_validation(*,
         'mean_mv_violation_mean': float(mv_v.mean()),
         'fidelity_gates': locals().get('fidelity_gates', None),
         'wm_posterior_prior_decomp': locals().get('pp_res', None),
+        'wm_disturbance_prediction': locals().get('dp_res', None),
         'episodes': metrics_records,
         'disturbance_rejection': disturbance_records,
     }
