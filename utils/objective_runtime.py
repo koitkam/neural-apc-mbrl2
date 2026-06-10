@@ -238,8 +238,38 @@ def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
             if _cv_ratio > 1e-6 and _margin > _cv_ratio:
                 _boost_max = float(os.environ.get(
                     'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX', '10.0'))
-                coef *= float(min(max(1.0, _margin / _cv_ratio),
-                                  max(1.0, _boost_max)))
+                _boost = float(min(max(1.0, _margin / _cv_ratio),
+                                   max(1.0, _boost_max)))
+                # Dead-time-aware LIMIT-CYCLE damping (2026-06-09, p107 RCA).
+                # Integral action + plant dead time is the classic limit-cycle
+                # generator (p107: soft CV brake parked the CV on the limit ->
+                # the boosted integral + θ=8/τ=53 dead time produced a sustained
+                # cycle).  The phase margin a pure-integral loop loses to dead
+                # time scales with the dead-time fraction f_dt = θ/(θ+τ); to keep
+                # the closed loop away from the oscillation boundary the integral
+                # gain must be REDUCED as f_dt grows.  Damp the soft-compensation
+                # boost by ``(1 - k·f_dt)`` (k = OBJ_AUTO_INTEGRAL_DEADTIME_K,
+                # default 2.0), floored at 1.0 so a boosted integral on a dead-
+                # time plant is never stronger than a fast plant's, and never
+                # below the un-boosted coef.  Sim-agnostic: θ, τ come from the
+                # identified-plant env vars the workflow already exports.  No
+                # effect when there is no dead time (f_dt=0 -> factor 1.0) or the
+                # boost is off.  Disable via OBJ_AUTO_INTEGRAL_DEADTIME_K=0.
+                try:
+                    _k = float(os.environ.get('OBJ_AUTO_INTEGRAL_DEADTIME_K', '2.0'))
+                    if _k > 0.0:
+                        _theta = _safe_float(os.environ.get('IDENTIFIED_DEAD_TIME')
+                                             or os.environ.get('SIM_IDENTIFIED_DEAD_TIME'), 0.0)
+                        _tau = _safe_float(os.environ.get('IDENTIFIED_TAU_DOMINANT')
+                                           or os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT'), 0.0)
+                        if _theta > 0.0 and _tau > 0.0:
+                            _f_dt = _theta / (_theta + _tau)
+                            _damp = max(0.0, min(1.0, 1.0 - _k * _f_dt))
+                            # Damp only the boost ABOVE 1.0, never below 1.0.
+                            _boost = 1.0 + (_boost - 1.0) * _damp
+                except Exception:
+                    pass
+                coef *= _boost
     except Exception:
         pass
     windup = float(_safe_float(_r('OBJECTIVE_INTEGRAL_WINDUP', 'integral_windup', 5.0), 5.0))
