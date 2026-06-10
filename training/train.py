@@ -521,16 +521,16 @@ class TrainConfig:
     # ``head_hidden``.
     disturbance_head_hidden: int = 0
     disturbance_head_layers: int = 2
-    # Supervised-loss weight added to the world-model total.
-    # ``DREAMER_DISTURBANCE_LOSS_SCALE``.
+    # Supervised-loss weight added to the world-model total.  Under stop-grad
+    # (the default) this is the head-only (read-out) weight; it CANNOT affect
+    # the WM trunk, so its magnitude is harmless.  ``DREAMER_DISTURBANCE_LOSS_SCALE``.
     disturbance_loss_scale: float = 1.0
     # Stop-gradient the latent feeding the disturbance head (2026-06-10).
     # When True (DEFAULT), the head is a pure READ-OUT probe: it trains on the
     # WM feature but its gradient does NOT flow back into the encoder/dynamics
-    # trunk, so it can never degrade the WM gain/dynamics.  This is the safe
-    # default — it measures how well the latent ALREADY encodes the unmeasured
-    # disturbance (what the validation disturbance-prediction diagnostic reads)
-    # without the head competing with recon/KL for the latent.
+    # trunk, so it can never degrade the WM gain/dynamics — yet the policy still
+    # sees the disturbance in the shared latent (feed-forward rejection still
+    # works; the validation disturbance-prediction diagnostic measures how well).
     # RCA (p109, 2026-06-10): the head's optimizer-coverage bug was fixed
     # (commit 5a31041) so the head finally trained — but at the untuned
     # ``disturbance_loss_scale=1.0`` its loss term DOMINATED wm_total (10-27x
@@ -539,14 +539,27 @@ class TrainConfig:
     # real->post 0.844->0.783, KL 0.30->0.72, and the actor never sharpened.
     # Defaulting to stop-grad restores the p106 WM-trunk gradient exactly while
     # keeping the head trainable.  Set False to OPT IN to latent-SHAPING (the
-    # original P87 feed-forward intent) — but then TUNE ``disturbance_loss_scale``
-    # DOWN (~0.05-0.1) so the auxiliary term does not dominate the WM loss.
+    # original P87 feed-forward intent) — and when you do, the shaping gradient
+    # is bounded ADAPTIVELY by ``disturbance_loss_rel_weight`` below (NOT the raw
+    # ``disturbance_loss_scale``), so it stays sim-agnostic and trunk-safe.
     # ``DREAMER_DISTURBANCE_HEAD_STOP_GRAD``.
     disturbance_head_stop_grad: bool = True
-    # Soft WM-fidelity gate: the disturbance term is scaled by
-    # ``min(1, gate_recon / recon_loss)`` so a not-yet-converged world model is
-    # not destabilised by the auxiliary target early in P1.  ``<=0`` disables
-    # the gate (weight always full).
+    # Adaptive SIM-AGNOSTIC shaping weight — used ONLY when stop_grad is False
+    # (latent-shaping / active feed-forward).  Each step the disturbance term is
+    # set to ``rel`` x the RECON term (via a detached loss-magnitude ratio), so
+    # the feed-forward gradient is a fixed fraction of the gain-carrying recon
+    # gradient REGARDLESS of the simulator's disturbance scale or obs variance
+    # (the absolute magnitudes cancel).  This is the p109 RCA fix: it makes
+    # shaping structurally unable to swamp recon (the failure mode was a 27x
+    # ratio).  ``< 1.0`` keeps recon dominant; default 0.3 = a gentle nudge.
+    # ``0`` falls back to the legacy absolute (NON-sim-agnostic) path.  The
+    # absolute ``disturbance_loss_scale`` acts as a hard ceiling on the adaptive
+    # coefficient.  ``DREAMER_DISTURBANCE_LOSS_REL_WEIGHT``.
+    disturbance_loss_rel_weight: float = 0.3
+    # Soft WM-fidelity gate (legacy absolute path only): the disturbance term is
+    # scaled by ``min(1, gate_recon / recon_loss)`` so a not-yet-converged world
+    # model is not destabilised by the auxiliary target early in P1.  ``<=0``
+    # disables the gate.  Ignored under stop-grad and under the adaptive path.
     disturbance_loss_gate_recon: float = 1.0
 
     # ---- World-model backbone (P68, 2026-05-30) ----
@@ -3017,33 +3030,56 @@ def _disturbance_head_loss(model: DreamerV4, feat: torch.Tensor,
     ``feat`` (RSSM posterior ``[h, z]`` or the transformer agent-register
     hidden state).  Returns ``(weighted_term, loss_detached, rmse)`` where
     ``weighted_term`` is what to add to ``wm_total`` (zero when the head is
-    disabled / no target).  Scaled by a soft WM-fidelity gate so a not-yet-
-    converged decoder is not destabilised early in P1.
+    disabled / no target).
+
+    Two regimes (the p109 RCA design):
+      * ``stop_grad`` (DEFAULT): the head reads a DETACHED latent — a pure
+        read-out probe.  It cannot touch the WM trunk, so we train it at the
+        full ``disturbance_loss_scale`` (its magnitude is harmless).  The
+        policy still sees the disturbance in the latent (feed-forward works);
+        the validation diagnostic measures how well.
+      * shaping (``stop_grad=False``): the head's gradient reaches the trunk
+        (the original P87 feed-forward-shaping intent).  The weight is then set
+        ADAPTIVELY to ``disturbance_loss_rel_weight`` x the RECON term via a
+        detached loss-ratio, so it is SIM-AGNOSTIC and can never swamp the
+        gain-carrying recon gradient (p109: an absolute 1.0 made it 27x recon).
     """
     zero = torch.zeros((), device=feat.device, dtype=feat.dtype)
     dist_coef = float(getattr(cfg, 'disturbance_loss_scale', 0.0) or 0.0)
     dist_head = getattr(model, 'disturbance', None)
     if dist_head is None or dist_target is None or dist_coef <= 0.0:
         return zero, zero, 0.0
-    # Stop-gradient (default ON): the head reads the latent as a pure read-out
-    # probe so its gradient never flows into the encoder/dynamics trunk.  This
-    # is the p109 RCA fix — at scale=1.0 the un-stopped head dominated wm_total
-    # (10-27x recon) and degraded the WM gain.  Set False to opt into the P87
-    # latent-shaping (then tune disturbance_loss_scale down).
-    feat_in = (feat.detach()
-               if bool(getattr(cfg, 'disturbance_head_stop_grad', True))
-               else feat)
+    stop_grad = bool(getattr(cfg, 'disturbance_head_stop_grad', True))
+    feat_in = feat.detach() if stop_grad else feat
     dpred = dist_head(feat_in)
     if dpred.shape != dist_target.shape:
         return zero, zero, 0.0
     dt = dist_target.to(dpred.dtype)
     dist_loss = F.mse_loss(dpred.float(), dt.float())
-    thr = float(getattr(cfg, 'disturbance_loss_gate_recon', 0.0) or 0.0)
-    if thr > 0.0:
-        gate = torch.clamp(thr / recon_loss.detach().clamp_min(1e-6), max=1.0)
+    if stop_grad:
+        # Read-out probe: gradient-isolated from the trunk, so the loss
+        # magnitude is harmless — train the head at full weight so it learns a
+        # clean estimate fast.
+        term = dist_coef * dist_loss
     else:
-        gate = torch.ones((), device=feat.device)
-    term = dist_coef * gate * dist_loss
+        # Latent-SHAPING (active feed-forward): bound the trunk gradient.
+        rel = float(getattr(cfg, 'disturbance_loss_rel_weight', 0.0) or 0.0)
+        if rel > 0.0:
+            # Adaptive sim-agnostic: term magnitude == rel x recon-term.  The
+            # detached ratio cancels both the sim-specific disturbance scale and
+            # the recon scale, leaving exactly ``rel`` x the recon gradient.
+            recon_scale = float(getattr(cfg, 'recon_scale', 0.1) or 0.0)
+            recon_term = (recon_scale * recon_loss).detach().clamp_min(0.0)
+            eff = rel * recon_term / dist_loss.detach().clamp_min(1e-8)
+            eff = torch.clamp(eff, max=dist_coef)      # absolute ceiling
+            term = eff * dist_loss
+        else:
+            # Legacy absolute path (NOT sim-agnostic — discouraged); gated.
+            thr = float(getattr(cfg, 'disturbance_loss_gate_recon', 0.0) or 0.0)
+            gate = (torch.clamp(thr / recon_loss.detach().clamp_min(1e-6),
+                                max=1.0)
+                    if thr > 0.0 else torch.ones((), device=feat.device))
+            term = dist_coef * gate * dist_loss
     with torch.no_grad():
         rmse = float(dist_loss.clamp_min(0.0).sqrt())
     return term, dist_loss.detach(), rmse

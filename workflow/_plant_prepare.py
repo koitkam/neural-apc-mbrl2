@@ -429,6 +429,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),
     'DREAMER_DISTURBANCE_HEAD_STOP_GRAD': ('disturbance_head_stop_grad',     _as_bool),
+    'DREAMER_DISTURBANCE_LOSS_REL_WEIGHT':('disturbance_loss_rel_weight',    float),
     'DREAMER_DISTURBANCE_LOSS_GATE_RECON':('disturbance_loss_gate_recon',    float),
     'DREAMER_DISTURBANCE_HEAD_HIDDEN':    ('disturbance_head_hidden',        int),
     'DREAMER_DISTURBANCE_HEAD_LAYERS':    ('disturbance_head_layers',        int),
