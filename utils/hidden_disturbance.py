@@ -1,41 +1,46 @@
-"""Hidden, dynamics-respecting unmeasured-CV disturbance process.
+"""Hidden, dynamics-respecting unmeasured-LOAD disturbance process.
 
-Replaces the step-shaped ``unmeasured_cv`` events from
-``training_disturbance.py`` with a per-episode Ornstein-Uhlenbeck (OU)
-process that injects a smoothly evolving bias into each CV state
-channel.  The OU state is **never exposed** to the agent or the world
-model — it is a true unmeasured disturbance, exactly mirroring the
-unobservable upstream upsets a deployed APC controller must reject.
+Models the unobservable upstream upsets a deployed APC controller must reject
+(feed-composition shifts, ambient changes, fouling, slugs) as a true unmeasured
+LOAD with its OWN dynamics — NOT a step added directly onto the controlled
+variable.
 
-Why this exists
----------------
-Step disturbances are mathematically Diracs in the dynamics: the world
-model has zero observable signal predicting the spike, so it incurs a
-loss floor that no amount of training can drive away.  Empirically (run
-p33, WM-only, 1M env-steps) ``sf_loss`` plateaus at ~1.15
-regardless of training time when the disturbance schedule emits
-unmeasured CV steps.
+The single ``HiddenDisturbance`` class (2026-06-10 consolidation) does:
 
-With a hidden OU process the disturbance evolves on a timescale
-``tau_dist`` that the WM CAN model implicitly via its lookback context
-(transformer's posterior gradually picks up on the unexplained CV
-drift).  The driving noise ``w_t`` is small and white, so the
-unlearnable-noise floor is bounded by ``Var(w_t)`` per step, not the
-event amplitude.
+  L(t)  — a per-episode schedule of discrete unmeasured LOAD events
+          (step / ramp / pulse; isolated or overlapping; reverting or held),
+          magnitude capped at a fraction of the agent's MV->CV authority.  This
+          is the upset ORIGIN and MAY be a sharp step (a feed valve switches).
+  Gd    — the disturbance->CV transfer function, FOPDT with UNIT DC gain:
+          ``Gd(s) = e^{-theta_d s} / (tau_d s + 1)``.  ``theta_d`` (transport
+          delay) and ``tau_d`` (lag) are sampled per-episode ADAPTIVELY from the
+          identified plant timing (dead_time, tau_dom).
+  d_cv  — ``Gd`` applied to ``L``: the SMOOTH, DELAYED contribution actually
+          added to the CV output.  Unit DC gain preserves the authority cap.
 
-Sizing rationale
-----------------
-- ``tau_dist`` ~ Uniform(0.15, 0.5) * tau_dom: well below the dominant
-  plant time-constant so the disturbance is distinguishable from plant
-  dynamics, and ≥ a few sample periods so it is representable.
-- Steady-state amplitude ≤ ``amp_frac * mv_authority_cv``: capped at a
-  fraction of the agent's MV-to-CV authority so the policy always has
-  headroom to reject.  Default ``amp_frac=0.10``.
+The OU state / load schedule is **never exposed** to the agent or the world
+model — it is a true unmeasured disturbance.
+
+Why this design (the p33/p110 finding)
+---------------------------------------
+Adding the disturbance DIRECTLY (un-lagged) to the CV is a step/Dirac on the
+controlled variable: the world model has zero observable signal predicting the
+spike, so it incurs a loss/gain-bias floor that no amount of training removes,
+and the feed-forward disturbance head cannot predict it.  Routing the load
+through ``Gd`` makes the CV effect a first-order response — smooth and
+autocorrelated — which the WM CAN learn from its lookback context and the head
+CAN predict.
+
+Sizing rationale (all sim-adaptive, env-overridable)
+-----------------------------------------------------
+- ``tau_d`` ~ ``U(0.5, 1.0) * tau_dom``: comparable to the plant lag, so the
+  disturbance is clearly learnable (not high-frequency noise) yet distinct.
+- ``theta_d`` ~ ``U(0.5, 1.5) * dead_time`` (floored at >=1 step): a realistic
+  transport delay — a real upset takes time to reach the CV.
+- Load amplitude <= ``amp_frac * mv_authority_cv`` (default 0.10) so the policy
+  always has headroom to reject; unit-DC-gain ``Gd`` preserves this at the CV.
 - Per-episode Bernoulli toggle: with probability ``DREAMER_DISTURBANCE_PROB``
   the episode has this hidden disturbance; otherwise it is clean.
-  Recommended split: 0.3 during WM-training phases (P1/P2), 0.5 during
-  agent-training phase (P3).  Set via env vars
-  ``DREAMER_DISTURBANCE_PROB_WM`` and ``DREAMER_DISTURBANCE_PROB_AGENT``.
 
 This module is intentionally sim-agnostic: it only touches CV channels
 identified through ``sim.cv_indices`` and respects
@@ -56,6 +61,28 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except Exception:
         return float(default)
+
+
+def _env_pair(name: str, lo_default: float, hi_default: float) -> tuple:
+    """Read a ``"lo:hi"`` env var as a (lo, hi) float pair (never raises).
+
+    Returns ``(lo_default, hi_default)`` when unset/malformed; if a single
+    value is given it is used for both ends; ensures ``hi >= lo``.
+    """
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return float(lo_default), float(hi_default)
+    try:
+        if ':' in raw:
+            a, b = raw.split(':')
+            lo, hi = float(a), float(b)
+        else:
+            lo = hi = float(raw)
+        if hi < lo:
+            hi = lo
+        return lo, hi
+    except Exception:
+        return float(lo_default), float(hi_default)
 
 
 def hidden_disturbance_enabled(default: bool = True) -> bool:
@@ -300,140 +327,18 @@ def get_phase_disturbance_prob(
     return float(p_min + (p_max - p_min) * frac)
 
 
-class HiddenDisturbanceProcess:
-    """Per-episode OU process injecting a hidden bias into CV channels.
-
-    State (per CV channel):
-        d_{t+1} = (1 - alpha) * d_t + sigma_w * sqrt(2*alpha) * eps_t,
-        eps_t ~ N(0, 1)
-    With ``alpha = sample_rate / tau_dist`` this yields a stationary
-    Gaussian with std = ``sigma_w`` and autocorrelation time ``tau_dist``.
-    """
-
-    def __init__(
-        self,
-        rng: np.random.Generator,
-        sim,
-        *,
-        tau_dom: float,
-        sample_rate: float,
-        amp_frac: float = 0.10,
-        tau_frac_range: tuple = (0.15, 0.5),
-        identifier_ctx: Optional[Dict] = None,
-        drift_frac: float = 0.0,
-    ) -> None:
-        self.sim = sim
-        cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
-        if not cv_indices:
-            self.cv_indices: List[int] = []
-            self.amp: np.ndarray = np.zeros(0, dtype='float64')
-            self.alpha: np.ndarray = np.zeros(0, dtype='float64')
-            self.d: np.ndarray = np.zeros(0, dtype='float64')
-            self.tau_dist: np.ndarray = np.zeros(0, dtype='float64')
-            self.drift: np.ndarray = np.zeros(0, dtype='float64')
-            self.last_applied: np.ndarray = np.zeros(0, dtype='float64')
-            self._is_normalized: bool = bool(getattr(sim, 'state_is_normalized', False))
-            return
-
-        self.cv_indices = cv_indices
-        n_cv = len(cv_indices)
-        self._is_normalized = bool(getattr(sim, 'state_is_normalized', False))
-
-        # Per-channel CV span (engineering units; or [0,1] if normalized).
-        cv_ranges = list(getattr(sim, 'cv_normalization_ranges', []))
-        spans = np.ones(n_cv, dtype='float64')
-        for pos in range(n_cv):
-            if 0 <= pos < len(cv_ranges):
-                lo, hi = float(cv_ranges[pos][0]), float(cv_ranges[pos][1])
-                if hi > lo:
-                    spans[pos] = hi - lo
-
-        # MV->CV authority cap (engineering units) — disturbance amp ≤
-        # ``amp_frac`` of what the agent can rebalance by moving the MV
-        # across its op-band.  Falls back to ``amp_frac * cv_span`` if
-        # authority is unknown.
-        mv_authority_cv = 0.0
-        try:
-            from utils.training_disturbance import compute_mv_authority_to_cv
-            mv_authority_cv = float(
-                compute_mv_authority_to_cv(sim, identifier_ctx) or 0.0
-            )
-        except Exception:
-            mv_authority_cv = 0.0
-
-        # Per-channel steady-state amplitude (1 standard deviation).
-        amp_eng = np.empty(n_cv, dtype='float64')
-        for pos in range(n_cv):
-            cap_authority = (
-                amp_frac * mv_authority_cv if mv_authority_cv > 1e-9 else float('inf')
-            )
-            cap_span = amp_frac * spans[pos]
-            amp_eng[pos] = min(cap_span, cap_authority)
-        # If the sim exposes its state in normalized [0,1] space, convert
-        # the engineering-units amplitude to normalized units so adding
-        # ``d`` to the CV state has the intended physical magnitude.
-        if self._is_normalized:
-            self.amp = amp_eng / np.maximum(spans, 1e-9)
-        else:
-            self.amp = amp_eng
-
-        # Per-channel tau_dist sampled per episode within configured band.
-        lo_frac, hi_frac = float(tau_frac_range[0]), float(tau_frac_range[1])
-        tau_doms = max(1e-6, float(tau_dom))
-        self.tau_dist = rng.uniform(lo_frac, hi_frac, size=n_cv) * tau_doms
-        # alpha = sample_rate / tau_dist, clamped to (0, 1].
-        sr = max(1e-6, float(sample_rate))
-        self.alpha = np.clip(sr / np.maximum(self.tau_dist, 3.0 * sr), 1e-3, 1.0)
-
-        # Initialize OU at the stationary distribution so episode-start
-        # behaviour matches mid-episode.
-        self.d = rng.normal(0.0, 1.0, size=n_cv) * self.amp
-        # Per-episode constant drift offset (Stage C #5: DR over OU mean).
-        # ``drift_frac`` is a scalar in [-1, 1]; the per-channel constant
-        # added to every OU draw is ``drift_frac * amp`` so the bias is
-        # always within the authority cap.
-        self.drift = float(drift_frac) * self.amp
-        self._rng = rng
-        # Per-step CV offset actually injected (d + drift), aligned to
-        # ``cv_indices`` order.  Exposed so evaluation can record/plot the
-        # otherwise-invisible unmeasured disturbance the agent rejected.
-        self.last_applied = np.zeros(n_cv, dtype='float64')
-
-    def is_empty(self) -> bool:
-        return len(self.cv_indices) == 0
-
-    def step(self, state: np.ndarray) -> None:
-        """Advance the OU one step and add it to the CV channels of ``state``.
-
-        Modifies ``state`` in place.
-        """
-        if self.is_empty():
-            return
-        # OU update with variance-preserving driving noise:
-        #     d <- (1-alpha) d + sigma_w * sqrt(2*alpha - alpha^2) eps
-        # The factor sqrt(2*alpha - alpha^2) keeps Var(d) = amp^2 at
-        # steady state for any alpha in (0, 1].
-        a = self.alpha
-        eps = self._rng.normal(0.0, 1.0, size=self.d.shape)
-        sigma_drive = np.sqrt(np.maximum(2.0 * a - a * a, 1e-12)) * self.amp
-        self.d = (1.0 - a) * self.d + sigma_drive * eps
-        self.last_applied = (self.d + self.drift).astype('float64')
-        for pos, idx in enumerate(self.cv_indices):
-            state[int(idx)] = float(state[int(idx)]) + float(self.d[pos]) + float(self.drift[pos])
-        # If the sim publishes state in normalized [0,1] space, clip back
-        # in to keep downstream consumers (encoder, reward) well-defined.
-        if self._is_normalized:
-            for idx in self.cv_indices:
-                state[int(idx)] = float(np.clip(state[int(idx)], 0.0, 1.0))
-
-    def summary(self) -> Dict:
-        return {
-            'cv_indices': list(self.cv_indices),
-            'tau_dist': self.tau_dist.tolist(),
-            'amp': self.amp.tolist(),
-            'alpha': self.alpha.tolist(),
-            'drift': self.drift.tolist() if hasattr(self.drift, 'tolist') else list(self.drift),
-        }
+# NOTE (2026-06-10 consolidation): the legacy ``HiddenDisturbanceProcess`` (OU
+# bias added DIRECTLY to the CV output) and the instant-event
+# ``HiddenDisturbanceSchedule`` (also output-additive) were REMOVED.  Both
+# injected the disturbance straight onto the CV un-lagged — physically a
+# step/Dirac on the controlled variable, which (a) is unlike any real plant
+# upset, (b) is an unlearnable target for the world model (no observable signal
+# precedes a Dirac → a permanent WM loss/gain bias, the p33/p110 finding), and
+# (c) is unpredictable for the feed-forward disturbance head.  They are replaced
+# by the single ``HiddenDisturbance`` class below: a hidden LOAD (the unmeasured
+# upset events) propagated to the CV through its OWN disturbance transfer
+# function ``Gd`` = dead-time + first-order lag (adaptive from the identified
+# plant), i.e. a true unmeasured DV with hidden dynamics.
 
 
 def _cv_amp_caps(sim, amp_frac: float,
@@ -478,43 +383,57 @@ def _cv_amp_caps(sim, amp_frac: float,
     return amp.astype('float64'), is_norm, spans
 
 
-class HiddenDisturbanceSchedule:
-    """Per-episode schedule of realistic, sim-adaptive unmeasured-CV events.
+class HiddenDisturbance:
+    """Hidden unmeasured LOAD disturbance, propagated to the CV through its OWN
+    disturbance transfer function ``Gd`` (dead-time + first-order lag).
 
-    Replaces the single always-on OU drift (``HiddenDisturbanceProcess``)
-    with a sequence of discrete disturbance EVENTS of varied:
+    Models a true unmeasured DV / load upset (feed-composition shift, ambient
+    change, fouling, slug) the way a real plant experiences it — NOT a step
+    added straight onto the controlled variable:
 
-      * **shape** — ``step`` (instant load change), ``ramp`` (gradual
-        drift to a new level), ``pulse`` (temporary excursion that returns),
-        ``ou_drift`` (a noisy/rough patch);
-      * **timing** — sometimes ISOLATED with ≥ settling-time gaps (each
-        event reaches steady state before the next), sometimes OVERLAPPING /
-        serial (a new upset arrives before the previous settles);
-      * **persistence** — some events REVERT to baseline (ramp back down),
-        some HOLD permanently (a lasting operating-point shift).
+      L(t)  — a sim-adaptive schedule of discrete unmeasured LOAD events
+              (``step`` = a feed/valve switches; ``ramp`` = a gradual drift;
+              ``pulse`` = a transient slug), isolated or overlapping, reverting
+              or permanently held, magnitude capped at ``amp_frac`` of the
+              agent's MV->CV authority.  This is the upset ORIGIN — it MAY be a
+              sharp step.
+      Gd    — the disturbance->CV transfer function, FOPDT with UNIT DC gain:
+              ``Gd(s) = e^{-theta_d s} / (tau_d s + 1)``.  ``theta_d`` (transport
+              delay) and ``tau_d`` (lag) are sampled per episode ADAPTIVELY from
+              the identified plant timing (``dead_time``, ``tau_dom``).
+      d_cv  — ``Gd`` applied to ``L``: the SMOOTH, DELAYED contribution actually
+              added to the CV.  Unit DC gain keeps the steady-state magnitude
+              within the authority cap.
 
-    This mimics how a real chemical plant experiences unmeasured upsets
-    (feed-composition shifts, ambient changes, fouling, slugs) instead of a
-    constant high-frequency wiggle.  Every timescale is sim-adaptive: derived
-    from the identified dead time + dominant time constant (settling time);
-    every magnitude is capped by the agent's MV->CV authority.  The schedule
-    is **never exposed** to the agent or WM (truly unmeasured).
+    Output-additive (DMC-style output disturbance): ``d_cv`` is added to the CV
+    AFTER the plant step because ``Gd`` already encodes the full disturbance->CV
+    path (the plant lag is NOT re-applied).  Because ``d_cv`` is a first-order
+    response (never an instantaneous step on the CV), the world model CAN learn
+    it from its lookback context and the feed-forward disturbance head CAN
+    predict it (the p33/p110 Dirac-floor fix).
 
-    Drop-in for ``HiddenDisturbanceProcess``: ``is_empty()``, ``step(state)``
-    (in place; advances an internal step counter), ``last_applied`` (per
-    ``cv_indices``), ``summary()``.
+    NEVER exposed to the agent or WM (truly unmeasured).  Stable drop-in
+    interface — ``is_empty()``, ``step(state)`` (in place; advances an internal
+    counter), ``last_applied`` (the per-``cv_indices`` ``d_cv`` just injected),
+    ``summary()`` — so the disturbance-head target (env trace), the validation
+    disturbance-prediction diagnostic, and the rejection plot all read the same
+    ``last_applied`` signal with no extra wiring.
 
     Env knobs (all optional; sim-adaptive defaults):
-      ``DREAMER_HIDDEN_DIST_SETTLE_NTAU``   settle = dead + N·tau   (default 4)
-      ``DREAMER_HIDDEN_DIST_MAX_EVENTS``    cap on events/episode   (default 6)
-      ``DREAMER_HIDDEN_DIST_P_ISOLATED``    P(gap ≥ settle)         (default 0.5)
-      ``DREAMER_HIDDEN_DIST_P_REVERT``      P(event reverts)        (default 0.5)
-      ``DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS`` "step,ramp,pulse,ou"    (default 0.3,0.3,0.2,0.2)
+      ``DREAMER_HIDDEN_DIST_SETTLE_NTAU``   load-event settle = dead + N*tau (4)
+      ``DREAMER_HIDDEN_DIST_MAX_EVENTS``    cap on load events / episode     (6)
+      ``DREAMER_HIDDEN_DIST_P_ISOLATED``    P(gap >= settle)                 (0.5)
+      ``DREAMER_HIDDEN_DIST_P_REVERT``      P(load event reverts)            (0.7)
+      ``DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS`` "step,ramp,pulse"         (0.5,0.3,0.2)
+      ``DREAMER_HIDDEN_DIST_SPREAD``        spread events across the episode (1)
+      ``DREAMER_HIDDEN_DIST_TAU_FRAC``      "lo:hi": tau_d=U(lo,hi)*tau_dom (0.5:1.0)
+      ``DREAMER_HIDDEN_DIST_DEADTIME_FRAC`` "lo:hi": theta_d=U(lo,hi)*dead   (0.5:1.5)
     """
 
     def __init__(self, rng: np.random.Generator, sim, *,
                  tau_dom: float, sample_rate: float, dead_time: float,
                  episode_length: int, amp_frac: float = 0.10,
+                 drift_frac: float = 0.0,
                  identifier_ctx: Optional[Dict] = None) -> None:
         self.sim = sim
         self.cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
@@ -528,6 +447,13 @@ class HiddenDisturbanceSchedule:
         self.events: List[Dict] = []
         self._settle = 0.0
         self._tau_steps = 0.0
+        # Gd state (per CV channel) — populated below when active.
+        self.drift = np.zeros(max(n_cv, 0), dtype='float64')
+        self._y = np.zeros(max(n_cv, 0), dtype='float64')
+        self._delay: List = []
+        self.tau_d_steps = np.zeros(max(n_cv, 0), dtype='float64')
+        self.theta_d_steps = np.zeros(max(n_cv, 0), dtype='int64')
+        self._alpha = np.zeros(max(n_cv, 0), dtype='float64')
         if n_cv == 0 or (amp.size and float(np.max(np.abs(amp))) <= 0.0):
             return
 
@@ -544,15 +470,39 @@ class HiddenDisturbanceSchedule:
             _env_float('DREAMER_HIDDEN_DIST_P_ISOLATED', 0.5), 0.0, 1.0))
         p_revert = float(np.clip(
             _env_float('DREAMER_HIDDEN_DIST_P_REVERT', 0.7), 0.0, 1.0))
-        shapes = ['step', 'ramp', 'pulse', 'ou_drift']
+        shapes = ['step', 'ramp', 'pulse']
         weights = self._shape_weights()
 
+        # ----- Gd: per-channel disturbance transfer function (FOPDT) -----
+        # tau_d ~ comparable to the plant dominant lag (smooth + learnable);
+        # theta_d ~ a fraction-to-multiple of the plant dead time (transport
+        # delay), floored at >=1 step so every disturbance is delayed.  Both
+        # sim-adaptive (from the identified plant) + env-overridable.  UNIT DC
+        # gain (the lag has no extra gain) so the authority-based amp cap on
+        # the load is preserved at the CV.
+        tau_lo, tau_hi = _env_pair('DREAMER_HIDDEN_DIST_TAU_FRAC', 0.5, 1.0)
+        dt_lo, dt_hi = _env_pair('DREAMER_HIDDEN_DIST_DEADTIME_FRAC', 0.5, 1.5)
+        self.tau_d_steps = np.maximum(
+            rng.uniform(tau_lo, tau_hi, size=n_cv) * tau_steps, 1.0)
+        self._alpha = np.clip(1.0 / self.tau_d_steps, 1e-3, 1.0)
+        theta = np.round(rng.uniform(dt_lo, dt_hi, size=n_cv) * dead_steps)
+        self.theta_d_steps = np.maximum(theta, 1.0).astype('int64')
+        # Per-episode constant LOAD bias (operating-point shift), within cap.
+        self.drift = (float(drift_frac) * self.amp_cap).astype('float64')
+        # Initialise Gd at the drift steady state (the bias pre-exists the
+        # episode — no artificial ramp-in at t=0).
+        self._y = self.drift.copy()
+        from collections import deque
+        self._delay = [
+            deque([float(self.drift[p])] * (int(self.theta_d_steps[p]) + 1),
+                  maxlen=int(self.theta_d_steps[p]) + 1)
+            for p in range(n_cv)
+        ]
+
         n_budget = int(np.clip(round(T / (1.5 * settle)), 1, max(1, max_events)))
-        # Spread mode (DEFAULT 2026-06-08): distribute event starts UNIFORMLY
-        # across the whole episode so the unmeasured disturbance is active
-        # start->end (a realistic sequence of distinct plant upsets) instead of
-        # the legacy front-loaded sequential placement, which — once the plant
-        # timescale is correct — still ends well before the episode does.  Set
+        # Spread mode (DEFAULT): distribute LOAD-event starts UNIFORMLY across
+        # the whole episode (a realistic sequence of distinct upsets) instead of
+        # the legacy front-loaded sequential placement.  Set
         # ``DREAMER_HIDDEN_DIST_SPREAD=0`` to restore the legacy placement.
         spread = str(os.environ.get('DREAMER_HIDDEN_DIST_SPREAD', '1')).strip() \
             .lower() not in ('0', 'false', 'no', 'off', '')
@@ -591,11 +541,7 @@ class HiddenDisturbanceSchedule:
     def _make_event(self, rng: np.random.Generator, t: float, n_cv: int,
                      shapes: List[str], weights: np.ndarray, tau_steps: float,
                      settle: float, p_revert: float) -> Dict:
-        """Draw one disturbance event (shape/magnitude/timing) starting at ``t``.
-
-        Draw order is identical to the original inline body so the training
-        RNG stream is unchanged when ``DREAMER_HIDDEN_DIST_SPREAD`` is off.
-        """
+        """Draw one LOAD event (shape / magnitude / timing) starting at ``t``."""
         pos = int(rng.integers(0, n_cv))
         shape = str(rng.choice(shapes, p=weights))
         sign = 1.0 if rng.uniform() < 0.5 else -1.0
@@ -604,42 +550,33 @@ class HiddenDisturbanceSchedule:
             rise = 0.0
         elif shape == 'pulse':
             rise = float(rng.uniform(0.3, 0.8)) * tau_steps
-        else:  # ramp / ou_drift
+        else:  # ramp
             rise = float(rng.uniform(0.5, 1.5)) * tau_steps
         if shape == 'pulse':
             hold = float(rng.uniform(0.5, 1.5)) * tau_steps
             revert = True
-        elif shape == 'ou_drift':
-            hold = float(rng.uniform(1.0, 3.0)) * tau_steps
-            revert = bool(rng.uniform() < p_revert)
         else:  # step / ramp held toward steady state
             hold = float(rng.uniform(0.5, 2.0)) * settle
             revert = bool(rng.uniform() < p_revert)
         fall = (float(rng.uniform(0.5, 1.5)) * tau_steps) if revert else 0.0
-        tau_dist = float(rng.uniform(0.15, 0.5)) * tau_steps
-        alpha = (float(np.clip(1.0 / max(tau_dist, 1.0), 1e-3, 1.0))
-                 if shape == 'ou_drift' else 0.0)
         return {
             'pos': pos, 'shape': shape, 'mag': float(mag),
             'start': float(t), 'rise': float(rise), 'hold': float(hold),
             'fall': float(fall), 'revert': bool(revert),
-            'alpha': float(alpha), 'ou': 0.0,
         }
 
     def _shape_weights(self) -> np.ndarray:
-        # Default 2026-06-08: NO ``ou_drift`` (weight 0).  ou_drift injects a
-        # per-step OU random walk that reads as high-frequency noise on top of
-        # the plant measurement noise — not a "reasonable plant disturbance".
-        # The unmeasured disturbance is now built from smooth, persistent
-        # step / ramp / pulse events only (each ramps to a level, holds —
-        # sometimes to steady state — then mostly reverts).  Re-enable ou_drift
-        # for ablations via ``DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS``.
-        default = np.array([0.40, 0.35, 0.25, 0.00], dtype='float64')
+        # step / ramp / pulse only.  Gd (dead-time + lag) provides the
+        # smoothing, so a sharp ``step`` LOAD is fine — it produces a smooth
+        # first-order CV response, not a CV discontinuity.  (The legacy
+        # ``ou_drift`` shape — a per-step random walk that read as
+        # high-frequency noise — is removed.)
+        default = np.array([0.5, 0.3, 0.2], dtype='float64')
         raw = os.environ.get('DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS', '').strip()
         if raw:
             try:
                 w = np.array([float(x) for x in raw.split(',')], dtype='float64')
-                if w.size == 4 and w.sum() > 0:
+                if w.size == 3 and w.sum() > 0:
                     return w / w.sum()
             except Exception:
                 pass
@@ -648,25 +585,12 @@ class HiddenDisturbanceSchedule:
     def is_empty(self) -> bool:
         return len(self.cv_indices) == 0 or len(self.events) == 0
 
-    def _event_value(self, ev: Dict, local: float) -> float:
-        """Signed offset contributed by ``ev`` at local time ``local`` (≥0)."""
-        shape = ev['shape']
+    def _load_value(self, ev: Dict, local: float) -> float:
+        """Raw LOAD contributed by ``ev`` at local time ``local`` (>=0)."""
         mag = ev['mag']
         rise = ev['rise']
         hold = ev['hold']
         fall = ev['fall']
-        if shape == 'ou_drift':
-            active_len = rise + hold
-            if local >= active_len:
-                ev['ou'] = 0.0
-                return 0.0
-            a = ev['alpha']
-            eps = self._rng.normal(0.0, 1.0)
-            sigma_drive = np.sqrt(max(2.0 * a - a * a, 1e-12)) * abs(mag)
-            ev['ou'] = (1.0 - a) * ev['ou'] + sigma_drive * eps
-            env_scale = min(1.0, local / rise) if rise > 0 else 1.0
-            return float(ev['ou']) * env_scale
-        # deterministic step / ramp / pulse
         if local < rise:
             return mag * (local / rise) if rise > 0 else mag
         if local < rise + hold:
@@ -679,33 +603,48 @@ class HiddenDisturbanceSchedule:
         return mag  # permanent hold (non-reverting step/ramp)
 
     def step(self, state: np.ndarray) -> None:
-        """Advance one step; add the active events' offsets to CV channels."""
+        """Advance one step: build the raw LOAD, filter it through ``Gd``
+        (dead-time + first-order lag), and add the resulting smooth ``d_cv`` to
+        the CV channels of ``state`` (in place)."""
         n_cv = len(self.cv_indices)
         if n_cv == 0:
             return
         self._t += 1
         t = self._t
-        off = np.zeros(n_cv, dtype='float64')
+        # Raw unmeasured LOAD = constant bias + active events (the upset origin).
+        load = self.drift.astype('float64').copy()
         for ev in self.events:
             local = t - ev['start']
             if local < 0:
                 continue
-            off[ev['pos']] += self._event_value(ev, float(local))
-        self.last_applied = off
+            load[ev['pos']] += self._load_value(ev, float(local))
+        # Gd per channel: dead-time delay, then first-order lag (unit DC gain).
+        d_cv = np.zeros(n_cv, dtype='float64')
+        for pos in range(n_cv):
+            self._delay[pos].append(float(load[pos]))
+            u_delayed = float(self._delay[pos][0])    # load theta_d steps ago
+            self._y[pos] += self._alpha[pos] * (u_delayed - self._y[pos])
+            d_cv[pos] = self._y[pos]
+        self.last_applied = d_cv
         for pos, idx in enumerate(self.cv_indices):
-            if off[pos] != 0.0:
-                state[int(idx)] = float(state[int(idx)]) + float(off[pos])
+            if d_cv[pos] != 0.0:
+                state[int(idx)] = float(state[int(idx)]) + float(d_cv[pos])
+        # If the sim publishes state in normalized [0,1] space, clip back in to
+        # keep downstream consumers (encoder, reward) well-defined.
         if self._is_norm:
             for idx in self.cv_indices:
                 state[int(idx)] = float(np.clip(state[int(idx)], 0.0, 1.0))
 
     def summary(self) -> Dict:
         return {
-            'mode': 'schedule',
+            'mode': 'load_through_Gd',
             'n_events': len(self.events),
             'cv_indices': list(self.cv_indices),
             'settle_steps': float(self._settle),
             'tau_steps': float(self._tau_steps),
+            'tau_d_steps': self.tau_d_steps.tolist(),
+            'theta_d_steps': self.theta_d_steps.tolist(),
+            'drift': self.drift.tolist(),
             'events': [
                 {k: ev[k] for k in ('pos', 'shape', 'mag', 'start',
                                      'rise', 'hold', 'fall', 'revert')}
@@ -729,7 +668,7 @@ def maybe_build_hidden_disturbance(
     dead_time: float = 0.0,
     episode_length: int = 0,
 ):
-    """Bernoulli-toggle the per-episode hidden disturbance process.
+    """Bernoulli-toggle the per-episode hidden LOAD disturbance.
 
     Returns ``None`` for clean episodes so the WM also sees some clean
     data and can sharpen its base dynamics estimate.  Set ``force=True``
@@ -737,19 +676,22 @@ def maybe_build_hidden_disturbance(
 
     ``progress`` is the training progress in ``[0, 1]``; combined with
     the amplitude curriculum (see ``curriculum_amp_scale``) and the
-    per-episode jitter / drift DR knobs (Stage C #5) to produce the
-    effective ``amp_frac`` and ``drift_frac`` for this episode.
-    ``phase`` (optional) selects the phase-aware amp cap (P1/P2 vs P3).
+    per-episode jitter / drift DR knobs to produce the effective
+    ``amp_frac`` and ``drift_frac`` for this episode.  ``phase`` (optional)
+    selects the phase-aware amp cap (P1/P2 vs P3).
 
-    Two models (``DREAMER_HIDDEN_DIST_MODE``):
-      * ``schedule`` (default, P89): a realistic sim-adaptive EVENT schedule
-        with varied shapes (step/ramp/pulse/ou_drift), realistic timing
-        (sometimes isolated + held to steady state, sometimes overlapping)
-        and persistence (revert vs hold).  Needs ``episode_length``.
-      * ``ou``: legacy always-on per-episode OU drift
-        (``HiddenDisturbanceProcess``).
+    Single consolidated model (2026-06-10): a hidden unmeasured LOAD (the
+    upset events) propagated to the CV through its OWN disturbance transfer
+    function ``Gd`` (dead-time + first-order lag), adaptive from the identified
+    plant — see ``HiddenDisturbance``.  Needs ``episode_length`` to schedule
+    the load events.
     """
     if not hidden_disturbance_enabled(default=True):
+        return None
+    if int(episode_length) <= 0:
+        # The consolidated model schedules LOAD events across the episode, so a
+        # disturbance needs a positive horizon.  (Every live caller passes
+        # cfg.episode_length > 0; this guards degenerate/unit-test inputs.)
         return None
     if not force:
         if prob <= 0.0:
@@ -760,34 +702,18 @@ def maybe_build_hidden_disturbance(
     curr_scale = curriculum_amp_scale(float(progress), phase=phase)
     jitter = _sample_amp_jitter(rng)
     eff_amp_frac = float(amp_frac) * float(curr_scale) * float(jitter)
-
-    mode = os.environ.get('DREAMER_HIDDEN_DIST_MODE', 'schedule').strip().lower()
-    if mode in ('schedule', 'events', 'realistic') and int(episode_length) > 0:
-        sched = HiddenDisturbanceSchedule(
-            rng=rng,
-            sim=sim,
-            tau_dom=float(tau_dom),
-            sample_rate=float(sample_rate),
-            dead_time=float(dead_time),
-            episode_length=int(episode_length),
-            amp_frac=eff_amp_frac,
-            identifier_ctx=identifier_ctx,
-        )
-        if sched.is_empty():
-            return None
-        return sched
-
-    # ----- legacy OU drift -----
     drift_frac = _sample_drift_frac(rng)
-    proc = HiddenDisturbanceProcess(
+    dist = HiddenDisturbance(
         rng=rng,
         sim=sim,
         tau_dom=float(tau_dom),
         sample_rate=float(sample_rate),
+        dead_time=float(dead_time),
+        episode_length=int(episode_length),
         amp_frac=eff_amp_frac,
-        identifier_ctx=identifier_ctx,
         drift_frac=drift_frac,
+        identifier_ctx=identifier_ctx,
     )
-    if proc.is_empty():
+    if dist.is_empty():
         return None
-    return proc
+    return dist

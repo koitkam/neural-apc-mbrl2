@@ -1833,9 +1833,11 @@ class APCEnv:
                       f'(further occurrences silenced): {_de!r}', flush=True)
                 traceback.print_exc()
                 self._disturbance_err_logged = True
-        # Hidden (truly unmeasured) CV disturbance: advance OU and add to
-        # CV state channels.  Only active on episodes where the per-episode
-        # Bernoulli toggle (or force flag) fired in reset().
+        # Hidden (truly unmeasured) LOAD disturbance: advance the load schedule,
+        # filter it through the disturbance transfer function Gd (dead-time +
+        # first-order lag) and add the resulting smooth CV effect.  Only active
+        # on episodes where the per-episode Bernoulli toggle (or force flag)
+        # fired in reset().  ``last_applied`` = the per-CV d_cv just injected.
         hidden_applied = np.zeros(len(self.cv_indices), dtype='float32')
         if self._hidden_disturbance is not None:
             try:
