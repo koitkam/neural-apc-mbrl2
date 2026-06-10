@@ -1,0 +1,3323 @@
+{
+  "controller_dir": "/home/koitkam/neural-apc-mbrl/output/test_sim/run_20260609_p106_mccritic",
+  "simulation_dir": "/home/koitkam/neural-apc-mbrl/simulation/test_sim",
+  "ckpt": "/home/koitkam/neural-apc-mbrl/output/test_sim/run_20260609_p106_mccritic/best.pt",
+  "deterministic": true,
+  "policy_type": "continuous",
+  "actor_loss_type": "reinforce",
+  "policy_init_log_std": -2.0,
+  "n_seeds": 3,
+  "episodes_per_seed": 3,
+  "n_episodes_total": 12,
+  "cum_raw_reward_mean": -31777.339192708332,
+  "cum_raw_reward_std": 21225.5338453575,
+  "cum_raw_reward_min": -85943.453125,
+  "cum_raw_reward_max": -5775.6494140625,
+  "mean_cv_violation_mean": 10.676152984301249,
+  "mean_mv_violation_mean": 0.519867519615218,
+  "fidelity_gates": {
+    "wm_next_state_r_min": 0.5,
+    "reward_head_r_min": 0.3,
+    "critic_r_min": 0.3,
+    "wm_next_state_r_observed": 0.5388241718052974,
+    "reward_head_r_observed": 0.17744259371904544,
+    "critic_r_observed": 0.7378883877973023,
+    "wm_pass": true,
+    "reward_pass": false,
+    "critic_pass": true,
+    "all_pass": false,
+    "wm_gain_rel_err": 0.18645362190220355,
+    "wm_gain_rel_err_max": 0.18645362190220355,
+    "wm_gain_pass": true,
+    "wm_gain_healthy": true,
+    "n_pairs": 1
+  },
+  "episodes": [
+    {
+      "seed": 10000,
+      "episode": 0,
+      "cum_raw_reward": -10758.5927734375,
+      "cum_scaled_reward": -29.337512969970703,
+      "mean_cv_violation": 2.468696355819702,
+      "mean_mv_violation": 2.801539421081543,
+      "episode_length": 1220,
+      "n_disturbance_events": 4,
+      "kpi_cv_violation_mean": 2.468696355819702,
+      "kpi_mv_violation_mean": 2.801539421081543,
+      "kpi_mv_tv": 1075.589599609375,
+      "kpi_mv_activity_ratio": 0.1281031101903799,
+      "kpi_mv_bound_hugging_score": 0.20204800881974685,
+      "kpi_mv_bound_usage": 0.8151041666666666,
+      "kpi_mv_reversal_rate": 0.42411812961443807,
+      "kpi_economic_score": -8.818526268005371,
+      "kpi_cum_raw_reward": -10758.5927734375,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10000,
+      "episode": 1,
+      "cum_raw_reward": -85943.453125,
+      "cum_scaled_reward": -215.47422790527344,
+      "mean_cv_violation": 30.47576904296875,
+      "mean_mv_violation": 0.0,
+      "episode_length": 1220,
+      "n_disturbance_events": 1,
+      "kpi_cv_violation_mean": 30.47576904296875,
+      "kpi_mv_violation_mean": 0.0,
+      "kpi_mv_tv": 897.9202270507812,
+      "kpi_mv_activity_ratio": 0.14246269623886573,
+      "kpi_mv_bound_hugging_score": 0.4455828975198048,
+      "kpi_mv_bound_usage": 0.7161458333333334,
+      "kpi_mv_reversal_rate": 0.44380639868744876,
+      "kpi_economic_score": -70.44544219970703,
+      "kpi_cum_raw_reward": -85943.453125,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10000,
+      "episode": 2,
+      "cum_raw_reward": -30816.72265625,
+      "cum_scaled_reward": -82.72433471679688,
+      "mean_cv_violation": 7.592254638671875,
+      "mean_mv_violation": 0.010161683894693851,
+      "episode_length": 1220,
+      "n_disturbance_events": 3,
+      "kpi_cv_violation_mean": 7.592254638671875,
+      "kpi_mv_violation_mean": 0.010161683894693851,
+      "kpi_mv_tv": 911.8046875,
+      "kpi_mv_activity_ratio": 0.16445958320633472,
+      "kpi_mv_bound_hugging_score": 0.30248965383227405,
+      "kpi_mv_bound_usage": 0.8216145833333334,
+      "kpi_mv_reversal_rate": 0.42165709598031176,
+      "kpi_economic_score": -25.259599685668945,
+      "kpi_cum_raw_reward": -30816.72265625,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10001,
+      "episode": 0,
+      "cum_raw_reward": -52201.3046875,
+      "cum_scaled_reward": -133.74546813964844,
+      "mean_cv_violation": 35.13959503173828,
+      "mean_mv_violation": 0.0,
+      "episode_length": 1220,
+      "n_disturbance_events": 4,
+      "kpi_cv_violation_mean": 35.13959503173828,
+      "kpi_mv_violation_mean": 0.0,
+      "kpi_mv_tv": 931.2640380859375,
+      "kpi_mv_activity_ratio": 0.12163211507423195,
+      "kpi_mv_bound_hugging_score": 0.27075702531741613,
+      "kpi_mv_bound_usage": 0.5445963541666666,
+      "kpi_mv_reversal_rate": 0.4085315832649713,
+      "kpi_economic_score": -42.78794860839844,
+      "kpi_cum_raw_reward": -52201.3046875,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10001,
+      "episode": 1,
+      "cum_raw_reward": -17109.177734375,
+      "cum_scaled_reward": -51.225399017333984,
+      "mean_cv_violation": 6.321990966796875,
+      "mean_mv_violation": 0.14469851553440094,
+      "episode_length": 1220,
+      "n_disturbance_events": 1,
+      "kpi_cv_violation_mean": 6.321990966796875,
+      "kpi_mv_violation_mean": 0.14469851553440094,
+      "kpi_mv_tv": 1060.621337890625,
+      "kpi_mv_activity_ratio": 0.14233698526931352,
+      "kpi_mv_bound_hugging_score": 0.26961713592862824,
+      "kpi_mv_bound_usage": 0.81640625,
+      "kpi_mv_reversal_rate": 0.3781788351107465,
+      "kpi_economic_score": -14.023923873901367,
+      "kpi_cum_raw_reward": -17109.177734375,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10001,
+      "episode": 2,
+      "cum_raw_reward": -43244.58984375,
+      "cum_scaled_reward": -117.29706573486328,
+      "mean_cv_violation": 16.301925659179688,
+      "mean_mv_violation": 0.0,
+      "episode_length": 1220,
+      "n_disturbance_events": 2,
+      "kpi_cv_violation_mean": 16.301925659179688,
+      "kpi_mv_violation_mean": 0.0,
+      "kpi_mv_tv": 1018.8574829101562,
+      "kpi_mv_activity_ratio": 0.15393555475068807,
+      "kpi_mv_bound_hugging_score": 0.38081926700195984,
+      "kpi_mv_bound_usage": 0.7044270833333334,
+      "kpi_mv_reversal_rate": 0.35438884331419196,
+      "kpi_economic_score": -35.4463996887207,
+      "kpi_cum_raw_reward": -43244.58984375,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10002,
+      "episode": 0,
+      "cum_raw_reward": -39262.34765625,
+      "cum_scaled_reward": -99.74797058105469,
+      "mean_cv_violation": 7.634934425354004,
+      "mean_mv_violation": 0.0,
+      "episode_length": 1220,
+      "n_disturbance_events": 2,
+      "kpi_cv_violation_mean": 7.634934425354004,
+      "kpi_mv_violation_mean": 0.0,
+      "kpi_mv_tv": 893.2249755859375,
+      "kpi_mv_activity_ratio": 0.1291057274718598,
+      "kpi_mv_bound_hugging_score": 0.35733193569496025,
+      "kpi_mv_bound_usage": 0.703125,
+      "kpi_mv_reversal_rate": 0.4257588187038556,
+      "kpi_economic_score": -32.18230438232422,
+      "kpi_cum_raw_reward": -39262.34765625,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10002,
+      "episode": 1,
+      "cum_raw_reward": -18711.89453125,
+      "cum_scaled_reward": -52.082523345947266,
+      "mean_cv_violation": 4.026234149932861,
+      "mean_mv_violation": 0.0,
+      "episode_length": 1220,
+      "n_disturbance_events": 3,
+      "kpi_cv_violation_mean": 4.026234149932861,
+      "kpi_mv_violation_mean": 0.0,
+      "kpi_mv_tv": 947.9022216796875,
+      "kpi_mv_activity_ratio": 0.16596295391568958,
+      "kpi_mv_bound_hugging_score": 0.2692695596830441,
+      "kpi_mv_bound_usage": 0.640625,
+      "kpi_mv_reversal_rate": 0.40607054963084493,
+      "kpi_economic_score": -15.337618827819824,
+      "kpi_cum_raw_reward": -18711.89453125,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10002,
+      "episode": 2,
+      "cum_raw_reward": -38806.65234375,
+      "cum_scaled_reward": -100.0567626953125,
+      "mean_cv_violation": 8.204439163208008,
+      "mean_mv_violation": 0.5699084401130676,
+      "episode_length": 1220,
+      "n_disturbance_events": 5,
+      "kpi_cv_violation_mean": 8.204439163208008,
+      "kpi_mv_violation_mean": 0.5699084401130676,
+      "kpi_mv_tv": 967.890625,
+      "kpi_mv_activity_ratio": 0.16002917884185736,
+      "kpi_mv_bound_hugging_score": 0.41936372225401825,
+      "kpi_mv_bound_usage": 0.7786458333333334,
+      "kpi_mv_reversal_rate": 0.42165709598031176,
+      "kpi_economic_score": -31.8087215423584,
+      "kpi_cum_raw_reward": -38806.65234375,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10003,
+      "episode": 0,
+      "cum_raw_reward": -20872.7421875,
+      "cum_scaled_reward": -52.137516021728516,
+      "mean_cv_violation": 4.252005577087402,
+      "mean_mv_violation": 0.0,
+      "episode_length": 1220,
+      "n_disturbance_events": 3,
+      "kpi_cv_violation_mean": 4.252005577087402,
+      "kpi_mv_violation_mean": 0.0,
+      "kpi_mv_tv": 1041.1688232421875,
+      "kpi_mv_activity_ratio": 0.14737816721899902,
+      "kpi_mv_bound_hugging_score": 0.3111316493300141,
+      "kpi_mv_bound_usage": 0.8854166666666666,
+      "kpi_mv_reversal_rate": 0.38392124692370794,
+      "kpi_economic_score": -17.108795166015625,
+      "kpi_cum_raw_reward": -20872.7421875,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10003,
+      "episode": 1,
+      "cum_raw_reward": -5775.6494140625,
+      "cum_scaled_reward": -16.76663589477539,
+      "mean_cv_violation": 2.1275417804718018,
+      "mean_mv_violation": 0.0,
+      "episode_length": 1220,
+      "n_disturbance_events": 2,
+      "kpi_cv_violation_mean": 2.1275417804718018,
+      "kpi_mv_violation_mean": 0.0,
+      "kpi_mv_tv": 1044.5947265625,
+      "kpi_mv_activity_ratio": 0.12393071242230924,
+      "kpi_mv_bound_hugging_score": 0.22167261676058747,
+      "kpi_mv_bound_usage": 0.7239583333333334,
+      "kpi_mv_reversal_rate": 0.4388843314191961,
+      "kpi_economic_score": -4.734136581420898,
+      "kpi_cum_raw_reward": -5775.6494140625,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    },
+    {
+      "seed": 10003,
+      "episode": 2,
+      "cum_raw_reward": -17824.943359375,
+      "cum_scaled_reward": -47.83214569091797,
+      "mean_cv_violation": 3.568449020385742,
+      "mean_mv_violation": 2.712102174758911,
+      "episode_length": 1220,
+      "n_disturbance_events": 3,
+      "kpi_cv_violation_mean": 3.568449020385742,
+      "kpi_mv_violation_mean": 2.712102174758911,
+      "kpi_mv_tv": 955.606689453125,
+      "kpi_mv_activity_ratio": 0.14757793258559546,
+      "kpi_mv_bound_hugging_score": 0.2591044941886526,
+      "kpi_mv_bound_usage": 0.6575520833333334,
+      "kpi_mv_reversal_rate": 0.3806398687448728,
+      "kpi_economic_score": -14.610618591308594,
+      "kpi_cum_raw_reward": -17824.943359375,
+      "kpi_iae_normed_mean": 0.0,
+      "kpi_itae_normed_mean": 0.0,
+      "kpi_ise_normed_mean": 0.0
+    }
+  ],
+  "disturbance_rejection": [
+    {
+      "seed": 10000,
+      "cum_raw_reward": -88412.3359375,
+      "mean_cv_violation": 48.19166564941406,
+      "mean_mv_violation": 0.0,
+      "event_annotations": [
+        {
+          "cv_row": 0,
+          "start": 144,
+          "overshoot": -3.2679214477539062,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_1"
+        },
+        {
+          "cv_row": 0,
+          "start": 186,
+          "overshoot": -3.4903335571289062,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_2"
+        },
+        {
+          "cv_row": 0,
+          "start": 247,
+          "overshoot": 6.089447021484375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_3"
+        },
+        {
+          "cv_row": 0,
+          "start": 299,
+          "overshoot": 3.4167098999023438,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_4"
+        },
+        {
+          "cv_row": 0,
+          "start": 392,
+          "overshoot": 6.723060607910156,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_5"
+        },
+        {
+          "cv_row": 0,
+          "start": 494,
+          "overshoot": 6.1728973388671875,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_6"
+        },
+        {
+          "cv_row": 0,
+          "start": 535,
+          "overshoot": 4.039939880371094,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_7"
+        },
+        {
+          "cv_row": 0,
+          "start": 615,
+          "overshoot": 1.9470977783203125,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_8"
+        },
+        {
+          "cv_row": 0,
+          "start": 699,
+          "overshoot": -4.1506195068359375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_9"
+        },
+        {
+          "cv_row": 0,
+          "start": 742,
+          "overshoot": -4.5921173095703125,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_10"
+        },
+        {
+          "cv_row": 0,
+          "start": 837,
+          "overshoot": -4.497474670410156,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_11"
+        },
+        {
+          "cv_row": 0,
+          "start": 912,
+          "overshoot": -2.909942626953125,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_12"
+        },
+        {
+          "cv_row": 0,
+          "start": 995,
+          "overshoot": -2.4190902709960938,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_13"
+        },
+        {
+          "cv_row": 0,
+          "start": 1046,
+          "overshoot": -2.3392715454101562,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_14"
+        }
+      ],
+      "schedule": [
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_1",
+          "start": 144,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -24.54494849474592,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 1076,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_2",
+          "start": 186,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -30.07665643471841,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 1034,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_3",
+          "start": 247,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 20.38210440917673,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 973,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_4",
+          "start": 299,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 11.540884574645567,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 921,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_5",
+          "start": 392,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 24.964640277111478,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 828,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_6",
+          "start": 494,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 21.997864776029136,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 726,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_7",
+          "start": 535,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 8.420608675555396,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 685,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_8",
+          "start": 615,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -6.904159319715912,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 605,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_9",
+          "start": 699,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -6.1020889904290385,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 521,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_10",
+          "start": 742,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -14.916568640557708,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 478,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_11",
+          "start": 837,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -29.440659364938924,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 383,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_12",
+          "start": 912,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -12.204844412993287,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 308,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_13",
+          "start": 995,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 6.71534041966032,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 225,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_14",
+          "start": 1046,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 11.87144580812971,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 174,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        }
+      ],
+      "episode_metrics_agent": {
+        "cv_violation_mean": 48.19166564941406,
+        "mv_violation_mean": 0.0,
+        "mv_tv": 1017.32177734375,
+        "mv_activity_ratio": 0.19793016912840497,
+        "mv_bound_hugging_score": 0.35361272989075043,
+        "mv_bound_usage": 0.76171875,
+        "mv_reversal_rate": 0.42411812961443807,
+        "economic_score": -72.46916198730469,
+        "cum_raw_reward": -88412.3359375,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "episode_metrics_baseline": {
+        "cv_violation_mean": 149.44622802734375,
+        "mv_violation_mean": 0.0,
+        "mv_tv": 0.0,
+        "mv_activity_ratio": 0.0,
+        "mv_bound_hugging_score": 0.5,
+        "mv_bound_usage": 0.0,
+        "mv_reversal_rate": 0.0,
+        "economic_score": -165.62100219726562,
+        "cum_raw_reward": -202057.625,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "event_response": {
+        "window_steps": 200,
+        "settle_band_normed": 0.05,
+        "overshoot_normed": {
+          "median": 0.5378766741071428,
+          "p90": 0.8782660348074777,
+          "max": 0.9604372297014508,
+          "n": 14
+        },
+        "iae_window_normed": {
+          "median": 41.716661180768696,
+          "p90": 93.96274076189314,
+          "max": 107.40372903006417,
+          "n": 14
+        },
+        "settle_steps": {
+          "median": 200.0,
+          "p90": 200.0,
+          "max": 200.0,
+          "n_settled": 14,
+          "n_total": 14
+        },
+        "events": [
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_1",
+            "start": 144,
+            "end": 344,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -24.54494849474592,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.4668459211077009,
+              "settle_steps": 200,
+              "iae_window_normed": 33.14460754394531
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.4668459211077009,
+                "settle_steps": 200,
+                "iae_window_normed": 33.14460754394531
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_2",
+            "start": 186,
+            "end": 386,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -30.07665643471841,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.49861907958984375,
+              "settle_steps": 200,
+              "iae_window_normed": 35.8886217389788
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.49861907958984375,
+                "settle_steps": 200,
+                "iae_window_normed": 35.8886217389788
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_3",
+            "start": 247,
+            "end": 447,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 20.38210440917673,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.8699210030691964,
+              "settle_steps": 200,
+              "iae_window_normed": 91.80980573381697
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.8699210030691964,
+                "settle_steps": 200,
+                "iae_window_normed": 91.80980573381697
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_4",
+            "start": 299,
+            "end": 499,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 11.540884574645567,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.4881014142717634,
+              "settle_steps": 200,
+              "iae_window_normed": 34.95176478794643
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.4881014142717634,
+                "settle_steps": 200,
+                "iae_window_normed": 34.95176478794643
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_5",
+            "start": 392,
+            "end": 592,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 24.964640277111478,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.9604372297014508,
+              "settle_steps": 200,
+              "iae_window_normed": 86.99326760428292
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.9604372297014508,
+                "settle_steps": 200,
+                "iae_window_normed": 86.99326760428292
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_6",
+            "start": 494,
+            "end": 694,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 21.997864776029136,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.8818424769810268,
+              "settle_steps": 200,
+              "iae_window_normed": 107.40372903006417
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.8818424769810268,
+                "settle_steps": 200,
+                "iae_window_normed": 107.40372903006417
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_7",
+            "start": 535,
+            "end": 735,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 8.420608675555396,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.577134268624442,
+              "settle_steps": 200,
+              "iae_window_normed": 58.71030099051339
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.577134268624442,
+                "settle_steps": 200,
+                "iae_window_normed": 58.71030099051339
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_8",
+            "start": 615,
+            "end": 815,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -6.904159319715912,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.27815682547433035,
+              "settle_steps": 183,
+              "iae_window_normed": 15.596190316336497
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.27815682547433035,
+                "settle_steps": 183,
+                "iae_window_normed": 15.596190316336497
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_9",
+            "start": 699,
+            "end": 899,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -6.1020889904290385,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.5929456438337054,
+              "settle_steps": 200,
+              "iae_window_normed": 39.61870683942522
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.5929456438337054,
+                "settle_steps": 200,
+                "iae_window_normed": 39.61870683942522
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_10",
+            "start": 742,
+            "end": 942,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -14.916568640557708,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.6560167585100446,
+              "settle_steps": 200,
+              "iae_window_normed": 59.25719996861049
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.6560167585100446,
+                "settle_steps": 200,
+                "iae_window_normed": 59.25719996861049
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_11",
+            "start": 837,
+            "end": 1037,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -29.440659364938924,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.6424963814871651,
+              "settle_steps": 200,
+              "iae_window_normed": 94.88542720249721
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.6424963814871651,
+                "settle_steps": 200,
+                "iae_window_normed": 94.88542720249721
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_12",
+            "start": 912,
+            "end": 1112,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -12.204844412993287,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.41570608956473215,
+              "settle_steps": 200,
+              "iae_window_normed": 43.81461552211216
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.41570608956473215,
+                "settle_steps": 200,
+                "iae_window_normed": 43.81461552211216
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_13",
+            "start": 995,
+            "end": 1195,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 6.71534041966032,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.3455843244280134,
+              "settle_steps": 200,
+              "iae_window_normed": 23.6832024710519
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.3455843244280134,
+                "settle_steps": 200,
+                "iae_window_normed": 23.6832024710519
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_14",
+            "start": 1046,
+            "end": 1220,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 11.87144580812971,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.33418164934430805,
+              "settle_steps": 174,
+              "iae_window_normed": 23.081817626953125
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.33418164934430805,
+                "settle_steps": 174,
+                "iae_window_normed": 23.081817626953125
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "seed": 10001,
+      "cum_raw_reward": -11129.39453125,
+      "mean_cv_violation": 2.7082371711730957,
+      "mean_mv_violation": 0.0,
+      "event_annotations": [
+        {
+          "cv_row": 0,
+          "start": 138,
+          "overshoot": -2.7884597778320312,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_1"
+        },
+        {
+          "cv_row": 0,
+          "start": 239,
+          "overshoot": 3.409698486328125,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_2"
+        },
+        {
+          "cv_row": 0,
+          "start": 315,
+          "overshoot": 2.7129058837890625,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_3"
+        },
+        {
+          "cv_row": 0,
+          "start": 361,
+          "overshoot": -2.2004547119140625,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_4"
+        },
+        {
+          "cv_row": 0,
+          "start": 428,
+          "overshoot": -2.5429916381835938,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_5"
+        },
+        {
+          "cv_row": 0,
+          "start": 544,
+          "overshoot": -2.8438491821289062,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_6"
+        },
+        {
+          "cv_row": 0,
+          "start": 586,
+          "overshoot": 1.9466171264648438,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_7"
+        },
+        {
+          "cv_row": 0,
+          "start": 660,
+          "overshoot": 2.7111892700195312,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_8"
+        },
+        {
+          "cv_row": 0,
+          "start": 733,
+          "overshoot": -2.0844955444335938,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_9"
+        },
+        {
+          "cv_row": 0,
+          "start": 823,
+          "overshoot": -2.4803085327148438,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_10"
+        },
+        {
+          "cv_row": 0,
+          "start": 891,
+          "overshoot": 2.779510498046875,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_11"
+        },
+        {
+          "cv_row": 0,
+          "start": 930,
+          "overshoot": 4.688758850097656,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_12"
+        },
+        {
+          "cv_row": 0,
+          "start": 1038,
+          "overshoot": 5.210334777832031,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_13"
+        },
+        {
+          "cv_row": 0,
+          "start": 1122,
+          "overshoot": -6.1457061767578125,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_14"
+        }
+      ],
+      "schedule": [
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_1",
+          "start": 138,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 8.671621587245506,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 1082,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_2",
+          "start": 239,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -20.811714055542524,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 981,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_3",
+          "start": 315,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 29.760185622902995,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 905,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_4",
+          "start": 361,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -6.045056262100395,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 859,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_5",
+          "start": 428,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -20.936039240016694,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 792,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_6",
+          "start": 544,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 4.433996125180373,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 676,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_7",
+          "start": 586,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -27.39936748929557,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 634,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_8",
+          "start": 660,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 29.485678585595867,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 560,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_9",
+          "start": 733,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -11.833082503997991,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 487,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_10",
+          "start": 823,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -12.479532670875116,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 397,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_11",
+          "start": 891,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 15.787651415431188,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 329,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_12",
+          "start": 930,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 10.702847631150334,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 290,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_13",
+          "start": 1038,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -4.511388876628461,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 182,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_14",
+          "start": 1122,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -28.403874005490735,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 98,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        }
+      ],
+      "episode_metrics_agent": {
+        "cv_violation_mean": 2.7082371711730957,
+        "mv_violation_mean": 0.0,
+        "mv_tv": 992.7021484375,
+        "mv_activity_ratio": 0.1523931085795304,
+        "mv_bound_hugging_score": 0.2940196501101301,
+        "mv_bound_usage": 0.8776041666666666,
+        "mv_reversal_rate": 0.39868744872846595,
+        "economic_score": -9.122461318969727,
+        "cum_raw_reward": -11129.39453125,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "episode_metrics_baseline": {
+        "cv_violation_mean": 88.56112670898438,
+        "mv_violation_mean": 0.0,
+        "mv_tv": 0.0,
+        "mv_activity_ratio": 0.0,
+        "mv_bound_hugging_score": 0.5,
+        "mv_bound_usage": 0.0,
+        "mv_reversal_rate": 0.0,
+        "economic_score": -126.07689666748047,
+        "cum_raw_reward": -153813.8125,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "event_response": {
+        "window_steps": 200,
+        "settle_band_normed": 0.05,
+        "overshoot_normed": {
+          "median": 0.3923154558454241,
+          "p90": 0.7219802856445313,
+          "max": 0.8779580252511161,
+          "n": 14
+        },
+        "iae_window_normed": {
+          "median": 30.168775830950057,
+          "p90": 42.81778586251395,
+          "max": 65.31979043143136,
+          "n": 14
+        },
+        "settle_steps": {
+          "median": 200.0,
+          "p90": 200.0,
+          "max": 200.0,
+          "n_settled": 14,
+          "n_total": 14
+        },
+        "events": [
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_1",
+            "start": 138,
+            "end": 338,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 8.671621587245506,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.3983513968331473,
+              "settle_steps": 200,
+              "iae_window_normed": 31.916875566755024
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.3983513968331473,
+                "settle_steps": 200,
+                "iae_window_normed": 31.916875566755024
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_2",
+            "start": 239,
+            "end": 439,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -20.811714055542524,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.4870997837611607,
+              "settle_steps": 199,
+              "iae_window_normed": 39.816975184849326
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.4870997837611607,
+                "settle_steps": 199,
+                "iae_window_normed": 39.816975184849326
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_3",
+            "start": 315,
+            "end": 515,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 29.760185622902995,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.3875579833984375,
+              "settle_steps": 192,
+              "iae_window_normed": 23.828414916992188
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.3875579833984375,
+                "settle_steps": 192,
+                "iae_window_normed": 23.828414916992188
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_4",
+            "start": 361,
+            "end": 561,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -6.045056262100395,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.31435067313058035,
+              "settle_steps": 192,
+              "iae_window_normed": 24.28199441092355
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.31435067313058035,
+                "settle_steps": 192,
+                "iae_window_normed": 24.28199441092355
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_5",
+            "start": 428,
+            "end": 628,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -20.936039240016694,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.3632845197405134,
+              "settle_steps": 200,
+              "iae_window_normed": 24.253451756068635
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.3632845197405134,
+                "settle_steps": 200,
+                "iae_window_normed": 24.253451756068635
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_6",
+            "start": 544,
+            "end": 744,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 4.433996125180373,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.40626416887555805,
+              "settle_steps": 200,
+              "iae_window_normed": 41.16579001290458
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.40626416887555805,
+                "settle_steps": 200,
+                "iae_window_normed": 41.16579001290458
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_7",
+            "start": 586,
+            "end": 786,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -27.39936748929557,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.2780881609235491,
+              "settle_steps": 200,
+              "iae_window_normed": 26.023958478655135
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.2780881609235491,
+                "settle_steps": 200,
+                "iae_window_normed": 26.023958478655135
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_8",
+            "start": 660,
+            "end": 860,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 29.485678585595867,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.38731275285993305,
+              "settle_steps": 200,
+              "iae_window_normed": 23.425146920340403
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.38731275285993305,
+                "settle_steps": 200,
+                "iae_window_normed": 23.425146920340403
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_9",
+            "start": 733,
+            "end": 933,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -11.833082503997991,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.2977850777762277,
+              "settle_steps": 199,
+              "iae_window_normed": 28.42067609514509
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.2977850777762277,
+                "settle_steps": 199,
+                "iae_window_normed": 28.42067609514509
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_10",
+            "start": 823,
+            "end": 1023,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -12.479532670875116,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.3543297903878348,
+              "settle_steps": 200,
+              "iae_window_normed": 40.134419032505576
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.3543297903878348,
+                "settle_steps": 200,
+                "iae_window_normed": 40.134419032505576
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_11",
+            "start": 891,
+            "end": 1091,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 15.787651415431188,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.3970729282924107,
+              "settle_steps": 200,
+              "iae_window_normed": 27.643672398158486
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.3970729282924107,
+                "settle_steps": 200,
+                "iae_window_normed": 27.643672398158486
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_12",
+            "start": 930,
+            "end": 1130,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 10.702847631150334,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.6698226928710938,
+              "settle_steps": 200,
+              "iae_window_normed": 34.15742492675781
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.6698226928710938,
+                "settle_steps": 200,
+                "iae_window_normed": 34.15742492675781
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_13",
+            "start": 1038,
+            "end": 1220,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -4.511388876628461,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.7443335396902901,
+              "settle_steps": 177,
+              "iae_window_normed": 43.52578408377511
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.7443335396902901,
+                "settle_steps": 177,
+                "iae_window_normed": 43.52578408377511
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_14",
+            "start": 1122,
+            "end": 1220,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -28.403874005490735,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.8779580252511161,
+              "settle_steps": 98,
+              "iae_window_normed": 65.31979043143136
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.8779580252511161,
+                "settle_steps": 98,
+                "iae_window_normed": 65.31979043143136
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "seed": 10002,
+      "cum_raw_reward": -9147.66796875,
+      "mean_cv_violation": 3.1849582195281982,
+      "mean_mv_violation": 0.00024338782532140613,
+      "event_annotations": [
+        {
+          "cv_row": 0,
+          "start": 102,
+          "overshoot": -5.268768310546875,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_1"
+        },
+        {
+          "cv_row": 0,
+          "start": 175,
+          "overshoot": 3.9589080810546875,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_2"
+        },
+        {
+          "cv_row": 0,
+          "start": 227,
+          "overshoot": 3.7284622192382812,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_3"
+        },
+        {
+          "cv_row": 0,
+          "start": 335,
+          "overshoot": 4.2806854248046875,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_4"
+        },
+        {
+          "cv_row": 0,
+          "start": 426,
+          "overshoot": 4.54925537109375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_5"
+        },
+        {
+          "cv_row": 0,
+          "start": 467,
+          "overshoot": 5.107017517089844,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_6"
+        },
+        {
+          "cv_row": 0,
+          "start": 523,
+          "overshoot": 3.57568359375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_7"
+        },
+        {
+          "cv_row": 0,
+          "start": 649,
+          "overshoot": -4.662132263183594,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_8"
+        },
+        {
+          "cv_row": 0,
+          "start": 739,
+          "overshoot": 2.4876251220703125,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_9"
+        },
+        {
+          "cv_row": 0,
+          "start": 796,
+          "overshoot": -3.4002838134765625,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_10"
+        },
+        {
+          "cv_row": 0,
+          "start": 897,
+          "overshoot": 4.998588562011719,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_11"
+        },
+        {
+          "cv_row": 0,
+          "start": 1004,
+          "overshoot": -2.23089599609375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_12"
+        },
+        {
+          "cv_row": 0,
+          "start": 1048,
+          "overshoot": 3.3398056030273438,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_13"
+        },
+        {
+          "cv_row": 0,
+          "start": 1092,
+          "overshoot": 1.8764495849609375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_14"
+        }
+      ],
+      "schedule": [
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_1",
+          "start": 102,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 11.691706846008822,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 1118,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_2",
+          "start": 175,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -6.507384509165109,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 1045,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_3",
+          "start": 227,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 20.385918248676393,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 993,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_4",
+          "start": 335,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -19.76515288555558,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 885,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_5",
+          "start": 426,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -11.207756925493788,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 794,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_6",
+          "start": 467,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -5.074934392297682,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 753,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_7",
+          "start": 523,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 27.32910792800861,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 697,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_8",
+          "start": 649,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -29.201671202707175,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 571,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_9",
+          "start": 739,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 9.440585321086157,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 481,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_10",
+          "start": 796,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -14.492227000297493,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 424,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_11",
+          "start": 897,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 15.914914873756754,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 323,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_12",
+          "start": 1004,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -11.493153550622836,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 216,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_13",
+          "start": 1048,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 22.564386443295543,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 172,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_14",
+          "start": 1092,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 6.807584998438351,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 128,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        }
+      ],
+      "episode_metrics_agent": {
+        "cv_violation_mean": 3.1849582195281982,
+        "mv_violation_mean": 0.00024338782532140613,
+        "mv_tv": 1038.03173828125,
+        "mv_activity_ratio": 0.13666949461909159,
+        "mv_bound_hugging_score": 0.2578037501684303,
+        "mv_bound_usage": 0.5944010416666666,
+        "mv_reversal_rate": 0.38720262510254305,
+        "economic_score": -7.4980854988098145,
+        "cum_raw_reward": -9147.66796875,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "episode_metrics_baseline": {
+        "cv_violation_mean": 46.37767028808594,
+        "mv_violation_mean": 0.0,
+        "mv_tv": 0.0,
+        "mv_activity_ratio": 0.0,
+        "mv_bound_hugging_score": 0.5,
+        "mv_bound_usage": 0.0,
+        "mv_reversal_rate": 0.0,
+        "economic_score": -79.3665771484375,
+        "cum_raw_reward": -96827.2265625,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "event_response": {
+        "window_steps": 200,
+        "settle_band_normed": 0.05,
+        "overshoot_normed": {
+          "median": 0.5490978785923549,
+          "p90": 0.7249269757952009,
+          "max": 0.7526811872209821,
+          "n": 14
+        },
+        "iae_window_normed": {
+          "median": 38.21135820661273,
+          "p90": 69.81840046473913,
+          "max": 92.32607378278459,
+          "n": 14
+        },
+        "settle_steps": {
+          "median": 200.0,
+          "p90": 200.0,
+          "max": 200.0,
+          "n_settled": 14,
+          "n_total": 14
+        },
+        "events": [
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_1",
+            "start": 102,
+            "end": 302,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 11.691706846008822,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.7526811872209821,
+              "settle_steps": 198,
+              "iae_window_normed": 65.77354649135044
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.7526811872209821,
+                "settle_steps": 198,
+                "iae_window_normed": 65.77354649135044
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_2",
+            "start": 175,
+            "end": 375,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -6.507384509165109,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.5655582972935268,
+              "settle_steps": 200,
+              "iae_window_normed": 39.2208971296038
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.5655582972935268,
+                "settle_steps": 200,
+                "iae_window_normed": 39.2208971296038
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_3",
+            "start": 227,
+            "end": 427,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 20.385918248676393,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.532637459891183,
+              "settle_steps": 200,
+              "iae_window_normed": 33.428691319056924
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.532637459891183,
+                "settle_steps": 200,
+                "iae_window_normed": 33.428691319056924
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_4",
+            "start": 335,
+            "end": 535,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -19.76515288555558,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.6115264892578125,
+              "settle_steps": 200,
+              "iae_window_normed": 26.27012743268694
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.6115264892578125,
+                "settle_steps": 200,
+                "iae_window_normed": 26.27012743268694
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_5",
+            "start": 426,
+            "end": 626,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -11.207756925493788,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.6498936244419643,
+              "settle_steps": 200,
+              "iae_window_normed": 37.20181928362165
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.6498936244419643,
+                "settle_steps": 200,
+                "iae_window_normed": 37.20181928362165
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_6",
+            "start": 467,
+            "end": 667,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -5.074934392297682,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.7295739310128349,
+              "settle_steps": 200,
+              "iae_window_normed": 53.18034362792969
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.7295739310128349,
+                "settle_steps": 200,
+                "iae_window_normed": 53.18034362792969
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_7",
+            "start": 523,
+            "end": 723,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 27.32910792800861,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.5108119419642857,
+              "settle_steps": 200,
+              "iae_window_normed": 27.609316144670757
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.5108119419642857,
+                "settle_steps": 200,
+                "iae_window_normed": 27.609316144670757
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_8",
+            "start": 649,
+            "end": 849,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -29.201671202707175,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.6660188947405133,
+              "settle_steps": 200,
+              "iae_window_normed": 71.55190931047713
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.6660188947405133,
+                "settle_steps": 200,
+                "iae_window_normed": 71.55190931047713
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_9",
+            "start": 739,
+            "end": 939,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 9.440585321086157,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.35537501743861605,
+              "settle_steps": 200,
+              "iae_window_normed": 28.65348924909319
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.35537501743861605,
+                "settle_steps": 200,
+                "iae_window_normed": 28.65348924909319
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_10",
+            "start": 796,
+            "end": 996,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -14.492227000297493,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.4857548304966518,
+              "settle_steps": 200,
+              "iae_window_normed": 47.51404898507255
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.4857548304966518,
+                "settle_steps": 200,
+                "iae_window_normed": 47.51404898507255
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_11",
+            "start": 897,
+            "end": 1097,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 15.914914873756754,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.7140840802873883,
+              "settle_steps": 200,
+              "iae_window_normed": 92.32607378278459
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.7140840802873883,
+                "settle_steps": 200,
+                "iae_window_normed": 92.32607378278459
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_12",
+            "start": 1004,
+            "end": 1204,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -11.493153550622836,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.31869942801339285,
+              "settle_steps": 200,
+              "iae_window_normed": 21.23147691999163
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.31869942801339285,
+                "settle_steps": 200,
+                "iae_window_normed": 21.23147691999163
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_13",
+            "start": 1048,
+            "end": 1220,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 22.564386443295543,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.4771150861467634,
+              "settle_steps": 172,
+              "iae_window_normed": 40.442883082798545
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.4771150861467634,
+                "settle_steps": 172,
+                "iae_window_normed": 40.442883082798545
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_14",
+            "start": 1092,
+            "end": 1220,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 6.807584998438351,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.26806422642299105,
+              "settle_steps": 128,
+              "iae_window_normed": 7.372049604143415
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.26806422642299105,
+                "settle_steps": 128,
+                "iae_window_normed": 7.372049604143415
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "seed": 10003,
+      "cum_raw_reward": -40620.08984375,
+      "mean_cv_violation": 11.771712303161621,
+      "mean_mv_violation": 0.0,
+      "event_annotations": [
+        {
+          "cv_row": 0,
+          "start": 119,
+          "overshoot": 3.3454971313476562,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_1"
+        },
+        {
+          "cv_row": 0,
+          "start": 169,
+          "overshoot": -2.3940963745117188,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_2"
+        },
+        {
+          "cv_row": 0,
+          "start": 224,
+          "overshoot": 3.5987319946289062,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_3"
+        },
+        {
+          "cv_row": 0,
+          "start": 331,
+          "overshoot": -2.1433563232421875,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_4"
+        },
+        {
+          "cv_row": 0,
+          "start": 406,
+          "overshoot": -3.8138427734375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_5"
+        },
+        {
+          "cv_row": 0,
+          "start": 444,
+          "overshoot": -2.4810562133789062,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_6"
+        },
+        {
+          "cv_row": 0,
+          "start": 513,
+          "overshoot": -3.708984375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_7"
+        },
+        {
+          "cv_row": 0,
+          "start": 610,
+          "overshoot": -2.99359130859375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_8"
+        },
+        {
+          "cv_row": 0,
+          "start": 664,
+          "overshoot": 4.715690612792969,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_9"
+        },
+        {
+          "cv_row": 0,
+          "start": 751,
+          "overshoot": 2.6259841918945312,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_10"
+        },
+        {
+          "cv_row": 0,
+          "start": 795,
+          "overshoot": -2.820068359375,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_11"
+        },
+        {
+          "cv_row": 0,
+          "start": 848,
+          "overshoot": 2.1703872680664062,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_12"
+        },
+        {
+          "cv_row": 0,
+          "start": 893,
+          "overshoot": 2.7470932006835938,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_economic_13"
+        },
+        {
+          "cv_row": 0,
+          "start": 1120,
+          "overshoot": 2.760955810546875,
+          "settle_steps": 0,
+          "name": "measured_dv_FEED_DV_kg_h_violation_14"
+        }
+      ],
+      "schedule": [
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_1",
+          "start": 119,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 4.588598855296318,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 1101,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_2",
+          "start": 169,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 5.599489539585649,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 1051,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_3",
+          "start": 224,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 29.224333015699226,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 996,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_4",
+          "start": 331,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -24.394973874225858,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 889,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_5",
+          "start": 406,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -27.480914267306705,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 814,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_6",
+          "start": 444,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 8.3458641101803,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 776,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_7",
+          "start": 513,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": 11.666788067631266,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 707,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_8",
+          "start": 610,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": -19.308596167081113,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 610,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_9",
+          "start": 664,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 22.86753749124763,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 556,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_10",
+          "start": 751,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 17.407346785949905,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 469,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_11",
+          "start": 795,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -6.352975960541707,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 425,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_12",
+          "start": 848,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -10.196862605617984,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 372,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_economic_13",
+          "start": 893,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "economic",
+          "delta": -11.671607614795327,
+          "allow_out_of_bounds": false,
+          "color": "#2a9d8f",
+          "duration": 327,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": false
+        },
+        {
+          "name": "measured_dv_FEED_DV_kg_h_violation_14",
+          "start": 1120,
+          "target_group": "dv",
+          "target_pos": 0,
+          "target_state_index": 0,
+          "target_name": "FEED_DV_kg_h",
+          "source": "measured_dv",
+          "intent": "violation",
+          "delta": 28.654533454511277,
+          "allow_out_of_bounds": false,
+          "color": "#e76f51",
+          "duration": 100,
+          "shape": "step",
+          "period": 1220.0,
+          "_applied": true,
+          "_is_violation": true
+        }
+      ],
+      "episode_metrics_agent": {
+        "cv_violation_mean": 11.771712303161621,
+        "mv_violation_mean": 0.0,
+        "mv_tv": 937.5047607421875,
+        "mv_activity_ratio": 0.1336161032099946,
+        "mv_bound_hugging_score": 0.3620226405617969,
+        "mv_bound_usage": 0.6744791666666666,
+        "mv_reversal_rate": 0.39048400328137817,
+        "economic_score": -33.295169830322266,
+        "cum_raw_reward": -40620.08984375,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "episode_metrics_baseline": {
+        "cv_violation_mean": 14.575496673583984,
+        "mv_violation_mean": 0.0,
+        "mv_tv": 0.0,
+        "mv_activity_ratio": 0.0,
+        "mv_bound_hugging_score": 0.5,
+        "mv_bound_usage": 0.0,
+        "mv_reversal_rate": 0.0,
+        "economic_score": -24.240758895874023,
+        "cum_raw_reward": -29573.7265625,
+        "iae_normed_mean": 0.0,
+        "itae_normed_mean": 0.0,
+        "ise_normed_mean": 0.0,
+        "iae_normed_per_cv": [],
+        "itae_normed_per_cv": [],
+        "ise_normed_per_cv": []
+      },
+      "event_response": {
+        "window_steps": 200,
+        "settle_band_normed": 0.05,
+        "overshoot_normed": {
+          "median": 0.3986445835658482,
+          "p90": 0.5403407505580358,
+          "max": 0.6736700875418526,
+          "n": 14
+        },
+        "iae_window_normed": {
+          "median": 30.882680075509207,
+          "p90": 55.08835133143836,
+          "max": 70.25899069649833,
+          "n": 14
+        },
+        "settle_steps": {
+          "median": 200.0,
+          "p90": 200.0,
+          "max": 200.0,
+          "n_settled": 14,
+          "n_total": 14
+        },
+        "events": [
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_1",
+            "start": 119,
+            "end": 319,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 4.588598855296318,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.47792816162109375,
+              "settle_steps": 200,
+              "iae_window_normed": 25.57391357421875
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.47792816162109375,
+                "settle_steps": 200,
+                "iae_window_normed": 25.57391357421875
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_2",
+            "start": 169,
+            "end": 369,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 5.599489539585649,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.3420137677873884,
+              "settle_steps": 199,
+              "iae_window_normed": 31.227321079799104
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.3420137677873884,
+                "settle_steps": 199,
+                "iae_window_normed": 31.227321079799104
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_3",
+            "start": 224,
+            "end": 424,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 29.224333015699226,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.5141045706612724,
+              "settle_steps": 200,
+              "iae_window_normed": 37.09189169747489
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.5141045706612724,
+                "settle_steps": 200,
+                "iae_window_normed": 37.09189169747489
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_4",
+            "start": 331,
+            "end": 531,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -24.394973874225858,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.30619376046316965,
+              "settle_steps": 200,
+              "iae_window_normed": 30.538039071219305
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.30619376046316965,
+                "settle_steps": 200,
+                "iae_window_normed": 30.538039071219305
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_5",
+            "start": 406,
+            "end": 606,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -27.480914267306705,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.5448346819196429,
+              "settle_steps": 200,
+              "iae_window_normed": 70.25899069649833
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.5448346819196429,
+                "settle_steps": 200,
+                "iae_window_normed": 70.25899069649833
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_6",
+            "start": 444,
+            "end": 644,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 8.3458641101803,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.3544366019112723,
+              "settle_steps": 200,
+              "iae_window_normed": 27.546585083007812
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.3544366019112723,
+                "settle_steps": 200,
+                "iae_window_normed": 27.546585083007812
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_7",
+            "start": 513,
+            "end": 713,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": 11.666788067631266,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.5298549107142857,
+              "settle_steps": 200,
+              "iae_window_normed": 38.055895124162944
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.5298549107142857,
+                "settle_steps": 200,
+                "iae_window_normed": 38.055895124162944
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_8",
+            "start": 610,
+            "end": 810,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": -19.308596167081113,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.42765590122767855,
+              "settle_steps": 200,
+              "iae_window_normed": 36.55208478655134
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.42765590122767855,
+                "settle_steps": 200,
+                "iae_window_normed": 36.55208478655134
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_9",
+            "start": 664,
+            "end": 864,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 22.86753749124763,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.6736700875418526,
+              "settle_steps": 197,
+              "iae_window_normed": 62.38797542027064
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.6736700875418526,
+                "settle_steps": 197,
+                "iae_window_normed": 62.38797542027064
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_10",
+            "start": 751,
+            "end": 951,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 17.407346785949905,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.3751405988420759,
+              "settle_steps": 200,
+              "iae_window_normed": 31.6714848109654
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.3751405988420759,
+                "settle_steps": 200,
+                "iae_window_normed": 31.6714848109654
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_11",
+            "start": 795,
+            "end": 995,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -6.352975960541707,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": -0.40286690848214285,
+              "settle_steps": 200,
+              "iae_window_normed": 23.869008745465962
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": -0.40286690848214285,
+                "settle_steps": 200,
+                "iae_window_normed": 23.869008745465962
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_12",
+            "start": 848,
+            "end": 1048,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -10.196862605617984,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.3100553240094866,
+              "settle_steps": 186,
+              "iae_window_normed": 20.98636191231864
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.3100553240094866,
+                "settle_steps": 186,
+                "iae_window_normed": 20.98636191231864
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_economic_13",
+            "start": 893,
+            "end": 1093,
+            "intent": "economic",
+            "source": "measured_dv",
+            "delta": -11.671607614795327,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.39244188581194195,
+              "settle_steps": 200,
+              "iae_window_normed": 29.59905242919922
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.39244188581194195,
+                "settle_steps": 200,
+                "iae_window_normed": 29.59905242919922
+              }
+            ]
+          },
+          {
+            "name": "measured_dv_FEED_DV_kg_h_violation_14",
+            "start": 1120,
+            "end": 1220,
+            "intent": "violation",
+            "source": "measured_dv",
+            "delta": 28.654533454511277,
+            "worst_cv": {
+              "cv_row": 0,
+              "cv_index": 0,
+              "peak_overshoot_normed": 0.39442225864955355,
+              "settle_steps": 100,
+              "iae_window_normed": 25.032250540597097
+            },
+            "per_cv": [
+              {
+                "cv_row": 0,
+                "cv_index": 0,
+                "peak_overshoot_normed": 0.39442225864955355,
+                "settle_steps": 100,
+                "iae_window_normed": 25.032250540597097
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
