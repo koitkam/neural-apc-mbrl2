@@ -148,9 +148,19 @@ class RSSMState:
 
     @property
     def feat(self) -> torch.Tensor:
-        # NOTE: the DOB state ``d`` is deliberately NOT part of ``feat`` — it is
-        # an OUTPUT-space additive bias (added at decode), not a latent the heads
-        # condition on.  Keeping feat = [h, z_flat] preserves the head input dim.
+        # Scope 2 (DOB feed-forward, 2026-06-11): when the DOB carries a
+        # disturbance estimate ``d`` we APPEND it (detached) so the actor /
+        # critic / reward heads CONDITION on the disturbance — explicit
+        # feed-forward.  p114 RCA: without this the imagined world is
+        # disturbance-free and the actor learns to be passive (mv_tv≈0 while
+        # CV drifts).  ``d`` is detached because it is a sensor-like estimate
+        # driven by the recon innovation (the DOB is trained via ``apply_dob``
+        # on the recon, NOT by the heads), so head gradients must not reshape
+        # it.  The DECODER still reads only ``[h, z_flat]`` (``decode`` slices
+        # the d-tail off) — the clean-gain ``g`` + additive ``d`` factorisation
+        # is preserved.  ``d is None`` (DOB off) ⇒ feat = [h, z_flat] exactly.
+        if self.d is not None:
+            return torch.cat([self.h, self.stoch_flat, self.d.detach()], dim=-1)
         return torch.cat([self.h, self.stoch_flat], dim=-1)
 
 
@@ -222,8 +232,10 @@ class RSSMDynamics(nn.Module):
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
-        # Decoder: [h, z] → reconstructed (normalized) obs.
-        self.decoder = _MLP(self.feat_dim, self.obs_dim,
+        # Decoder: [h, z] → reconstructed (normalized) obs.  Reads the CORE
+        # feature only (deter + stoch); the DOB d-tail (Scope 2) is sliced off
+        # in ``decode`` and re-added via ``apply_dob`` (the g + d factorisation).
+        self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
         # Recurrent dynamics: pre-GRU projection then GRUCell.
         self.pre_gru = _MLP(trans_in, trans_in,
@@ -257,7 +269,11 @@ class RSSMDynamics(nn.Module):
 
     @property
     def feat_dim(self) -> int:
-        return self.deter_dim + self.stoch_flat_dim
+        # Scope 2: the head-facing feature includes the DOB disturbance estimate
+        # ``d`` (one scalar per CV) so the actor/critic/reward heads condition
+        # on it.  The decoder reads only the core (deter+stoch) — see ``decode``.
+        core = self.deter_dim + self.stoch_flat_dim
+        return core + (self.n_cv if getattr(self, 'dob_enabled', False) else 0)
 
     # ----- embedding ----------------------------------------------------
     def embed(self, obs: torch.Tensor) -> torch.Tensor:
@@ -384,7 +400,11 @@ class RSSMDynamics(nn.Module):
         return feats, post_logits, prior_logits, state, ds
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
-        return self.decoder(feat)
+        # Scope 2: the decoder learns the CLEAN g([h, z]); slice off any DOB
+        # d-tail that ``feat`` may carry (it is re-added by ``apply_dob``).  When
+        # the DOB is off, ``feat`` is already core-width so this is a no-op.
+        core = self.deter_dim + self.stoch_flat_dim
+        return self.decoder(feat[..., :core])
 
 
 # ---------------------------------------------------------------------------

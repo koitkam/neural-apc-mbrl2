@@ -130,7 +130,78 @@ def _check(wm_type):
     print(f'[smoke] OK  DOB params in opt_world only, recon backprops (|g|={g:.4f}) [{wm_type}]')
 
 
+def _check_scope2(wm_type):
+    """Scope 2: the DOB estimate d_t is fed (detached) into ``feat`` so the
+    actor/critic/reward heads condition on it; the decoder still reads core."""
+    print(f'\n=== {wm_type} Scope 2 (d_t in feat) ===')
+    # OFF: feat_dim == core, rollout feat width == core (byte-identical)
+    cfg, model, batch = _mk(wm_type, dob=False)
+    rssm = model.dynamics
+    core = rssm.deter_dim + rssm.stoch_flat_dim
+    assert rssm.feat_dim == core, f'feat_dim off should be core={core}, got {rssm.feat_dim}'
+    feats_off, _, _, _last_off, _ = rssm.rollout_observed(
+        batch['obs'], batch['act'], sample=True)
+    assert feats_off.shape[-1] == core, f'feat width off {feats_off.shape[-1]} != {core}'
+    print(f'[smoke] OK  DOB off: feat_dim == core == {core} [{wm_type}]')
+
+    # ON: feat_dim == core + n_cv; the rollout feats carry d in the tail; the
+    # decoder ignores the d-tail; the heads accept the augmented width.
+    cfg, model, batch = _mk(wm_type, dob=True, cv_idx=(2,))
+    rssm = model.dynamics
+    n_cv = rssm.n_cv
+    assert rssm.feat_dim == core + n_cv, \
+        f'feat_dim on should be {core + n_cv}, got {rssm.feat_dim}'
+    feats, _, _, _last, ds = rssm.rollout_observed(
+        batch['obs'], batch['act'], sample=True)
+    assert feats.shape[-1] == core + n_cv, \
+        f'feat width on {feats.shape[-1]} != {core + n_cv}'
+    assert torch.allclose(feats[..., core:], ds), 'feat d-tail must equal ds'
+    rec_full = rssm.decode(feats)
+    rec_core = rssm.decode(feats[..., :core])
+    assert torch.allclose(rec_full, rec_core), 'decode must ignore the d-tail'
+    print(f'[smoke] OK  DOB on: feat_dim == core+n_cv == {core + n_cv}; '
+          f'd-tail==ds; decode slices [{wm_type}]')
+
+    # heads accept the augmented feat (dim match) — this is the feed-forward path
+    feat1 = feats[:, -1]                                    # (B, core+n_cv)
+    _ = model.value(feat1)
+    _ = model.reward(feat1)
+    a, _lp, _ent, _raw = model.policy.sample_with_raw(feat1)
+    assert a.shape[0] == feat1.shape[0]
+    print(f'[smoke] OK  policy/value/reward accept augmented feat '
+          f'(dim {feat1.shape[-1]}) [{wm_type}]')
+
+    # the d-tail is DETACHED: a head's gradient must NOT leak into the DOB via
+    # feat (the DOB is trained by the recon innovation, not the heads).
+    model.zero_grad(set_to_none=True)
+    feats2, _, _, _, ds2 = rssm.rollout_observed(
+        batch['obs'], batch['act'], sample=True)
+    ds2.retain_grad()
+    model.value(feats2[:, -1]).sum().backward()
+    leaked = 0.0 if ds2.grad is None else float(ds2.grad.abs().sum())
+    assert leaked == 0.0, f'd-tail leaked grad into value head: {leaked}'
+    print(f'[smoke] OK  d-tail detached: value-head grad into ds = {leaked} [{wm_type}]')
+
+    # REGRESSION (Scope 2): the WM-loss paths that reconstruct an RSSMState from
+    # ``feats`` (overshoot / held-rollout / steady-consistency) must slice the
+    # stochastic block EXACTLY and not choke on the d-tail.  Enable all three +
+    # DOB and assert wm_total backprops cleanly (these are RSSM-only).
+    if wm_type == 'rssm':
+        cfg, model, batch = _mk(wm_type, dob=True, cv_idx=(2,))
+        cfg.wm_overshoot_coef = 0.3
+        cfg.wm_overshoot_len = 8
+        cfg.wm_held_rollout_coef = 0.5
+        cfg.wm_held_rollout_len = 8
+        cfg.wm_steady_coef = 0.1
+        losses, _, _ = world_model_loss(model, batch, cfg)
+        losses['wm_total'].backward()
+        print(f'[smoke] OK  Scope2 + overshoot/held/steady paths backprop '
+              f"(overshoot={float(losses.get('wm_overshoot_loss', 0)):.3f} "
+              f"held={float(losses.get('wm_held_rollout_loss', 0)):.3f}) [{wm_type}]")
+
+
 if __name__ == '__main__':
     for wm in ('rssm', 'tssm'):
         _check(wm)
+        _check_scope2(wm)
     print('\n[smoke] ALL DOB CHECKS PASSED (both backbones)')

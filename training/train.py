@@ -2984,7 +2984,10 @@ def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
     f = feats[:, :-1]                                  # (B, T-1, F)
     Bm = B * (T - 1)
     h = f[..., :rssm.deter_dim].reshape(Bm, -1)
-    z_flat = f[..., rssm.deter_dim:]
+    # Scope 2: slice EXACTLY the stochastic block; ``feat`` may carry a DOB
+    # d-tail (deter+stoch+n_cv) that must not bleed into the z reshape.
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    z_flat = f[..., rssm.deter_dim:_ze]
     z = z_flat.reshape(Bm, rssm.n_categoricals, rssm.n_classes)
     state = RSSMState(
         h=h,
@@ -3153,7 +3156,9 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     f0 = feats[:, starts]                                         # (B, S, F)
     Bm = B * S
     h = f0[..., :rssm.deter_dim].reshape(Bm, -1)
-    z = f0[..., rssm.deter_dim:].reshape(
+    # Scope 2: slice EXACTLY the stochastic block (exclude any DOB d-tail).
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
     state = RSSMState(
         h=h,
@@ -3234,7 +3239,9 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     f0 = feats[:, starts]                                         # (B, S, F)
     Bm = B * S
     h = f0[..., :rssm.deter_dim].reshape(Bm, -1)
-    z = f0[..., rssm.deter_dim:].reshape(
+    # Scope 2: slice EXACTLY the stochastic block (exclude any DOB d-tail).
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
     state = RSSMState(
         h=h,
@@ -3401,7 +3408,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     losses.update(kl_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
     with torch.no_grad():
-        z_flat = feats[..., rssm.deter_dim:]
+        # Scope 2: stochastic block only (exclude any DOB d-tail).
+        _ze = rssm.deter_dim + rssm.stoch_flat_dim
+        z_flat = feats[..., rssm.deter_dim:_ze]
         obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
         z_var_per_dim = z_flat.float().var(dim=(0, 1))
         losses['encoder_var_ratio'] = (z_var_per_dim.mean() / obs_var).detach()
@@ -3414,7 +3423,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         losses['z_alive_dims'] = (
             (z_var_per_dim > 0.01 * v_max).float().sum().detach())
     # z_clean here = posterior stochastic features (detached).
-    return losses, feats[..., rssm.deter_dim:].detach(), feats
+    # Scope 2: stochastic block only (exclude any DOB d-tail).
+    return losses, feats[..., rssm.deter_dim:rssm.deter_dim
+                         + rssm.stoch_flat_dim].detach(), feats
 
 
 def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
@@ -5547,8 +5558,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # P87: size the WM disturbance-estimator head per-simulator (one output
     # per CV channel).  0 ⇒ no head (pre-P87 model).  Resolved here so every
     # downstream builder (build_model) and the replay buffer agree.
+    # Scope 2 / DOB (2026-06-11): when the neural-Kalman DOB is on it REPLACES
+    # the P87 read-out head — the DOB's d_t IS the disturbance estimate, now fed
+    # into ``feat`` (so the actor/critic condition on it) and read directly by
+    # the validation diagnostic.  Retire the redundant head so it cannot
+    # trivially echo the ``d`` that is now present in ``feat`` (a feat-cheat).
+    _dob_on = (bool(getattr(cfg, 'dob_enabled', False))
+               and len(env.cv_indices) > 0)
     cfg.disturbance_head_dim = (int(len(env.cv_indices))
-                                if bool(getattr(cfg, 'disturbance_head', True))
+                                if (bool(getattr(cfg, 'disturbance_head', True))
+                                    and not _dob_on)
                                 else 0)
     # WM autoencoder lever (2026-06-09): resolve the CV obs indices per-sim so
     # the per-channel recon weight (cfg.wm_recon_cv_weight) can up-weight the

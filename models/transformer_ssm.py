@@ -179,6 +179,13 @@ class TSSMState:
 
     @property
     def feat(self) -> torch.Tensor:
+        # Scope 2 (DOB feed-forward, 2026-06-11) — mirror of RSSMState.feat:
+        # append the (detached) DOB disturbance estimate ``d`` so the actor /
+        # critic / reward heads condition on it (explicit feed-forward).  The
+        # decoder reads only ``[h, z_flat]`` (``decode`` slices the d-tail off).
+        # ``d is None`` (DOB off) ⇒ feat = [h, z_flat] exactly (byte-identical).
+        if self.d is not None:
+            return torch.cat([self.h, self.stoch_flat, self.d.detach()], dim=-1)
         return torch.cat([self.h, self.stoch_flat], dim=-1)
 
 
@@ -307,7 +314,10 @@ class TransformerSSMDynamics(nn.Module):
             nn.Linear(cfg.embed_dim, cfg.embed_dim),
         )
         self.decoder = nn.Sequential(
-            nn.Linear(self.feat_dim, cfg.embed_dim), nn.SiLU(),
+            # Scope 2: decode the CORE feature only (deter+stoch); the DOB d-tail
+            # is sliced off in ``decode`` and re-added via ``apply_dob``.
+            nn.Linear(self.deter_dim + self.stoch_flat_dim, cfg.embed_dim),
+            nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
         # Token projection: [z_{t-1}_flat ; a_t ; (dv_t)] -> d_model.
@@ -347,7 +357,11 @@ class TransformerSSMDynamics(nn.Module):
 
     @property
     def feat_dim(self) -> int:
-        return self.deter_dim + self.stoch_flat_dim
+        # Scope 2 (mirror of RSSMDynamics.feat_dim): the head-facing feature
+        # includes the DOB ``d`` (one scalar per CV); the decoder reads only the
+        # core (deter+stoch).
+        core = self.deter_dim + self.stoch_flat_dim
+        return core + (self.n_cv if getattr(self, 'dob_enabled', False) else 0)
 
     # ----- DOB helpers (mirror RSSMDynamics) -----
     def dob_decay(self) -> torch.Tensor:
@@ -369,7 +383,10 @@ class TransformerSSMDynamics(nn.Module):
         return self.encoder(obs)
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
-        return self.decoder(feat)
+        # Scope 2 (mirror of RSSMDynamics.decode): decode the CLEAN core feature;
+        # slice off any DOB d-tail (re-added by ``apply_dob``).  No-op when off.
+        core = self.deter_dim + self.stoch_flat_dim
+        return self.decoder(feat[..., :core])
 
     def initial_state(self, batch_size: int,
                       device: torch.device) -> TSSMState:
