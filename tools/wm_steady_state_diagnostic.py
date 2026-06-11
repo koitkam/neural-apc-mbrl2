@@ -181,6 +181,12 @@ def _load_model(ckpt_path: Path, device: torch.device):
         tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
         dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
         dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+        # Neural Kalman filter / DOB (2026-06-11): thread so the rebuilt model
+        # has the d_t observer params (else load_state_dict fails on DOB keys).
+        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
+        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
+        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
+        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
         # 'sdpa' is significantly faster on CPU than 'manual' (uses torch's
         # fused scaled_dot_product_attention which has a vectorised CPU path).
         attn_impl='sdpa',

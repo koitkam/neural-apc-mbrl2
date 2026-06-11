@@ -145,6 +145,10 @@ if __name__ == '__main__':
         disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
         disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
         disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
+        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
+        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
+        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
+        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)

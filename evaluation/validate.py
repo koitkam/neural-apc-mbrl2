@@ -1643,6 +1643,13 @@ def run_validation(*,
         tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
         dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
         dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+        # Neural Kalman filter / DOB (2026-06-11): MUST thread these so the
+        # rebuilt model has the d_t observer params (dynamics.dob_log_decay/
+        # gain) — else load_state_dict fails on the DOB checkpoint keys.
+        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
+        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
+        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
+        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
         attn_impl=getattr(cfg, 'attn_impl', 'auto'),
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

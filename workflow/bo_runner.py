@@ -555,6 +555,10 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         disturbance_head_dim=int(getattr(cfg_loaded, 'disturbance_head_dim', 0) or 0),
         disturbance_head_hidden=int(getattr(cfg_loaded, 'disturbance_head_hidden', 0) or 0),
         disturbance_head_layers=int(getattr(cfg_loaded, 'disturbance_head_layers', 2) or 2),
+        dob_enabled=bool(getattr(cfg_loaded, 'dob_enabled', False)),
+        cv_obs_indices=tuple(getattr(cfg_loaded, 'cv_obs_indices', ()) or ()),
+        dob_decay_init=float(getattr(cfg_loaded, 'dob_decay_init', 3.0)),
+        dob_gain_init=float(getattr(cfg_loaded, 'dob_gain_init', -2.2)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)
