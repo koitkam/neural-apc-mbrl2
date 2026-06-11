@@ -562,6 +562,23 @@ class TrainConfig:
     # disables the gate.  Ignored under stop-grad and under the adaptive path.
     disturbance_loss_gate_recon: float = 1.0
 
+    # ---- Neural Kalman filter / disturbance observer (DOB), 2026-06-11 ----
+    # The unmeasured load is an OMITTED VARIABLE that attenuates the WM gain
+    # (Exp A / p113: gain rel_err 0.36 with the disturbance ON vs 0.18 with it
+    # OFF; the autoencoder real->post recovered 0.766->0.94 disturbance-off).
+    # The DOB augments the RSSM/TSSM with an explicit additive output-disturbance
+    # state ``d_t`` (per CV) that integrates the one-step prediction residual and
+    # is added to the decoded CV at recon (``CV = g(feat) + d_t``), so ``g``
+    # learns the CLEAN input->CV gain while ``d_t`` absorbs the load AND becomes
+    # the unmeasured-disturbance estimate (feeds the disturbance diagnostic).
+    # See docs/architecture.md §3.  ``dob_enabled=False`` = byte-identical to the
+    # pre-DOB model.  Backbone-agnostic (RSSM + TSSM share feat->decode).  ENV:
+    # DREAMER_DOB_ENABLED / _REG_COEF / _DECAY_INIT / _GAIN_INIT.
+    dob_enabled: bool = False
+    dob_reg_coef: float = 0.01      # L2 "process-noise-is-small" prior on d_t
+    dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence (A)
+    dob_gain_init: float = -2.2     # sigmoid(-2.2)=0.10 — small correction (K)
+
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
     # default: its deterministic GRU core can learn a held-action fixed
@@ -3296,9 +3313,16 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     """
     from models.dreamer_v4_rssm import rssm_kl_loss
     rssm = model.dynamics
-    feats, post_logits, prior_logits, _last = rssm.rollout_observed(
-        obs_cur, act, sample=True)               # feats (B,T,F)
-    recon = rssm.decode(feats)                    # (B, T, obs_dim)
+    feats, post_logits, prior_logits, _last, ds = rssm.rollout_observed(
+        obs_cur, act, sample=True)               # feats (B,T,F); ds (B,T,n_cv)|None
+    recon = rssm.decode(feats)                    # (B, T, obs_dim) = g(feat)
+    # DOB (neural Kalman filter): add the disturbance estimate d_t into the CV
+    # channels so the recon target the decoder/dynamics ``g`` must fit becomes
+    # ``obs - d_t`` — i.e. g learns the CLEAN input->CV response and d_t absorbs
+    # the unmeasured load (de-confounds the omitted-variable gain attenuation).
+    dob_on = bool(getattr(rssm, 'dob_enabled', False)) and ds is not None
+    if dob_on:
+        recon = rssm.apply_dob(recon, ds)
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
     kl_loss, kl_diag = rssm_kl_loss(
         post_logits, prior_logits,
@@ -3306,6 +3330,15 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
         repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
     wm_total = cfg.recon_scale * recon_loss + kl_loss
+    # DOB regulariser: a small L2 prior that the disturbance estimate is small
+    # (the Kalman "process noise is small" assumption).  Keeps d_t from absorbing
+    # MORE than the genuine unexplained residual — the model prefers to explain
+    # CV movement with g (the inputs) whenever it can, using d_t only for the
+    # slow unmeasured load.  ``dob_reg_coef=0`` disables the prior.
+    dob_reg = torch.zeros((), device=feats.device)
+    if dob_on:
+        dob_reg = ds.float().pow(2).mean()
+        wm_total = wm_total + float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0) * dob_reg
 
     # ----- (b) held-action steady-state consistency (RSSM) -----
     # P89 consolidation: the multi-step held-action ROLLOUT stationarity loss
@@ -3361,6 +3394,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=feats.device),
         'wm_held_rollout_loss': held_loss.detach(),
+        'dob_reg': dob_reg.detach(),
+        'dob_d_absmean': (ds.abs().mean().detach() if dob_on
+                          else torch.zeros((), device=feats.device)),
     }
     losses.update(kl_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
@@ -3695,7 +3731,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # are the per-step posterior features used by the replay-grounded
     # critic anchor.
     with torch.no_grad():
-        feats_real, _post_lg, _prior_lg, last_state = rssm.rollout_observed(
+        feats_real, _post_lg, _prior_lg, last_state, _ds_real = rssm.rollout_observed(
             obs, act, sample=True)
         agent_hid_real = feats_real                          # (B, T, F)
 
@@ -4359,6 +4395,10 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
         dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
         dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
+        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
+        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
+        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
     )
     model = DreamerV4(model_cfg)
     # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths

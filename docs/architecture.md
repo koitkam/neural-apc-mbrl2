@@ -9,7 +9,15 @@ expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 `feat = cat([h, stoch_flat])` and `decode(feat) → obs`.
 
 Status legend: **[current]** = implemented & default · **[opt-in]** = implemented,
-env-gated off · **[planned]** = designed, not yet built (the DOB observer).
+env-gated off · **[planned]** = designed, not yet built.
+
+> **2026-06-11:** the neural-Kalman-filter / DOB disturbance observer (§3) is now
+> **implemented** in both backbones (`models/dreamer_v4_rssm.py`,
+> `models/transformer_ssm.py`), env-gated **off** by default
+> (`DREAMER_DOB_ENABLED=1` to turn on). It was validated by Exp A (p113): with
+> the hidden disturbance OFF the WM gain recovered 0.36→0.18 and the autoencoder
+> real→posterior 0.77→0.94, confirming the unmeasured load was an omitted
+> variable attenuating the gain — exactly what the DOB de-confounds.
 
 ---
 
@@ -31,7 +39,7 @@ flowchart TB
     CORE["deterministic core\nGRU (RSSM) / transformer (TSSM)\nstate h"]
     FEAT["feat = [h, z]"]
     DEC["decoder g(feat) -> obs_hat"]
-    DOBS["disturbance state d_t\n(neural Kalman / DOB)  [planned]"]
+    DOBS["disturbance state d_t\n(neural Kalman / DOB)  [opt-in]"]
     ENC --> POST --> CORE --> FEAT
     CORE --> PRIOR
     FEAT --> DEC
@@ -43,7 +51,7 @@ flowchart TB
     VAL["critic / value head\n(twohot V(feat))  — opt_critic"]
     TGT["target_value (EMA, frozen)"]
     POL["actor / policy head\npi(a | feat)  — opt_actor"]
-    DHEAD["disturbance head\nreads feat (read-out)  [opt-in]\n-> becomes d_t readout  [planned]"]
+    DHEAD["disturbance head\nreads feat (read-out)  [opt-in]\nsuperseded by d_t when DOB on"]
   end
 
   OBS --> ENC
@@ -115,9 +123,9 @@ critic, reward head and imagination are training-only). With the [planned] DOB,
 
 ---
 
-## 3. [planned] Neural Kalman filter / disturbance observer (DOB)
+## 3. [opt-in] Neural Kalman filter / disturbance observer (DOB)
 
-The unmeasured load is an **omitted variable**: the WM cannot attribute that CV
+Implemented 2026-06-11 (`DREAMER_DOB_ENABLED=1`, default off). The unmeasured load is an **omitted variable**: the WM cannot attribute that CV
 movement to any input it sees, so it under-fits the input→CV gain
 (MV ratio ≈ 0.64, DV ratio ≈ 0.73 in p112) — which makes the actor over-actuate
 and oscillate, and makes a read-out disturbance head unrecoverable. The fix is a
@@ -144,20 +152,26 @@ flowchart LR
 - **Correct** (`obs_step`, real obs): `ν_t = CV_obs − (g + A·d_{t-1})`;
   `d_t = A·d_{t-1} + K·ν_t` (`K` = **learned** Kalman gain).
 - **Output**: decoder `CV = g(h,z) + d_t`. `g` now learns the *true* gain because
-  `d_t` absorbs the unexplained movement (de-confounds the attenuation).
-- **Feedforward**: the actor reads `d_t` (via `feat`) and pre-empts the load —
-  prediction-error feedforward, not just feedback. The innovation `ν_t` IS the
-  neural prediction error; integrating + feeding it forward IS the FFW capability.
+  `d_t` absorbs the unexplained movement (de-confounds the attenuation). The
+  recon loss compares `g(feat)+d_t` vs `obs`, and an L2 prior on `d_t`
+  (`dob_reg_coef`, the Kalman "process-noise-is-small" assumption) keeps the
+  model using `d_t` only for the genuine residual.
 - **Disturbance estimate**: `d_t` itself is the estimate — `wm_disturbance_prediction`
-  reads it directly (the read-out head is retired).
+  reads it directly (converted to engineering units via the obs-norm std),
+  superseding the read-out head when DOB is on.
+- **Feedforward [planned next increment]**: feeding `d_t` into `feat` so the actor
+  conditions on it and pre-empts the load (prediction-error feedforward, not just
+  feedback) is the follow-up — Scope 1 (this) de-confounds the gain; Scope 2 adds
+  explicit feedforward-in-imagination once the gain fix is confirmed.
 
 Classical mapping: process model = learned WM dynamics; measurement model =
-decoder; `K` = learned Kalman gain; `d_t` = bias/disturbance state; holding `d_t`
-(decayed) through imagination = the MPC "persistent disturbance" assumption,
-learned. Build RSSM-first (state + `obs_step` correction + `img_step`
-propagation + additive decoder term), grad-isolation smoke (the `d_t` update must
-not corrupt the gain path), one confirming run, then wire the identical hooks into
-TSSM and verify parity. Env-gated, default-off until proven.
+decoder; `K` = learned Kalman gain (per-CV, `sigmoid` ∈ (0,1)); `d_t` =
+bias/disturbance state; holding `d_t` (decayed by `A`, per-CV `sigmoid` ∈ (0,1))
+through imagination = the MPC "persistent disturbance" assumption, learned.
+Implemented once at the shared `feat → decode` interface so RSSM + TSSM share the
+observer math. Env knobs: `DREAMER_DOB_ENABLED` / `_REG_COEF` / `_DECAY_INIT` /
+`_GAIN_INIT`. Verified by `tools/_smoke_dob.py` (both backbones: A/K bounded,
+decay/correct, CV-only add, grad-isolated into `opt_world`).
 
 ---
 
@@ -171,6 +185,8 @@ TSSM and verify parity. Env-gated, default-off until proven.
 | WM loss (recon/KL/overshoot/held-rollout, disturbance) | `training/train.py` (`world_model_loss`, `_disturbance_head_loss`) |
 | Imagination + λ-returns + MC grounding + actor/critic | `training/train.py` (`_imagination_step_rssm`, `imagination_step`) |
 | Hidden load + Gd disturbance | `utils/hidden_disturbance.py` (`HiddenDisturbance`) |
+| Neural Kalman filter / DOB (`d_t` state) | `models/dreamer_v4_rssm.py` + `models/transformer_ssm.py` (`dob_enabled`, `obs_step`/`img_step`/`apply_dob`); recon in `training/train.py:_rssm_world_model_loss` |
 | Gradient-isolation audit | `tools/_smoke_grad_isolation.py` |
+| DOB smoke (both backbones) | `tools/_smoke_dob.py` |
 | Disturbance-prediction diagnostic | `evaluation/wm_disturbance_prediction.py` |
 | WM gain / posterior-prior probes | `evaluation/wm_transfer_matrix.py`, `tools/wm_posterior_prior_probe.py` |

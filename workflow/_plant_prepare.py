@@ -433,6 +433,11 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_DISTURBANCE_LOSS_GATE_RECON':('disturbance_loss_gate_recon',    float),
     'DREAMER_DISTURBANCE_HEAD_HIDDEN':    ('disturbance_head_hidden',        int),
     'DREAMER_DISTURBANCE_HEAD_LAYERS':    ('disturbance_head_layers',        int),
+    # Neural Kalman filter / disturbance observer (DOB, 2026-06-11; default off).
+    'DREAMER_DOB_ENABLED':                ('dob_enabled',                    _as_bool),
+    'DREAMER_DOB_REG_COEF':               ('dob_reg_coef',                   float),
+    'DREAMER_DOB_DECAY_INIT':             ('dob_decay_init',                 float),
+    'DREAMER_DOB_GAIN_INIT':              ('dob_gain_init',                  float),
     # #1 (P88): critic real-grounding rebalance (down-weight imagined critic CE
     # so the real-return anchor dominates -> breaks bootstrap self-dominance).
     'DREAMER_CRITIC_IMAG_LOSS_COEF':      ('critic_imag_loss_coef',          float),

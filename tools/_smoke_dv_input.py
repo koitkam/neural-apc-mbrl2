@@ -118,7 +118,7 @@ def test_end_to_end_rssm():
     B, T = 2, 10
     obs = torch.randn(B, T, OBS_DIM)
     act = torch.rand(B, T, ACT_DIM) * 2 - 1
-    feats, post_lg, prior_lg, last = model.dynamics.rollout_observed(obs, act)
+    feats, post_lg, prior_lg, last, *_ = model.dynamics.rollout_observed(obs, act)
     assert feats.shape[0] == B
     # imagination: hold the DV at the last obs value (the train.py path)
     dv_hold = obs[:, -1].index_select(-1, model.dynamics.dv_index_t)

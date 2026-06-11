@@ -147,6 +147,13 @@ class TransformerSSMConfig:
     # input instead of being predicted forward.  ``dv_dim = 0`` = paper default.
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
+    # Neural Kalman filter / disturbance observer (DOB) — mirror of RSSMConfig.
+    # See models/dreamer_v4_rssm.RSSMConfig + docs/architecture.md §3.  Shared
+    # feat->decode interface, so the observer math is identical to the RSSM.
+    dob_enabled: bool = False
+    cv_indices: Tuple[int, ...] = ()
+    dob_decay_init: float = 3.0
+    dob_gain_init: float = -2.2
 
 
 @dataclass
@@ -164,6 +171,7 @@ class TSSMState:
     # per-layer (k, v) each (B, n_heads, pos, head_dim); None = empty context.
     kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
     pos: int = 0                # number of tokens already in the cache
+    d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
 
     @property
     def stoch_flat(self) -> torch.Tensor:
@@ -321,9 +329,40 @@ class TransformerSSMDynamics(nn.Module):
             self.deter_dim + cfg.embed_dim, self.n_categoricals,
             self.n_classes, unimix=cfg.unimix)
 
+        # ----- Neural Kalman filter / disturbance observer (DOB) -----
+        # Identical to RSSMDynamics: a first-order learned observer (per-CV A,K
+        # in (0,1)) on the one-step prediction residual, added to the decoded CV.
+        self.register_buffer(
+            'cv_index_t',
+            torch.tensor(list(getattr(cfg, 'cv_indices', ()) or ()),
+                         dtype=torch.long),
+            persistent=False)
+        self.n_cv = int(self.cv_index_t.numel())
+        self.dob_enabled = bool(getattr(cfg, 'dob_enabled', False)) and self.n_cv > 0
+        if self.dob_enabled:
+            self.dob_log_decay = nn.Parameter(torch.full(
+                (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
+            self.dob_log_gain = nn.Parameter(torch.full(
+                (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
+
     @property
     def feat_dim(self) -> int:
         return self.deter_dim + self.stoch_flat_dim
+
+    # ----- DOB helpers (mirror RSSMDynamics) -----
+    def dob_decay(self) -> torch.Tensor:
+        return torch.sigmoid(self.dob_log_decay)
+
+    def dob_gain(self) -> torch.Tensor:
+        return torch.sigmoid(self.dob_log_gain)
+
+    def apply_dob(self, decoded: torch.Tensor,
+                  d: Optional[torch.Tensor]) -> torch.Tensor:
+        if not self.dob_enabled or d is None:
+            return decoded
+        out = decoded.clone()
+        out.index_add_(-1, self.cv_index_t, d.to(out.dtype))
+        return out
 
     # ----- shared pieces (real) -----
     def embed(self, obs: torch.Tensor) -> torch.Tensor:
@@ -339,7 +378,9 @@ class TransformerSSMDynamics(nn.Module):
                                self.n_classes, device=device)
         z = torch.zeros_like(z_logits)
         z[..., 0] = 1.0
-        return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0)
+        d = (torch.zeros(batch_size, self.n_cv, device=device)
+             if self.dob_enabled else None)
+        return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0, d=d)
 
     # ----- internal: token build + causal encode -----
     def _build_token(self, z: torch.Tensor,
@@ -397,21 +438,33 @@ class TransformerSSMDynamics(nn.Module):
         pos = int(getattr(prev, 'pos', 0) or 0)
         h, new_cache = self._step(token, cache, pos)
         z_logits, z = self.prior_net(h, sample=sample)
+        d_new = (self.dob_decay() * prev.d
+                 if (self.dob_enabled and prev.d is not None) else prev.d)
         return TSSMState(h=h, z_logits=z_logits, z=z,
-                         kv_cache=new_cache, pos=pos + 1)
+                         kv_cache=new_cache, pos=pos + 1, d=d_new)
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
-                 sample: bool = True
+                 sample: bool = True, obs: Optional[torch.Tensor] = None
                  ) -> Tuple[TSSMState, TSSMState]:
         """Observation step -> (posterior, prior).  Prior is needed for KL; both
         share ``h``; the posterior conditions on the obs embedding and is the z
-        carried forward (with the prior's KV-cache + position)."""
+        carried forward (with the prior's KV-cache + position).  DOB: when
+        ``obs`` is supplied the posterior carries the corrected disturbance
+        state ``d_t = A*d_{t-1} + K*nu`` (innovation on the prior forecast),
+        identical to RSSMDynamics."""
         prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
+        d_post = prior.d
+        if self.dob_enabled and obs is not None and prior.d is not None:
+            cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
+                       + prior.d)
+            cv_obs = obs.index_select(-1, self.cv_index_t)
+            nu = cv_obs - cv_pred
+            d_post = prior.d + self.dob_gain() * nu
         post = TSSMState(h=prior.h, z_logits=post_logits, z=post_z,
-                         kv_cache=prior.kv_cache, pos=prior.pos)
+                         kv_cache=prior.kv_cache, pos=prior.pos, d=d_post)
         return post, prior
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
@@ -421,23 +474,27 @@ class TransformerSSMDynamics(nn.Module):
         """Teacher-forced posterior rollout over (B, T, *).  ``act[:, t]`` drives
         the transition INTO ``obs[:, t]`` (contemporaneous-action convention, as
         in RSSMDynamics).  Returns (feats, post_logits, prior_logits,
-        last_state) with shapes (B, T, F), (B, T, K, C), (B, T, K, C)."""
+        last_state, ds) with shapes (B, T, F), (B, T, K, C), (B, T, K, C), the
+        last state, and ds (B, T, n_cv) = per-step DOB estimate (None=off)."""
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                         # (B, T, embed_dim)
         dvs = (obs.index_select(-1, self.dv_index_t)
                if self.dv_dim > 0 else None)             # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
-        feats_l, post_l, prior_l = [], [], []
+        feats_l, post_l, prior_l, ds_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        dv=dv_t, sample=sample)
+                                        dv=dv_t, sample=sample, obs=obs[:, t])
             state = post
             feats_l.append(post.feat)
             post_l.append(post.z_logits)
             prior_l.append(prior.z_logits)
+            if self.dob_enabled and post.d is not None:
+                ds_l.append(post.d)
         feats = torch.stack(feats_l, dim=1)
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)
-        return feats, post_logits, prior_logits, state
+        ds = torch.stack(ds_l, dim=1) if ds_l else None
+        return feats, post_logits, prior_logits, state, ds

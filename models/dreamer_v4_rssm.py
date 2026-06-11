@@ -91,6 +91,23 @@ class RSSMConfig:
     # bit-identical to the paper behaviour.
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
+    # ---- Neural Kalman filter / disturbance observer (DOB), 2026-06-11 ----
+    # When ``dob_enabled`` the WM carries an explicit additive output-disturbance
+    # state ``d_t`` (one scalar per CV channel) that INTEGRATES the one-step
+    # prediction residual (innovation) and is ADDED to the decoded CV at recon
+    # time: ``CV = g(feat) + d_t``.  This gives the decoder/dynamics ``g`` a
+    # dedicated channel to absorb the unmeasured-load movement so it is no longer
+    # forced to soak it up — de-confounding the omitted-variable gain attenuation
+    # (p112: gain 0.36 with the disturbance ON vs 0.18 with it OFF, Exp A p113).
+    # Predict (img_step, no obs): d_t = A·d_{t-1}.  Correct (obs_step, real obs):
+    # d_t = A·d_{t-1} + K·(CV_obs − [g(prior.feat)+A·d_{t-1}]).  A,K are learned
+    # per-CV scalars in (0,1) (sigmoid) — a first-order learned Kalman gain.
+    # ``cv_indices`` = the CV obs-vector positions (== env.cv_indices); 0 CVs or
+    # ``dob_enabled=False`` ⇒ byte-identical to the pre-DOB model.
+    dob_enabled: bool = False
+    cv_indices: Tuple[int, ...] = ()
+    dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence
+    dob_gain_init: float = -2.2     # sigmoid(-2.2)=0.10 — small correction
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +140,7 @@ class RSSMState:
     h: torch.Tensor             # (..., deter_dim) deterministic recurrent state
     z_logits: torch.Tensor      # (..., n_categoricals, n_classes)
     z: torch.Tensor             # (..., n_categoricals, n_classes) one-hot (ST grad)
+    d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
 
     @property
     def stoch_flat(self) -> torch.Tensor:
@@ -130,6 +148,9 @@ class RSSMState:
 
     @property
     def feat(self) -> torch.Tensor:
+        # NOTE: the DOB state ``d`` is deliberately NOT part of ``feat`` — it is
+        # an OUTPUT-space additive bias (added at decode), not a latent the heads
+        # condition on.  Keeping feat = [h, z_flat] preserves the head input dim.
         return torch.cat([self.h, self.stoch_flat], dim=-1)
 
 
@@ -216,6 +237,24 @@ class RSSMDynamics(nn.Module):
             self.deter_dim + self.embed_dim, self.n_categoricals,
             self.n_classes, hidden_dim=self.hidden_dim, unimix=cfg.unimix)
 
+        # ----- Neural Kalman filter / disturbance observer (DOB) -----
+        # ``d_t`` (per-CV) is a first-order learned observer on the one-step
+        # prediction residual.  A (decay) and K (innovation gain) are learned
+        # per-CV scalars in (0,1) via sigmoid.  Requires CV obs-vector indices;
+        # with 0 CVs the DOB is force-disabled (no channel to observe).
+        self.register_buffer(
+            'cv_index_t',
+            torch.tensor(list(getattr(cfg, 'cv_indices', ()) or ()),
+                         dtype=torch.long),
+            persistent=False)
+        self.n_cv = int(self.cv_index_t.numel())
+        self.dob_enabled = bool(getattr(cfg, 'dob_enabled', False)) and self.n_cv > 0
+        if self.dob_enabled:
+            self.dob_log_decay = nn.Parameter(torch.full(
+                (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
+            self.dob_log_gain = nn.Parameter(torch.full(
+                (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
+
     @property
     def feat_dim(self) -> int:
         return self.deter_dim + self.stoch_flat_dim
@@ -232,7 +271,26 @@ class RSSMDynamics(nn.Module):
                                self.n_classes, device=device)
         z = torch.zeros_like(z_logits)
         z[..., 0] = 1.0  # arbitrary valid one-hot
-        return RSSMState(h=h, z_logits=z_logits, z=z)
+        d = (torch.zeros(batch_size, self.n_cv, device=device)
+             if self.dob_enabled else None)
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d)
+
+    # ----- DOB helpers --------------------------------------------------
+    def dob_decay(self) -> torch.Tensor:
+        return torch.sigmoid(self.dob_log_decay)
+
+    def dob_gain(self) -> torch.Tensor:
+        return torch.sigmoid(self.dob_log_gain)
+
+    def apply_dob(self, decoded: torch.Tensor,
+                  d: Optional[torch.Tensor]) -> torch.Tensor:
+        """Add the DOB disturbance state ``d`` (..., n_cv) into the CV channels
+        of a decoded obs tensor (..., obs_dim).  Identity when DOB is off."""
+        if not self.dob_enabled or d is None:
+            return decoded
+        out = decoded.clone()
+        out.index_add_(-1, self.cv_index_t, d.to(out.dtype))
+        return out
 
     # ----- transitions --------------------------------------------------
     def img_step(self, prev: RSSMState, prev_action: torch.Tensor,
@@ -254,17 +312,34 @@ class RSSMDynamics(nn.Module):
         x = self.pre_gru(x)
         h = self.gru(x, prev.h)
         z_logits, z = self.prior_net(h, sample=sample)
-        return RSSMState(h=h, z_logits=z_logits, z=z)
+        # DOB predict step: decay the disturbance estimate (no obs to correct).
+        d_new = (self.dob_decay() * prev.d
+                 if (self.dob_enabled and prev.d is not None) else prev.d)
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new)
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
-                 sample: bool = True
+                 sample: bool = True, obs: Optional[torch.Tensor] = None
                  ) -> Tuple[RSSMState, RSSMState]:
-        """Observation step → (posterior, prior).  Prior is needed for KL."""
+        """Observation step → (posterior, prior).  Prior is needed for KL.
+
+        When the DOB is active and ``obs`` (the raw obs vector, for the CV
+        channels) is supplied, the posterior carries the CORRECTED disturbance
+        state ``d_t = A·d_{t-1} + K·ν`` where ``ν`` is the one-step prediction
+        residual on the PRIOR forecast (a genuine innovation; the prior has not
+        seen the current obs).  ``obs=None`` (probes / diagnostics) ⇒ the
+        posterior just carries the decayed prior ``d`` (pure process model)."""
         prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
-        post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z)
+        d_post = prior.d
+        if self.dob_enabled and obs is not None and prior.d is not None:
+            cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
+                       + prior.d)                       # one-step CV forecast
+            cv_obs = obs.index_select(-1, self.cv_index_t)
+            nu = cv_obs - cv_pred                        # innovation
+            d_post = prior.d + self.dob_gain() * nu      # = A·d_{t-1} + K·ν
+        post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z, d=d_post)
         return post, prior
 
     # ----- sequence rollout ---------------------------------------------
@@ -279,9 +354,10 @@ class RSSMDynamics(nn.Module):
         ``feat[t]`` has seen ``a_t`` so ``reward(feat[t])`` predicts the
         reward of the action taken at step ``t``).
 
-        Returns ``(feats, post_logits, prior_logits, last_state)`` with
-        shapes ``(B, T, F)``, ``(B, T, K, C)``, ``(B, T, K, C)`` and the
-        final ``RSSMState`` (for imagination warm-start).
+        Returns ``(feats, post_logits, prior_logits, last_state, ds)`` with
+        shapes ``(B, T, F)``, ``(B, T, K, C)``, ``(B, T, K, C)``, the final
+        ``RSSMState`` (for imagination warm-start), and ``ds`` ``(B, T, n_cv)``
+        = the per-step DOB disturbance estimate (``None`` when DOB is off).
         """
         B, T = obs.shape[:2]
         device = obs.device
@@ -290,19 +366,22 @@ class RSSMDynamics(nn.Module):
         dvs = (obs.index_select(-1, self.dv_index_t)
                if self.dv_dim > 0 else None)           # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
-        feats_l, post_l, prior_l = [], [], []
+        feats_l, post_l, prior_l, ds_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        dv=dv_t, sample=sample)
+                                        dv=dv_t, sample=sample, obs=obs[:, t])
             state = post
             feats_l.append(post.feat)
             post_l.append(post.z_logits)
             prior_l.append(prior.z_logits)
+            if self.dob_enabled and post.d is not None:
+                ds_l.append(post.d)
         feats = torch.stack(feats_l, dim=1)
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)
-        return feats, post_logits, prior_logits, state
+        ds = torch.stack(ds_l, dim=1) if ds_l else None
+        return feats, post_logits, prior_logits, state, ds
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         return self.decoder(feat)

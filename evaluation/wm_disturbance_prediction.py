@@ -74,8 +74,10 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
     self-contained.  Returns a JSON-able dict (metrics + per-step traces).
     """
     head = getattr(model, 'disturbance', None)
-    if head is None:
-        return {'enabled': False, 'reason': 'no disturbance head on model'}
+    dob = bool(getattr(getattr(model, 'dynamics', None), 'dob_enabled', False))
+    if head is None and not dob:
+        return {'enabled': False,
+                'reason': 'no disturbance head and DOB disabled'}
     if not _is_rssm(model):
         return {'enabled': False, 'reason': 'disturbance diagnostic is RSSM/TSSM only'}
 
@@ -99,6 +101,23 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
         state = rssm.initial_state(1, device)
         prev_a = torch.zeros(1, action_dim, device=device)
 
+        # DOB (neural Kalman filter): when the WM carries the disturbance state
+        # d_t, IT is the estimate (read d_t, converted to engineering units via
+        # the obs-norm std at each CV index) — strictly better than the read-out
+        # head.  Else fall back to the head.
+        dob_on = bool(getattr(rssm, 'dob_enabled', False))
+        cv_std = np.ones(n_cv, dtype='float32')
+        if dob_on:
+            try:
+                _ons = env.get_obs_norm_stats()
+                _var = np.asarray(_ons.get('var'), dtype='float64')
+                for c, ci in enumerate(env.cv_indices):
+                    if 0 <= int(ci) < _var.shape[0]:
+                        cv_std[c] = float(np.sqrt(max(_var[int(ci)], 1e-12)))
+            except Exception:
+                pass
+        estimator = 'dob_d_t' if dob_on else 'readout_head'
+
         true_d = np.zeros((T, n_cv), dtype='float32')
         pred_d = np.zeros((T, n_cv), dtype='float32')
 
@@ -109,11 +128,18 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
                                      dtype=torch.bfloat16,
                                      enabled=(device.type == 'cuda')):
                 emb = rssm.embed(o)
-                post, _ = rssm.obs_step(state, prev_a, emb, sample=True)
+                # Pass obs=o so the DOB innovation/correction runs when enabled.
+                post, _ = rssm.obs_step(state, prev_a, emb, sample=True, obs=o)
                 feat = post.feat
-                # The head predicts the per-CV hidden disturbance from the
-                # SAME posterior feature the policy reads (read-out probe).
-                dpred = head(feat).float().squeeze(0).cpu().numpy()
+                if dob_on and getattr(post, 'd', None) is not None:
+                    # d_t is in normalized obs space -> engineering units.
+                    d_norm = post.d.float().squeeze(0).cpu().numpy()
+                    dpred = d_norm[:n_cv] * cv_std[:n_cv]
+                elif head is not None:
+                    # read-out head: predicts the per-CV disturbance from feat.
+                    dpred = head(feat).float().squeeze(0).cpu().numpy()
+                else:
+                    dpred = np.zeros(n_cv, dtype='float32')
                 action_t, _, _ = model.policy(feat, deterministic=deterministic)
             pred_d[t, :min(n_cv, dpred.shape[0])] = dpred[:n_cv]
             a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
@@ -180,6 +206,7 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
             'pred_disturbance_t': pred_d.tolist(),
             'cv_indices': [int(x) for x in env.cv_indices],
             'sample_rate': sr,
+            'estimator': estimator,
             'stop_grad': bool(getattr(cfg, 'disturbance_head_stop_grad', True)),
             'disturbance_loss_scale': float(getattr(cfg, 'disturbance_loss_scale', 0.0)),
         }
@@ -233,8 +260,9 @@ def plot_disturbance_prediction(result: Dict, out_path) -> bool:
             f"(r@lag={m['best_lag_corr']:.2f})", fontsize=9)
     axes[-1][0].set_xlabel('step')
     sg = 'read-out probe (stop-grad)' if result.get('stop_grad') else 'latent-shaping'
+    est = result.get('estimator', 'readout_head')
     fig.suptitle(
-        f"WM unmeasured-disturbance prediction — mean NRMSE={result['mean_nrmse']:.2f} "
+        f"WM unmeasured-disturbance prediction [{est}] — mean NRMSE={result['mean_nrmse']:.2f} "
         f"r={result['mean_pearson_r']:.2f} R²={result['mean_r2']:.2f}  [{sg}]",
         fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.98))

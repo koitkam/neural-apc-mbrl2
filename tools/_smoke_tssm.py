@@ -39,7 +39,7 @@ def test_interface_shapes():
     B, T = 3, 7
     obs = torch.randn(B, T, cfg.obs_dim)
     act = torch.rand(B, T, cfg.action_dim) * 2 - 1
-    feats, post_lg, prior_lg, last = m.rollout_observed(obs, act, sample=True)
+    feats, post_lg, prior_lg, last, *_ = m.rollout_observed(obs, act, sample=True)
     F = m.feat_dim
     assert feats.shape == (B, T, F), feats.shape
     assert post_lg.shape == (B, T, cfg.n_categoricals, cfg.n_classes), post_lg.shape
