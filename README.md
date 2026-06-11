@@ -41,6 +41,11 @@ plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
 
 ## Architecture (paper-faithful, adapted to vector APC observations)
 
+> **Diagram:** see [docs/architecture.md](docs/architecture.md) for the full
+> data-flow diagram (world model + actor + critic + reward head + the planned
+> neural-Kalman-filter / DOB disturbance observer), the inference loop, and the
+> code map. Keep it in sync when the data flow changes.
+
 The **world model is selectable** via `world_model_type` (TrainConfig /
 `DREAMER_WORLD_MODEL_TYPE`). Two backbones share the same reward / value /
 policy heads and the same three-phase trainer:
