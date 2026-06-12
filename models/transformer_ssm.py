@@ -499,19 +499,48 @@ class TransformerSSMDynamics(nn.Module):
         dvs = (obs.index_select(-1, self.dv_index_t)
                if self.dv_dim > 0 else None)             # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
-        feats_l, post_l, prior_l, ds_l = [], [], [], []
+        core = self.deter_dim + self.stoch_flat_dim
+        feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
+            # COMPILE-EFFICIENT DOB (2026-06-12, mirror of RSSMDynamics): run the
+            # (h, z) recurrence WITHOUT the per-step DOB correction (``obs=None``)
+            # — ``d`` does not affect h/z (the token is built from z+action+dv,
+            # post_net from h+embed) — so the per-step prior decode for the
+            # innovation is hoisted OUT of the loop and done ONCE, batched, below.
+            # Keeps the compiled graph free of T× decoder MLPs.  Math identical
+            # (first-order linear filter); validated in tools/_smoke_dob.py.
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        dv=dv_t, sample=sample, obs=obs[:, t])
+                                        dv=dv_t, sample=sample, obs=None)
             state = post
-            feats_l.append(post.feat)
+            feats_l.append(post.feat[..., :core])        # core [h, z_flat]
             post_l.append(post.z_logits)
             prior_l.append(prior.z_logits)
-            if self.dob_enabled and post.d is not None:
-                ds_l.append(post.d)
-        feats = torch.stack(feats_l, dim=1)
+            if self.dob_enabled:
+                prior_core_l.append(prior.feat[..., :core])
+        post_core = torch.stack(feats_l, dim=1)          # (B, T, core)
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)
-        ds = torch.stack(ds_l, dim=1) if ds_l else None
+        ds = None
+        if self.dob_enabled:
+            # ONE batched prior decode → CV forecast base, then the scalar per-CV
+            # Kalman filter: d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
+            prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, core)
+            base = self.decode(prior_core).index_select(-1, self.cv_index_t)
+            cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
+            A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
+            u = K * (cv_obs - base)                               # drive (B,T,n_cv)
+            coef = (1.0 - K) * A                                  # (n_cv,)
+            d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
+            ds_l = []
+            for t in range(T):
+                d_prev = coef * d_prev + u[:, t]
+                ds_l.append(d_prev)
+            ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+            feats = torch.cat([post_core, ds.detach()], dim=-1)
+            state = TSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
+                              kv_cache=state.kv_cache, pos=state.pos,
+                              d=ds[:, -1])
+        else:
+            feats = post_core
         return feats, post_logits, prior_logits, state, ds

@@ -200,8 +200,44 @@ def _check_scope2(wm_type):
               f"held={float(losses.get('wm_held_rollout_loss', 0)):.3f}) [{wm_type}]")
 
 
+def _check_compile_equiv(wm_type):
+    """Compile-efficiency refactor (2026-06-12): the vectorized DOB
+    ``rollout_observed`` (d-free recurrence + ONE batched prior decode + scalar
+    Kalman scan) must be NUMERICALLY IDENTICAL to the per-step ``obs_step``
+    reference (which still does the inline per-step decode).  Deterministic
+    (sample=False) so there is no RNG divergence between the two paths."""
+    print(f'\n=== {wm_type} compile-equiv (vectorized == per-step) ===')
+    cfg, model, batch = _mk(wm_type, dob=True, cv_idx=(2,))
+    rssm = model.dynamics
+    obs, act = batch['obs'], batch['act']
+    B, T = obs.shape[:2]
+    dev = obs.device
+    # Reference: per-step obs_step with the REAL obs (the pre-refactor path).
+    with torch.no_grad():
+        state = rssm.initial_state(B, dev)
+        ref_feats, ref_ds = [], []
+        for t in range(T):
+            post, _prior = rssm.obs_step(state, act[:, t], rssm.embed(obs[:, t]),
+                                         sample=False, obs=obs[:, t])
+            state = post
+            ref_feats.append(post.feat)
+            ref_ds.append(post.d)
+        ref_feats = torch.stack(ref_feats, dim=1)
+        ref_ds = torch.stack(ref_ds, dim=1)
+        # Vectorized rollout (the refactored production path).
+        feats, _pl, _prl, last, ds = rssm.rollout_observed(obs, act, sample=False)
+    fe = float((feats - ref_feats).abs().max())
+    de = float((ds - ref_ds).abs().max())
+    assert fe < 1e-4, f'feats mismatch vs per-step ref: max|Δ|={fe}'
+    assert de < 1e-4, f'ds mismatch vs per-step ref: max|Δ|={de}'
+    assert torch.allclose(last.d, ref_ds[:, -1], atol=1e-4), 'last_state.d mismatch'
+    print(f'[smoke] OK  vectorized rollout == per-step obs_step '
+          f'(max|Δfeats|={fe:.2e}, max|Δds|={de:.2e}) [{wm_type}]')
+
+
 if __name__ == '__main__':
     for wm in ('rssm', 'tssm'):
         _check(wm)
         _check_scope2(wm)
+        _check_compile_equiv(wm)
     print('\n[smoke] ALL DOB CHECKS PASSED (both backbones)')
