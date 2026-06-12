@@ -19,8 +19,24 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 
 ## Lineage at a glance
 
+> **Backfill caveat (p95–p105)**: these predate the MC-critic (landed p106) and
+> likely the 4× WM-gain-horizon fix (commit 830cdc8), so their `gain` is on the
+> old anchor-critic regime and NOT directly comparable to p106+. Rows are a
+> lightweight JSON backfill (no plot re-inspection). Treat as historical context.
+
 | Run | Date | Change / hypothesis vs prev | Headline result | Verdict |
 |---|---|---|---|---|
+| p95 | 2026-06-07 | joint-mode isolation baseline (anchor-critic, pre-MC) | gain 0.402, reward_r −0.30, econ −33.6, cv 20.5, mv_tv 2002 | 🔬 baseline; reward head anti-correlated |
+| p96 | 2026-06-07 | γ0.985 + anchor_coef_long=2.0 + critic_imag=0.1 (critic bundle) | gain 0.377, reward_r 0.13, econ −72.6, cv 56.8 | ❌ econ/cv worse |
+| p97 | 2026-06-07 | flat BC (`expert_bc_p3_floor=1.0`) | no validation (aborted/failed) | ⏹️ no result |
+| p98 | 2026-06-07 | `reward_head_exclude_expert=True` (reward-head fix) | reward_r 0.003, econ −37.6, cv 22.2 | 🔬 reward-head decoupled from expert (kept) |
+| p99 | 2026-06-07 | + DV-as-input (measured DV as exogenous WM input) | gain 0.257, reward_r 0.30, econ −39.1, cv 23.9 | ✅ DV-input helps reward_r+gain (kept) |
+| p100 | 2026-06-07 | + `return_value_cap_gamma_horizon` (cap fix) | gain 0.164, reward_r 0.12, econ −71.9, cv 37.4 | 🔬 gain good, econ noisy (cap kept) |
+| p101 | 2026-06-08 | γ0.985→**0.97** | gain 0.708, reward_r 0.29, econ −107.6, cv 92.1, mv_tv 3621 | ❌ regressed hard at γ0.97 alone (needed MC-critic) |
+| p102 | 2026-06-08 | disturbance τ-fix + low-freq spread | gain 0.331, reward_r 0.07, econ **−25.5**, cv 13.7, mv_tv 1018 | ✅ best econ pre-MC; disturbance fix kept |
+| p103 | 2026-06-08 | B=6 (`bound_training_reward_max=6.0`, aggressive) | gain 0.328, econ −114.1, cv 97.5 | ❌ B=6 cascaded → keep B=3 |
+| p104 | 2026-06-08 | `rssm_free_bits=0.25` | no validation (aborted/failed) | ⏹️ no result |
+| p105 | 2026-06-08 | excitation reinject into SHARED buffer (every 5 iters) | gain 0.288, reward_r −0.08, econ −74.7, cv 50.7, mv_tv 4157 | ❌ shared-buffer reinject HURT actor (→ later WM-only partition) |
 | p106 | 2026-06-09 | MC-critic + γ0.97 + B3 + DV-input + WM recipe (the proven stack) | gain 0.186, reward_r 0.177, mv_tv 979, cv_viol ~11, econ −30.6 (+69%) | ✅ **BEST baseline (KNOWN-GOOD)** |
 | p107 | 2026-06-09 | econ-led `OBJ_AUTO_CV_OVER_ECON_RATIO=1.0` + early-stop 120 | gain 0.094 (best WM) BUT mv_tv 4019, cv_viol 46, econ −108.5 | ❌ FAILED — constraint limit cycle |
 | p108 | 2026-06-09 | econ-led 1.0 + integral-boost OFF (single-var ablation of p107) | cycle gone (mv_tv 1777, mv_viol 0) but parks outside limit: cv_viol 72, econ −131, gain 0.183 | ❌ econ-led not ready; p106 stays best |
@@ -30,7 +46,7 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 | p112 | 2026-06-10 | Gd hidden-disturbance ON (realistic FOPDT load) | gain 0.357, actor best-but-oscillates, mv_tv 1855 | 🔬 omitted-variable confound visible |
 | p113 | 2026-06-10 | **Exp A**: hidden-disturbance OFF (ablation) | gain 0.176, real→post 0.940, mv_tv 813 | 🎯 **DECISIVE** — omitted-variable attenuation confirmed |
 | p114 | 2026-06-11 | **DOB Scope 1** (neural Kalman filter; d_t output-additive only) | gain 0.365 (NOT recovered), reward_r 0.024, mv_tv 1007, cv_viol 31.5, econ −48.7; decomp 0.798/**1.000**/0.850; dist r **+0.70** R² −0.55 | ⚠️ prior dynamics perfect + dist-corr positive + no oscillation, BUT gain not recovered (autoencoder) + **actor PASSIVE** (mv_viol 0.13 vs p106 35.9) |
-| p115 | 2026-06-11 | **DOB + Scope 2** (d_t fed into feat) + excitation 0.6 + recon_cv 4 + P87 head retired | _running_ | ⏳ in progress |
+| p115 | 2026-06-11 | **DOB + Scope 2** (d_t fed into feat) + excitation 0.6 + recon_cv 4 + P87 head retired | gain **0.298** (healthy✓, ↓ from p114 0.365), reward_r **0.160** (recovered from 0.024), real→post **0.886**, dist r 0.64 R² **+0.30** (flipped +); econ −49.2, cv_viol 28.1 | ⚠️ **WM #1+#2 advanced** (gain healthy, dist R² positive) but not yet p106's 0.186; actor still mv_viol≈0 (econ #4 deferred); residual = autoencoder+compounding |
 
 ## Run details
 
@@ -56,7 +72,7 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   passivity); (b) attack the now-dominant autoencoder with recon_cv +
   open-loop excitation; (c) retire the redundant P87 head. → **p115**.
 
-### p115 — DOB + Scope 2 + open-loop excitation (IN PROGRESS)
+### p115 — DOB + Scope 2 + open-loop excitation
 - **Change vs p114**: Scope 2 (RSSMState/TSSMState `feat = [h, z_flat,
   d.detach()]` so the actor/critic/reward heads condition on d_t — explicit
   feed-forward; decoder still reads the clean core) + `WM_EXCITATION_BUFFER_FRAC=0.6`
@@ -64,9 +80,24 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   only 0.4 AND had the confounding head) + `WM_RECON_CV_WEIGHT=4.0` (autoencoder)
   + P87 head retired (`DISTURBANCE_LOSS_SCALE=0.0` → `disturbance_head_dim=0`;
   the DOB d_t replaces it).
-- **Watch**: gain < 0.186 WITH disturbance on (does open-loop excitation recover
-  it once the head confound is gone?); actor ACTIVE again (mv_tv ~979, not ~0);
-  dist r stays positive; real→post → 1.0 (recon_cv).
-- **Decision rule**: gain < 0.186 → excitation+DOB+Scope2 works, promote + add
-  WM-freeze next. gain ~0.31–0.365 → partial-excitation-while-co-training is
-  futile → build the pure open-loop WM+DOB **pretrain-then-FREEZE** workstream.
+- **Result** (326 iters, p3_plateau early-stop, best det −98.1 @iter126): gain
+  **0.298** (HEALTHY, down from p114's 0.365 — open-loop excitation + head
+  removal recovered part of it, but NOT to p106's 0.186); reward_r **0.160**
+  (recovered from p114's 0.024 — Scope 2 gave the head the disturbance signal);
+  decomp real→post **0.886** (autoencoder, improved from 0.798) / post→1step
+  1.000 / 1step→openloop 0.854 (compounding, ≈unchanged); disturbance d_t r 0.64
+  **R² +0.30** (flipped positive from p114's −0.55 — d_t now correctly scaled).
+  Economics still regressed: econ −49.2, cv_viol 28.1, mv_viol≈0 (actor still
+  not actuating much in steady state — but this is the #4 priority, deferred).
+- **Read**: Scope 2 + excitation advanced the TWO top priorities — **#1 WM gain**
+  (0.365→0.298, now in the healthy band) and **#2 disturbance** (R² −0.55→+0.30,
+  reward_r recovered). The gain is NOT yet at p106's 0.186; the decomp localises
+  the residual to the **autoencoder (0.886)** + **compounding (0.854)** — neither
+  is a disturbance-confounding problem the DOB can fix, and co-training the WM
+  with the actor keeps re-contaminating it.
+- **Verdict / next**: keep DOB+Scope2 (clear progress on #1+#2). The remaining
+  gain gap is the autoencoder/compounding under closed-loop co-training → the
+  next lever is the **pure open-loop WM+DOB pretrain-then-FREEZE** (train the WM
+  on open-loop excitation until the gain converges, freeze the WM core incl. the
+  DOB A/K, THEN train actor/critic on the static unbiased WM). Compile refactor
+  (below) lands first so the pretrain phase is fast.
