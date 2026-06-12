@@ -238,11 +238,12 @@ The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 > CV-weighted recon (`wm_recon_cv_weight`) / per-CV obs-norm / larger latent —
 > not more step-tests.
 >
-> **Caveat (current):** the WM-only excitation **partition**
-> (`wm_excitation_buffer_frac`) is only drawn in the **P3/joint** WM-update path,
-> so it is **inert in phased P1/P2** — Stage-1 excitation comes from the seed
-> buffer (above) + random-action collection, not the partition. Wiring the
-> partition into Stage 1 is a tracked enhancement (a secondary autoencoder help).
+> **Note (2026-06-12):** the WM-only excitation **partition**
+> (`wm_excitation_buffer_frac`) was **removed** — it was only ever drawn in the
+> P3/joint WM-update path (inert in this phased curriculum), never demonstrably
+> helped, and (per the p117 probe above) the dynamics are already fully
+> identified without it. Stage-1 open-loop excitation comes from the settle-aware
+> seed buffer + random-action collection + P1 const/step re-injection.
 
 Verified by `tools/_smoke_curriculum.py` (per-stage `requires_grad` partition +
 `dob_active` toggle + gradient isolation: S1 recon trains `g` not the DOB, S2
