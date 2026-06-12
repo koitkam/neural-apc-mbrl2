@@ -579,6 +579,35 @@ class TrainConfig:
     dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence (A)
     dob_gain_init: float = -2.2     # sigmoid(-2.2)=0.10 — small correction (K)
 
+    # ---- Staged clean->disturbance curriculum (2026-06-12) ----
+    # The textbook system-ID / Kalman recipe applied to the DOB: identify the
+    # plant on CLEAN data FIRST, THEN identify the observer on the FIXED plant,
+    # THEN design the controller.  Fixes the gain<->disturbance identifiability
+    # confound (p114/p115: when g and d_t co-train on confounded closed-loop
+    # disturbance data, d_t "steals" gain from g).  Runs ON TOP of phased mode
+    # (the 3 stages = phases P1/P2/P3, budgeted by phase{1,2,3}_frac):
+    #   Stage 1 (P1): CLEAN (hidden disturbance OFF) + DOB d_t SUPPRESSED ->
+    #     g learns the UNBIASED input->CV gain (no omitted-variable confound).
+    #   Stage 2 (P2): FREEZE g (NOT the DOB) + disturbance ON + d_t ACTIVE ->
+    #     the recon innovation trains the Kalman observer (A,K) on the fixed g
+    #     (all CV movement g can't explain is attributed to d_t = identifiable).
+    #     (reuses the P2 loss path; BC also warms the actor as a free bonus.)
+    #   Stage 3 (P3): FREEZE g AND the DOB + disturbance + domain-randomization
+    #     ON -> actor/critic train on the static unbiased WM + working observer
+    #     and learn to REJECT disturbances (d_t feed-forward) for runtime
+    #     robustness.  (reuses the P3 _wm_frozen_now path; reward head adapts.)
+    # REQUIRES ``dob_enabled=True`` and ``train_mode != 'joint'`` (it IS the
+    # phased curriculum).  Default OFF = the phased schedule is byte-identical.
+    # ENV: DREAMER_CURRICULUM_ENABLED / _STAGE2_DISTURBANCE_PROB / _STAGE3_*.
+    curriculum_enabled: bool = False
+    # Per-stage hidden-disturbance per-episode probability (overrides the
+    # adaptive ``get_phase_disturbance_prob`` ramp).  Stage 1 is always 0.0
+    # (clean by construction).  Stage 2 = max density so the observer sees lots
+    # of disturbance residual to identify A,K.  Stage 3 < 1.0 so the actor also
+    # sees some clean episodes (covers the no-disturbance operating point).
+    curriculum_stage2_disturbance_prob: float = 1.0
+    curriculum_stage3_disturbance_prob: float = 0.85
+
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
     # default: its deterministic GRU core can learn a held-action fixed
@@ -1059,33 +1088,21 @@ class TrainConfig:
     # fraction is too small to retrain the head between P3 iters. K=1
     # restores paper behaviour at the cost of ~30% throughput.
     phase3_collect_every_iters: int = 1
-    # ----- Persistent open-loop excitation re-injection (2026-06-08) -----
-    # The co-train loop otherwise feeds the WM ONLY on-policy CLOSED-LOOP
-    # episodes (the actor holding CV at setpoint), under which the naive
-    # ∂CV/∂MV reads small -> the WM's open-loop steady-state gain regresses
-    # toward zero and its dynamics get sluggish (WM-gain RCA 2026-06-08).
-    # The gain-rich step-test / PRBS episodes only exist in the one-time seed
-    # fill and get diluted then FIFO-evicted as training proceeds.  When
-    # ``excitation_reinject_every_iters > 0`` the loop re-collects ONE clean
-    # open-loop excitation episode (alternating step-test / PRBS) every N
-    # iters and appends it to the buffer, so clean step-response data stays
-    # continuously present.  Default 0 = OFF (opt-in via
-    # ``DREAMER_EXCITATION_REINJECT_EVERY``).
-    excitation_reinject_every_iters: int = 0
     # ----- WM-loss-only open-loop excitation PARTITION (2026-06-09) -----
-    # ``excitation_reinject_every_iters`` (above) was PROVEN HARMFUL (p105):
-    # appending open-loop excitation to the SHARED buffer also feeds the
-    # actor/critic imagination OFF-DISTRIBUTION start-states (the critic must
-    # start imagination from on-policy states, not step-test transients).
-    # This knob instead keeps the gain-rich seed excitation (PRBS + const/step
-    # + step-test) in a SEPARATE persistent buffer that the actor/critic NEVER
-    # sample — only the WM-update step draws from it.  When ``> 0``, each
-    # joint/P3 WM-update step draws its batch from the excitation buffer with
-    # this probability (else from the on-policy buffer); the actor/critic
-    # imagination ALWAYS uses the on-policy buffer.  The excitation buffer is
-    # never FIFO-evicted by closed-loop data, so the WM's open-loop gain stays
-    # supervised for the whole run.  ``0.0`` = OFF (p106-baseline).  WM-only =
-    # backbone-agnostic (transfers to TSSM).
+    # CONSOLIDATION (2026-06-12): the older ``excitation_reinject_every_iters``
+    # (re-inject open-loop excitation into the SHARED buffer) was REMOVED — it
+    # was PROVEN HARMFUL (p105): appending step-test/PRBS to the shared buffer
+    # also fed the actor/critic imagination OFF-DISTRIBUTION start-states (the
+    # critic must start imagination from on-policy states, not step-test
+    # transients).  This partition is its replacement: the gain-rich seed
+    # excitation (PRBS + const/step + step-test) lives in a SEPARATE persistent
+    # buffer that the actor/critic NEVER sample — only the WM-update step draws
+    # from it.  When ``> 0``, each joint/P3 WM-update step draws its batch from
+    # the excitation buffer with this probability (else from the on-policy
+    # buffer); the actor/critic imagination ALWAYS uses the on-policy buffer.
+    # The excitation buffer is never FIFO-evicted by closed-loop data, so the
+    # WM's open-loop gain stays supervised for the whole run.  ``0.0`` = OFF
+    # (p106-baseline).  WM-only = backbone-agnostic (transfers to TSSM).
     wm_excitation_buffer_frac: float = 0.0
     # Reduce inner train steps in P3 so more iters happen per fixed
     # env-step budget — Optuna's pruner gets more samples and we get
@@ -6303,6 +6320,40 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
     joint_prior_refresh_iters = int(
         getattr(cfg, 'joint_prior_refresh_iters', 0) or 0)
+    # ----- Staged clean->disturbance curriculum (2026-06-12) -----
+    # Precondition: needs phased mode (it IS the phased curriculum) + the DOB.
+    # If misconfigured, hard-disable with a loud warning rather than running a
+    # half-applied curriculum.  ``_cur_stage`` latches the applied stage so the
+    # freeze/dob_active/banner fire exactly once per transition (the per-iter
+    # disturbance-prob override is cheap and re-applied every iter).
+    curriculum = bool(getattr(cfg, 'curriculum_enabled', False))
+    if curriculum and joint_mode:
+        print('[curriculum] DISABLED: curriculum_enabled requires phased mode '
+              '(train_mode != joint) — it IS the phased curriculum.',
+              flush=True)
+        curriculum = False
+    if curriculum and not (bool(getattr(cfg, 'dob_enabled', False))
+                           and len(env.cv_indices) > 0):
+        print('[curriculum] DISABLED: curriculum_enabled requires dob_enabled '
+              '+ >=1 CV channel (the observer it identifies in Stage 2).',
+              flush=True)
+        curriculum = False
+    _cur_stage = 0
+    if curriculum:
+        # Stage-1 state applied BEFORE the seed fill so the seed buffer is
+        # collected CLEAN (no hidden disturbance) and the DOB is suppressed
+        # (d_t==0 -> g must explain all CV movement).  wm_freeze_after_p1 is
+        # forced off so the Stage-2 (P2) loss keeps wm_total (its recon
+        # innovation is what trains the observer on the frozen g).
+        wm_freeze_after_p1 = False
+        _fz = model.set_world_model_trainable(g=True, dob=False, reward=True)
+        model.set_dob_active(False)
+        env._disturbance_prob_override = 0.0
+        print('[curriculum] ENABLED — staged clean->disturbance Kalman/DOB '
+              'curriculum. Stage 1 (P1): CLEAN data + DOB suppressed -> WM '
+              f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
+              f'reward={_fz["reward"]} tensors; disturbance prob=0).',
+              flush=True)
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
@@ -6663,6 +6714,53 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             )
         except Exception:
             pass
+
+        # ---------- Staged curriculum stage control (2026-06-12) ----------
+        # Stage == current_phase.  Override the disturbance prob per stage
+        # (cheap, every iter) and apply the freeze/dob_active partition ONCE
+        # per stage via the ``_cur_stage`` latch (idempotent; survives the
+        # quality-gate phase extensions since it keys off the actual phase).
+        if curriculum:
+            if int(current_phase) == 1:
+                env._disturbance_prob_override = 0.0
+            elif int(current_phase) == 2:
+                env._disturbance_prob_override = float(
+                    getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
+            else:
+                env._disturbance_prob_override = float(
+                    getattr(cfg, 'curriculum_stage3_disturbance_prob', 0.85))
+            if _cur_stage != int(current_phase):
+                _cur_stage = int(current_phase)
+                if _cur_stage == 1:
+                    model.set_dob_active(False)
+                    _fz = model.set_world_model_trainable(
+                        g=True, dob=False, reward=True)
+                    _desc = ('CLEAN-WM id (g trains, DOB suppressed, '
+                             'disturbance 0)')
+                elif _cur_stage == 2:
+                    # Freeze g, turn the observer ON, keep wm_total in the P2
+                    # loss so the recon innovation trains A,K on the FROZEN g.
+                    model.set_dob_active(True)
+                    _fz = model.set_world_model_trainable(
+                        g=False, dob=True, reward=True)
+                    _desc = ('DOB id (g FROZEN, observer A,K + reward train '
+                             f'via recon innovation, disturbance '
+                             f'{env._disturbance_prob_override:.2f})')
+                else:
+                    # Freeze g AND the observer; actor/critic train on the
+                    # static unbiased WM.  _wm_frozen_now drops wm_total in the
+                    # P3 path so only reward-MTP + actor/critic optimise.
+                    model.set_dob_active(True)
+                    _fz = model.set_world_model_trainable(
+                        g=False, dob=False, reward=True)
+                    _wm_frozen_now = True
+                    _desc = ('actor/critic on FROZEN WM+DOB (disturbance '
+                             f'{env._disturbance_prob_override:.2f} + domain '
+                             'randomization -> runtime robustness)')
+                print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
+                      f"steps{total_env_steps}: {_desc} "
+                      f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
+                      f"trainable-flags set]", flush=True)
 
         # ---------- P52 RCA: phase-transition quality gates ----------
         # When the env-step budget says "leave the current phase", check
@@ -7052,46 +7150,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 ret = float(ep['rew'].sum())
                 ema_return = (ret if ema_return is None
                                 else 0.95 * ema_return + 0.05 * ret)
-            # Persistent open-loop excitation re-injection (2026-06-08).
-            # On-policy closed-loop episodes under-excite the WM's gain
-            # (the actor holds CV flat -> ∂CV/∂MV reads small), so every
-            # ``excitation_reinject_every_iters`` iters add ONE clean
-            # open-loop excitation episode (alternating step-test / PRBS)
-            # to keep gain-rich step-response data continuously in the
-            # buffer.  Not a policy return -> excluded from ema_return /
-            # return_window.  Guarded so a collection failure never kills
-            # the run.
-            reinj_every = int(getattr(cfg, 'excitation_reinject_every_iters',
-                                       0) or 0)
-            if reinj_every > 0 and (total_iters % reinj_every) == 0:
-                try:
-                    _ob = float(getattr(cfg, 'constant_action_seed_op_band',
-                                         0.6))
-                    _astd = float(getattr(cfg, 'baseline_seed_action_std',
-                                           0.05))
-                    _pob = float(getattr(cfg, 'prbs_seed_op_band', 0.95))
-                    _ndv = int(len(getattr(env.sim, 'dv_indices', []) or []))
-                    if (total_iters // reinj_every) % 2 == 0:
-                        _lvl = float(env.rng.uniform(-_ob, _ob))
-                        _pdv = (int(env.rng.integers(0, _ndv))
-                                if _ndv > 0 else -1)
-                        _xep = collect_step_test_episode(
-                            env, cfg, initial_level=_lvl, primary_dv_pos=_pdv)
-                        _xkind = 'step_test'
-                    else:
-                        _xep = collect_prbs_episode(
-                            env, cfg, action_std=_astd, op_band=_pob)
-                        _xkind = 'prbs'
-                    buf.add_episode(_xep['obs'], _xep['act'], _xep['rew'],
-                                    _xep['cont'])
-                    total_env_steps += cfg.episode_length
-                    if (total_iters % max(1, reinj_every * 10)) == 0:
-                        print(f"[excite] re-injected {_xkind} @iter"
-                              f"{total_iters} (every {reinj_every} iters)",
-                              flush=True)
-                except Exception as _xe:
-                    print(f"[excite] re-injection skipped @iter{total_iters}: "
-                          f"{_xe!r}", flush=True)
+            # NOTE (consolidation 2026-06-12): the legacy persistent open-loop
+            # excitation RE-INJECTION into the shared buffer was removed here
+            # (p105 anti-pattern — fed the actor/critic imagination off-
+            # distribution step-test start-states).  Use the WM-only excitation
+            # PARTITION (``wm_excitation_buffer_frac``) instead, which the
+            # actor/critic never sample.
             # Periodic deterministic eval (for the BO score window).
             if (total_iters % max(1, cfg.phase3_eval_every_iters)) == 0:
                 ep_eval = collect_episode(env, model, device, cfg,

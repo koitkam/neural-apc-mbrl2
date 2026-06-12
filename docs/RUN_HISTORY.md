@@ -47,6 +47,7 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 | p113 | 2026-06-10 | **Exp A**: hidden-disturbance OFF (ablation) | gain 0.176, real→post 0.940, mv_tv 813 | 🎯 **DECISIVE** — omitted-variable attenuation confirmed |
 | p114 | 2026-06-11 | **DOB Scope 1** (neural Kalman filter; d_t output-additive only) | gain 0.365 (NOT recovered), reward_r 0.024, mv_tv 1007, cv_viol 31.5, econ −48.7; decomp 0.798/**1.000**/0.850; dist r **+0.70** R² −0.55 | ⚠️ prior dynamics perfect + dist-corr positive + no oscillation, BUT gain not recovered (autoencoder) + **actor PASSIVE** (mv_viol 0.13 vs p106 35.9) |
 | p115 | 2026-06-11 | **DOB + Scope 2** (d_t fed into feat) + excitation 0.6 + recon_cv 4 + P87 head retired | gain **0.298** (healthy✓, ↓ from p114 0.365), reward_r **0.160** (recovered from 0.024), real→post **0.886**, dist r 0.64 R² **+0.30** (flipped +); econ −49.2, cv_viol 28.1 | ⚠️ **WM #1+#2 advanced** (gain healthy, dist R² positive) but not yet p106's 0.186; actor still mv_viol≈0 (econ #4 deferred); residual = autoencoder+compounding |
+| p116 | 2026-06-12 | **Stage 1 of staged plan**: clean data (`HIDDEN_DISTURBANCE=0`) + Kalman/DOB OFF + excitation 0.6 + recon_cv 4 + **compile ON** (default) | _running_ | ⏳ WM-gain-ceiling probe + compile validation |
 
 ## Run details
 
@@ -101,3 +102,25 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   on open-loop excitation until the gain converges, freeze the WM core incl. the
   DOB A/K, THEN train actor/critic on the static unbiased WM). Compile refactor
   (below) lands first so the pretrain phase is fast.
+
+### p116 — Stage 1: clean-data WM (compile default-on)
+- **Context**: first stage of the user's staged clean→disturbance curriculum
+  (the proper Kalman/DOB design: identify the plant on CLEAN data, THEN fit the
+  observer on the fixed plant). Launched standalone (no new code) while the full
+  3-stage curriculum is built.
+- **Change vs p115**: `DREAMER_HIDDEN_DISTURBANCE=0` (CLEAN — no unmeasured
+  disturbance; measured DV + noise + DR stay) + DOB **OFF** + `DISTURBANCE_LOSS_SCALE=0`
+  (P87 head retired, `disturbance_head_dim=0`); keeps excitation 0.6 + recon_cv 4;
+  **`torch.compile` ON** (the default — stopped passing `DREAMER_COMPILE=0`; the
+  refactor f0faa3b made the DOB graph compile, and this DOB-off run is the proven
+  p106 compile path = live end-to-end compile validation).
+- **Purpose / judge by**: the unbiased-WM **gain ceiling** — with zero
+  omitted-variable confound + the recon_cv/excitation levers, how low can
+  `wm_gain_rel_err` go (expect ≤ p113's 0.176)? + decomp `real→post` → ~1.0
+  (isolates how much of p115's gap was confound vs autoencoder). Do **NOT** judge
+  by actor econ / disturbance-rejection — a clean-trained actor will not reject
+  disturbances **by design**; the disturbance-capable actor is **Stage 3** of the
+  curriculum (with disturbances + domain randomization for runtime robustness).
+- **Next**: build the integrated 3-stage curriculum (clean-WM → freeze-g-not-DOB
+  + disturbance+DOB on → actor) as ONE run; this p116 clean WM is the reference
+  for the achievable gain ceiling.

@@ -349,6 +349,10 @@ class TransformerSSMDynamics(nn.Module):
             persistent=False)
         self.n_cv = int(self.cv_index_t.numel())
         self.dob_enabled = bool(getattr(cfg, 'dob_enabled', False)) and self.n_cv > 0
+        # Curriculum Stage-1 suppression (2026-06-12, mirror of RSSMDynamics):
+        # ``dob_active=False`` forces d_t==0 (clean-plant identification stage)
+        # while keeping a zero d-tail in feat so head dims stay constant.
+        self.dob_active = True
         if self.dob_enabled:
             self.dob_log_decay = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
@@ -523,20 +527,25 @@ class TransformerSSMDynamics(nn.Module):
         prior_logits = torch.stack(prior_l, dim=1)
         ds = None
         if self.dob_enabled:
-            # ONE batched prior decode → CV forecast base, then the scalar per-CV
-            # Kalman filter: d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-            prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, core)
-            base = self.decode(prior_core).index_select(-1, self.cv_index_t)
-            cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
-            A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
-            u = K * (cv_obs - base)                               # drive (B,T,n_cv)
-            coef = (1.0 - K) * A                                  # (n_cv,)
-            d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
-            ds_l = []
-            for t in range(T):
-                d_prev = coef * d_prev + u[:, t]
-                ds_l.append(d_prev)
-            ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+            if self.dob_active:
+                # ONE batched prior decode → CV forecast base, then the scalar per-CV
+                # Kalman filter: d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
+                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, core)
+                base = self.decode(prior_core).index_select(-1, self.cv_index_t)
+                cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
+                A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
+                u = K * (cv_obs - base)                               # drive (B,T,n_cv)
+                coef = (1.0 - K) * A                                  # (n_cv,)
+                d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
+                ds_l = []
+                for t in range(T):
+                    d_prev = coef * d_prev + u[:, t]
+                    ds_l.append(d_prev)
+                ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+            else:
+                # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
+                ds = torch.zeros(B, T, self.n_cv, device=device,
+                                 dtype=post_core.dtype)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = TSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               kv_cache=state.kv_cache, pos=state.pos,

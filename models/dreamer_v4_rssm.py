@@ -261,6 +261,14 @@ class RSSMDynamics(nn.Module):
             persistent=False)
         self.n_cv = int(self.cv_index_t.numel())
         self.dob_enabled = bool(getattr(cfg, 'dob_enabled', False)) and self.n_cv > 0
+        # Curriculum Stage-1 suppression (2026-06-12): when ``dob_active`` is
+        # False (Stage 1 = clean-plant identification) the disturbance estimate
+        # d_t is forced to ZERO so the dynamics ``g`` must explain ALL CV
+        # movement (no observer escape-hatch) -> unbiased input->CV gain.  The
+        # feature still carries a ZERO d-tail so head dims stay constant across
+        # stages (no checkpoint head-dim mismatch).  Set via
+        # ``DreamerV4.set_dob_active``.  Default True = observer runs.
+        self.dob_active = True
         if self.dob_enabled:
             self.dob_log_decay = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
@@ -409,21 +417,26 @@ class RSSMDynamics(nn.Module):
         prior_logits = torch.stack(prior_l, dim=1)
         ds = None
         if self.dob_enabled:
-            # ONE batched prior decode → CV forecast base (d-free), then the
-            # scalar per-CV Kalman filter.  d_t = A·d_{t-1} + K·ν with
-            # ν = CV_obs − (base + A·d_{t-1}) ⇒ d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-            prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, core)
-            base = self.decode(prior_core).index_select(-1, self.cv_index_t)
-            cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
-            A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
-            u = K * (cv_obs - base)                               # drive (B,T,n_cv)
-            coef = (1.0 - K) * A                                  # (n_cv,)
-            d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
-            ds_l = []
-            for t in range(T):
-                d_prev = coef * d_prev + u[:, t]
-                ds_l.append(d_prev)
-            ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+            if self.dob_active:
+                # ONE batched prior decode → CV forecast base (d-free), then the
+                # scalar per-CV Kalman filter.  d_t = A·d_{t-1} + K·ν with
+                # ν = CV_obs − (base + A·d_{t-1}) ⇒ d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
+                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, core)
+                base = self.decode(prior_core).index_select(-1, self.cv_index_t)
+                cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
+                A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
+                u = K * (cv_obs - base)                               # drive (B,T,n_cv)
+                coef = (1.0 - K) * A                                  # (n_cv,)
+                d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
+                ds_l = []
+                for t in range(T):
+                    d_prev = coef * d_prev + u[:, t]
+                    ds_l.append(d_prev)
+                ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+            else:
+                # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
+                ds = torch.zeros(B, T, self.n_cv, device=device,
+                                 dtype=post_core.dtype)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               d=ds[:, -1])

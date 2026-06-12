@@ -204,7 +204,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_TARGET_CRITIC_TAU':  ('target_critic_tau',          float),
     'DREAMER_P3_COLLECT_EVERY':   ('phase3_collect_every_iters', int),
     'DREAMER_BUFFER_CAP_STEPS':   ('buffer_capacity_steps',      int),
-    'DREAMER_EXCITATION_REINJECT_EVERY': ('excitation_reinject_every_iters', int),
+    # (DREAMER_EXCITATION_REINJECT_EVERY removed 2026-06-12 — the shared-buffer
+    #  re-injection was the p105 anti-pattern; use DREAMER_WM_EXCITATION_BUFFER_
+    #  FRAC, the WM-only partition the actor/critic never sample.)
     # 2026-05-19 paper-strip-back knobs (p28 A/B): expose the remaining
     # auto-tuned cfg fields so a fully paper-faithful baseline can be
     # launched purely via env vars.
@@ -438,6 +440,11 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_DOB_REG_COEF':               ('dob_reg_coef',                   float),
     'DREAMER_DOB_DECAY_INIT':             ('dob_decay_init',                 float),
     'DREAMER_DOB_GAIN_INIT':              ('dob_gain_init',                  float),
+    # Staged clean->disturbance curriculum (2026-06-12; default off).  Requires
+    # dob_enabled + phased mode.  See TrainConfig.curriculum_enabled.
+    'DREAMER_CURRICULUM_ENABLED':         ('curriculum_enabled',             _as_bool),
+    'DREAMER_CURRICULUM_STAGE2_DISTURBANCE_PROB': ('curriculum_stage2_disturbance_prob', float),
+    'DREAMER_CURRICULUM_STAGE3_DISTURBANCE_PROB': ('curriculum_stage3_disturbance_prob', float),
     # #1 (P88): critic real-grounding rebalance (down-weight imagined critic CE
     # so the real-return anchor dominates -> breaks bootstrap self-dominance).
     'DREAMER_CRITIC_IMAG_LOSS_COEF':      ('critic_imag_loss_coef',          float),

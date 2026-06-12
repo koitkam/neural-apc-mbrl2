@@ -1584,6 +1584,56 @@ class DreamerV4(nn.Module):
         """Value head — trained in Phase 3 only."""
         return list(self.value.parameters())
 
+    # ----------------------------------------- staged curriculum freeze control
+    def set_world_model_trainable(self, *, g: bool, dob: bool,
+                                  reward: bool) -> Dict[str, int]:
+        """Set ``requires_grad`` on the world-model parameter sub-groups for the
+        staged clean→disturbance curriculum (2026-06-12).
+
+        Partitions the world-model params into three independently-controlled
+        groups so each curriculum stage trains exactly the right thing:
+          * ``g``      — the WM dynamics ``g``: encoder/decoder/GRU(or
+            transformer)/prior/posterior (+ tokenizer for the SF backbone),
+            i.e. EVERYTHING in ``self.dynamics`` EXCEPT the DOB observer params.
+            This is the input→CV plant model whose gain we identify in Stage 1.
+          * ``dob``    — the neural-Kalman observer params ``dob_log_decay`` /
+            ``dob_log_gain`` (A, K).  Identified in Stage 2 on the FROZEN ``g``.
+          * ``reward`` — the reward (-MTP) head.
+
+        Frozen params (``requires_grad=False``) get no gradient, so ``opt_world``
+        (which spans ``parameters_world``) simply skips them — no optimizer
+        rebuild needed.  ``load_state_dict`` copies data in-place and preserves
+        these flags, so a warm-restore does not silently un-freeze.  Returns the
+        per-group tensor counts for logging.
+        """
+        dyn = self.dynamics
+        dob_ids = set()
+        for _n in ('dob_log_decay', 'dob_log_gain'):
+            _p = getattr(dyn, _n, None)
+            if _p is not None:
+                dob_ids.add(id(_p))
+        n_g = n_dob = n_r = 0
+        for p in dyn.parameters():
+            if id(p) in dob_ids:
+                p.requires_grad_(bool(dob)); n_dob += 1
+            else:
+                p.requires_grad_(bool(g)); n_g += 1
+        if getattr(self, 'tokenizer', None) is not None:
+            for p in self.tokenizer.parameters():
+                p.requires_grad_(bool(g)); n_g += 1
+        for p in self.reward.parameters():
+            p.requires_grad_(bool(reward)); n_r += 1
+        return {'g': n_g, 'dob': n_dob, 'reward': n_r}
+
+    def set_dob_active(self, active: bool) -> None:
+        """Toggle the DOB observer (Stage-1 suppression).  When False the
+        disturbance estimate ``d_t`` is forced to zero in ``rollout_observed``
+        (the WM must explain all CV movement with ``g``); the feature still
+        carries a zero d-tail so head dims stay constant.  No-op if DOB off."""
+        dyn = getattr(self, 'dynamics', None)
+        if dyn is not None and hasattr(dyn, 'dob_active'):
+            dyn.dob_active = bool(active)
+
     # --------------------------------------------------- inference: latent step
     @torch.no_grad()
     def imagine_next_z(self, z_history: torch.Tensor, action: torch.Tensor,
