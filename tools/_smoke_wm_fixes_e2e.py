@@ -1,17 +1,16 @@
 """End-to-end (in-loop) smoke for the 2026-06-09 WM-fix levers.
 
 Runs the REAL ``train()`` loop on test_sim for a tiny budget (CPU, joint mode)
-with ALL FOUR new knobs turned ON, then asserts that each new code path actually
+with the new knobs turned ON, then asserts that each new code path actually
 EXECUTED in the loop (not just the unit-level helpers in _smoke_wm_fixes.py):
 
   * #5 freeze-after-pretrain  -> a row with ``wm_frozen == True`` + the
                                  "[joint] WM CORE FROZEN" banner.
-  * #7 excitation partition   -> ``n_wm_exc_draws`` increases over the run
-                                 (the WM-update step drew from the WM-only buf).
   * #4 BC expert tracking      -> at least one row carries a non-null
                                  ``expert_det_return`` + ``agent_minus_expert_return``.
   * #6 CV-weighted recon       -> ``recon_loss`` stays finite throughout with
                                  the lever engaged.
+  (#7 WM-only excitation partition was removed 2026-06-12 — see TrainConfig.)
   * the run completes without raising.
 
 This is intentionally heavier than the unit smoke; keep the budget tiny.
@@ -119,11 +118,6 @@ def main():
     froze = [r for r in rows if r.get('wm_frozen') is True]
     assert froze, 'WM never froze (wm_frozen never True) — freeze hook not wired'
     print(f'[e2e] OK  #5 WM froze in-loop (wm_frozen=True in {len(froze)} rows)')
-
-    # #7 excitation draws happened.
-    draws = [r.get('n_wm_exc_draws', 0) for r in rows]
-    assert max(draws) > 0, 'n_wm_exc_draws never > 0 — excitation partition unused'
-    print(f'[e2e] OK  #7 WM-only excitation draws occurred (max={max(draws)})')
 
     # #4 BC expert tracking logged.
     exp_rows = [r for r in rows if r.get('expert_det_return') is not None]

@@ -410,7 +410,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # WM-fix workstream (2026-06-09): all default-OFF (identity to p106).
     'DREAMER_WM_FREEZE_AFTER_ITERS':      ('wm_freeze_after_iters',          int),
     'DREAMER_WM_RECON_CV_WEIGHT':         ('wm_recon_cv_weight',             float),
-    'DREAMER_WM_EXCITATION_BUFFER_FRAC':  ('wm_excitation_buffer_frac',      float),
     'DREAMER_BC_TRACK_EXPERT_EVERY':      ('bc_track_expert_every',          int),
     'DREAMER_EXPERT_BC_P3_FLOOR':         ('expert_bc_p3_floor',             float),
     'DREAMER_P3_CRITIC_WARMUP_ITERS':     ('p3_critic_warmup_iters',         int),

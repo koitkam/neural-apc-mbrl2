@@ -1088,22 +1088,18 @@ class TrainConfig:
     # fraction is too small to retrain the head between P3 iters. K=1
     # restores paper behaviour at the cost of ~30% throughput.
     phase3_collect_every_iters: int = 1
-    # ----- WM-loss-only open-loop excitation PARTITION (2026-06-09) -----
-    # CONSOLIDATION (2026-06-12): the older ``excitation_reinject_every_iters``
-    # (re-inject open-loop excitation into the SHARED buffer) was REMOVED — it
-    # was PROVEN HARMFUL (p105): appending step-test/PRBS to the shared buffer
-    # also fed the actor/critic imagination OFF-DISTRIBUTION start-states (the
-    # critic must start imagination from on-policy states, not step-test
-    # transients).  This partition is its replacement: the gain-rich seed
-    # excitation (PRBS + const/step + step-test) lives in a SEPARATE persistent
-    # buffer that the actor/critic NEVER sample — only the WM-update step draws
-    # from it.  When ``> 0``, each joint/P3 WM-update step draws its batch from
-    # the excitation buffer with this probability (else from the on-policy
-    # buffer); the actor/critic imagination ALWAYS uses the on-policy buffer.
-    # The excitation buffer is never FIFO-evicted by closed-loop data, so the
-    # WM's open-loop gain stays supervised for the whole run.  ``0.0`` = OFF
-    # (p106-baseline).  WM-only = backbone-agnostic (transfers to TSSM).
-    wm_excitation_buffer_frac: float = 0.0
+    # (REMOVED 2026-06-12) ``wm_excitation_buffer_frac`` — the WM-only open-loop
+    # excitation PARTITION.  It existed to keep gain-rich open-loop data flowing
+    # to the WM-update during JOINT closed-loop co-training, but: (1) it was only
+    # ever drawn in the P3/joint branch (inert in the phased curriculum's P1/P2),
+    # (2) it never demonstrably helped (p109/p110/p115 regressed or were
+    # confounded; the known-good p106 never used it), and (3) the p117 clean
+    # Stage-1 gain probe proved the WM DYNAMICS are already perfectly identified
+    # (posterior→1-step gain x0.998) from the settle-aware seed buffer + random
+    # collection — the residual gain under-read is the AUTOENCODER (real→post
+    # x0.847), which more open-loop data cannot fix.  Removed as dead weight; the
+    # gain-rich seed excitation (PRBS + const/step-settle + step-test, all in the
+    # shared buffer) already gives open-loop coverage.
     # Reduce inner train steps in P3 so more iters happen per fixed
     # env-step budget — Optuna's pruner gets more samples and we get
     # finer-grained logs of actor / entropy progression.
@@ -6053,21 +6049,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     if buf.dist is not None:
         buf._dist_source = env
 
-    # WM-loss-only excitation partition (2026-06-09): a SEPARATE persistent
-    # buffer holding ONLY the gain-rich open-loop seed excitation (PRBS +
-    # const/step + step-test).  Never FIFO-evicted by closed-loop data and
-    # NEVER sampled by the actor/critic — only the WM-update step draws from it
-    # (with prob wm_exc_frac).  n_dist=0 so it dodges the single-env
-    # _dist_source double-pop (disturbance head is skipped on these samples).
-    # Allocated only when the partition is on (frac > 0) = p106-baseline off.
-    wm_exc_frac = float(getattr(cfg, 'wm_excitation_buffer_frac', 0.0) or 0.0)
-    wm_exc_buf: Optional[TrajectoryBuffer] = None
-    if wm_exc_frac > 0.0:
-        wm_exc_buf = TrajectoryBuffer(max(1, capacity_eps), cfg.episode_length,
-                                       cfg.obs_dim, cfg.action_dim, n_dist=0)
-        print(f"[wm-exc] WM-only excitation partition ENABLED "
-              f"(frac={wm_exc_frac:.2f}, cap={capacity_eps} eps) — actor/"
-              f"critic never sample it", flush=True)
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / 'train_log.jsonl'
@@ -6102,7 +6083,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     iter_mv_violations: List[float] = []
     iter_raw_returns: List[float] = []
     n_grad_skip = 0
-    n_wm_exc_draws = 0
     current_phase = 1
     t_collect_acc = 0.0
     t_sample_acc = 0.0
@@ -6471,8 +6451,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     action_std=baseline_seed_std,
                                     op_band=prbs_op_band)
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-        if wm_exc_buf is not None:
-            wm_exc_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
 
     # Constant-action / step-and-settle seed (run_p31 RCA 2026-05-21
@@ -6524,9 +6502,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                           level=float(lvl),
                                           do_step=bool(do_step_mask[i]))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-            if wm_exc_buf is not None:
-                wm_exc_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
-                                        ep['cont'])
             total_env_steps += cfg.episode_length
             if do_step_mask[i]:
                 n_step_emitted += 1
@@ -6566,9 +6541,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                              initial_level=float(lvl),
                                              primary_dv_pos=int(primary))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-            if wm_exc_buf is not None:
-                wm_exc_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
-                                        ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] step-test={n_step_test_seed} "
               f"(n_mv={n_mv}, n_dv={n_dv}, per_ch={n_per_ch}, "
@@ -7150,12 +7122,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 ret = float(ep['rew'].sum())
                 ema_return = (ret if ema_return is None
                                 else 0.95 * ema_return + 0.05 * ret)
-            # NOTE (consolidation 2026-06-12): the legacy persistent open-loop
-            # excitation RE-INJECTION into the shared buffer was removed here
-            # (p105 anti-pattern — fed the actor/critic imagination off-
-            # distribution step-test start-states).  Use the WM-only excitation
-            # PARTITION (``wm_excitation_buffer_frac``) instead, which the
-            # actor/critic never sample.
+            # (Open-loop excitation re-injection into the buffer was removed
+            # 2026-06-12: the p105 shared-buffer reinject fed the actor/critic
+            # imagination off-distribution step-test start-states, and the
+            # separate WM-only partition that replaced it never helped — the
+            # settle-aware seed buffer already covers open-loop gain.)
             # Periodic deterministic eval (for the BO score window).
             if (total_iters % max(1, cfg.phase3_eval_every_iters)) == 0:
                 ep_eval = collect_episode(env, model, device, cfg,
@@ -7458,30 +7429,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # via imagination from a possibly different batch.
                 _t = time.time()
                 # ---- (a) WM + reward-head update -----------------
-                # WM-loss-only excitation partition (2026-06-09): draw the
-                # WM-update batch from the persistent open-loop excitation
-                # buffer with prob ``wm_exc_frac`` (else the on-policy batch).
-                # The actor/critic step (b) ALWAYS uses the on-policy ``batch``
-                # so imagination start-states stay in-distribution (the p105
-                # lesson — shared-buffer reinject was harmful).
-                wm_batch = batch
-                if (wm_exc_buf is not None and wm_exc_buf.filled > 0
-                        and wm_exc_frac > 0.0
-                        and float(rng.random()) < wm_exc_frac):
-                    _wb_np = wm_exc_buf.sample(cfg.batch_size, cfg.seq_len, rng)
-                    wm_batch = {}
-                    for _k, _v in _wb_np.items():
-                        _bt = torch.from_numpy(_v)
-                        _bt = (_bt.pin_memory().to(device, non_blocking=True)
-                               if device.type == 'cuda' else _bt.to(device))
-                        wm_batch[_k] = _bt
-                    n_wm_exc_draws += 1
+                # The WM + reward heads train on the SAME on-policy ``batch`` the
+                # actor/critic imagine from (joint/P3 co-training).
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
-                    wm_losses, _, agent_hid = world_model_loss(model, wm_batch,
+                    wm_losses, _, agent_hid = world_model_loss(model, batch,
                                                                   cfg)
-                    ag_losses = agent_finetune_loss(model, wm_batch,
+                    ag_losses = agent_finetune_loss(model, batch,
                                                       agent_hid, cfg)
                     # Drop BC term in P3 (the actor is now driven by
                     # imagination/PMPO; BC against random-action data
@@ -7646,7 +7601,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                             if iter_mv_violations else None),
                 'n_grad_skip': int(n_grad_skip),
                 'buf_fill_pct': float(buf.filled) / max(1, buf.capacity_eps),
-                'n_wm_exc_draws': int(n_wm_exc_draws),
                 'wm_frozen': bool(_wm_frozen_now),
                 'expert_det_return': last_expert_det_return,
                 'agent_minus_expert_return': last_agent_minus_expert,

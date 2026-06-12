@@ -94,7 +94,6 @@ def _mk_cfg(out_dir):
     cfg.dob_enabled = True
     cfg.disturbance_head_dim = 0           # DOB retires the P87 head
     cfg.wm_recon_cv_weight = 4.0
-    cfg.wm_excitation_buffer_frac = 0.5
     cfg.curriculum_enabled = True
     cfg.curriculum_stage2_disturbance_prob = 1.0
     cfg.curriculum_stage3_disturbance_prob = 0.85

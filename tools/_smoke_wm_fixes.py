@@ -2,17 +2,15 @@
 
   * #6 per-channel CV-weighted recon (``wm_recon_cv_weight``)
   * #5 WM freeze-after-pretrain (``wm_freeze_after_iters``) — freeze mechanism
-  * #7 WM-loss-only excitation partition (``wm_excitation_buffer_frac``) —
-       the n_dist=0 excitation buffer feeding ``world_model_loss``
   * #4 BC expert-return tracking (``bc_track_expert_every``) — config plumbing
-  * ENV_OVERRIDES wiring for all five new DREAMER_* knobs.
+  * ENV_OVERRIDES wiring for the new DREAMER_* knobs.
+  (#7 WM-only excitation partition was REMOVED 2026-06-12 — never helped; the
+   settle-aware seed buffer covers open-loop gain.)
 
 Verifies, for BOTH backbones where applicable, WITHOUT a real env:
   * default cfg => every lever OFF / identity (no change vs p106 baseline).
   * #6 engaged => weighted recon finite, differs from uniform, up-weights the
     CV channel, backprops; world_model_loss stays finite (RSSM + SF).
-  * #7 => a TrajectoryBuffer(n_dist=0) round-trips through world_model_loss
-    (the disturbance-head None path) finite on both backbones.
   * #5 => freezing model.dynamics leaves the reward head (parameters_world)
     still trainable.
   * env overrides map each knob onto the right cfg field.
@@ -128,30 +126,6 @@ def _test_recon_integration(wm_type):
           f'({r1:.5f}) ({wm_type})')
 
 
-def _test_excitation_buffer(wm_type):
-    print(f'\n=== #7 WM-only excitation buffer (n_dist=0) ({wm_type}) ===')
-    cfg, model, _ = _mk(wm_type=wm_type)
-    T = 40
-    exc = TrajectoryBuffer(4, T, cfg.obs_dim, cfg.action_dim, n_dist=0)
-    rng = np.random.default_rng(0)
-    for _ in range(3):
-        exc.add_episode(
-            rng.standard_normal((T, cfg.obs_dim)).astype('float32'),
-            (rng.random((T, cfg.action_dim)) * 2 - 1).astype('float32'),
-            rng.standard_normal(T).astype('float32'),
-            np.ones(T, dtype='float32'))
-    assert exc.filled == 3, f'expected 3 filled, got {exc.filled}'
-    bnp = exc.sample(cfg.batch_size if hasattr(cfg, 'batch_size') else 3,
-                     cfg.seq_len, rng)
-    assert 'dist' not in bnp, 'n_dist=0 buffer must NOT emit a dist key'
-    batch = {k: torch.from_numpy(v) for k, v in bnp.items()}
-    losses, _, _ = world_model_loss(model, batch, cfg)
-    assert torch.isfinite(losses['wm_total']).all(), 'wm_total must be finite'
-    losses['wm_total'].backward()
-    print(f'[smoke] OK  excitation buffer round-trips through world_model_loss '
-          f'(wm_total={float(losses["wm_total"]):.4f}, no dist key) ({wm_type})')
-
-
 def _test_freeze_mechanism():
     print('\n=== #5 freeze-after-pretrain (freeze mechanism) ===')
     cfg, model, _ = _mk(wm_type='rssm')
@@ -174,7 +148,6 @@ def _test_defaults_and_env():
     cfg = TrainConfig()
     assert cfg.wm_recon_cv_weight == 1.0, 'recon weight must default 1.0 (identity)'
     assert cfg.wm_freeze_after_iters == 0, 'freeze must default 0 (off)'
-    assert cfg.wm_excitation_buffer_frac == 0.0, 'exc frac must default 0 (off)'
     assert cfg.bc_track_expert_every == 0, 'bc track must default 0 (off)'
     assert cfg.cv_obs_indices == (), 'cv_obs_indices must default empty'
     print('[smoke] OK  all new knobs default to OFF / identity')
@@ -183,7 +156,6 @@ def _test_defaults_and_env():
     env_map = {
         'DREAMER_WM_FREEZE_AFTER_ITERS': ('40', 'wm_freeze_after_iters', 40),
         'DREAMER_WM_RECON_CV_WEIGHT': ('6.0', 'wm_recon_cv_weight', 6.0),
-        'DREAMER_WM_EXCITATION_BUFFER_FRAC': ('0.3', 'wm_excitation_buffer_frac', 0.3),
         'DREAMER_BC_TRACK_EXPERT_EVERY': ('5', 'bc_track_expert_every', 5),
         'DREAMER_EXPERT_BC_P3_FLOOR': ('0.0', 'expert_bc_p3_floor', 0.0),
     }
@@ -205,7 +177,6 @@ if __name__ == '__main__':
     _test_weighted_recon()
     for wm in ('rssm', 'sf_transformer'):
         _test_recon_integration(wm)
-        _test_excitation_buffer(wm)
     _test_freeze_mechanism()
     _test_defaults_and_env()
     print('\n[smoke] ALL WM-FIX SMOKE TESTS PASSED')
