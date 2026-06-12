@@ -224,12 +224,25 @@ The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
   disturbances + domain randomization on**, so the deployed controller is robust
   at runtime. The reward head keeps adapting.
 
+> **Stage-1 excitation (verified p117):** the seed buffer is **settle-aware**, not
+> random-only — it carries constant-action episodes (full-episode hold, 4–10×
+> settle time), step-settle episodes (hold u₀→step→hold u₁ to episode end, `>>τ`
+> tail, noise-free), step-test episodes, and PRBS with a slow hold ≈ `(θ+4τ)/sr`
+> (≈4τ ≈ 98% settled); P1 re-injects const+step every 20 iters (anti-eviction).
+> So the schedule **does** consider time-to-steady-state. **Empirically (p117
+> clean Stage-1 gain probe): the dynamics are essentially perfectly identified**
+> (posterior→1-step gain ratio ×0.998); the residual gain under-read sits in the
+> **autoencoder** (real→posterior ×0.847) + mild compounding (×0.905), i.e. it is
+> an encoder/decoder/latent-capacity bottleneck (the small CV step-gain gets
+> squashed), **not** a non-settling/excitation problem. The lever is the
+> CV-weighted recon (`wm_recon_cv_weight`) / per-CV obs-norm / larger latent —
+> not more step-tests.
+>
 > **Caveat (current):** the WM-only excitation **partition**
 > (`wm_excitation_buffer_frac`) is only drawn in the **P3/joint** WM-update path,
-> so it is **inert in phased P1/P2** — Stage-1 open-loop excitation comes from the
-> random-action collection + seed-buffer PRBS, not the partition. Wiring the
-> partition (or structured PRBS/step collection) into Stage 1 is a tracked
-> enhancement.
+> so it is **inert in phased P1/P2** — Stage-1 excitation comes from the seed
+> buffer (above) + random-action collection, not the partition. Wiring the
+> partition into Stage 1 is a tracked enhancement (a secondary autoencoder help).
 
 Verified by `tools/_smoke_curriculum.py` (per-stage `requires_grad` partition +
 `dob_active` toggle + gradient isolation: S1 recon trains `g` not the DOB, S2
