@@ -48,7 +48,8 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 | p114 | 2026-06-11 | **DOB Scope 1** (neural Kalman filter; d_t output-additive only) | gain 0.365 (NOT recovered), reward_r 0.024, mv_tv 1007, cv_viol 31.5, econ −48.7; decomp 0.798/**1.000**/0.850; dist r **+0.70** R² −0.55 | ⚠️ prior dynamics perfect + dist-corr positive + no oscillation, BUT gain not recovered (autoencoder) + **actor PASSIVE** (mv_viol 0.13 vs p106 35.9) |
 | p115 | 2026-06-11 | **DOB + Scope 2** (d_t fed into feat) + excitation 0.6 + recon_cv 4 + P87 head retired | gain **0.298** (healthy✓, ↓ from p114 0.365), reward_r **0.160** (recovered from 0.024), real→post **0.886**, dist r 0.64 R² **+0.30** (flipped +); econ −49.2, cv_viol 28.1 | ⚠️ **WM #1+#2 advanced** (gain healthy, dist R² positive) but not yet p106's 0.186; actor still mv_viol≈0 (econ #4 deferred); residual = autoencoder+compounding |
 | p116 | 2026-06-12 | **Stage 1 of staged plan**: clean data (`HIDDEN_DISTURBANCE=0`) + Kalman/DOB OFF + excitation 0.6 + recon_cv 4 + **compile ON** (default) | killed @iter270 (~20%, joint, redundant) — confirmed compile default-on works end-to-end; recon converged ~0.02–0.10 | ⏹️ superseded by p117 (its Stage 1 = the clean-WM probe, in phased mode) |
-| p117 | 2026-06-12 | **Staged curriculum** (phased): S1 clean+DOB-suppressed → S2 freeze-g+observer-id → S3 frozen-WM actor + DR; DOB + curriculum_enabled, phases 0.45/0.25/0.30, recon_cv 4, excitation 0.6, compile on | _running_ | ⏳ S1 gain ceiling → S2 gain HOLDS w/ disturbance + d_t R²>0 → S3 actor rejects disturbances |
+| p117 | 2026-06-12 | **Staged curriculum** (phased): S1 clean+DOB-suppressed → S2 freeze-g+observer-id → S3 frozen-WM actor + DR; DOB + curriculum_enabled, phases 0.45/0.25/0.30, recon_cv 4, compile on | gain **0.217** (healthy), **all_pass=1 (FIRST in series)**, reward_r **0.436 (best)**, real→post **0.926 (best)**, lever→**compounding**; actor **ACTIVE** (mv_viol 0.295, mv_tv 799 smooth, no cascade), econ −39.0; **dist R² −0.626 (REGRESSED)** | ✅ **curriculum WORKS** — #1 WM all-pass, #3 critic healthy, #4 actor active+smooth; ONE regression: #2 dist amplitude (d_t over-shrunk by dob_reg on the better clean g) |
+| p118 | 2026-06-13 | **DEVIATION from plan** (not recon_cv — autoencoder already fixed @0.926; decomp lever=compounding). p117 recipe + **`DOB_REG_COEF 0.01→0.002`** (single var) to recover dist R². Safe: g FROZEN ⇒ d_t can't steal gain | _running_ | ⏳ dist R²>0 restored (amplitude) while WM/critic/actor hold p117 levels |
 
 ## Run details
 
@@ -125,3 +126,45 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 - **Next**: build the integrated 3-stage curriculum (clean-WM → freeze-g-not-DOB
   + disturbance+DOB on → actor) as ONE run; this p116 clean WM is the reference
   for the achievable gain ceiling.
+
+### p117 — Staged curriculum (the payoff run)
+- **What**: the full 3-stage curriculum executed flawlessly. `dob_d_absmean` by
+  stage: P1=0.0 (suppressed ✓) → P2=0.088 (observer learning ✓) → P3=0.139
+  (active feedforward ✓). Warm-restore loaded the best clean WM (iter 70) at
+  P1→P2 before freezing.
+- **Result — the best run of the series**:
+  - **WM #1**: gain `rel_err 0.217` (healthy); **all_pass=1 — the FIRST run in the
+    series to pass every internal fidelity gate** (wm_r 0.537, reward_r 0.436,
+    critic_r 0.810). Decomp: real→post **0.926 (best ever)** / post→1step 0.994 /
+    1step→openloop 0.836 → **dominant lever is now COMPOUNDING, not autoencoder**
+    (the clean staged ID fixed the autoencoder).
+  - **#3 critic**: healthy, calibrated (critic_pred_target_r 0.994, critic_r 0.810).
+  - **#4 actor**: **ACTIVE again** (val mv_viol 0.295 vs p115's passive 0.000),
+    **smooth** (mv_tv 799, below p106's 979), no cascade (return_scale stable 9.9);
+    econ −39.0 (better than p115 −49.2, short of p106 −26.0 — but p117's actor
+    faces disturbances p106's never did).
+  - **#2 disturbance — REGRESSED**: d_t R² **−0.626** (p115 was +0.30). r=0.606
+    (direction right) but NRMSE 1.275 (amplitude too small). Cause: the better
+    clean `g` (0.926) explains more CV movement → smaller residual → `dob_reg`
+    (0.01) over-shrinks d_t → amplitude under-predicted.
+- **Verdict**: the curriculum is a **keeper** — it cured the p115 actor passivity,
+  produced the first all-pass WM, and lifted the autoencoder. The single
+  regression (#2 amplitude) has a clean, **safe** fix: lower `dob_reg` — and
+  because `g` is FROZEN in Stages 2/3, a larger d_t **cannot steal gain** (the
+  p114 failure mode is structurally impossible now).
+
+### p118 — DEVIATION: dob_reg fix (not the planned recon_cv)
+- **Why deviate**: the planned p118 (recon_cv 4→6-8 to attack the autoencoder) is
+  **mis-targeted** — p117's decomp proves the autoencoder is fixed (real→post
+  0.926) and the bottleneck moved to **compounding**; recon_cv also has a backfire
+  history (p109/p110 made the gain worse). The pressing issue is the **#2
+  disturbance regression** (user priority #2), not the autoencoder.
+- **Change vs p117 (single variable)**: `DREAMER_DOB_REG_COEF 0.01 → 0.002` so the
+  Kalman d_t isn't over-shrunk → amplitude matches → R² recovers. Everything else
+  = p117 (also drops the now-removed `wm_excitation_buffer_frac` knob).
+- **Judge by**: dist R² back > 0 (amplitude, NRMSE → ~1) **while** WM gain (0.217),
+  all_pass, reward_r (0.436) and the active/smooth actor hold p117 levels.
+- **If it works**: promote `curriculum_enabled` + `dob_enabled` to default-on. The
+  remaining WM-gain refinement (compounding 0.836) is a separate, lower-priority
+  lever (raise overshoot/held-rollout coefs), not recon_cv.
+
