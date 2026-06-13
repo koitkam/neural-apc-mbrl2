@@ -6229,6 +6229,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P2', '0'))
     const_inject_in_p3 = int(
         os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P3', '0'))
+    # ----- Periodic STEP-TEST (DV-exciting) re-injection (2026-06-13) -----
+    # The const-inject above replenishes only the MV exciters (const +
+    # step-settle); the DV-exciting STEP-TEST episodes are seed-only.  Once the
+    # buffer saturates (~iter 40 on test_sim) the isolated DV->CV step responses
+    # are FIFO-evicted, so the WM's DV->CV steady-state gain DE-TRAINS over P1
+    # and (in the curriculum) is frozen biased — p117: DV gain ratio 0.62 vs MV
+    # 0.78, while the aggregate wm_gain_rel_err looked healthy.  This re-injects
+    # step-test episodes on the same cadence so the DV gain stays supervised
+    # right up to the WM freeze.  Default ON in P1 (matches const-inject), P2/P3
+    # opt-in (P50 cascade caution), NO-OP when the sim has no DV channel.
+    step_test_inject_every = int(
+        os.environ.get('DREAMER_STEP_TEST_INJECT_EVERY', '20'))
+    step_test_inject_n = int(
+        os.environ.get('DREAMER_STEP_TEST_INJECT_N', '2'))
+    step_test_inject_in_p2 = int(
+        os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P2', '0'))
+    step_test_inject_in_p3 = int(
+        os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P3', '0'))
     # ----- Periodic EXPERT re-injection (P81 RCA, 2026-06-03) -----
     # Same eviction failure mode as the const-action seeds above, but for
     # the objective-aligned expert demonstrations: the expert episodes are
@@ -7051,6 +7069,44 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"const={_n_c} step={_n_s} episodes "
                   f"(buf_fill={buf.filled}/{buf.capacity_eps})",
                   flush=True)
+
+        # ----- Periodic STEP-TEST (DV-exciting) re-injection (2026-06-13) -----
+        # Keep the isolated DV->CV step-response data fresh in the buffer so the
+        # WM's DV gain doesn't de-train via FIFO eviction (the const-inject above
+        # only replenishes the MV exciters).  Same phase gating as const-inject;
+        # no-op when the sim has no DV channel.  collect_step_test_episode holds
+        # the MV baseline and drives isolated MV+DV step EVENTS (independent of
+        # the curriculum's hidden-disturbance setting), so it excites dCV/dDV
+        # directly even in a CLEAN Stage 1.
+        _st_inject_active = (
+            (current_phase == 1)
+            or (current_phase == 2 and step_test_inject_in_p2)
+            or (current_phase == 3 and step_test_inject_in_p3))
+        _n_dv_inj = int(len(getattr(env.sim, 'dv_indices', []) or []))
+        if (_st_inject_active
+                and step_test_inject_every > 0
+                and step_test_inject_n > 0
+                and _n_dv_inj > 0
+                and total_iters > 0
+                and (total_iters % step_test_inject_every) == 0):
+            _st_op = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
+            _st_levels = np.linspace(-_st_op, _st_op, step_test_inject_n,
+                                      dtype='float32')
+            _st_jit = env.rng.uniform(-0.05, 0.05,
+                                       size=_st_levels.shape).astype('float32')
+            _st_levels = np.clip(_st_levels + _st_jit * _st_op, -1.0, 1.0)
+            for _si, _slvl in enumerate(_st_levels):
+                _primary = _si % _n_dv_inj
+                _stp = collect_step_test_episode(
+                    env, cfg, initial_level=float(_slvl),
+                    primary_dv_pos=int(_primary))
+                buf.add_episode(_stp['obs'], _stp['act'], _stp['rew'],
+                                 _stp['cont'])
+                total_env_steps += cfg.episode_length
+            print(f"[step-test-inject p{current_phase}] iter {total_iters}: "
+                  f"added step-test={step_test_inject_n} episodes "
+                  f"(n_dv={_n_dv_inj}, buf_fill={buf.filled}/"
+                  f"{buf.capacity_eps})", flush=True)
 
         # ----- Periodic EXPERT re-injection (P81 RCA) -----
         # Keep objective-aligned expert demonstrations alive in the ring
