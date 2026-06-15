@@ -235,7 +235,8 @@ class TrainConfig:
     # backbones (RSSM decode-MSE + SF tokenizer recon) so the fix transfers to
     # TSSM.  ``1.0`` = uniform = paper / p106-baseline behaviour (identity).
     # Resolved CV obs indices live in ``cv_obs_indices`` (set at runtime).
-    wm_recon_cv_weight: float = 1.0
+    # Default 4.0 = p117 curriculum-recipe (promoted 2026-06-14; was 1.0).
+    wm_recon_cv_weight: float = 4.0
     cv_obs_indices: Tuple[int, ...] = ()
     sf_scale: float = 1.0
     # P2+P3 reward-MTP loss weight (Dreamer-V4 paper Eq. 9).  Lowered
@@ -370,7 +371,8 @@ class TrainConfig:
     # ``reward = clip(raw * B/reward_clip_ref, -B, B)``.  Raised 1.0→6.0 so
     # the per-step reward spans ~12 twohot bins (head resolution) while
     # imagined returns stay bounded ~B·H (cascade-safe).  See env.step.
-    bound_training_reward_max: float = 6.0
+    # Default 3.0 = p117 curriculum-recipe (promoted 2026-06-14; was 6.0).
+    bound_training_reward_max: float = 3.0
     # Fallback ``reward_clip_ref`` when objective_runtime does not expose
     # one (older comps / degenerate weights); matches the adaptive-clip floor.
     bound_training_reward_ref: float = 50.0
@@ -395,7 +397,9 @@ class TrainConfig:
     # to genuine reward variance and cannot float free.  ``coef`` weights the
     # anchor vs the imagined critic loss.  Set ``critic_replay_anchor_coef=0.0``
     # to disable (legacy pure-imagination critic).
-    critic_replay_anchor_coef: float = 0.5
+    # Default 0.0 = p117 recipe: grounding is done by the MC term below, not
+    # this anchor (promoted 2026-06-14; was 0.5).
+    critic_replay_anchor_coef: float = 0.0
 
     # ---- B : long-horizon critic-anchor grounding (P85, 2026-06-04) ----
     # The replay anchor above computes its TD-λ target over the FULL real
@@ -436,7 +440,9 @@ class TrainConfig:
     # critic trained on REAL states also values IMAGINED states correctly
     # (value-equivalence).  ``1.0`` = legacy (imagined-primary).  Env
     # ``DREAMER_CRITIC_IMAG_LOSS_COEF``.
-    critic_imag_loss_coef: float = 1.0
+    # Default 0.3 = p117 recipe: let the MC grounding term dominate the critic
+    # target so it can't self-inflate (promoted 2026-06-14; was 1.0).
+    critic_imag_loss_coef: float = 0.3
 
     # ---- Real-return (Monte-Carlo) critic grounding (Option #1 / TD-MPC, 2026-06-09) ----
     # The replay anchor above (``critic_replay_anchor_coef``) builds a TD-λ
@@ -452,9 +458,11 @@ class TrainConfig:
     # economics and cannot float on its own fiction.  ``coef`` weights it
     # against the imagined critic CE; pair with a REDUCED
     # ``critic_imag_loss_coef`` (and ``critic_replay_anchor_coef=0``) so the MC
-    # target dominates.  0.0 (default) = off / legacy.  Env
-    # ``DREAMER_CRITIC_MC_GROUNDING_COEF``.
-    critic_mc_grounding_coef: float = 0.0
+    # target dominates.  Default 1.0 = p117 recipe — THIS is the knob that keeps
+    # ``critic_rew_to_tgt_var`` healthy and stops the return_scale runaway/
+    # bootstrap cascade (p120 regressed to 0.0 -> return_scale 139).  Promoted
+    # 2026-06-14 (was 0.0).  Env ``DREAMER_CRITIC_MC_GROUNDING_COEF``.
+    critic_mc_grounding_coef: float = 1.0
     # When True, cap the MC return with a single discounted tail bootstrap
     # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
     # (default) the return is PURE MC (truncated at the segment end).  At
@@ -574,10 +582,17 @@ class TrainConfig:
     # See docs/architecture.md §3.  ``dob_enabled=False`` = byte-identical to the
     # pre-DOB model.  Backbone-agnostic (RSSM + TSSM share feat->decode).  ENV:
     # DREAMER_DOB_ENABLED / _REG_COEF / _DECAY_INIT / _GAIN_INIT.
-    dob_enabled: bool = False
+    # Default True = p117 curriculum-recipe (promoted 2026-06-14; was False).
+    # Backbone-agnostic; sims with 0 CVs fall back to byte-identical pre-DOB.
+    dob_enabled: bool = True
     dob_reg_coef: float = 0.01      # L2 "process-noise-is-small" prior on d_t
     dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence (A)
-    dob_gain_init: float = -2.2     # sigmoid(-2.2)=0.10 — small correction (K)
+    # sigmoid(-1.8)=0.14 — modest Kalman correction (K).  Raised -2.2→-1.8 on
+    # 2026-06-14 (p121): the disturbance estimate under-predicted amplitude
+    # (pred_std 1.16 vs true 1.93, ~1.7×) because the observer was too slow; a
+    # slightly larger K tracks the disturbance amplitude better.  Pairs with
+    # the DV-PRBS fix (a correct DV gain cleans the innovation feeding K).
+    dob_gain_init: float = -1.8
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
     # The textbook system-ID / Kalman recipe applied to the DOB: identify the
@@ -599,7 +614,10 @@ class TrainConfig:
     # REQUIRES ``dob_enabled=True`` and ``train_mode != 'joint'`` (it IS the
     # phased curriculum).  Default OFF = the phased schedule is byte-identical.
     # ENV: DREAMER_CURRICULUM_ENABLED / _STAGE2_DISTURBANCE_PROB / _STAGE3_*.
-    curriculum_enabled: bool = False
+    # Default True = p117 curriculum-recipe (promoted 2026-06-14; was False).
+    # Self-validates at runtime: needs dob_enabled + phased + n_cv>0, else it
+    # hard-disables with a warning, so defaulting ON is safe on any plant.
+    curriculum_enabled: bool = True
     # Per-stage hidden-disturbance per-episode probability (overrides the
     # adaptive ``get_phase_disturbance_prob`` ramp).  Stage 1 is always 0.0
     # (clean by construction).  Stage 2 = max density so the observer sees lots
@@ -623,7 +641,7 @@ class TrainConfig:
     rssm_embed_dim: int = 256
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01          # paper 1% uniform mixture
-    rssm_free_bits: float = 1.0        # paper free-bits floor (nats)
+    rssm_free_bits: float = 0.5        # p117 recipe (promoted 2026-06-14; paper=1.0)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
     rssm_kl_repr_w: float = 0.1        # paper KL-balance repr weight
     # DV-as-input (Option B, 2026-06-07): feed the measured disturbance-variable
@@ -660,8 +678,10 @@ class TrainConfig:
     #       removes the per-step jitter so the reward head sees the
     #       settled mean latent.  Actor exploration still comes from the
     #       policy's own action sampling (TD-MPC2-style deterministic
-    #       latent + stochastic action).  Default False = paper-faithful.
-    rssm_imag_latent_mode: bool = False
+    #       latent + stochastic action).  Default True = p117 recipe: removes the
+    #       per-step imagined-latent jitter that biases imagined returns negative
+    #       and feeds the cascade (promoted 2026-06-14; paper-faithful = False).
+    rssm_imag_latent_mode: bool = True
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -808,6 +828,20 @@ class TrainConfig:
     # cross-DV cases.  0.7 = strong stratification while still seeing
     # the off-primary DVs.
     step_test_primary_dv_bias: float = 0.7
+    # ---- DV-PRBS seed episodes (2026-06-14, p121 DV-gain RCA) ----
+    # The DV analogue of the MV's ``collect_prbs_episode``: hold the MV and
+    # sweep every measured-DV channel with a full-range, multi-timescale,
+    # stratified PRBS (hidden disturbance OFF).  Fixes the ~30× MV-vs-DV
+    # excitation asymmetry that left the DV→CV gain attenuated (~0.75) while
+    # the MV gain reached 0.93.  ``collect_dv_prbs_episode`` is a no-op
+    # fallback (MV-hold) on plants with 0 DV channels, so defaulting >0 is
+    # safe.  Re-injected through Stage 1 via DREAMER_DV_PRBS_INJECT_EVERY/_N.
+    dv_prbs_seed_episodes: int = 16
+    # Fraction of HALF the DV engineering span used as the stratified-level
+    # sweep amplitude (|offset| ≤ op_frac·span/2).  0.6 = sweep ~60% of the
+    # range each side of baseline: large enough that Var(DV) ≫ Var(noise)
+    # (kills regression dilution) yet safely inside the channel bounds.
+    dv_prbs_op_frac: float = 0.6
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -875,7 +909,8 @@ class TrainConfig:
     # expert via the real-reward/MC-critic objective.  ``0`` = OFF (no extra
     # eval cost = p106-baseline behaviour).  To remove the floor confound for a
     # clean learning test, ALSO set DREAMER_EXPERT_BC_P3_FLOOR=0 (full release).
-    bc_track_expert_every: int = 0
+    # Default 1 = p117 curriculum-recipe (promoted 2026-06-14; was 0).
+    bc_track_expert_every: int = 1
 
     # ----- (a) adaptive bounded-return envelope (WM-drift mitigation) -----
     # With per-step reward bounded to [-B, B] (P77 linear remap), the λ-return
@@ -978,7 +1013,9 @@ class TrainConfig:
     # only (the SF backbone's shortcut-forcing is its native multi-step term).
     # ``coef=0`` = OFF (legacy / paper-faithful).  Cost ~ O(B·max_starts·len)
     # GRU steps.  Env DREAMER_WM_OVERSHOOT_{COEF,LEN,MAX_STARTS}.
-    wm_overshoot_coef: float = 0.0
+    # Default 0.3 = p117 recipe: the open-loop compounding lever (promoted
+    # 2026-06-14; was 0.0).  ``wm_overshoot_len`` is set = horizon in single_run.
+    wm_overshoot_coef: float = 0.3
     wm_overshoot_len: int = 15            # K open-loop prior steps to supervise
     wm_overshoot_max_starts: int = 24     # cap start positions (stride) for cost
     # Soft recon-fidelity gate (mirrors the disturbance head): the overshoot
@@ -1004,11 +1041,14 @@ class TrainConfig:
     # the gain) and RSSM-only (the SF backbone uses its native sf_bootstrap plus
     # the ``_sf_steady_consistency`` anchor).  ``coef=0`` = OFF.  Env
     # DREAMER_WM_HELD_ROLLOUT_{COEF,LEN,SETTLE_FRAC,WIN,MAX_STARTS,GATE_RECON}.
-    wm_held_rollout_coef: float = 0.0
+    # Default coef 0.5 / max_starts 8 = p117 recipe: the held-action steady-state
+    # lever that kills multi-step compounding drift (promoted 2026-06-14; were
+    # 0.0 / 12).  ``wm_held_rollout_len`` is set = horizon in single_run.
+    wm_held_rollout_coef: float = 0.5
     wm_held_rollout_len: int = 64          # K prior steps under the HELD action
     wm_held_rollout_settle_frac: float = 0.5   # early window starts at frac·K
     wm_held_rollout_win: int = 8           # window length for drift averaging
-    wm_held_rollout_max_starts: int = 12   # cap start positions (stride) for cost
+    wm_held_rollout_max_starts: int = 8    # cap start positions (stride) for cost
     wm_held_rollout_gate_recon: float = 0.1    # soft recon-fidelity ramp gate
 
     # ----- MTP -----
@@ -1118,8 +1158,10 @@ class TrainConfig:
     # is coupled to the actor — i.e. "critic converges before actor coupling"
     # (functionally = warming it at the end of P2).  An earlier short-budget
     # version was removed 2026-05-20; re-added P93 as an env-gated, properly
-    # placed warmup.  Default 0 = OFF (paper co-trains from P3 start).
-    p3_critic_warmup_iters: int = 0
+    # placed warmup.  Default 10 = p117 recipe: calibrate the critic before it
+    # couples to the actor, so P3 doesn't open with a self-inflating critic
+    # (promoted 2026-06-14; paper co-trains from P3 start = 0).
+    p3_critic_warmup_iters: int = 10
     # ---- (P93, 2026-06-06) protect the WM trunk from agent grads in P2 ----
     # At P1→P2 the BC + reward-MTP losses (agent_finetune_loss, read off
     # ``agent_hid`` = the dynamics' own feature) are added; their gradient
@@ -1129,8 +1171,9 @@ class TrainConfig:
     # losses so the reward/BC heads still train but the WM dynamics keeps
     # converging on its OWN losses (recon/kl/overshoot/held) — the WM then
     # cleanly converges + plateaus by end of P2 without needing the wm_best
-    # restore crutch.  Default OFF.  DREAMER_WM_TRUNK_STOPGRAD_IN_P2.
-    wm_trunk_stopgrad_in_p2: bool = False
+    # restore crutch.  Default True = p117 curriculum-recipe (promoted
+    # 2026-06-14; was False).  DREAMER_WM_TRUNK_STOPGRAD_IN_P2.
+    wm_trunk_stopgrad_in_p2: bool = True
 
     # NOTE: ``p3_critic_warmup_iters`` and the ``p3_critic_stability_*``
     # gate (introduced 2026-05-06 and 2026-05-08) were removed on
@@ -2886,6 +2929,160 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
         rew_buf[t] = reward
         cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
         obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
+def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
+                             mv_level: float = 0.0,
+                             ) -> Dict[str, np.ndarray]:
+    """DV-PRBS seed episode (2026-06-14): the DV analogue of
+    ``collect_prbs_episode``.  Holds the MV at a (stratified) operating
+    point and sweeps EVERY measured-DV channel with an independent,
+    full-range, multi-timescale, stratified PRBS, with the hidden OU
+    disturbance OFF.
+
+    Why this exists (p119–p121 RCA): in the staged curriculum the WM's
+    input→CV gain is identified on CLEAN Stage-1 data.  ``collect_prbs_
+    episode`` gives the MV full-range stratified PRBS in (nearly) every
+    seed episode, and the WM conditions on the NOISE-FREE commanded MV
+    action — so the MV→CV gain is identified unbiasedly (p121 ratio 0.93).
+    The DV, by contrast, is never PRBS-swept: it is only nudged by sparse
+    10–30 %-span steps in the ~20 step-test episodes (``dv_share`` 0.5),
+    and during clean Stage 1 (hidden disturbance OFF) that is the ONLY DV
+    motion.  The result is a ~30× MV-vs-DV excitation asymmetry → the
+    DV→CV gain is systematically ATTENUATED (p119–p121 DV ratio stuck
+    ~0.75) by two signal-theory mechanisms:
+      * insufficient / non-persistent excitation (the WM rarely sees the
+        DV held long enough to reach steady state), and
+      * errors-in-variables / regression dilution — the WM's DV regressor
+        is the *measured* (noisy) DV obs, not a clean command, so a low
+        DV-signal-to-noise ratio biases the learned gain toward zero.
+
+    This episode removes BOTH: it drives the DV with the SAME persistent,
+    full-range, multi-timescale excitation the MV gets, at LARGE amplitude
+    (so Var(DV) ≫ Var(meas-noise) and the dilution factor → 1), with the
+    MV HELD (so ∂CV/∂DV is identifiable in isolation, no MV–DV confound).
+    Backbone-agnostic: with ``dv_as_input`` the WM consumes the measured
+    DV as an exogenous input, so it sees clean ``(DV_prbs, resulting CV)``
+    pairs and learns the DV gain + dynamics directly.  A correct DV gain
+    also cleans the DOB innovation (DV-driven CV no longer leaks into the
+    disturbance estimate), so it improves the unmeasured-disturbance head
+    as a coupled bonus.
+
+    Falls back to an MV-hold episode when the sim has no DV channels.
+    ``mv_level`` (normalized action space) sets the held MV operating
+    point; vary it across the seed batch for MV-level coverage.  Returns
+    the same dict shape as ``collect_episode``.
+    """
+    from utils.training_disturbance import _channel_catalog
+    T = int(cfg.episode_length)
+    D = env.obs_dim
+    obs_window = env.reset(exploration=True)
+    env._schedule = []
+    env._hidden_disturbance = None
+
+    channels = _channel_catalog(env.sim)
+    dv_chs = list(channels.get('dv', []))
+    has_dv = len(dv_chs) > 0
+
+    # Held MV operating point (clip to the seed op-band, then [-1, 1]).
+    u_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
+    cur_u = float(np.clip(mv_level, -u_band, u_band))
+    cur_u = float(np.clip(cur_u, -1.0, 1.0))
+    act_buf = np.full((T, env.action_dim), cur_u, dtype='float32')
+
+    # ----- Multi-timescale segment lengths (mirror collect_prbs_episode) -
+    # seg_max ≈ (θ+4τ)/sr (settling time, from auto_tune_seed_buffer) so the
+    # DV settles at each level (steady-state gain identifiable); seg_min ≈
+    # τ/(3·sr) (fast transient) so the WM also learns the DV dynamics.
+    seg_max = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
+    seg_max = max(8, min(seg_max if seg_max > 0 else T // 12, T // 4))
+    seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
+    seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
+    if not has_dv:
+        # No DV channels → just run the held-MV episode (still useful as a
+        # steady-state MV anchor; matches collect_constant semantics).
+        obs_buf = np.zeros((T, D), dtype='float32')
+        rew_buf = np.zeros(T, dtype='float32')
+        cont_buf = np.ones(T, dtype='float32')
+        for t in range(T):
+            obs_buf[t] = obs_window[-1]
+            obs_window, reward, done, _ = env.step(act_buf[t])
+            rew_buf[t] = reward
+            cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+            if done:
+                break
+        return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+    # Pre-roll segment start times (log-uniform multi-timescale).
+    seg_starts: List[int] = []
+    t = 0
+    while t < T - max(8, seg_min):
+        seg_starts.append(int(t))
+        if seg_min < seg_max:
+            u = env.rng.uniform(np.log(seg_min), np.log(max(seg_min + 1, seg_max)))
+            sl = int(round(float(np.exp(u))))
+        else:
+            sl = seg_max
+        t += max(seg_min, min(seg_max, sl))
+    n_seg = len(seg_starts)
+
+    # ----- Build an independent stratified-level PRBS per DV channel -----
+    # Levels are OFFSETS from the channel baseline, stratified over
+    # ±op_frac·(span/2) so the sweep covers the operating range (boundary
+    # strata included).  The disturbance schedule accumulates achieved
+    # deltas as a persistent offset (telescoping), so delta_k = L_k − L_{k−1}
+    # makes the held DV level track L_k.
+    op_frac = float(np.clip(getattr(cfg, 'dv_prbs_op_frac', 0.6), 0.05, 0.95))
+    dv_schedule: List[Dict] = []
+    for ch in dv_chs:
+        b = ch.get('bounds')
+        span = (float(b[1]) - float(b[0])) if (isinstance(b, list)
+                                                and len(b) >= 2) else 1.0
+        amp = op_frac * 0.5 * abs(span)            # max |offset| from baseline
+        # Stratified target levels across [-amp, +amp] (guarantees the
+        # extremes are visited even when n_seg is small).
+        strata_n = max(1, min(int(getattr(cfg, 'prbs_seed_n_strata', 8)), n_seg))
+        edges = np.linspace(-amp, +amp, strata_n + 1)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        levels = np.empty(n_seg, dtype='float64')
+        order = env.rng.permutation(n_seg)
+        half_w = amp / strata_n
+        jit = env.rng.uniform(-half_w, +half_w, size=strata_n)
+        levels[:strata_n] = centers + jit
+        if n_seg > strata_n:
+            levels[strata_n:] = env.rng.uniform(-amp, +amp, size=n_seg - strata_n)
+        levels = levels[order]
+        prev = 0.0
+        for k, start in enumerate(seg_starts):
+            delta = float(levels[k] - prev)
+            prev = float(levels[k])
+            if abs(delta) < 1e-9:
+                continue
+            dv_schedule.append({
+                'name': f"dv_prbs_{ch.get('name', ch.get('pos', '?'))}_t{int(start)}",
+                'target_group': 'dv',
+                'target_pos': int(ch.get('pos', 0)),
+                'start': int(start),
+                'duration': 1,
+                'shape': 'step',
+                'delta': float(delta),
+                'source': 'dv_prbs_seed',
+                '_applied': False,
+            })
+    env._schedule = dv_schedule
+
+    # ----- Run the episode (MV held, DV swept by the schedule) ----------
+    obs_buf = np.zeros((T, D), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window[-1]
+        obs_window, reward, done, _ = env.step(act_buf[t])
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
         if done:
             break
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
@@ -6247,6 +6444,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P2', '0'))
     step_test_inject_in_p3 = int(
         os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P3', '0'))
+    # DV-PRBS re-injection (2026-06-14): keep the full-range DV sweep fresh
+    # in the ring buffer through Stage 1 so the DV→CV gain stays supervised
+    # right up to the WM freeze (the seed-time dv-prbs episodes are FIFO-
+    # evicted by ~iter 40 otherwise, exactly the eviction that left the DV
+    # gain under-identified).  Default ON in P1, P2/P3 opt-in, NO-OP when
+    # the sim has no DV channel.
+    dv_prbs_inject_every = int(
+        os.environ.get('DREAMER_DV_PRBS_INJECT_EVERY', '20'))
+    dv_prbs_inject_n = int(
+        os.environ.get('DREAMER_DV_PRBS_INJECT_N', '2'))
+    dv_prbs_inject_in_p2 = int(
+        os.environ.get('DREAMER_DV_PRBS_INJECT_IN_P2', '0'))
+    dv_prbs_inject_in_p3 = int(
+        os.environ.get('DREAMER_DV_PRBS_INJECT_IN_P3', '0'))
     # ----- Periodic EXPERT re-injection (P81 RCA, 2026-06-03) -----
     # Same eviction failure mode as the const-action seeds above, but for
     # the objective-aligned expert demonstrations: the expert episodes are
@@ -6566,6 +6777,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"dv_share={cfg.step_test_dv_share:.2f}, "
               f"overlap_frac={cfg.step_test_overlap_frac:.2f}, "
               f"primary_dv_bias={cfg.step_test_primary_dv_bias:.2f})",
+              flush=True)
+
+    # ---------- DV-PRBS seed episodes (2026-06-14, p121 DV-gain RCA) ----------
+    # Sweep every measured-DV channel with a full-range, multi-timescale,
+    # stratified PRBS (MV held), the DV analogue of the MV PRBS seeding above.
+    # Closes the ~30× MV-vs-DV excitation asymmetry that left the DV→CV gain
+    # attenuated (~0.75).  No-op fallback (MV-hold) when n_dv=0.  MV operating
+    # point is stratified across the batch so the DV gain is identified at
+    # several MV levels.
+    n_dv_prbs_seed = int(getattr(cfg, 'dv_prbs_seed_episodes', 0))
+    if n_dv_prbs_seed > 0 and n_dv > 0:
+        dvp_levels = np.linspace(-const_op_band, const_op_band,
+                                  n_dv_prbs_seed, dtype='float32')
+        dvp_jit = env.rng.uniform(-0.05, 0.05,
+                                   size=dvp_levels.shape).astype('float32')
+        dvp_levels = np.clip(dvp_levels + dvp_jit * const_op_band, -1.0, 1.0)
+        for lvl in dvp_levels:
+            ep = collect_dv_prbs_episode(env, cfg, mv_level=float(lvl))
+            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            total_env_steps += cfg.episode_length
+        print(f"[seed] dv-prbs={n_dv_prbs_seed} "
+              f"(n_dv={n_dv}, op_frac={cfg.dv_prbs_op_frac:.2f}, "
+              f"seg=[{int(getattr(cfg, 'prbs_seed_segment_steps_min', 0))}.."
+              f"{int(getattr(cfg, 'prbs_seed_segment_steps', 0))}])",
               flush=True)
 
     # ---------- APC expert seed episodes (P81 design, 2026-06-03) ----------
@@ -7105,6 +7340,39 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 total_env_steps += cfg.episode_length
             print(f"[step-test-inject p{current_phase}] iter {total_iters}: "
                   f"added step-test={step_test_inject_n} episodes "
+                  f"(n_dv={_n_dv_inj}, buf_fill={buf.filled}/"
+                  f"{buf.capacity_eps})", flush=True)
+
+        # ----- Periodic DV-PRBS re-injection (2026-06-14, p121 DV-gain RCA) ---
+        # Keep the FULL-RANGE DV sweep fresh in the buffer so the DV->CV gain
+        # stays supervised right up to the WM freeze.  Complements step-test-
+        # inject (isolated DV steps): dv-prbs gives the DV the same persistent,
+        # stratified, multi-timescale, large-amplitude excitation the MV gets
+        # from PRBS — the lever that actually closes the DV-gain attenuation.
+        # Same phase gating as the others; no-op when the sim has no DV channel.
+        _dvp_inject_active = (
+            (current_phase == 1)
+            or (current_phase == 2 and dv_prbs_inject_in_p2)
+            or (current_phase == 3 and dv_prbs_inject_in_p3))
+        if (_dvp_inject_active
+                and dv_prbs_inject_every > 0
+                and dv_prbs_inject_n > 0
+                and _n_dv_inj > 0
+                and total_iters > 0
+                and (total_iters % dv_prbs_inject_every) == 0):
+            _dvp_op = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
+            _dvp_levels = np.linspace(-_dvp_op, _dvp_op, dv_prbs_inject_n,
+                                       dtype='float32')
+            _dvp_jit = env.rng.uniform(-0.05, 0.05,
+                                        size=_dvp_levels.shape).astype('float32')
+            _dvp_levels = np.clip(_dvp_levels + _dvp_jit * _dvp_op, -1.0, 1.0)
+            for _dvl in _dvp_levels:
+                _dvp = collect_dv_prbs_episode(env, cfg, mv_level=float(_dvl))
+                buf.add_episode(_dvp['obs'], _dvp['act'], _dvp['rew'],
+                                 _dvp['cont'])
+                total_env_steps += cfg.episode_length
+            print(f"[dv-prbs-inject p{current_phase}] iter {total_iters}: "
+                  f"added dv-prbs={dv_prbs_inject_n} episodes "
                   f"(n_dv={_n_dv_inj}, buf_fill={buf.filled}/"
                   f"{buf.capacity_eps})", flush=True)
 

@@ -338,6 +338,14 @@ def main() -> int:
         batch_size=batch_size,
         out_dir=str(out_dir),
         init_from_ckpt=str(args.init_from_ckpt or ''),
+        # Plant-tie the WM multi-step supervision windows to the imagination
+        # horizon (= 2% settling time).  Both the open-loop overshoot term and
+        # the held-action steady-state term should span ~one full settling
+        # response so the WM learns the asymptotic gain, not a truncated step.
+        # p117 set these = horizon via env-override; promoted here 2026-06-14 so
+        # they derive per-plant and can't be silently dropped from a launch.
+        wm_overshoot_len=horizon,
+        wm_held_rollout_len=horizon,
         **(dict(phase1_frac=phase1_frac, phase2_frac=phase2_frac, phase3_frac=phase3_frac) 
            if phase1_frac is not None else {}),
     )

@@ -9,7 +9,15 @@ def derive_phase_budgets(*, episode_length, complexity_score, model_size,
     """
     P1_ITERS_BY_SIZE = {'S': 50, 'M': 65, 'L': 80}
     P2_ITERS_BY_SIZE = {'S': 25, 'M': 35, 'L': 45}
-    P3_ITERS_BY_SIZE = {'S': 50, 'M': 70, 'L': 90}
+    # P3 reduced 2026-06-14 (p121 RCA): the generic Dreamer split made P3 ≥ P1
+    # (S/M/L = 50/70/90), which (a) under-budgeted the staged curriculum's WM-
+    # identification phases (Stage-1 clean gain id + Stage-2 observer id are
+    # the value-critical phases here, not actor training) and (b) exposed a
+    # slow late-P3 actor-critic drift (p121 ema_return collapsed in the back
+    # half of a 391-iter P3 that p117's shorter P3 never reached).  Setting
+    # P3 ≈ 0.67·P1 restores the proven p117 ~0.45/0.25/0.30 split: more WM-id
+    # budget, and P3 ends before the drift regime.
+    P3_ITERS_BY_SIZE = {'S': 35, 'M': 45, 'L': 55}
     factor = min(max(complexity_score / 4, 1.0), complexity_factor_cap)
     p1_iters = int(P1_ITERS_BY_SIZE[model_size] * factor)
     p2_iters = int(P2_ITERS_BY_SIZE[model_size] * factor)

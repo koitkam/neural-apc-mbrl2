@@ -169,3 +169,166 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   remaining WM-gain refinement (compounding 0.836) is a separate, lower-priority
   lever (raise overshoot/held-rollout coefs), not recon_cv.
 
+### p119 — step-test re-injection (DV-gain fix) + dob_reg 0.002 — MIXED
+- **Recipe**: p117 curriculum + **step-test-inject** (`EVERY=20 N=2`, re-injects
+  isolated MV+DV step events into P1 so the DV→CV gain stays supervised to the
+  WM freeze) + `DREAMER_DOB_REG_COEF 0.002` (the p118 disturbance fix). Phases
+  P1=1‑86, P2=87‑150, P3=151‑492.
+- **#1 WM gain — IMPROVED (step-test-inject WORKED)**: aggregate gain rel_err
+  **0.217 → 0.164** (best yet), `all_pass` HELD. **Per-input** (the open user
+  question): MV ratio **0.783 → 0.836**, DV ratio **0.625 → 0.761** — DV improved
+  most, exactly what step-test-inject targets. Decomp real→post 0.926→0.933,
+  1step→openloop 0.836→**0.884** (compounding improved). Residual DV bias is a
+  *genuine ~24% under-read*, NOT a horizon artifact (DV WM curve settled by H:
+  0.753@¾H → 0.760@end).
+- **dob_reg 0.002 — BACKFIRED on #2 + actor**: lowering the L2 prior let `d_t`
+  grow (P3 dob_d 0.139→**0.246**) but it became **mis-scaled + sign-flipped**
+  noise — disturbance R² **−0.626 → −2.48**, r **+0.606 → −0.058** (lost
+  direction), NRMSE 1.275→1.865 (vision: blue d_t often opposite-sign to true).
+  The actor conditions on this corrupted d_t → **passive again** (mv_viol
+  0.295→**0.000**) and parks outside limits (cv_viol 24→**86**) → econ −39→**−105**.
+- **Lesson**: `dob_reg` is NOT the #2 lever to loosen on a clean curriculum WM —
+  a smaller residual (clean `g` explains more CV) leaves d_t *less* signal, so
+  loosening reg amplifies noise/sign error rather than recovering amplitude.
+  **Keep `dob_reg=0.01` (p117).** step-test-inject is a clear **KEEP**.
+
+### p120 — revert dob_reg + STRONGER step-test (reduce DV bias further)
+- **Two changes vs p119** (well-isolated): (A) **REVERT** `DREAMER_DOB_REG_COEF
+  0.002 → 0.01` (fixes the p119 actor passivity + disturbance sign-flip; back to
+  p117 known-good). (B) **STRENGTHEN** step-test-inject `EVERY 20→10`, `N 2→4`.
+- **Why (B) — decisive checkpoint timing**: dynamics `g` (which holds the DV→CV
+  gain) trains ONLY in P1 then FREEZES at P1→P2. `wm_best` peaked **iter 60**;
+  the P1→P2 warm-restore loaded iter-60 and **discarded iters 61‑86**. So the DV
+  gain is set entirely by step-test data present **before iter 60**. p119 fired
+  at iters 20/40/60/80 but iter-80 was discarded → only **6 episodes** (3 cycles
+  ×2) shaped the gain, and the buffer saturated@iter40 (FIFO-evicting the iter-20
+  batch). p120 `EVERY=10 N=4` injects at 10/20/30/40/50/60 = **24 episodes**
+  (6 cycles ×4) concentrated in the iters 1‑60 gain-learning window — **4× the
+  effective DV freshness at the peak**.
+- **Judge by**: DV ratio **0.76 → >0.85** (MV holds ~0.84+), `all_pass` held,
+  actor **ACTIVE again** (mv_viol > 0.2, cv_viol < 25, econ beats −39),
+  disturbance r back **positive** (≳ +0.5 like p117).
+- **If DV still < 0.85**: escalate `EVERY=8 / N=6`, or make `wm_best` selection
+  **gain-aware** (it is recon-fidelity only today, so it can discard a
+  better-gain late-P1 checkpoint — the deeper lever).
+- **Deferred (separate run)**: structural disturbance-R² fix — even p117's 0.01
+  gave R² −0.626; DOB on a near-perfect clean `g` has tiny innovation → needs the
+  `disturbance_loss_rel_weight`/`stop_grad=0` active-shaping path, not a reg tweak.
+- **If p120 confirms**: promote `curriculum` + `dob` + step-test-inject
+  (`EVERY=10 N=4`) to default-on.
+
+### p120 — VERDICT: not a real result, a CONFIG ACCIDENT (critic cascade)
+- **What happened**: the p120 launch carried only **3** env-overrides
+  (`dob_enabled`, `dob_reg_coef`, `curriculum_enabled`) but p117/p119 used **~25**.
+  It silently **dropped ~22 overrides → 20 knobs reverted to TrainConfig
+  defaults**. p120 is therefore *not* a clean step-test test.
+- **Critic cascade (the headline)**: `critic_mc_grounding_coef 1.0→0.0`,
+  `critic_imag_loss_coef 0.3→1.0`, `p3_critic_warmup_iters 10→0`,
+  `rssm_imag_latent_mode T→F`, `rssm_free_bits 0.5→1.0` all reverted. Within ~20
+  P3 iters `critic_rew_to_tgt_var` collapsed **0.0187 → 0.001**, `return_scale`
+  ran **2.6 → 139** (53×), `critic_pred_target_r` pinned 0.99 = textbook
+  bootstrap runaway. Actor thrashed downstream: val mv_viol **5.26**, cv_viol
+  **78.9**, cum_raw **−128.7k** (min −285k / max −16k).
+- **WM still OK despite the mess**: `wm_overshoot/held=0.0`, `recon_cv=1.0` (levers
+  OFF) yet gain came out **MV 0.805 / DV 0.783** (step-test `EVERY=10 N=4`: DV
+  0.761→0.783, MV 0.836→0.805, aggregate 0.164→**0.188** ≈ flat — 10/4 traded MV
+  for DV, no net gain over 20/2). **Curriculum + step-test are robust.**
+  Disturbance r=**+0.713** (best yet), R² −0.900.
+- **Training-data question (noise/disturbances)**: **not the cause.** CV output
+  SNR **18 dB** (clean, meas-noise σ 0.14), DV 12 dB; the −9 dB obs[2]/obs[11]
+  are the **MV being PRBS-dithered** (the WM conditions on the *commanded action*,
+  not the noisy MV obs → no gain attenuation), and `g` freezes on **clean**
+  Stage-1 data so Stage-2/3 disturbances can't steal gain. The residual ~0.8 gain
+  is decomp-localized to **real→post 0.931** (recon, lever `wm_recon_cv_weight`)
+  + **1step→openloop 0.89** (compounding, levers `wm_overshoot`/`wm_held`) — both
+  of which p120 had **turned off**.
+
+### p121 — FIX: promote the proven recipe to DEFAULTS, env-free restoration
+- **Root-cause fix (the user's "update training defaults")**: promoted the full
+  p117 winning recipe from fragile env-overrides into **`TrainConfig` defaults**
+  so a thin launch can never silently regress them again. 14 knobs in
+  `training/train.py` (`critic_mc_grounding_coef 1.0`, `critic_imag_loss_coef 0.3`,
+  `critic_replay_anchor_coef 0.0`, `p3_critic_warmup_iters 10`, `rssm_free_bits 0.5`,
+  `rssm_imag_latent_mode True`, `bound_training_reward_max 3.0`,
+  `wm_recon_cv_weight 4.0`, `bc_track_expert_every 1`, `wm_trunk_stopgrad_in_p2 True`,
+  `curriculum_enabled True`, `dob_enabled True`, `wm_overshoot_coef 0.3`,
+  `wm_held_rollout_coef 0.5`, `wm_held_rollout_max_starts 8`) + 2 plant-tied
+  lengths in `single_run.py` (`wm_overshoot_len = wm_held_rollout_len = horizon`).
+  Left alone: `gamma` (auto-tunes to 0.99 at H=55), `disturbance_loss_scale=1.0`
+  (harmless under stop-grad), phase fracs (auto-derive). Curriculum smoke green
+  (both backbones).
+- **Launch**: **env-free** — `python -m workflow.single_run --simulation-dir
+  simulation/test_sim --out-dir …`. Resolved cfg verified: mc=1.0 / imag=0.3 /
+  anchor=0.0 / warmup=10 / free_bits=0.5 / imag_latent=T / overshoot=0.3 len=55 /
+  held=0.5 len=55 / recon_cv=4.0 / curriculum+dob=T / gamma=0.99(auto) /
+  bound_max=3.0. Step-test 20/2 (default), dob_reg 0.01 (default).
+- **This isolates the critic fix AND turns the WM-bias levers (overshoot / held /
+  recon_cv) back ON** (p120 had them off) — that is the "reduce WM bias further"
+  the user asked for, on a known-good base.
+- **Judge by**: (1) critic `return_scale < 15` (p117=9.7), `rew_to_tgt_var`
+  recovers, **no cascade**; (2) actor active+economic (mv_viol ~0.3, cv_viol < 25,
+  cum_raw beats −47k); (3) WM gain MV ≥ 0.80 / DV ≥ 0.78, ideally toward 1.0;
+  (4) disturbance r > +0.5.
+- **If confirmed**: commit + push the defaults promotion; run the
+  paper-defaults-audit to log the new baseline. Residual WM bias → p122 (longer
+  step-test holds for steady-state dwell, or gain-aware `wm_best`), not stacked
+  onto p121.
+
+### p121 — VERDICT: critic-fix worked for MV, DV under-excited, actor still poor
+- **MV gain FIXED**: ratio **0.805 → 0.932** (best ever) — the default-restore
+  (critic grounding + WM levers back on) did it. Decomp shows compounding is
+  essentially solved (1step→openloop **0.981**, post→1step 1.001), so any
+  residual is identification, not rollout.
+- **DV gain STUCK ~0.75** (0.761/0.783/0.753 across p119/p120/p121 — unchanged by
+  anything tried). It is **settled** by the horizon (not a measurement artifact),
+  so it is a genuine **gain-identification** failure.
+- **Disturbance prediction still lacking**: r **0.557**, R² −0.258, pred_std 1.16
+  vs true 1.93 → **under-amplitude ~1.7×** with local sign flips. Same
+  under-prediction signature as the DV gain (they're coupled).
+- **Critic better but not healthy**: MC grounding engaged (mc_loss = 93% of
+  critic loss) so **no p120-style cascade**, but `return_scale` creeps 15→35 and
+  `ema_return` collapses in the back half (−337 → −2326 after iter ~428).
+- **Actor still poor**: validation `best.pt` is iter **341** (captured *before*
+  the collapse) yet still cum_raw −110k, cv_viol 64.8 — never rides the limit.
+  Entropy swings −0.10 ↔ −1.0 = the "oscillate ↔ passive" the user sees.
+
+### Root cause of the DV gap — ~30× MV-vs-DV excitation asymmetry
+- `collect_prbs_episode` gives the **MV** full-range, stratified, multi-timescale
+  PRBS in (nearly) every seed episode, and the WM conditions on the **noise-free
+  commanded** MV → MV gain identified unbiasedly (0.93).
+- The **DV is never PRBS-swept**: it only gets sparse 10–30 %-span steps in ~20
+  step-test episodes (`dv_share` 0.5), and during clean Stage 1 that is the ONLY
+  DV motion. Two signal-theory failures follow: **(a) insufficient/non-persistent
+  excitation** (DV rarely held to steady state) and **(b) errors-in-variables /
+  regression dilution** — the WM's DV regressor is the *measured* (noisy) DV, so a
+  low DV SNR biases the learned gain toward zero. A wrong DV gain also leaks
+  DV-driven CV into the DOB innovation → the disturbance under-prediction. So
+  **fixing DV excitation fixes both** the DV gain and the disturbance head.
+
+### p122 — fixes: DV-PRBS excitation + observer gain + phase rebalance
+- **Fix 1 (DV gain, the headline)** — new `collect_dv_prbs_episode`: the DV
+  analogue of the MV PRBS. Holds the MV and sweeps **every** measured-DV channel
+  with a full-range (`dv_prbs_op_frac=0.6`), multi-timescale, stratified PRBS via
+  the persistent-offset disturbance schedule (Δ_k = L_k − L_{k−1}), hidden
+  disturbance off. Seeded (`dv_prbs_seed_episodes=16`) **and** re-injected through
+  Stage 1 (`DREAMER_DV_PRBS_INJECT_EVERY=20 N=2`, default-on in P1) so the DV gain
+  stays supervised to the WM freeze. Removes both excitation deficits: persistent
+  large-amplitude excitation (Var(DV) ≫ Var(noise) → dilution → 1) with the MV
+  held (∂CV/∂DV identifiable in isolation). Smoke-verified: DV span 7.15 vs
+  step-test 1.77, MV std 0.0. No-op fallback when n_dv=0.
+- **Fix 2 (disturbance/critic-observer)** — `dob_gain_init −2.2 → −1.8` (Kalman
+  K 0.10 → 0.14) so the observer tracks the disturbance amplitude better (was
+  under-predicting 1.7×); pairs with Fix 1, which cleans the innovation feeding K.
+- **Fix 3 (actor/critic + WM budget)** — rebalanced `derive_phase_budgets`
+  P3_ITERS (S/M/L 50/70/90 → **35/45/55**) so P3 ≤ P1. Restores the proven p117
+  **0.45/0.25/0.30** split (was 0.37/0.21/0.42): more Stage-1/2 WM-identification
+  budget, and P3 ends before the late actor-critic drift regime that the
+  over-long p121 P3 exposed.
+- **Held at proven (no confound)**: critic grounding mc=1.0 / imag=0.3, warmup=10,
+  all WM levers, curriculum+DOB — all from defaults (env-free launch). Verified
+  resolved cfg + `[seed] dv-prbs=16` + phase split 0.45/0.25/0.30 in p122.
+- **Judge by**: DV ratio **0.75 → >0.85** (MV holds 0.93); disturbance r **>0.6**
+  and pred_std/true_std **>0.75**; **no late `ema_return` collapse** (return_scale
+  stays <15); actor rides the limit (cv_viol <25, cum_raw beats −47k). Attribution
+  is clean — DV gain, disturbance, critic, actor each have separate metrics.
+
