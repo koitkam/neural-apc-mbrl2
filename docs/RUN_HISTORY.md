@@ -332,3 +332,104 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   stays <15); actor rides the limit (cv_viol <25, cum_raw beats −47k). Attribution
   is clean — DV gain, disturbance, critic, actor each have separate metrics.
 
+### p122 — VERDICT: small WM progress, disturbance miscalibrated, actor passive
+- **WM gain**: MV 0.932 → **0.947**, DV 0.753 → **0.792**. DV-PRBS helped but the
+  improvement is **capped** (see root cause B).
+- **Disturbance**: r 0.557 → **0.654** (DV-PRBS cleaned the observer innovation —
+  the DV-gain↔disturbance coupling is **confirmed**), BUT R² −0.258 → **−1.775**
+  and pred_std 1.16 → **2.27** vs true 1.93 = now **over-predicts** (ratio 1.18).
+- **Critic**: the phase rebalance **worked** — P3 is 249 iters (vs p121's 391); the
+  mid-P3 cascade peaked at return_scale 55 then **recovered to 13** (vs p121's
+  runaway to 35+ and ema −2326). But `rew2tgt` stays **<0.015** throughout
+  (bootstrap dominance) despite MC grounding at 93% of the critic loss.
+- **Actor**: cum_raw −110k → **−138k**, cv_viol 64.8 → **94.9**, mv_viol 6.5 →
+  **0.0** (fully passive; vision: "MV flat, CV violates high, passive not
+  active-economic"). Entropy collapsed to −0.10 (σ floor) early in P3.
+
+**Three distinct root causes:**
+- **(A) #2 disturbance over-predict** — `dob_gain_init −1.8` **overshot** (Kalman
+  K 0.142 too reactive at validation: −2.2 under-predicted 0.60×, −1.8 over 1.18×).
+- **(B) #1 DV gain capped** — the P1→P2 `wm_best` **warm-restore** loaded the
+  iter-30 correlation peak, and the fidelity probe (`_probe_wm_fidelity` = Pearson
+  r + held-convergence) is **scale-invariant / gain-blind**, so it **discarded the
+  DV-PRBS re-injections** at iter 40/60. Only the 16 **seed** dv-prbs episodes
+  survived into the frozen WM.
+- **(C) #4 actor passive** — downstream of the #3 cascade (NOT `d_t`: in-training
+  `dob_d` 0.275 is *lower* than p121's 0.378, and anti-correlates with
+  return_scale). The over-amplified **validation-time** `d_t` (pred_std 2.27)
+  corrupts the actor's `feat` at validation.
+
+### p123 — fixes: dob_gain revert + DV front-loading (clean per-metric attribution)
+- **(1) #2 disturbance** — `dob_gain_init −1.8 → −2.0` (K 0.142 → 0.119; amplitude
+  ratio 1.18 → ~0.9). Also reverts the validation-time `d_t` toward p117's
+  active-actor regime → helps #4.
+- **(2) #1 DV gain** — `dv_prbs_seed_episodes 16 → 24`: more DV excitation in the
+  **early** checkpoint the warm-restore keeps, bypassing the gain-blind probe.
+- **(3) #1 DV gain** — DV-PRBS re-inject `every 20 → 10`: fires at iter 10/20/30
+  (all inside the ≤30 kept window) instead of 20/40/60 (40/60 rolled back).
+- **Each fix targets a distinct metric via a distinct mechanism** (DV gain ← seed
+  + inject cadence; disturbance amplitude ← dob_gain; actor ← the dob_gain regime
+  revert) so attribution stays clean. Held at proven: critic grounding mc=1.0 /
+  imag=0.3 / warmup=10, phase 0.45/0.25/0.30, all WM levers. Curriculum smoke green.
+- **Deliberately NOT changed**: entropy floor / critic warmup / cascade early-stop
+  — speculative and risk backfire (more warmup on a passive BC-warmed actor can
+  *reinforce* passivity) or confound the WM attribution.
+- **Judge by**: DV ratio 0.79 → **>0.85** (MV holds 0.95); disturbance r **>0.6**
+  with pred/true **0.85–1.1** (not over); actor **less passive** (mv_viol >0.2,
+  cv_viol <40, cum_raw beats −110k); critic no worse.
+- **If the actor stays passive** after the dob_gain revert: the next run needs the
+  **structural #1 lever** (make `_probe_wm_fidelity` gain-aware via predicted-vs-
+  real slope, OR disable the P1→P2 warm-restore in curriculum mode — the
+  overshoot+held losses already prevent drift), which *also* helps #3/#4 (an
+  accurate WM → less erratic imagined returns → smaller cascade), plus a dedicated
+  critic intervention (return_scale clamp, or tighten the cascade early-stop
+  growth 100× → 30×).
+
+### p123 — VERDICT: fixes applied but didn't work; gain-blind wm_best is the root cause
+- **Fixes confirmed applied**: `dob_gain −2.0`, `dv_prbs_seed 24`, DV-PRBS inject
+  every 10 (fired iter 10/20/30/40/50/60). But results barely moved vs p122:
+  - **WM gain**: MV 0.947 → **0.898** (worse), DV 0.792 → **0.772** (~flat).
+  - **Disturbance**: amplitude **fixed** by `dob_gain` (pred/true 1.18 → **0.96**,
+    the target) BUT correlation **collapsed** r 0.654 → **0.092**, R² −3.60.
+  - **Actor**: cum_raw −150k, cv_viol 101, `return_scale` stuck **~27** all P3
+    (p117-healthy 9.7), rew2tgt <0.001, entropy pinned. Vision: partially
+    economic (tracks limit changes) but violates + mild oscillation.
+- **Decisive RCA (P1 probe trace)**: the `wm_best` fidelity score is **dominated
+  by correlation noise**. The per-offset Pearson r bounces ±0.15 with no trend;
+  iter 30 won "best" only on a **noise spike** crossing the r-floor (best_h 27 at
+  iter 30 vs **0** at iter 40–70). The **stable, gain-relevant** metrics improve
+  monotonically to P1 end — recon **0.102 → 0.087**, convergence **0.25 → 1.00**.
+  So the P1→P2 warm-restore froze the **under-trained iter-30 `g`** and discarded
+  the late-P1 DV-PRBS gain data (injects at 40/50/60).
+- **One cause, three symptoms**: (1) WM gain capped/randomized; (2) the DOB
+  observer built on the frozen-random `g` → disturbance r swings **0.557 / 0.654
+  / 0.092** across p121/122/123 (near-identical configs) = observer uncontrolled;
+  (3) noisy observer → noisy imagined returns → `return_scale` runaway (27) →
+  shrunk actor advantage (`adv = adv_raw / return_scale`).
+
+### p124 — fixes: disable curriculum warm-restore (root) + adaptive return-scale cap
+- **(A, root cause)** In **curriculum mode**, disable the P1→P2 `wm_best`
+  warm-restore — freeze the **full-P1-trained `g`** (all clean + DV-PRBS gain
+  data; lower recon = better gain; conv = 1.00) instead of rolling back to the
+  noisy correlation-peak checkpoint. Justified because the "post-peak drift" is
+  correlation **noise** (recon + convergence prove iter 70 > iter 30), and the
+  anti-drift `overshoot`(0.3) + `held_rollout`(0.5) losses protect the gain.
+  Gated on `curriculum_enabled` and honours an explicit
+  `DREAMER_WM_BEST_RESTORE_AT_P2`.
+- **(B, safety net)** `return_scale_abs_cap` 500 → **sim-adaptive
+  `max(20, 0.12·B·H)`** (test_sim = 20). Sits above p117's healthy max (17.5),
+  below the 27–55 runaway → never distorts a healthy run but arrests the
+  return-norm runaway that shrinks the actor's economic advantage. Sim-adaptive
+  via the plant's own `B` and `horizon`.
+- **Clean attribution**: A = WM gain + disturbance-r consistency; B =
+  `return_scale` + actor economics. Both in defaults (env-free launch); verified
+  `return_scale_abs_cap=20.0` + `warm-restore DISABLED` banners. Curriculum smoke
+  green (both backbones).
+- **Judge by**: DV ratio 0.77 → **>0.85** with MV ≥ 0.93 (gain no longer capped);
+  disturbance r **stable >0.5** (no more 0.09 collapse = observer controlled);
+  `return_scale` settles **<20**; actor active + economic (cv_viol <40, cum_raw
+  beats −110k, rides the limit).
+- **If A works**: the gain-blind-checkpoint saga is closed; an optional general
+  follow-up is to make the `wm_best` score gain-aware (CV std-ratio from the
+  k-step rollout `pred_obs`/`real_obs`) for non-curriculum runs.
+

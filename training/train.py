@@ -587,12 +587,15 @@ class TrainConfig:
     dob_enabled: bool = True
     dob_reg_coef: float = 0.01      # L2 "process-noise-is-small" prior on d_t
     dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence (A)
-    # sigmoid(-1.8)=0.14 — modest Kalman correction (K).  Raised -2.2→-1.8 on
-    # 2026-06-14 (p121): the disturbance estimate under-predicted amplitude
-    # (pred_std 1.16 vs true 1.93, ~1.7×) because the observer was too slow; a
-    # slightly larger K tracks the disturbance amplitude better.  Pairs with
-    # the DV-PRBS fix (a correct DV gain cleans the innovation feeding K).
-    dob_gain_init: float = -1.8
+    # sigmoid(-2.0)=0.119 — modest Kalman correction (K).  History: -2.2 (p121)
+    # under-predicted the disturbance amplitude (pred_std 1.16 vs true 1.93,
+    # ratio 0.60); -1.8 (p122) OVER-shot (pred_std 2.27, ratio 1.18) which both
+    # mis-calibrated the disturbance head (R² -0.26→-1.77) AND over-amplified the
+    # validation-time d_t feeding the actor's feat.  -2.0 (p123) lands the
+    # amplitude ratio ~0.9 — the sweet spot between the two — and reverts the
+    # actor's d_t toward the p117 active-actor regime.  Pairs with the DV-PRBS
+    # fix (a correct DV gain cleans the innovation feeding K).
+    dob_gain_init: float = -2.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
     # The textbook system-ID / Kalman recipe applied to the DOB: identify the
@@ -836,7 +839,12 @@ class TrainConfig:
     # the MV gain reached 0.93.  ``collect_dv_prbs_episode`` is a no-op
     # fallback (MV-hold) on plants with 0 DV channels, so defaulting >0 is
     # safe.  Re-injected through Stage 1 via DREAMER_DV_PRBS_INJECT_EVERY/_N.
-    dv_prbs_seed_episodes: int = 16
+    # Raised 16→24 on 2026-06-14 (p122 RCA): the P1→P2 wm_best warm-restore
+    # keeps an EARLY (~iter 30) correlation-peak checkpoint and the probe is
+    # gain-BLIND, so it discards the later DV-PRBS re-injections.  More SEED
+    # DV-PRBS (trained from iter 1) lands the DV excitation inside the kept
+    # early checkpoint instead of relying on re-injects that get rolled back.
+    dv_prbs_seed_episodes: int = 24
     # Fraction of HALF the DV engineering span used as the stratified-level
     # sweep amplitude (|offset| ≤ op_frac·span/2).  0.6 = sweep ~60% of the
     # range each side of baseline: large enough that Var(DV) ≫ Var(noise)
@@ -6449,9 +6457,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # right up to the WM freeze (the seed-time dv-prbs episodes are FIFO-
     # evicted by ~iter 40 otherwise, exactly the eviction that left the DV
     # gain under-identified).  Default ON in P1, P2/P3 opt-in, NO-OP when
-    # the sim has no DV channel.
+    # the sim has no DV channel.  Cadence 20→10 on 2026-06-14 (p122 RCA): the
+    # P1→P2 wm_best warm-restore keeps an early (~iter 30) checkpoint, so the
+    # re-injects must land BEFORE it — every-10 fires at iter 10/20/30 (all
+    # inside the kept window) instead of 20/40/60 (40/60 rolled back).
     dv_prbs_inject_every = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_EVERY', '20'))
+        os.environ.get('DREAMER_DV_PRBS_INJECT_EVERY', '10'))
     dv_prbs_inject_n = int(
         os.environ.get('DREAMER_DV_PRBS_INJECT_N', '2'))
     dv_prbs_inject_in_p2 = int(
@@ -6563,6 +6574,29 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
               f'reward={_fz["reward"]} tensors; disturbance prob=0).',
               flush=True)
+        # p123 RCA (2026-06-15): in curriculum mode, do NOT roll the WM back to
+        # the P1 correlation-peak checkpoint at P1->P2.  The wm_best fidelity
+        # score is dominated by correlation NOISE in P1 — the per-offset Pearson
+        # r bounces ~+/-0.15 with no trend, so the "best" is whichever iter has
+        # a noise spike crossing the r-floor (p123: iter 30, best_h=27 on a
+        # spike).  Meanwhile the STABLE, gain-relevant metrics improve
+        # monotonically to P1 end (p123 recon 0.102->0.087, conv 0.25->1.00 from
+        # iter 30->70).  The rollback therefore froze an UNDER-trained iter-30 g
+        # and DISCARDED the late-P1 DV-PRBS gain excitation (injects at iter
+        # 40/50/60), which (a) capped the DV->CV gain (~0.75 across p121-p123)
+        # and (b) randomized the DOB observer built on the frozen g (disturbance
+        # r varied 0.09-0.65 run-to-run).  Curriculum P1 is dedicated clean
+        # gain-ID with the anti-drift overshoot+held losses ON, so the
+        # full-P1-trained g is both better (lower recon = better gain, full
+        # convergence) AND drift-protected.  Honour an explicit override.
+        if 'DREAMER_WM_BEST_RESTORE_AT_P2' not in os.environ:
+            if wm_best_restore_at_p2:
+                print('[curriculum] P1->P2 WM warm-restore DISABLED: freeze the '
+                      'FULL-P1-trained g (all clean+DV-PRBS gain data) instead '
+                      'of rolling back to the noisy correlation-peak checkpoint. '
+                      'Override with DREAMER_WM_BEST_RESTORE_AT_P2=1.',
+                      flush=True)
+            wm_best_restore_at_p2 = False
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
