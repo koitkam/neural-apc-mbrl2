@@ -338,32 +338,13 @@ def main() -> int:
         batch_size=batch_size,
         out_dir=str(out_dir),
         init_from_ckpt=str(args.init_from_ckpt or ''),
-        # Plant-tie the WM multi-step supervision windows to the imagination
-        # horizon (= 2% settling time).  Both the open-loop overshoot term and
-        # the held-action steady-state term should span ~one full settling
-        # response so the WM learns the asymptotic gain, not a truncated step.
-        # p117 set these = horizon via env-override; promoted here 2026-06-14 so
-        # they derive per-plant and can't be silently dropped from a launch.
-        wm_overshoot_len=horizon,
-        wm_held_rollout_len=horizon,
+        # NOTE: wm_overshoot_len / wm_held_rollout_len / return_scale_abs_cap are
+        # H-derived and now live in training.train.auto_tune_seed_buffer (the
+        # SHARED layer) so BOTH single_run.py and workflow/bo_runner.py inherit
+        # them per-plant (p124 config-audit RCA — bo_runner used to miss them).
         **(dict(phase1_frac=phase1_frac, phase2_frac=phase2_frac, phase3_frac=phase3_frac) 
            if phase1_frac is not None else {}),
     )
-    # Return-scale runaway ceiling (p123 RCA, 2026-06-15): make the abs cap
-    # sim-adaptive instead of the loose universal 500.  ``return_scale`` is the
-    # p95-p5 spread of the (bounded-reward) λ-returns, so it is bounded by the
-    # envelope ``B·H``.  A HEALTHY economic return_scale is empirically only
-    # ~5-10% of that worst case (test_sim: settled ~10, max ~17 vs B·H=165),
-    # while the critic-pessimism runaway that shrinks the actor's advantage
-    # (adv = adv_raw / return_scale → passive/weak-economic actor) climbs to
-    # 27-55.  Cap at ~12% of B·H (floor 20) so it never touches healthy growth
-    # but arrests the runaway.  Sim-adaptive via the plant's own B and horizon;
-    # env override DREAMER_RETURN_SCALE_ABS_CAP (applied below) still wins.
-    _B_env = float(getattr(cfg, 'bound_training_reward_max', 3.0) or 3.0)
-    cfg.return_scale_abs_cap = round(max(20.0, 0.12 * _B_env * float(horizon)), 1)
-    print(f"[run] return_scale_abs_cap={cfg.return_scale_abs_cap} "
-          f"(sim-adaptive: max(20, 0.12·B·H)=max(20, 0.12·{_B_env:g}·{horizon}))",
-          flush=True)
     # Optional env-var overrides for A/B experiments.  These apply
     # *after* dataclass construction so auto-tune (which compares
     # against the dataclass default to decide whether to overwrite)

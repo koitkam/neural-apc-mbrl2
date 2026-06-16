@@ -5186,6 +5186,42 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                       f'4·H target)',
         }
 
+    # ---- WM multi-step supervision windows + return-scale cap (H-derived) ----
+    # All three are functions of the imagination horizon H (= the identified
+    # plant settling time, itself sim-adaptive via derive_horizon = round(
+    # (θ+4τ)/sr)).  They live HERE in the SHARED auto-tune layer rather than in
+    # single_run.py so that BOTH single_run.py AND workflow/bo_runner.py inherit
+    # them per-plant (p124 config-audit RCA: bo_runner built TrainConfig()
+    # directly and never derived these, leaving them stuck at the test-sim-
+    # inappropriate dataclass constants 15 / 64 / 500).  The apply loop in
+    # ``train`` sets each only when the field is still at its dataclass default,
+    # so an explicit env-override / constructor value still wins.
+    H_wm = int(getattr(cfg, 'horizon', 15) or 15)
+    # (a) overshoot + held-rollout supervision span ≈ one full settling response
+    # so the WM learns the asymptotic gain, not a truncated step.
+    out['wm_overshoot_len'] = {
+        'value': int(H_wm),
+        'source': f'horizon (={H_wm}) — one settling response',
+    }
+    out['wm_held_rollout_len'] = {
+        'value': int(H_wm),
+        'source': f'horizon (={H_wm}) — one settling response',
+    }
+    # (b) return-scale runaway ceiling.  ``return_scale`` is the p95-p5 spread of
+    # the bounded-reward λ-returns, bounded by the envelope B·H; a HEALTHY
+    # economic value is empirically ~5-12% of that worst case, while the critic-
+    # pessimism runaway that shrinks the actor advantage (adv = adv_raw/
+    # return_scale → passive/weak-economic actor) climbs far higher (27-55 on
+    # test_sim).  Cap at ~12% of B·H, floored at 20 (a dimensionless return-unit
+    # backstop for short-horizon plants).  Sim-adaptive via H; sim-agnostic via
+    # B (a dimensionless post-calibration reward bound) + the 0.12 / 20 consts.
+    B_rs = float(getattr(cfg, 'bound_training_reward_max', 3.0) or 3.0)
+    rs_cap = round(max(20.0, 0.12 * B_rs * float(H_wm)), 1)
+    out['return_scale_abs_cap'] = {
+        'value': float(rs_cap),
+        'source': f'max(20, 0.12·B·H)=max(20, 0.12·{B_rs:g}·{H_wm})={rs_cap}',
+    }
+
     sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
     tau_plant = 0.0
     theta_plant = 0.0
@@ -5297,6 +5333,11 @@ _AUTO_TUNE_FIELD_DEFAULTS: Dict[str, object] = {
     'prbs_seed_segment_steps_min': TrainConfig().prbs_seed_segment_steps_min,
     # P48 (2026-05-24) structural γ/H mismatch fix: γ adaptive to horizon.
     'gamma':                    TrainConfig().gamma,
+    # p124 config-audit (2026-06-15): H-derived, moved from single_run.py into
+    # the shared auto-tune so bo_runner inherits them per-plant too.
+    'wm_overshoot_len':         TrainConfig().wm_overshoot_len,
+    'wm_held_rollout_len':      TrainConfig().wm_held_rollout_len,
+    'return_scale_abs_cap':     TrainConfig().return_scale_abs_cap,
 }
 
 
