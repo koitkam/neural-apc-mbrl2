@@ -349,6 +349,18 @@ class TrainConfig:
     # scores on the unshaped economic ``info['raw_reward']`` so the audited
     # objective is unchanged.  Set ``reward_shaping_coef=0.0`` to disable.
     reward_shaping_coef: float = 1.0
+    # Flat-top safety-margin width (2026-06-16, p125 RCA) for the RANGE/limit
+    # case of the shaping potential (no enabled CV target).  The legacy
+    # band-keeping potential was a TENT peaked at the band CENTRE, which (a)
+    # center-biases the actor away from an economic limit-riding operating point
+    # and (b) spreads the safety gradient thinly across the whole band.  Instead
+    # Φ is FLAT (=1) across the interior and ramps 0→1 only within a margin band
+    # of width ``shaping_safe_margin_frac · half_band`` at each edge — zero
+    # center-pull (economics free) with a CONCENTRATED, ~1/frac steeper pull-back
+    # exactly in the near-constraint zone where disturbance-driven overshoot
+    # happens.  Still potential-based (policy-invariant) and sim-adaptive (a
+    # fraction of the plant's own half-band).  ``1.0`` recovers the legacy tent.
+    shaping_safe_margin_frac: float = 0.25
 
     # ---- P73 : bounded training reward (cascade root-cause fix) ------
     # The bootstrap-cascade root cause (P69-P71) is UNBOUNDED reward scale:
@@ -1872,8 +1884,17 @@ class APCEnv:
                 d = abs(cv - float(targets[i])) / half
                 vals.append(max(0.0, 1.0 - d))
             else:
-                m = min(cv - lo, hi - cv) / half
-                vals.append(float(np.clip(m, 0.0, 1.0)))
+                # Flat-top SAFETY-MARGIN potential (p125 RCA, 2026-06-16): for a
+                # range/limit objective (no enabled CV target) Φ is FLAT (=1) in
+                # the interior and ramps 0→1 only within a margin band of width
+                # ``margin_frac·half`` at each edge — no centre-pull (economics
+                # free) with a concentrated, ~1/frac steeper pull-back in the
+                # near-constraint zone.  ``margin_frac=1.0`` recovers the legacy
+                # centre-peaked tent.
+                m = min(cv - lo, hi - cv) / half          # 0 at edge, 1 at centre
+                mf = float(getattr(self.cfg, 'shaping_safe_margin_frac', 0.25))
+                mf = float(np.clip(mf, 1e-3, 1.0))
+                vals.append(float(np.clip(m / mf, 0.0, 1.0)))
         if not vals:
             return 0.0
         return float(np.mean(vals))
@@ -3394,7 +3415,15 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
         state = rssm.img_step(state, a_k, dv=dv_k, sample=True)
         pred = rssm.decode(state.feat).reshape(B, S, -1)
         tgt = obs[:, a_idx].detach()                             # (B, S, D)
-        total = total + (pred - tgt).pow(2).mean()
+        # CV-weight the multi-step MSE (2026-06-16, p124 RCA): this open-loop
+        # term IS the horizon-gain supervisor, but a UNIFORM MSE drowns the
+        # small-variance CV step-response under the high-variance PRBS'd MV/DV
+        # channels — so the WM nails the 1-step transient yet plateaus BELOW the
+        # true steady-state gain (decomp 1step→openloop ~0.91; vision: "rises
+        # fast then plateaus early").  Reusing the recon CV-weight directly
+        # supervises the CV's open-loop settling toward the real gain.  Identity
+        # when wm_recon_cv_weight==1.0 or no CV indices.
+        total = total + _weighted_recon_mse(pred, tgt, cfg)
     loss = total / float(K)
     # Soft recon-fidelity gate: ramp the term in only as 1-step recon converges
     # (early P1 the WM can't predict multi-step; an ungated term would swamp the
@@ -4794,6 +4823,35 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
         'summary': summary,
         'passes_full': best_h >= H,
     }
+    # GAIN-FIDELITY term (p126 RCA, 2026-06-17): the correlation + convergence +
+    # recon terms are all SHAPE/scale-invariant or aggregate — none directly
+    # measure whether the WM reproduces the CV's open-loop GAIN, the control-
+    # relevant property the transfer matrix scores.  The wm_best pick therefore
+    # rode correlation noise and the frozen WM gain bounced 0.85–0.95 run-to-run
+    # (p121–p126), under-reading the DV→CV gain (~0.78) so the actor under-reacts
+    # to disturbances → catastrophic CV overshoot.  Measure the CV-channel
+    # std-ratio over the k-step open-loop rollout (under REAL actions + DV teacher-
+    # forced): when the WM under-reads the gain, the predicted CV varies LESS than
+    # the real CV → ratio < 1.  ``min(ratio, 1)`` credits a faithful/over-reading
+    # gain fully and penalises only under-prediction (the actual bias).  Averaged
+    # over CV channels; NaN-safe (returns None on degenerate std).  cv_obs_indices
+    # is set at runtime from env.cv_indices.
+    try:
+        cv_idx = [int(i) for i in (getattr(cfg, 'cv_obs_indices', ()) or ())]
+        po = np.asarray(wm.get('pred_obs'), dtype='float64')   # (S, K, D)
+        ro = np.asarray(wm.get('real_obs'), dtype='float64')
+        if cv_idx and po.ndim == 3 and po.shape == ro.shape:
+            ratios = []
+            for c in cv_idx:
+                if 0 <= c < po.shape[-1]:
+                    rs = float(ro[..., c].std())
+                    ps = float(po[..., c].std())
+                    if rs > 1e-6:
+                        ratios.append(min(ps / rs, 1.0))
+            if ratios:
+                result['wm_gain_fidelity'] = float(np.mean(ratios))
+    except Exception as e:
+        print(f'[wm-gain-fidelity] skipped: {e!r}', flush=True)
     # P89: held-action convergence companion (anti-drift) so the wm_best score
     # is not blind to imagination drift (the r-terms above are scale-invariant).
     # Gated (DREAMER_WM_FIDELITY_CONV_PROBE), RSSM-only, never fatal.
@@ -6615,29 +6673,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
               f'reward={_fz["reward"]} tensors; disturbance prob=0).',
               flush=True)
-        # p123 RCA (2026-06-15): in curriculum mode, do NOT roll the WM back to
-        # the P1 correlation-peak checkpoint at P1->P2.  The wm_best fidelity
-        # score is dominated by correlation NOISE in P1 — the per-offset Pearson
-        # r bounces ~+/-0.15 with no trend, so the "best" is whichever iter has
-        # a noise spike crossing the r-floor (p123: iter 30, best_h=27 on a
-        # spike).  Meanwhile the STABLE, gain-relevant metrics improve
-        # monotonically to P1 end (p123 recon 0.102->0.087, conv 0.25->1.00 from
-        # iter 30->70).  The rollback therefore froze an UNDER-trained iter-30 g
-        # and DISCARDED the late-P1 DV-PRBS gain excitation (injects at iter
-        # 40/50/60), which (a) capped the DV->CV gain (~0.75 across p121-p123)
-        # and (b) randomized the DOB observer built on the frozen g (disturbance
-        # r varied 0.09-0.65 run-to-run).  Curriculum P1 is dedicated clean
-        # gain-ID with the anti-drift overshoot+held losses ON, so the
-        # full-P1-trained g is both better (lower recon = better gain, full
-        # convergence) AND drift-protected.  Honour an explicit override.
-        if 'DREAMER_WM_BEST_RESTORE_AT_P2' not in os.environ:
-            if wm_best_restore_at_p2:
-                print('[curriculum] P1->P2 WM warm-restore DISABLED: freeze the '
-                      'FULL-P1-trained g (all clean+DV-PRBS gain data) instead '
-                      'of rolling back to the noisy correlation-peak checkpoint. '
-                      'Override with DREAMER_WM_BEST_RESTORE_AT_P2=1.',
-                      flush=True)
-            wm_best_restore_at_p2 = False
+        # NOTE (2026-06-16, p124 RCA): the p123 experiment that DISABLED the
+        # P1->P2 wm_best warm-restore in curriculum mode was REVERTED — it
+        # regressed the MV gain (warm-restore OFF p124 MV 0.849 vs ON p121-123
+        # avg 0.926).  P1 recon is non-monotonic (p124: bottoms iter40 0.085,
+        # rises to iter70 0.108), so freezing the END-of-P1 WM froze a WORSE
+        # checkpoint than wm_best.  The warm-restore (P39 default) stays ON; the
+        # real gain fix is the CV-weighted overshoot loss (supervises the
+        # open-loop CV gain directly), not the checkpoint-selection policy.
     wm_best_restore_min_gap = int(
         os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
@@ -8116,7 +8159,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         print(f"[wm-fidelity-probe-iter{total_iters}] "
                               f"{_pbe['summary']} "
                               f"floor={_pbe['r_floor']:.2f} "
-                              f"best_h={_pbe['best_h']}/{_pbe['H']}",
+                              f"best_h={_pbe['best_h']}/{_pbe['H']}"
+                              + (f" gain_fid={_pbe['wm_gain_fidelity']:.3f}"
+                                 if _pbe.get('wm_gain_fidelity') is not None
+                                 else ''),
                               flush=True)
                         # ---- Fidelity-based best-ckpt + early stop ----
                         # Score = sum of positive Pearson r across
@@ -8173,6 +8219,32 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                               else _rl)
                                 if np.isfinite(_rlv):
                                     _score = _score - _recon_w * _rlv
+                            except Exception:
+                                pass
+                        # GAIN-FIDELITY term (p126 RCA, 2026-06-17): reward the
+                        # checkpoint whose open-loop CV std-ratio is closest to
+                        # the real plant (= accurate CV gain), so the wm_best
+                        # pick + P1->P2 restore stop riding correlation noise and
+                        # the frozen WM gain is both HIGHER and STABLE run-to-run
+                        # (the DV-gain under-read → actor under-reaction → cv
+                        # blow-up chain).  Gated by a recon ramp so an untrained,
+                        # high-variance early checkpoint cannot win on spurious
+                        # CV variance (mirrors the overshoot/held recon gates).
+                        # Weight via DREAMER_WM_FIDELITY_GAIN_WEIGHT (0=off).
+                        _gain_w = float(os.environ.get(
+                            'DREAMER_WM_FIDELITY_GAIN_WEIGHT', '3.0'))
+                        _gain_fid = _pbe.get('wm_gain_fidelity')
+                        if _gain_w > 0.0 and _gain_fid is not None:
+                            try:
+                                _rl = wm_losses.get('recon_loss')
+                                _rlv = float(_rl.detach().item()
+                                              if torch.is_tensor(_rl)
+                                              else _rl)
+                                _gate_thr = float(os.environ.get(
+                                    'DREAMER_WM_FIDELITY_GAIN_GATE_RECON', '0.15'))
+                                _gate = (min(1.0, _gate_thr / max(_rlv, 1e-6))
+                                          if np.isfinite(_rlv) else 0.0)
+                                _score = _score + _gain_w * float(_gain_fid) * _gate
                             except Exception:
                                 pass
                         # Update EMA of the score (used for ES only).

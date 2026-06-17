@@ -433,3 +433,127 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   follow-up is to make the `wm_best` score gain-aware (CV std-ratio from the
   k-step rollout `pred_obs`/`real_obs`) for non-curriculum runs.
 
+### p124 — VERDICT: warm-restore-disable was a regression; found the WM-gain root
+- **The p123 warm-restore-disable HURT**: MV gain 0.947 → **0.849** (worse). Warm-restore
+  ON (p121/122/123) averaged **0.926**; OFF (p124) gave 0.849. The p123 hypothesis
+  ("full-P1 g is better") was wrong — P1 recon is **non-monotonic** (bottoms iter 40
+  = 0.085, rises to iter 70 = 0.108), so freezing end-of-P1 froze a *worse* WM.
+- **`return_scale_abs_cap=20` WORKED (clean keep)**: return_scale pinned at 20.00 all
+  P3 (vs p123's 27 runaway). The return-norm runaway is arrested — but the **actor is
+  still passive**, proving passivity is NOT the return-norm runaway.
+- **Actor-passivity root = reward asymmetry 659:1**: raw_min −488 vs raw_max +0.74,
+  positive_fraction only **8.9%**. MC grounding is 90% engaged yet `critic_target_v_r`
+  = 0.97 — the economic upside (+0.74 for riding the limit) is a sliver below the noise
+  floor against the −488 violation cliff. Deferred to a dedicated run (objective design).
+- **WM-gain structural root (vision-confirmed)**: the decomp splits the bias into
+  `real→post` **0.855** (1-step autoencoder, already CV-weighted since 2026-06-09) +
+  `1step→openloop` **0.906** (multi-step open-loop = the gain over the horizon). The
+  `_wm_latent_overshoot_loss` is THE open-loop gain supervisor but used **uniform MSE**
+  — so the small-variance CV step-response is drowned by the high-variance PRBS'd MV/DV
+  channels. Vision: the WM "rises fast then plateaus early **below**" the real gain =
+  premature saturation = undersupervised asymptote. (The held-rollout loss is
+  gain-neutral by construction — not the lever.)
+
+### p125 — fix: CV-weight the multi-step overshoot loss + revert warm-restore
+- **(structural)** CV-weight `_wm_latent_overshoot_loss`: replace
+  `(pred−tgt).pow(2).mean()` with `_weighted_recon_mse(pred, tgt, cfg)` so the
+  multi-step open-loop **CV** response (the gain over the settling horizon) is directly
+  supervised instead of drowned. Reuses `cv_obs_indices` + `wm_recon_cv_weight=4.0`
+  (sim-agnostic, within-loss emphasis, renorm mean-1 preserves magnitude; identity at
+  weight 1). This is the same CV-weighting the 1-step recon got in 2026-06-09, finally
+  applied to the multi-step term that actually sets the open-loop gain.
+- **(revert)** Removed the p123 curriculum warm-restore-disable — back to the P39
+  default (ON), since p124 proved OFF regressed the gain.
+- **Kept**: `return_scale_abs_cap=20` (now via shared auto-tune), all proven defaults.
+- **Judge by**: open-loop gain ratio 0.775 → **>0.90** (WM reaches steady state, no
+  premature plateau), MV ≥ 0.92 / DV ≥ 0.85, disturbance r **stable >0.5** (observer on
+  a converged g). Single coherent WM-gain change for clean attribution.
+- **If WM gain fixed but actor still passive**: next run attacks the reward asymmetry
+  (659:1) directly — that's the binding actor constraint now, separate from the WM.
+
+### p125 — VERDICT: CV-weighted overshoot WORKED (best WM); critic healthy; actor economically right but imprecise
+- **WM (best in series)**: MV gain 0.849 → **0.950**, DV 0.761 → **0.859**, `real→post`
+  0.855 → **0.959** (autoencoder ~fixed), `1step→openloop` **0.926**, disturbance r
+  **0.738** (best ever) with pred/true **1.03** (well-calibrated). The CV-weighted
+  multi-step overshoot loss fixed the open-loop gain undersupervision — **keep**.
+- **Critic — healthy** (the user's question): fits its target (`critic_pred_target_r`
+  0.983), MC grounding 91% engaged, `return_scale` **cleanly capped at 20.00** all P3
+  (the `abs_cap` fix works — no cascade, no runaway). `rew_to_tgt` 0.0009 is **expected**
+  for a long correlated horizon (H=55, persistent violations → return variance ~20× iid),
+  not pathological; `adv_std` 0.54 shows the critic does distinguish states. **The critic
+  is not the bottleneck.**
+- **Actor (vision overturned the "passive" read)**: it **is** economically optimizing —
+  low reflux, riding the **upper** temperature limit, MV actively moving (`mv_viol 0.000`
+  = reflux stays inside its own actuator bounds, not passivity). The real problem is
+  **imprecise constraint handling**: cv_viol 76, it overshoots the limit it rides, with
+  violations mostly **disturbance / band-step driven**.
+- **Root of imprecision**: the operating-region reward is ~30× below the band-keeping
+  shaping + imagined-reward noise (0.19). The bounded-reward slope `B/ref = 3/100 = 0.03`
+  compresses economics (+0.73) and mild violations (to ~−10 raw) into `[−0.3, +0.02]`, so
+  the actor gets a usable gradient only from catastrophic violations (raw < −100 → −3).
+  The 770:1 reward asymmetry is fundamental — a symmetric scale keeps economics tiny, and
+  amplifying it asymmetrically risks flipping the optimum toward violating.
+
+### p126 — fix: flat-top safety-margin shaping (actor precision)
+- The band-keeping shaping potential (`_shaping_potential`, no-target/range case) was a
+  **tent peaked at the band centre** — it center-biases the actor (diluting economic
+  limit-riding) and spreads the safety gradient thinly. Replace with a **flat-top**:
+  Φ = 1 across the interior (no center-pull, economics free) ramping 0→1 only within a
+  margin band of width `shaping_safe_margin_frac · half_band` (default **0.25**) at each
+  edge — a concentrated, steeper pull-back exactly in the near-constraint zone where the
+  disturbance-driven overshoot happens. Still **potential-based (policy-invariant** —
+  cannot change the economic optimum) and **sim-adaptive** (margin = fraction of the
+  plant's own half-band). The target-tracking path is unchanged. Verified: zero interior
+  center-pull, steeper near-limit gradient; curriculum smoke green.
+- **WM + critic kept as-is** (WM is good at 0.95/0.86; critic healthy) for clean
+  attribution of the shaping change.
+- **Judge by**: cv_viol 76 → materially lower (**< 40**) **while** the actor stays
+  economic (still rides the upper limit, cum_raw no worse than −128k) and MV stays smooth.
+- **If insufficient**: the deeper lever is objective re-design — asymmetric reward scaling
+  or a training-time constraint back-off — to make the economic signal visible without
+  flipping the optimum.
+
+### p126 — VERDICT: shaping didn't help; the smoking gun is run-to-run VARIANCE
+- **Safety-margin shaping regressed (within noise)**: cv_viol 76 → **99**, cum_raw
+  −128k → −149k, WM MV gain 0.950 → **0.861**. But this is **inside the noise band**.
+- **The decisive finding — we've been measuring NOISE**: per-seed validation cum_raw
+  ranges **−5,646 to −440,575** across this one run's 12 episodes (80× spread). And the
+  cross-run metrics bounce with **no trend** over 6 runs: MV gain
+  0.932/0.947/0.898/0.849/0.950/0.861 (±0.05), DV 0.753/0.792/0.772/0.761/0.859/0.775
+  (~0.78), cv_viol 64.8/94.9/101/62.8/76.2/99.0 (±20). Single-knob A/Bs **cannot be
+  attributed** — the variance dwarfs the effect.
+- **Critic — structurally fine** (the user's question): fits target (`pred_target_r`
+  0.983), MC grounding 92%, `return_scale` cleanly capped at 20.00. Entropy pins at the
+  σ-floor (−0.101) from the first P3 iter. The critic faithfully fits a reward whose
+  economic component is genuinely tiny — it is not the bottleneck.
+- **Root cause of the variance + "passive actor" (vision-confirmed)**: the actor
+  **under-reacts to measured disturbances** (MV moves right direction but too little/slow)
+  → CV overshoots the limit by **6–7 °C** and sustains the −488 cliff → catastrophic
+  episodes that dominate the mean. This is **downstream of the DV-gain under-read (0.78)**:
+  the WM tells the actor a disturbance is only 78% as strong as it is. And the DV gain
+  bounces run-to-run because the `wm_best` pick is **noise-driven** (gain-blind score).
+
+### p127 — fix: gain-aware `wm_best` selection (the structural #1-priority lever)
+- The `wm_best` fidelity score was correlation + convergence + recon — none directly
+  measure the **CV open-loop gain**, so the pick rode noise and the frozen WM gain
+  bounced 0.85–0.95. Add a **gain-fidelity term**: the CV-channel std-ratio of the k-step
+  open-loop rollout (pred vs real, under real actions + DV teacher-forced). `min(ratio,1)`
+  credits a faithful/over-reading gain fully and penalises only under-prediction (the
+  actual bias). Recon-gated so an untrained, high-variance early checkpoint can't win on
+  spurious CV variance. Weight `DREAMER_WM_FIDELITY_GAIN_WEIGHT=3.0` (default-on),
+  gate `…GAIN_GATE_RECON=0.15`.
+- **Why this is the root-cause fix**: it directly optimizes the control-relevant property
+  (CV gain), so it should (a) **raise** the frozen WM gain — especially the DV (the
+  under-reaction source) — and (b) **reduce run-to-run variance** by picking consistently
+  high-gain checkpoints instead of noise spikes, which makes future fixes attributable.
+  Serves the standing #1 priority (unbiased WM) directly.
+- **Kept p126 as the baseline** (flat-top shaping) so the only new variable is the
+  gain-aware selection. Unit-tested (0.78→0.78, 0.97→0.97, over-read capped at 1.0);
+  curriculum smoke green.
+- **Judge by**: MV gain → **>0.93** AND DV → **>0.85** AND **lower run-to-run spread**
+  (the variance drop is itself the signal); then the actor's catastrophic-episode rate
+  should fall (cum_raw spread tightens) as the DV under-reaction is corrected.
+- **If the gain rises but the actor is still imprecise**: the next lever is the economic
+  signal strength (the 770:1 asymmetry) — but fix the WM gain + variance first so it's
+  measurable.
+
