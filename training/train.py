@@ -361,6 +361,26 @@ class TrainConfig:
     # happens.  Still potential-based (policy-invariant) and sim-adaptive (a
     # fraction of the plant's own half-band).  ``1.0`` recovers the legacy tent.
     shaping_safe_margin_frac: float = 0.25
+    # R2a economic-potential weight (2026-06-17, p128 RC-A1 fix).  The shaping
+    # potential becomes Φ = Φ_safe + ``shaping_econ_coef``·Φ_econ, where Φ_econ
+    # ∈ [0,1] is a STATE-BASED economic-direction potential: a linear ramp
+    # across each economically-weighted MV/CV channel's engineering band,
+    # oriented by the sign of its economic weight (the direction that LOWERS the
+    # objective's economic penalty), aggregated weight-magnitude-weighted.
+    # Why: the true economic reward is near-invisible to the actor — the P77
+    # bounded-reward remap (slope B/ref≈0.03) crushes a full econ swing
+    # (+0.73) to +0.022, ~9× below the imagined-reward noise floor (0.19), so
+    # the flat-top safety potential (interior-flat by design) leaves NOTHING to
+    # climb.  Φ_econ re-introduces a dense economic gradient in the interior.
+    # Crucially it is potential-based (telescoping, same γ) ⇒ POLICY-INVARIANT
+    # (Ng 1999) for ANY potential — so unlike a gain-matched aux loss it is
+    # SAFE on nonlinear plants (it can only change learning speed, never the
+    # optimum).  It is also feasibility-aligned: clipped at the band edges so it
+    # adds ZERO gradient outside the limits (no incentive to violate; the
+    # quadratic violation penalty still owns that region).  Kept at HALF the
+    # safety weight so constraint-keeping stays primary.  0.0 disables Φ_econ
+    # (recovers the pure flat-top safety potential).
+    shaping_econ_coef: float = 0.5
 
     # ---- P73 : bounded training reward (cascade root-cause fix) ------
     # The bootstrap-cascade root cause (P69-P71) is UNBOUNDED reward scale:
@@ -862,6 +882,16 @@ class TrainConfig:
     # range each side of baseline: large enough that Var(DV) ≫ Var(noise)
     # (kills regression dilution) yet safely inside the channel bounds.
     dv_prbs_op_frac: float = 0.6
+    # R1a (2026-06-17, p128 DV-gain RCA): also drive the MEASURED DV with the
+    # SAME full-range PRBS during the clean Stage-1 ON-POLICY collection (not
+    # only in the evicted seed batch).  The seed DV-PRBS lands the excitation
+    # in iter-1 data that the gain-blind wm_best probe can roll back; injecting
+    # it on-policy keeps the DV→CV gradient flowing across the whole Stage-1 so
+    # the kept checkpoint carries the corrected DV gain.  Closes the ~30×
+    # MV-vs-DV on-policy excitation asymmetry (RC-W1).  No-op when n_dv=0 or the
+    # run is non-curricular.  Set False to recover the legacy sparse-event
+    # Stage-1 DV distribution.
+    dv_prbs_onpolicy_in_p1: bool = True
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -1589,6 +1619,21 @@ class APCEnv:
             getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0)
         self._shaping_gamma: float = float(getattr(cfg, 'gamma', 0.997) or 0.997)
         self._prev_potential: Optional[float] = None
+        # R2a (p128, 2026-06-17): economic-potential weight.  Φ = Φ_safe +
+        # ``_shaping_econ_coef``·Φ_econ where Φ_econ ∈ [0,1] is a STATE-BASED
+        # economic-direction potential (high toward the objective's economic
+        # operating point).  Densifies the near-invisible economic gradient
+        # (RC-A1: bounded-remap slope 0.03 crushes econ +0.73→+0.022, ~9× below
+        # the imagined-reward noise floor) while staying potential-based /
+        # policy-invariant (Ng 1999) — safe even for nonlinear plants since the
+        # optimum is unchanged for ANY potential.  0.0 disables Φ_econ.
+        self._shaping_econ_coef: float = float(
+            getattr(cfg, 'shaping_econ_coef', 0.0) or 0.0)
+        # R1a (p128, 2026-06-17): when set by the curriculum stage controller
+        # (Stage-1 + measured-DV channels), ``reset`` REPLACES the sparse
+        # measured-DV step schedule with a full-range on-policy DV-PRBS so the
+        # WM's DV→CV gain gets continuous excitation on the live distribution.
+        self._dv_prbs_in_reset: bool = False
 
         # ---- P73/P77 : bounded training reward --------------------------
         # When enabled, the per-step TRAINING reward is mapped into [-B, B]
@@ -1803,6 +1848,20 @@ class APCEnv:
             intensity=intensity,
             sim=self.sim,
         )
+        # R1a (p128, 2026-06-17): Stage-1 ON-POLICY full-range DV excitation.
+        # When enabled (curriculum P1 + measured-DV channels) REPLACE the sparse
+        # measured-DV step schedule (~1-5 events/episode) with the SAME
+        # persistent, full-range, multi-timescale DV-PRBS the seed episodes use,
+        # so the WM's DV→CV gain is identified on the LIVE on-policy distribution
+        # (not only in the evicted seed batch).  Closes the ~30× MV-vs-DV
+        # on-policy excitation asymmetry (RC-W1).  Only the MEASURED DV is
+        # excited; the hidden (unmeasured) disturbance stays OFF in P1 (prob
+        # override 0 below), so the gain↔unmeasured-disturbance separation that
+        # the clean Stage-1 protects is NOT confounded.
+        if bool(getattr(self, '_dv_prbs_in_reset', False)):
+            _dv_sched = _build_dv_prbs_schedule(self, self.cfg)
+            if _dv_sched:
+                self._schedule = _dv_sched
         # Per-episode hidden OU disturbance.  Bernoulli toggle gated
         # by phase-aware prob (P1/P2: 0.3, P3: 0.5).  Set force=True
         # in validation to always build.
@@ -1856,13 +1915,21 @@ class APCEnv:
         return out
 
     def _shaping_potential(self, state: np.ndarray) -> float:
-        """Dense band-keeping potential Φ(s) ∈ [0, 1] for reward shaping.
+        """Dense shaping potential Φ(s) for reward shaping.
 
-        Returns the mean over CVs of the normalised margin to the nearest
-        band edge: 1.0 at the band centre (or at an enabled CV target),
-        0.0 at the edge, clamped to 0 outside the band.  This is the
-        positive-gradient signal the one-sided economic objective lacks
-        inside the safe band.  Read-only; no side effects.
+        Φ(s) = Φ_safe(s) + ``_shaping_econ_coef``·Φ_econ(s).
+
+        * Φ_safe ∈ [0, 1]: mean over CVs of the normalised margin to the
+          nearest band edge (1.0 at the band centre / at an enabled CV target,
+          0.0 at the edge, clamped to 0 outside the band) — the positive-
+          gradient signal the one-sided economic objective lacks inside the
+          safe band.  (Flat-top for the range/limit case; see below.)
+        * Φ_econ ∈ [0, 1]: state-based economic-direction potential
+          (``_economic_potential``), added only when ``_shaping_econ_coef`` > 0
+          (R2a).  Densifies the otherwise near-invisible economic gradient.
+
+        Potential-based (telescoping, same γ) ⇒ policy-invariant (Ng 1999).
+        Read-only; no side effects.
         """
         sp = self.setpoint_mgr
         try:
@@ -1895,9 +1962,79 @@ class APCEnv:
                 mf = float(getattr(self.cfg, 'shaping_safe_margin_frac', 0.25))
                 mf = float(np.clip(mf, 1e-3, 1.0))
                 vals.append(float(np.clip(m / mf, 0.0, 1.0)))
-        if not vals:
-            return 0.0
-        return float(np.mean(vals))
+        phi_safe = float(np.mean(vals)) if vals else 0.0
+        # R2a: add the economic-direction potential when enabled.  Kept
+        # additive (commensurate [0,1] scales) so ``_shaping_econ_coef`` is the
+        # econ-vs-safety emphasis.  The telescoping in ``step`` handles the
+        # combined Φ unchanged.
+        econ_coef = float(getattr(self, '_shaping_econ_coef', 0.0) or 0.0)
+        if econ_coef > 0.0:
+            return phi_safe + econ_coef * self._economic_potential(state)
+        return phi_safe
+
+    def _economic_potential(self, state: np.ndarray) -> float:
+        """State-based economic-direction potential Φ_econ ∈ [0, 1] (R2a).
+
+        A linear ramp across each economically-weighted MV / CV channel's
+        engineering band, oriented by the SIGN of its economic weight — the
+        direction that lowers the objective's economic penalty
+        (``reward −= Σ (x−typical)·w``, so ∂reward/∂x = −w):
+
+            w > 0  ⇒  lower value is economically better  ⇒  g = 1 − x_norm
+            w < 0  ⇒  higher value is economically better  ⇒  g = x_norm
+
+        aggregated as the |weight|-weighted mean over all economic channels.
+        ``x_norm`` is clamped to the band so Φ_econ adds ZERO gradient outside
+        the limits (matches the objective's "clipped to bounds: no gradient
+        outside" economic term — no incentive to violate; the quadratic
+        violation penalty still owns that region).  Returns 0.5 (a constant,
+        policy-inert) when no economic weights are configured.  Read-only.
+
+        Provably policy-invariant as a potential (Ng 1999) for ANY plant, so
+        — unlike a gain-matched auxiliary loss — it is safe on NONLINEAR
+        simulators: it only densifies the economic gradient, never moves the
+        optimum.
+        """
+        num = 0.0
+        den = 0.0
+        # ---- MV economic channels (MV read from the state vector) --------
+        try:
+            mv_idx = [int(x) for x in self.meta.get('mv_indices', [])]
+        except Exception:
+            mv_idx = []
+        mv_w = list(self.obj_w.get('mv_economic_weights', []) or [])
+        for i, si in enumerate(mv_idx):
+            if i >= self.mv_bounds_eu.shape[0] or si < 0 or si >= state.shape[0]:
+                continue
+            w = float(mv_w[i]) if i < len(mv_w) else 0.0
+            if abs(w) < 1e-12:
+                continue
+            lo = float(self.mv_bounds_eu[i, 0]); hi = float(self.mv_bounds_eu[i, 1])
+            if hi - lo <= 1e-9:
+                continue
+            x = float(np.clip((float(state[si]) - lo) / (hi - lo), 0.0, 1.0))
+            g = (1.0 - x) if w > 0.0 else x
+            num += abs(w) * g
+            den += abs(w)
+        # ---- CV economic channels (CV read from the state vector) --------
+        cv_w = list(self.obj_w.get('cv_economic_weights', []) or [])
+        for j, ci in enumerate(self.cv_indices):
+            if ci is None or j >= self.cv_bounds_eu.shape[0] \
+                    or int(ci) >= state.shape[0]:
+                continue
+            w = float(cv_w[j]) if j < len(cv_w) else 0.0
+            if abs(w) < 1e-12:
+                continue
+            lo = float(self.cv_bounds_eu[j, 0]); hi = float(self.cv_bounds_eu[j, 1])
+            if hi - lo <= 1e-9:
+                continue
+            y = float(np.clip((float(state[int(ci)]) - lo) / (hi - lo), 0.0, 1.0))
+            g = (1.0 - y) if w > 0.0 else y
+            num += abs(w) * g
+            den += abs(w)
+        if den <= 0.0:
+            return 0.5
+        return float(np.clip(num / den, 0.0, 1.0))
 
     def step(self, action_norm: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         action_norm = np.asarray(action_norm, dtype='float32').reshape(self.action_dim)
@@ -2963,6 +3100,100 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
 
+def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig) -> List[Dict]:
+    """Full-range, multi-timescale, stratified DV-PRBS disturbance schedule.
+
+    Schedule-construction core shared by the DV-PRBS SEED episodes
+    (``collect_dv_prbs_episode``) and the Stage-1 ON-POLICY DV excitation
+    (R1a, p128) so both use identical excitation statistics.  Sweeps EVERY
+    measured-DV channel independently across ±``dv_prbs_op_frac``·(span/2) at
+    mixed timescales (seg_min … seg_max) via telescoping step deltas
+    (``delta_k = L_k − L_{k−1}``) so the accumulated offset tracks the
+    stratified level sequence.  Returns an empty list when the sim has no
+    measured-DV channels (caller leaves the existing schedule untouched).
+
+    Why (RC-W1, p119–p127 DV-gain RCA): the WM's DV→CV gain is identified on
+    the SLOW on-policy FEED motion (≈0.29 std OU) plus only ~1-5 sparse step
+    events/episode from ``build_training_disturbance_schedule`` — a ~30×
+    deficit vs the MV's continuous full-range PRBS.  With ``dv_as_input`` +
+    held-const-in-imagination the FEED→CV weight then gets almost no gradient
+    (DV gain stuck ~0.76 across 7 runs).  Persistent, large-amplitude DV
+    excitation kills both the under-excitation and the errors-in-variables
+    regression dilution.
+    """
+    from utils.training_disturbance import _channel_catalog
+    T = int(cfg.episode_length)
+    dv_chs = list(_channel_catalog(env.sim).get('dv', []))
+    if not dv_chs:
+        return []
+    # ----- Multi-timescale segment lengths (mirror collect_prbs_episode) -
+    # seg_max ≈ (θ+4τ)/sr (settling time, from auto_tune_seed_buffer) so the
+    # DV settles at each level (steady-state gain identifiable); seg_min ≈
+    # τ/(3·sr) (fast transient) so the WM also learns the DV dynamics.
+    seg_max = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
+    seg_max = max(8, min(seg_max if seg_max > 0 else T // 12, T // 4))
+    seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
+    seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
+    # Pre-roll segment start times (log-uniform multi-timescale).
+    seg_starts: List[int] = []
+    t = 0
+    while t < T - max(8, seg_min):
+        seg_starts.append(int(t))
+        if seg_min < seg_max:
+            u = env.rng.uniform(np.log(seg_min), np.log(max(seg_min + 1, seg_max)))
+            sl = int(round(float(np.exp(u))))
+        else:
+            sl = seg_max
+        t += max(seg_min, min(seg_max, sl))
+    n_seg = len(seg_starts)
+    if n_seg == 0:
+        return []
+    # ----- Build an independent stratified-level PRBS per DV channel -----
+    # Levels are OFFSETS from the channel baseline, stratified over
+    # ±op_frac·(span/2) so the sweep covers the operating range (boundary
+    # strata included).  The disturbance schedule accumulates achieved
+    # deltas as a persistent offset (telescoping), so delta_k = L_k − L_{k−1}
+    # makes the held DV level track L_k.
+    op_frac = float(np.clip(getattr(cfg, 'dv_prbs_op_frac', 0.6), 0.05, 0.95))
+    dv_schedule: List[Dict] = []
+    for ch in dv_chs:
+        b = ch.get('bounds')
+        span = (float(b[1]) - float(b[0])) if (isinstance(b, list)
+                                                and len(b) >= 2) else 1.0
+        amp = op_frac * 0.5 * abs(span)            # max |offset| from baseline
+        # Stratified target levels across [-amp, +amp] (guarantees the
+        # extremes are visited even when n_seg is small).
+        strata_n = max(1, min(int(getattr(cfg, 'prbs_seed_n_strata', 8)), n_seg))
+        edges = np.linspace(-amp, +amp, strata_n + 1)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        levels = np.empty(n_seg, dtype='float64')
+        order = env.rng.permutation(n_seg)
+        half_w = amp / strata_n
+        jit = env.rng.uniform(-half_w, +half_w, size=strata_n)
+        levels[:strata_n] = centers + jit
+        if n_seg > strata_n:
+            levels[strata_n:] = env.rng.uniform(-amp, +amp, size=n_seg - strata_n)
+        levels = levels[order]
+        prev = 0.0
+        for k, start in enumerate(seg_starts):
+            delta = float(levels[k] - prev)
+            prev = float(levels[k])
+            if abs(delta) < 1e-9:
+                continue
+            dv_schedule.append({
+                'name': f"dv_prbs_{ch.get('name', ch.get('pos', '?'))}_t{int(start)}",
+                'target_group': 'dv',
+                'target_pos': int(ch.get('pos', 0)),
+                'start': int(start),
+                'duration': 1,
+                'shape': 'step',
+                'delta': float(delta),
+                'source': 'dv_prbs_seed',
+                '_applied': False,
+            })
+    return dv_schedule
+
+
 def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                              mv_level: float = 0.0,
                              ) -> Dict[str, np.ndarray]:
@@ -3022,14 +3253,6 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     cur_u = float(np.clip(cur_u, -1.0, 1.0))
     act_buf = np.full((T, env.action_dim), cur_u, dtype='float32')
 
-    # ----- Multi-timescale segment lengths (mirror collect_prbs_episode) -
-    # seg_max ≈ (θ+4τ)/sr (settling time, from auto_tune_seed_buffer) so the
-    # DV settles at each level (steady-state gain identifiable); seg_min ≈
-    # τ/(3·sr) (fast transient) so the WM also learns the DV dynamics.
-    seg_max = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
-    seg_max = max(8, min(seg_max if seg_max > 0 else T // 12, T // 4))
-    seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
-    seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
     if not has_dv:
         # No DV channels → just run the held-MV episode (still useful as a
         # steady-state MV anchor; matches collect_constant semantics).
@@ -3045,63 +3268,10 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                 break
         return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
-    # Pre-roll segment start times (log-uniform multi-timescale).
-    seg_starts: List[int] = []
-    t = 0
-    while t < T - max(8, seg_min):
-        seg_starts.append(int(t))
-        if seg_min < seg_max:
-            u = env.rng.uniform(np.log(seg_min), np.log(max(seg_min + 1, seg_max)))
-            sl = int(round(float(np.exp(u))))
-        else:
-            sl = seg_max
-        t += max(seg_min, min(seg_max, sl))
-    n_seg = len(seg_starts)
-
-    # ----- Build an independent stratified-level PRBS per DV channel -----
-    # Levels are OFFSETS from the channel baseline, stratified over
-    # ±op_frac·(span/2) so the sweep covers the operating range (boundary
-    # strata included).  The disturbance schedule accumulates achieved
-    # deltas as a persistent offset (telescoping), so delta_k = L_k − L_{k−1}
-    # makes the held DV level track L_k.
-    op_frac = float(np.clip(getattr(cfg, 'dv_prbs_op_frac', 0.6), 0.05, 0.95))
-    dv_schedule: List[Dict] = []
-    for ch in dv_chs:
-        b = ch.get('bounds')
-        span = (float(b[1]) - float(b[0])) if (isinstance(b, list)
-                                                and len(b) >= 2) else 1.0
-        amp = op_frac * 0.5 * abs(span)            # max |offset| from baseline
-        # Stratified target levels across [-amp, +amp] (guarantees the
-        # extremes are visited even when n_seg is small).
-        strata_n = max(1, min(int(getattr(cfg, 'prbs_seed_n_strata', 8)), n_seg))
-        edges = np.linspace(-amp, +amp, strata_n + 1)
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        levels = np.empty(n_seg, dtype='float64')
-        order = env.rng.permutation(n_seg)
-        half_w = amp / strata_n
-        jit = env.rng.uniform(-half_w, +half_w, size=strata_n)
-        levels[:strata_n] = centers + jit
-        if n_seg > strata_n:
-            levels[strata_n:] = env.rng.uniform(-amp, +amp, size=n_seg - strata_n)
-        levels = levels[order]
-        prev = 0.0
-        for k, start in enumerate(seg_starts):
-            delta = float(levels[k] - prev)
-            prev = float(levels[k])
-            if abs(delta) < 1e-9:
-                continue
-            dv_schedule.append({
-                'name': f"dv_prbs_{ch.get('name', ch.get('pos', '?'))}_t{int(start)}",
-                'target_group': 'dv',
-                'target_pos': int(ch.get('pos', 0)),
-                'start': int(start),
-                'duration': 1,
-                'shape': 'step',
-                'delta': float(delta),
-                'source': 'dv_prbs_seed',
-                '_applied': False,
-            })
-    env._schedule = dv_schedule
+    # Full-range, multi-timescale, stratified DV-PRBS schedule (shared
+    # builder; byte-identical excitation statistics to the R1a Stage-1
+    # on-policy DV excitation in ``APCEnv.reset``).
+    env._schedule = _build_dv_prbs_schedule(env, cfg)
 
     # ----- Run the episode (MV held, DV swept by the schedule) ----------
     obs_buf = np.zeros((T, D), dtype='float32')
@@ -7072,6 +7242,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             else:
                 env._disturbance_prob_override = float(
                     getattr(cfg, 'curriculum_stage3_disturbance_prob', 0.85))
+            # R1a (p128): drive the MEASURED DV with a full-range on-policy
+            # PRBS during the clean Stage-1 WM-id (only when the sim has
+            # measured-DV channels and the knob is on).  reset() consumes the
+            # flag.  OFF in P2/P3 so the observer-id and actor stages see the
+            # realistic sparse-event DV distribution.
+            _n_dv_live = int(len(getattr(env.sim, 'dv_indices', []) or []))
+            env._dv_prbs_in_reset = bool(
+                int(current_phase) == 1
+                and bool(getattr(cfg, 'dv_prbs_onpolicy_in_p1', True))
+                and _n_dv_live > 0)
             if _cur_stage != int(current_phase):
                 _cur_stage = int(current_phase)
                 if _cur_stage == 1:

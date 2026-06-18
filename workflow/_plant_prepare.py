@@ -235,6 +235,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # transition input (held constant in imagination = MPC feedforward) instead
     # of predicting them.  Default ON; DREAMER_DV_AS_INPUT=0 reverts to paper.
     'DREAMER_DV_AS_INPUT':                ('dv_as_input',                _as_bool),
+    # R1a (2026-06-17, p128): drive the measured DV with full-range on-policy
+    # PRBS during the clean Stage-1 WM-id (closes the ~30× MV-vs-DV on-policy
+    # excitation asymmetry).  Default ON; =0 reverts to sparse-event Stage-1 DV.
+    'DREAMER_DV_PRBS_ONPOLICY_IN_P1':     ('dv_prbs_onpolicy_in_p1',     _as_bool),
     # 2026-05-22: number of constant-action seed episodes (steady-state
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.
@@ -314,6 +318,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # fixed point (critic_target_v_r→0.95) that drives the cascade.
     # Both sim-agnostic dimensionless coefficients.
     'DREAMER_REWARD_SHAPING_COEF':        ('reward_shaping_coef',            float),
+    # R2a (2026-06-17, p128): economic-direction shaping potential weight
+    # Φ = Φ_safe + coef·Φ_econ.  Policy-invariant (Ng 1999), feasibility-aligned
+    # (zero gradient outside limits).  0.0 disables Φ_econ.  Sim-agnostic.
+    'DREAMER_SHAPING_ECON_COEF':          ('shaping_econ_coef',              float),
     'DREAMER_CRITIC_REPLAY_ANCHOR_COEF':  ('critic_replay_anchor_coef',      float),
     # (B) P85 (2026-06-04): long-horizon critic-anchor grounding.  The
     # replay anchor's own λ (decoupled from the cascade-sensitive

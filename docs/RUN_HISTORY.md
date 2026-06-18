@@ -557,3 +557,48 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   signal strength (the 770:1 asymmetry) — but fix the WM gain + variance first so it's
   measurable.
 
+### p127 — VERDICT: gain-aware selection FAILED, 7-run plateau (p121–p127)
+- Gain-aware changed the pick (iter110 vs p126's iter60) but the transfer gain stayed
+  biased: **MV 0.882, DV 0.760**, disturbance r 0.347 (now *over*-predicts, pred/true
+  1.61), cum_raw −156k, cv_viol 98, mv_viol 0.53 (MV oscillating), per-seed spread
+  −15k…−459k. The `gain_fid` proxy (P1 random-action CV std-ratio) does **not** match the
+  post-train isolated-step transfer gain → we optimized the **wrong proxy**.
+- **4 evidence-backed root causes**: RC-W1 (sysID, #1) DV→CV gain structurally
+  under-identified — FEED moves ~0.29 std (slow OU) + only ~1–5 sparse step events/episode
+  on-policy vs MV's ±0.6 continuous PRBS → DV gain stuck 0.76 across all 7 runs. RC-W2
+  (signal theory) WM-gain measurement is noisy (same-ckpt probe bounces 0.2–0.3). RC-A1
+  (control/ML) economics-blind reward (bounded-remap slope 0.03 crushes econ +0.73→+0.022,
+  ~9× below noise). RC-A2 (control) actor controls a biased plant (under-reads DV 24% →
+  CV overshoot 6–7 °C). RC-M1 (meta) per-seed 30–80× spread on 3×3 val exceeds the effect
+  size → runs un-attributable.
+
+### p128 — fixes: R0 (val CI) + R1a (on-policy DV-PRBS) + R2a (economic shaping)
+- **R0 (measurement unblock, RC-M1)**: `--val-episodes 3→4`, `--val-seeds 3→8` (32 vs 9
+  rollouts) + a **mean ± 95 % CI** print and `cum_raw_reward_ci95_halfwidth` /
+  `_n_rollouts` stored in `validation_summary.json` (sample sd, 1.96·s/√n). Makes the
+  run-to-run variance — the p126 smoking gun — **measurable**, so the bundled p128 stays
+  attributable.
+- **R1a (WM root, RC-W1)**: drive the **measured DV** with the **same full-range,
+  multi-timescale, stratified PRBS** the seed episodes use **throughout the clean Stage-1
+  on-policy collection** (not just the evicted seed batch). Extracted the schedule core
+  into a shared `_build_dv_prbs_schedule(env, cfg)`; `reset()` swaps in the DV-PRBS when
+  the curriculum sets `env._dv_prbs_in_reset` (P1 + measured DV + `dv_prbs_onpolicy_in_p1`,
+  default ON; OFF in P2/P3). Hidden/unmeasured disturbance stays OFF in P1, so the
+  gain↔unmeasured-disturbance separation is preserved. Smoke: P1-reset DV events 4→11.
+- **R2a (actor, RC-A1; greenlit)**: a **state-based economic potential** Φ_econ ∈ [0,1]
+  folded into the shaping potential — Φ = Φ_safe + `shaping_econ_coef`·Φ_econ
+  (default 0.5). Φ_econ is a per-channel linear ramp across each economically-weighted
+  MV/CV's engineering band, oriented by the sign of its economic weight (the
+  penalty-lowering direction), |w|-weighted, clamped at the band (zero gradient outside
+  the limits = feasibility-aligned). Potential-based ⇒ **policy-invariant (Ng 1999) for
+  any potential**, so — unlike the held R1b gain-loss — it is **safe on nonlinear plants**
+  (only densifies the near-invisible economic gradient, never moves the optimum). Smoke:
+  Φ_econ 0.95 at low MV vs 0.05 at high MV (correct for test_sim's +5.0 reflux-min weight).
+- **Verification**: both new env-overrides (`DREAMER_DV_PRBS_ONPOLICY_IN_P1`,
+  `DREAMER_SHAPING_ECON_COEF`) wired; p128 smoke green; curriculum freeze-partition smoke
+  green on **both** backbones. **Not yet launched** (awaiting user go).
+- **Judge by**: DV transfer gain **>0.85** (R1a) AND a **tighter validation CI / smaller
+  per-seed spread** (R0+R1a) AND actor **cv_viol down** (R2a). The R0 CIs make the
+  3-change bundle attributable.
+
+

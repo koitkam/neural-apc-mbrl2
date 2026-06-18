@@ -39,6 +39,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict
 
+import numpy as np
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,8 +103,13 @@ def main() -> int:
                         help='Skip plant-aware noise config (debug mode).')
     parser.add_argument('--no-validate', action='store_true',
                         help='Skip post-training validation.')
-    parser.add_argument('--val-episodes', type=int, default=3)
-    parser.add_argument('--val-seeds', type=int, default=3)
+    # R0 (p128, 2026-06-17): wider validation sample (4 eps × 8 seeds = 32
+    # rollouts vs the legacy 3×3 = 9) so the run-to-run cum_raw variance — the
+    # p126 RCA smoking gun (per-seed spread 30-80× the effect size) — is
+    # actually MEASURABLE.  Paired with the mean±95 %CI print below, single-knob
+    # A/Bs become attributable instead of lost in the noise floor (RC-M1).
+    parser.add_argument('--val-episodes', type=int, default=4)
+    parser.add_argument('--val-seeds', type=int, default=8)
     parser.add_argument('--init-from-ckpt', type=str, default='',
                         help='Path to a previous run\'s checkpoint (e.g. '
                              'best.pt) to warm-start model weights from. '
@@ -436,6 +443,31 @@ def main() -> int:
             val_summary['validated_ckpt'] = val_ckpt
             with open(out_dir / 'validation_summary.json', 'w') as f:
                 json.dump(val_summary, f, indent=2, default=str)
+            # R0 (p128, 2026-06-17): report a 95 % confidence interval on the
+            # mean cum_raw across all (seeds × episodes) rollouts so cross-run
+            # comparisons are attributable despite the large per-seed variance.
+            # Uses the SAMPLE std (ddof=1) over the per-episode records and a
+            # normal-approx half-width 1.96·s/√n (n=32 ⇒ normal ≈ t).  Stored
+            # back into the summary for the RUN_HISTORY ledger / programmatic
+            # cross-run diffs.
+            try:
+                _ep_cum = [float(m.get('cum_raw_reward', float('nan')))
+                           for m in (val_summary.get('episodes') or [])]
+                _ep_cum = [x for x in _ep_cum if np.isfinite(x)]
+                _n = len(_ep_cum)
+                if _n >= 2:
+                    _mean = float(np.mean(_ep_cum))
+                    _sd = float(np.std(_ep_cum, ddof=1))
+                    _ci = 1.96 * _sd / float(np.sqrt(_n))
+                    val_summary['cum_raw_reward_ci95_halfwidth'] = _ci
+                    val_summary['cum_raw_reward_n_rollouts'] = int(_n)
+                    with open(out_dir / 'validation_summary.json', 'w') as f:
+                        json.dump(val_summary, f, indent=2, default=str)
+                    print(f"[run] validation cum_raw 95%CI: "
+                          f"{_mean:.2f} ± {_ci:.2f} "
+                          f"(n={_n} rollouts, sample sd={_sd:.2f})", flush=True)
+            except Exception as _cie:
+                print(f'[run] CI computation skipped: {_cie!r}', flush=True)
             print(f"[run] validation cum_raw_reward "
                   f"mean={val_summary.get('cum_raw_reward_mean', float('nan')):.2f} "
                   f"std={val_summary.get('cum_raw_reward_std', float('nan')):.2f} "
