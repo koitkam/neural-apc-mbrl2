@@ -361,26 +361,6 @@ class TrainConfig:
     # happens.  Still potential-based (policy-invariant) and sim-adaptive (a
     # fraction of the plant's own half-band).  ``1.0`` recovers the legacy tent.
     shaping_safe_margin_frac: float = 0.25
-    # R2a economic-potential weight (2026-06-17, p128 RC-A1 fix).  The shaping
-    # potential becomes Φ = Φ_safe + ``shaping_econ_coef``·Φ_econ, where Φ_econ
-    # ∈ [0,1] is a STATE-BASED economic-direction potential: a linear ramp
-    # across each economically-weighted MV/CV channel's engineering band,
-    # oriented by the sign of its economic weight (the direction that LOWERS the
-    # objective's economic penalty), aggregated weight-magnitude-weighted.
-    # Why: the true economic reward is near-invisible to the actor — the P77
-    # bounded-reward remap (slope B/ref≈0.03) crushes a full econ swing
-    # (+0.73) to +0.022, ~9× below the imagined-reward noise floor (0.19), so
-    # the flat-top safety potential (interior-flat by design) leaves NOTHING to
-    # climb.  Φ_econ re-introduces a dense economic gradient in the interior.
-    # Crucially it is potential-based (telescoping, same γ) ⇒ POLICY-INVARIANT
-    # (Ng 1999) for ANY potential — so unlike a gain-matched aux loss it is
-    # SAFE on nonlinear plants (it can only change learning speed, never the
-    # optimum).  It is also feasibility-aligned: clipped at the band edges so it
-    # adds ZERO gradient outside the limits (no incentive to violate; the
-    # quadratic violation penalty still owns that region).  Kept at HALF the
-    # safety weight so constraint-keeping stays primary.  0.0 disables Φ_econ
-    # (recovers the pure flat-top safety potential).
-    shaping_econ_coef: float = 0.5
 
     # ---- P73 : bounded training reward (cascade root-cause fix) ------
     # The bootstrap-cascade root cause (P69-P71) is UNBOUNDED reward scale:
@@ -882,16 +862,20 @@ class TrainConfig:
     # range each side of baseline: large enough that Var(DV) ≫ Var(noise)
     # (kills regression dilution) yet safely inside the channel bounds.
     dv_prbs_op_frac: float = 0.6
-    # R1a (2026-06-17, p128 DV-gain RCA): also drive the MEASURED DV with the
-    # SAME full-range PRBS during the clean Stage-1 ON-POLICY collection (not
-    # only in the evicted seed batch).  The seed DV-PRBS lands the excitation
-    # in iter-1 data that the gain-blind wm_best probe can roll back; injecting
-    # it on-policy keeps the DV→CV gradient flowing across the whole Stage-1 so
-    # the kept checkpoint carries the corrected DV gain.  Closes the ~30×
-    # MV-vs-DV on-policy excitation asymmetry (RC-W1).  No-op when n_dv=0 or the
-    # run is non-curricular.  Set False to recover the legacy sparse-event
-    # Stage-1 DV distribution.
-    dv_prbs_onpolicy_in_p1: bool = True
+    # D1 (2026-06-18, p128 DV-gain RCA): minimum fraction of the Stage-1 (P1/P2)
+    # WM minibatch drawn from DV-ISOLATED episodes (MV held, DV full-range PRBS —
+    # collect_dv_prbs_episode).  p128 proved the DV→CV gain is stuck ~0.76 NOT
+    # from under-excitation (seed + periodic DV-PRBS re-inject already keep it
+    # fresh) but because the DV is a SUBDOMINANT regressor: its CV contribution
+    # (gain 0.18) is drowned by the MV-driven CV variance (gain 0.28, full-range
+    # action) in the autoencoder + CV-weighted recon/overshoot loss.  In a
+    # DV-isolated episode ALL CV variance is DV-driven (and DV is swept at large
+    # amplitude so EIV≈1), so oversampling them in the WM loss supervises ∂CV/∂DV
+    # undiluted.  Sim-agnostic (a fraction), backbone-agnostic (sampling is
+    # upstream of the WM), NO linearity assumption (supervises the real CV
+    # response → safe on nonlinear sims).  0.0 disables (uniform sampling).
+    # Gated to P1/P2 by the caller so P3 imagination starts stay representative.
+    wm_dv_isolated_minibatch_frac: float = 0.3
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -1619,21 +1603,6 @@ class APCEnv:
             getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0)
         self._shaping_gamma: float = float(getattr(cfg, 'gamma', 0.997) or 0.997)
         self._prev_potential: Optional[float] = None
-        # R2a (p128, 2026-06-17): economic-potential weight.  Φ = Φ_safe +
-        # ``_shaping_econ_coef``·Φ_econ where Φ_econ ∈ [0,1] is a STATE-BASED
-        # economic-direction potential (high toward the objective's economic
-        # operating point).  Densifies the near-invisible economic gradient
-        # (RC-A1: bounded-remap slope 0.03 crushes econ +0.73→+0.022, ~9× below
-        # the imagined-reward noise floor) while staying potential-based /
-        # policy-invariant (Ng 1999) — safe even for nonlinear plants since the
-        # optimum is unchanged for ANY potential.  0.0 disables Φ_econ.
-        self._shaping_econ_coef: float = float(
-            getattr(cfg, 'shaping_econ_coef', 0.0) or 0.0)
-        # R1a (p128, 2026-06-17): when set by the curriculum stage controller
-        # (Stage-1 + measured-DV channels), ``reset`` REPLACES the sparse
-        # measured-DV step schedule with a full-range on-policy DV-PRBS so the
-        # WM's DV→CV gain gets continuous excitation on the live distribution.
-        self._dv_prbs_in_reset: bool = False
 
         # ---- P73/P77 : bounded training reward --------------------------
         # When enabled, the per-step TRAINING reward is mapped into [-B, B]
@@ -1848,20 +1817,6 @@ class APCEnv:
             intensity=intensity,
             sim=self.sim,
         )
-        # R1a (p128, 2026-06-17): Stage-1 ON-POLICY full-range DV excitation.
-        # When enabled (curriculum P1 + measured-DV channels) REPLACE the sparse
-        # measured-DV step schedule (~1-5 events/episode) with the SAME
-        # persistent, full-range, multi-timescale DV-PRBS the seed episodes use,
-        # so the WM's DV→CV gain is identified on the LIVE on-policy distribution
-        # (not only in the evicted seed batch).  Closes the ~30× MV-vs-DV
-        # on-policy excitation asymmetry (RC-W1).  Only the MEASURED DV is
-        # excited; the hidden (unmeasured) disturbance stays OFF in P1 (prob
-        # override 0 below), so the gain↔unmeasured-disturbance separation that
-        # the clean Stage-1 protects is NOT confounded.
-        if bool(getattr(self, '_dv_prbs_in_reset', False)):
-            _dv_sched = _build_dv_prbs_schedule(self, self.cfg)
-            if _dv_sched:
-                self._schedule = _dv_sched
         # Per-episode hidden OU disturbance.  Bernoulli toggle gated
         # by phase-aware prob (P1/P2: 0.3, P3: 0.5).  Set force=True
         # in validation to always build.
@@ -1915,21 +1870,13 @@ class APCEnv:
         return out
 
     def _shaping_potential(self, state: np.ndarray) -> float:
-        """Dense shaping potential Φ(s) for reward shaping.
+        """Dense band-keeping potential Φ(s) ∈ [0, 1] for reward shaping.
 
-        Φ(s) = Φ_safe(s) + ``_shaping_econ_coef``·Φ_econ(s).
-
-        * Φ_safe ∈ [0, 1]: mean over CVs of the normalised margin to the
-          nearest band edge (1.0 at the band centre / at an enabled CV target,
-          0.0 at the edge, clamped to 0 outside the band) — the positive-
-          gradient signal the one-sided economic objective lacks inside the
-          safe band.  (Flat-top for the range/limit case; see below.)
-        * Φ_econ ∈ [0, 1]: state-based economic-direction potential
-          (``_economic_potential``), added only when ``_shaping_econ_coef`` > 0
-          (R2a).  Densifies the otherwise near-invisible economic gradient.
-
-        Potential-based (telescoping, same γ) ⇒ policy-invariant (Ng 1999).
-        Read-only; no side effects.
+        Returns the mean over CVs of the normalised margin to the nearest
+        band edge: 1.0 at the band centre (or at an enabled CV target),
+        0.0 at the edge, clamped to 0 outside the band.  This is the
+        positive-gradient signal the one-sided economic objective lacks
+        inside the safe band.  Read-only; no side effects.
         """
         sp = self.setpoint_mgr
         try:
@@ -1962,79 +1909,9 @@ class APCEnv:
                 mf = float(getattr(self.cfg, 'shaping_safe_margin_frac', 0.25))
                 mf = float(np.clip(mf, 1e-3, 1.0))
                 vals.append(float(np.clip(m / mf, 0.0, 1.0)))
-        phi_safe = float(np.mean(vals)) if vals else 0.0
-        # R2a: add the economic-direction potential when enabled.  Kept
-        # additive (commensurate [0,1] scales) so ``_shaping_econ_coef`` is the
-        # econ-vs-safety emphasis.  The telescoping in ``step`` handles the
-        # combined Φ unchanged.
-        econ_coef = float(getattr(self, '_shaping_econ_coef', 0.0) or 0.0)
-        if econ_coef > 0.0:
-            return phi_safe + econ_coef * self._economic_potential(state)
-        return phi_safe
-
-    def _economic_potential(self, state: np.ndarray) -> float:
-        """State-based economic-direction potential Φ_econ ∈ [0, 1] (R2a).
-
-        A linear ramp across each economically-weighted MV / CV channel's
-        engineering band, oriented by the SIGN of its economic weight — the
-        direction that lowers the objective's economic penalty
-        (``reward −= Σ (x−typical)·w``, so ∂reward/∂x = −w):
-
-            w > 0  ⇒  lower value is economically better  ⇒  g = 1 − x_norm
-            w < 0  ⇒  higher value is economically better  ⇒  g = x_norm
-
-        aggregated as the |weight|-weighted mean over all economic channels.
-        ``x_norm`` is clamped to the band so Φ_econ adds ZERO gradient outside
-        the limits (matches the objective's "clipped to bounds: no gradient
-        outside" economic term — no incentive to violate; the quadratic
-        violation penalty still owns that region).  Returns 0.5 (a constant,
-        policy-inert) when no economic weights are configured.  Read-only.
-
-        Provably policy-invariant as a potential (Ng 1999) for ANY plant, so
-        — unlike a gain-matched auxiliary loss — it is safe on NONLINEAR
-        simulators: it only densifies the economic gradient, never moves the
-        optimum.
-        """
-        num = 0.0
-        den = 0.0
-        # ---- MV economic channels (MV read from the state vector) --------
-        try:
-            mv_idx = [int(x) for x in self.meta.get('mv_indices', [])]
-        except Exception:
-            mv_idx = []
-        mv_w = list(self.obj_w.get('mv_economic_weights', []) or [])
-        for i, si in enumerate(mv_idx):
-            if i >= self.mv_bounds_eu.shape[0] or si < 0 or si >= state.shape[0]:
-                continue
-            w = float(mv_w[i]) if i < len(mv_w) else 0.0
-            if abs(w) < 1e-12:
-                continue
-            lo = float(self.mv_bounds_eu[i, 0]); hi = float(self.mv_bounds_eu[i, 1])
-            if hi - lo <= 1e-9:
-                continue
-            x = float(np.clip((float(state[si]) - lo) / (hi - lo), 0.0, 1.0))
-            g = (1.0 - x) if w > 0.0 else x
-            num += abs(w) * g
-            den += abs(w)
-        # ---- CV economic channels (CV read from the state vector) --------
-        cv_w = list(self.obj_w.get('cv_economic_weights', []) or [])
-        for j, ci in enumerate(self.cv_indices):
-            if ci is None or j >= self.cv_bounds_eu.shape[0] \
-                    or int(ci) >= state.shape[0]:
-                continue
-            w = float(cv_w[j]) if j < len(cv_w) else 0.0
-            if abs(w) < 1e-12:
-                continue
-            lo = float(self.cv_bounds_eu[j, 0]); hi = float(self.cv_bounds_eu[j, 1])
-            if hi - lo <= 1e-9:
-                continue
-            y = float(np.clip((float(state[int(ci)]) - lo) / (hi - lo), 0.0, 1.0))
-            g = (1.0 - y) if w > 0.0 else y
-            num += abs(w) * g
-            den += abs(w)
-        if den <= 0.0:
-            return 0.5
-        return float(np.clip(num / den, 0.0, 1.0))
+        if not vals:
+            return 0.0
+        return float(np.mean(vals))
 
     def step(self, action_norm: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         action_norm = np.asarray(action_norm, dtype='float32').reshape(self.action_dim)
@@ -2232,6 +2109,13 @@ class TrajectoryBuffer:
         # applied ONLY where this is 1.0 (avoids the documented "clone the
         # whole replay buffer → policy collapse" trap).
         self.expert = np.zeros((capacity_eps, self.T), dtype='float32')
+        # Per-EPISODE flag marking MV-held, DV-excited "DV-isolated" episodes
+        # (collect_dv_prbs_episode).  In these episodes ALL CV variance is
+        # DV-driven, so the WM's CV-weighted recon/overshoot loss supervises
+        # ∂CV/∂DV with no MV competition.  ``sample`` can OVERSAMPLE them in the
+        # Stage-1 WM minibatch (D1 fix, p128 RCA) so the subdominant DV→CV gain
+        # (real 0.18 vs MV 0.28) is not drowned by the MV-driven CV variance.
+        self.dv_isolated = np.zeros(capacity_eps, dtype='float32')
         # Per-step hidden-disturbance target for the WM disturbance-estimator
         # head (P87).  Allocated only when ``n_dist > 0``; otherwise the
         # buffer is byte-identical to the pre-P87 layout.  ``_dist_source``
@@ -2246,7 +2130,8 @@ class TrajectoryBuffer:
 
     def add_episode(self, obs: np.ndarray, act: np.ndarray, rew: np.ndarray,
                     cont: np.ndarray, expert: Optional[np.ndarray] = None,
-                    dist: Optional[np.ndarray] = None) -> None:
+                    dist: Optional[np.ndarray] = None,
+                    dv_isolated: bool = False) -> None:
         T = obs.shape[0]
         assert T == self.T, f"episode length mismatch: {T} vs {self.T}"
         assert obs.ndim == 2 and obs.shape[1] == self.obs_dim, (
@@ -2258,6 +2143,7 @@ class TrajectoryBuffer:
         self.cont[i] = cont
         self.expert[i] = (expert if expert is not None
                           else np.zeros(self.T, dtype='float32'))
+        self.dv_isolated[i] = 1.0 if dv_isolated else 0.0
         if self.dist is not None:
             if dist is None and self._dist_source is not None:
                 try:
@@ -2275,11 +2161,26 @@ class TrajectoryBuffer:
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
-    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator
+    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator,
+               dv_oversample_frac: float = 0.0
                ) -> Dict[str, np.ndarray]:
         if self.filled == 0:
             raise ValueError("empty buffer")
         ep_idx = rng.integers(0, self.filled, size=batch_size)
+        # D1 (p128 RCA, 2026-06-18): guarantee a minimum minibatch fraction of
+        # DV-isolated (MV-held, DV-excited) episodes so the subdominant DV→CV
+        # gain stops being drowned by the MV-driven CV variance.  A FLOOR only —
+        # the remaining slots stay uniform (which may draw more DV-isolated
+        # episodes).  No-op when the fraction is 0 or no such episode is in the
+        # buffer (e.g. P3 imagination starts, or a sim with no DV channel).
+        frac = float(dv_oversample_frac)
+        if frac > 0.0:
+            dv_pool = np.flatnonzero(self.dv_isolated[:self.filled] > 0.5)
+            if dv_pool.size > 0:
+                n_dv = int(round(batch_size * min(frac, 1.0)))
+                if n_dv > 0:
+                    ep_idx[:n_dv] = dv_pool[
+                        rng.integers(0, dv_pool.size, size=n_dv)]
         max_start = self.T - seq_len
         if max_start <= 0:
             starts = np.zeros(batch_size, dtype=np.int64)
@@ -7083,7 +6984,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         dvp_levels = np.clip(dvp_levels + dvp_jit * const_op_band, -1.0, 1.0)
         for lvl in dvp_levels:
             ep = collect_dv_prbs_episode(env, cfg, mv_level=float(lvl))
-            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            # D1: MV-held DV-swept => DV-isolated WM-loss target (oversampled).
+            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'],
+                            dv_isolated=True)
             total_env_steps += cfg.episode_length
         print(f"[seed] dv-prbs={n_dv_prbs_seed} "
               f"(n_dv={n_dv}, op_frac={cfg.dv_prbs_op_frac:.2f}, "
@@ -7242,16 +7145,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             else:
                 env._disturbance_prob_override = float(
                     getattr(cfg, 'curriculum_stage3_disturbance_prob', 0.85))
-            # R1a (p128): drive the MEASURED DV with a full-range on-policy
-            # PRBS during the clean Stage-1 WM-id (only when the sim has
-            # measured-DV channels and the knob is on).  reset() consumes the
-            # flag.  OFF in P2/P3 so the observer-id and actor stages see the
-            # realistic sparse-event DV distribution.
-            _n_dv_live = int(len(getattr(env.sim, 'dv_indices', []) or []))
-            env._dv_prbs_in_reset = bool(
-                int(current_phase) == 1
-                and bool(getattr(cfg, 'dv_prbs_onpolicy_in_p1', True))
-                and _n_dv_live > 0)
             if _cur_stage != int(current_phase):
                 _cur_stage = int(current_phase)
                 if _cur_stage == 1:
@@ -7666,8 +7559,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _dvp_levels = np.clip(_dvp_levels + _dvp_jit * _dvp_op, -1.0, 1.0)
             for _dvl in _dvp_levels:
                 _dvp = collect_dv_prbs_episode(env, cfg, mv_level=float(_dvl))
+                # D1: DV-isolated WM-loss target (oversampled in P1/P2).
                 buf.add_episode(_dvp['obs'], _dvp['act'], _dvp['rew'],
-                                 _dvp['cont'])
+                                 _dvp['cont'], dv_isolated=True)
                 total_env_steps += cfg.episode_length
             print(f"[dv-prbs-inject p{current_phase}] iter {total_iters}: "
                   f"added dv-prbs={dv_prbs_inject_n} episodes "
@@ -7824,7 +7718,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                           if current_phase != 3
                           else max(1, int(cfg.phase3_train_steps_per_iter))):
             _t = time.time()
-            batch_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
+            batch_np = buf.sample(cfg.batch_size, cfg.seq_len, rng,
+                                  dv_oversample_frac=(
+                                      float(getattr(
+                                          cfg,
+                                          'wm_dv_isolated_minibatch_frac', 0.0))
+                                      if current_phase in (1, 2) else 0.0))
             batch: Dict[str, torch.Tensor] = {}
             for k, v in batch_np.items():
                 t = torch.from_numpy(v)

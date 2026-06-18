@@ -601,4 +601,75 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   per-seed spread** (R0+R1a) AND actor **cv_viol down** (R2a). The R0 CIs make the
   3-change bundle attributable.
 
+### p128 — VERDICT: MV gain BEST-EVER (0.96) but DV still 0.76; actor poor; DV gain is THE root
+- **WM transfer matrix**: **MV ratio 0.961** (real −0.28, WM −0.269) — best of the whole series
+  (p117 0.78 → p125 0.95 → p128 0.96, near-unbiased). **DV ratio 0.764** (real +0.18, WM +0.1375)
+  — UNCHANGED from the 8-run plateau (~0.76). R1a (on-policy DV-PRBS) did NOT move the DV gain.
+- **R1a FALSIFIED + counter-productive**: direct regen showed the on-policy DV-PRBS flag-ON gives
+  FEED(obs) std **0.73** (range ±1.65) vs the legacy sparse schedule flag-OFF std **1.20** (±3.5) —
+  R1a *reduced* on-policy DV excitation, and even the larger legacy excitation never moved 0.76.
+  ⇒ **excitation amplitude is NOT the binding constraint** (revert candidate).
+- **DV bias is STRUCTURAL — every excitation/data fix already tried & failed**: seed DV-PRBS (24 eps),
+  periodic MV-held DV-PRBS re-inject (every 10 iters, 2026-06-14), step-test re-inject (every 20),
+  R1a on-policy — all keep MV-held DV-isolated data fresh in the buffer, gain still 0.76. EIV ruled
+  out (obs[3] FEED SNR **11.25 dB** → attenuation ≈0.93, explains only ~7% of the 24% gap). Eviction
+  ruled out (re-inject exists). **Root cause = DV is a SUBDOMINANT regressor**: its CV contribution
+  (gain 0.18) is drowned by the MV-driven CV variance (gain 0.28, full-range action) in the
+  autoencoder + CV-weighted recon/overshoot loss, so the categorical latent under-represents the
+  small DV-driven CV component → open-loop DV gain plateaus ~0.76 (× EIV 0.93). The overshoot loss
+  DOES teacher-force the real DV, but its CV-weighted MSE is still dominated by MV-driven CV.
+- **Actor poor (vision-confirmed)**: REFLUX **passive** (~56-58%, barely moves), under-reacts to FEED
+  steps → CV rides **1–3.5 °C above the 85.5 high limit for ~600 steps**. cv_viol mean **95.7**
+  (healthy ~11), median per-ep 57.5, catastrophic tail (max 603, cum_raw −651k); cum_raw mean −144k
+  ± 41.9k CI95 (n=36). Direct signature of the biased DV gain: frozen WM under-reads FEED 24% →
+  actor under-compensates. `wm_gain_rel_err 0.039` is MV-only ⇒ all_pass=1 is a FALSE POSITIVE.
+- **Critic structurally fine**: pred_target_r 0.99, MC loss ~2.5 engaged, return_scale capped 20,
+  σ 0.219→0.13 (not floored). `rew_to_tgt_var` 0.001 = the known MC-measurement caveat. NOT the
+  bottleneck. (adv_std decays 0.99→0.34.)
+- **Disturbance head**: amplitude OK (pred_std 1.88 ≈ true_std 1.93, lag −2) but R² **−1.56** (r 0.56)
+  — a slow mid-episode DRIFT/bias (what the user saw), consistent with under-read measured-FEED
+  leaking into `d_t`. Largely downstream of the DV gain.
+- **R2a (econ shaping) premature**: Φ_econ pushes CV toward the high limit (min-reflux econ) under a
+  disturbance-blind WM → makes the high-side violations WORSE. Revert/margin-gate until WM unbiased.
+- **UNIFYING ROOT CAUSE = the biased DV→CV gain (0.76)**: it is the common root of (1) the DV
+  transfer bias, (2) the disturbance-head drift (FEED leaks into d_t), and (3) the actor
+  under-reaction → CV high-side violation. Fix #1 (DV gain) addresses all three.
+- **Next (proposed, awaiting approval)**: un-bias the DV gain by making the MV-held DV-isolated
+  episodes a FIRST-CLASS WM-loss target (tag + oversample in the Stage-1 minibatch, mirroring the
+  `expert` per-step flag) so the subdominant DV-driven CV stops being drowned — sim-agnostic, no
+  linearity assumption (supervises the real CV response, unlike the held R1b scalar-gain loss).
+  Revert R1a (counter-productive) + revert/margin-gate R2a. Re-judge DV gain, disturbance R², actor.
+
+### p129 — fix: D1 DV-isolated minibatch oversampling (the DV-gain root); revert R1a + R2a
+- **D1 (the DV-gain root cause)**: tag MV-held, DV-swept episodes (`collect_dv_prbs_episode`) as
+  `dv_isolated` in `TrajectoryBuffer` (mirrors the per-episode `expert` flag pattern) and OVERSAMPLE
+  them to a guaranteed floor fraction (`wm_dv_isolated_minibatch_frac`, default **0.3**) of the
+  Stage-1 (P1/P2) WM minibatch. In those episodes ALL CV variance is DV-driven (and the DV is swept
+  at large amplitude ⇒ EIV≈1), so the CV-weighted recon/overshoot loss supervises ∂CV/∂DV
+  **undiluted** — directly attacking the p128 root cause (the DV is a subdominant regressor whose
+  CV contribution, gain 0.18, was drowned by the MV-driven CV variance, gain 0.28). Gated to P1/P2
+  by the caller so P3 imagination starts stay representative. Sim-agnostic (a fraction),
+  backbone-agnostic (sampling is upstream of the WM), **no linearity assumption** (supervises the
+  real CV response → safe on nonlinear ONNX sims — the property the held R1b scalar-gain loss lacks).
+  Env: `DREAMER_WM_DV_ISOLATED_FRAC`. Realistic target: DV ratio 0.76 → ~0.90 (EIV 0.93 floor).
+- **Cleanliness cull (per the standing mandate)**: **reverted R1a** (on-policy DV-PRBS in reset —
+  falsified by p128: it *reduced* on-policy FEED excitation std 1.2→0.73 and didn't move the gain;
+  removed the `_dv_prbs_in_reset` flag + reset hook + curriculum wiring + `dv_prbs_onpolicy_in_p1`
+  knob + `DREAMER_DV_PRBS_ONPOLICY_IN_P1`; KEPT the clean `_build_dv_prbs_schedule` refactor that
+  `collect_dv_prbs_episode` uses) and **reverted R2a** (econ shaping — premature: Φ_econ pushed CV
+  toward the high limit under a disturbance-blind WM, worsening high-side violations; removed
+  `_economic_potential`, the Φ_econ fold, the `shaping_econ_coef` knob + `DREAMER_SHAPING_ECON_COEF`).
+  Net **−169/+103 lines**. So D1 is the only new variable vs p128 (R0's val CIs stay for attribution).
+- **Verification**: p129 D1 smoke green (tag stored, oversample floor honoured — 54≥38 @frac0.3,
+  empty-pool no-op, override works, R1a/R2a fully gone, helper kept); curriculum freeze-partition
+  smoke green on **both** backbones. Launched env-free (tmux `mbrl_p129`), curriculum Stage-1 active,
+  no env-overrides, clean startup.
+- **Judge by**: **DV ss-gain ratio >0.85** (read `wm_dv_transfer_matrix.json`) — the primary signal;
+  then disturbance-head **R² >0** (FEED stops leaking into `d_t`) and actor **cv_viol down** + tighter
+  CI (all DOWNSTREAM of the DV gain). MV gain should HOLD ~0.96.
+- **Deferred (Step 4, post-p129)**: actor reward redesign — re-introduce economic shaping ONLY after
+  the WM is unbiased, ideally **CV-margin-gated** (reward econ only when the CV has safe headroom) so
+  it doesn't chase economics into the constraint. On the todo list + memory.
+
+
 
