@@ -45,7 +45,9 @@ from tools.wm_steady_state_diagnostic import (  # noqa: E402
     _find_ckpt, _load_model, _pick_device, _imagine_open_loop_rssm,
     _is_rssm_model,
 )
-from evaluation.wm_transfer_matrix import _settle_capture, _real_step_rollout  # noqa: E402
+from evaluation.wm_transfer_matrix import (  # noqa: E402
+    _settle_capture, _real_step_rollout, _dv_settle_step_rollout,
+)
 
 
 def _cv_gain(curve_cv: np.ndarray, baseline: float, tail_frac: float = 0.25) -> float:
@@ -171,6 +173,98 @@ def compute_posterior_prior_decomp(model, env, cfg, device, *,
         'decomp_real_to_posterior': r_post,
         'decomp_posterior_to_1step': r_prior_step,
         'decomp_1step_to_openloop': r_compound,
+        'dominant_lever': lever,
+        'verdict': verdict,
+    }
+
+
+@torch.no_grad()
+def compute_dv_posterior_prior_decomp(model, env, cfg, device, *,
+                                      levels=(0.0, 0.3, -0.3), step_frac=0.4,
+                                      horizon=220, settle=220, dv_pos=0):
+    """DV→CV analogue of ``compute_posterior_prior_decomp``: localise WHERE the
+    measured-DV→CV steady-state gain is lost — autoencoder (encoder/categorical/
+    decoder) vs the prior(1-step) gap — by driving a REAL DV step (via
+    ``sim.set_disturbance_offset``) while the MV is held, then teacher-forcing
+    the posterior + prior through the resulting trajectory (the DV enters via
+    the obs embedding, identical to ``rollout_observed``).
+
+    Added 2026-06-19 (p129 RCA): the MV decomp localised the MV gain loss, but
+    the control-relevant DV→CV gain had NEVER been localised across the 9-run
+    DV-bias plateau.  This decomp showed real→post ×0.767 / post→1step ×1.002 —
+    i.e. the DV gain dies ENTIRELY in the autoencoder, NOT the prior and NOT the
+    data — which is why every excitation/data fix (seed DV-PRBS, re-injection,
+    on-policy PRBS, DV-isolated oversampling) failed to move it.
+
+    Returns a JSON-able dict; ``{'enabled': False, ...}`` when the WM has no
+    DV-as-input (``dynamics.dv_dim == 0``), the sim lacks
+    ``set_disturbance_offset``, or no usable DV step responses exist.
+    """
+    if not _is_rssm_model(model):
+        return {'enabled': False, 'reason': 'not an RSSM/TSSM model'}
+    rssm = model.dynamics
+    if int(getattr(rssm, 'dv_dim', 0) or 0) <= 0:
+        return {'enabled': False, 'reason': 'WM has no DV-as-input (dv_dim=0)'}
+    cv_idx = int(env.cv_indices[0])
+    L = min(int(getattr(cfg, 'lookback', 64)), settle)
+    try:
+        dvr = env.sim.dv_normalization_ranges[dv_pos]
+        dv_span = abs(float(dvr[1]) - float(dvr[0]))
+    except Exception:
+        dv_span = 100.0
+    rows, kl_all = [], []
+    for lev in levels:
+        base = np.zeros(int(env.action_dim), dtype='float32'); base[0] = float(lev)
+        for d in (+abs(step_frac), -abs(step_frac)):
+            off = d * 0.5 * dv_span
+            lb_obs, lb_act, pre, real_obs, applied = _dv_settle_step_rollout(
+                env, base, dv_pos, float(off), settle, horizon, L)
+            if not applied or lb_obs.shape[0] == 0:
+                continue
+            post_dec, prior_dec, kl = _teacher_forced_post_prior(
+                model, lb_obs, lb_act, real_obs, base, device)
+            b = float(pre[cv_idx])
+            g_real = _cv_gain(real_obs[:, cv_idx], b)
+            if abs(g_real) < 1e-6:
+                continue
+            rows.append((g_real, _cv_gain(post_dec[:, cv_idx], b),
+                         _cv_gain(prior_dec[:, cv_idx], b)))
+            kl_all.append(float(kl.mean()))
+    if not rows:
+        return {'enabled': False,
+                'reason': 'no usable DV step responses (no set_disturbance_offset / gain ~0)'}
+    arr = np.asarray(rows)
+    gr, gp, gpr = arr[:, 0], arr[:, 1], arr[:, 2]
+    r_post = float(np.mean(gp / gr))
+    r_prior_step = float(np.mean(gpr / gp))
+    free_bits = float(getattr(cfg, 'rssm_free_bits', 1.0))
+    if r_post < 0.9:
+        lever = 'autoencoder'
+        verdict = ('DV gain dies in the AUTOENCODER (encoder/categorical/decoder) '
+                   '-> data reweighting + free_bits CANNOT help; needs a '
+                   'representation fix (e.g. a direct DV->decoder/head feedforward '
+                   'path so the exogenous DV gain skips the categorical bottleneck).')
+    elif r_prior_step < 0.9:
+        lever = 'prior'
+        verdict = ('posterior faithful but the PRIOR under-uses the DV input '
+                   '-> the transition DV pathway / free_bits is the lever.')
+    else:
+        lever = 'faithful'
+        verdict = ('DV posterior + 1-step prior both faithful; any residual '
+                   'transfer-matrix bias is open-loop compounding.')
+    kl_mean = float(np.mean(kl_all))
+    return {
+        'enabled': True,
+        'channel': 'dv',
+        'dv_pos': int(dv_pos),
+        'n_steps': len(rows),
+        'horizon': int(horizon),
+        'free_bits_floor': free_bits,
+        'kl_post_prior_mean': kl_mean,
+        'gain_ratio_posterior_vs_real': r_post,
+        'gain_ratio_prior1step_vs_real': float(np.mean(gpr / gr)),
+        'decomp_real_to_posterior': r_post,
+        'decomp_posterior_to_1step': r_prior_step,
         'dominant_lever': lever,
         'verdict': verdict,
     }

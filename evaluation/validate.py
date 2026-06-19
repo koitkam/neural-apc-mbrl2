@@ -2121,6 +2121,47 @@ def run_validation(*,
         except Exception as _ppe:
             print(f'[val] WM posterior/prior decomp skipped: {_ppe!r}', flush=True)
 
+    # ---- WM DV→CV posterior-vs-prior gain-lag decomposition (2026-06-19) ----
+    # The MV decomp above localises the MV gain loss; this is the DV analogue —
+    # it localises WHERE the measured-DV→CV gain is lost (autoencoder vs prior).
+    # p129 RCA: across a 9-run DV-bias plateau the DV gain (~0.76) had NEVER
+    # been localised; this decomp showed real→post ×0.767 / post→1step ×1.002
+    # ⇒ the DV gain dies ENTIRELY in the autoencoder (not the prior, not data),
+    # explaining why every excitation/data fix failed.  Saved as
+    # wm_dv_posterior_prior_decomp.json.  ON by default (RSSM/TSSM + DV-as-input
+    # + sim.set_disturbance_offset); shares the DREAMER_VAL_WM_POSTPRIOR gate.
+    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+        try:
+            from tools.wm_posterior_prior_probe import compute_dv_posterior_prior_decomp
+            dpp_env = APCEnv(cfg, np.random.default_rng(43_211))
+            dpp_env._disturbance_prob_override = 0.0
+            if obs_norm_state is not None:
+                try:
+                    dpp_env.set_obs_norm_stats(
+                        mean=np.asarray(obs_norm_state.get('mean')),
+                        var=np.asarray(obs_norm_state.get('var')),
+                        count=float(obs_norm_state.get('count', 1.0)),
+                        learn=False)
+                except Exception:
+                    pass
+            _tf_h2 = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
+            _dpp_h = _tf_h2 if _tf_h2 > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            dvpp_res = compute_dv_posterior_prior_decomp(
+                model, dpp_env, cfg, device, horizon=_dpp_h, settle=_dpp_h)
+            with open(out_dir / 'wm_dv_posterior_prior_decomp.json', 'w') as f:
+                json.dump(dvpp_res, f, indent=2)
+            if dvpp_res.get('enabled'):
+                print(f'[val] WM DV→CV posterior/prior gain decomp: '
+                      f'real->post x{dvpp_res["decomp_real_to_posterior"]:.3f}, '
+                      f'post->1step x{dvpp_res["decomp_posterior_to_1step"]:.3f} '
+                      f'| lever={dvpp_res["dominant_lever"]} -> '
+                      f'{out_dir}/wm_dv_posterior_prior_decomp.json', flush=True)
+            else:
+                print(f'[val] WM DV→CV posterior/prior decomp: not applicable '
+                      f'({dvpp_res.get("reason")})', flush=True)
+        except Exception as _dppe:
+            print(f'[val] WM DV→CV posterior/prior decomp skipped: {_dppe!r}', flush=True)
+
     # ----- WM unmeasured-disturbance PREDICTION diagnostic (2026-06-10) -----
     # How well does the WM disturbance-estimator head (P87 feed-forward model)
     # predict the TRUE hidden OU disturbance the agent can't see?  Rolls one
@@ -2183,6 +2224,7 @@ def run_validation(*,
         'mean_mv_violation_mean': float(mv_v.mean()),
         'fidelity_gates': locals().get('fidelity_gates', None),
         'wm_posterior_prior_decomp': locals().get('pp_res', None),
+        'wm_dv_posterior_prior_decomp': locals().get('dvpp_res', None),
         'wm_disturbance_prediction': locals().get('dp_res', None),
         'episodes': metrics_records,
         'disturbance_rejection': disturbance_records,

@@ -671,5 +671,40 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   the WM is unbiased, ideally **CV-margin-gated** (reward econ only when the CV has safe headroom) so
   it doesn't chase economics into the constraint. On the todo list + memory.
 
+### p129 — VERDICT: D1 FAILED (DV 0.765 ≈ p128 0.764); DV bias is an AUTOENCODER bottleneck (new decomp)
+- **D1 did nothing**: DV ss-gain ratio **0.765** vs p128 0.764 — a 30% DV-isolated minibatch oversample
+  (verified to fire: `run_plan.wm_dv_isolated_minibatch_frac=0.3`) moved the gain by **0.001**. MV
+  slipped 0.961→**0.905**. This near-exact repeat across a big data-mix change is the decisive clue:
+  the DV bias is **NOT data-limited**.
+- **NEW DIAGNOSTIC — DV posterior-prior decomposition** (added this run, `compute_dv_posterior_prior_decomp`):
+  drives a real DV step (via `sim.set_disturbance_offset`) with the MV held, teacher-forces the WM
+  posterior+prior. Result: **real→posterior ×0.72–0.77, posterior→1-step ×1.00**. The DV gain dies
+  **entirely in the AUTOENCODER** (encoder→categorical latent→decoder); the prior transition is
+  *perfect*. (The MV decomp also flipped to "autoencoder" this run: real→post 0.854.) **This is why
+  9 runs of data/excitation fixes failed** — seed DV-PRBS, two re-injectors, R1a, D1 all feed more
+  data to a loss whose bottleneck is the representational capacity of the autoencoder. You cannot fix
+  a categorical-bottleneck quantization limit with more data. Architecture fact: the decoder input is
+  `[deter h, stoch z]` only — the measured DV feeds the *transition* but the decoder + reward/value
+  heads never see it directly, so the small DV→CV gain must survive the lossy encode→decode.
+- **ACTOR — structural root: the policy gradient is ≈ 0**. `actor_loss ≈ 0` for all of P3
+  (0.005/−0.000/0.001/0.003…), σ **pinned at its 0.219 max** (`policy_log_std_max` ceiling, never
+  tightened), `mv_viol 0.003` (MV barely moves), `pmpo_pos_frac ≈ 0.5` (symmetric), `cv_viol 104`,
+  cum_raw −152k. The actor is passive because it gets **no gradient**, not by choice. Mechanism: the
+  imagined-return variance is dominated by the **uncontrollable hidden-disturbance**, so the advantage
+  is ~noise around 0 (`reinforce_actor_loss = −E[adv·logπ]` → ~0); the *controllable* economic+safety
+  signal is below that noise floor (economics-blind reward, 770:1 asymmetry, bounded slope 0.03 → econ
+  ~9× below noise) AND attenuated 24% by the biased WM DV gain. Critic is structurally fine
+  (pred_target_r 0.99, MC engaged). So the actor is gated by (a) the reward shape and (b) the WM DV bias.
+- **Disturbance head**: r 0.78 (up from p128 0.56), pred_std 1.61 vs true 1.93, R² still −1.59 (slow
+  drift) — largely downstream of the DV gain.
+- **Next (proposed, awaiting approval)**: (1) **WM DV-gain representation fix** — give the decoder +
+  reward/value heads **direct access to the exogenous DV** (feedforward: `feat'/decode_in = [h, z, dv]`)
+  so the measured-DV→CV gain skips the categorical bottleneck (both backbones; the confirmed root after
+  9 data-fix failures). (2) **Actor**: margin-gated economic shaping + a disturbance-aware advantage
+  baseline to lift the controllable signal above the disturbance noise — AFTER the WM DV fix. (3) Added
+  the DV decomp as a permanent validation diagnostic (`wm_dv_posterior_prior_decomp.json`); propose an
+  actor controllable-vs-uncontrollable return-variance diagnostic next.
+
+
 
 
