@@ -374,7 +374,13 @@ class TrainConfig:
     # function keeps it a valid potential — so it densifies the near-invisible
     # economic gradient WITHOUT changing the constrained optimum and is safe on
     # nonlinear plants.  ``0.0`` disables Φ_econ (pure safety shaping).
-    shaping_econ_coef: float = 0.5
+    # 2026-06-19 (p130 RCA): tempered 0.5→0.25.  Fix 2 (p130) ACTIVATED the
+    # actor (imag_adv_action_corr 0→0.74) but on a still-biased WM (gain 0.81)
+    # the 0.5 econ push over-drove it → oscillation + imagined_return runaway.
+    # A gentler 0.25 lets the now-active actor track the WM while it heals
+    # (D1 removal recovers the gain) instead of chasing economics into the WM's
+    # bias.  Restore 0.5 once the WM gain is back >0.9.
+    shaping_econ_coef: float = 0.25
     # Width (as a fraction of the CV half-band) of the inner SAFE zone over which
     # the economic gate ramps 0→1: gate = clip(margin_to_edge / (frac·half), 0,
     # 1).  ``0.5`` ⇒ economics is fully active only in the inner 50 % and fully
@@ -713,6 +719,18 @@ class TrainConfig:
     # actor).  Sim-adaptive: no-op when the plant has no measured DV (dv_dim=0).
     # Backbone-agnostic (RSSM + TSSM).  Opt out with DREAMER_DV_FEEDFORWARD=0.
     dv_feedforward: bool = True
+    # De-contaminate the disturbance head from the MEASURED dv (2026-06-19, p130
+    # RCA).  ``dv_feedforward`` routes the measured DV into ``feat`` (decoder +
+    # heads).  The disturbance head predicts the UNMEASURED load — but it reads
+    # the SAME ``feat``, so the measured dv leaks in and the head conflates the
+    # measured-DV-driven CV move with the unmeasured disturbance (p130: head r
+    # 0.78→0.54, R² −1.6→−2.4, std flipped under→over-predict).  When True, the
+    # measured-dv columns of ``feat`` are ZEROED before the disturbance head
+    # only (the decoder + actor/critic heads still get the dv feed-forward).
+    # The head can still infer the load indirectly via the (h, z) latent — this
+    # removes only the DIRECT measured-dv shortcut.  No-op when dv_feedforward is
+    # off or the plant has no DV.  ``DREAMER_DISTURBANCE_HEAD_EXCLUDE_DV``.
+    disturbance_head_exclude_dv: bool = True
     # ===== TSSM (transformer-SSM) backbone dims (neural-apc-mbrl) =====
     # Used only when world_model_type='tssm'.  Reuses the rssm_* categorical-
     # latent dims (n_categoricals/n_classes/embed_dim/unimix/free_bits/kl_*).
@@ -902,20 +920,6 @@ class TrainConfig:
     # range each side of baseline: large enough that Var(DV) ≫ Var(noise)
     # (kills regression dilution) yet safely inside the channel bounds.
     dv_prbs_op_frac: float = 0.6
-    # D1 (2026-06-18, p128 DV-gain RCA): minimum fraction of the Stage-1 (P1/P2)
-    # WM minibatch drawn from DV-ISOLATED episodes (MV held, DV full-range PRBS —
-    # collect_dv_prbs_episode).  p128 proved the DV→CV gain is stuck ~0.76 NOT
-    # from under-excitation (seed + periodic DV-PRBS re-inject already keep it
-    # fresh) but because the DV is a SUBDOMINANT regressor: its CV contribution
-    # (gain 0.18) is drowned by the MV-driven CV variance (gain 0.28, full-range
-    # action) in the autoencoder + CV-weighted recon/overshoot loss.  In a
-    # DV-isolated episode ALL CV variance is DV-driven (and DV is swept at large
-    # amplitude so EIV≈1), so oversampling them in the WM loss supervises ∂CV/∂DV
-    # undiluted.  Sim-agnostic (a fraction), backbone-agnostic (sampling is
-    # upstream of the WM), NO linearity assumption (supervises the real CV
-    # response → safe on nonlinear sims).  0.0 disables (uniform sampling).
-    # Gated to P1/P2 by the caller so P3 imagination starts stay representative.
-    wm_dv_isolated_minibatch_frac: float = 0.3
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -2232,13 +2236,6 @@ class TrajectoryBuffer:
         # applied ONLY where this is 1.0 (avoids the documented "clone the
         # whole replay buffer → policy collapse" trap).
         self.expert = np.zeros((capacity_eps, self.T), dtype='float32')
-        # Per-EPISODE flag marking MV-held, DV-excited "DV-isolated" episodes
-        # (collect_dv_prbs_episode).  In these episodes ALL CV variance is
-        # DV-driven, so the WM's CV-weighted recon/overshoot loss supervises
-        # ∂CV/∂DV with no MV competition.  ``sample`` can OVERSAMPLE them in the
-        # Stage-1 WM minibatch (D1 fix, p128 RCA) so the subdominant DV→CV gain
-        # (real 0.18 vs MV 0.28) is not drowned by the MV-driven CV variance.
-        self.dv_isolated = np.zeros(capacity_eps, dtype='float32')
         # Per-step hidden-disturbance target for the WM disturbance-estimator
         # head (P87).  Allocated only when ``n_dist > 0``; otherwise the
         # buffer is byte-identical to the pre-P87 layout.  ``_dist_source``
@@ -2253,8 +2250,7 @@ class TrajectoryBuffer:
 
     def add_episode(self, obs: np.ndarray, act: np.ndarray, rew: np.ndarray,
                     cont: np.ndarray, expert: Optional[np.ndarray] = None,
-                    dist: Optional[np.ndarray] = None,
-                    dv_isolated: bool = False) -> None:
+                    dist: Optional[np.ndarray] = None) -> None:
         T = obs.shape[0]
         assert T == self.T, f"episode length mismatch: {T} vs {self.T}"
         assert obs.ndim == 2 and obs.shape[1] == self.obs_dim, (
@@ -2266,7 +2262,6 @@ class TrajectoryBuffer:
         self.cont[i] = cont
         self.expert[i] = (expert if expert is not None
                           else np.zeros(self.T, dtype='float32'))
-        self.dv_isolated[i] = 1.0 if dv_isolated else 0.0
         if self.dist is not None:
             if dist is None and self._dist_source is not None:
                 try:
@@ -2284,26 +2279,11 @@ class TrajectoryBuffer:
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
-    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator,
-               dv_oversample_frac: float = 0.0
+    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator
                ) -> Dict[str, np.ndarray]:
         if self.filled == 0:
             raise ValueError("empty buffer")
         ep_idx = rng.integers(0, self.filled, size=batch_size)
-        # D1 (p128 RCA, 2026-06-18): guarantee a minimum minibatch fraction of
-        # DV-isolated (MV-held, DV-excited) episodes so the subdominant DV→CV
-        # gain stops being drowned by the MV-driven CV variance.  A FLOOR only —
-        # the remaining slots stay uniform (which may draw more DV-isolated
-        # episodes).  No-op when the fraction is 0 or no such episode is in the
-        # buffer (e.g. P3 imagination starts, or a sim with no DV channel).
-        frac = float(dv_oversample_frac)
-        if frac > 0.0:
-            dv_pool = np.flatnonzero(self.dv_isolated[:self.filled] > 0.5)
-            if dv_pool.size > 0:
-                n_dv = int(round(batch_size * min(frac, 1.0)))
-                if n_dv > 0:
-                    ep_idx[:n_dv] = dv_pool[
-                        rng.integers(0, dv_pool.size, size=n_dv)]
         max_start = self.T - seq_len
         if max_start <= 0:
             starts = np.zeros(batch_size, dtype=np.int64)
@@ -3475,6 +3455,31 @@ def _sf_steady_consistency(model: DreamerV4, z_clean: torch.Tensor,
     return loss, {'wm_steady_held_frac': float(mask.mean())}
 
 
+def _mask_measured_dv_from_feat(model: DreamerV4,
+                                 feat: torch.Tensor) -> torch.Tensor:
+    """Zero the MEASURED-dv columns of a WM ``feat`` (p130 RCA).
+
+    ``dv_feedforward`` appends the measured DV after the latent core
+    ``[h, z]`` (see ``RSSMState.feat`` / ``TSSMState.feat``), so the disturbance
+    head — which must predict the UNMEASURED load — would otherwise read the
+    measured DV directly and conflate the two.  Returns ``feat`` unchanged when
+    no dv is fed forward; else a clone with ``feat[..., core:core+dv_feed]``
+    zeroed (the (h, z) latent and any DOB ``d`` tail are untouched, so the head
+    can still infer the load indirectly).  Backbone-agnostic (RSSM + TSSM share
+    ``deter_dim`` / ``stoch_flat_dim`` / ``_dv_feed_dim``).
+    """
+    dyn = getattr(model, 'dynamics', None)
+    dv_feed = int(getattr(dyn, '_dv_feed_dim', 0) or 0)
+    if dyn is None or dv_feed <= 0:
+        return feat
+    core = int(dyn.deter_dim) + int(dyn.stoch_flat_dim)
+    if feat.shape[-1] < core + dv_feed:
+        return feat
+    out = feat.clone()
+    out[..., core:core + dv_feed] = 0.0
+    return out
+
+
 def _disturbance_head_loss(model: DreamerV4, feat: torch.Tensor,
                             dist_target: Optional[torch.Tensor],
                             recon_loss: torch.Tensor, cfg: TrainConfig,
@@ -3506,6 +3511,8 @@ def _disturbance_head_loss(model: DreamerV4, feat: torch.Tensor,
         return zero, zero, 0.0
     stop_grad = bool(getattr(cfg, 'disturbance_head_stop_grad', True))
     feat_in = feat.detach() if stop_grad else feat
+    if bool(getattr(cfg, 'disturbance_head_exclude_dv', True)):
+        feat_in = _mask_measured_dv_from_feat(model, feat_in)
     dpred = dist_head(feat_in)
     if dpred.shape != dist_target.shape:
         return zero, zero, 0.0
@@ -7155,9 +7162,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         dvp_levels = np.clip(dvp_levels + dvp_jit * const_op_band, -1.0, 1.0)
         for lvl in dvp_levels:
             ep = collect_dv_prbs_episode(env, cfg, mv_level=float(lvl))
-            # D1: MV-held DV-swept => DV-isolated WM-loss target (oversampled).
-            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'],
-                            dv_isolated=True)
+            buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] dv-prbs={n_dv_prbs_seed} "
               f"(n_dv={n_dv}, op_frac={cfg.dv_prbs_op_frac:.2f}, "
@@ -7730,9 +7735,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _dvp_levels = np.clip(_dvp_levels + _dvp_jit * _dvp_op, -1.0, 1.0)
             for _dvl in _dvp_levels:
                 _dvp = collect_dv_prbs_episode(env, cfg, mv_level=float(_dvl))
-                # D1: DV-isolated WM-loss target (oversampled in P1/P2).
                 buf.add_episode(_dvp['obs'], _dvp['act'], _dvp['rew'],
-                                 _dvp['cont'], dv_isolated=True)
+                                 _dvp['cont'])
                 total_env_steps += cfg.episode_length
             print(f"[dv-prbs-inject p{current_phase}] iter {total_iters}: "
                   f"added dv-prbs={dv_prbs_inject_n} episodes "
@@ -7889,12 +7893,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                           if current_phase != 3
                           else max(1, int(cfg.phase3_train_steps_per_iter))):
             _t = time.time()
-            batch_np = buf.sample(cfg.batch_size, cfg.seq_len, rng,
-                                  dv_oversample_frac=(
-                                      float(getattr(
-                                          cfg,
-                                          'wm_dv_isolated_minibatch_frac', 0.0))
-                                      if current_phase in (1, 2) else 0.0))
+            batch_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
             batch: Dict[str, torch.Tensor] = {}
             for k, v in batch_np.items():
                 t = torch.from_numpy(v)

@@ -239,10 +239,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # around the categorical bottleneck (where the DV→CV gain dies) directly
     # into the decoder + heads.  Default ON; =0 reverts to transition-only DV.
     'DREAMER_DV_FEEDFORWARD':             ('dv_feedforward',             _as_bool),
-    # D1 (2026-06-18, p128): min fraction of the Stage-1 WM minibatch drawn from
-    # DV-isolated (MV-held, DV-swept) episodes so the subdominant DV→CV gain is
-    # not drowned by MV-driven CV variance.  Sim-agnostic fraction; 0 = uniform.
-    'DREAMER_WM_DV_ISOLATED_FRAC':        ('wm_dv_isolated_minibatch_frac', float),
+    # De-contaminate the disturbance head from the MEASURED dv (2026-06-19,
+    # p130): zero the dv-feedforward columns of feat before the disturbance
+    # head so it predicts the UNMEASURED load, not the measured DV.  Default ON.
+    'DREAMER_DISTURBANCE_HEAD_EXCLUDE_DV': ('disturbance_head_exclude_dv', _as_bool),
     # 2026-05-22: number of constant-action seed episodes (steady-state
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.

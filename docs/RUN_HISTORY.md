@@ -742,6 +742,82 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   `imag_adv_action_corr` rising off ~0, σ decaying off its max, `mv_viol`/economics improving, and
   `cv_viol` down — with the val CIs for attribution.
 
+### p130 — VERDICT: MIXED — dv_feedforward lifted the DV autoencoder but D1 starved the MV + the active actor over-drove the biased WM
+- **WM bias (the headline)**: MV ss-gain ratio **0.813** (DOWN from p129 0.905, p128 0.961 — MV bias
+  INCREASED), DV **0.769** (open-loop ~unchanged). But the DECOMP is the real signal: MV real→post
+  0.869, **DV real→post 0.859** (up from p129's 0.717–0.767) ⇒ **dv_feedforward lifted the DV
+  autoencoder to MATCH the MV** (~0.86). Both channels now share a **~0.86 autoencoder ceiling**
+  (categorical-latent contraction). Vision-confirmed: the DV transfer-matrix **band TIGHTENED**
+  (variance DOWN — the user's read was right); the MV band stayed wide.
+- **MV DECLINE root = D1 still on** (`wm_dv_isolated_minibatch_frac=0.3`): D1 oversamples MV-HELD
+  DV-isolated episodes ⇒ STARVES the MV gain (MV autoencoder 0.945 p128 → 0.854 p129 [D1 era] →
+  0.869 p130). D1 is **falsified** (p129 moved the gain 0.001), **superseded** by dv_feedforward, and
+  **harmful** to the MV ⇒ remove.
+- **Neural Kalman / disturbance (`d_t`) WORSE**: r 0.78→0.54, R² −1.6→−2.4, pred_std 1.61→**2.39** vs
+  true 1.93 (flipped UNDER→OVER-predict), lag −2→+2. For this DOB-enabled sim the reported estimator
+  is the DOB `d_t` (not the read-out head): a MORE-biased decoder `g` (MV gain 0.81) leaves a LARGER
+  recon residual for `d_t` to absorb ⇒ `d_t` inflates. **Downstream of the WM gain bias** — the WM
+  fix is the primary Kalman lever (Kalman gain `dob_gain_init` is unchanged, so the over-shoot is not
+  from K). Separately, dv_feedforward put the measured dv in `feat`, contaminating the read-out HEAD
+  (which must predict the UNMEASURED load) — a real correctness bug to harden.
+- **Actor went PASSIVE→ACTIVE but worse**: Fix 2 WORKED — `imag_adv_action_corr` STARTED **0.735**
+  (vs ~0 in p129, a real policy gradient on μ) — but it **collapses** to ~0.01 over P3, `cv_viol` 187
+  (was 104), `mv_viol` 0.368 (was 0.003), `cum_raw` −242k±66k (worse than −152k). `imagined_return`
+  RUNS AWAY −13→−187 (NOT a numerical cascade — `return_scale` capped 20, `critic_pred_target_r` 0.99,
+  MC engaged: the ACTIVE actor genuinely drives the BIASED WM into imagined violations);
+  `imag_reward_dv_corr` HIGH 0.3–0.86 (imagined reward disturbance-dominated). Vision: disturbance-
+  driven MV excursions 5–10%pp, 30–60 step period, CV violates, under-reacting. **Root: the Fix-2
+  actor activation is PREMATURE on a biased WM (0.81/0.77)** — temper the econ push so it doesn't
+  over-drive while the WM heals.
+- **Unifying root**: the WM autoencoder bias (~0.86) **+ D1 starving the MV**. The Kalman head and the
+  actor are largely DOWNSTREAM. Keep dv_feedforward (net-positive for DV repr + variance) and fix the
+  side-effects.
+
+### p131 — fix: REMOVE D1 (WM gain) + de-contaminate the disturbance head from the measured dv (Kalman) + temper econ shaping (actor)
+- **Fix A (WM bias — the primary lever)**: **remove the D1 DV-isolated oversampling** entirely
+  (falsified p129, superseded by dv_feedforward, and actively starving the MV gain). Deleted the
+  machinery per the cleanliness mandate: the buffer `dv_isolated` tag (`__init__`/`add_episode`/
+  `sample`), the `wm_dv_isolated_minibatch_frac` knob, the `DREAMER_WM_DV_ISOLATED_FRAC` override, the
+  two `dv_isolated=True` add-site tags (seed + reinject), and the `sample(dv_oversample_frac=…)` call
+  site. **Kept** `collect_dv_prbs_episode` + the DV-PRBS seed/reinject episodes (the excitation is
+  fine — the oversampling was the harm) and **kept dv_feedforward** (it lifted the DV autoencoder
+  0.72→0.86 + tightened the DV band). Expectation: the MV autoencoder recovers toward ~0.95 while DV
+  holds ~0.86.
+- **Fix B (neural Kalman / disturbance head — de-contaminate)**: the disturbance head must predict the
+  UNMEASURED load, but `dv_feedforward` routes the MEASURED dv into `feat` ⇒ the head conflated the
+  two (p130: r 0.78→0.54, std flipped under→over). New `_mask_measured_dv_from_feat` ZEROES the
+  measured-dv columns of `feat` (`feat[…, core:core+dv_feed]`, `core=deter+stoch_flat`) before the
+  disturbance head ONLY — the decoder + actor/critic heads still get the dv feed-forward, and the head
+  can still infer the load indirectly via the `(h, z)` latent (removes only the DIRECT measured-dv
+  shortcut). Applied in `_disturbance_head_loss` (training) AND the validation read-out probe
+  (`evaluation/wm_disturbance_prediction.py`). Backbone-agnostic; no-op when dv_feedforward is off or
+  the plant has no DV. Knob `disturbance_head_exclude_dv` (default True) + `DREAMER_DISTURBANCE_HEAD_
+  EXCLUDE_DV`. **NOTE**: for DOB-enabled sims the *reported* disturbance estimate is the DOB `d_t`, not
+  the head — its p130 over-shoot is downstream of the WM gain bias, so **Fix A is the primary Kalman
+  lever** and Fix B is correctness hardening (matters when the head is the estimator / latent-shaping).
+- **Fix C (actor — temper the econ push)**: `shaping_econ_coef` **0.5→0.25**. Fix 2 (p130) made the
+  actor ACTIVE (`imag_adv_action_corr` 0→0.74) but the 0.5 econ push over-drove it on the still-biased
+  WM ⇒ oscillation + `imagined_return` runaway. A gentler 0.25 lets the now-active actor track the WM
+  while the gain heals (Fix A), instead of chasing economics into the WM's bias. Kept Fix 2b
+  (disturbance-aware advantage baseline — it helped) + the Diagnostic-2 canaries. Restore 0.5 once the
+  MV gain is back >0.9.
+- **Each subsystem keeps its own readout for attribution**: the DV decomp (WM), the disturbance R²/`d_t`
+  amplitude (Kalman), `imag_adv_action_corr` (actor), plus the R0 val CIs.
+- **Designed-but-deferred (p132 if p131 insufficient)**: A2 = break the **0.86 autoencoder ceiling**
+  shared by both channels via `wm_recon_cv_weight` 4→8 OR `rssm_n_classes` 32→48 (capacity). Verify
+  Fix A first — removing D1 may recover the MV toward 0.945 without it.
+- **Verification**: p131 smoke green (config defaults econ=0.25/exclude_dv=True/D1-knob-gone; buffer
+  `sample`/`add_episode` reject the removed kwargs; `_mask_measured_dv_from_feat` zeroes exactly the
+  dv cols + no-op when off; `_disturbance_head_loss` invariant to dv cols with exclude on, sensitive
+  with it off — A/B works). DV-input, DOB, and curriculum-partition smokes green on **both** backbones.
+  (The `_smoke_curriculum_e2e` STAGE-2 banner check fails identically on clean master b296fab — a
+  pre-existing tiny-budget stage-latch artefact, unrelated; it disables the disturbance head.)
+- **Judge by**: **MV ss-gain ratio recovers >0.9** (`wm_transfer_matrix.json`) AND DV holds ~0.86 with
+  the band tight (`wm_dv_transfer_matrix.json` + DV decomp real→post ~0.86); the disturbance R²
+  improves off −2.38 (ideally `d_t` amplitude de-inflates toward true 1.93); `imag_adv_action_corr`
+  stays >0.1 (no collapse) + `imagined_return` stops running away + `cv_viol` down — with the val CIs.
+
+
 
 
 

@@ -137,7 +137,19 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
                     dpred = d_norm[:n_cv] * cv_std[:n_cv]
                 elif head is not None:
                     # read-out head: predicts the per-CV disturbance from feat.
-                    dpred = head(feat).float().squeeze(0).cpu().numpy()
+                    # De-contaminate from the measured dv (p130): when
+                    # dv_feedforward appends the measured DV after [h, z], zero
+                    # those columns so the head can't conflate the measured DV
+                    # with the UNMEASURED load it must predict.
+                    feat_head = feat
+                    if bool(getattr(cfg, 'disturbance_head_exclude_dv', True)):
+                        _dv_feed = int(getattr(rssm, '_dv_feed_dim', 0) or 0)
+                        if _dv_feed > 0:
+                            _core = int(rssm.deter_dim) + int(rssm.stoch_flat_dim)
+                            if feat.shape[-1] >= _core + _dv_feed:
+                                feat_head = feat.clone()
+                                feat_head[..., _core:_core + _dv_feed] = 0.0
+                    dpred = head(feat_head).float().squeeze(0).cpu().numpy()
                 else:
                     dpred = np.zeros(n_cv, dtype='float32')
                 action_t, _, _ = model.policy(feat, deterministic=deterministic)
