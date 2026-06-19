@@ -705,6 +705,44 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   the DV decomp as a permanent validation diagnostic (`wm_dv_posterior_prior_decomp.json`); propose an
   actor controllable-vs-uncontrollable return-variance diagnostic next.
 
+### p130 — fix: DV→decoder+heads feedforward (WM gain root) + margin-gated econ shaping + actor diagnostics
+- **Fix 1 (WM DV gain, the confirmed p129 root)**: the measured DV is now appended to the head-facing
+  `feat` AND fed directly into the WM **decoder**, so the CV reconstruction is `g(h, z, dv)` — a DIRECT
+  ∂CV/∂dv path that **skips the categorical bottleneck** where the DV→CV gain was dying (p129 decomp:
+  real→post ×0.77, post→1step ×1.00). Feat layout `[h, z, dv, d_tail]`; decoder reads `[h, z, dv]`
+  (contiguous front slice), DOB d-tail sliced off + re-added by `apply_dob` (factorisation preserved).
+  Implemented on **BOTH backbones** (RSSM + TSSM, symmetric mirrors) + threaded through the state
+  (img_step/obs_step carry `dv`), rollout_observed, decode, feat_dim, and the held-DV imagination (the
+  value/reward/policy heads now SEE the disturbance → also the disturbance-aware baseline for the actor).
+  Sim-adaptive: no-op when the plant has no measured DV (`dv_dim=0`). Knob `dv_feedforward` (default
+  True) + `DREAMER_DV_FEEDFORWARD`; threaded TrainConfig→DreamerV4Config→both dyn configs + the
+  bo_runner ONNX-export build (also fixed a latent omission: that build was missing `dv_dim`/`dv_indices`).
+- **Fix 2a (actor reward, margin-gated econ shaping)**: re-added the economic potential Φ_econ but now
+  **CV-margin-gated** — `Φ = Φ_safe + coef·gate·Φ_econ`, gate→0 at the constraint and →1 with safe
+  headroom (`shaping_econ_margin_frac`, default 0.5) — the safe successor to the reverted R2a (which,
+  ungated, pushed the CV into the high limit). Still potential-based ⇒ policy-invariant (Ng 1999).
+  Knobs `shaping_econ_coef` (default 0.5) + `shaping_econ_margin_frac` + env overrides.
+- **Fix 2b (disturbance-aware advantage baseline)**: subtract the per-horizon **batch-mean advantage**
+  (a pure, unbiased control variate) so the uncontrollable common-mode return offset driven by the
+  disturbance level is removed, leaving the controllable action-relative advantage → higher
+  policy-gradient SNR. Pairs with Fix 1 (value baseline now conditions on the DV). Knob
+  `actor_disturbance_baseline` (default True) + `DREAMER_ACTOR_DISTURBANCE_BASELINE`.
+- **Diagnostic 2 (actor controllable-vs-uncontrollable)**: two new `train_log.jsonl` fields in the
+  imagination diag — `imag_adv_action_corr` (|corr(advantage, action)|: ~0 ⇒ the advantage doesn't
+  credit the action ⇒ no policy gradient on μ ⇒ passive actor — the p129 signature) and
+  `imag_reward_dv_corr` (|corr(per-rollout reward, held DV)|: high ⇒ imagined reward is
+  disturbance-dominated, the controllable signal buried).
+- **Verification**: model forward both backbones (feat_dim 130, recon correct, decoder gets gradient);
+  end-to-end WM loss + imagination both backbones; Fix-2a gate (econ add 0.025 near-limit vs 0.315
+  mid-band); DOB vectorized==per-step equivalence (Δ=1.5e-7) + DV-input teacher-forcing intact;
+  curriculum freeze-partition green both backbones; all overrides apply; full import check. `dv_dim=0`
+  is a verified no-op.
+- **Judge by**: **DV ss-gain ratio >0.85** (the root fix — `wm_dv_transfer_matrix.json`) AND the DV
+  decomp's `real→posterior` jumping toward 1.0 (the autoencoder now represents ∂CV/∂dv); then
+  `imag_adv_action_corr` rising off ~0, σ decaying off its max, `mv_viol`/economics improving, and
+  `cv_viol` down — with the val CIs for attribution.
+
+
 
 
 

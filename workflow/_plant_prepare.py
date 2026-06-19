@@ -235,6 +235,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # transition input (held constant in imagination = MPC feedforward) instead
     # of predicting them.  Default ON; DREAMER_DV_AS_INPUT=0 reverts to paper.
     'DREAMER_DV_AS_INPUT':                ('dv_as_input',                _as_bool),
+    # DV→decoder+heads feedforward (2026-06-19, p129): route the measured DV
+    # around the categorical bottleneck (where the DV→CV gain dies) directly
+    # into the decoder + heads.  Default ON; =0 reverts to transition-only DV.
+    'DREAMER_DV_FEEDFORWARD':             ('dv_feedforward',             _as_bool),
     # D1 (2026-06-18, p128): min fraction of the Stage-1 WM minibatch drawn from
     # DV-isolated (MV-held, DV-swept) episodes so the subdominant DV→CV gain is
     # not drowned by MV-driven CV variance.  Sim-agnostic fraction; 0 = uniform.
@@ -318,6 +322,14 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # fixed point (critic_target_v_r→0.95) that drives the cascade.
     # Both sim-agnostic dimensionless coefficients.
     'DREAMER_REWARD_SHAPING_COEF':        ('reward_shaping_coef',            float),
+    # Fix 2a (2026-06-19, p129): margin-gated economic shaping weight + the
+    # CV-safety-margin gate width.  Φ = Φ_safe + coef·gate·Φ_econ; econ pull is
+    # suppressed near a constraint.  Policy-invariant.  0.0 disables Φ_econ.
+    'DREAMER_SHAPING_ECON_COEF':          ('shaping_econ_coef',              float),
+    'DREAMER_SHAPING_ECON_MARGIN_FRAC':   ('shaping_econ_margin_frac',       float),
+    # Fix 2b (2026-06-19, p129): disturbance-aware advantage baseline (subtract
+    # the per-horizon batch-mean advantage = the uncontrollable common-mode).
+    'DREAMER_ACTOR_DISTURBANCE_BASELINE': ('actor_disturbance_baseline',     _as_bool),
     'DREAMER_CRITIC_REPLAY_ANCHOR_COEF':  ('critic_replay_anchor_coef',      float),
     # (B) P85 (2026-06-04): long-horizon critic-anchor grounding.  The
     # replay anchor's own λ (decoupled from the cascade-sensitive

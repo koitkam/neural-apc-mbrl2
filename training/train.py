@@ -361,6 +361,26 @@ class TrainConfig:
     # happens.  Still potential-based (policy-invariant) and sim-adaptive (a
     # fraction of the plant's own half-band).  ``1.0`` recovers the legacy tent.
     shaping_safe_margin_frac: float = 0.25
+    # Fix 2a economic-shaping weight (2026-06-19, p129 RC-A).  Φ = Φ_safe +
+    # ``shaping_econ_coef``·gate·Φ_econ, where Φ_econ ∈ [0,1] is a STATE-BASED
+    # economic-direction potential (per-channel linear band ramp oriented by the
+    # sign of each economic weight — the direction that LOWERS the objective's
+    # economic penalty) and ``gate`` ∈ [0,1] is a CV-SAFETY MARGIN gate that
+    # SUPPRESSES the economic pull near a constraint (gate→0 at the limit) and
+    # enables it only with safe headroom (gate→1 in the interior).  This is the
+    # margin-gated successor to the reverted R2a (which, ungated, pushed the CV
+    # INTO the high limit under a disturbance-blind WM).  Still potential-based
+    # (telescoping, same γ) ⇒ POLICY-INVARIANT (Ng 1999) — gating by a state
+    # function keeps it a valid potential — so it densifies the near-invisible
+    # economic gradient WITHOUT changing the constrained optimum and is safe on
+    # nonlinear plants.  ``0.0`` disables Φ_econ (pure safety shaping).
+    shaping_econ_coef: float = 0.5
+    # Width (as a fraction of the CV half-band) of the inner SAFE zone over which
+    # the economic gate ramps 0→1: gate = clip(margin_to_edge / (frac·half), 0,
+    # 1).  ``0.5`` ⇒ economics is fully active only in the inner 50 % and fully
+    # OFF at the limit; smaller = econ allowed closer to the edge.  Sim-adaptive
+    # (a fraction of the plant's own band).
+    shaping_econ_margin_frac: float = 0.5
 
     # ---- P73 : bounded training reward (cascade root-cause fix) ------
     # The bootstrap-cascade root cause (P69-P71) is UNBOUNDED reward scale:
@@ -397,6 +417,16 @@ class TrainConfig:
     # Cursor reference clamps at ±4 (single-MV) / ±8 (multi-MV); we default
     # to 8.0.  Set ``advantage_clip=0.0`` to disable (legacy unclamped).
     advantage_clip: float = 8.0
+    # Fix 2b (2026-06-19, p129 RC-A): disturbance-aware advantage baseline.
+    # Subtract the per-horizon batch-mean advantage so the COMMON-MODE return
+    # offset driven by the (uncontrollable) disturbance level — identical across
+    # the actions a given imagined rollout could take — is removed, leaving the
+    # CONTROLLABLE action-relative advantage.  A pure control variate ⇒ the
+    # policy gradient stays UNBIASED while the disturbance-driven noise that
+    # buried the economic signal (the p129 passive-actor cause) drops.  Pairs
+    # with Fix 1 (the value baseline now SEES the DV).  Sim-agnostic; ``False``
+    # recovers the raw ``return − V`` advantage.
+    actor_disturbance_baseline: bool = True
 
     # ---- C : replay-grounded critic anchor (P66-RCA, 2026-05-29) ----
     # The cascade's root cause is that the P3 critic regresses purely on
@@ -673,6 +703,16 @@ class TrainConfig:
     dv_as_input: bool = True
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
+    # DV→decoder+heads FEEDFORWARD (2026-06-19, p129 RCA).  Route the measured
+    # DV directly into the WM decoder AND the reward/value/policy heads (in
+    # addition to the transition), so the CV reconstruction ``g(h, z, dv)`` has
+    # a DIRECT ∂CV/∂dv path that SKIPS the categorical bottleneck where the
+    # DV→CV gain was dying (p129 DV posterior-prior decomp: real→post ×0.77,
+    # post→1step ×1.00 — the loss is the autoencoder, not data/excitation), and
+    # the actor finally SEES the disturbance in imagination (fixes the passive
+    # actor).  Sim-adaptive: no-op when the plant has no measured DV (dv_dim=0).
+    # Backbone-agnostic (RSSM + TSSM).  Opt out with DREAMER_DV_FEEDFORWARD=0.
+    dv_feedforward: bool = True
     # ===== TSSM (transformer-SSM) backbone dims (neural-apc-mbrl) =====
     # Used only when world_model_type='tssm'.  Reuses the rssm_* categorical-
     # latent dims (n_categoricals/n_classes/embed_dim/unimix/free_bits/kl_*).
@@ -1603,6 +1643,10 @@ class APCEnv:
             getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0)
         self._shaping_gamma: float = float(getattr(cfg, 'gamma', 0.997) or 0.997)
         self._prev_potential: Optional[float] = None
+        # Fix 2a (p129): margin-gated economic-shaping weight (Φ_econ pull,
+        # suppressed near a constraint by the CV-safety gate).  0 ⇒ off.
+        self._shaping_econ_coef: float = float(
+            getattr(cfg, 'shaping_econ_coef', 0.0) or 0.0)
 
         # ---- P73/P77 : bounded training reward --------------------------
         # When enabled, the per-step TRAINING reward is mapped into [-B, B]
@@ -1870,13 +1914,24 @@ class APCEnv:
         return out
 
     def _shaping_potential(self, state: np.ndarray) -> float:
-        """Dense band-keeping potential Φ(s) ∈ [0, 1] for reward shaping.
+        """Dense shaping potential Φ(s) for reward shaping.
 
-        Returns the mean over CVs of the normalised margin to the nearest
-        band edge: 1.0 at the band centre (or at an enabled CV target),
-        0.0 at the edge, clamped to 0 outside the band.  This is the
-        positive-gradient signal the one-sided economic objective lacks
-        inside the safe band.  Read-only; no side effects.
+        Φ(s) = Φ_safe(s) + ``_shaping_econ_coef``·gate(s)·Φ_econ(s).
+
+        * Φ_safe ∈ [0, 1]: mean over CVs of the normalised margin to the nearest
+          band edge (1.0 at the band centre / at an enabled CV target, 0.0 at
+          the edge, clamped to 0 outside) — the positive-gradient signal the
+          one-sided economic objective lacks inside the safe band.
+        * Φ_econ ∈ [0, 1] (Fix 2a, added only when ``_shaping_econ_coef`` > 0):
+          a state-based economic-direction potential (``_economic_potential``),
+          MARGIN-GATED by ``gate`` — the mean CV safety headroom ramped over the
+          inner ``shaping_econ_margin_frac`` of the half-band — so the economic
+          pull is SUPPRESSED near a constraint (gate→0) and active only with safe
+          headroom (gate→1).  Densifies the near-invisible economic gradient
+          without driving the CV into the limit (the reverted-R2a failure).
+
+        Potential-based (telescoping, same γ; gate is a state function) ⇒
+        policy-invariant (Ng 1999).  Read-only; no side effects.
         """
         sp = self.setpoint_mgr
         try:
@@ -1886,6 +1941,9 @@ class APCEnv:
         except Exception:
             return 0.0
         vals: List[float] = []
+        gate_vals: List[float] = []
+        mf_econ = float(np.clip(
+            getattr(self.cfg, 'shaping_econ_margin_frac', 0.5), 1e-3, 1.0))
         for i, ci in enumerate(self.cv_indices):
             if ci is None or i >= bounds.shape[0] or int(ci) >= state.shape[0]:
                 continue
@@ -1894,6 +1952,11 @@ class APCEnv:
             if half <= 1e-9:
                 continue
             cv = float(state[int(ci)])
+            # CV safety headroom (0 at either edge, 1 at the band centre) — used
+            # both for the (no-target) flat-top safety potential and the
+            # economic gate.
+            m = min(cv - lo, hi - cv) / half
+            gate_vals.append(float(np.clip(m / mf_econ, 0.0, 1.0)))
             if i < tgt_en.shape[0] and bool(tgt_en[i]) and np.isfinite(targets[i]):
                 d = abs(cv - float(targets[i])) / half
                 vals.append(max(0.0, 1.0 - d))
@@ -1905,13 +1968,73 @@ class APCEnv:
                 # free) with a concentrated, ~1/frac steeper pull-back in the
                 # near-constraint zone.  ``margin_frac=1.0`` recovers the legacy
                 # centre-peaked tent.
-                m = min(cv - lo, hi - cv) / half          # 0 at edge, 1 at centre
                 mf = float(getattr(self.cfg, 'shaping_safe_margin_frac', 0.25))
                 mf = float(np.clip(mf, 1e-3, 1.0))
                 vals.append(float(np.clip(m / mf, 0.0, 1.0)))
-        if not vals:
-            return 0.0
-        return float(np.mean(vals))
+        phi_safe = float(np.mean(vals)) if vals else 0.0
+        econ_coef = float(getattr(self, '_shaping_econ_coef', 0.0) or 0.0)
+        if econ_coef > 0.0:
+            gate = float(np.mean(gate_vals)) if gate_vals else 0.0
+            return phi_safe + econ_coef * gate * self._economic_potential(state)
+        return phi_safe
+
+    def _economic_potential(self, state: np.ndarray) -> float:
+        """State-based economic-direction potential Φ_econ ∈ [0, 1] (Fix 2a).
+
+        A linear ramp across each economically-weighted MV / CV channel's
+        engineering band, oriented by the SIGN of its economic weight — the
+        direction that lowers the objective's economic penalty
+        (``reward −= Σ (x−typical)·w``, so ∂reward/∂x = −w):
+
+            w > 0  ⇒  lower value is economically better  ⇒  g = 1 − x_norm
+            w < 0  ⇒  higher value is economically better  ⇒  g = x_norm
+
+        aggregated as the |weight|-weighted mean over all economic channels.
+        ``x_norm`` is clamped to the band so Φ_econ adds ZERO gradient outside
+        the limits (matches the objective's clipped-to-bounds economic term).
+        Returns 0.5 (a constant, policy-inert) when no economic weights are
+        configured.  Read-only.  Policy-invariant as a potential for ANY plant
+        (Ng 1999) — safe on nonlinear simulators (densifies the economic
+        gradient, never moves the optimum).
+        """
+        num = 0.0
+        den = 0.0
+        try:
+            mv_idx = [int(x) for x in self.meta.get('mv_indices', [])]
+        except Exception:
+            mv_idx = []
+        mv_w = list(self.obj_w.get('mv_economic_weights', []) or [])
+        for i, si in enumerate(mv_idx):
+            if i >= self.mv_bounds_eu.shape[0] or si < 0 or si >= state.shape[0]:
+                continue
+            w = float(mv_w[i]) if i < len(mv_w) else 0.0
+            if abs(w) < 1e-12:
+                continue
+            lo = float(self.mv_bounds_eu[i, 0]); hi = float(self.mv_bounds_eu[i, 1])
+            if hi - lo <= 1e-9:
+                continue
+            x = float(np.clip((float(state[si]) - lo) / (hi - lo), 0.0, 1.0))
+            g = (1.0 - x) if w > 0.0 else x
+            num += abs(w) * g
+            den += abs(w)
+        cv_w = list(self.obj_w.get('cv_economic_weights', []) or [])
+        for j, ci in enumerate(self.cv_indices):
+            if ci is None or j >= self.cv_bounds_eu.shape[0] \
+                    or int(ci) >= state.shape[0]:
+                continue
+            w = float(cv_w[j]) if j < len(cv_w) else 0.0
+            if abs(w) < 1e-12:
+                continue
+            lo = float(self.cv_bounds_eu[j, 0]); hi = float(self.cv_bounds_eu[j, 1])
+            if hi - lo <= 1e-9:
+                continue
+            y = float(np.clip((float(state[int(ci)]) - lo) / (hi - lo), 0.0, 1.0))
+            g = (1.0 - y) if w > 0.0 else y
+            num += abs(w) * g
+            den += abs(w)
+        if den <= 0.0:
+            return 0.5
+        return float(np.clip(num / den, 0.0, 1.0))
 
     def step(self, action_norm: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         action_norm = np.asarray(action_norm, dtype='float32').reshape(self.action_dim)
@@ -4238,6 +4361,17 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
             model.value(agent_hids.reshape(-1, agent_hids.shape[-1]))
         ).view(B, H)
         adv_raw = target_returns - baseline
+        # Fix 2b (p129 RCA): DISTURBANCE-AWARE ADVANTAGE BASELINE.  Subtract the
+        # per-horizon batch-mean advantage so the COMMON-MODE return offset
+        # driven by the (uncontrollable) disturbance level — which differs across
+        # the imagined rollouts but is the same for every action a rollout could
+        # take — is removed, leaving the CONTROLLABLE, action-relative advantage.
+        # A pure control variate (action-independent within each horizon step) ⇒
+        # the policy-gradient stays UNBIASED while its variance (and the
+        # disturbance-driven noise that buried the economic signal, RC-A) drops.
+        # Complements Fix 1 (the value baseline now SEES the DV); sim-agnostic.
+        if bool(getattr(cfg, 'actor_disturbance_baseline', True)) and B > 1:
+            adv_raw = adv_raw - adv_raw.mean(dim=0, keepdim=True)
         scale = model.update_return_scale(
             target_returns,
             abs_cap=float(getattr(
@@ -4288,6 +4422,40 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         tgt_var = tgt.float().var().clamp_min(1e-8)
         rew_to_tgt_var = (rew_var / tgt_var).clamp_max(10.0)
 
+        # ----- Diagnostic 2 (p129 RCA): actor controllable-vs-uncontrollable ---
+        # Does the imagined advantage actually CREDIT the action (so the policy
+        # gradient on μ has a signal), or is the imagined return driven by the
+        # uncontrollable disturbance (→ passive actor)?  Two cheap, principled
+        # readouts:
+        #  * ``imag_adv_action_corr`` — mean over action dims of |Pearson(adv,
+        #    action)| across the (B·H) imagined samples.  ~0 ⇒ the advantage does
+        #    NOT depend on the action ⇒ REINFORCE gives μ no directional gradient
+        #    ⇒ the mean never moves (the p129 passive-actor signature).  >~0.05
+        #    ⇒ a real action signal exists.
+        #  * ``imag_reward_dv_corr`` — |Pearson(per-rollout mean imagined reward,
+        #    held DV level)|.  High ⇒ imagined reward is DISTURBANCE-dominated
+        #    (the controllable economic signal is buried) — exactly the RC-A
+        #    failure mode.  0 when the plant has no measured DV.
+        _adv_c = (adv_raw.float() - adv_raw.float().mean()).reshape(-1)
+        _act_bha = actions.float()                                # (B, H, A)
+        _corr_dims = []
+        for _ai in range(_act_bha.shape[-1]):
+            _a = _act_bha[..., _ai].reshape(-1)
+            _a_c = _a - _a.mean()
+            _den = (_adv_c.norm() * _a_c.norm()).clamp_min(1e-8)
+            _corr_dims.append(((_adv_c * _a_c).sum() / _den).abs())
+        imag_adv_action_corr = (torch.stack(_corr_dims).mean()
+                                if _corr_dims else torch.zeros((), device=device))
+        if _dv_hold is not None and B > 1:
+            _rew_roll = rewards.float().mean(dim=1)               # (B,) per-rollout
+            _dv_lvl = _dv_hold.float().mean(dim=1)                # (B,) mean DV
+            _rr_c = _rew_roll - _rew_roll.mean()
+            _dv_c = _dv_lvl - _dv_lvl.mean()
+            _den2 = (_rr_c.norm() * _dv_c.norm()).clamp_min(1e-8)
+            imag_reward_dv_corr = ((_rr_c * _dv_c).sum() / _den2).abs()
+        else:
+            imag_reward_dv_corr = torch.zeros((), device=device)
+
     diag = {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
@@ -4307,6 +4475,8 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_pred_target_r': crit_pred_target_r.detach(),
         'critic_target_v_r': crit_target_v_r.detach(),
         'critic_rew_to_tgt_var': rew_to_tgt_var.detach(),
+        'imag_adv_action_corr': imag_adv_action_corr.detach(),
+        'imag_reward_dv_corr': imag_reward_dv_corr.detach(),
         'critic_anchor_loss': critic_anchor_loss.detach(),
     }
     diag.update(pmpo_diag)
@@ -4724,6 +4894,7 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
         dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
         dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
         dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
         cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),

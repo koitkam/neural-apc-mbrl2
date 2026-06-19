@@ -91,6 +91,16 @@ class RSSMConfig:
     # bit-identical to the paper behaviour.
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
+    # DV→decoder+heads FEEDFORWARD (2026-06-19, p129 RCA).  When True (and
+    # dv_dim>0) the measured DV is appended to the head-facing ``feat`` AND fed
+    # directly into the decoder, so the reconstructed CV is ``g(h, z, dv)`` — a
+    # DIRECT exogenous-DV path that SKIPS the lossy categorical bottleneck.  The
+    # p129 DV posterior-prior decomp proved the DV→CV gain dies ENTIRELY in the
+    # autoencoder (real→post ×0.77, post→1step ×1.00); routing the DV around the
+    # latent lets the decoder represent ∂CV/∂DV directly, and the value/policy/
+    # reward heads finally SEE the disturbance (fixes the passive actor).
+    # ``dv_dim = 0`` ⇒ no-op (byte-identical to the pre-feedforward model).
+    dv_feedforward: bool = True
     # ---- Neural Kalman filter / disturbance observer (DOB), 2026-06-11 ----
     # When ``dob_enabled`` the WM carries an explicit additive output-disturbance
     # state ``d_t`` (one scalar per CV channel) that INTEGRATES the one-step
@@ -141,6 +151,7 @@ class RSSMState:
     z_logits: torch.Tensor      # (..., n_categoricals, n_classes)
     z: torch.Tensor             # (..., n_categoricals, n_classes) one-hot (ST grad)
     d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
+    dv: Optional[torch.Tensor] = None  # (..., dv_dim) exogenous DV feedforward (None=off)
 
     @property
     def stoch_flat(self) -> torch.Tensor:
@@ -148,20 +159,25 @@ class RSSMState:
 
     @property
     def feat(self) -> torch.Tensor:
-        # Scope 2 (DOB feed-forward, 2026-06-11): when the DOB carries a
-        # disturbance estimate ``d`` we APPEND it (detached) so the actor /
-        # critic / reward heads CONDITION on the disturbance — explicit
-        # feed-forward.  p114 RCA: without this the imagined world is
-        # disturbance-free and the actor learns to be passive (mv_tv≈0 while
-        # CV drifts).  ``d`` is detached because it is a sensor-like estimate
-        # driven by the recon innovation (the DOB is trained via ``apply_dob``
-        # on the recon, NOT by the heads), so head gradients must not reshape
-        # it.  The DECODER still reads only ``[h, z_flat]`` (``decode`` slices
-        # the d-tail off) — the clean-gain ``g`` + additive ``d`` factorisation
-        # is preserved.  ``d is None`` (DOB off) ⇒ feat = [h, z_flat] exactly.
+        # Scope 2 (DOB feed-forward, 2026-06-11) + DV feed-forward (2026-06-19):
+        # the head-facing feature is ``[h, z_flat, (dv), (d.detach())]``.
+        #  * ``dv`` (DV feedforward) is appended RIGHT AFTER the latent core so
+        #    the DECODER reads ``[h, z, dv]`` (a contiguous front slice) — the
+        #    direct exogenous-DV path that skips the categorical bottleneck — AND
+        #    so the actor/critic/reward heads CONDITION on the measured DV.  Not
+        #    detached: the decoder learns ∂CV/∂dv through it (dv itself is a
+        #    teacher-forced/held leaf, so there is no upstream graph to protect).
+        #  * ``d`` (DOB) is appended LAST and DETACHED — the heads condition on
+        #    the disturbance estimate but head grads must not reshape the
+        #    innovation-driven observer.  The decoder slices the d-tail off.
+        # ``dv is None`` AND ``d is None`` ⇒ feat = [h, z_flat] (byte-identical
+        # to the paper RSSM).
+        parts = [self.h, self.stoch_flat]
+        if self.dv is not None:
+            parts.append(self.dv)
         if self.d is not None:
-            return torch.cat([self.h, self.stoch_flat, self.d.detach()], dim=-1)
-        return torch.cat([self.h, self.stoch_flat], dim=-1)
+            parts.append(self.d.detach())
+        return torch.cat(parts, dim=-1)
 
 
 class _CategoricalLatent(nn.Module):
@@ -226,16 +242,24 @@ class RSSMDynamics(nn.Module):
             torch.tensor(list(getattr(cfg, 'dv_indices', ()) or ()),
                          dtype=torch.long),
             persistent=False)
+        # DV→decoder+heads feedforward (2026-06-19): only meaningful with DVs.
+        self.dv_feedforward = bool(getattr(cfg, 'dv_feedforward', True)) \
+            and self.dv_dim > 0
+        self._dv_feed_dim = self.dv_dim if self.dv_feedforward else 0
         # Transition input = [z_flat ; action ; (dv)].
         trans_in = self.stoch_flat_dim + self.action_dim + self.dv_dim
 
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
-        # Decoder: [h, z] → reconstructed (normalized) obs.  Reads the CORE
-        # feature only (deter + stoch); the DOB d-tail (Scope 2) is sliced off
-        # in ``decode`` and re-added via ``apply_dob`` (the g + d factorisation).
-        self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim, self.obs_dim,
+        # Decoder: [h, z, (dv)] → reconstructed (normalized) obs.  Reads the
+        # latent core (deter + stoch) PLUS the exogenous DV when DV-feedforward
+        # is on, so the CV reconstruction ``g(h, z, dv)`` has a DIRECT ∂CV/∂dv
+        # path that skips the categorical bottleneck (p129 RCA).  The DOB d-tail
+        # (Scope 2) is sliced off in ``decode`` and re-added via ``apply_dob``
+        # (the g + d factorisation).
+        self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim
+                            + self._dv_feed_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
         # Recurrent dynamics: pre-GRU projection then GRUCell.
         self.pre_gru = _MLP(trans_in, trans_in,
@@ -277,11 +301,18 @@ class RSSMDynamics(nn.Module):
 
     @property
     def feat_dim(self) -> int:
-        # Scope 2: the head-facing feature includes the DOB disturbance estimate
-        # ``d`` (one scalar per CV) so the actor/critic/reward heads condition
-        # on it.  The decoder reads only the core (deter+stoch) — see ``decode``.
+        # Scope 2: the head-facing feature includes the DV feedforward (dv_dim
+        # when on) so the heads condition on the measured DV, plus the DOB
+        # disturbance estimate ``d`` (one scalar per CV).  The decoder reads
+        # ``[h, z, (dv)]`` (see ``_decode_in_dim`` / ``decode``).
         core = self.deter_dim + self.stoch_flat_dim
-        return core + (self.n_cv if getattr(self, 'dob_enabled', False) else 0)
+        return (core + self._dv_feed_dim
+                + (self.n_cv if getattr(self, 'dob_enabled', False) else 0))
+
+    @property
+    def _decode_in_dim(self) -> int:
+        # Width of the decoder input slice = latent core + DV feedforward.
+        return self.deter_dim + self.stoch_flat_dim + self._dv_feed_dim
 
     # ----- embedding ----------------------------------------------------
     def embed(self, obs: torch.Tensor) -> torch.Tensor:
@@ -297,7 +328,9 @@ class RSSMDynamics(nn.Module):
         z[..., 0] = 1.0  # arbitrary valid one-hot
         d = (torch.zeros(batch_size, self.n_cv, device=device)
              if self.dob_enabled else None)
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d)
+        dv = (torch.zeros(batch_size, self.dv_dim, device=device)
+              if self.dv_feedforward else None)
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv)
 
     # ----- DOB helpers --------------------------------------------------
     def dob_decay(self) -> torch.Tensor:
@@ -339,7 +372,10 @@ class RSSMDynamics(nn.Module):
         # DOB predict step: decay the disturbance estimate (no obs to correct).
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new)
+        # DV feedforward: carry the (real / held / zero-filled) DV into the
+        # state so ``feat`` + ``decode`` expose it to the decoder and heads.
+        dv_new = dv if self.dv_feedforward else None
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new)
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -363,7 +399,10 @@ class RSSMDynamics(nn.Module):
             cv_obs = obs.index_select(-1, self.cv_index_t)
             nu = cv_obs - cv_pred                        # innovation
             d_post = prior.d + self.dob_gain() * nu      # = A·d_{t-1} + K·ν
-        post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z, d=d_post)
+        # Posterior inherits the prior's exogenous DV feedforward (same measured
+        # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
+        post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z, d=d_post,
+                         dv=prior.dv)
         return post, prior
 
     # ----- sequence rollout ---------------------------------------------
@@ -391,6 +430,7 @@ class RSSMDynamics(nn.Module):
                if self.dv_dim > 0 else None)           # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
+        dec_in = self._decode_in_dim                   # core (+ dv feedforward)
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
@@ -407,12 +447,12 @@ class RSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            feats_l.append(post.feat[..., :core])      # core [h, z_flat]
+            feats_l.append(post.feat[..., :dec_in])    # decoder feat [h, z, (dv)]
             post_l.append(post.z_logits)
             prior_l.append(prior.z_logits)
             if self.dob_enabled:
-                prior_core_l.append(prior.feat[..., :core])
-        post_core = torch.stack(feats_l, dim=1)        # (B, T, core)
+                prior_core_l.append(prior.feat[..., :dec_in])
+        post_core = torch.stack(feats_l, dim=1)        # (B, T, dec_in) = [h,z,(dv)]
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)
         ds = None
@@ -421,7 +461,7 @@ class RSSMDynamics(nn.Module):
                 # ONE batched prior decode → CV forecast base (d-free), then the
                 # scalar per-CV Kalman filter.  d_t = A·d_{t-1} + K·ν with
                 # ν = CV_obs − (base + A·d_{t-1}) ⇒ d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, core)
+                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
@@ -439,17 +479,18 @@ class RSSMDynamics(nn.Module):
                                  dtype=post_core.dtype)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
-                              d=ds[:, -1])
+                              d=ds[:, -1], dv=state.dv)
         else:
             feats = post_core
         return feats, post_logits, prior_logits, state, ds
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
-        # Scope 2: the decoder learns the CLEAN g([h, z]); slice off any DOB
-        # d-tail that ``feat`` may carry (it is re-added by ``apply_dob``).  When
-        # the DOB is off, ``feat`` is already core-width so this is a no-op.
-        core = self.deter_dim + self.stoch_flat_dim
-        return self.decoder(feat[..., :core])
+        # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the
+        # DV (when fed forward) sits right after the latent core so it is part
+        # of the contiguous front slice, while any DOB d-tail beyond it is
+        # sliced OFF (re-added by ``apply_dob``).  When DV-feedforward and DOB
+        # are both off, ``feat`` is already core-width so this is a no-op slice.
+        return self.decoder(feat[..., :self._decode_in_dim])
 
 
 # ---------------------------------------------------------------------------

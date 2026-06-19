@@ -147,6 +147,12 @@ class TransformerSSMConfig:
     # input instead of being predicted forward.  ``dv_dim = 0`` = paper default.
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
+    # DV→decoder+heads FEEDFORWARD (2026-06-19, p129 RCA) — mirror of RSSMConfig.
+    # When True (and dv_dim>0) the measured DV is appended to ``feat`` AND fed
+    # directly into the decoder so the CV reconstruction ``g(h, z, dv)`` has a
+    # DIRECT exogenous-DV path that skips the categorical bottleneck (the DV gain
+    # dies in the autoencoder, p129), and the heads see the disturbance.
+    dv_feedforward: bool = True
     # Neural Kalman filter / disturbance observer (DOB) — mirror of RSSMConfig.
     # See models/dreamer_v4_rssm.RSSMConfig + docs/architecture.md §3.  Shared
     # feat->decode interface, so the observer math is identical to the RSSM.
@@ -172,6 +178,7 @@ class TSSMState:
     kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
     pos: int = 0                # number of tokens already in the cache
     d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
+    dv: Optional[torch.Tensor] = None  # (..., dv_dim) exogenous DV feedforward (None=off)
 
     @property
     def stoch_flat(self) -> torch.Tensor:
@@ -179,14 +186,19 @@ class TSSMState:
 
     @property
     def feat(self) -> torch.Tensor:
-        # Scope 2 (DOB feed-forward, 2026-06-11) — mirror of RSSMState.feat:
-        # append the (detached) DOB disturbance estimate ``d`` so the actor /
-        # critic / reward heads condition on it (explicit feed-forward).  The
-        # decoder reads only ``[h, z_flat]`` (``decode`` slices the d-tail off).
-        # ``d is None`` (DOB off) ⇒ feat = [h, z_flat] exactly (byte-identical).
+        # DV feedforward (2026-06-19) + Scope 2 DOB (2026-06-11) — mirror of
+        # RSSMState.feat: ``[h, z_flat, (dv), (d.detach())]``.  ``dv`` sits right
+        # after the latent core (the decoder reads ``[h, z, dv]`` as a
+        # contiguous front slice — the direct DV path skipping the categorical
+        # bottleneck — and the heads condition on the measured DV); the DOB
+        # ``d`` is appended last and DETACHED (heads see it; the decoder slices
+        # it off).  Both None ⇒ feat = [h, z_flat] (byte-identical paper TSSM).
+        parts = [self.h, self.stoch_flat]
+        if self.dv is not None:
+            parts.append(self.dv)
         if self.d is not None:
-            return torch.cat([self.h, self.stoch_flat, self.d.detach()], dim=-1)
-        return torch.cat([self.h, self.stoch_flat], dim=-1)
+            parts.append(self.d.detach())
+        return torch.cat(parts, dim=-1)
 
 
 class _CausalSelfAttention(nn.Module):
@@ -307,6 +319,10 @@ class TransformerSSMDynamics(nn.Module):
             torch.tensor(list(getattr(cfg, 'dv_indices', ()) or ()),
                          dtype=torch.long),
             persistent=False)
+        # DV→decoder+heads feedforward (2026-06-19) — mirror of RSSMDynamics.
+        self.dv_feedforward = bool(getattr(cfg, 'dv_feedforward', True)) \
+            and self.dv_dim > 0
+        self._dv_feed_dim = self.dv_dim if self.dv_feedforward else 0
 
         # ----- shared, low-risk pieces (real implementations) -----
         self.encoder = nn.Sequential(
@@ -314,9 +330,12 @@ class TransformerSSMDynamics(nn.Module):
             nn.Linear(cfg.embed_dim, cfg.embed_dim),
         )
         self.decoder = nn.Sequential(
-            # Scope 2: decode the CORE feature only (deter+stoch); the DOB d-tail
-            # is sliced off in ``decode`` and re-added via ``apply_dob``.
-            nn.Linear(self.deter_dim + self.stoch_flat_dim, cfg.embed_dim),
+            # DV feedforward + Scope 2: decode ``[h, z, (dv)]`` (the DV gives the
+            # CV reconstruction a direct ∂CV/∂dv path skipping the categorical
+            # bottleneck); the DOB d-tail is sliced off in ``decode`` and
+            # re-added via ``apply_dob``.
+            nn.Linear(self.deter_dim + self.stoch_flat_dim + self._dv_feed_dim,
+                      cfg.embed_dim),
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
@@ -361,11 +380,17 @@ class TransformerSSMDynamics(nn.Module):
 
     @property
     def feat_dim(self) -> int:
-        # Scope 2 (mirror of RSSMDynamics.feat_dim): the head-facing feature
-        # includes the DOB ``d`` (one scalar per CV); the decoder reads only the
-        # core (deter+stoch).
+        # Mirror of RSSMDynamics.feat_dim: head-facing feature = latent core +
+        # DV feedforward (when on) + DOB ``d`` (one scalar per CV).  The decoder
+        # reads ``[h, z, (dv)]`` (see ``_decode_in_dim`` / ``decode``).
         core = self.deter_dim + self.stoch_flat_dim
-        return core + (self.n_cv if getattr(self, 'dob_enabled', False) else 0)
+        return (core + self._dv_feed_dim
+                + (self.n_cv if getattr(self, 'dob_enabled', False) else 0))
+
+    @property
+    def _decode_in_dim(self) -> int:
+        # Width of the decoder input slice = latent core + DV feedforward.
+        return self.deter_dim + self.stoch_flat_dim + self._dv_feed_dim
 
     # ----- DOB helpers (mirror RSSMDynamics) -----
     def dob_decay(self) -> torch.Tensor:
@@ -387,10 +412,11 @@ class TransformerSSMDynamics(nn.Module):
         return self.encoder(obs)
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
-        # Scope 2 (mirror of RSSMDynamics.decode): decode the CLEAN core feature;
-        # slice off any DOB d-tail (re-added by ``apply_dob``).  No-op when off.
-        core = self.deter_dim + self.stoch_flat_dim
-        return self.decoder(feat[..., :core])
+        # DV feedforward + Scope 2 (mirror of RSSMDynamics.decode): decode
+        # ``[h, z, (dv)]`` (the contiguous front slice); any DOB d-tail beyond
+        # it is sliced off (re-added by ``apply_dob``).  No-op slice when both
+        # DV-feedforward and the DOB are off.
+        return self.decoder(feat[..., :self._decode_in_dim])
 
     def initial_state(self, batch_size: int,
                       device: torch.device) -> TSSMState:
@@ -401,7 +427,10 @@ class TransformerSSMDynamics(nn.Module):
         z[..., 0] = 1.0
         d = (torch.zeros(batch_size, self.n_cv, device=device)
              if self.dob_enabled else None)
-        return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0, d=d)
+        dv = (torch.zeros(batch_size, self.dv_dim, device=device)
+              if self.dv_feedforward else None)
+        return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0, d=d,
+                         dv=dv)
 
     # ----- internal: token build + causal encode -----
     def _build_token(self, z: torch.Tensor,
@@ -454,6 +483,11 @@ class TransformerSSMDynamics(nn.Module):
         new position.  ``dv`` (B, dv_dim) is the exogenous measured-DV input
         when DV-as-input is on; ``None`` -> zeros.  ``kv_cache=None`` (feat-only
         reconstruction by a Markovian consumer) starts a fresh context."""
+        # DV feedforward: materialise the (possibly zero-filled) DV so it can be
+        # both fed to the token AND stored in the state (decoder + heads read it).
+        if self.dv_feedforward and dv is None:
+            dv = torch.zeros(prev_action.shape[0], self.dv_dim,
+                             device=prev_action.device, dtype=prev_action.dtype)
         token = self._build_token(prev.z, prev_action, dv)
         cache = getattr(prev, 'kv_cache', None)
         pos = int(getattr(prev, 'pos', 0) or 0)
@@ -461,8 +495,9 @@ class TransformerSSMDynamics(nn.Module):
         z_logits, z = self.prior_net(h, sample=sample)
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
+        dv_new = dv if self.dv_feedforward else None
         return TSSMState(h=h, z_logits=z_logits, z=z,
-                         kv_cache=new_cache, pos=pos + 1, d=d_new)
+                         kv_cache=new_cache, pos=pos + 1, d=d_new, dv=dv_new)
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -484,8 +519,11 @@ class TransformerSSMDynamics(nn.Module):
             cv_obs = obs.index_select(-1, self.cv_index_t)
             nu = cv_obs - cv_pred
             d_post = prior.d + self.dob_gain() * nu
+        # Posterior inherits the prior's exogenous DV feedforward (same measured
+        # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
         post = TSSMState(h=prior.h, z_logits=post_logits, z=post_z,
-                         kv_cache=prior.kv_cache, pos=prior.pos, d=d_post)
+                         kv_cache=prior.kv_cache, pos=prior.pos, d=d_post,
+                         dv=prior.dv)
         return post, prior
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
@@ -504,6 +542,7 @@ class TransformerSSMDynamics(nn.Module):
                if self.dv_dim > 0 else None)             # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
+        dec_in = self._decode_in_dim                     # core (+ dv feedforward)
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
@@ -517,12 +556,12 @@ class TransformerSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            feats_l.append(post.feat[..., :core])        # core [h, z_flat]
+            feats_l.append(post.feat[..., :dec_in])      # decoder feat [h, z, (dv)]
             post_l.append(post.z_logits)
             prior_l.append(prior.z_logits)
             if self.dob_enabled:
-                prior_core_l.append(prior.feat[..., :core])
-        post_core = torch.stack(feats_l, dim=1)          # (B, T, core)
+                prior_core_l.append(prior.feat[..., :dec_in])
+        post_core = torch.stack(feats_l, dim=1)          # (B, T, dec_in) = [h,z,(dv)]
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)
         ds = None
@@ -530,7 +569,7 @@ class TransformerSSMDynamics(nn.Module):
             if self.dob_active:
                 # ONE batched prior decode → CV forecast base, then the scalar per-CV
                 # Kalman filter: d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, core)
+                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
@@ -549,7 +588,7 @@ class TransformerSSMDynamics(nn.Module):
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = TSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               kv_cache=state.kv_cache, pos=state.pos,
-                              d=ds[:, -1])
+                              d=ds[:, -1], dv=state.dv)
         else:
             feats = post_core
         return feats, post_logits, prior_logits, state, ds

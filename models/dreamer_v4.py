@@ -1257,6 +1257,10 @@ class DreamerV4Config:
     # Resolved at runtime to ``len(dv_indices)`` when ``cfg.dv_as_input``.
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
+    # DV→decoder+heads feedforward (2026-06-19, p129 RCA): route the measured DV
+    # directly into the WM decoder + reward/value/policy heads (skips the
+    # categorical bottleneck where the DV→CV gain dies).  No-op when dv_dim=0.
+    dv_feedforward: bool = True
     # Neural Kalman filter / disturbance observer (DOB, 2026-06-11).  Threaded
     # to RSSM/TSSM config; ``cv_obs_indices`` = the CV positions in the obs
     # vector.  ``dob_enabled=False`` ⇒ disabled (pre-DOB behaviour).
@@ -1288,6 +1292,7 @@ class DreamerV4(nn.Module):
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
                 dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
                 dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+                dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
                 dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
                 cv_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
                 dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
@@ -1315,6 +1320,7 @@ class DreamerV4(nn.Module):
                 max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
                 dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
                 dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+                dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
                 dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
                 cv_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
                 dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
