@@ -17,6 +17,30 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 - Deep narrative + RCA detail lives in `/memories/repo/mbrl_open_items.md`
   (agent memory). This file is the scannable cross-run history for humans.
 
+## BEST-RUN BASELINES (per subsystem) — UPDATE THIS EACH VERDICT
+
+The current champion per subsystem — the baselines a new run must **beat** (or
+not regress below). Update the row whenever a run sets a new best. `test_sim`.
+Targets: gain ratios →1.0, disturbance r→1 / R²→+1 / amplitude→1.0, critic
+`critic_rew_to_tgt_var` >0.015 (P3 mean), actor `cum_raw`→0 + `cv_viol`→0.
+
+| Subsystem | Metric (target) | Champion | Value | Notes |
+|---|---|---|---|---|
+| **MV WM gain** | `wm_transfer` ss-ratio (→1.0) | **p128** | **0.967** | dvprbs+econ; regressed to ~0.82 since (dv_ff/D1) — the open p132 target |
+| **DV WM gain** | `wm_dv_transfer` ss-ratio (→1.0) | **p131** | **0.868** | the dv_feedforward (p130) + D1-removal (p131) win |
+| **Disturbance — r** | `dist_r` (→1) | **p126** | **0.817** | safety-margin era; DOB `d_t` |
+| **Disturbance — R²** | `dist_R²` (→+1) | **p121** | **−0.258** | least-biased; but amplitude low (0.60, under-predicts) |
+| **Disturbance — amplitude** | `pred_std/true_std` (→1.0) | **p125** | **1.032** | best-calibrated; r 0.738 / R² −1.0 = strongest all-around disturbance run |
+| **Critic** | `critic_rew_to_tgt_var` (>0.015) | **p131** | **0.0079** | ⚠ NONE healthy yet — all runs <0.015 (bootstrap-dominated); p131 is merely the least-bad |
+| **Actor** | `cum_raw` (→0) / `cv_viol` (→0) | **p124** | **−105k / 62.8** | p121 close (−110k / 64.8); wide CIs (±40–66k) so treat as a band, not a point |
+
+> **Note on the disturbance champion**: no run has a *positive* disturbance R²
+> yet — the DOB `d_t` integrates the WM-gain-error residual, so a biased WM gain
+> contaminates it (the persistent <0 R²). p125/p126 were best because they paired
+> a good WM gain with a calm actor; p130/p131 regressed (dv_ff dropped the MV
+> gain, then the more-active p131 actor amplified the gain-error drift → R² −6.07).
+> The disturbance is a **downstream** metric of the WM gain (#1) — fix the gain first.
+
 ## Lineage at a glance
 
 > **Backfill caveat (p95–p105)**: these predate the MC-critic (landed p106) and

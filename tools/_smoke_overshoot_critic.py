@@ -56,12 +56,18 @@ def _run(wm_type):
     cfg, model, batch = _mk(wm_type=wm_type)
     print(f'\n=== backbone: {wm_type} ===')
 
-    # ---- overshoot/held are ON by default (coef 0.3/0.5, promoted p117) ----
+    # ---- overshoot/held are ON by default (coef 0.3/0.5, promoted p117).
+    # The overshoot/held losses are RSSM-only (the SF backbone's shortcut-
+    # forcing is its native multi-step term), so they are a no-op (==0) for SF. -
     losses, _, _ = world_model_loss(model, batch, cfg)
     assert 'wm_overshoot_loss' in losses, 'overshoot key missing'
     ov_on = float(losses['wm_overshoot_loss'])
-    assert ov_on > 0.0, f'overshoot must be ON by default (p117), got {ov_on}'
-    print(f'[smoke] OK  default wm_overshoot_loss > 0 ({ov_on:.4f}) ({wm_type})')
+    if wm_type == 'rssm':
+        assert ov_on > 0.0, f'RSSM overshoot must be ON by default (p117), got {ov_on}'
+        print(f'[smoke] OK  default wm_overshoot_loss > 0 ({ov_on:.4f}) ({wm_type})')
+    else:
+        assert ov_on == 0.0, f'SF overshoot must be a no-op (0), got {ov_on}'
+        print(f'[smoke] OK  default wm_overshoot_loss == 0 (SF no-op) ({wm_type})')
 
     # ---- coef=0 turns it OFF (the escape hatch) ----
     cfg.wm_overshoot_coef = 0.0
@@ -79,20 +85,22 @@ def _run(wm_type):
     assert 'critic_imag_loss' in diag, 'critic_imag_loss missing from diag'
     cl = float(diag['critic_loss'])
     cil = float(diag['critic_imag_loss'])
-    # default coef 1.0 + default anchor coef 0.5 -> critic_loss = cil + 0.5*anchor
-    # so critic_loss >= cil only if anchor>=0; check identity of the imag term
-    # by disabling the anchor.
+    # critic_loss = imag_coef*imag + anchor_coef*anchor + mc_coef*mc.  Current
+    # promoted defaults (p117/p124): imag_coef=0.3, anchor_coef=0.0, mc_coef=1.0
+    # — so the identity critic_loss == critic_imag_loss only holds when we force
+    # imag_coef=1.0 AND zero BOTH grounded terms (the TD-λ replay anchor AND the
+    # MC grounding).
+    cfg.critic_imag_loss_coef = 1.0
     cfg.critic_replay_anchor_coef = 0.0
+    cfg.critic_mc_grounding_coef = 0.0
     diag_na = imagination_step(model, batch, cfg)
     assert abs(float(diag_na['critic_loss'])
                - float(diag_na['critic_imag_loss'])) < 1e-5, \
-        'coef=1.0 + no anchor must give critic_loss == critic_imag_loss'
-    cfg.critic_replay_anchor_coef = 0.5
+        'imag_coef=1.0 + no grounded terms must give critic_loss == critic_imag_loss'
     print(f'[smoke] OK  #1 identity at coef=1.0 (critic_loss==imag) ({wm_type})')
 
-    # ---- #1 engaged: down-weight imagined CE ----
+    # ---- #1 engaged: down-weight imagined CE (grounded terms still off) ----
     cfg.critic_imag_loss_coef = 0.3
-    cfg.critic_replay_anchor_coef = 0.0   # isolate the imag term
     diag1 = imagination_step(model, batch, cfg)
     cl1 = float(diag1['critic_loss'])
     cil1 = float(diag1['critic_imag_loss'])
@@ -100,8 +108,10 @@ def _run(wm_type):
         f'#1 rebalance wrong: critic_loss={cl1} != 0.3*{cil1}'
     assert torch.isfinite(diag1['critic_loss']).all()
     diag1_full = dict(diag1)
-    cfg.critic_replay_anchor_coef = 0.5
-    cfg.critic_imag_loss_coef = 1.0
+    # restore the promoted defaults
+    cfg.critic_imag_loss_coef = 0.3
+    cfg.critic_replay_anchor_coef = 0.0
+    cfg.critic_mc_grounding_coef = 1.0
     print(f'[smoke] OK  #1 engaged critic_loss == 0.3*imag ({wm_type})')
 
     # ---- #2 engaged (RSSM real; SF no-op) ----
