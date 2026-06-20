@@ -468,6 +468,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_OVERSHOOT_COEF':          ('wm_overshoot_coef',              float),
     'DREAMER_WM_OVERSHOOT_LEN':           ('wm_overshoot_len',               int),
     'DREAMER_WM_OVERSHOOT_MAX_STARTS':    ('wm_overshoot_max_starts',        int),
+    'DREAMER_WM_OVERSHOOT_TAIL_POWER':    ('wm_overshoot_tail_power',        float),
     'DREAMER_WM_OVERSHOOT_GATE_RECON':    ('wm_overshoot_gate_recon',        float),
 }
 

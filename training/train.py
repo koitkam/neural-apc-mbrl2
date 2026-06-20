@@ -1096,6 +1096,16 @@ class TrainConfig:
     wm_overshoot_coef: float = 0.3
     wm_overshoot_len: int = 15            # K open-loop prior steps to supervise
     wm_overshoot_max_starts: int = 24     # cap start positions (stride) for cost
+    # Steady-state TAIL emphasis (2026-06-20, p131 RCA): per-step weight
+    # ``(k/K)^tail_power`` over the K-step rollout (then Σw-normalised).  The
+    # open-loop gain dies in COMPOUNDING — a DC/steady-state phenomenon — but a
+    # uniform ``/K`` mean dilutes the settled tail to ~1/K weight.  A power>0
+    # concentrates the gain gradient on the DC-gain region (the settled tail)
+    # WITHOUT inflating the term (bounded weighted mean) so it can't destabilise
+    # the WM; the noisy early transient (already covered by 1-step recon/KL) is
+    # de-emphasised.  ``2.0`` ≈ last step gets ~3× its uniform weight.  ``0.0``
+    # recovers the exact uniform mean.  Env DREAMER_WM_OVERSHOOT_TAIL_POWER.
+    wm_overshoot_tail_power: float = 2.0
     # Soft recon-fidelity gate (mirrors the disturbance head): the overshoot
     # term is scaled by ``min(1, gate_recon / recon_loss)`` so it RAMPS IN only
     # as 1-step reconstruction converges — early in P1 the WM cannot predict
@@ -3606,6 +3616,23 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
                              device=device, dtype=f0.dtype),
         z=z)
     total = zero
+    # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
+    # contraction (decomp 1step→openloop ×0.876; probe: sampled open-loop gain
+    # 0.79 vs real, and sample=False is WORSE 0.32 → the gain lives in the
+    # learned SAMPLED prior, the loss is weak supervision NOT a sampling EIV) is
+    # a STEADY-STATE / DC-gain phenomenon: the 1-step prior is faithful (×1.001)
+    # but the gain compounds away over the rollout.  A UNIFORM ``/K`` mean
+    # dilutes the settled tail to ~1/K weight, so the DC gain (where the
+    # contraction lives) is under-supervised.  Weight step ``k`` by
+    # ``(k/K)^tail_power`` (a smooth low-frequency / DC emphasis) and normalise
+    # by Σw — bounded magnitude (still a weighted mean, no term inflation) so it
+    # cannot destabilise the WM, but it concentrates the gain gradient on the
+    # steady-state (p=2 → the last step gets ~3× its uniform weight, the noisy
+    # early transient less — which the 1-step recon/KL already cover).
+    # ``tail_power=0`` recovers the exact uniform mean.  Sim-agnostic (unitless
+    # step fraction), backbone-agnostic.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
+    tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 0.0) or 0.0)
+    wsum = 0.0
     for k in range(1, K + 1):
         a_idx = starts + k                                        # (S,)
         a_k = act[:, a_idx].reshape(Bm, -1)                       # (B*S, A)
@@ -3624,8 +3651,10 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
         # fast then plateaus early").  Reusing the recon CV-weight directly
         # supervises the CV's open-loop settling toward the real gain.  Identity
         # when wm_recon_cv_weight==1.0 or no CV indices.
-        total = total + _weighted_recon_mse(pred, tgt, cfg)
-    loss = total / float(K)
+        w_k = (float(k) / float(K)) ** tail_power if tail_power > 0.0 else 1.0
+        total = total + w_k * _weighted_recon_mse(pred, tgt, cfg)
+        wsum += w_k
+    loss = total / max(wsum, 1e-8)
     # Soft recon-fidelity gate: ramp the term in only as 1-step recon converges
     # (early P1 the WM can't predict multi-step; an ungated term would swamp the
     # encoder/decoder).  ``gate_recon<=0`` disables.

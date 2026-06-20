@@ -56,14 +56,24 @@ def _run(wm_type):
     cfg, model, batch = _mk(wm_type=wm_type)
     print(f'\n=== backbone: {wm_type} ===')
 
-    # ---- defaults: #2 OFF, #1 identity ----
+    # ---- overshoot/held are ON by default (coef 0.3/0.5, promoted p117) ----
     losses, _, _ = world_model_loss(model, batch, cfg)
     assert 'wm_overshoot_loss' in losses, 'overshoot key missing'
-    ov0 = float(losses['wm_overshoot_loss'])
-    assert ov0 == 0.0, f'overshoot must be 0 by default, got {ov0}'
-    assert float(losses.get('wm_held_rollout_loss', 0.0)) == 0.0, \
-        'held-rollout must be 0 by default'
-    print(f'[smoke] OK  default wm_overshoot_loss == 0 ({wm_type})')
+    ov_on = float(losses['wm_overshoot_loss'])
+    assert ov_on > 0.0, f'overshoot must be ON by default (p117), got {ov_on}'
+    print(f'[smoke] OK  default wm_overshoot_loss > 0 ({ov_on:.4f}) ({wm_type})')
+
+    # ---- coef=0 turns it OFF (the escape hatch) ----
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    losses_off, _, _ = world_model_loss(model, batch, cfg)
+    assert float(losses_off['wm_overshoot_loss']) == 0.0, \
+        'overshoot must be 0 when coef=0'
+    assert float(losses_off.get('wm_held_rollout_loss', 0.0)) == 0.0, \
+        'held-rollout must be 0 when coef=0'
+    cfg.wm_overshoot_coef = 0.3
+    cfg.wm_held_rollout_coef = 0.5
+    print(f'[smoke] OK  coef=0 disables overshoot/held ({wm_type})')
 
     diag = imagination_step(model, batch, cfg)
     assert 'critic_imag_loss' in diag, 'critic_imag_loss missing from diag'

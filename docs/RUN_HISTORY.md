@@ -817,6 +817,56 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
   improves off −2.38 (ideally `d_t` amplitude de-inflates toward true 1.93); `imag_adv_action_corr`
   stays >0.1 (no collapse) + `imagined_return` stops running away + `cv_viol` down — with the val CIs.
 
+### p131 — VERDICT: PARTIAL SUCCESS — fixes worked; the residual MV bias is now a cleaner COMPOUNDING root
+- **What WORKED** (all three fixes did their job): (1) **removing D1 FIXED the MV autoencoder** — MV decomp
+  real→post **0.869→0.909** (exactly as predicted; D1 was starving the MV). (2) **DV open-loop transfer IMPROVED
+  0.769→0.868** (dv_feedforward held it + D1 no longer starving). (3) **Actor improved** — `cum_raw`
+  −242k→**−182k** (CI tighter 66k→43k), `cv_viol` 187→**121**, `imagined_return` runaway BOUNDED −187→−52,
+  `imag_adv_action_corr` sustained better (0.51 start, oscillates 0.05–0.21, ends 0.149 vs p130's collapse to
+  0.01) — the econ temper 0.5→0.25 helped.
+- **What DIDN'T fully resolve**: MV **open-loop** gain only 0.813→**0.828** (NOT >0.9) — the bias **moved from the
+  autoencoder to COMPOUNDING**: MV decomp post→1step **1.001** (1-step prior faithful) but 1step→openloop **0.876**
+  (the free-running multi-step rollout contracts the gain). Disturbance R² −2.38→**−6.07** WORSE — but `r` 0.53
+  stable and amplitude ratio now **0.97** (calibrated): the DOB `d_t` **DRIFTS positive while the true OU
+  disturbance is negative** (vision) = a SIGN/DRIFT bias, not amplitude. `mv_viol` 0.368→3.76 up (actor moves MV
+  more — economically good, but over-shoots the limit).
+- **ROOT of the residual (decisive probe)**: `tools/_probe_sampling_gain.py` measured the open-loop MV→CV gain
+  under **sampled vs expected latent**: real −3.21, **sample=True 0.79×**, **sample=False (expected) 0.32×**. The
+  expected path COLLAPSES the gain → the gain lives in the **learned SAMPLED prior**; sampling is NOT the
+  contraction (it's the opposite), so this is **weak steady-state supervision**, not a categorical Jensen/EIV
+  artefact. The overshoot loss (THE gain supervisor) ALREADY runs at full horizon (auto-tune `wm_overshoot_len`=
+  horizon=**55**, NOT the run_plan's pre-auto-tune 15) but its **uniform `/K` mean dilutes the settled tail (the DC
+  gain) to ~1/K weight** — coef 0.3 too weak there. The DOB `d_t` drift + the actor mis-calibration are BOTH
+  **downstream** of this MV-gain contraction (a biased `g` → MV-correlated recon residual → `d_t` absorbs an
+  MV-driven bias → drifts; the actor imagines a gain-contracted WM). One root fixes #1 + #2 + #4.
+
+### p132 — fix: steady-state TAIL-WEIGHTING of the latent-overshoot loss (the open-loop DC-gain supervisor)
+- **The fix (single variable)**: new `wm_overshoot_tail_power` (default **2.0**, `DREAMER_WM_OVERSHOOT_TAIL_POWER`).
+  The overshoot loss now weights rollout step `k` by `(k/K)^power` (Σw-normalised), concentrating the gain
+  gradient on the **settled tail** where the contraction lives, instead of a uniform `/K` mean that dilutes the DC
+  gain to ~1/K. Bounded magnitude (still a weighted mean — no term inflation, can't destabilise the WM); the noisy
+  early transient (already covered by 1-step recon/KL) is de-emphasised (p=2 ⇒ last step ~2.9× its uniform weight,
+  first step ~0). RSSM-only (the gain supervisor is RSSM-only; SF/TSSM unaffected). `power=0` recovers the exact
+  uniform mean.
+- **Theory**: this is Simulation-Error-Minimisation / latent-overshooting applied to the **DC gain** — the
+  steady-state gain is the **zero-frequency** response, so a low-frequency (settled-tail) emphasis is the
+  signal-theoretically correct way to fit it. The probe ruled out the sampling-EIV alternative (sample=False is
+  worse), so strengthening the learned-prior supervision is the right lever, not a sampling change.
+- **Why one change**: the DOB `d_t` drift (#2) and the actor mis-calibration (#4) are downstream of the MV-gain
+  contraction, so NO separate DOB/actor fix is bundled — the WM gain recovery should de-drift `d_t` (shrinks the
+  MV-correlated residual it integrates) and de-bias the actor's imagination. Kept `wm_overshoot_coef` at 0.3 to
+  isolate the variable; p133 bumps it (and/or the A2 autoencoder-ceiling levers) only if the tail-weighting is
+  insufficient.
+- **Verification**: `/tmp/p132_smoke.py` green (config default 2.0; env override wired; weighting math — p=0 exact
+  uniform 1/K, p=2 last-step 2.92× uniform + first-step ~0; loss runs finite for both powers). `world_model_loss`
+  integration green on **both** backbones (`_smoke_wm_fixes`); curriculum + dv-input green both backbones. Also
+  fixed the STALE `overshoot==0 by default` assertion in `_smoke_overshoot_critic.py` (p117 promoted the coef
+  0→0.3). (Other p117-promotion stale assertions — `wm_recon_cv_weight==1.0`, the critic-identity composition —
+  REMAIN in those smokes, out of p132 scope; noted for a cleanup pass.)
+- **Judge by**: MV **1step→openloop** decomp ratio rises toward 1.0 AND the MV open-loop transfer ratio >0.9
+  (`wm_transfer_matrix.json` + `wm_posterior_prior_decomp.json`); the DOB `d_t` stops drifting (R² up off −6.07, no
+  sign flip in `wm_disturbance_prediction.png`); `cv_viol` down further — with the val CIs for attribution.
+
 
 
 
