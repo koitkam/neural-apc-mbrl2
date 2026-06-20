@@ -731,6 +731,15 @@ class TrainConfig:
     # removes only the DIRECT measured-dv shortcut.  No-op when dv_feedforward is
     # off or the plant has no DV.  ``DREAMER_DISTURBANCE_HEAD_EXCLUDE_DV``.
     disturbance_head_exclude_dv: bool = True
+    # Disturbance-prediction DETREND window for the CONTROL-RELEVANT Kalman score
+    # (2026-06-20).  The DOB d_t feeds forward; a slow drift in the estimate
+    # (timescale ≫ closed-loop settling) is rejected by the feedback integral
+    # action, so only the DYNAMIC tracking error matters for feed-forward.  The
+    # validation disturbance metric is ALSO reported high-pass-detrended with a
+    # window = ``this × settling`` (settling = the auto-tuned ``horizon``), so it
+    # is SIM-ADAPTIVE.  4× keeps the settling-band dynamics, removes slower drift.
+    # ``DREAMER_DISTURBANCE_DETREND_SETTLE_MULT``.
+    disturbance_detrend_settle_mult: float = 4.0
     # ===== TSSM (transformer-SSM) backbone dims (neural-apc-mbrl) =====
     # Used only when world_model_type='tssm'.  Reuses the rssm_* categorical-
     # latent dims (n_categoricals/n_classes/embed_dim/unimix/free_bits/kl_*).

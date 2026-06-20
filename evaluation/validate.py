@@ -2193,8 +2193,12 @@ def run_validation(*,
                 print(f'[val] WM disturbance prediction: '
                       f'mean NRMSE={dp_res["mean_nrmse"]:.3f} '
                       f'r={dp_res["mean_pearson_r"]:.3f} '
-                      f'R²={dp_res["mean_r2"]:.3f} '
-                      f'(stop_grad={dp_res["stop_grad"]}) -> '
+                      f'R²={dp_res["mean_r2"]:.3f} | '
+                      f'DETRENDED (control-relevant) '
+                      f'r={dp_res.get("mean_pearson_r_detrended", float("nan")):.3f} '
+                      f'R²={dp_res.get("mean_r2_detrended", float("nan")):.3f} '
+                      f'(drift_sd={dp_res.get("mean_drift_err_std", float("nan")):.3f} '
+                      f'dyn_sd={dp_res.get("mean_dyn_err_std", float("nan")):.3f}) -> '
                       f'{out_dir}/wm_disturbance_prediction.png', flush=True)
             else:
                 print(f'[val] WM disturbance prediction: not applicable '

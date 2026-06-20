@@ -63,6 +63,24 @@ def _best_lead_lag(pred: np.ndarray, true: np.ndarray, max_lag: int) -> Dict:
             'best_lag_corr': (float(best_r) if best_r > -2.0 else float('nan'))}
 
 
+def _moving_average(x: np.ndarray, w: int) -> np.ndarray:
+    """Centered, edge-padded moving average — a zero-phase low-pass."""
+    n = len(x)
+    if w <= 1:
+        return np.zeros_like(x)
+    if w >= n:
+        return np.full_like(x, float(x.mean()))
+    pad = w // 2
+    xp = np.pad(x, pad, mode='edge')
+    k = np.ones(w, dtype=np.float64) / float(w)
+    return np.convolve(xp.astype('float64'), k, mode='same')[pad:pad + n].astype(x.dtype)
+
+
+def _highpass_detrend(x: np.ndarray, w: int) -> np.ndarray:
+    """High-pass = ``x - MA(x, w)`` — removes drift slower than window ``w``."""
+    return x - _moving_average(x, w)
+
+
 @torch.no_grad()
 def compute_disturbance_prediction(model, env, cfg, device, *,
                                    deterministic: bool = True,
@@ -178,6 +196,21 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
                       if hasattr(env, '_resolve_plant_timing') else 8)
 
         sv = list(env.meta.get('state_variables', []) or [])
+        # --- Detrend window for the CONTROL-RELEVANT (dynamic) Kalman metric ---
+        # The DOB d_t feeds FORWARD; a slow drift in the estimate (timescale
+        # ≫ closed-loop settling) is rejected by the feedback INTEGRAL action
+        # (the sensitivity S(jω)→0 as ω→0), so it is benign — only the DYNAMIC
+        # tracking error (≈ settling-band frequencies) actually reaches the CV
+        # and is what feedforward must minimise.  R² on the raw trace is
+        # dominated by that benign drift (it penalises a DC/slow bias the loop
+        # already cancels), so we ALSO report metrics on the HIGH-PASS-detrended
+        # signals.  Window = ``mult × settling`` (sim-adaptive via the auto-tuned
+        # ``horizon`` = one settling response): high enough to PRESERVE the
+        # settling-band dynamics, low enough to REMOVE the slower drift.
+        T_settle = int(getattr(cfg, 'horizon', 0) or 0) or max(8, max_lag * 4)
+        detrend_mult = float(getattr(cfg, 'disturbance_detrend_settle_mult', 4.0) or 4.0)
+        navail = max(8, n - w0)
+        W = int(np.clip(round(detrend_mult * T_settle), 8, max(8, navail // 3)))
         per_channel: List[Dict] = []
         for c in range(n_cv):
             tr = true_d[w0:, c]
@@ -188,6 +221,17 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
             ss_tot = float(np.sum((tr - tr.mean()) ** 2))
             r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else float('nan')
             ci = int(env.cv_indices[c])
+            # Detrended (high-pass) dynamic-tracking metrics + drift descriptors.
+            tr_hp = _highpass_detrend(tr, W)
+            pr_hp = _highpass_detrend(pr, W)
+            rmse_hp = float(np.sqrt(np.mean((pr_hp - tr_hp) ** 2)))
+            std_t_hp = float(tr_hp.std())
+            ss_res_hp = float(np.sum((tr_hp - pr_hp) ** 2))
+            ss_tot_hp = float(np.sum((tr_hp - tr_hp.mean()) ** 2))
+            r2_hp = (float(1.0 - ss_res_hp / ss_tot_hp)
+                     if ss_tot_hp > 1e-12 else float('nan'))
+            err = tr - pr
+            err_slow = _moving_average(err, W)        # drift error (feedback rejects)
             per_channel.append({
                 'cv_index': ci,
                 'cv_name': sv[ci] if 0 <= ci < len(sv) else f'CV{c}',
@@ -197,6 +241,16 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
                 'r2': r2,
                 'true_std': std_t,
                 'pred_std': float(pr.std()),
+                # control-relevant (high-pass detrended) dynamic tracking
+                'pearson_r_detrended': _safe_corr(pr_hp, tr_hp),
+                'r2_detrended': r2_hp,
+                'nrmse_detrended': (float(rmse_hp / std_t_hp)
+                                    if std_t_hp > 1e-9 else float('nan')),
+                'pred_std_detrended': float(pr_hp.std()),
+                'true_std_detrended': std_t_hp,
+                # drift (slow, feedback-rejectable) vs dynamic (feedforward) error
+                'drift_err_std': float(err_slow.std()),
+                'dyn_err_std': float((err - err_slow).std()),
                 **_best_lead_lag(pr, tr, max_lag),
             })
 
@@ -212,6 +266,20 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
             'mean_nrmse': _m('nrmse'),
             'mean_pearson_r': _m('pearson_r'),
             'mean_r2': _m('r2'),
+            # Control-relevant DYNAMIC tracking (high-pass detrended): the slow
+            # drift is rejected by the feedback integral action, so THESE are the
+            # metrics that reflect feed-forward Kalman quality (see per-channel).
+            'mean_pearson_r_detrended': _m('pearson_r_detrended'),
+            'mean_r2_detrended': _m('r2_detrended'),
+            'mean_nrmse_detrended': _m('nrmse_detrended'),
+            'mean_drift_err_std': _m('drift_err_std'),
+            'mean_dyn_err_std': _m('dyn_err_std'),
+            'detrend_window': int(W),
+            'detrend_settle_mult': float(detrend_mult),
+            'detrend_note': ('detrended metrics high-pass-remove drift slower than '
+                             f'{W} steps (~{detrend_mult:g}x the {T_settle}-step '
+                             'settling); that drift is feedback-rejectable so the '
+                             'detrended r/R2 are the control-relevant Kalman scores'),
             'per_channel': per_channel,
             # raw traces (for the plot + offline re-analysis)
             'true_disturbance_t': true_d.tolist(),
@@ -246,6 +314,7 @@ def plot_disturbance_prediction(result: Dict, out_path) -> bool:
     n_cv = int(result['n_cv'])
     w0 = int(result.get('warmup_skipped', 0))
     sr = int(result.get('sample_rate', 1) or 1)
+    Wdt = int(result.get('detrend_window', 0) or 0)
     t_ax = np.arange(true_d.shape[0]) * sr
 
     fig, axes = plt.subplots(n_cv, 1, figsize=(11, 2.8 * n_cv + 0.6),
@@ -257,7 +326,14 @@ def plot_disturbance_prediction(result: Dict, out_path) -> bool:
                         label='true hidden disturbance')
         ax.plot(t_ax, true_d[:, c], color='tab:orange', lw=1.3)
         ax.plot(t_ax, pred_d[:, c], color='tab:blue', lw=1.2, ls='--',
-                label='WM head prediction')
+                label='WM prediction')
+        # Overlay the SLOW DRIFT (low-pass) of the prediction — the benign part
+        # the feedback integral action rejects; the detrended metric scores the
+        # rest (the dynamic tracking that actually reaches the CV).
+        if Wdt > 1 and pred_d.shape[0] > Wdt:
+            drift = _moving_average(pred_d[:, c].astype('float64'), Wdt)
+            ax.plot(t_ax, drift, color='tab:red', lw=1.0, ls=':',
+                    label=f'pred slow drift (MA{Wdt}, feedback-rejected)')
         if w0 > 0:
             ax.axvspan(0, w0 * sr, color='gray', alpha=0.12)
             ax.axvline(w0 * sr, color='gray', lw=0.6, ls=':')
@@ -266,16 +342,19 @@ def plot_disturbance_prediction(result: Dict, out_path) -> bool:
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8, loc='upper right')
         ax.set_title(
-            f"{m.get('cv_name', f'CV{c}')}: "
-            f"NRMSE={m['nrmse']:.2f}  r={m['pearson_r']:.2f}  "
-            f"R²={m['r2']:.2f}  lag={m['best_lag_steps']}step "
-            f"(r@lag={m['best_lag_corr']:.2f})", fontsize=9)
+            f"{m.get('cv_name', f'CV{c}')}: raw r={m['pearson_r']:.2f} "
+            f"R²={m['r2']:.2f}  |  DETRENDED (control-relevant) "
+            f"r={m.get('pearson_r_detrended', float('nan')):.2f} "
+            f"R²={m.get('r2_detrended', float('nan')):.2f}  "
+            f"lag={m['best_lag_steps']}step", fontsize=9)
     axes[-1][0].set_xlabel('step')
     sg = 'read-out probe (stop-grad)' if result.get('stop_grad') else 'latent-shaping'
     est = result.get('estimator', 'readout_head')
     fig.suptitle(
-        f"WM unmeasured-disturbance prediction [{est}] — mean NRMSE={result['mean_nrmse']:.2f} "
-        f"r={result['mean_pearson_r']:.2f} R²={result['mean_r2']:.2f}  [{sg}]",
+        f"WM unmeasured-disturbance prediction [{est}] — DETRENDED (control-relevant) "
+        f"r={result.get('mean_pearson_r_detrended', float('nan')):.2f} "
+        f"R²={result.get('mean_r2_detrended', float('nan')):.2f}  "
+        f"(raw R²={result['mean_r2']:.2f} drift-dominated)  [{sg}]",
         fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     try:

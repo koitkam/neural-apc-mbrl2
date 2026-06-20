@@ -243,6 +243,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # p130): zero the dv-feedforward columns of feat before the disturbance
     # head so it predicts the UNMEASURED load, not the measured DV.  Default ON.
     'DREAMER_DISTURBANCE_HEAD_EXCLUDE_DV': ('disturbance_head_exclude_dv', _as_bool),
+    # Detrend window (× settling) for the control-relevant dynamic Kalman score
+    # (2026-06-20): the slow drift is feedback-rejectable, so the disturbance
+    # metric is also reported high-pass-detrended over this × the settling time.
+    'DREAMER_DISTURBANCE_DETREND_SETTLE_MULT': ('disturbance_detrend_settle_mult', float),
     # 2026-05-22: number of constant-action seed episodes (steady-state
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.

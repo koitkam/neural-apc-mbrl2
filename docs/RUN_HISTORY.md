@@ -21,25 +21,28 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 
 The current champion per subsystem — the baselines a new run must **beat** (or
 not regress below). Update the row whenever a run sets a new best. `test_sim`.
-Targets: gain ratios →1.0, disturbance r→1 / R²→+1 / amplitude→1.0, critic
+Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 `critic_rew_to_tgt_var` >0.015 (P3 mean), actor `cum_raw`→0 + `cv_viol`→0.
 
 | Subsystem | Metric (target) | Champion | Value | Notes |
 |---|---|---|---|---|
 | **MV WM gain** | `wm_transfer` ss-ratio (→1.0) | **p128** | **0.967** | dvprbs+econ; regressed to ~0.82 since (dv_ff/D1) — the open p132 target |
 | **DV WM gain** | `wm_dv_transfer` ss-ratio (→1.0) | **p131** | **0.868** | the dv_feedforward (p130) + D1-removal (p131) win |
-| **Disturbance — r** | `dist_r` (→1) | **p126** | **0.817** | safety-margin era; DOB `d_t` |
-| **Disturbance — R²** | `dist_R²` (→+1) | **p121** | **−0.258** | least-biased; but amplitude low (0.60, under-predicts) |
-| **Disturbance — amplitude** | `pred_std/true_std` (→1.0) | **p125** | **1.032** | best-calibrated; r 0.738 / R² −1.0 = strongest all-around disturbance run |
+| **Disturbance (Kalman, dynamic)** | `r2_detrended` / `r_detrended` (→1) | **p129** | **0.593 / 0.778** | DETRENDED = control-relevant (see note). p128 ~tied (0.558 / 0.747); p127 amplitude-best (det 0.99). RAW R² is drift-dominated & **misleading** (p129 raw −1.59) |
 | **Critic** | `critic_rew_to_tgt_var` (>0.015) | **p131** | **0.0079** | ⚠ NONE healthy yet — all runs <0.015 (bootstrap-dominated); p131 is merely the least-bad |
 | **Actor** | `cum_raw` (→0) / `cv_viol` (→0) | **p124** | **−105k / 62.8** | p121 close (−110k / 64.8); wide CIs (±40–66k) so treat as a band, not a point |
 
-> **Note on the disturbance champion**: no run has a *positive* disturbance R²
-> yet — the DOB `d_t` integrates the WM-gain-error residual, so a biased WM gain
-> contaminates it (the persistent <0 R²). p125/p126 were best because they paired
-> a good WM gain with a calm actor; p130/p131 regressed (dv_ff dropped the MV
-> gain, then the more-active p131 actor amplified the gain-error drift → R² −6.07).
-> The disturbance is a **downstream** metric of the WM gain (#1) — fix the gain first.
+> **Note on the disturbance metric (2026-06-20, control-theory re-frame)**: the
+> DOB `d_t` feeds **forward**, and a slow drift in the estimate (timescale ≫
+> closed-loop settling) is rejected by the feedback **integral action** (`S(jω)→0`
+> as ω→0) — so it is *benign*. The RAW R² is dominated by that drift and is the
+> WRONG score for feed-forward quality. The champion is now ranked on the
+> **high-pass-detrended** `r2_detrended` / `r_detrended` (window = 4× the settling
+> horizon), which isolates the DYNAMIC tracking that actually reaches the CV.
+> Re-scored on this metric, **p129 (0.593/0.778) and p128 (0.558/0.747) are the
+> best** — exactly the runs that *looked* good — while p130/p131 show a **real
+> dynamic** collapse (det R² <0, dyn-error ≈2×), not merely drift. The dynamic
+> error is downstream of the MV WM gain (#1) + actor activity — fix the gain first.
 
 ## Lineage at a glance
 
