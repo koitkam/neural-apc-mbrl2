@@ -358,17 +358,28 @@ def compute_transfer_matrix(model, env, cfg, device, *,
                     _mvi = int(_mv_obs_idx[j])
                     _mv_sd = float(obs_std[_mvi]) if _mvi < len(obs_std) else 1.0
                     d_mv_eng = float((real_obs[-1, _mvi] - _settled[_mvi]) * _mv_sd)
+                    # WM gain denominator = the MV the WM ITSELF realised (its
+                    # predicted actuator position).  The WM rolls out the
+                    # COMMANDED action, which the real plant may clip; dividing
+                    # the WM's ΔCV by the WM's OWN ΔMV gives the WM's internal
+                    # ∂CV/∂MV, so g_wm vs g_real is a fair GAIN comparison even
+                    # when the actuator clips and the WM may/may-not have learned
+                    # the clip (mirrors the DV path, where the WM is fed the real
+                    # observed DV so its realised input already equals real).
+                    d_mv_wm = float((pred_obs[-1, _mvi] - _settled[_mvi]) * _mv_sd)
                     pre = _settled
-                else:  # fallback: commanded control (legacy)
+                else:  # fallback: commanded control (legacy; pre-mv_indices)
                     d_mv_eng = float(stepped_ctrl[j] - base_ctrl[j])
+                    d_mv_wm = d_mv_eng
                     pre = real_obs[0]
                 if abs(d_mv_eng) < 1e-9:
                     continue
+                _den_wm = d_mv_wm if abs(d_mv_wm) > 1e-9 else d_mv_eng
                 for ci, c in enumerate(cv_idx):
                     sd = float(obs_std[c]) if c < len(obs_std) else 1.0
                     # ΔCV engineering = ΔCV_norm * channel_std; transfer gain
-                    # = ΔCV_eng / ΔMV_eng.
-                    g_wm = (pred_obs[:, c] - pre[c]) * sd / d_mv_eng
+                    # = ΔCV_eng / ΔMV_eng (each side by its OWN realised ΔMV).
+                    g_wm = (pred_obs[:, c] - pre[c]) * sd / _den_wm
                     g_real = (real_obs[:, c] - pre[c]) * sd / d_mv_eng
                     key = f'{cv_names[ci]}<-{mv_names[j]}'
                     cells.setdefault(key, {'wm': [], 'real': []})
@@ -637,7 +648,8 @@ def plot_combined_transfer_matrix(mv_result: Dict, dv_result: Optional[Dict],
     legend_handles = [
         Line2D([0], [0], color='k', lw=2.2, ls='-', label='real sim (ground truth)'),
         Line2D([0], [0], color='C0', lw=2.2, ls='--', label='world model'),
-        Patch(facecolor='grey', alpha=0.2, label='shaded = min–max over operating region'),
+        Patch(facecolor='grey', alpha=0.2,
+              label='shaded = GAIN range across operating points (NOT noise)'),
     ]
     fig.legend(handles=legend_handles, loc='lower center', ncol=3, fontsize=8,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.075))
@@ -646,8 +658,13 @@ def plot_combined_transfer_matrix(mv_result: Dict, dv_result: Optional[Dict],
     fig.suptitle(sup, fontsize=12, y=0.99)
     fig.text(0.5, 0.018,
              'How to read: each cell = step response of that CV to that input '
-             '(engineering gain).\nWM (blue dashed) should overlap real (black '
-             'solid); bold = mean, light shading = operating-range spread.',
+             '(engineering gain); read the GAIN at the SETTLED (right) end — the '
+             'cell title gives the SS gains.\nWM (blue dashed) should overlap '
+             'real (black solid).  The shaded band is the GAIN RANGE across '
+             'operating points (each curve = a realised ΔCV/Δinput): it COLLAPSES '
+             'to the line for a linear / consistent-gain plant and widens ONLY '
+             'where the gain is genuinely NONLINEAR — it is NOT measurement noise '
+             'or variance.',
              ha='center', va='bottom', fontsize=8)
     fig.tight_layout(rect=(0.04, 0.12, 1, 0.94))
     out_path = Path(out_path)
