@@ -688,12 +688,31 @@ class TrainConfig:
     # against the NOMINAL plant (eval disables DR), forcing the categorical
     # latent to model a gain DISTRIBUTION ⇒ a systematically ATTENUATED
     # identified gain (the cross-run ~0.85 'ceiling').  When True the curriculum
-    # turns DR OFF for the seed collection + P1 (clean WM id) + P2 (DOB id), and
-    # back ON for P3 (the actor trains with runtime robustness on the FROZEN,
-    # now-unbiased WM).  Textbook system-ID: identify the plant clean, then
-    # design a robust controller.  Sim-agnostic (toggles the existing
+    # turns DR OFF for the seed collection + P1 (clean WM id) + P2 (DOB id).  As
+    # of Stage A (p135) DR STAYS OFF for P3 too — the actor's loop-gain
+    # robustness now comes from IMAGINATION-time gain randomization
+    # (actor_imag_gain_random_frac) rather than REAL-data DR, which created a
+    # train/imagination mismatch (p134 actor regression: the real loop gain
+    # varied ±frac but the actor imagined on the nominal frozen WM).  Textbook
+    # system-ID: identify the plant clean, then design a robust controller
+    # (robustness injected in imagination).  Sim-agnostic (toggles the existing
     # randomizer).  ``DREAMER_CURRICULUM_WM_ID_DR_OFF``.
     curriculum_wm_id_dr_off: bool = True
+
+    # ---- Actor-imagination loop-gain randomization (Stage A, p135, 2026-06-21)
+    # Replaces the Stage-3 REAL-data DR.  Each imagined rollout scales the action
+    # fed into the (frozen) WM dynamics by a per-rollout g~U(1-frac, 1+frac), held
+    # CONSTANT over the horizon (a per-episode plant-gain offset), so the actor
+    # optimises E_g[return] -> a loop-gain-robust policy with NO real/imagination
+    # mismatch (the real plant stays nominal).  For a SISO loop an INPUT (actuator)
+    # gain scale is equivalent to the real DR's OUTPUT (sensor) gain scale, and for
+    # the common LINEAR MV economic cost the expected cost is unbiased.  None =
+    # AUTO: inherit the sim's own DR output-gain spread (robust to exactly the
+    # gain uncertainty the plant carries); unitless 0.10 fallback when the sim has
+    # no randomizer.  0.0 = OFF.  Sim-adaptive + backbone-agnostic (RSSM + TSSM
+    # both route through _imagination_step_rssm).
+    # ``DREAMER_ACTOR_IMAG_GAIN_RANDOM_FRAC``.
+    actor_imag_gain_random_frac: Optional[float] = None
 
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
@@ -4292,16 +4311,38 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     imagined_agent_hid: List[torch.Tensor] = []
     imagined_agent_hid_pre: List[torch.Tensor] = []
 
+    # Stage A (p135): IMAGINATION-time loop-gain randomization.  Draw ONE
+    # per-rollout gain offset g~U(1-frac, 1+frac) (shape (B,1)), held CONSTANT
+    # over the horizon (a per-episode plant-gain offset), and scale the action
+    # FED TO THE DYNAMICS by it (the true action_t is still stored for the actor
+    # log-prob / economic cost).  The actor thus optimises E_g[return] -> a
+    # loop-gain-robust policy, replacing the old Stage-3 real-data DR that caused
+    # a train/imagination mismatch.  frac auto-inherits the sim's DR output-gain
+    # spread (resolved in the trainer); 0 disables.  Targets the MV->CV loop gain
+    # only (the held DV is untouched).
+    _imag_gf = float(getattr(cfg, 'actor_imag_gain_random_frac', 0.0) or 0.0)
+    _g_rand = None  # drawn lazily at h==0 (needs action_t's dtype/device)
+
     for h in range(H):
         # 1. Sample action from the current state's feat (saw a_{prev}).
         feat_pre = state.feat
         action_t, logp_t, ent_t, raw_t = model.policy.sample_with_raw(feat_pre)
+        # Loop-gain perturbation: scale the action fed to the DYNAMICS only.
+        if _imag_gf > 0.0:
+            if _g_rand is None:
+                _g_rand = 1.0 + (torch.rand(action_t.shape[0], 1,
+                                            device=action_t.device,
+                                            dtype=action_t.dtype)
+                                 * 2.0 - 1.0) * _imag_gf
+            a_dyn = action_t * _g_rand
+        else:
+            a_dyn = action_t
 
         # 2. Advance the prior under that action (frozen WM).  P70 fix (1):
         #    use the categorical MODE (sample=False) when latent-mode is on
         #    so imagination follows the contracting deterministic path.
         with torch.no_grad():
-            next_state = rssm.img_step(state, action_t, dv=_dv_hold,
+            next_state = rssm.img_step(state, a_dyn, dv=_dv_hold,
                                        sample=not _imag_mode)
         feat_post = next_state.feat                          # (B, F) — sees a_h
 
@@ -4568,6 +4609,34 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     }
     diag.update(pmpo_diag)
     return diag
+
+
+def _read_env_dr_gain_frac(env) -> Optional[float]:
+    """Return the sim's configured domain-randomization OUTPUT-GAIN spread
+    (``output_gain_pct``, defaulting to the randomizer's top-level ``frac``),
+    or ``None`` when the sim has no randomizer.  Used to auto-size the
+    actor-imagination loop-gain randomization so the actor is made robust to
+    exactly the gain uncertainty the plant carries (sim-adaptive).  The
+    randomizer's ``frac`` persists even when DR is toggled off for the clean
+    WM identification, so this reads the configured magnitude regardless of
+    the current enabled state.
+    """
+    sim = getattr(env, 'sim', None)
+    rd = getattr(sim, '_randomizer', None)
+    if rd is None and sim is not None:
+        rd = getattr(getattr(sim, '_sim', None), '_randomizer', None)
+    if rd is None:
+        return None
+    frac = float(getattr(rd, 'frac', 0.0) or 0.0)
+    cfg_block = getattr(rd, '_config_block', None)
+    if isinstance(cfg_block, dict):
+        v = cfg_block.get('output_gain_pct', None)
+        if v is not None:
+            try:
+                frac = float(v)
+            except (TypeError, ValueError):
+                pass
+    return frac if frac > 0.0 else None
 
 
 def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
@@ -6986,6 +7055,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               '+ >=1 CV channel (the observer it identifies in Stage 2).',
               flush=True)
         curriculum = False
+    # Resolve the actor-imagination loop-gain randomization spread ONCE (Stage A,
+    # p135): None -> inherit the sim's DR output-gain frac (sim-adaptive); fall
+    # back to a unitless 0.10 when the sim has no randomizer; explicit value is
+    # clamped >=0 (0 disables).  Applied only inside the P3 imagination rollout
+    # (_imagination_step_rssm), so resolving here is safe for both curriculum and
+    # joint modes.
+    _imag_gf_cfg = getattr(cfg, 'actor_imag_gain_random_frac', None)
+    if _imag_gf_cfg is None:
+        _dr_frac = _read_env_dr_gain_frac(env)
+        cfg.actor_imag_gain_random_frac = float(_dr_frac) if _dr_frac else 0.10
+    else:
+        cfg.actor_imag_gain_random_frac = max(0.0, float(_imag_gf_cfg))
+    print(f"[imag-gain-rand] actor imagination loop-gain spread = "
+          f"\u00b1{cfg.actor_imag_gain_random_frac:.3f} "
+          f"({'auto:sim-DR' if _imag_gf_cfg is None else 'explicit'})",
+          flush=True)
     _cur_stage = 0
     if curriculum:
         # Stage-1 state applied BEFORE the seed fill so the seed buffer is
@@ -6998,15 +7083,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         model.set_dob_active(False)
         env._disturbance_prob_override = 0.0
         # DR RCA (2026-06-20): turn OFF domain randomization for the clean WM/DOB
-        # identification (seeds + P1 + P2) so the gain is fit to the NOMINAL
-        # plant (re-enabled at the Stage-3 transition for actor robustness).
+        # identification.  Stage A (p135): DR now stays OFF for ALL stages (the
+        # actor's loop-gain robustness is injected in IMAGINATION instead, see
+        # actor_imag_gain_random_frac) so the gain is fit to the NOMINAL plant
+        # and the actor has no real/imagination mismatch.
         _dr_gated = bool(getattr(cfg, 'curriculum_wm_id_dr_off', True))
         _dr_found = env.set_domain_randomization(False) if _dr_gated else False
         print('[curriculum] ENABLED — staged clean->disturbance Kalman/DOB '
               'curriculum. Stage 1 (P1): CLEAN data + DOB suppressed -> WM '
               f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
               f'reward={_fz["reward"]} tensors; disturbance prob=0; '
-              f'domain_randomization={"OFF (re-on @P3)" if (_dr_gated and _dr_found) else "on"}).',
+              f'domain_randomization={"OFF (all stages; actor robustness via imagination gain-rand)" if (_dr_gated and _dr_found) else "on"}).',
               flush=True)
         # NOTE (2026-06-16, p124 RCA): the p123 experiment that DISABLED the
         # P1->P2 wm_best warm-restore in curriculum mode was REVERTED — it
@@ -7432,16 +7519,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _fz = model.set_world_model_trainable(
                         g=False, dob=False, reward=True)
                     _wm_frozen_now = True
-                    # Re-enable domain randomization for the actor (the WM is now
-                    # frozen + identified clean, so DR no longer biases it; it
-                    # gives the real-data buffer/critic runtime-robustness spread).
-                    _dr_on = (env.set_domain_randomization(True)
-                              if bool(getattr(cfg, 'curriculum_wm_id_dr_off', True))
-                              else False)
+                    # Stage A (p135): DR stays OFF on the REAL plant.  The old
+                    # Stage-3 re-enable created a train/imagination mismatch (the
+                    # actor saw a ±frac-randomised real loop gain but imagined on
+                    # the nominal frozen WM -> p134 actor regression).  Actor
+                    # loop-gain robustness now comes from IMAGINATION-time gain
+                    # randomization (cfg.actor_imag_gain_random_frac, applied in
+                    # _imagination_step_rssm).  The unmeasured OU disturbance
+                    # still rides the real P3 data (it is a feed-forward target,
+                    # not a robustness perturbation).
+                    _igf = float(getattr(cfg, 'actor_imag_gain_random_frac', 0.0) or 0.0)
                     _desc = ('actor/critic on FROZEN WM+DOB (disturbance '
-                             f'{env._disturbance_prob_override:.2f} + domain '
-                             f'randomization {"RE-ON" if _dr_on else "on"} '
-                             '-> runtime robustness)')
+                             f'{env._disturbance_prob_override:.2f}; real-plant '
+                             f'DR OFF; imagination loop-gain rand '
+                             f'±{_igf:.3f} -> runtime robustness)')
                 print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
                       f"steps{total_env_steps}: {_desc} "
                       f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "

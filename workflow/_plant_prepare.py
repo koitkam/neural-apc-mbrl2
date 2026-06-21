@@ -468,6 +468,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # + DOB identification (clean nominal-plant gain), back ON for the Stage-3
     # actor.  =0 to keep DR on throughout (the old, gain-biasing behaviour).
     'DREAMER_CURRICULUM_WM_ID_DR_OFF':    ('curriculum_wm_id_dr_off',        _as_bool),
+    # Stage A (p135): actor-imagination loop-gain randomization spread (replaces
+    # the Stage-3 real-data DR).  Float; 0 disables; unset -> auto (inherit the
+    # sim's DR output-gain frac).  See TrainConfig.actor_imag_gain_random_frac.
+    'DREAMER_ACTOR_IMAG_GAIN_RANDOM_FRAC':('actor_imag_gain_random_frac',    float),
     # #1 (P88): critic real-grounding rebalance (down-weight imagined critic CE
     # so the real-return anchor dominates -> breaks bootstrap self-dominance).
     'DREAMER_CRITIC_IMAG_LOSS_COEF':      ('critic_imag_loss_coef',          float),
