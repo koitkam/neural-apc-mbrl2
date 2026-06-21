@@ -322,6 +322,16 @@ def compute_transfer_matrix(model, env, cfg, device, *,
 
     cells: Dict[str, Dict] = {}
     t_axis = list(range(H))
+    # OBSERVED-MV indices in the obs vector (state-led).  The gain denominator
+    # uses the MV the plant ACTUALLY saw (the settled actuator position), NOT
+    # the commanded action: the env action-map range (mv_normalization_ranges)
+    # can exceed the sim's actuator clip, so at extreme test levels the
+    # commanded ΔMV overstates the realised ΔMV and DEFLATES the gain (the
+    # spurious wide band; p136 RCA).  Mirrors the DV path (observed DV) and is
+    # robust to actuator clipping AND plant nonlinearity (local realised gain).
+    # Falls back to the commanded control if mv_indices are unavailable.
+    _mv_obs_idx = (list(env.meta.get('mv_indices') or [])
+                   or list(getattr(env.sim, 'mv_indices', []) or []))
     for j in range(n_mv):
         for lev in levels:
             base_action = np.zeros(n_mv, dtype='float32')
@@ -338,16 +348,28 @@ def compute_transfer_matrix(model, env, cfg, device, *,
                 pred_obs = _wm_rollout(model, lb_obs, lb_act, act_seq, H,
                                        device, k_max)
                 real_obs, stepped_ctrl = _real_step_rollout(env, stepped, H)
-                d_mv_eng = float(stepped_ctrl[j] - base_ctrl[j])
+                # ΔMV from the OBSERVED actuator position (settled base ->
+                # settled stepped), de-normalised — robust to actuator clipping
+                # + nonlinearity.  Baseline ``pre`` is the settled base obs (NOT
+                # real_obs[0], whose MV has already jumped under the fast
+                # actuator) so ΔCV and ΔMV share the same reference, consistent
+                # with the DV path.
+                if 0 <= j < len(_mv_obs_idx):
+                    _mvi = int(_mv_obs_idx[j])
+                    _mv_sd = float(obs_std[_mvi]) if _mvi < len(obs_std) else 1.0
+                    d_mv_eng = float((real_obs[-1, _mvi] - _settled[_mvi]) * _mv_sd)
+                    pre = _settled
+                else:  # fallback: commanded control (legacy)
+                    d_mv_eng = float(stepped_ctrl[j] - base_ctrl[j])
+                    pre = real_obs[0]
                 if abs(d_mv_eng) < 1e-9:
                     continue
-                pre = real_obs[0]      # response measured vs first settled obs
                 for ci, c in enumerate(cv_idx):
                     sd = float(obs_std[c]) if c < len(obs_std) else 1.0
                     # ΔCV engineering = ΔCV_norm * channel_std; transfer gain
                     # = ΔCV_eng / ΔMV_eng.
                     g_wm = (pred_obs[:, c] - pre[c]) * sd / d_mv_eng
-                    g_real = (real_obs[:, c] - real_obs[0, c]) * sd / d_mv_eng
+                    g_real = (real_obs[:, c] - pre[c]) * sd / d_mv_eng
                     key = f'{cv_names[ci]}<-{mv_names[j]}'
                     cells.setdefault(key, {'wm': [], 'real': []})
                     cells[key]['wm'].append(g_wm.astype('float32'))
