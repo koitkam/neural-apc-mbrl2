@@ -261,6 +261,21 @@ class RSSMDynamics(nn.Module):
         self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim
                             + self._dv_feed_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
+        # Direct DV→obs FEEDFORWARD SKIP (2026-06-20, p132 RCA).  The measured
+        # DV is a single channel concatenated into the ~1500-d decoder MLP input
+        # — its gradient is diluted ~1/1500, so the decoder under-uses it and the
+        # DV→CV gain still dies in the autoencoder (p132 DV real→post 0.67 < MV
+        # 0.84, i.e. the "direct" dv-feedforward is NOT actually direct).  This
+        # linear skip gives the exogenous DV a CLEAN, high-gradient path straight
+        # to the reconstructed obs (g(h,z,dv) + W·dv), bypassing BOTH the dilution
+        # AND the categorical bottleneck — exactly the role dv-feedforward was
+        # meant to play.  ZERO-INIT ⇒ starts as an exact no-op (byte-identical to
+        # the pre-skip decode) and learns the clean ∂CV/∂dv from the residual.
+        self.dv_skip = (nn.Linear(self._dv_feed_dim, self.obs_dim)
+                        if self._dv_feed_dim > 0 else None)
+        if self.dv_skip is not None:
+            nn.init.zeros_(self.dv_skip.weight)
+            nn.init.zeros_(self.dv_skip.bias)
         # Recurrent dynamics: pre-GRU projection then GRUCell.
         self.pre_gru = _MLP(trans_in, trans_in,
                             hidden_dim=self.hidden_dim, num_layers=1)
@@ -490,7 +505,13 @@ class RSSMDynamics(nn.Module):
         # of the contiguous front slice, while any DOB d-tail beyond it is
         # sliced OFF (re-added by ``apply_dob``).  When DV-feedforward and DOB
         # are both off, ``feat`` is already core-width so this is a no-op slice.
-        return self.decoder(feat[..., :self._decode_in_dim])
+        x = feat[..., :self._decode_in_dim]
+        out = self.decoder(x)
+        if self.dv_skip is not None:
+            core = self.deter_dim + self.stoch_flat_dim
+            dv = feat[..., core:core + self._dv_feed_dim]
+            out = out + self.dv_skip(dv)
+        return out
 
 
 # ---------------------------------------------------------------------------

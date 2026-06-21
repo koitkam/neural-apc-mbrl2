@@ -509,8 +509,13 @@ class TrainConfig:
     # target dominates.  Default 1.0 = p117 recipe — THIS is the knob that keeps
     # ``critic_rew_to_tgt_var`` healthy and stops the return_scale runaway/
     # bootstrap cascade (p120 regressed to 0.0 -> return_scale 139).  Promoted
-    # 2026-06-14 (was 0.0).  Env ``DREAMER_CRITIC_MC_GROUNDING_COEF``.
-    critic_mc_grounding_coef: float = 1.0
+    # 2026-06-14 (was 0.0).  2026-06-20 (p132 RCA): raised 1.0->2.0 — at 1.0 the
+    # grounding held EARLY P3 (rew_to_tgt_var 0.019) but DECAYED to 0.002 by P3
+    # end (bootstrap re-dominated -> the actor's advantage oscillated, imag_adv_
+    # action_corr swung 0.01<->0.59).  A stronger real-MC anchor (2.0, now ~6.7x
+    # the imag CE 0.3) pins the critic baseline to realised economics through all
+    # of P3 -> a STABLE advantage -> a calmer actor.  Env DREAMER_CRITIC_MC_GROUNDING_COEF.
+    critic_mc_grounding_coef: float = 2.0
     # When True, cap the MC return with a single discounted tail bootstrap
     # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
     # (default) the return is PURE MC (truncated at the segment end).  At

@@ -894,6 +894,52 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   (`wm_transfer_matrix.json` + `wm_posterior_prior_decomp.json`); the DOB `d_t` stops drifting (R² up off −6.07, no
   sign flip in `wm_disturbance_prediction.png`); `cv_viol` down further — with the val CIs for attribution.
 
+### p132 — VERDICT: tail-weighting FIXED the compounding, but the autoencoder is the residual ceiling; data is GOOD
+- **Tail-weighting worked on its target**: MV **1step→openloop ×0.876→×0.964** (the compounding contraction is
+  largely fixed, exactly as designed). But the **autoencoder regressed** (MV real→post 0.909→0.837 — mostly
+  run-to-run variance: real→post bounces 0.84–0.945 across runs), so net MV open-loop **0.856** (~flat), and DV
+  regressed to **0.686**. The lever flipped back to `autoencoder` for both channels (prior stays perfect ×1.000).
+- **Disturbance** (detrended, control-relevant): **det R² 0.05 / det r 0.52** — far below p129's 0.59/0.78. The
+  drift fell (drift_sd 0.64) but the **dynamic error is high** (dyn_sd 1.02), tracking the DV-gain regression.
+- **Actor**: `cum_raw` **−144k** (↑ from −182k), `mv_viol` 0.11 (↓), `cv_viol` 99.5 — but `imag_adv_action_corr`
+  **oscillates 0.01↔0.59** and `critic_rew_to_tgt_var` decays **0.019→0.002** (bootstrap re-dominates P3).
+- **Two user hypotheses FALSIFIED by measurement (valuable):** (1) **MV/DV correlation in the injected data** —
+  measured `corr(MV,DV)=+0.004`, var-ratio 1.35 ⇒ **decorrelated + balanced** (the env drives the DV in MV-PRBS
+  episodes too, independently). The data is good; the bias is **model-side**. (2) **raise `wm_recon_cv_weight`** —
+  measured the **CV is the *highest*-variance obs channel** (var 2.43 vs MV 1.01 / DV 1.39), already over-weighted
+  4×; raising it worsens the autoencoding "cheat" (reconstruct the CV *level*, not the input→CV *gain*). Confirmed
+  by p110 history (cv6→autoenc 0.783, cv3→0.815, cv1→0.844: **higher cv BACKFIRES**).
+- **Unifying RCA**: the **MV autoencoder ~0.84 ≈ p106's cv1 0.844** ⇒ the MV ceiling is the **categorical
+  autoencoder's fundamental small-signal-gain limit** (not data, not cv_weight). The **DV (0.67) sits *below* that
+  ceiling** ⇒ the dv-feedforward (1-dim drowned in the ~1500-d decoder MLP) is underutilized. The **actor
+  oscillation is downstream of the WM gain under-estimate** (control theory, p112-confirmed: an under-gained WM →
+  the actor over-actuates in imagination → overshoots the real, higher-gain plant → reduced phase margin).
+
+### p133 — fix: zero-init DV→obs decoder skip (DV gain) + stronger critic MC-grounding (actor stability)
+- **WM (Fix A)**: a **zero-init `dv → obs` linear skip** in the decoder of BOTH backbones — `out = decoder([h,z,dv])
+  + W·dv`, `W` zero-init ⇒ exact no-op at start, learns the clean `∂CV/∂dv` from the residual, giving the exogenous
+  DV a direct, high-gradient path that **bypasses both the ~1/1500 MLP dilution and the categorical bottleneck**.
+  Targets the worst gain (DV 0.67 < MV 0.84, which proves the dv-feedforward is *not* actually direct) and cleans
+  the DOB innovation. Readout: **DV decomp real→post** (should rise toward/above the MV ceiling).
+- **Critic (Fix B)**: `critic_mc_grounding_coef` **1.0→2.0** (now ~6.7× the imag CE 0.3). At 1.0 the real-economic
+  grounding held early P3 (rew_to_tgt_var 0.019) but decayed to 0.002 (bootstrap re-dominated → the advantage
+  oscillated). A stronger MC anchor pins the critic baseline to realised economics through all of P3 → a stable
+  advantage → a calmer actor. Readout: `critic_rew_to_tgt_var` stays >0.015.
+- **Why these two (separate readouts)**: the DV-skip reads via the DV decomp; the critic via `rew_to_tgt_var`. The
+  Kalman (#2) improves downstream of the DV gain; the actor (#4) improves downstream of both (correct DV loop +
+  grounded baseline). Kept tail-weighting, econ temper 0.25, dv_feedforward, detrend metric.
+- **Verification**: p133 smoke green (critic coef 2.0; dv_skip present + zero-init no-op + sensitive-to-dv after
+  training, both backbones; absent when `dv_dim=0`). dv-input / DOB (vectorized==per-step 1.5e-7) / curriculum
+  green on both backbones.
+- **Designed-but-deferred (the MV ceiling — the real WM frontier; user decides the bigger bet)**: `rssm_n_classes`
+  32→48 (categorical capacity), OR a continuous-latent component, OR a direct **identified-gain-matching** aux loss
+  (match the WM's N-step step-response asymptote to the `dynamics_id` gain). `wm_recon_cv_weight` is **not** the
+  lever — do not raise it (the p110 + variance evidence says lower-is-better for the autoencoder).
+- **Judge by**: DV decomp real→post up (skip works) + disturbance **det R²** up off 0.05 + `critic_rew_to_tgt_var`
+  holds >0.015 through P3 + `imag_adv_action_corr` stops oscillating + `cum_raw`/`cv_viol` improve — val CIs for
+  attribution.
+
+
 
 
 

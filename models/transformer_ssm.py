@@ -339,6 +339,18 @@ class TransformerSSMDynamics(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
+        # Direct DV→obs FEEDFORWARD SKIP (2026-06-20, p132 RCA; mirror of
+        # RSSMDynamics).  The single measured-DV channel is diluted ~1/(d_model)
+        # inside the decoder MLP, so the DV→CV gain still dies in the autoencoder
+        # (p132 DV real→post < MV).  This zero-init linear skip gives the DV a
+        # clean direct path to the reconstructed obs (decode + W·dv), bypassing
+        # the dilution + the categorical bottleneck.  Zero-init ⇒ exact no-op at
+        # start; learns ∂CV/∂dv from the residual.
+        self.dv_skip = (nn.Linear(self._dv_feed_dim, self.obs_dim)
+                        if self._dv_feed_dim > 0 else None)
+        if self.dv_skip is not None:
+            nn.init.zeros_(self.dv_skip.weight)
+            nn.init.zeros_(self.dv_skip.bias)
         # Token projection: [z_{t-1}_flat ; a_t ; (dv_t)] -> d_model.
         self.token_proj = nn.Linear(
             self.stoch_flat_dim + self.action_dim + self.dv_dim,
@@ -416,7 +428,13 @@ class TransformerSSMDynamics(nn.Module):
         # ``[h, z, (dv)]`` (the contiguous front slice); any DOB d-tail beyond
         # it is sliced off (re-added by ``apply_dob``).  No-op slice when both
         # DV-feedforward and the DOB are off.
-        return self.decoder(feat[..., :self._decode_in_dim])
+        x = feat[..., :self._decode_in_dim]
+        out = self.decoder(x)
+        if self.dv_skip is not None:
+            core = self.deter_dim + self.stoch_flat_dim
+            dv = feat[..., core:core + self._dv_feed_dim]
+            out = out + self.dv_skip(dv)
+        return out
 
     def initial_state(self, batch_size: int,
                       device: torch.device) -> TSSMState:
