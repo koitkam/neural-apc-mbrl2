@@ -464,6 +464,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_CURRICULUM_ENABLED':         ('curriculum_enabled',             _as_bool),
     'DREAMER_CURRICULUM_STAGE2_DISTURBANCE_PROB': ('curriculum_stage2_disturbance_prob', float),
     'DREAMER_CURRICULUM_STAGE3_DISTURBANCE_PROB': ('curriculum_stage3_disturbance_prob', float),
+    # DR RCA (2026-06-20): gate domain randomization OFF during the Stage-1/2 WM
+    # + DOB identification (clean nominal-plant gain), back ON for the Stage-3
+    # actor.  =0 to keep DR on throughout (the old, gain-biasing behaviour).
+    'DREAMER_CURRICULUM_WM_ID_DR_OFF':    ('curriculum_wm_id_dr_off',        _as_bool),
     # #1 (P88): critic real-grounding rebalance (down-weight imagined critic CE
     # so the real-return anchor dominates -> breaks bootstrap self-dominance).
     'DREAMER_CRITIC_IMAG_LOSS_COEF':      ('critic_imag_loss_coef',          float),

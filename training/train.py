@@ -681,6 +681,19 @@ class TrainConfig:
     # sees some clean episodes (covers the no-disturbance operating point).
     curriculum_stage2_disturbance_prob: float = 1.0
     curriculum_stage3_disturbance_prob: float = 0.85
+    # Domain-randomization (±frac output-gain/bias/actuator jitter) is an
+    # ACTOR-robustness mechanism, but it was active during the Stage-1/2 WORLD-
+    # MODEL identification too (initialised globally in SimNoiseWrapper, never
+    # stage-gated) — so the WM gain was fit to a RANDOMISED gain and scored
+    # against the NOMINAL plant (eval disables DR), forcing the categorical
+    # latent to model a gain DISTRIBUTION ⇒ a systematically ATTENUATED
+    # identified gain (the cross-run ~0.85 'ceiling').  When True the curriculum
+    # turns DR OFF for the seed collection + P1 (clean WM id) + P2 (DOB id), and
+    # back ON for P3 (the actor trains with runtime robustness on the FROZEN,
+    # now-unbiased WM).  Textbook system-ID: identify the plant clean, then
+    # design a robust controller.  Sim-agnostic (toggles the existing
+    # randomizer).  ``DREAMER_CURRICULUM_WM_ID_DR_OFF``.
+    curriculum_wm_id_dr_off: bool = True
 
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
@@ -1860,6 +1873,30 @@ class APCEnv:
         if dead <= 0 and sim is not None:
             dead = float(getattr(sim, 'dead_time', 0.0) or 0.0)
         return float(tau), float(dead)
+
+    def set_domain_randomization(self, enabled: bool) -> bool:
+        """Toggle the sim's per-episode domain randomizer (output gain/bias/
+        actuator-lag jitter).  Returns True if a randomizer was found.
+
+        Used by the staged curriculum (2026-06-20, p132 DR RCA): DR is an
+        ACTOR-robustness mechanism (Stage 3), but it was leaking into the
+        Stage-1/2 WORLD-MODEL identification — the WM was being fit to a
+        ±frac-randomised OUTPUT GAIN and then scored against the NOMINAL plant,
+        so the categorical latent had to model a gain DISTRIBUTION and the
+        identified gain came out attenuated (the same ~0.85 'ceiling' seen
+        across runs; the eval already disables DR via _quiet_env, so this is a
+        TRAIN-time confound).  Identify the plant CLEAN (DR off in P1/P2), then
+        randomise for the actor (DR on in P3).  ``frac`` is preserved so
+        re-enabling restores the configured magnitude.
+        """
+        sim = getattr(self, 'sim', None)
+        rd = getattr(sim, '_randomizer', None)
+        if rd is None and sim is not None:
+            rd = getattr(getattr(sim, '_sim', None), '_randomizer', None)
+        if rd is None or not hasattr(rd, 'enabled'):
+            return False
+        rd.enabled = bool(enabled)
+        return True
 
     def reset(self, *, exploration: bool = False) -> np.ndarray:
         state = self.sim.reset()
@@ -6960,10 +6997,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _fz = model.set_world_model_trainable(g=True, dob=False, reward=True)
         model.set_dob_active(False)
         env._disturbance_prob_override = 0.0
+        # DR RCA (2026-06-20): turn OFF domain randomization for the clean WM/DOB
+        # identification (seeds + P1 + P2) so the gain is fit to the NOMINAL
+        # plant (re-enabled at the Stage-3 transition for actor robustness).
+        _dr_gated = bool(getattr(cfg, 'curriculum_wm_id_dr_off', True))
+        _dr_found = env.set_domain_randomization(False) if _dr_gated else False
         print('[curriculum] ENABLED — staged clean->disturbance Kalman/DOB '
               'curriculum. Stage 1 (P1): CLEAN data + DOB suppressed -> WM '
               f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
-              f'reward={_fz["reward"]} tensors; disturbance prob=0).',
+              f'reward={_fz["reward"]} tensors; disturbance prob=0; '
+              f'domain_randomization={"OFF (re-on @P3)" if (_dr_gated and _dr_found) else "on"}).',
               flush=True)
         # NOTE (2026-06-16, p124 RCA): the p123 experiment that DISABLED the
         # P1->P2 wm_best warm-restore in curriculum mode was REVERTED — it
@@ -7389,9 +7432,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _fz = model.set_world_model_trainable(
                         g=False, dob=False, reward=True)
                     _wm_frozen_now = True
+                    # Re-enable domain randomization for the actor (the WM is now
+                    # frozen + identified clean, so DR no longer biases it; it
+                    # gives the real-data buffer/critic runtime-robustness spread).
+                    _dr_on = (env.set_domain_randomization(True)
+                              if bool(getattr(cfg, 'curriculum_wm_id_dr_off', True))
+                              else False)
                     _desc = ('actor/critic on FROZEN WM+DOB (disturbance '
                              f'{env._disturbance_prob_override:.2f} + domain '
-                             'randomization -> runtime robustness)')
+                             f'randomization {"RE-ON" if _dr_on else "on"} '
+                             '-> runtime robustness)')
                 print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
                       f"steps{total_env_steps}: {_desc} "
                       f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
