@@ -152,6 +152,26 @@ class TrainConfig:
     # robustness; switch to PMPO only for discrete-action sims if
     # desired (env: DREAMER_ACTOR_LOSS=pmpo).
     actor_loss_type: str = 'reinforce'
+    # ----- Actor KL trust region (p136, 2026-06-21) -----
+    # The REINFORCE surrogate above already NORMALISES the advantage
+    # (adv/return_scale + disturbance-baseline + clip) — that IS the paper's
+    # "normalized_advantage", and on its own it lets the policy HUNT (p135:
+    # actor_logp_mean swung 0.35↔10.7; the actor underperformed the static
+    # expert).  ``reinforce_actor_loss`` carries a built-in KL-to-prior term
+    # (a trust region) that was hard-disabled (kl_coef=0).  ``actor_kl_coef``>0
+    # enables it: a GENTLE penalty on KL(π ‖ π_prior) toward a periodically
+    # refreshed snapshot of the recent policy, damping the per-update policy
+    # swing WITHOUT PMPO's continuous-action-unstable advantage-sign split.
+    # Sim-agnostic (unitless KL nats).  0.0 = legacy (no trust region); PMPO
+    # remains the stronger fallback.  ``DREAMER_ACTOR_KL_COEF``.
+    actor_kl_coef: float = 0.3
+    # Phased-P3 trust-region prior refresh cadence (iters).  The phased run
+    # snapshots π_prior ONCE at P3 start (near-uniform) — a static KL anchor is
+    # an entropy pull, NOT a trust region.  Refreshing every N P3 iters makes
+    # KL(π‖π_prior) a MOVING trust region (penalises rapid change from the
+    # recent policy → anti-hunting).  0 = keep the once-at-start snapshot.
+    # Sim-agnostic.  ``DREAMER_P3_PRIOR_REFRESH_ITERS``.
+    p3_prior_refresh_iters: int = 5
 
     # ----- Plant / windowing -----
     lookback: int = 32        # transformer context length T_ctx
@@ -635,9 +655,16 @@ class TrainConfig:
     # See docs/architecture.md §3.  ``dob_enabled=False`` = byte-identical to the
     # pre-DOB model.  Backbone-agnostic (RSSM + TSSM share feat->decode).  ENV:
     # DREAMER_DOB_ENABLED / _REG_COEF / _DECAY_INIT / _GAIN_INIT.
-    # Default True = p117 curriculum-recipe (promoted 2026-06-14; was False).
-    # Backbone-agnostic; sims with 0 CVs fall back to byte-identical pre-DOB.
-    dob_enabled: bool = True
+    # Default False (p136, 2026-06-21): the DOB was added to DE-CONFOUND the gain
+    # (omitted-variable attenuation), but the REAL confound was domain
+    # randomization — fixed in Stage A (DR-off ID → gain 0.84→0.97).  With the
+    # gain de-confounded, the DOB's job is subsumed: the frozen-g GRU latent
+    # already tracks the unmeasured disturbance (p109 read-out r=0.95) and the
+    # always-trainable disturbance_head reads it out.  So we identify clean
+    # (DR off, g frozen in Stage 2) WITHOUT the DOB and let the head be the
+    # disturbance estimator.  The DOB code is retained + gated (verify-then-strip):
+    # set True to restore the additive d_t observer.  ``DREAMER_DOB_ENABLED=1``.
+    dob_enabled: bool = False
     dob_reg_coef: float = 0.01      # L2 "process-noise-is-small" prior on d_t
     dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence (A)
     # sigmoid(-2.0)=0.119 — modest Kalman correction (K).  History: -2.2 (p121)
@@ -4311,15 +4338,18 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     imagined_agent_hid: List[torch.Tensor] = []
     imagined_agent_hid_pre: List[torch.Tensor] = []
 
-    # Stage A (p135): IMAGINATION-time loop-gain randomization.  Draw ONE
-    # per-rollout gain offset g~U(1-frac, 1+frac) (shape (B,1)), held CONSTANT
-    # over the horizon (a per-episode plant-gain offset), and scale the action
-    # FED TO THE DYNAMICS by it (the true action_t is still stored for the actor
-    # log-prob / economic cost).  The actor thus optimises E_g[return] -> a
-    # loop-gain-robust policy, replacing the old Stage-3 real-data DR that caused
-    # a train/imagination mismatch.  frac auto-inherits the sim's DR output-gain
-    # spread (resolved in the trainer); 0 disables.  Targets the MV->CV loop gain
-    # only (the held DV is untouched).
+    # Stage A (p135) + p136 refinement: IMAGINATION-time loop-gain randomization.
+    # Draw ONE gain offset g~U(1-frac, 1+frac) SHARED ACROSS THE WHOLE BATCH
+    # (shape (1,1)), held CONSTANT over the horizon, and scale the action FED TO
+    # THE DYNAMICS by it (true action_t is still stored for the actor log-prob /
+    # economic cost).  p136: shared-across-batch (was per-rollout (B,1)) so the
+    # per-horizon batch-mean advantage baseline cancels its common-mode return
+    # shift — per-rollout g injected cross-rollout variance that HALVED
+    # imag_adv_action_corr (p135 0.10 vs p134 0.19).  Robustness is preserved
+    # because g still varies across UPDATES (a fresh g each call), so the actor
+    # still optimises E_g[return] — just with a clean per-update advantage.
+    # frac auto-inherits the sim's DR output-gain spread; 0 disables.  Targets
+    # the MV->CV loop gain only (the held DV is untouched).
     _imag_gf = float(getattr(cfg, 'actor_imag_gain_random_frac', 0.0) or 0.0)
     _g_rand = None  # drawn lazily at h==0 (needs action_t's dtype/device)
 
@@ -4330,7 +4360,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
         # Loop-gain perturbation: scale the action fed to the DYNAMICS only.
         if _imag_gf > 0.0:
             if _g_rand is None:
-                _g_rand = 1.0 + (torch.rand(action_t.shape[0], 1,
+                _g_rand = 1.0 + (torch.rand(1, 1,
                                             device=action_t.device,
                                             dtype=action_t.dtype)
                                  * 2.0 - 1.0) * _imag_gf
@@ -4524,11 +4554,14 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
             alpha=cfg.pmpo_alpha, beta=cfg.pmpo_beta,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 0.0)))
     else:
+        # DreamerV3 REINFORCE (= normalized advantage).  p136: enable the
+        # built-in KL-to-prior trust region (actor_kl_coef>0) to damp the
+        # policy hunting; 0 = legacy off.
         actor_loss, pmpo_diag = reinforce_actor_loss(
             model.policy, model.prior_policy,
             feat_flat_for_policy, raws_flat, adv_flat,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 3e-4)),
-            kl_coef=0.0)
+            kl_coef=float(getattr(cfg, 'actor_kl_coef', 0.0) or 0.0))
 
     # Critic-health diagnostics (same readouts as the SF path).
     with torch.no_grad():
@@ -4941,14 +4974,15 @@ def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             alpha=cfg.pmpo_alpha, beta=cfg.pmpo_beta,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 0.0)))
     else:
-        # DreamerV3 REINFORCE — robust default, no per-sim retuning.
-        # The V4 KL-to-prior is left off (kl_coef=0); the bounded
-        # REINFORCE surrogate plus entropy bonus is sufficient anchor.
+        # DreamerV3 REINFORCE (= normalized advantage).  p136: enable the
+        # built-in KL-to-prior trust region (actor_kl_coef>0) to damp the
+        # policy hunting (the bounded surrogate + entropy alone let it swing);
+        # 0 = legacy off.
         actor_loss, pmpo_diag = reinforce_actor_loss(
             model.policy, model.prior_policy,
             feat_flat_for_policy, raws_flat, adv_flat,
             entropy_coef=float(getattr(cfg, 'pmpo_entropy_coef', 3e-4)),
-            kl_coef=0.0)
+            kl_coef=float(getattr(cfg, 'actor_kl_coef', 0.0) or 0.0))
 
     # ------------------------------------------------------------------
     # P41 diag: critic-training health.  Adds direct readouts of the
@@ -7037,6 +7071,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
     joint_prior_refresh_iters = int(
         getattr(cfg, 'joint_prior_refresh_iters', 0) or 0)
+    p3_prior_refresh_iters = int(
+        getattr(cfg, 'p3_prior_refresh_iters', 0) or 0)
     # ----- Staged clean->disturbance curriculum (2026-06-12) -----
     # Precondition: needs phased mode (it IS the phased curriculum) + the DOB.
     # If misconfigured, hard-disable with a loud warning rather than running a
@@ -7049,10 +7085,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               '(train_mode != joint) — it IS the phased curriculum.',
               flush=True)
         curriculum = False
-    if curriculum and not (bool(getattr(cfg, 'dob_enabled', False))
-                           and len(env.cv_indices) > 0):
-        print('[curriculum] DISABLED: curriculum_enabled requires dob_enabled '
-              '+ >=1 CV channel (the observer it identifies in Stage 2).',
+    # p136: the curriculum no longer REQUIRES the DOB — Stage 2 identifies the
+    # disturbance with the always-trainable disturbance_head (on the frozen g)
+    # when the DOB is off.  It needs a CV to control + SOME disturbance estimator
+    # (the DOB or the head).  This DECOUPLES the DR-off clean-WM-id gating (which
+    # lives inside this curriculum block) from dob_enabled, so turning the DOB
+    # off does NOT silently disable the curriculum and re-confound the gain.
+    _has_dist_est = (bool(getattr(cfg, 'dob_enabled', False))
+                     or bool(getattr(cfg, 'disturbance_head', True)))
+    if curriculum and not (len(env.cv_indices) > 0 and _has_dist_est):
+        print('[curriculum] DISABLED: curriculum needs >=1 CV channel + a '
+              'disturbance estimator (dob_enabled OR disturbance_head).',
               flush=True)
         curriculum = False
     # Resolve the actor-imagination loop-gain randomization spread ONCE (Stage A,
@@ -7089,8 +7132,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # and the actor has no real/imagination mismatch.
         _dr_gated = bool(getattr(cfg, 'curriculum_wm_id_dr_off', True))
         _dr_found = env.set_domain_randomization(False) if _dr_gated else False
-        print('[curriculum] ENABLED — staged clean->disturbance Kalman/DOB '
-              'curriculum. Stage 1 (P1): CLEAN data + DOB suppressed -> WM '
+        print('[curriculum] ENABLED — staged clean->disturbance curriculum '
+              f'(disturbance estimator: {"DOB (neural-Kalman d_t)" if bool(getattr(cfg, "dob_enabled", False)) else "disturbance_head readout"}). '
+              'Stage 1 (P1): CLEAN data -> WM '
               f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
               f'reward={_fz["reward"]} tensors; disturbance prob=0; '
               f'domain_randomization={"OFF (all stages; actor robustness via imagination gain-rand)" if (_dr_gated and _dr_found) else "on"}).',
@@ -7500,22 +7544,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     model.set_dob_active(False)
                     _fz = model.set_world_model_trainable(
                         g=True, dob=False, reward=True)
-                    _desc = ('CLEAN-WM id (g trains, DOB suppressed, '
-                             'disturbance 0)')
+                    _desc = ('CLEAN-WM id (g trains, '
+                             + ('DOB suppressed, ' if bool(getattr(cfg, 'dob_enabled', False)) else '')
+                             + 'disturbance 0)')
                 elif _cur_stage == 2:
-                    # Freeze g, turn the observer ON, keep wm_total in the P2
-                    # loss so the recon innovation trains A,K on the FROZEN g.
-                    model.set_dob_active(True)
+                    # Freeze g (protect the clean Stage-1 gain), turn the
+                    # disturbance estimator ON, keep wm_total so its innovation
+                    # trains the estimator on the FROZEN g.  With the DOB on this
+                    # is the neural-Kalman A,K; with the DOB off (p136 default)
+                    # it is the always-trainable disturbance_head reading the
+                    # frozen GRU latent's disturbance tracking.
+                    _dob_on = bool(getattr(cfg, 'dob_enabled', False))
+                    model.set_dob_active(_dob_on)
                     _fz = model.set_world_model_trainable(
-                        g=False, dob=True, reward=True)
-                    _desc = ('DOB id (g FROZEN, observer A,K + reward train '
-                             f'via recon innovation, disturbance '
+                        g=False, dob=_dob_on, reward=True)
+                    _est = ('DOB id (observer A,K)' if _dob_on
+                            else 'disturbance-head id (frozen-g readout)')
+                    _desc = (f'{_est} (g FROZEN + reward train via recon '
+                             f'innovation, disturbance '
                              f'{env._disturbance_prob_override:.2f})')
                 else:
                     # Freeze g AND the observer; actor/critic train on the
                     # static unbiased WM.  _wm_frozen_now drops wm_total in the
                     # P3 path so only reward-MTP + actor/critic optimise.
-                    model.set_dob_active(True)
+                    model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
                     _fz = model.set_world_model_trainable(
                         g=False, dob=False, reward=True)
                     _wm_frozen_now = True
@@ -7529,7 +7581,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # still rides the real P3 data (it is a feed-forward target,
                     # not a robustness perturbation).
                     _igf = float(getattr(cfg, 'actor_imag_gain_random_frac', 0.0) or 0.0)
-                    _desc = ('actor/critic on FROZEN WM+DOB (disturbance '
+                    _wmtag = 'WM+DOB' if bool(getattr(cfg, 'dob_enabled', False)) else 'WM'
+                    _desc = (f'actor/critic on FROZEN {_wmtag} (disturbance '
                              f'{env._disturbance_prob_override:.2f}; real-plant '
                              f'DR OFF; imagination loop-gain rand '
                              f'±{_igf:.3f} -> runtime robustness)')
@@ -8410,12 +8463,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
 
-        # neural-apc-mbrl JOINT mode: periodically refresh the PMPO prior
-        # policy so the KL anchor tracks a slowly-moving target over the long
-        # single-phase run (0 = keep the once-at-start snapshot).
-        if (joint_mode and joint_prior_refresh_iters > 0
-                and current_phase == 3 and p3_iters > 0
-                and (p3_iters % joint_prior_refresh_iters) == 0):
+        # Periodically refresh the KL trust-region prior so KL(π‖π_prior) tracks
+        # a slowly-moving target (a MOVING trust region, anti-hunting) instead of
+        # a static once-at-start snapshot.  JOINT: joint_prior_refresh_iters.
+        # PHASED P3 (p136): p3_prior_refresh_iters (the actor_kl_coef trust
+        # region needs a recent prior to BE a trust region, not an entropy pull).
+        _refresh_n = (joint_prior_refresh_iters if joint_mode
+                      else p3_prior_refresh_iters)
+        if (current_phase == 3 and p3_iters > 0 and _refresh_n > 0
+                and (p3_iters % _refresh_n) == 0):
             model.snapshot_prior_policy()
 
         total_iters += 1

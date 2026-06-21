@@ -472,6 +472,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # the Stage-3 real-data DR).  Float; 0 disables; unset -> auto (inherit the
     # sim's DR output-gain frac).  See TrainConfig.actor_imag_gain_random_frac.
     'DREAMER_ACTOR_IMAG_GAIN_RANDOM_FRAC':('actor_imag_gain_random_frac',    float),
+    # p136: actor KL trust region (damps policy hunting) + phased-P3 prior
+    # refresh cadence.  actor_kl_coef=0 disables (legacy); see TrainConfig.
+    'DREAMER_ACTOR_KL_COEF':              ('actor_kl_coef',                  float),
+    'DREAMER_P3_PRIOR_REFRESH_ITERS':     ('p3_prior_refresh_iters',         int),
     # #1 (P88): critic real-grounding rebalance (down-weight imagined critic CE
     # so the real-return anchor dominates -> breaks bootstrap self-dominance).
     'DREAMER_CRITIC_IMAG_LOSS_COEF':      ('critic_imag_loss_coef',          float),
