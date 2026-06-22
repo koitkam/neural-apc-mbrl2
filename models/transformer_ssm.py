@@ -559,8 +559,9 @@ class TransformerSSMDynamics(nn.Module):
         """Teacher-forced posterior rollout over (B, T, *).  ``act[:, t]`` drives
         the transition INTO ``obs[:, t]`` (contemporaneous-action convention, as
         in RSSMDynamics).  Returns (feats, post_logits, prior_logits,
-        last_state, ds) with shapes (B, T, F), (B, T, K, C), (B, T, K, C), the
-        last state, and ds (B, T, n_cv) = per-step DOB estimate (None=off)."""
+        last_state, ds, cont) with shapes (B, T, F), (B, T, K, C), (B, T, K, C),
+        the last state, ds (B, T, n_cv) = per-step DOB estimate (None=off), and
+        cont = continuous-latent stats (always None on the TSSM scaffold)."""
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                         # (B, T, embed_dim)
@@ -617,4 +618,9 @@ class TransformerSSMDynamics(nn.Module):
                               d=ds[:, -1], dv=state.dv)
         else:
             feats = post_core
-        return feats, post_logits, prior_logits, state, ds
+        # 6th return = cont (continuous gain+disturbance latent stats), to match
+        # RSSMDynamics.rollout_observed's signature so the shared
+        # _rssm_world_model_loss unpacks both backbones.  The TSSM does NOT yet
+        # implement the cont latent (its transition is still a scaffold) → None
+        # (the loss skips the cont KL / gain-match when cont is None).
+        return feats, post_logits, prior_logits, state, ds, None

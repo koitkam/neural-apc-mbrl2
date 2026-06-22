@@ -70,7 +70,7 @@ def _check(wm_type):
     cfg, model, batch = _mk(wm_type, dob=False)
     rssm = model.dynamics
     assert not getattr(rssm, 'dob_enabled', False), 'DOB must be OFF by default'
-    feats, _pl, _prl, last, ds = rssm.rollout_observed(batch['obs'], batch['act'],
+    feats, _pl, _prl, last, ds, *_ = rssm.rollout_observed(batch['obs'], batch['act'],
                                                        sample=True)
     assert ds is None, 'ds must be None when DOB off'
     assert last.d is None, 'state.d must be None when DOB off'
@@ -86,7 +86,7 @@ def _check(wm_type):
     # A,K bounded in (0,1)
     A = float(rssm.dob_decay().mean()); K = float(rssm.dob_gain().mean())
     assert 0.0 < A < 1.0 and 0.0 < K < 1.0, f'A={A} K={K} must be in (0,1)'
-    feats, _pl, _prl, last, ds = rssm.rollout_observed(batch['obs'], batch['act'],
+    feats, _pl, _prl, last, ds, *_ = rssm.rollout_observed(batch['obs'], batch['act'],
                                                        sample=True)
     assert ds is not None and ds.shape == (3, cfg.seq_len, 1), f'ds shape {None if ds is None else ds.shape}'
     assert torch.isfinite(ds).all(), 'ds must be finite'
@@ -139,7 +139,7 @@ def _check_scope2(wm_type):
     rssm = model.dynamics
     core = rssm.deter_dim + rssm.stoch_flat_dim
     assert rssm.feat_dim == core, f'feat_dim off should be core={core}, got {rssm.feat_dim}'
-    feats_off, _, _, _last_off, _ = rssm.rollout_observed(
+    feats_off, _, _, _last_off, _, *_ = rssm.rollout_observed(
         batch['obs'], batch['act'], sample=True)
     assert feats_off.shape[-1] == core, f'feat width off {feats_off.shape[-1]} != {core}'
     print(f'[smoke] OK  DOB off: feat_dim == core == {core} [{wm_type}]')
@@ -151,7 +151,7 @@ def _check_scope2(wm_type):
     n_cv = rssm.n_cv
     assert rssm.feat_dim == core + n_cv, \
         f'feat_dim on should be {core + n_cv}, got {rssm.feat_dim}'
-    feats, _, _, _last, ds = rssm.rollout_observed(
+    feats, _, _, _last, ds, *_ = rssm.rollout_observed(
         batch['obs'], batch['act'], sample=True)
     assert feats.shape[-1] == core + n_cv, \
         f'feat width on {feats.shape[-1]} != {core + n_cv}'
@@ -174,7 +174,7 @@ def _check_scope2(wm_type):
     # the d-tail is DETACHED: a head's gradient must NOT leak into the DOB via
     # feat (the DOB is trained by the recon innovation, not the heads).
     model.zero_grad(set_to_none=True)
-    feats2, _, _, _, ds2 = rssm.rollout_observed(
+    feats2, _, _, _, ds2, *_ = rssm.rollout_observed(
         batch['obs'], batch['act'], sample=True)
     ds2.retain_grad()
     model.value(feats2[:, -1]).sum().backward()
@@ -225,7 +225,7 @@ def _check_compile_equiv(wm_type):
         ref_feats = torch.stack(ref_feats, dim=1)
         ref_ds = torch.stack(ref_ds, dim=1)
         # Vectorized rollout (the refactored production path).
-        feats, _pl, _prl, last, ds = rssm.rollout_observed(obs, act, sample=False)
+        feats, _pl, _prl, last, ds, *_ = rssm.rollout_observed(obs, act, sample=False)
     fe = float((feats - ref_feats).abs().max())
     de = float((ds - ref_ds).abs().max())
     assert fe < 1e-4, f'feats mismatch vs per-step ref: max|Δ|={fe}'

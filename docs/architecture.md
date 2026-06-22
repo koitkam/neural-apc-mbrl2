@@ -19,6 +19,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > real→posterior 0.77→0.94, confirming the unmeasured load was an omitted
 > variable attenuating the gain — exactly what the DOB de-confounds.
 
+> **2026-06-22:** the **continuous gain+disturbance latent (§3b, C3)** supersedes
+> the DOB as the default direction (`DREAMER_CONT_LATENT_ENABLED=1`). One Gaussian
+> latent fixes BOTH the subdominant DV-gain categorical-attenuation bias (≈0.85,
+> via the C(1) gain-match) AND the unmeasured-disturbance estimate (an inherent
+> amortized Kalman, **no DOB**). The DOB stays in the code as a one-flag fallback
+> (`DREAMER_DOB_ENABLED=1`) until the cont disturbance is verified to recover
+> (detrended r ≥ the DOB's 0.354). First run: p137.
+
 ---
 
 ## 1. Full architecture (training)
@@ -176,6 +184,58 @@ Implemented once at the shared `feat → decode` interface so RSSM + TSSM share 
 observer math. Env knobs: `DREAMER_DOB_ENABLED` / `_REG_COEF` / `_DECAY_INIT` /
 `_GAIN_INIT`. Verified by `tools/_smoke_dob.py` (both backbones: A/K bounded,
 decay/correct, CV-only add, grad-isolated into `opt_world`).
+
+---
+
+## 3b. [current] Continuous gain+disturbance latent (C3) — the DOB-free direction
+
+Shipped 2026-06-22 (`DREAMER_CONT_LATENT_ENABLED=1`, first run p137). A small
+**Gaussian latent alongside the categorical** (`_ContinuousLatent` in
+`models/dreamer_v4_rssm.py`) gives the precision-critical **continuous** quantities
+an un-quantized home that the 32-class categorical attenuates — the shared root
+cause of (a) the subdominant DV-gain bias (≈0.85) and (b) the disturbance read-out
+collapse when the DOB is removed (p136: head amplitude 2% of true). One change
+fixes BOTH:
+
+- **GAIN block** (`cont_gain_dim = n_cv·(n_mv+n_dv)`): inferred in-context from the
+  lookback, feeds the GRU (so `h` carries the per-episode gain forward) **and**
+  the decoder. Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
+  finite-difference step-response asymptote (roll the prior K=`gain_match_len`
+  steps, held baseline vs +`gain_match_step` per MV/DV input, ΔCV/step) matched to
+  the identified steady-state gain in WM-normalized units
+  (`gain_match_mv_target`/`gain_match_dv_target`, resolved by
+  `_resolve_gain_match_targets` from `dynamics_identification.json` + obs-norm +
+  action scale: `g_dv_norm = g_eng·obs_std[dv]/obs_std[cv]`,
+  `g_mv_norm = g_eng·mv_action_scale/obs_std[cv]`). `sample=False` freezes the
+  categorical so the gain gradient flows into the continuous channel + decoder —
+  the un-cheatable DC supervisor.
+- **DISTURBANCE block** (`cont_dist_dim = n_cv`): an **inherent amortized Kalman**
+  — the posterior `q(c|h,embed)` infers it from the innovation, the prior
+  `p(c|h)` rolls it forward (OU), the KL-balanced free-bits continuous KL
+  (`rssm_cont_kl_loss`) trains the roll-forward. Replaces the bolt-on DOB; the
+  actor reads it in `feat` for feedforward.
+
+`feat = [h, z_flat, c, (dv), (d)]`; the decoder reads `[h, z, c, (dv)]`. Both
+blocks feed the GRU transition. `cont_gain_dim == cont_dist_dim == 0` ⇒
+byte-identical to the pre-cont model (regression-verified). Env knobs:
+`DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /
+`_KL_SCALE` / `_GAIN_PERSIST_COEF`, `DREAMER_GAIN_MATCH_COEF` / `_LEN` /
+`_MAX_STARTS` / `_STEP`. Threaded through all 5 `DreamerV4Config` build sites.
+**RSSM is the runnable path (p137 live-validated: `cont_kl`, `gain_match_loss`
+compute, targets resolve); TSSM parity is config-threaded but the transformer
+transition is still a scaffold.**
+
+### Continuous-latent curriculum (the simplified path)
+
+When `cont_latent_enabled` (DOB off), the staged §4 curriculum is replaced by the
+`_cont_curric` branch in `train()`: **WM-id (P1+P2): `g` TRAINS WITH the
+disturbance present** — the cont gain channel + gain-match de-confound the gain
+*inherently*, so there is **no clean-P1 / frozen-g-P2 staging** (that existed only
+to protect the gain from the disturbance/DR confound), and the cont disturbance
+channel learns from the disturbance being present — then **actor on the frozen WM
+(P3)**. DR stays **off** (robustness via imagination gain-rand). **DR-on for
+in-context gain ADAPTIVITY is the next-run item, gated on a gain-tracking probe
+(verify the gain channel infers the per-episode gain before enabling DR-on).**
 
 ---
 

@@ -122,14 +122,14 @@ def _check(wm_type):
 
     # ---- dob_active toggles d_t zero/non-zero; feat width constant ----
     model.set_dob_active(False)
-    _f, _, _, _last, ds_off = rssm.rollout_observed(batch['obs'], batch['act'],
+    _f, _, _, _last, ds_off, *_ = rssm.rollout_observed(batch['obs'], batch['act'],
                                                     sample=True)
     assert ds_off is not None and float(ds_off.abs().sum()) == 0.0, \
         'suppressed d_t must be exactly zero'
     assert _f.shape[-1] == core + n_cv, 'feat width must stay core+n_cv'
     assert float(_f[..., core:].abs().sum()) == 0.0, 'suppressed d-tail !=0'
     model.set_dob_active(True)
-    _f2, _, _, _l2, ds_on = rssm.rollout_observed(batch['obs'], batch['act'],
+    _f2, _, _, _l2, ds_on, *_ = rssm.rollout_observed(batch['obs'], batch['act'],
                                                   sample=True)
     assert ds_on is not None and float(ds_on.abs().sum()) > 0.0, \
         'active d_t must be non-zero'
