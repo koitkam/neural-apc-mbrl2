@@ -160,6 +160,14 @@ class TransformerSSMConfig:
     cv_indices: Tuple[int, ...] = ()
     dob_decay_init: float = 3.0
     dob_gain_init: float = -2.2
+    # Continuous gain+disturbance latent (2026-06-22) — mirror of RSSMConfig.
+    # A Gaussian latent alongside the categorical for the precision-critical
+    # gain (supervised, in-context DR) + unmeasured disturbance (amortized
+    # Kalman).  cont_gain_dim==cont_dist_dim==0 ⇒ pre-continuous-latent model.
+    cont_gain_dim: int = 0
+    cont_dist_dim: int = 0
+    cont_min_std: float = 0.1
+    cont_max_std: float = 2.0
 
 
 @dataclass

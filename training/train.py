@@ -164,7 +164,13 @@ class TrainConfig:
     # swing WITHOUT PMPO's continuous-action-unstable advantage-sign split.
     # Sim-agnostic (unitless KL nats).  0.0 = legacy (no trust region); PMPO
     # remains the stronger fallback.  ``DREAMER_ACTOR_KL_COEF``.
-    actor_kl_coef: float = 0.3
+    # REVERTED 0.3→0.0 (p136 verdict 2026-06-22): the KL trust region did NOT
+    # prevent the entropy collapse (actor_kl_pen faded to 0.001 — a refreshed-
+    # prior TR follows a SLOW σ-collapse, the wrong mechanism) and only added a
+    # confound.  The p136 collapse was DOWNSTREAM of the missing disturbance in
+    # imagination (DOB removed); the continuous-latent disturbance restores the
+    # objective.  Re-enable only if the policy HUNTS once the objective is fixed.
+    actor_kl_coef: float = 0.0
     # Phased-P3 trust-region prior refresh cadence (iters).  The phased run
     # snapshots π_prior ONCE at P3 start (near-uniform) — a static KL anchor is
     # an entropy pull, NOT a trust region.  Refreshing every N P3 iters makes
@@ -759,6 +765,41 @@ class TrainConfig:
     rssm_free_bits: float = 0.5        # p117 recipe (promoted 2026-06-14; paper=1.0)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
     rssm_kl_repr_w: float = 0.1        # paper KL-balance repr weight
+    # ---- Continuous gain + disturbance latent (2026-06-22) ----
+    # A Gaussian latent ALONGSIDE the categorical, giving precision-critical
+    # CONTINUOUS quantities an un-quantized home the categorical attenuates:
+    #   * cont_gain_dim = the in-context GAIN block (supervised by C(1) toward
+    #     the identified steady-state gain → fixes the DV categorical-attenuation
+    #     bias + carries the per-episode gain so the WM ADAPTS to DR), and
+    #   * cont_dist_dim = the unmeasured-DISTURBANCE block (= n_cv; an amortized
+    #     Kalman state inferred from the innovation + rolled by the prior — the
+    #     INHERENT, DOB-free disturbance estimator).
+    # ``cont_latent_enabled=False`` (or both dims 0) ⇒ pre-continuous-latent
+    # model.  When enabled the dims are auto-resolved from the plant
+    # (cont_dist_dim=n_cv, cont_gain_dim=n_cv·(n_mv+n_dv)).  Backbone-agnostic
+    # (RSSM + TSSM); every field is a TrainConfig knob so BO inherits it.
+    cont_latent_enabled: bool = False
+    cont_gain_dim: int = 0
+    cont_dist_dim: int = 0
+    cont_min_std: float = 0.1
+    cont_max_std: float = 2.0
+    cont_free_bits: float = 0.5
+    cont_kl_scale: float = 1.0
+    # C(1) gain-matching: supervise the WM's finite-difference step-response
+    # ASYMPTOTE toward the identified steady-state gain (the un-cheatable DC
+    # supervisor that pins the subdominant DV gain).  Resolved >0 only when the
+    # continuous gain channel is on AND the identified gains are available.
+    gain_match_coef: float = 0.0
+    gain_match_len: int = 0            # K step-response rollout steps (= horizon)
+    gain_match_max_starts: int = 6
+    gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
+    # Resolved gain targets (WM/normalized units): per-input rows of n_cv gains.
+    # ``*_kinds``/``*_idx`` map each row to an action col (mv) or dv-vector col.
+    gain_match_mv_target: Tuple[Tuple[float, ...], ...] = ()
+    gain_match_dv_target: Tuple[Tuple[float, ...], ...] = ()
+    # Gain-channel persistence: a light L2 on the step-to-step change of the
+    # gain block (the gain is a per-episode CONSTANT, so it should not wander).
+    cont_gain_persist_coef: float = 0.0
     # DV-as-input (Option B, 2026-06-07): feed the measured disturbance-variable
     # channels as an EXOGENOUS transition input (teacher-forced from the real
     # obs in WM training; HELD CONSTANT over the imagination horizon = the MPC
@@ -1039,9 +1080,13 @@ class TrainConfig:
     expert_bc_p3: bool = True
     # Decay floor: the P3 BC weight decays expert_bc_scale*(1→floor) across
     # P3 (phase-length adaptive — stretches with the run).  A non-zero floor
-    # is a PERMANENT anti-reversion anchor; 0.05 keeps ~1/3 of the seed
-    # weight at the very end without overriding the matured RL gradient.
-    expert_bc_p3_floor: float = 0.05
+    # is a PERMANENT anti-reversion anchor.
+    # SET 0.05→0.0 (Fix B, 2026-06-22): the 0.05 floor is a permanent leash on
+    # the policy — the likely reason the actor never beats the static expert
+    # (p135 8%).  Decay the anchor fully to 0 so it warm-starts the policy in the
+    # expert basin then RELEASES it to find the economic optimum.  Re-add a small
+    # floor only if the actor reverts/diverges without the anchor late in P3.
+    expert_bc_p3_floor: float = 0.0
     # TD3+BC return-scale normalisation (Fujimoto 2021).  OPT-IN (default
     # off): REINFORCE already divides the advantage by return_scale, so the
     # PG gradient on μ is already O(1) regardless of scale and a fixed-weight
@@ -1390,6 +1435,11 @@ class TrainConfig:
     early_stop_entropy_collapse_frac: float = 0.20
     early_stop_entropy_collapse_window_iters: int = 30
     early_stop_entropy_collapse_min_frac_below: float = 0.70
+    # Performance gate (Fix B, 2026-06-22): an entropy-near-floor window is only
+    # a COLLAPSE if the policy is also degenerate.  Trip only when the recent
+    # median |imag_adv_action_corr| is below this — a committed-and-learning
+    # low-σ policy (high corr) is NOT killed.  0.0 ⇒ entropy-only (legacy).
+    early_stop_entropy_collapse_min_adv_corr: float = 0.05
     # Legacy: kept for backward compat with env-var overrides.  Set to
     # the same value as ``window_iters`` so single-streak users still get
     # a sensible default; the sliding-window check usually trips first.
@@ -3878,6 +3928,199 @@ def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
     return (se * w).mean()
 
 
+def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
+                        obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig
+                        ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """C(1): finite-difference step-response asymptote gain-matching (RSSM).
+
+    From a strided set of posterior start states, roll the PRIOR forward ``K``
+    steps under (a) a HELD baseline action/DV and (b) a unit STEP in each input
+    channel.  The DIFFERENCE of the decoded CV at step ``K`` cancels the common
+    transient and isolates the WM's realized STEADY-STATE gain ``ΔCV/Δinput``;
+    we match it to the identified gain (in WM/normalized units).  The continuous
+    gain channel gives the WM the un-quantized capacity this loss grabs onto, so
+    together they pin the subdominant DV gain the categorical attenuates.
+
+    ``sample=False`` freezes the categorical at its argmax so the gain gradient
+    flows into the CONTINUOUS gain channel + decoder + GRU (not the categorical
+    we are trying to bypass).  RSSM-only; ``(0, {})`` otherwise / when off.
+    """
+    zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
+    diag: Dict[str, torch.Tensor] = {}
+    if float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0:
+        return zero, diag
+    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+        return zero, diag
+    rssm = model.dynamics
+    if int(getattr(rssm, 'cont_gain_dim', 0) or 0) <= 0 or rssm.n_cv <= 0:
+        return zero, diag
+    mv_target = list(getattr(cfg, 'gain_match_mv_target', ()) or ())
+    dv_target = list(getattr(cfg, 'gain_match_dv_target', ()) or ())
+    if not mv_target and not dv_target:
+        return zero, diag
+    from models.dreamer_v4_rssm import RSSMState
+    B, T = obs.shape[:2]
+    K = int(getattr(cfg, 'gain_match_len', 0) or 0)
+    K = min(K, T - 1) if K > 0 else (T - 1)
+    if K < 2:
+        return zero, diag
+    step = float(getattr(cfg, 'gain_match_step', 1.0) or 1.0)
+    max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
+    n_valid = T - K
+    if n_valid < 1:
+        return zero, diag
+    stride = max(1, n_valid // max_starts)
+    starts = torch.arange(0, n_valid, stride, device=obs.device)
+    S = int(starts.numel())
+    f0 = feats[:, starts]                                   # (B, S, F)
+    Bm = B * S
+    h0 = f0[..., :rssm.deter_dim].reshape(Bm, -1)
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    z0 = f0[..., rssm.deter_dim:_ze].reshape(
+        Bm, rssm.n_categoricals, rssm.n_classes)
+    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
+          if rssm.cont_dim > 0 else None)
+    cv_idx = rssm.cv_index_t
+
+    def _state():
+        return RSSMState(
+            h=h0.clone(),
+            z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
+                                 device=obs.device, dtype=f0.dtype),
+            z=z0.clone(), c=(c0.clone() if c0 is not None else None))
+
+    a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
+    dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+           if getattr(rssm, 'dv_dim', 0) > 0 else None)
+
+    def _roll(a_held, dv_held):
+        st = _state()
+        for _ in range(K):
+            st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
+        return rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
+
+    cv_base = _roll(a_base, dv0)
+    total = zero
+    nterm = 0
+    for j, tgt_row in enumerate(mv_target):                # MV: step the action
+        if j >= a_base.shape[-1]:
+            break
+        a_step = a_base.clone()
+        a_step[:, j] = a_step[:, j] + step
+        g_wm = (_roll(a_step, dv0) - cv_base) / step        # (Bm, n_cv)
+        tgt = torch.tensor(list(tgt_row), device=obs.device, dtype=g_wm.dtype)
+        total = total + (g_wm - tgt).pow(2).mean()
+        nterm += 1
+    if dv0 is not None:
+        for j, tgt_row in enumerate(dv_target):            # DV: step the DV input
+            if j >= dv0.shape[-1]:
+                break
+            dv_step = dv0.clone()
+            dv_step[:, j] = dv_step[:, j] + step
+            g_wm = (_roll(a_base, dv_step) - cv_base) / step
+            tgt = torch.tensor(list(tgt_row), device=obs.device,
+                               dtype=g_wm.dtype)
+            total = total + (g_wm - tgt).pow(2).mean()
+            nterm += 1
+    if nterm == 0:
+        return zero, diag
+    loss = total / float(nterm)
+    diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
+    return loss, diag
+
+
+def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
+    """C(1): convert the identified steady-state gains (engineering units) into
+    the WM's NORMALIZED units and store them on ``cfg`` for the gain-match loss.
+
+    Normalized-gain identities (the WM operates in obs-normalized space; the MV
+    enters as the raw action ∈[-1,1], the DV as the normalized obs channel):
+      * MV col:  ∂CV_norm/∂action = g_eng · (ΔMV_eng/Δaction) / cv_std
+                 where ΔMV_eng/Δaction = (mv_hi − mv_lo)/2 (the action map).
+      * DV col:  ∂CV_norm/∂dv_norm = g_eng · dv_std / cv_std.
+    ``g_eng = amplitude/delta`` (signed) averaged over the valid identified
+    step trials for each (input, CV) pair.  Raises on missing data → the caller
+    disables the loss (graceful no-op; the cont gain channel still trains via
+    recon).
+    """
+    out_dir = Path(getattr(cfg, 'out_dir', '.') or '.')
+    roots = [out_dir]
+    cur = out_dir
+    for _ in range(4):
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+        roots.append(cur)
+    raw = None
+    for root in roots:
+        for cand in (root / 'plant_id' / 'dynamics_identification.json',
+                     root / 'dynamics_identification.json'):
+            if cand.exists():
+                with open(cand) as _f:
+                    raw = json.load(_f) or {}
+                break
+        if raw:
+            break
+    if not raw:
+        raise FileNotFoundError('dynamics_identification.json not found')
+    acc: Dict[tuple, List[float]] = {}
+    for e in raw.get('per_pair_estimates', []) or []:
+        if not e.get('valid'):
+            continue
+        try:
+            delta = float(e.get('delta', 0.0))
+            amp = float(e.get('amplitude', 0.0))
+        except (TypeError, ValueError):
+            continue
+        if abs(delta) < 1e-9 or not np.isfinite(amp):
+            continue
+        it = str(e.get('input_type') or '')
+        inp = str(e.get('input') or e.get('mv') or e.get('dv') or '')
+        cvn = str(e.get('cv') or '')
+        if it and inp and cvn:
+            acc.setdefault((it, inp, cvn), []).append(amp / delta)
+    g_eng = {k: float(np.mean(v)) for k, v in acc.items()}
+    if not g_eng:
+        raise ValueError('no valid identified gain estimates')
+    sv = list(env.meta.get('state_variables', []) or [])
+
+    def _nm(idxs):
+        return [sv[i] if 0 <= i < len(sv) else f'idx{i}' for i in idxs]
+
+    mv_idx = [int(x) for x in (env.meta.get('mv_indices') or [])]
+    cv_idx = [int(x) for x in env.cv_indices]
+    dv_idx = [int(x) for x in (env.meta.get('dv_indices') or [])
+              if x is not None]
+    mv_names, cv_names, dv_names = _nm(mv_idx), _nm(cv_idx), _nm(dv_idx)
+    var = np.asarray(env.get_obs_norm_stats().get('var'), dtype='float64')
+    std = np.sqrt(np.clip(var, 1e-8, None))
+    cv_std = [float(std[i]) if i < len(std) else 1.0 for i in cv_idx]
+    dv_std = [float(std[i]) if i < len(std) else 1.0 for i in dv_idx]
+    mv_scale = [(float(hi) - float(lo)) / 2.0
+                for lo, hi in list(env.mv_norm_ranges)]
+    mv_target = []
+    for i, mvn in enumerate(mv_names):
+        sc = mv_scale[i] if i < len(mv_scale) else 1.0
+        mv_target.append(tuple(
+            float(g_eng.get(('mv', mvn, cvn), 0.0) * sc / max(cv_std[j], 1e-6))
+            for j, cvn in enumerate(cv_names)))
+    dv_target = []
+    for i, dvn in enumerate(dv_names):
+        dv_target.append(tuple(
+            float(g_eng.get(('dv', dvn, cvn), 0.0) * dv_std[i]
+                  / max(cv_std[j], 1e-6))
+            for j, cvn in enumerate(cv_names)))
+    cfg.gain_match_mv_target = tuple(mv_target)
+    cfg.gain_match_dv_target = tuple(dv_target)
+    if float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0:
+        cfg.gain_match_coef = 1.0
+    if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
+        cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
+    print(f'[gain-match] targets (WM-norm) mv={cfg.gain_match_mv_target} '
+          f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
+          f'len={cfg.gain_match_len}', flush=True)
+
+
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                             act: torch.Tensor, cfg: TrainConfig,
                             dist_target: Optional[torch.Tensor] = None,
@@ -3894,7 +4137,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     """
     from models.dreamer_v4_rssm import rssm_kl_loss
     rssm = model.dynamics
-    feats, post_logits, prior_logits, _last, ds = rssm.rollout_observed(
+    feats, post_logits, prior_logits, _last, ds, cont = rssm.rollout_observed(
         obs_cur, act, sample=True)               # feats (B,T,F); ds (B,T,n_cv)|None
     recon = rssm.decode(feats)                    # (B, T, obs_dim) = g(feat)
     # DOB (neural Kalman filter): add the disturbance estimate d_t into the CV
@@ -3911,6 +4154,29 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
         repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
     wm_total = cfg.recon_scale * recon_loss + kl_loss
+    # ----- continuous-latent KL (gain + disturbance channels) -----
+    # The Gaussian analogue of the categorical KL: trains the prior to ROLL the
+    # gain (persist) + disturbance (OU) forward so imagination carries them.
+    cont_kl = torch.zeros((), device=feats.device)
+    cont_gain_persist = torch.zeros((), device=feats.device)
+    if cont is not None:
+        from models.dreamer_v4_rssm import rssm_cont_kl_loss
+        cont_kl, _cont_kl_diag = rssm_cont_kl_loss(
+            cont['post_mean'], cont['post_std'],
+            cont['prior_mean'], cont['prior_std'],
+            free_bits=float(getattr(cfg, 'cont_free_bits', 0.5)),
+            dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
+            repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
+        wm_total = wm_total + float(getattr(cfg, 'cont_kl_scale', 1.0)) * cont_kl
+        # Gain-channel persistence: the gain block (first cont_gain_dim dims) is
+        # a per-episode CONSTANT → penalise its step-to-step drift so the channel
+        # holds a stable gain (separates it from the time-varying disturbance).
+        gp_coef = float(getattr(cfg, 'cont_gain_persist_coef', 0.0) or 0.0)
+        n_gain = int(getattr(model.dynamics, 'cont_gain_dim', 0) or 0)
+        if gp_coef > 0.0 and n_gain > 0:
+            g_seq = cont['sample'][..., :n_gain]           # (B, T, n_gain)
+            cont_gain_persist = (g_seq[:, 1:] - g_seq[:, :-1]).pow(2).mean()
+            wm_total = wm_total + gp_coef * cont_gain_persist
     # DOB regulariser: a small L2 prior that the disturbance estimate is small
     # (the Kalman "process noise is small" assumption).  Keeps d_t from absorbing
     # MORE than the genuine unexplained residual — the model prefers to explain
@@ -3961,6 +4227,16 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
     wm_total = wm_total + held_coef * held_loss
 
+    # ----- C(1) gain-matching step-response asymptote (RSSM) -----
+    # Supervise the WM's finite-difference step-response asymptote toward the
+    # identified steady-state gain — the un-cheatable DC supervisor that pins
+    # the subdominant DV gain the categorical attenuates (the continuous gain
+    # channel gives the WM the un-quantized CAPACITY this loss grabs onto).
+    gm_coef = float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0)
+    gain_match_loss, gain_match_diag = _wm_gain_match_loss(
+        model, feats, obs_cur, act, cfg)
+    wm_total = wm_total + gm_coef * gain_match_loss
+
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
         'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
@@ -3975,11 +4251,15 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=feats.device),
         'wm_held_rollout_loss': held_loss.detach(),
+        'cont_kl': cont_kl.detach(),
+        'cont_gain_persist': cont_gain_persist.detach(),
+        'gain_match_loss': gain_match_loss.detach(),
         'dob_reg': dob_reg.detach(),
         'dob_d_absmean': (ds.abs().mean().detach() if dob_on
                           else torch.zeros((), device=feats.device)),
     }
     losses.update(kl_diag)
+    losses.update(gain_match_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
     with torch.no_grad():
         # Scope 2: stochastic block only (exclude any DOB d-tail).
@@ -4316,7 +4596,7 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # are the per-step posterior features used by the replay-grounded
     # critic anchor.
     with torch.no_grad():
-        feats_real, _post_lg, _prior_lg, last_state, _ds_real = rssm.rollout_observed(
+        feats_real, _post_lg, _prior_lg, last_state, _ds_real, _cont_real = rssm.rollout_observed(
             obs, act, sample=True)
         agent_hid_real = feats_real                          # (B, T, F)
 
@@ -5089,6 +5369,10 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
         dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
+        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
+        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
+        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
+        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
     )
     model = DreamerV4(model_cfg)
     # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths
@@ -6341,6 +6625,26 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         cfg.dv_indices = ()
         cfg.dv_dim = 0
 
+    # ---- Continuous gain+disturbance latent dims (2026-06-22) ----
+    # Resolve from the plant when enabled: one DISTURBANCE channel per CV
+    # (the amortized-Kalman, DOB-free estimator) and one GAIN channel per
+    # (CV × input) where inputs = MVs + measured DVs (the un-quantized,
+    # in-context, C(1)-supervised gain).  Disabled (both 0) ⇒ pre-cont model.
+    if bool(getattr(cfg, 'cont_latent_enabled', False)) and len(env.cv_indices) > 0:
+        _n_cv = int(len(env.cv_indices))
+        _n_mv = int(len([x for x in (env.meta.get('mv_indices') or [])
+                         if x is not None]))
+        _n_dv = int(cfg.dv_dim)
+        cfg.cont_dist_dim = _n_cv
+        cfg.cont_gain_dim = _n_cv * (_n_mv + _n_dv)
+        print(f'[cont-latent] ENABLED: gain_dim={cfg.cont_gain_dim} '
+              f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})), '
+              f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator).',
+              flush=True)
+    else:
+        cfg.cont_gain_dim = 0
+        cfg.cont_dist_dim = 0
+
     # A' : enable potential-based reward shaping on the TRAINING env only.
     # Validation builds its own APCEnv instances (evaluation/validate.py)
     # which leave shaping OFF, so the audited economic score is unshaped.
@@ -6712,6 +7016,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         except Exception as exc:  # pragma: no cover — diagnostic only
             print(f"[snr] SKIPPED ({exc!r})", flush=True)
 
+    # ---- C(1) gain-match target resolution (2026-06-22) ----
+    # Now that obs-norm is populated (calibration ran episodes), convert the
+    # identified steady-state gains into WM-normalized units for the gain-match
+    # loss.  Only when the continuous gain channel is on; graceful no-op (coef
+    # stays 0, the channel still trains via recon) if the gains are unavailable.
+    if int(getattr(cfg, 'cont_gain_dim', 0) or 0) > 0:
+        try:
+            _resolve_gain_match_targets(env, cfg)
+        except Exception as _gm_exc:
+            print(f'[gain-match] target resolution SKIPPED ({_gm_exc!r}); '
+                  f'gain_match_coef=0 (cont gain channel still trains via '
+                  f'recon).', flush=True)
+            cfg.gain_match_coef = 0.0
+
     model = build_model(cfg).to(device)
 
     # ---- Optional warm-start from a previous run's checkpoint ----------
@@ -6840,6 +7158,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     iters_since_best: int = 0
     ent_collapse_streak: int = 0
     ent_window: List[float] = []
+    adv_corr_window: List[float] = []
     critic_div_streak: int = 0
     critic_loss_window: 'deque[float]' = deque(maxlen=200)
     # 2026-05-23 (P41 RCA): bootstrap-cascade canary state.  Captured
@@ -7115,6 +7434,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
           f"({'auto:sim-DR' if _imag_gf_cfg is None else 'explicit'})",
           flush=True)
     _cur_stage = 0
+    # Continuous-latent curriculum (2026-06-22): with the cont gain channel +
+    # C(1) gain-match de-confounding the gain INHERENTLY, there is NO clean-P1 /
+    # frozen-g-P2 staging — WM-id trains g WITH the disturbance present (so the
+    # cont disturbance channel learns the amortized-Kalman estimate), then the
+    # actor trains on the frozen WM.  (DOB off; the cont disturbance channel is
+    # the estimator.)
+    _cont_curric = (curriculum
+                    and bool(getattr(cfg, 'cont_latent_enabled', False))
+                    and not bool(getattr(cfg, 'dob_enabled', False))
+                    and len(env.cv_indices) > 0)
     if curriculum:
         # Stage-1 state applied BEFORE the seed fill so the seed buffer is
         # collected CLEAN (no hidden disturbance) and the DOB is suppressed
@@ -7124,7 +7453,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         wm_freeze_after_p1 = False
         _fz = model.set_world_model_trainable(g=True, dob=False, reward=True)
         model.set_dob_active(False)
-        env._disturbance_prob_override = 0.0
+        # Continuous-latent path: disturbance ON from the seed buffer onward
+        # (the cont disturbance channel needs it); the gain is protected by the
+        # cont gain channel + gain-match, not by clean data.  Legacy DOB path:
+        # clean seed (disturbance prob 0).
+        env._disturbance_prob_override = (
+            float(getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
+            if _cont_curric else 0.0)
         # DR RCA (2026-06-20): turn OFF domain randomization for the clean WM/DOB
         # identification.  Stage A (p135): DR now stays OFF for ALL stages (the
         # actor's loop-gain robustness is injected in IMAGINATION instead, see
@@ -7132,13 +7467,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # and the actor has no real/imagination mismatch.
         _dr_gated = bool(getattr(cfg, 'curriculum_wm_id_dr_off', True))
         _dr_found = env.set_domain_randomization(False) if _dr_gated else False
-        print('[curriculum] ENABLED — staged clean->disturbance curriculum '
-              f'(disturbance estimator: {"DOB (neural-Kalman d_t)" if bool(getattr(cfg, "dob_enabled", False)) else "disturbance_head readout"}). '
-              'Stage 1 (P1): CLEAN data -> WM '
-              f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
-              f'reward={_fz["reward"]} tensors; disturbance prob=0; '
-              f'domain_randomization={"OFF (all stages; actor robustness via imagination gain-rand)" if (_dr_gated and _dr_found) else "on"}).',
-              flush=True)
+        if _cont_curric:
+            print('[curriculum] ENABLED — continuous-latent curriculum '
+                  '(DOB-free; cont gain channel + C(1) gain-match de-confound '
+                  'the gain INHERENTLY). WM-id (P1+P2): g TRAINS WITH the '
+                  f'disturbance present (prob={env._disturbance_prob_override:.2f}) '
+                  'so the cont disturbance channel learns the amortized-Kalman '
+                  f'estimate (g={_fz["g"]} dob={_fz["dob"]} reward={_fz["reward"]} '
+                  f'tensors; domain_randomization='
+                  f'{"OFF (all stages; actor robustness via imagination gain-rand)" if (_dr_gated and _dr_found) else "on"}).',
+                  flush=True)
+        else:
+            print('[curriculum] ENABLED — staged clean->disturbance curriculum '
+                  f'(disturbance estimator: {"DOB (neural-Kalman d_t)" if bool(getattr(cfg, "dob_enabled", False)) else "disturbance_head readout"}). '
+                  'Stage 1 (P1): CLEAN data -> WM '
+                  f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
+                  f'reward={_fz["reward"]} tensors; disturbance prob=0; '
+                  f'domain_randomization={"OFF (all stages; actor robustness via imagination gain-rand)" if (_dr_gated and _dr_found) else "on"}).',
+                  flush=True)
         # NOTE (2026-06-16, p124 RCA): the p123 experiment that DISABLED the
         # P1->P2 wm_best warm-restore in curriculum mode was REVERTED — it
         # regressed the MV gain (warm-restore OFF p124 MV 0.849 vs ON p121-123
@@ -7530,7 +7876,41 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # per stage via the ``_cur_stage`` latch (idempotent; survives the
         # quality-gate phase extensions since it keys off the actual phase).
         if curriculum:
-            if int(current_phase) == 1:
+            if _cont_curric:
+                # Continuous-latent curriculum: WM-id (g trains + disturbance
+                # present) for stages 1-2, then actor on the frozen WM (stage 3).
+                # Disturbance ON throughout; the cont gain channel + gain-match
+                # hold the gain unbiased (no clean-data / frozen-g protection).
+                env._disturbance_prob_override = (
+                    float(getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
+                    if int(current_phase) < 3
+                    else float(getattr(cfg, 'curriculum_stage3_disturbance_prob',
+                                       0.85)))
+                if _cur_stage != int(current_phase):
+                    _cur_stage = int(current_phase)
+                    model.set_dob_active(False)
+                    if _cur_stage < 3:
+                        _fz = model.set_world_model_trainable(
+                            g=True, dob=False, reward=True)
+                        _desc = (f'WM-id (cont gain+disturbance latent; g TRAINS, '
+                                 f'disturbance {env._disturbance_prob_override:.2f}, '
+                                 f'gain-match supervises the gain)')
+                    else:
+                        _fz = model.set_world_model_trainable(
+                            g=False, dob=False, reward=True)
+                        _wm_frozen_now = True
+                        _igf = float(getattr(cfg,
+                                'actor_imag_gain_random_frac', 0.0) or 0.0)
+                        _desc = (f'actor/critic on FROZEN cont-WM (disturbance '
+                                 f'{env._disturbance_prob_override:.2f}; real-plant '
+                                 f'DR OFF; imagination loop-gain rand '
+                                 f'±{_igf:.3f}; DOB-free disturbance via cont '
+                                 f'channel)')
+                    print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
+                          f"steps{total_env_steps}: {_desc} "
+                          f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']}]",
+                          flush=True)
+            elif int(current_phase) == 1:
                 env._disturbance_prob_override = 0.0
             elif int(current_phase) == 2:
                 env._disturbance_prob_override = float(
@@ -8922,31 +9302,63 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # Sliding-window detector: trip when a sufficient
                         # fraction of the last ``win_n`` entropies is
                         # below ``thr``.
+                        # PERFORMANCE-AWARE GATE (Fix B, 2026-06-22): a low σ is
+                        # only a COLLAPSE if the policy is also DEGENERATE — a
+                        # healthy actor that has legitimately COMMITTED (low σ,
+                        # GOOD returns) reads the same entropy.  The p136
+                        # collapse had imag_adv_action_corr crash 0.77→0.014;
+                        # a committed-and-learning policy keeps it high.  So
+                        # only trip when the recent advantage-action correlation
+                        # is also low (genuine degeneracy), never on a
+                        # performing low-σ policy.  ``adv_corr`` None (pre-corr
+                        # logging) ⇒ fall back to the entropy-only trip.
+                        _ac = row.get('imag_adv_action_corr')
+                        if _ac is not None:
+                            adv_corr_window.append(abs(float(_ac)))
+                            if len(adv_corr_window) > win_n:
+                                adv_corr_window.pop(0)
                         if len(ent_window) >= win_n:
                             n_below = sum(1 for e in ent_window if e < thr)
                             min_below = (float(getattr(cfg,
                                     'early_stop_entropy_collapse_min_frac_below',
                                     0.70))
                                           * win_n)
-                            if n_below >= min_below:
+                            _corr_gate = float(getattr(cfg,
+                                    'early_stop_entropy_collapse_min_adv_corr',
+                                    0.05))
+                            _recent_corr = (float(np.median(adv_corr_window))
+                                            if adv_corr_window else 0.0)
+                            _degenerate = (_recent_corr < _corr_gate
+                                           or not adv_corr_window)
+                            if n_below >= min_below and _degenerate:
                                 early_stop_reason = (
                                     f'entropy_collapse_window: '
                                     f'{n_below}/{win_n} iters below '
                                     f'thr={thr:.3f} '
-                                    f'(latest={ent:.3f})')
+                                    f'(latest={ent:.3f}, '
+                                    f'adv_corr={_recent_corr:.3f})')
                         # Legacy consecutive-streak detector (kept as a
-                        # fallback for very long sustained collapse).
+                        # fallback for very long sustained collapse).  Same
+                        # performance gate: only a DEGENERATE low-σ streak trips.
                         if ent < thr:
                             ent_collapse_streak += 1
                         else:
                             ent_collapse_streak = 0
+                        _streak_corr = (float(np.median(adv_corr_window))
+                                        if adv_corr_window else 0.0)
+                        _streak_degen = (
+                            _streak_corr < float(getattr(cfg,
+                                'early_stop_entropy_collapse_min_adv_corr', 0.05))
+                            or not adv_corr_window)
                         if (early_stop_reason is None
+                                and _streak_degen
                                 and ent_collapse_streak >= int(getattr(cfg,
                                 'early_stop_entropy_collapse_patience_iters',
                                 30))):
                             early_stop_reason = (
                                 f'entropy_collapse: ent={ent:.3f} < '
-                                f'{thr:.3f} for {ent_collapse_streak} iters')
+                                f'{thr:.3f} for {ent_collapse_streak} iters '
+                                f'(adv_corr={_streak_corr:.3f})')
 
                     cl = row.get('critic_loss')
                     if cl is not None and cl > 0:

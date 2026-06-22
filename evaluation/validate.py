@@ -1650,6 +1650,13 @@ def run_validation(*,
         cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
         dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
+        # Continuous gain+disturbance latent (2026-06-22): MUST thread these too
+        # so the rebuilt model has the cont prior/post nets + gain/disturbance
+        # latent params — else the strict load_state_dict fails on the cont keys.
+        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
+        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
+        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
+        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
         attn_impl=getattr(cfg, 'attn_impl', 'auto'),
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

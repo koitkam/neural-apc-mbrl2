@@ -486,6 +486,26 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_OVERSHOOT_MAX_STARTS':    ('wm_overshoot_max_starts',        int),
     'DREAMER_WM_OVERSHOOT_TAIL_POWER':    ('wm_overshoot_tail_power',        float),
     'DREAMER_WM_OVERSHOOT_GATE_RECON':    ('wm_overshoot_gate_recon',        float),
+    # Continuous gain+disturbance latent (2026-06-22).  cont_latent_enabled on +
+    # dob_enabled off ⇒ the cont gain channel (C(1) gain-match) fixes the DV
+    # bias + the cont disturbance channel is the DOB-free amortized-Kalman
+    # estimator.  Dims auto-resolve from the plant; the rest are tuning knobs.
+    'DREAMER_CONT_LATENT_ENABLED':        ('cont_latent_enabled',            _as_bool),
+    'DREAMER_CONT_MIN_STD':               ('cont_min_std',                   float),
+    'DREAMER_CONT_MAX_STD':               ('cont_max_std',                   float),
+    'DREAMER_CONT_FREE_BITS':             ('cont_free_bits',                 float),
+    'DREAMER_CONT_KL_SCALE':              ('cont_kl_scale',                  float),
+    'DREAMER_CONT_GAIN_PERSIST_COEF':     ('cont_gain_persist_coef',         float),
+    # C(1) gain-matching (the step-response asymptote DC supervisor).  coef/len
+    # auto-resolve when the cont gain channel is on; these override.
+    'DREAMER_GAIN_MATCH_COEF':            ('gain_match_coef',                float),
+    'DREAMER_GAIN_MATCH_LEN':             ('gain_match_len',                 int),
+    'DREAMER_GAIN_MATCH_MAX_STARTS':      ('gain_match_max_starts',          int),
+    'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
+    # Fix B: performance-aware entropy-collapse early-stop gate (only trip when
+    # the policy is also degenerate: low imag_adv_action_corr).
+    'DREAMER_EARLY_STOP_ENT_COLLAPSE_MIN_ADV_CORR': ('early_stop_entropy_collapse_min_adv_corr', float),
+    'DREAMER_EXPERT_BC_P3_FLOOR':         ('expert_bc_p3_floor',             float),
 }
 
 

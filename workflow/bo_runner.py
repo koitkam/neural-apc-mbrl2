@@ -562,6 +562,10 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
         cv_obs_indices=tuple(getattr(cfg_loaded, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg_loaded, 'dob_decay_init', 3.0)),
         dob_gain_init=float(getattr(cfg_loaded, 'dob_gain_init', -2.2)),
+        cont_gain_dim=int(getattr(cfg_loaded, 'cont_gain_dim', 0) or 0),
+        cont_dist_dim=int(getattr(cfg_loaded, 'cont_dist_dim', 0) or 0),
+        cont_min_std=float(getattr(cfg_loaded, 'cont_min_std', 0.1)),
+        cont_max_std=float(getattr(cfg_loaded, 'cont_max_std', 2.0)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)

@@ -149,6 +149,10 @@ if __name__ == '__main__':
         cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
         dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
+        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
+        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
+        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
+        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
         attn_impl='manual',  # ONNX export: manual path is safer than SDPA
     )
     model = DreamerV4(model_cfg)

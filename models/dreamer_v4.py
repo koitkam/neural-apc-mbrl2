@@ -1268,6 +1268,14 @@ class DreamerV4Config:
     cv_obs_indices: Tuple[int, ...] = ()
     dob_decay_init: float = 3.0
     dob_gain_init: float = -2.2
+    # Continuous gain+disturbance latent (2026-06-22).  A Gaussian latent
+    # alongside the categorical that holds the precision-critical CONTINUOUS
+    # gain (supervised) + unmeasured disturbance (amortized Kalman) the
+    # categorical attenuates.  cont_gain_dim==cont_dist_dim==0 ⇒ pre-cont model.
+    cont_gain_dim: int = 0
+    cont_dist_dim: int = 0
+    cont_min_std: float = 0.1
+    cont_max_std: float = 2.0
 
 
 class DreamerV4(nn.Module):
@@ -1297,6 +1305,10 @@ class DreamerV4(nn.Module):
                 cv_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
                 dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
                 dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
+                cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
+                cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
+                cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
+                cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
             D = self.dynamics.feat_dim
@@ -1325,6 +1337,10 @@ class DreamerV4(nn.Module):
                 cv_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
                 dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
                 dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
+                cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
+                cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
+                cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
+                cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
             )
             self.dynamics = TransformerSSMDynamics(tssm_cfg)
             D = self.dynamics.feat_dim

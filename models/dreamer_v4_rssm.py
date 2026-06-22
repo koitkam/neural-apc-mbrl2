@@ -118,6 +118,23 @@ class RSSMConfig:
     cv_indices: Tuple[int, ...] = ()
     dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence
     dob_gain_init: float = -2.2     # sigmoid(-2.2)=0.10 — small correction
+    # ---- Continuous gain + disturbance latent (2026-06-22) ----
+    # A small Gaussian latent ALONGSIDE the categorical, giving precision-
+    # critical CONTINUOUS quantities (the subdominant input GAIN and the
+    # unmeasured DISTURBANCE) an UN-quantized home that the categorical
+    # small-signal attenuation cannot reach.  Split into a GAIN block
+    # (supervised toward the identified steady-state gain — fixes the DV
+    # categorical-attenuation bias AND carries the per-episode gain in-context
+    # so the WM ADAPTS to DR) and a DISTURBANCE block (= n_cv, an amortized
+    # Kalman state inferred from the innovation + rolled forward by the prior —
+    # the "inherent" replacement for the bolt-on DOB).  Both feed the GRU (so
+    # ``h`` carries them forward) and the decoder (so the recon forces them to
+    # mean what we want).  ``cont_gain_dim == cont_dist_dim == 0`` ⇒
+    # byte-identical to the pre-continuous-latent model.
+    cont_gain_dim: int = 0
+    cont_dist_dim: int = 0
+    cont_min_std: float = 0.1       # σ floor (numerical + KL well-posedness)
+    cont_max_std: float = 2.0       # σ ceiling
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +169,9 @@ class RSSMState:
     z: torch.Tensor             # (..., n_categoricals, n_classes) one-hot (ST grad)
     d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
     dv: Optional[torch.Tensor] = None  # (..., dv_dim) exogenous DV feedforward (None=off)
+    c: Optional[torch.Tensor] = None       # (..., cont_dim) continuous latent sample (None=off)
+    c_mean: Optional[torch.Tensor] = None  # (..., cont_dim) post/prior mean (for KL)
+    c_std: Optional[torch.Tensor] = None   # (..., cont_dim) post/prior std (for KL)
 
     @property
     def stoch_flat(self) -> torch.Tensor:
@@ -159,20 +179,21 @@ class RSSMState:
 
     @property
     def feat(self) -> torch.Tensor:
-        # Scope 2 (DOB feed-forward, 2026-06-11) + DV feed-forward (2026-06-19):
-        # the head-facing feature is ``[h, z_flat, (dv), (d.detach())]``.
-        #  * ``dv`` (DV feedforward) is appended RIGHT AFTER the latent core so
-        #    the DECODER reads ``[h, z, dv]`` (a contiguous front slice) — the
-        #    direct exogenous-DV path that skips the categorical bottleneck — AND
-        #    so the actor/critic/reward heads CONDITION on the measured DV.  Not
-        #    detached: the decoder learns ∂CV/∂dv through it (dv itself is a
-        #    teacher-forced/held leaf, so there is no upstream graph to protect).
-        #  * ``d`` (DOB) is appended LAST and DETACHED — the heads condition on
-        #    the disturbance estimate but head grads must not reshape the
-        #    innovation-driven observer.  The decoder slices the d-tail off.
-        # ``dv is None`` AND ``d is None`` ⇒ feat = [h, z_flat] (byte-identical
-        # to the paper RSSM).
+        # Scope 2 (DOB feed-forward, 2026-06-11) + DV feed-forward (2026-06-19)
+        # + continuous gain/disturbance latent (2026-06-22): the head-facing
+        # feature is ``[h, z_flat, (c), (dv), (d.detach())]``.
+        #  * ``c`` (continuous gain+disturbance latent) is appended RIGHT AFTER
+        #    the categorical core so the DECODER reads ``[h, z, c, (dv)]`` (a
+        #    contiguous front slice) — the un-quantized path for the gain and
+        #    the unmeasured disturbance.  NOT detached: the decoder learns to
+        #    use the gain/disturbance through it.
+        #  * ``dv`` (DV feedforward) follows ``c``.  Not detached.
+        #  * ``d`` (DOB) is appended LAST and DETACHED (sliced off by decode).
+        # ``c is None`` AND ``dv is None`` AND ``d is None`` ⇒ feat = [h, z_flat]
+        # (byte-identical to the paper RSSM).
         parts = [self.h, self.stoch_flat]
+        if self.c is not None:
+            parts.append(self.c)
         if self.dv is not None:
             parts.append(self.dv)
         if self.d is not None:
@@ -216,6 +237,40 @@ class _CategoricalLatent(nn.Module):
         return logits, sample_st
 
 
+class _ContinuousLatent(nn.Module):
+    """Feature → diagonal-Gaussian (mean, std) continuous latent.
+
+    A small reparameterised Gaussian channel that lives ALONGSIDE the
+    categorical ``_CategoricalLatent``.  Its purpose is to hold precision-
+    critical CONTINUOUS quantities (the per-episode input gain and the
+    unmeasured disturbance) that the discrete categorical attenuates by
+    quantization.  ``std`` is a softplus output clamped to
+    ``[min_std, max_std]`` for KL well-posedness; the sample uses the
+    reparameterisation trick so gradients flow into both the inference net
+    and (through the decoder/recon) the value of the latent.
+    """
+
+    def __init__(self, in_dim: int, cont_dim: int, hidden_dim: int = 256,
+                 min_std: float = 0.1, max_std: float = 2.0):
+        super().__init__()
+        self.cont_dim = int(cont_dim)
+        self.min_std = float(min_std)
+        self.max_std = float(max_std)
+        self.net = _MLP(in_dim, 2 * cont_dim, hidden_dim, num_layers=2)
+
+    def forward(self, x: torch.Tensor, sample: bool = True
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean, std_raw = self.net(x).chunk(2, dim=-1)
+        # Bounded std: min_std + (max_std-min_std)·sigmoid(std_raw) keeps σ
+        # strictly inside (min_std, max_std) — no exp() blow-up, well-posed KL.
+        std = self.min_std + (self.max_std - self.min_std) * torch.sigmoid(std_raw)
+        if sample:
+            c = mean + std * torch.randn_like(std)
+        else:
+            c = mean
+        return c, mean, std
+
+
 # ---------------------------------------------------------------------------
 # RSSM dynamics
 # ---------------------------------------------------------------------------
@@ -234,6 +289,16 @@ class RSSMDynamics(nn.Module):
         self.embed_dim = int(cfg.embed_dim)
         self.hidden_dim = int(cfg.hidden_dim)
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
+        # Continuous gain+disturbance latent (2026-06-22).  cont_dim splits into
+        # a supervised GAIN block (first ``cont_gain_dim`` dims) and a
+        # DISTURBANCE block (last ``cont_dist_dim`` dims).  Both feed the GRU
+        # (so ``h`` carries them forward → the prior can roll them) AND the
+        # decoder (so the recon forces them to mean what we want).
+        self.cont_gain_dim = int(getattr(cfg, 'cont_gain_dim', 0) or 0)
+        self.cont_dist_dim = int(getattr(cfg, 'cont_dist_dim', 0) or 0)
+        self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
+        self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
+        self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
         # DV-as-input (Option B): exogenous measured-DV channels fed into the
         # transition.  ``dv_index_t`` selects them out of the obs vector.
         self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
@@ -246,8 +311,10 @@ class RSSMDynamics(nn.Module):
         self.dv_feedforward = bool(getattr(cfg, 'dv_feedforward', True)) \
             and self.dv_dim > 0
         self._dv_feed_dim = self.dv_dim if self.dv_feedforward else 0
-        # Transition input = [z_flat ; action ; (dv)].
-        trans_in = self.stoch_flat_dim + self.action_dim + self.dv_dim
+        # Transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
+        # latent feeds the GRU so ``h`` carries the gain/disturbance forward.
+        trans_in = (self.stoch_flat_dim + self.cont_dim
+                    + self.action_dim + self.dv_dim)
 
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
@@ -258,7 +325,7 @@ class RSSMDynamics(nn.Module):
         # path that skips the categorical bottleneck (p129 RCA).  The DOB d-tail
         # (Scope 2) is sliced off in ``decode`` and re-added via ``apply_dob``
         # (the g + d factorisation).
-        self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim
+        self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim + self.cont_dim
                             + self._dv_feed_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
         # Direct DV→obs FEEDFORWARD SKIP (2026-06-20, p132 RCA).  The measured
@@ -287,6 +354,15 @@ class RSSMDynamics(nn.Module):
         self.post_net = _CategoricalLatent(
             self.deter_dim + self.embed_dim, self.n_categoricals,
             self.n_classes, hidden_dim=self.hidden_dim, unimix=cfg.unimix)
+        # Continuous-latent prior p(c'|h') and posterior q(c'|h', embed).
+        if self.cont_dim > 0:
+            self.cont_prior_net = _ContinuousLatent(
+                self.deter_dim, self.cont_dim, hidden_dim=self.hidden_dim,
+                min_std=self.cont_min_std, max_std=self.cont_max_std)
+            self.cont_post_net = _ContinuousLatent(
+                self.deter_dim + self.embed_dim, self.cont_dim,
+                hidden_dim=self.hidden_dim, min_std=self.cont_min_std,
+                max_std=self.cont_max_std)
 
         # ----- Neural Kalman filter / disturbance observer (DOB) -----
         # ``d_t`` (per-CV) is a first-order learned observer on the one-step
@@ -320,14 +396,15 @@ class RSSMDynamics(nn.Module):
         # when on) so the heads condition on the measured DV, plus the DOB
         # disturbance estimate ``d`` (one scalar per CV).  The decoder reads
         # ``[h, z, (dv)]`` (see ``_decode_in_dim`` / ``decode``).
-        core = self.deter_dim + self.stoch_flat_dim
+        core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
         return (core + self._dv_feed_dim
                 + (self.n_cv if getattr(self, 'dob_enabled', False) else 0))
 
     @property
     def _decode_in_dim(self) -> int:
-        # Width of the decoder input slice = latent core + DV feedforward.
-        return self.deter_dim + self.stoch_flat_dim + self._dv_feed_dim
+        # Width of the decoder input slice = latent core + cont latent + DV ff.
+        return (self.deter_dim + self.stoch_flat_dim + self.cont_dim
+                + self._dv_feed_dim)
 
     # ----- embedding ----------------------------------------------------
     def embed(self, obs: torch.Tensor) -> torch.Tensor:
@@ -345,7 +422,9 @@ class RSSMDynamics(nn.Module):
              if self.dob_enabled else None)
         dv = (torch.zeros(batch_size, self.dv_dim, device=device)
               if self.dv_feedforward else None)
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv)
+        c = (torch.zeros(batch_size, self.cont_dim, device=device)
+             if self.cont_dim > 0 else None)
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c)
 
     # ----- DOB helpers --------------------------------------------------
     def dob_decay(self) -> torch.Tensor:
@@ -373,24 +452,41 @@ class RSSMDynamics(nn.Module):
         ``dv`` (B, dv_dim) is the exogenous measured-DV input when DV-as-input
         is enabled (``dv_dim > 0``); ``None`` is filled with zeros.  Ignored
         entirely when ``dv_dim == 0`` (paper behaviour)."""
+        # GRU transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
+        # latent feeds the recurrence so ``h`` carries the gain/disturbance
+        # forward and the prior ``cont_prior_net(h')`` can roll them.
+        parts = [prev.stoch_flat]
+        if self.cont_dim > 0:
+            c_prev = prev.c
+            if c_prev is None:
+                c_prev = torch.zeros(prev_action.shape[0], self.cont_dim,
+                                     device=prev_action.device,
+                                     dtype=prev_action.dtype)
+            parts.append(c_prev)
+        parts.append(prev_action)
         if self.dv_dim > 0:
             if dv is None:
                 dv = torch.zeros(prev_action.shape[0], self.dv_dim,
                                  device=prev_action.device,
                                  dtype=prev_action.dtype)
-            x = torch.cat([prev.stoch_flat, prev_action, dv], dim=-1)
-        else:
-            x = torch.cat([prev.stoch_flat, prev_action], dim=-1)
+            parts.append(dv)
+        x = torch.cat(parts, dim=-1)
         x = self.pre_gru(x)
         h = self.gru(x, prev.h)
         z_logits, z = self.prior_net(h, sample=sample)
+        # Continuous-latent prior p(c'|h'): gain persists (carried via h) and
+        # the disturbance OU-rolls; both inferred from the recurrent state.
+        c_new = c_mean = c_std = None
+        if self.cont_dim > 0:
+            c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
         # DOB predict step: decay the disturbance estimate (no obs to correct).
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
         # DV feedforward: carry the (real / held / zero-filled) DV into the
         # state so ``feat`` + ``decode`` expose it to the decoder and heads.
         dv_new = dv if self.dv_feedforward else None
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new)
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
+                         c=c_new, c_mean=c_mean, c_std=c_std)
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -407,6 +503,13 @@ class RSSMDynamics(nn.Module):
         prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
+        # Continuous-latent posterior q(c'|h', embed): infers the gain (from the
+        # accumulated history in h) and the disturbance (from the innovation the
+        # embed carries) — the amortized Kalman update.
+        c_post = c_post_mean = c_post_std = None
+        if self.cont_dim > 0:
+            c_post, c_post_mean, c_post_std = self.cont_post_net(
+                post_in, sample=sample)
         d_post = prior.d
         if self.dob_enabled and obs is not None and prior.d is not None:
             cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
@@ -417,7 +520,8 @@ class RSSMDynamics(nn.Module):
         # Posterior inherits the prior's exogenous DV feedforward (same measured
         # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
         post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z, d=d_post,
-                         dv=prior.dv)
+                         dv=prior.dv, c=c_post, c_mean=c_post_mean,
+                         c_std=c_post_std)
         return post, prior
 
     # ----- sequence rollout ---------------------------------------------
@@ -445,8 +549,9 @@ class RSSMDynamics(nn.Module):
                if self.dv_dim > 0 else None)           # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
-        dec_in = self._decode_in_dim                   # core (+ dv feedforward)
+        dec_in = self._decode_in_dim                   # core (+ cont + dv ff)
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+        c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             # COMPILE-EFFICIENT DOB (2026-06-12): run the (h, z) recurrence
@@ -462,12 +567,15 @@ class RSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            feats_l.append(post.feat[..., :dec_in])    # decoder feat [h, z, (dv)]
+            feats_l.append(post.feat[..., :dec_in])    # decoder feat [h,z,(c),(dv)]
             post_l.append(post.z_logits)
             prior_l.append(prior.z_logits)
+            if self.cont_dim > 0:
+                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
             if self.dob_enabled:
                 prior_core_l.append(prior.feat[..., :dec_in])
-        post_core = torch.stack(feats_l, dim=1)        # (B, T, dec_in) = [h,z,(dv)]
+        post_core = torch.stack(feats_l, dim=1)        # (B, T, dec_in)=[h,z,(c),(dv)]
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)
         ds = None
@@ -494,10 +602,22 @@ class RSSMDynamics(nn.Module):
                                  dtype=post_core.dtype)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
-                              d=ds[:, -1], dv=state.dv)
+                              d=ds[:, -1], dv=state.dv, c=state.c,
+                              c_mean=state.c_mean, c_std=state.c_std)
         else:
             feats = post_core
-        return feats, post_logits, prior_logits, state, ds
+        # Continuous-latent KL stats + posterior sample (for the cont KL +
+        # gain-matching aux loss + disturbance readout).  ``None`` when off.
+        cont = None
+        if self.cont_dim > 0:
+            cont = {
+                'post_mean': torch.stack(c_qm_l, dim=1),   # (B,T,cont_dim)
+                'post_std': torch.stack(c_qs_l, dim=1),
+                'prior_mean': torch.stack(c_pm_l, dim=1),
+                'prior_std': torch.stack(c_ps_l, dim=1),
+                'sample': post_core[..., core:core + self.cont_dim],
+            }
+        return feats, post_logits, prior_logits, state, ds, cont
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the
@@ -508,7 +628,7 @@ class RSSMDynamics(nn.Module):
         x = feat[..., :self._decode_in_dim]
         out = self.decoder(x)
         if self.dv_skip is not None:
-            core = self.deter_dim + self.stoch_flat_dim
+            core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
             dv = feat[..., core:core + self._dv_feed_dim]
             out = out + self.dv_skip(dv)
         return out
@@ -551,5 +671,42 @@ def rssm_kl_loss(post_logits: torch.Tensor, prior_logits: torch.Tensor,
         'kl_repr': kl_repr.detach(),
         'kl_dyn_raw': kl_dyn_raw.mean().detach(),
         'kl_repr_raw': kl_repr_raw.mean().detach(),
+    }
+    return kl_loss, diag
+
+
+def rssm_cont_kl_loss(post_mean: torch.Tensor, post_std: torch.Tensor,
+                      prior_mean: torch.Tensor, prior_std: torch.Tensor,
+                      free_bits: float = 1.0, dyn_w: float = 0.5,
+                      repr_w: float = 0.1
+                      ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """KL-balanced free-bits loss for the continuous (diagonal-Gaussian)
+    latent — the Gaussian analogue of ``rssm_kl_loss``.
+
+    ``dyn`` term (stop-grad on posterior) trains the prior toward the
+    posterior (so the prior learns to ROLL the gain/disturbance forward);
+    ``repr`` term (stop-grad on prior) trains the posterior toward the prior.
+    The free-bits floor is applied to the mean dim-summed KL.
+    """
+    def _kl_gauss(mq, sq, mp, sp):
+        # KL(N(mq,sq²) || N(mp,sp²)) summed over the last (cont) dim → (B, T).
+        var_q = sq * sq
+        var_p = sp * sp
+        return (torch.log(sp) - torch.log(sq)
+                + (var_q + (mq - mp) ** 2) / (2.0 * var_p) - 0.5).sum(dim=-1)
+
+    kl_dyn_raw = _kl_gauss(post_mean.detach(), post_std.detach(),
+                           prior_mean, prior_std)
+    kl_repr_raw = _kl_gauss(post_mean, post_std,
+                            prior_mean.detach(), prior_std.detach())
+    fb = torch.tensor(float(free_bits), device=post_mean.device,
+                      dtype=kl_dyn_raw.dtype)
+    kl_dyn = torch.maximum(kl_dyn_raw.mean(), fb)
+    kl_repr = torch.maximum(kl_repr_raw.mean(), fb)
+    kl_loss = dyn_w * kl_dyn + repr_w * kl_repr
+    diag = {
+        'cont_kl_dyn': kl_dyn.detach(),
+        'cont_kl_repr': kl_repr.detach(),
+        'cont_kl_dyn_raw': kl_dyn_raw.mean().detach(),
     }
     return kl_loss, diag
