@@ -5996,18 +5996,42 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         'source': f'horizon (={H_wm}) — one settling response',
     }
     # (b) return-scale runaway ceiling.  ``return_scale`` is the p95-p5 spread of
-    # the bounded-reward λ-returns, bounded by the envelope B·H; a HEALTHY
-    # economic value is empirically ~5-12% of that worst case, while the critic-
-    # pessimism runaway that shrinks the actor advantage (adv = adv_raw/
-    # return_scale → passive/weak-economic actor) climbs far higher (27-55 on
-    # test_sim).  Cap at ~12% of B·H, floored at 20 (a dimensionless return-unit
-    # backstop for short-horizon plants).  Sim-adaptive via H; sim-agnostic via
-    # B (a dimensionless post-calibration reward bound) + the 0.12 / 20 consts.
+    # the bounded-reward λ-returns; it NORMALISES the ACTOR advantage ONLY
+    # (adv_flat = adv_raw/return_scale — the critic targets are RAW symlog, they
+    # do NOT see return_scale), bounded by the envelope B·H.  The cap arrests the
+    # critic-pessimism RUNAWAY (return_scale → ∞ → adv → 0 → passive actor).
+    # p137 RCA (2026-06-23) — the 0.12/20 ceiling was TOO AGGRESSIVE and bound
+    # PREMATURELY, TRIGGERING the opposite failure (a hunting actor):
+    #   · The actor turns on at the critic-warmup end (P3 iter 125).  return_scale
+    #     was climbing freely (5→17, critic HEALTHY + STABLE: rew_to_tgt_var
+    #     ~0.015, NOT decaying) and the raw advantage spread is large
+    #     (adv_std 5-11 ≫ the DreamerV3 O(1) target).
+    #   · At iter 129 return_scale SATURATED the cap (20) while adv_raw kept
+    #     growing → the advantage was UNDER-normalised (frozen denominator) right
+    #     as the actor began PMPO → the policy BLEW UP (actor_logp_std 0.78→7.3).
+    #   · The wild actor drove the latent OFF-DISTRIBUTION → the WM imagination
+    #     diverged PESSIMISTICALLY (imagined_return −44→−206) while the REAL
+    #     economics IMPROVED to best-ever → the critic chased the imagined
+    #     cascade (pred_target_r→0.99, rew_to_tgt_var→4e-4).  i.e. the cascade is
+    #     an under-normalised-ACTOR artefact, NOT a critic-grounding failure
+    #     (bumping critic_mc_grounding_coef is contraindicated — mc_rew_to_tgt_var
+    #     is inherently ~1e-3 near steady state, so it weights a low-variance
+    #     target; 1.0→2.0 already failed in p132/p137).
+    # FIX = raise the sim-adaptive fraction 0.12→0.30 so the scale can track the
+    # NATURAL return spread and normalise the advantage toward O(1) (DreamerV3-
+    # faithful) AS the actor turns on → a calm, on-distribution policy → no
+    # imagination cascade.  test_sim: cap 20→~50.  Even if return_scale pegs at
+    # the new cap the advantage stays ≥1 (adv_raw_std/cap ≈ 1-2 — calm, NOT
+    # passive).  Runaway is still bounded (higher backstop) + the cascade early-
+    # stop (early_stop_cascade_min_return_scale_growth).  Sim-adaptive via H;
+    # sim-agnostic via B (a dimensionless post-calibration reward bound) + the
+    # 0.30 / 20 consts.  Short-horizon plants (0.30·B·H < 20) keep the floor 20
+    # unchanged (no regression where the old cap was not the binding constraint).
     B_rs = float(getattr(cfg, 'bound_training_reward_max', 3.0) or 3.0)
-    rs_cap = round(max(20.0, 0.12 * B_rs * float(H_wm)), 1)
+    rs_cap = round(max(20.0, 0.30 * B_rs * float(H_wm)), 1)
     out['return_scale_abs_cap'] = {
         'value': float(rs_cap),
-        'source': f'max(20, 0.12·B·H)=max(20, 0.12·{B_rs:g}·{H_wm})={rs_cap}',
+        'source': f'max(20, 0.30·B·H)=max(20, 0.30·{B_rs:g}·{H_wm})={rs_cap}',
     }
 
     sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
