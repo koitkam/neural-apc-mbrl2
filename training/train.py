@@ -3629,7 +3629,13 @@ def _mask_measured_dv_from_feat(model: DreamerV4,
     dv_feed = int(getattr(dyn, '_dv_feed_dim', 0) or 0)
     if dyn is None or dv_feed <= 0:
         return feat
-    core = int(dyn.deter_dim) + int(dyn.stoch_flat_dim)
+    # feat = [h, z, (c), (dv), (d)] — the continuous latent ``c`` (2026-06-22)
+    # sits BETWEEN the categorical core and the dv feedforward, so the dv block
+    # starts at deter+stoch+cont_dim (NOT deter+stoch).  Missing the cont_dim
+    # offset zeroed a cont/gain channel and let the measured DV LEAK into the
+    # disturbance head (the exact p130 conflation this guard prevents).
+    cont_dim = int(getattr(dyn, 'cont_dim', 0) or 0)
+    core = int(dyn.deter_dim) + int(dyn.stoch_flat_dim) + cont_dim
     if feat.shape[-1] < core + dv_feed:
         return feat
     out = feat.clone()
@@ -3943,13 +3949,15 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder + GRU (not the categorical
-    we are trying to bypass).  RSSM-only; ``(0, {})`` otherwise / when off.
+    we are trying to bypass).  RSSM + TSSM (the TSSM rolls from a fresh
+    KV-cache); ``(0, {})`` for other backbones / when off.
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
     if float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0:
         return zero, diag
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+    _wmt = getattr(model, 'world_model_type', 'sf_transformer')
+    if _wmt not in ('rssm', 'tssm'):
         return zero, diag
     rssm = model.dynamics
     if int(getattr(rssm, 'cont_gain_dim', 0) or 0) <= 0 or rssm.n_cv <= 0:
@@ -3958,7 +3966,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     dv_target = list(getattr(cfg, 'gain_match_dv_target', ()) or ())
     if not mv_target and not dv_target:
         return zero, diag
-    from models.dreamer_v4_rssm import RSSMState
+    if _wmt == 'tssm':
+        from models.transformer_ssm import TSSMState as _State
+    else:
+        from models.dreamer_v4_rssm import RSSMState as _State
     B, T = obs.shape[:2]
     K = int(getattr(cfg, 'gain_match_len', 0) or 0)
     K = min(K, T - 1) if K > 0 else (T - 1)
@@ -3983,11 +3994,14 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     cv_idx = rssm.cv_index_t
 
     def _state():
-        return RSSMState(
+        kw = dict(
             h=h0.clone(),
             z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
                                  device=obs.device, dtype=f0.dtype),
             z=z0.clone(), c=(c0.clone() if c0 is not None else None))
+        if _wmt == 'tssm':
+            kw.update(kv_cache=None, pos=0)   # roll from a fresh transformer ctx
+        return _State(**kw)
 
     a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
     dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)

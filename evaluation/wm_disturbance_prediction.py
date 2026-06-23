@@ -163,7 +163,13 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
                     if bool(getattr(cfg, 'disturbance_head_exclude_dv', True)):
                         _dv_feed = int(getattr(rssm, '_dv_feed_dim', 0) or 0)
                         if _dv_feed > 0:
-                            _core = int(rssm.deter_dim) + int(rssm.stoch_flat_dim)
+                            # feat = [h, z, (c), (dv), (d)]: the continuous latent
+                            # ``c`` sits before the dv block, so include cont_dim
+                            # in the offset (else the measured DV leaks into the
+                            # head and a cont channel is zeroed — 2026-06-22 fix).
+                            _cont = int(getattr(rssm, 'cont_dim', 0) or 0)
+                            _core = (int(rssm.deter_dim)
+                                     + int(rssm.stoch_flat_dim) + _cont)
                             if feat.shape[-1] >= _core + _dv_feed:
                                 feat_head = feat.clone()
                                 feat_head[..., _core:_core + _dv_feed] = 0.0

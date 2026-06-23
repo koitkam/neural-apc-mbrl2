@@ -61,15 +61,27 @@ class DeterministicController(nn.Module):
 
     def forward(self, obs_window: torch.Tensor, prev_actions: torch.Tensor
                 ) -> torch.Tensor:
-        B = obs_window.shape[0]
-        L = self.lookback
-        z_ctx = self.tokenizer.encode(obs_window)             # (B, L, z_dim)
-        tau = torch.full((B, L), 1.0 - self.tau_ctx,
-                          device=obs_window.device, dtype=z_ctx.dtype)
-        d = torch.full((B, L), 1.0 / self.k_max,
-                        device=obs_window.device, dtype=z_ctx.dtype)
-        out = self.dynamics(z_ctx, tau, d, prev_actions)
-        agent_hid = out['agent_hid'][:, -1]                   # (B, d_model)
+        if self.tokenizer is not None:
+            # SF-transformer backbone: tokenize + the tau/d-conditioned dynamics.
+            B = obs_window.shape[0]
+            L = self.lookback
+            z_ctx = self.tokenizer.encode(obs_window)         # (B, L, z_dim)
+            tau = torch.full((B, L), 1.0 - self.tau_ctx,
+                              device=obs_window.device, dtype=z_ctx.dtype)
+            d = torch.full((B, L), 1.0 / self.k_max,
+                            device=obs_window.device, dtype=z_ctx.dtype)
+            out = self.dynamics(z_ctx, tau, d, prev_actions)
+            agent_hid = out['agent_hid'][:, -1]               # (B, d_model)
+        else:
+            # RSSM / TSSM backbone (no tokenizer): roll the posterior over the
+            # window DETERMINISTICALLY (sample=False ⇒ categorical argmax + the
+            # continuous-latent MEAN — no RNG, ONNX-safe + cont-latent-safe) and
+            # read the last feature.  Backbone-agnostic (both expose
+            # rollout_observed → (feats, ...)).  Fixes the ONNX export for the
+            # RSSM/TSSM production backbones (the wrapper was SF-only).
+            feats = self.dynamics.rollout_observed(
+                obs_window, prev_actions, sample=False)[0]    # (B, L, F)
+            agent_hid = feats[:, -1]                           # (B, F)
         # Deterministic action — works for both PolicyHead (argmax bin)
         # and ContinuousPolicyHead (tanh(mu)).
         action, _, _ = self.policy(agent_hid, deterministic=True)
@@ -97,6 +109,11 @@ def export_dreamer_v4_onnx(model: DreamerV4, out_path: str | Path,
         opset_version=opset,
         do_constant_folding=True,
         dynamic_axes=None,           # fixed batch=1, fixed lookback
+        dynamo=False,                # legacy TorchScript exporter: traces the
+                                     # RSSM/TSSM rollout loop + needs no
+                                     # ``onnxscript`` (torch>=2.9 defaults the
+                                     # dynamo exporter, which 500s here on the
+                                     # data-dependent latent control flow).
     )
     return str(out_path)
 

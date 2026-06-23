@@ -124,7 +124,7 @@ import torch.nn.functional as F
 
 # Reuse the proven RSSM building blocks so the categorical latent + KL are
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
-from models.dreamer_v4_rssm import _CategoricalLatent
+from models.dreamer_v4_rssm import _CategoricalLatent, _ContinuousLatent
 
 
 @dataclass
@@ -187,6 +187,9 @@ class TSSMState:
     pos: int = 0                # number of tokens already in the cache
     d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
     dv: Optional[torch.Tensor] = None  # (..., dv_dim) exogenous DV feedforward (None=off)
+    c: Optional[torch.Tensor] = None       # (..., cont_dim) continuous latent sample
+    c_mean: Optional[torch.Tensor] = None  # post/prior mean (for KL)
+    c_std: Optional[torch.Tensor] = None   # post/prior std (for KL)
 
     @property
     def stoch_flat(self) -> torch.Tensor:
@@ -194,14 +197,15 @@ class TSSMState:
 
     @property
     def feat(self) -> torch.Tensor:
-        # DV feedforward (2026-06-19) + Scope 2 DOB (2026-06-11) — mirror of
-        # RSSMState.feat: ``[h, z_flat, (dv), (d.detach())]``.  ``dv`` sits right
-        # after the latent core (the decoder reads ``[h, z, dv]`` as a
-        # contiguous front slice — the direct DV path skipping the categorical
-        # bottleneck — and the heads condition on the measured DV); the DOB
-        # ``d`` is appended last and DETACHED (heads see it; the decoder slices
-        # it off).  Both None ⇒ feat = [h, z_flat] (byte-identical paper TSSM).
+        # DV feedforward (2026-06-19) + Scope 2 DOB (2026-06-11) + continuous
+        # gain+disturbance latent (2026-06-22) — mirror of RSSMState.feat:
+        # ``[h, z_flat, (c), (dv), (d.detach())]``.  ``c`` sits right after the
+        # categorical core (the decoder reads ``[h, z, c, dv]`` as a contiguous
+        # front slice); the DOB ``d`` is appended last and DETACHED.  All None
+        # ⇒ feat = [h, z_flat] (byte-identical paper TSSM).
         parts = [self.h, self.stoch_flat]
+        if self.c is not None:
+            parts.append(self.c)
         if self.dv is not None:
             parts.append(self.dv)
         if self.d is not None:
@@ -319,6 +323,15 @@ class TransformerSSMDynamics(nn.Module):
         self.unimix = float(cfg.unimix)
         self.max_seq_len = int(cfg.max_seq_len)
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
+        # Continuous gain+disturbance latent (2026-06-22) — mirror of
+        # RSSMDynamics: a GAIN block (C1-supervised) + DISTURBANCE block
+        # (amortized Kalman).  Feeds the token (so the transformer carries it)
+        # AND the decoder.  cont_gain_dim==cont_dist_dim==0 ⇒ pre-cont model.
+        self.cont_gain_dim = int(getattr(cfg, 'cont_gain_dim', 0) or 0)
+        self.cont_dist_dim = int(getattr(cfg, 'cont_dist_dim', 0) or 0)
+        self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
+        self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
+        self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
         # DV-as-input (Option B): exogenous measured-DV channels appended to the
         # token input; ``dv_index_t`` selects them out of the obs vector.
         self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
@@ -342,8 +355,8 @@ class TransformerSSMDynamics(nn.Module):
             # CV reconstruction a direct ∂CV/∂dv path skipping the categorical
             # bottleneck); the DOB d-tail is sliced off in ``decode`` and
             # re-added via ``apply_dob``.
-            nn.Linear(self.deter_dim + self.stoch_flat_dim + self._dv_feed_dim,
-                      cfg.embed_dim),
+            nn.Linear(self.deter_dim + self.stoch_flat_dim + self.cont_dim
+                      + self._dv_feed_dim, cfg.embed_dim),
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
@@ -359,9 +372,9 @@ class TransformerSSMDynamics(nn.Module):
         if self.dv_skip is not None:
             nn.init.zeros_(self.dv_skip.weight)
             nn.init.zeros_(self.dv_skip.bias)
-        # Token projection: [z_{t-1}_flat ; a_t ; (dv_t)] -> d_model.
+        # Token projection: [z_{t-1}_flat ; (c) ; a_t ; (dv_t)] -> d_model.
         self.token_proj = nn.Linear(
-            self.stoch_flat_dim + self.action_dim + self.dv_dim,
+            self.stoch_flat_dim + self.cont_dim + self.action_dim + self.dv_dim,
             self.deter_dim)
         # Causal transformer (custom blocks: support full + KV-cached step).
         self.n_heads = int(cfg.n_heads)
@@ -377,6 +390,14 @@ class TransformerSSMDynamics(nn.Module):
         self.post_net = _CategoricalLatent(
             self.deter_dim + cfg.embed_dim, self.n_categoricals,
             self.n_classes, unimix=cfg.unimix)
+        # Continuous-latent prior p(c'|h') and posterior q(c'|h', embed).
+        if self.cont_dim > 0:
+            self.cont_prior_net = _ContinuousLatent(
+                self.deter_dim, self.cont_dim,
+                min_std=self.cont_min_std, max_std=self.cont_max_std)
+            self.cont_post_net = _ContinuousLatent(
+                self.deter_dim + cfg.embed_dim, self.cont_dim,
+                min_std=self.cont_min_std, max_std=self.cont_max_std)
 
         # ----- Neural Kalman filter / disturbance observer (DOB) -----
         # Identical to RSSMDynamics: a first-order learned observer (per-CV A,K
@@ -403,14 +424,15 @@ class TransformerSSMDynamics(nn.Module):
         # Mirror of RSSMDynamics.feat_dim: head-facing feature = latent core +
         # DV feedforward (when on) + DOB ``d`` (one scalar per CV).  The decoder
         # reads ``[h, z, (dv)]`` (see ``_decode_in_dim`` / ``decode``).
-        core = self.deter_dim + self.stoch_flat_dim
+        core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
         return (core + self._dv_feed_dim
                 + (self.n_cv if getattr(self, 'dob_enabled', False) else 0))
 
     @property
     def _decode_in_dim(self) -> int:
-        # Width of the decoder input slice = latent core + DV feedforward.
-        return self.deter_dim + self.stoch_flat_dim + self._dv_feed_dim
+        # Width of the decoder input slice = latent core + cont latent + DV ff.
+        return (self.deter_dim + self.stoch_flat_dim + self.cont_dim
+                + self._dv_feed_dim)
 
     # ----- DOB helpers (mirror RSSMDynamics) -----
     def dob_decay(self) -> torch.Tensor:
@@ -439,7 +461,7 @@ class TransformerSSMDynamics(nn.Module):
         x = feat[..., :self._decode_in_dim]
         out = self.decoder(x)
         if self.dv_skip is not None:
-            core = self.deter_dim + self.stoch_flat_dim
+            core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
             dv = feat[..., core:core + self._dv_feed_dim]
             out = out + self.dv_skip(dv)
         return out
@@ -455,21 +477,30 @@ class TransformerSSMDynamics(nn.Module):
              if self.dob_enabled else None)
         dv = (torch.zeros(batch_size, self.dv_dim, device=device)
               if self.dv_feedforward else None)
+        c = (torch.zeros(batch_size, self.cont_dim, device=device)
+             if self.cont_dim > 0 else None)
         return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0, d=d,
-                         dv=dv)
+                         dv=dv, c=c)
 
     # ----- internal: token build + causal encode -----
     def _build_token(self, z: torch.Tensor,
                      action: torch.Tensor,
-                     dv: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """token = proj([z_flat ; action ; (dv)]) -> (B, d_model)."""
-        z_flat = z.flatten(start_dim=-2)
+                     dv: Optional[torch.Tensor] = None,
+                     c: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """token = proj([z_flat ; (c) ; action ; (dv)]) -> (B, d_model)."""
+        parts = [z.flatten(start_dim=-2)]
+        if self.cont_dim > 0:
+            if c is None:
+                c = torch.zeros(action.shape[0], self.cont_dim,
+                                device=action.device, dtype=action.dtype)
+            parts.append(c)
+        parts.append(action)
         if self.dv_dim > 0:
             if dv is None:
                 dv = torch.zeros(action.shape[0], self.dv_dim,
                                  device=action.device, dtype=action.dtype)
-            return self.token_proj(torch.cat([z_flat, action, dv], dim=-1))
-        return self.token_proj(torch.cat([z_flat, action], dim=-1))
+            parts.append(dv)
+        return self.token_proj(torch.cat(parts, dim=-1))
 
     def _encode_window(self, window: torch.Tensor) -> torch.Tensor:
         """Full-sequence causal forward over (B, S, d_model) -> (B, S, d_model).
@@ -514,16 +545,21 @@ class TransformerSSMDynamics(nn.Module):
         if self.dv_feedforward and dv is None:
             dv = torch.zeros(prev_action.shape[0], self.dv_dim,
                              device=prev_action.device, dtype=prev_action.dtype)
-        token = self._build_token(prev.z, prev_action, dv)
+        token = self._build_token(prev.z, prev_action, dv, getattr(prev, 'c', None))
         cache = getattr(prev, 'kv_cache', None)
         pos = int(getattr(prev, 'pos', 0) or 0)
         h, new_cache = self._step(token, cache, pos)
         z_logits, z = self.prior_net(h, sample=sample)
+        # Continuous-latent prior p(c'|h') (gain persists, disturbance OU-rolls).
+        c_new = c_mean = c_std = None
+        if self.cont_dim > 0:
+            c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
         dv_new = dv if self.dv_feedforward else None
         return TSSMState(h=h, z_logits=z_logits, z=z,
-                         kv_cache=new_cache, pos=pos + 1, d=d_new, dv=dv_new)
+                         kv_cache=new_cache, pos=pos + 1, d=d_new, dv=dv_new,
+                         c=c_new, c_mean=c_mean, c_std=c_std)
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -538,6 +574,11 @@ class TransformerSSMDynamics(nn.Module):
         prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
+        # Continuous-latent posterior q(c'|h', embed) — the amortized Kalman.
+        c_post = c_post_mean = c_post_std = None
+        if self.cont_dim > 0:
+            c_post, c_post_mean, c_post_std = self.cont_post_net(
+                post_in, sample=sample)
         d_post = prior.d
         if self.dob_enabled and obs is not None and prior.d is not None:
             cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
@@ -549,7 +590,8 @@ class TransformerSSMDynamics(nn.Module):
         # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
         post = TSSMState(h=prior.h, z_logits=post_logits, z=post_z,
                          kv_cache=prior.kv_cache, pos=prior.pos, d=d_post,
-                         dv=prior.dv)
+                         dv=prior.dv, c=c_post, c_mean=c_post_mean,
+                         c_std=c_post_std)
         return post, prior
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
@@ -569,8 +611,9 @@ class TransformerSSMDynamics(nn.Module):
                if self.dv_dim > 0 else None)             # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
-        dec_in = self._decode_in_dim                     # core (+ dv feedforward)
+        dec_in = self._decode_in_dim                     # core (+ cont + dv ff)
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+        c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             # COMPILE-EFFICIENT DOB (2026-06-12, mirror of RSSMDynamics): run the
@@ -583,9 +626,12 @@ class TransformerSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            feats_l.append(post.feat[..., :dec_in])      # decoder feat [h, z, (dv)]
+            feats_l.append(post.feat[..., :dec_in])      # decoder feat [h,z,(c),(dv)]
             post_l.append(post.z_logits)
             prior_l.append(prior.z_logits)
+            if self.cont_dim > 0:
+                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
             if self.dob_enabled:
                 prior_core_l.append(prior.feat[..., :dec_in])
         post_core = torch.stack(feats_l, dim=1)          # (B, T, dec_in) = [h,z,(dv)]
@@ -615,12 +661,20 @@ class TransformerSSMDynamics(nn.Module):
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = TSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               kv_cache=state.kv_cache, pos=state.pos,
-                              d=ds[:, -1], dv=state.dv)
+                              d=ds[:, -1], dv=state.dv, c=state.c,
+                              c_mean=state.c_mean, c_std=state.c_std)
         else:
             feats = post_core
-        # 6th return = cont (continuous gain+disturbance latent stats), to match
-        # RSSMDynamics.rollout_observed's signature so the shared
-        # _rssm_world_model_loss unpacks both backbones.  The TSSM does NOT yet
-        # implement the cont latent (its transition is still a scaffold) → None
-        # (the loss skips the cont KL / gain-match when cont is None).
-        return feats, post_logits, prior_logits, state, ds, None
+        # 6th return = cont continuous-latent KL stats + posterior sample (the
+        # gain+disturbance latent), matching RSSMDynamics.rollout_observed so the
+        # shared _rssm_world_model_loss unpacks both backbones.  None when off.
+        cont = None
+        if self.cont_dim > 0:
+            cont = {
+                'post_mean': torch.stack(c_qm_l, dim=1),
+                'post_std': torch.stack(c_qs_l, dim=1),
+                'prior_mean': torch.stack(c_pm_l, dim=1),
+                'prior_std': torch.stack(c_ps_l, dim=1),
+                'sample': post_core[..., core:core + self.cont_dim],
+            }
+        return feats, post_logits, prior_logits, state, ds, cont
