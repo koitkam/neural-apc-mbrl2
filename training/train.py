@@ -800,6 +800,14 @@ class TrainConfig:
     # Gain-channel persistence: a light L2 on the step-to-step change of the
     # gain block (the gain is a per-episode CONSTANT, so it should not wander).
     cont_gain_persist_coef: float = 0.0
+    # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
+    # channel's posterior mean toward the recorded true hidden load so it
+    # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
+    # estimate) instead of staying a free OU the decoder uses to inject drift.
+    # Symmetric with C(1) gain-match.  Resolved >0 only when the cont
+    # disturbance channel is on (auto 0.3); the MSE is normalised by the load
+    # variance so the coef is sim-agnostic.  ``DREAMER_DIST_MATCH_COEF``.
+    dist_match_coef: float = 0.0
     # DV-as-input (Option B, 2026-06-07): feed the measured disturbance-variable
     # channels as an EXOGENOUS transition input (teacher-forced from the real
     # obs in WM training; HELD CONSTANT over the imagination horizon = the MPC
@@ -4173,6 +4181,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # gain (persist) + disturbance (OU) forward so imagination carries them.
     cont_kl = torch.zeros((), device=feats.device)
     cont_gain_persist = torch.zeros((), device=feats.device)
+    dist_match_loss = torch.zeros((), device=feats.device)
     if cont is not None:
         from models.dreamer_v4_rssm import rssm_cont_kl_loss
         cont_kl, _cont_kl_diag = rssm_cont_kl_loss(
@@ -4191,6 +4200,40 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             g_seq = cont['sample'][..., :n_gain]           # (B, T, n_gain)
             cont_gain_persist = (g_seq[:, 1:] - g_seq[:, :-1]).pow(2).mean()
             wm_total = wm_total + gp_coef * cont_gain_persist
+        # ----- C(2) disturbance-matching: supervise c_dist = true OU load -----
+        # The SYMMETRIC analogue of C(1) gain-matching for the DISTURBANCE
+        # block.  p138 RCA (DECISIVE probe tools/_probe_disturbance_localize):
+        # the unmeasured load is OBSERVABLE (the prior-CV INNOVATION tracks the
+        # true OU at det_r~0.37 = the DOB residual) but the WM posterior NEVER
+        # WRITES it into the latent (held-out probe on the full [h,z,c]=0.027,
+        # c_dist=0.06) because nothing supervises it: under CLOSED-LOOP control
+        # the controlled CV hides the load so recon is satisfied by [h,z] alone
+        # and the stop-grad read-out head is passive.  So c_dist stays a FREE OU
+        # (std~2.3) the decoder uses to inject open-loop DRIFT (the over-gain).
+        # FIX: pin the posterior disturbance mean to the recorded true load
+        # (known in training, in the same normalized-CV units the decoder
+        # consumes) so the posterior LEARNS the innovation->load inference (the
+        # PRBS-confounded buffer forces the MV-residual, not the raw CV =>
+        # transfers to closed loop) and the prior ROLLS the bounded OU forward
+        # (feed-forward).  NON-stop-grad (shaping the latent IS the point).
+        # Sim-agnostic: the MSE is normalised by the load variance => O(1) for
+        # any plant.  ``dist_match_coef=0`` (default) => byte-clean no-op.
+        dm_coef = float(getattr(cfg, 'dist_match_coef', 0.0) or 0.0)
+        n_dist = int(getattr(model.dynamics, 'cont_dist_dim', 0) or 0)
+        if (dm_coef > 0.0 and n_dist > 0 and dist_target is not None
+                and cont.get('post_mean') is not None):
+            n_g = int(getattr(model.dynamics, 'cont_gain_dim', 0) or 0)
+            c_dist = cont['post_mean'][..., n_g:n_g + n_dist]   # (B, T, n_cv)
+            dt = dist_target.to(c_dist.dtype)
+            if (dt.dim() == c_dist.dim() and dt.shape[:2] == c_dist.shape[:2]
+                    and dt.shape[-1] >= n_dist):
+                dt = dt[..., :n_dist]
+                dvar = dt.float().var().clamp_min(1e-4)
+                # supervise only when the load is actually present (var>0)
+                if float(dvar) > 1e-3:
+                    dist_match_loss = (F.mse_loss(c_dist.float(), dt.float())
+                                       / dvar)
+                    wm_total = wm_total + dm_coef * dist_match_loss
     # DOB regulariser: a small L2 prior that the disturbance estimate is small
     # (the Kalman "process noise is small" assumption).  Keeps d_t from absorbing
     # MORE than the genuine unexplained residual — the model prefers to explain
@@ -4268,6 +4311,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'cont_kl': cont_kl.detach(),
         'cont_gain_persist': cont_gain_persist.detach(),
         'gain_match_loss': gain_match_loss.detach(),
+        'dist_match_loss': dist_match_loss.detach(),
         'dob_reg': dob_reg.detach(),
         'dob_d_absmean': (ds.abs().mean().detach() if dob_on
                           else torch.zeros((), device=feats.device)),
@@ -5985,15 +6029,29 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # ``train`` sets each only when the field is still at its dataclass default,
     # so an explicit env-override / constructor value still wins.
     H_wm = int(getattr(cfg, 'horizon', 15) or 15)
-    # (a) overshoot + held-rollout supervision span ≈ one full settling response
-    # so the WM learns the asymptotic gain, not a truncated step.
+    # (a) overshoot span ≈ one full settling response so the WM learns the
+    # asymptotic gain, not a truncated step.  The overshoot SHAPE-matches the WM
+    # prior to the REAL response, so it stays at H (the control settling) — past
+    # H the real replay response is disturbance-driven and matching it would fit
+    # noise.
     out['wm_overshoot_len'] = {
         'value': int(H_wm),
         'source': f'horizon (={H_wm}) — one settling response',
     }
+    # The HELD-ROLLOUT is GAIN-NEUTRAL + SELF-supervised (penalises only the WM's
+    # OWN tail drift between [0.5K,K], no real-data target) so it is safe to
+    # extend.  p138 RCA: the WM open-loop prior settles ~2× SLOWER than the
+    # plant, so at K=H it goes stationary only to H and then DRIFTS — the
+    # transfer matrix reads the gain at 4×H=220 and so over-read it 1.38× off a
+    # post-H drift the K=H supervision never saw.  Extend to 2×H = the WM's
+    # actual settling so stationarity is enforced through the WM's own response
+    # → reliable DC gain (less over-gain / «WM variance»).  Sim-adaptive via H.
+    _held_len = int(round(2.0 * H_wm))
     out['wm_held_rollout_len'] = {
-        'value': int(H_wm),
-        'source': f'horizon (={H_wm}) — one settling response',
+        'value': _held_len,
+        'source': (f'2×horizon (=2×{H_wm}={_held_len}) — WM prior settles ~2× '
+                   f'slower than the plant; enforce stationarity over the WM '
+                   f'settling so the 4×H transfer gain is not drift-inflated'),
     }
     # (b) return-scale runaway ceiling.  ``return_scale`` is the p95-p5 spread of
     # the bounded-reward λ-returns; it NORMALISES the ACTOR advantage ONLY
@@ -6675,9 +6733,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _n_dv = int(cfg.dv_dim)
         cfg.cont_dist_dim = _n_cv
         cfg.cont_gain_dim = _n_cv * (_n_mv + _n_dv)
+        # C(2) disturbance-match auto-enable (p138 RCA): the cont disturbance
+        # channel is USELESS unless supervised toward the true load (it stays a
+        # free OU otherwise).  Mirror the C(1) gain-match auto-enable: turn it on
+        # by default when the channel exists; user/BO override via
+        # DREAMER_DIST_MATCH_COEF (sim-agnostic, variance-normalised coef).
+        if float(getattr(cfg, 'dist_match_coef', 0.0) or 0.0) <= 0.0:
+            cfg.dist_match_coef = 0.3
         print(f'[cont-latent] ENABLED: gain_dim={cfg.cont_gain_dim} '
               f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})), '
-              f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator).',
+              f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator); '
+              f'dist_match_coef={cfg.dist_match_coef}.',
               flush=True)
     else:
         cfg.cont_gain_dim = 0

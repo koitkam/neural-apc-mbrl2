@@ -496,6 +496,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_CONT_FREE_BITS':             ('cont_free_bits',                 float),
     'DREAMER_CONT_KL_SCALE':              ('cont_kl_scale',                  float),
     'DREAMER_CONT_GAIN_PERSIST_COEF':     ('cont_gain_persist_coef',         float),
+    # C(2) disturbance-matching: supervise the cont disturbance channel toward
+    # the true hidden load (auto-on when the cont disturbance channel is on).
+    'DREAMER_DIST_MATCH_COEF':            ('dist_match_coef',                float),
     # C(1) gain-matching (the step-response asymptote DC supervisor).  coef/len
     # auto-resolve when the cont gain channel is on; these override.
     'DREAMER_GAIN_MATCH_COEF':            ('gain_match_coef',                float),
