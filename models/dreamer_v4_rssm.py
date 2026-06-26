@@ -359,10 +359,26 @@ class RSSMDynamics(nn.Module):
             self.cont_prior_net = _ContinuousLatent(
                 self.deter_dim, self.cont_dim, hidden_dim=self.hidden_dim,
                 min_std=self.cont_min_std, max_std=self.cont_max_std)
+            # Innovation-driven posterior (2026-06-26, p139 RCA / Option B).  The
+            # DISTURBANCE block of the cont posterior infers the unmeasured load
+            # from the one-step CV INNOVATION ν = CV_obs − prior CV forecast (the
+            # DOB residual that IS the load) — NOT from [h, embed] alone, which
+            # could not (p139: the load is observable, det_r(ν)=0.32, but a
+            # non-innovation posterior learned an excited-CV shortcut that died
+            # under closed-loop control, det_r 0.03).  Appending ν makes c_dist a
+            # LEARNED amortized Kalman that transfers to deployment.  ν is n_cv =
+            # cont_dist_dim wide; only added when the disturbance block exists.
+            # Width = n_cv (the actual CV count = cont_dist_dim in a resolved
+            # run); gated on n_cv>0 so a CV-less config is a clean no-op.
+            _n_cv = len(getattr(cfg, 'cv_indices', ()) or ())
+            self._cont_post_uses_innov = self.cont_dist_dim > 0 and _n_cv > 0
+            _innov_dim = _n_cv if self._cont_post_uses_innov else 0
             self.cont_post_net = _ContinuousLatent(
-                self.deter_dim + self.embed_dim, self.cont_dim,
+                self.deter_dim + self.embed_dim + _innov_dim, self.cont_dim,
                 hidden_dim=self.hidden_dim, min_std=self.cont_min_std,
                 max_std=self.cont_max_std)
+        else:
+            self._cont_post_uses_innov = False
 
         # ----- Neural Kalman filter / disturbance observer (DOB) -----
         # ``d_t`` (per-CV) is a first-order learned observer on the one-step
@@ -490,7 +506,8 @@ class RSSMDynamics(nn.Module):
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
-                 sample: bool = True, obs: Optional[torch.Tensor] = None
+                 sample: bool = True, obs: Optional[torch.Tensor] = None,
+                 cont_innov: Optional[torch.Tensor] = None
                  ) -> Tuple[RSSMState, RSSMState]:
         """Observation step → (posterior, prior).  Prior is needed for KL.
 
@@ -499,17 +516,37 @@ class RSSMDynamics(nn.Module):
         state ``d_t = A·d_{t-1} + K·ν`` where ``ν`` is the one-step prediction
         residual on the PRIOR forecast (a genuine innovation; the prior has not
         seen the current obs).  ``obs=None`` (probes / diagnostics) ⇒ the
-        posterior just carries the decayed prior ``d`` (pure process model)."""
+        posterior just carries the decayed prior ``d`` (pure process model).
+
+        ``cont_innov`` (B, cont_dist_dim) is the same CV innovation, precomputed
+        BATCHED by ``rollout_observed`` and fed to the innovation-driven cont
+        DISTURBANCE posterior (Option B).  When omitted but ``obs`` is given
+        (standalone calls) it is computed inline; with neither it is zeros."""
         prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
-        # Continuous-latent posterior q(c'|h', embed): infers the gain (from the
-        # accumulated history in h) and the disturbance (from the innovation the
-        # embed carries) — the amortized Kalman update.
+        # Continuous-latent posterior q(c'|h', embed[, ν]): the GAIN block infers
+        # from the history in h; the DISTURBANCE block infers from the CV
+        # innovation ν (the amortized Kalman update — Option B).
         c_post = c_post_mean = c_post_std = None
         if self.cont_dim > 0:
+            cont_in = post_in
+            if self._cont_post_uses_innov:
+                if cont_innov is None:
+                    if obs is not None and self.n_cv > 0:
+                        cv_fore = self.decode(prior.feat).index_select(
+                            -1, self.cv_index_t)
+                        if prior.d is not None:
+                            cv_fore = cv_fore + prior.d
+                        cont_innov = (obs.index_select(-1, self.cv_index_t)
+                                      - cv_fore)
+                    else:
+                        cont_innov = torch.zeros(
+                            post_in.shape[0], self.n_cv,
+                            device=post_in.device, dtype=post_in.dtype)
+                cont_in = torch.cat([post_in, cont_innov], dim=-1)
             c_post, c_post_mean, c_post_std = self.cont_post_net(
-                post_in, sample=sample)
+                cont_in, sample=sample)
         d_post = prior.d
         if self.dob_enabled and obs is not None and prior.d is not None:
             cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
@@ -550,20 +587,29 @@ class RSSMDynamics(nn.Module):
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
         dec_in = self._decode_in_dim                   # core (+ cont + dv ff)
+        # Option B (2026-06-26, p139 RCA): the innovation-driven cont DISTURBANCE
+        # posterior needs the one-step CV innovation ν, which needs a PRIOR
+        # DECODE — too expensive PER STEP inside the compiled loop (the same
+        # reason the DOB below batches it).  So when the cont disturbance block
+        # is on we run TWO compile-friendly passes: pass 1 rolls a ZERO-
+        # innovation cont posterior to harvest the prior feats; ONE batched
+        # decode of those gives ν; pass 2 re-rolls feeding ν[:, t] so the c that
+        # feeds h is innovation-driven (→ the prior rolls the load forward in
+        # imagination).  pass-1 ν ≈ the full load (its c_dist is ~uninformative),
+        # exactly the signal the posterior should map.  Single pass when off.
+        two_pass = bool(getattr(self, '_cont_post_uses_innov', False))
+        _need_prior_core = self.dob_enabled or two_pass
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
-            # COMPILE-EFFICIENT DOB (2026-06-12): run the (h, z) recurrence
-            # WITHOUT the per-step DOB correction (``obs=None``).  ``d`` does NOT
-            # affect h/z (img_step consumes stoch+action(+dv); post_net consumes
-            # h+embed — never ``d``), so the EXPENSIVE per-step prior decode used
-            # for the innovation is hoisted OUT of this loop and done ONCE,
-            # batched, below.  This keeps the compiled graph free of the T×
-            # decoder-MLP copies (+ index_add_) that made the DOB rollout take
-            # ~15 min to compile / run launch-bound.  Math is identical (the d
-            # recurrence is a first-order linear filter on the prior decode) —
-            # validated by the equivalence test in tools/_smoke_dob.py.
+            # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z) recurrence
+            # with ``obs=None`` so neither the DOB d-update NOR the per-step prior
+            # decode (used for both the DOB and the cont innovation) enters the
+            # compiled loop — the EXPENSIVE decode is hoisted OUT and done ONCE,
+            # batched, below (the T× decoder-MLP copies otherwise made the
+            # rollout ~15 min to compile / run launch-bound).  ``d`` does NOT
+            # affect h/z, and the cont innovation is fed in pass 2.
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
@@ -573,8 +619,30 @@ class RSSMDynamics(nn.Module):
             if self.cont_dim > 0:
                 c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                 c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-            if self.dob_enabled:
+            if _need_prior_core:
                 prior_core_l.append(prior.feat[..., :dec_in])
+        if two_pass:
+            # ONE batched prior decode → CV forecast → innovation ν, then
+            # re-roll with the innovation-driven cont posterior.
+            prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+            base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
+            nu_seq = obs.index_select(-1, self.cv_index_t) - base  # (B, T, n_cv)
+            state = self.initial_state(B, device)
+            feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+            c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
+            for t in range(T):
+                dv_t = dvs[:, t] if dvs is not None else None
+                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                                            dv=dv_t, sample=sample, obs=None,
+                                            cont_innov=nu_seq[:, t])
+                state = post
+                feats_l.append(post.feat[..., :dec_in])
+                post_l.append(post.z_logits)
+                prior_l.append(prior.z_logits)
+                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if self.dob_enabled:
+                    prior_core_l.append(prior.feat[..., :dec_in])
         post_core = torch.stack(feats_l, dim=1)        # (B, T, dec_in)=[h,z,(c),(dv)]
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)

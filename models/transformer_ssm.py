@@ -395,9 +395,21 @@ class TransformerSSMDynamics(nn.Module):
             self.cont_prior_net = _ContinuousLatent(
                 self.deter_dim, self.cont_dim,
                 min_std=self.cont_min_std, max_std=self.cont_max_std)
+            # Innovation-driven posterior (2026-06-26, Option B — mirror of
+            # RSSMDynamics): the disturbance block infers the load from the CV
+            # innovation ν (the DOB residual) appended to [h, embed], not from
+            # [h, embed] alone (p139: a non-innovation posterior learned an
+            # excited-CV shortcut that died under closed-loop control).  ν is
+            # n_cv = cont_dist_dim wide; added only when the block exists.
+            # Width = n_cv (the actual CV count); gated on n_cv>0 (CV-less = no-op).
+            _n_cv = len(getattr(cfg, 'cv_indices', ()) or ())
+            self._cont_post_uses_innov = self.cont_dist_dim > 0 and _n_cv > 0
+            _innov_dim = _n_cv if self._cont_post_uses_innov else 0
             self.cont_post_net = _ContinuousLatent(
-                self.deter_dim + cfg.embed_dim, self.cont_dim,
+                self.deter_dim + cfg.embed_dim + _innov_dim, self.cont_dim,
                 min_std=self.cont_min_std, max_std=self.cont_max_std)
+        else:
+            self._cont_post_uses_innov = False
 
         # ----- Neural Kalman filter / disturbance observer (DOB) -----
         # Identical to RSSMDynamics: a first-order learned observer (per-CV A,K
@@ -563,22 +575,41 @@ class TransformerSSMDynamics(nn.Module):
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
-                 sample: bool = True, obs: Optional[torch.Tensor] = None
+                 sample: bool = True, obs: Optional[torch.Tensor] = None,
+                 cont_innov: Optional[torch.Tensor] = None
                  ) -> Tuple[TSSMState, TSSMState]:
         """Observation step -> (posterior, prior).  Prior is needed for KL; both
         share ``h``; the posterior conditions on the obs embedding and is the z
         carried forward (with the prior's KV-cache + position).  DOB: when
         ``obs`` is supplied the posterior carries the corrected disturbance
         state ``d_t = A*d_{t-1} + K*nu`` (innovation on the prior forecast),
-        identical to RSSMDynamics."""
+        identical to RSSMDynamics.  ``cont_innov`` (B, cont_dist_dim) is the same
+        CV innovation, fed to the innovation-driven cont disturbance posterior
+        (Option B); precomputed batched by ``rollout_observed`` or inline."""
         prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
-        # Continuous-latent posterior q(c'|h', embed) — the amortized Kalman.
+        # Continuous-latent posterior q(c'|h', embed[, ν]) — the amortized Kalman
+        # (the DISTURBANCE block conditions on the CV innovation ν).
         c_post = c_post_mean = c_post_std = None
         if self.cont_dim > 0:
+            cont_in = post_in
+            if self._cont_post_uses_innov:
+                if cont_innov is None:
+                    if obs is not None and self.n_cv > 0:
+                        cv_fore = self.decode(prior.feat).index_select(
+                            -1, self.cv_index_t)
+                        if prior.d is not None:
+                            cv_fore = cv_fore + prior.d
+                        cont_innov = (obs.index_select(-1, self.cv_index_t)
+                                      - cv_fore)
+                    else:
+                        cont_innov = torch.zeros(
+                            post_in.shape[0], self.n_cv,
+                            device=post_in.device, dtype=post_in.dtype)
+                cont_in = torch.cat([post_in, cont_innov], dim=-1)
             c_post, c_post_mean, c_post_std = self.cont_post_net(
-                post_in, sample=sample)
+                cont_in, sample=sample)
         d_post = prior.d
         if self.dob_enabled and obs is not None and prior.d is not None:
             cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
@@ -612,17 +643,21 @@ class TransformerSSMDynamics(nn.Module):
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
         dec_in = self._decode_in_dim                     # core (+ cont + dv ff)
+        # Option B (2026-06-26, mirror of RSSMDynamics): when the cont
+        # disturbance block is on, the innovation-driven posterior needs the CV
+        # innovation ν (a prior decode) — too expensive per step in the compiled
+        # loop — so run TWO passes: pass 1 (zero-innovation) harvests prior feats,
+        # ONE batched decode gives ν, pass 2 re-rolls feeding ν[:, t].  Single
+        # pass when off (DOB path unchanged).
+        two_pass = bool(getattr(self, '_cont_post_uses_innov', False))
+        _need_prior_core = self.dob_enabled or two_pass
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
-            # COMPILE-EFFICIENT DOB (2026-06-12, mirror of RSSMDynamics): run the
-            # (h, z) recurrence WITHOUT the per-step DOB correction (``obs=None``)
-            # — ``d`` does not affect h/z (the token is built from z+action+dv,
-            # post_net from h+embed) — so the per-step prior decode for the
-            # innovation is hoisted OUT of the loop and done ONCE, batched, below.
-            # Keeps the compiled graph free of T× decoder MLPs.  Math identical
-            # (first-order linear filter); validated in tools/_smoke_dob.py.
+            # COMPILE-EFFICIENT recurrence (2026-06-12, mirror of RSSMDynamics):
+            # ``obs=None`` keeps the per-step prior decode (for the DOB d-update
+            # AND the cont innovation) OUT of the loop — hoisted + batched below.
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
@@ -632,8 +667,28 @@ class TransformerSSMDynamics(nn.Module):
             if self.cont_dim > 0:
                 c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                 c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-            if self.dob_enabled:
+            if _need_prior_core:
                 prior_core_l.append(prior.feat[..., :dec_in])
+        if two_pass:
+            prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+            base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
+            nu_seq = obs.index_select(-1, self.cv_index_t) - base  # (B, T, n_cv)
+            state = self.initial_state(B, device)
+            feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+            c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
+            for t in range(T):
+                dv_t = dvs[:, t] if dvs is not None else None
+                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                                            dv=dv_t, sample=sample, obs=None,
+                                            cont_innov=nu_seq[:, t])
+                state = post
+                feats_l.append(post.feat[..., :dec_in])
+                post_l.append(post.z_logits)
+                prior_l.append(prior.z_logits)
+                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if self.dob_enabled:
+                    prior_core_l.append(prior.feat[..., :dec_in])
         post_core = torch.stack(feats_l, dim=1)          # (B, T, dec_in) = [h,z,(dv)]
         post_logits = torch.stack(post_l, dim=1)
         prior_logits = torch.stack(prior_l, dim=1)

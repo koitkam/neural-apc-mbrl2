@@ -34,6 +34,7 @@ def _build(wm_type, cont_on, dm_coef):
         cfg.cont_latent_enabled = True
         cfg.cont_gain_dim = 2
         cfg.cont_dist_dim = 1             # n_cv = 1
+        cfg.cv_obs_indices = (0,)        # 1 CV → exercises the innovation path
         cfg.dist_match_coef = dm_coef
     return cfg, build_model(cfg)
 
