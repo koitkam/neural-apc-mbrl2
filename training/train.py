@@ -5645,20 +5645,6 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     return result
 
 
-def _maybe_clip_horizon_to_wm_fidelity(model, env, device,
-                                         cfg: 'TrainConfig') -> None:
-    """Deprecated no-op.
-
-    The runtime WM-fidelity horizon clip + P1-extension mechanism was
-    removed 2026-05-20 alongside the short-budget knob cleanup.  With
-    the 1M-step default budget the P1 schedule has enough time to
-    train the WM at the paper-default H=15; runtime horizon shrinkage
-    is no longer needed.  This stub is retained so out-of-tree callers
-    do not break.
-    """
-    return
-
-
 def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                             ) -> Dict[str, Dict[str, object]]:
     """Derive plant-adaptive defaults for the cold-start seed buffer.
@@ -6029,29 +6015,21 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # ``train`` sets each only when the field is still at its dataclass default,
     # so an explicit env-override / constructor value still wins.
     H_wm = int(getattr(cfg, 'horizon', 15) or 15)
-    # (a) overshoot span ≈ one full settling response so the WM learns the
-    # asymptotic gain, not a truncated step.  The overshoot SHAPE-matches the WM
-    # prior to the REAL response, so it stays at H (the control settling) — past
-    # H the real replay response is disturbance-driven and matching it would fit
-    # noise.
+    # (a) overshoot + held-rollout supervision span = one settling response so
+    # the WM learns the asymptotic gain, not a truncated step.
+    # NOTE (p139 RCA): extending the held-rollout to 2xH (p138 Fix B) did NOT
+    # reduce the WM gain variance (its loss stayed tiny ~0.0014 — it constrains
+    # only the deterministic h-state, so it misses the categorical-z + cont-c
+    # open-loop drift that actually moves the decoded gain) and its premise was
+    # self-contradictory (it penalised the WM's OWN legitimate slow settling
+    # over [H,2H]).  Reverted to H.
     out['wm_overshoot_len'] = {
         'value': int(H_wm),
         'source': f'horizon (={H_wm}) — one settling response',
     }
-    # The HELD-ROLLOUT is GAIN-NEUTRAL + SELF-supervised (penalises only the WM's
-    # OWN tail drift between [0.5K,K], no real-data target) so it is safe to
-    # extend.  p138 RCA: the WM open-loop prior settles ~2× SLOWER than the
-    # plant, so at K=H it goes stationary only to H and then DRIFTS — the
-    # transfer matrix reads the gain at 4×H=220 and so over-read it 1.38× off a
-    # post-H drift the K=H supervision never saw.  Extend to 2×H = the WM's
-    # actual settling so stationarity is enforced through the WM's own response
-    # → reliable DC gain (less over-gain / «WM variance»).  Sim-adaptive via H.
-    _held_len = int(round(2.0 * H_wm))
     out['wm_held_rollout_len'] = {
-        'value': _held_len,
-        'source': (f'2×horizon (=2×{H_wm}={_held_len}) — WM prior settles ~2× '
-                   f'slower than the plant; enforce stationarity over the WM '
-                   f'settling so the 4×H transfer gain is not drift-inflated'),
+        'value': int(H_wm),
+        'source': f'horizon (={H_wm}) — one settling response',
     }
     # (b) return-scale runaway ceiling.  ``return_scale`` is the p95-p5 spread of
     # the bounded-reward λ-returns; it NORMALISES the ACTOR advantage ONLY

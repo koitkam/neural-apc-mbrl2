@@ -119,6 +119,27 @@ def _wm_rollout(model, lookback_obs, lookback_act, act_seq, horizon, device,
                               k_max, device)
 
 
+def _gain_at_horizon(curve: List[float], h_actor: int) -> float:
+    """Mean step-response gain over the window ending at the ACTOR's horizon.
+
+    The transfer matrix rolls 4xH steps so the (2x-slower) WM PRIOR can reach
+    its asymptote, and ``ss_gain_mean`` reads that asymptote.  But the ACTOR
+    only imagines ``cfg.horizon`` (=H) steps, so the gain it actually plans
+    against is the response at ~H, NOT the 4xH asymptote.  p139 RCA: the @H
+    gain is consistently ~0.85 (control-relevant under-bias) while the @4xH
+    asymptote swings 0.88-1.44 run-to-run (the late open-loop compounding the
+    actor never reaches) — reporting only the asymptote CONFLATES the two.
+    Averages a small tail window [H-H//5, H] to denoise the single-step read.
+    """
+    n = len(curve)
+    if n == 0:
+        return float('nan')
+    hi = min(max(1, int(h_actor)), n - 1)
+    lo = max(0, hi - max(1, int(h_actor) // 5))
+    seg = curve[lo:hi + 1]
+    return float(sum(seg) / len(seg)) if seg else float('nan')
+
+
 def _dv_settle_step_rollout(env, base_action: np.ndarray, dv_pos: int,
                             dv_offset_eng: float, settle_steps: int,
                             horizon: int, L: int,
@@ -279,10 +300,16 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
         real = _agg(cur['real'])
         rg = real['ss_gain_mean']
         wg = wm['ss_gain_mean']
+        _ha = int(getattr(cfg, 'horizon', 30) or 30)
+        wgh = _gain_at_horizon(wm['mean'], _ha)
+        rgh = _gain_at_horizon(real['mean'], _ha)
         result['pairs'][key] = {
             'wm': wm, 'real': real, 'wm_ss_gain': wg, 'real_ss_gain': rg,
             'ss_gain_ratio_wm_over_real': (wg / rg) if abs(rg) > 1e-9 else float('nan'),
-            'ss_gain_abs_err': abs(wg - rg)}
+            'ss_gain_abs_err': abs(wg - rg),
+            'actor_horizon': _ha,
+            'wm_gain_at_h': wgh, 'real_gain_at_h': rgh,
+            'gain_ratio_at_h': (wgh / rgh) if abs(rgh) > 1e-9 else float('nan')}
     return result
 
 
@@ -413,11 +440,18 @@ def compute_transfer_matrix(model, env, cfg, device, *,
         rg = real['ss_gain_mean']
         wg = wm['ss_gain_mean']
         gain_ratio = (wg / rg) if abs(rg) > 1e-9 else float('nan')
+        # CONTROL-RELEVANT gain at the actor's horizon (vs the 4xH asymptote).
+        _ha = int(getattr(cfg, 'horizon', 30) or 30)
+        wgh = _gain_at_horizon(wm['mean'], _ha)
+        rgh = _gain_at_horizon(real['mean'], _ha)
         result['pairs'][key] = {
             'wm': wm, 'real': real,
             'wm_ss_gain': wg, 'real_ss_gain': rg,
             'ss_gain_ratio_wm_over_real': gain_ratio,
             'ss_gain_abs_err': abs(wg - rg),
+            'actor_horizon': _ha,
+            'wm_gain_at_h': wgh, 'real_gain_at_h': rgh,
+            'gain_ratio_at_h': (wgh / rgh) if abs(rgh) > 1e-9 else float('nan'),
         }
     return result
 
