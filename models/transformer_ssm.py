@@ -168,6 +168,10 @@ class TransformerSSMConfig:
     cont_dist_dim: int = 0
     cont_min_std: float = 0.1
     cont_max_std: float = 2.0
+    # Deterministic cont-disturbance roll (p140 RCA) + static DV skip OFF (p132
+    # superseded) — mirror of RSSMConfig; see there for the full rationale.
+    cont_dist_deterministic_roll: bool = True
+    dv_static_skip: bool = False
 
 
 @dataclass
@@ -332,6 +336,9 @@ class TransformerSSMDynamics(nn.Module):
         self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
         self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
         self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
+        # Deterministic cont-disturbance roll in imagination (p140 RCA).
+        self.cont_dist_deterministic_roll = bool(
+            getattr(cfg, 'cont_dist_deterministic_roll', True))
         # DV-as-input (Option B): exogenous measured-DV channels appended to the
         # token input; ``dv_index_t`` selects them out of the obs vector.
         self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
@@ -367,8 +374,13 @@ class TransformerSSMDynamics(nn.Module):
         # clean direct path to the reconstructed obs (decode + W·dv), bypassing
         # the dilution + the categorical bottleneck.  Zero-init ⇒ exact no-op at
         # start; learns ∂CV/∂dv from the residual.
+        # DEFAULT OFF (2026-06-29, p140 RCA): memoryless feedthrough + gain_match
+        # crutch; superseded by the cont GAIN block + gain_match.  Gated behind
+        # ``dv_static_skip`` as an ablation lever.
+        self.dv_static_skip = bool(getattr(cfg, 'dv_static_skip', False))
         self.dv_skip = (nn.Linear(self._dv_feed_dim, self.obs_dim)
-                        if self._dv_feed_dim > 0 else None)
+                        if (self._dv_feed_dim > 0 and self.dv_static_skip)
+                        else None)
         if self.dv_skip is not None:
             nn.init.zeros_(self.dv_skip.weight)
             nn.init.zeros_(self.dv_skip.bias)
@@ -566,6 +578,14 @@ class TransformerSSMDynamics(nn.Module):
         c_new = c_mean = c_std = None
         if self.cont_dim > 0:
             c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
+            # R1 (p140 RCA): deterministic DISTURBANCE roll (prior MEAN) in
+            # imagination — clean feedforward, no per-rollout sampling noise in
+            # the imagined reward.  GAIN block stays sampled.  Mirror of RSSM.
+            if (self.cont_dist_deterministic_roll and sample
+                    and self.cont_dist_dim > 0):
+                c_new = torch.cat(
+                    [c_new[..., :self.cont_gain_dim],
+                     c_mean[..., self.cont_gain_dim:]], dim=-1)
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
         dv_new = dv if self.dv_feedforward else None

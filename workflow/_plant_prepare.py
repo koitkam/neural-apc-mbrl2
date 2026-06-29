@@ -496,6 +496,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_CONT_FREE_BITS':             ('cont_free_bits',                 float),
     'DREAMER_CONT_KL_SCALE':              ('cont_kl_scale',                  float),
     'DREAMER_CONT_GAIN_PERSIST_COEF':     ('cont_gain_persist_coef',         float),
+    # Deterministic cont-disturbance roll in imagination (p140 RCA, default on)
+    # + the static DV feedthrough skip (p132, default OFF — superseded).
+    'DREAMER_CONT_DIST_DET_ROLL':         ('cont_dist_deterministic_roll',   _as_bool),
+    'DREAMER_DV_STATIC_SKIP':             ('dv_static_skip',                 _as_bool),
     # C(2) disturbance-matching: supervise the cont disturbance channel toward
     # the true hidden load (auto-on when the cont disturbance channel is on).
     'DREAMER_DIST_MATCH_COEF':            ('dist_match_coef',                float),

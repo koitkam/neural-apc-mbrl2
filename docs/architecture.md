@@ -209,21 +209,44 @@ fixes BOTH:
   `g_mv_norm = g_eng·mv_action_scale/obs_std[cv]`). `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.
-- **DISTURBANCE block** (`cont_dist_dim = n_cv`): an **inherent amortized Kalman**
-  — the posterior `q(c|h,embed)` infers it from the innovation, the prior
-  `p(c|h)` rolls it forward (OU), the KL-balanced free-bits continuous KL
-  (`rssm_cont_kl_loss`) trains the roll-forward. Replaces the bolt-on DOB; the
-  actor reads it in `feat` for feedforward.
+- **DISTURBANCE block** (`cont_dist_dim = n_cv`): an **inherent amortized Kalman**.
+  The posterior `q(c|h,embed,ν)` infers the load from the one-step CV
+  **innovation** `ν = cv_obs − prior-CV-forecast` (the DOB residual that carries
+  the load) — fed EXPLICITLY since **p140**, because a posterior on `[h,embed]`
+  alone learned an excited-CV shortcut that died under closed-loop control (p139:
+  closed-loop `det_r(c_dist) 0.03` while `det_r(ν) 0.32`). It is supervised
+  toward the recorded true load (`dist_match_coef`, p138) and the prior `p(c|h)`
+  rolls it forward (OU) via the KL-balanced continuous KL (`rssm_cont_kl_loss`).
+  ν needs a prior decode (too costly per-step in the compiled loop), so
+  `rollout_observed` computes it BATCHED across two compile-friendly passes
+  (pass 1 harvests prior feats → one batched decode → ν; pass 2 re-rolls feeding
+  ν so the `c` that feeds `h` is innovation-driven). In **imagination** the
+  disturbance block rolls **DETERMINISTICALLY** (prior MEAN, not a sample —
+  `cont_dist_deterministic_roll`, p140 RCA): it is a feedforward signal, so a
+  per-rollout sample would inject uncontrollable noise into the imagined reward
+  and bury the action signal (the gain block stays sampled). Replaces the
+  bolt-on DOB; the actor reads `c` in `feat` for feedforward.
 
 `feat = [h, z_flat, c, (dv), (d)]`; the decoder reads `[h, z, c, (dv)]`. Both
 blocks feed the GRU transition. `cont_gain_dim == cont_dist_dim == 0` ⇒
 byte-identical to the pre-cont model (regression-verified). Env knobs:
 `DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /
 `_KL_SCALE` / `_GAIN_PERSIST_COEF`, `DREAMER_GAIN_MATCH_COEF` / `_LEN` /
-`_MAX_STARTS` / `_STEP`. Threaded through all 5 `DreamerV4Config` build sites.
-**RSSM is the runnable path (p137 live-validated: `cont_kl`, `gain_match_loss`
-compute, targets resolve); TSSM parity is config-threaded but the transformer
-transition is still a scaffold.**
+`_MAX_STARTS` / `_STEP`, `DREAMER_DIST_MATCH_COEF` (the disturbance-match
+supervision, auto-**0.6** when the cont disturbance block is on — raised from
+0.3 in p140 so `c_dist` fits the load AMPLITUDE against the cont KL),
+`DREAMER_CONT_DIST_DET_ROLL` (deterministic imagination roll, default on).
+Threaded through all 5 `DreamerV4Config` build sites.
+**Both RSSM AND TSSM are runnable** (p137 RSSM live-validated; TSSM parity is a
+real recompute impl — `cont_kl`, `gain_match_loss`, the innovation 2-pass all
+smoke-pass on both backbones).
+
+> **DV→obs static skip removed (p141)**: the p132 zero-init `W·dv_t` decoder
+> skip (`dv_static_skip`, now **default OFF**) was a memoryless feedthrough —
+> physically wrong (DV→CV has dead-time) and a `gain_match` crutch that let the
+> dynamic DV path stay weak. The cont GAIN block + `gain_match` supersede it;
+> the measured DV still feeds the decoder via `dv_feedforward` (p129) and drives
+> the CV through the recurrence. `DREAMER_DV_STATIC_SKIP=1` restores it (ablation).
 
 ### Continuous-latent curriculum (the simplified path)
 

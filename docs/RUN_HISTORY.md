@@ -939,6 +939,49 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   holds >0.015 through P3 + `imag_adv_action_corr` stops oscillating + `cum_raw`/`cv_viol` improve — val CIs for
   attribution.
 
+> **p134–p140 detail lives in `/memories/repo/mbrl_open_items.md`** (the human doc was not backfilled). Short
+> thread to p141: p137–p139 chased the disturbance channel (return_scale cap fix, dist_match supervision); **p140**
+> (innovation-driven cont-disturbance posterior, "Option B") was the structural win — **MV WM gain best-ever
+> (MV@H 0.94)** and the disturbance finally **ENCODED** (held-out localization det_r 0.025→**0.320**, ≈ the DOB's
+> 0.354) — but it **regressed the actor**: worst-ever econ `cum_raw` **−196k**, `cv_viol` 110, `mv_tv` ~2300
+> (all 9 seeds catastrophic). RCA: the encoded load now ROLLS STOCHASTICALLY in imagination →
+> `imag_reward_dv_corr` 0.44 (imagined reward disturbance-dominated) → `imag_adv_action_corr` 0.095 (action signal
+> buried) → actor thrash → `return_scale` pegs the cap → critic bootstrap cascade. Also: disturbance AMPLITUDE
+> attenuated (`dist_match_loss` 0.48→0.55 didn't converge, c_dist ~9% of true), and the DV WM transient off
+> (DV@H 1.00→0.89; instant t=0 jump from the static dv_skip).
+
+### p141 — fixes: R1 deterministic cont-disturbance roll (actor) + R2 dist_match 0.3→0.6 (rejection) + R3 remove the static DV feedthrough (cleanup)
+- **R1 (PRIMARY — the actor, control theory)**: roll the cont **disturbance block DETERMINISTICALLY** (prior MEAN,
+  not a sample) in `img_step` of BOTH backbones (`cont_dist_deterministic_roll=True`). The cont disturbance is a
+  **feedforward** signal — the actor needs the PREDICTED load, not a per-rollout sampled realization that injects
+  uncontrollable noise into the imagined reward (p140: `imag_reward_dv_corr` 0.44 buried the action signal →
+  `imag_adv_action_corr` 0.095 → thrash → cap cascade). Mirrors the DOB persistence roll (`d_t=A·d`, no sampling).
+  The GAIN block stays sampled. Removes the per-rollout `c_dist` noise the disturbance-aware advantage baseline
+  could not (it only cancels the measured-DV common-mode). Readout: `imag_adv_action_corr` ↑, `imag_reward_dv_corr`
+  controllable, `return_scale` stops pegging the cap, `rew_to_tgt_var` holds.
+- **R2 (rejection amplitude, variational)**: `dist_match_coef` auto **0.3→0.6**. At 0.3 the `cont_kl` (KL→OU prior,
+  which can't see the future load) **fought** the dist_match supervisor → `c_dist` settled at ~9% of the true load
+  amplitude (phase-correct but crushed) → weak feedforward → poor rejection. A stronger supervisor lets `c_dist`
+  fit the full amplitude against the KL. Complements R1 (deterministic + full-amplitude = strong, predictable
+  feedforward). Readout: `dist_match_loss` converges, `c_dist`/pred_std → toward the true load std, CV-obs
+  disturbance det_r ↓ (better rejection).
+- **R3 (real cleanup — remove the static DV→obs feedthrough)**: `dv_static_skip` **default OFF** (was the p132
+  always-on skip). The memoryless `W·dv_t` is (a) a **physically-wrong instant t=0 feedthrough** (DV→CV has
+  dead-time, not feedthrough) and (b) a **`gain_match` crutch** — `gain_match` measures the full decode
+  (`decoder([h,z,c]) + skip`), so the skip let it be satisfied with a WEAK dynamic DV path (slow rise, DV@H 0.89).
+  The cont **GAIN block + `gain_match`** (p134+) are the principled DYNAMIC gain mechanism that **supersedes** it;
+  removing the skip forces the latent path to carry the real DV transfer (gain + dynamics). Retained as an ablation
+  lever (`DREAMER_DV_STATIC_SKIP=1`) to verify the supersession. KEEP `dv_feedforward` (dv-in-decoder, p129) —
+  separate concern, next candidate if the DV transient is still wrong.
+- **Verification**: new `_smoke_cont_dist_roll.py` (R1: sampled `img_step` disturbance block == prior mean +
+  gain block still stochastic + flag-off restores stochasticity; R3: `dv_skip is None` by default, restorable) +
+  dist_match / rssm / tssm / dob smokes ALL green both backbones. No band-aids (no MV penalty, no extra cap raise).
+- **Judge by**: actor `cum_raw`→0 / `cv_viol`↓ / `mv_tv`→~979 (oscillation gone) + `imag_adv_action_corr` ↑ &
+  `return_scale` off the cap + `rew_to_tgt_var` >0.015 held (R1); disturbance pred amplitude ↑ & CV rejection ↑ &
+  `dist_match_loss` converges (R2); DV WM step-response shape (no instant jump, gain by horizon) + MV gain held
+  (R3) — val CIs for attribution.
+
+
 
 
 

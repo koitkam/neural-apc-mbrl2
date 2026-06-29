@@ -135,6 +135,25 @@ class RSSMConfig:
     cont_dist_dim: int = 0
     cont_min_std: float = 0.1       # σ floor (numerical + KL well-posedness)
     cont_max_std: float = 2.0       # σ ceiling
+    # Roll the DISTURBANCE block of the cont latent DETERMINISTICALLY (prior
+    # MEAN, not a sample) in imagination (2026-06-29, p140 RCA).  The cont
+    # disturbance is a FEEDFORWARD signal: the actor needs the PREDICTED load,
+    # not a per-rollout sampled realization that injects uncontrollable noise
+    # into the imagined reward (p140: imag_reward_dv_corr 0.44 buried the action
+    # signal → imag_adv_action_corr 0.095 → actor thrash + return_scale cap
+    # cascade).  Mirrors the DOB persistence roll (d_t = A·d, no sampling).  The
+    # GAIN block stays sampled (gain-uncertainty exploration).  No-op when
+    # sample=False (gain-match / probes already use the mean) or no dist block.
+    cont_dist_deterministic_roll: bool = True
+    # Static DV→obs feedthrough skip (p132).  DEFAULT OFF (2026-06-29, p140 RCA):
+    # a memoryless ``W·dv_t`` added to the decoded obs gives a PHYSICALLY-WRONG
+    # instant t=0 jump (DV→CV has dead-time, not feedthrough) AND acts as a
+    # CRUTCH — gain_match measures the full decode (decoder([h,z,c]) + skip), so
+    # the skip lets gain_match be satisfied with a WEAK dynamic path (slow DV
+    # rise).  The cont GAIN block + gain_match (p134+) are the principled DYNAMIC
+    # gain mechanism that SUPERSEDES it.  Retained as an ablation lever only;
+    # True restores the p132 static skip.
+    dv_static_skip: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +318,9 @@ class RSSMDynamics(nn.Module):
         self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
         self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
         self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
+        # Deterministic cont-disturbance roll in imagination (p140 RCA).
+        self.cont_dist_deterministic_roll = bool(
+            getattr(cfg, 'cont_dist_deterministic_roll', True))
         # DV-as-input (Option B): exogenous measured-DV channels fed into the
         # transition.  ``dv_index_t`` selects them out of the obs vector.
         self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
@@ -338,8 +360,14 @@ class RSSMDynamics(nn.Module):
         # AND the categorical bottleneck — exactly the role dv-feedforward was
         # meant to play.  ZERO-INIT ⇒ starts as an exact no-op (byte-identical to
         # the pre-skip decode) and learns the clean ∂CV/∂dv from the residual.
+        # DEFAULT OFF (2026-06-29, p140 RCA): the memoryless W·dv_t is a physically
+        # wrong instant feedthrough AND a gain_match crutch (lets the dynamic DV
+        # path stay weak); the cont GAIN block + gain_match supersede it.  Gated
+        # behind ``dv_static_skip`` as an ablation lever.
+        self.dv_static_skip = bool(getattr(cfg, 'dv_static_skip', False))
         self.dv_skip = (nn.Linear(self._dv_feed_dim, self.obs_dim)
-                        if self._dv_feed_dim > 0 else None)
+                        if (self._dv_feed_dim > 0 and self.dv_static_skip)
+                        else None)
         if self.dv_skip is not None:
             nn.init.zeros_(self.dv_skip.weight)
             nn.init.zeros_(self.dv_skip.bias)
@@ -495,6 +523,16 @@ class RSSMDynamics(nn.Module):
         c_new = c_mean = c_std = None
         if self.cont_dim > 0:
             c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
+            # R1 (p140 RCA): roll the DISTURBANCE block deterministically (prior
+            # MEAN) in imagination so the actor gets the PREDICTED load as a
+            # clean feedforward, not a per-rollout sample that buries the action
+            # signal in the imagined reward.  GAIN block stays sampled.  No-op
+            # when sample=False (c_new == c_mean already) or no disturbance block.
+            if (self.cont_dist_deterministic_roll and sample
+                    and self.cont_dist_dim > 0):
+                c_new = torch.cat(
+                    [c_new[..., :self.cont_gain_dim],
+                     c_mean[..., self.cont_gain_dim:]], dim=-1)
         # DOB predict step: decay the disturbance estimate (no obs to correct).
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)

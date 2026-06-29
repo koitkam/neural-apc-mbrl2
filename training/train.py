@@ -808,6 +808,19 @@ class TrainConfig:
     # disturbance channel is on (auto 0.3); the MSE is normalised by the load
     # variance so the coef is sim-agnostic.  ``DREAMER_DIST_MATCH_COEF``.
     dist_match_coef: float = 0.0
+    # Roll the cont DISTURBANCE block DETERMINISTICALLY (prior MEAN) in
+    # imagination (2026-06-29, p140 RCA).  The cont disturbance is a FEEDFORWARD
+    # signal — the actor needs the PREDICTED load, not a per-rollout sampled
+    # realization that buries the action signal in the imagined reward (p140:
+    # imag_reward_dv_corr 0.44 → imag_adv_action_corr 0.095 → actor thrash +
+    # return_scale cap cascade).  GAIN block stays sampled.  ``DREAMER_CONT_DIST_DET_ROLL``.
+    cont_dist_deterministic_roll: bool = True
+    # Static DV→obs feedthrough skip (p132).  DEFAULT OFF (2026-06-29, p140 RCA):
+    # the memoryless ``W·dv_t`` is a physically-wrong instant feedthrough (DV→CV
+    # has dead-time) AND a gain_match crutch (lets the dynamic DV path stay weak
+    # → slow rise); the cont GAIN block + gain_match supersede it.  Ablation
+    # lever only — ``DREAMER_DV_STATIC_SKIP=1`` restores the p132 skip.
+    dv_static_skip: bool = False
     # DV-as-input (Option B, 2026-06-07): feed the measured disturbance-variable
     # channels as an EXOGENOUS transition input (teacher-forced from the real
     # obs in WM training; HELD CONSTANT over the imagination horizon = the MPC
@@ -5431,6 +5444,9 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
         cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
         cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
+        cont_dist_deterministic_roll=bool(getattr(
+            cfg, 'cont_dist_deterministic_roll', True)),
+        dv_static_skip=bool(getattr(cfg, 'dv_static_skip', False)),
     )
     model = DreamerV4(model_cfg)
     # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths
@@ -6716,8 +6732,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # free OU otherwise).  Mirror the C(1) gain-match auto-enable: turn it on
         # by default when the channel exists; user/BO override via
         # DREAMER_DIST_MATCH_COEF (sim-agnostic, variance-normalised coef).
+        # 0.6 (2026-06-29, p140 RCA): 0.3 under-fit the load AMPLITUDE (c_dist
+        # std ~9% of true) because the cont_kl (KL→OU prior) fought the supervisor
+        # → weak feedforward → poor rejection.  Raise so c_dist fits the full
+        # amplitude against the KL.
         if float(getattr(cfg, 'dist_match_coef', 0.0) or 0.0) <= 0.0:
-            cfg.dist_match_coef = 0.3
+            cfg.dist_match_coef = 0.6
         print(f'[cont-latent] ENABLED: gain_dim={cfg.cont_gain_dim} '
               f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})), '
               f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator); '
