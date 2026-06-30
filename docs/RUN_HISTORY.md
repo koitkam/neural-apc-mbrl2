@@ -981,6 +981,45 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   `dist_match_loss` converges (R2); DV WM step-response shape (no instant jump, gain by horizon) + MV gain held
   (R3) — val CIs for attribution.
 
+### p141 — VERDICT: R3 win, R1 partial, R2 backfired; the cont-disturbance channel is a structural dead end
+- **R3 ✅** (remove the static DV skip): DV gain HELD/improved (DV@H **0.94**, @4H 0.98, decomp "faithful") — the
+  cont-gain + `gain_match` genuinely supersede the p132 feedthrough.
+- **R1 ⚠️** (deterministic disturbance roll): `imag_reward_dv_corr` 0.44→0.26 but the cascade STILL fired
+  (`return_scale`→49.5 cap, `rew_to_tgt_var`→0.0008). Eased the symptom, not the disease.
+- **R2 ❌** (dist_match 0.3→0.6): **diverged** (0.48→0.92); `c_dist` amplitude up but phase tracking destroyed.
+- **Disturbance encoding REGRESSED**: localize probe on `best.pt` held-out full-latent det_r **0.32(p140)→ −0.05**
+  (train 0.81 → test −0.05 = pure overfit). The learned cont-disturbance channel has now **failed 5 runs straight**
+  (p137–141); −0.05 < 0.1 = the documented DOB-fallback threshold.
+- **WM MV gain flipped to OVER**: MV@H 1.14, @4H 1.37 (autoencoder over-reads + open-loop drift — the prior never
+  settles). Run-to-run swing 0.82–1.14 @H. **Actor catastrophic**: cum_raw −147k, cv_viol 93, mv_tv 2201, critic_r 0.085.
+- **UNIFYING STRUCTURAL ROOT**: the large unmeasured load (CV swings ±2σ, MV authority small) is (a) not cleanly
+  identifiable by the learned latent (ν confounds load with the WM's own gain error) and (b) dominates the imagined
+  reward; since it isn't in the latent, the critic can't baseline it out → advantages = noise → actor diverges →
+  `return_scale` caps. ONE root (the load), four symptoms. → revert the disturbance to the classical DOB.
+
+### p142 — fix #1: revert the disturbance to the classical DOB (keep cont-gain), drop the failed cont-disturbance channel
+- **The call** (system-ID theory): the learned "inherent amortized-Kalman" cont-disturbance channel failed 5 runs;
+  the classical **DOB** (first-order neural-Kalman observer) is the *optimal* linear estimator for a Gauss-Markov
+  load and previously hit det_r **0.354**. Re-enable it (`DREAMER_DOB_ENABLED=1`) as the disturbance estimator +
+  Scope-2 feedforward (d_t in `feat`). **Keep the cont GAIN block** (it works — DV faithful 0.96); **drop the cont
+  DISTURBANCE block + dist_match** (auto when DOB on: `cont_dist_dim=0`, `dist_match_coef=0`).
+- **Why it fixes all four** (one root): the DOB de-confounds the WM gain (`d_t` absorbs the load → `g` learns the
+  clean input→CV gain, #1), puts a `d_t` state in `feat` the critic CAN use (#3 → #4), and gives clean feedforward
+  (#2, the proven 0.354). `gain_match` pins `g` so `d_t` cleanly gets the load residual (no gain↔disturbance fight).
+- **Workflow change (automatic, no manual data work)**: with the DOB on, the run switches from the non-staged
+  continuous-latent curriculum to the **staged clean→disturbance curriculum** — the textbook sysID recipe: **Stage 1**
+  collects a CLEAN seed buffer + trains `g` (incl. cont-gain + `gain_match`) on the unbiased gain; **Stage 2** freezes
+  `g`, trains the DOB (A,K) on the disturbance-laden innovation; **Stage 3** trains the actor on the frozen WM +
+  working observer. The clean Stage-1 should also tighten the MV gain (#1). The P87 readout head auto-retires
+  (`disturbance_head_dim=0`). Sim-agnostic (A,K learned, `cv_indices` auto, no-op when `n_cv=0`); both backbones.
+- **Deferred (#2, on the todo)**: a `d_t`-conditioned **advantage baseline** (control variate) to remove the
+  uncontrollable load from the policy gradient — the cascade's true fix, added next once the DOB revert is attributed.
+- **Verification**: new `_smoke_dob_cont_gain.py` (gain-only cont + DOB layout, dist_match=0, DOB d_t live, clean
+  g↔dob freeze partition) + dob/dist_match/cont_dist_roll/curriculum/rssm/tssm smokes ALL green both backbones.
+- **Judge by**: disturbance det_r → toward 0.354 (DOB d_t estimator) + MV gain @H toward 1.0 & stable @H==@4H
+  (clean Stage-1) + `critic_r` recovers off 0.085 + actor `cum_raw`/`cv_viol`/`mv_tv` improve — val CIs.
+
+
 
 
 

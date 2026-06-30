@@ -224,8 +224,20 @@ fixes BOTH:
   disturbance block rolls **DETERMINISTICALLY** (prior MEAN, not a sample —
   `cont_dist_deterministic_roll`, p140 RCA): it is a feedforward signal, so a
   per-rollout sample would inject uncontrollable noise into the imagined reward
-  and bury the action signal (the gain block stays sampled). Replaces the
-  bolt-on DOB; the actor reads `c` in `feat` for feedforward.
+  and bury the action signal (the gain block stays sampled).
+
+  > **⚠ SUPERSEDED for the disturbance (p142, after 5 failed runs p137–141).** The
+  > learned cont-disturbance block never reliably encoded the load on held-out
+  > data (p141 held-out `det_r` 0.32→**−0.05**; `dist_match` *diverged* at 0.6) —
+  > ν confounds the load with the WM's own gain error, so it is not cleanly
+  > identifiable. The disturbance is reverted to the classical **DOB** (the
+  > neural-Kalman observer, §3; proven `det_r` 0.354). **When `dob_enabled` AND
+  > `cont_latent_enabled`, the config resolves to GAIN-ONLY cont** (`cont_dist_dim
+  > =0`, `dist_match_coef=0`): the cont latent keeps only the GAIN block, the DOB
+  > owns the load (`d_t` in `feat`, Scope-2), and `gain_match` pins `g` so `d_t`
+  > cleanly gets the load residual (no gain↔disturbance fight). The staged
+  > clean→disturbance curriculum (the textbook sysID recipe) activates
+  > automatically with the DOB on.
 
 `feat = [h, z_flat, c, (dv), (d)]`; the decoder reads `[h, z, c, (dv)]`. Both
 blocks feed the GRU transition. `cont_gain_dim == cont_dist_dim == 0` ⇒
@@ -233,10 +245,10 @@ byte-identical to the pre-cont model (regression-verified). Env knobs:
 `DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /
 `_KL_SCALE` / `_GAIN_PERSIST_COEF`, `DREAMER_GAIN_MATCH_COEF` / `_LEN` /
 `_MAX_STARTS` / `_STEP`, `DREAMER_DIST_MATCH_COEF` (the disturbance-match
-supervision, auto-**0.6** when the cont disturbance block is on — raised from
-0.3 in p140 so `c_dist` fits the load AMPLITUDE against the cont KL),
-`DREAMER_CONT_DIST_DET_ROLL` (deterministic imagination roll, default on).
-Threaded through all 5 `DreamerV4Config` build sites.
+supervision, auto-**0.6** when the cont disturbance block is on AND the DOB is
+off — the DOB-off fallback only; p141 found 0.6 backfired so the disturbance is
+now the DOB's job), `DREAMER_CONT_DIST_DET_ROLL` (deterministic imagination roll,
+default on). Threaded through all 5 `DreamerV4Config` build sites.
 **Both RSSM AND TSSM are runnable** (p137 RSSM live-validated; TSSM parity is a
 real recompute impl — `cont_kl`, `gain_match_loss`, the innovation 2-pass all
 smoke-pass on both backbones).

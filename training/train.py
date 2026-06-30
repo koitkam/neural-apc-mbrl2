@@ -6725,24 +6725,41 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _n_mv = int(len([x for x in (env.meta.get('mv_indices') or [])
                          if x is not None]))
         _n_dv = int(cfg.dv_dim)
-        cfg.cont_dist_dim = _n_cv
         cfg.cont_gain_dim = _n_cv * (_n_mv + _n_dv)
-        # C(2) disturbance-match auto-enable (p138 RCA): the cont disturbance
-        # channel is USELESS unless supervised toward the true load (it stays a
-        # free OU otherwise).  Mirror the C(1) gain-match auto-enable: turn it on
-        # by default when the channel exists; user/BO override via
-        # DREAMER_DIST_MATCH_COEF (sim-agnostic, variance-normalised coef).
-        # 0.6 (2026-06-29, p140 RCA): 0.3 under-fit the load AMPLITUDE (c_dist
-        # std ~9% of true) because the cont_kl (KL→OU prior) fought the supervisor
-        # → weak feedforward → poor rejection.  Raise so c_dist fits the full
-        # amplitude against the KL.
-        if float(getattr(cfg, 'dist_match_coef', 0.0) or 0.0) <= 0.0:
-            cfg.dist_match_coef = 0.6
-        print(f'[cont-latent] ENABLED: gain_dim={cfg.cont_gain_dim} '
-              f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})), '
-              f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator); '
-              f'dist_match_coef={cfg.dist_match_coef}.',
-              flush=True)
+        if _dob_on:
+            # DOB owns the unmeasured disturbance (the classical neural-Kalman
+            # observer — proven det_r 0.354, the OPTIMAL linear estimator for a
+            # Gauss-Markov load).  The cont latent keeps ONLY the GAIN block (the
+            # C(1) gain-match de-confounder that fixed the DV bias).  DROP the
+            # cont DISTURBANCE channel + dist_match: a learned cont-disturbance
+            # block would COMPETE with the DOB d_t for the SAME CV innovation
+            # (the gain↔disturbance identifiability confound), and it FAILED 5
+            # runs (p137-141: held-out det_r −0.05, dist_match diverged at 0.6).
+            # gain_match still pins g, so d_t cleanly gets the load residual.
+            cfg.cont_dist_dim = 0
+            cfg.dist_match_coef = 0.0
+            print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
+                  f'gain_dim={cfg.cont_gain_dim} '
+                  f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
+                  f'channel + dist_match DISABLED (the DOB d_t is the estimator).',
+                  flush=True)
+        else:
+            cfg.cont_dist_dim = _n_cv
+            # C(2) disturbance-match auto-enable (p138 RCA): the cont disturbance
+            # channel is USELESS unless supervised toward the true load (it stays a
+            # free OU otherwise).  Mirror the C(1) gain-match auto-enable: turn it on
+            # by default when the channel exists; user/BO override via
+            # DREAMER_DIST_MATCH_COEF (sim-agnostic, variance-normalised coef).
+            # NOTE (p141): 0.6 BACKFIRED (dist_match diverged, c_dist lost phase);
+            # the cont disturbance direction was superseded by the DOB revert
+            # (p142) — this branch is the DOB-OFF fallback only.
+            if float(getattr(cfg, 'dist_match_coef', 0.0) or 0.0) <= 0.0:
+                cfg.dist_match_coef = 0.6
+            print(f'[cont-latent] ENABLED: gain_dim={cfg.cont_gain_dim} '
+                  f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})), '
+                  f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator); '
+                  f'dist_match_coef={cfg.dist_match_coef}.',
+                  flush=True)
     else:
         cfg.cont_gain_dim = 0
         cfg.cont_dist_dim = 0
