@@ -208,6 +208,17 @@ class TrainConfig:
     # critic warmup (p3_critic_warmup_iters) still runs at the very start so
     # the value head calibrates before actor coupling.  DREAMER_TRAIN_MODE.
     train_mode: str = 'phased'
+    # ----- Actor training data source (mbrl2 fork, 2026-07-07) -----
+    # ``imagination`` (legacy Dreamer): the actor-critic trains in the WM's
+    # latent imagination — sample-efficient but imports the WM's gain/dynamics
+    # BIAS into the policy gradient (objective mismatch; the p106->p143 actor
+    # failures).  ``realsim``: the WM(RSSM)+DOB are a FROZEN OBSERVER only; the
+    # actor-critic trains on λ-returns from REAL rollouts of the (cheap) true
+    # simulator with domain randomisation (``_realsim_actor_critic_step``).
+    # Exact policy gradient w.r.t. the true dynamics, real-return-grounded
+    # critic (no cascade), same DreamerV3 scale-invariant normalisation (=>
+    # fixed hyperparameters across sims).  DREAMER_ACTOR_SOURCE.
+    actor_train_source: str = 'imagination'
     # joint mode: re-snapshot the PMPO prior policy every N iters (0 = once at
     # start, like phased P3).  A slowly-refreshed prior keeps the KL anchor
     # from going stale over a long single-phase run.
@@ -5055,6 +5066,126 @@ def _read_env_dr_gain_frac(env) -> Optional[float]:
     return frac if frac > 0.0 else None
 
 
+def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
+                                cfg: TrainConfig) -> Dict[str, torch.Tensor]:
+    """Phase 3 (real-sim mode): actor-critic on REAL-environment λ-returns.
+
+    The mbrl2 pivot: the actor is NOT trained in the world model's imagination
+    (which imports the WM's gain/dynamics bias into the policy gradient — the
+    p106→p143 objective-mismatch failures).  Instead the WM (RSSM) + DOB act as
+    a FROZEN OBSERVER: we re-encode the on-policy real trajectory
+    ``batch = {obs, act, rew}`` (collected by ``collect_episode`` on the true
+    simulator, with domain randomisation) through the posterior to get the
+    per-step belief ``feat = [h, z, (dv), (d_t)]``, then compute λ-returns from
+    the **REAL** rewards + a bootstrapped slow critic and apply the SAME
+    DreamerV3 actor/critic loss + percentile return normalisation used in
+    imagination.  Only the data source changes (real vs imagined):
+
+      * the policy gradient is now exact w.r.t. the TRUE dynamics — no model
+        exploitation, no WM-@H-gain-induced under-actuation;
+      * real returns are bounded by the reward function ⇒ ``return_scale``
+        cannot run away (the cascade was an imagined-return artefact);
+      * the scale-invariant normalisation (symlog/twohot/percentile) is what
+        gives the fixed-hyperparameters-across-sims property — retained intact.
+
+    The observer is frozen (``no_grad`` + ``detach``) so only the actor + critic
+    receive gradients; the caller therefore skips the P3 world-model update.
+    RSSM/TSSM only.  Returns the same diag keys the P3 logger consumes.
+    """
+    rssm = model.dynamics
+    obs = batch['obs']                                   # (B, T, D)
+    act = batch['act']                                   # (B, T, A)
+    rew = batch['rew'].float()                           # (B, T)  REAL reward
+    B, T = obs.shape[:2]
+    device = obs.device
+
+    # ----- FROZEN OBSERVER: real trajectory -> per-step belief feat -----
+    # sample=False = the posterior MODE (certainty-equivalent belief), which is
+    # deterministic + reproducible so the critic value and the actor log-prob
+    # are evaluated on the SAME belief the control acts on.
+    with torch.no_grad():
+        feats, _pl, _prl, _last, _ds, _cont = rssm.rollout_observed(
+            obs, act, sample=False)                      # (B, T, F)
+    feats = feats.detach()
+    feat_flat = feats.reshape(B * T, -1)
+
+    # ----- critic value (grad) + slow-target bootstrap value (frozen) -----
+    value_logits = model.value(feat_flat)                # (B*T, n_bins)
+    with torch.no_grad():
+        v_slow = model.target_value.expectation(
+            model.target_value(feat_flat)).reshape(B, T)
+
+    # ----- λ-returns from REAL rewards (same TD-λ recursion as imagination) --
+    gamma = float(cfg.gamma)
+    lam = float(cfg.gae_lambda)
+    _ret_cap = _adaptive_return_cap(cfg)
+    if _ret_cap is not None:
+        v_slow = v_slow.clamp(-_ret_cap, _ret_cap)
+    returns = torch.zeros_like(v_slow)
+    returns[:, -1] = v_slow[:, -1]
+    for t in reversed(range(T - 1)):
+        bootstrap = (1.0 - lam) * v_slow[:, t + 1] + lam * returns[:, t + 1]
+        returns[:, t] = rew[:, t] + gamma * bootstrap
+    target_returns = returns.detach()
+    if _ret_cap is not None:
+        target_returns = target_returns.clamp(-_ret_cap, _ret_cap)
+
+    # ----- critic loss (twohot CE) — REUSED -----
+    critic_loss = model.value.loss(
+        value_logits, target_returns.reshape(-1)).mean()
+
+    # ----- advantage + percentile return-scale normalisation — REUSED -----
+    with torch.no_grad():
+        v_pred = model.value.expectation(value_logits).reshape(B, T)
+        adv_raw = target_returns - v_pred
+        scale = model.update_return_scale(
+            target_returns,
+            abs_cap=float(getattr(cfg, 'return_scale_abs_cap', 500.0)),
+        ).clamp_min(1.0)
+    adv_flat = (adv_raw / scale).reshape(-1)
+    _adv_clip = float(getattr(cfg, 'advantage_clip', 0.0) or 0.0)
+    if _adv_clip > 0.0:
+        adv_flat = adv_flat.clamp(-_adv_clip, _adv_clip)
+    adv_flat = adv_flat.detach()
+
+    # ----- actor loss: REINFORCE on the TAKEN real action + entropy bonus -----
+    act_flat = act.reshape(B * T, -1)
+    logp = model.policy.log_prob_of(feat_flat, act_flat)     # (B*T,)
+    entropy = model.policy.entropy(feat_flat)                # (B*T,)
+    ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
+    actor_loss = -(adv_flat * logp).mean() - ent_coef * entropy.mean()
+
+    # ----- diagnostics (mirror the imagination keys the P3 logger reads) -----
+    with torch.no_grad():
+        rew_var = rew.var().clamp_min(1e-8)
+        tgt_var = target_returns.float().var().clamp_min(1e-8)
+        _adv_c = (adv_raw.float() - adv_raw.float().mean()).reshape(-1)
+        _corr = []
+        for _ai in range(act_flat.shape[-1]):
+            _a = act_flat[:, _ai].float()
+            _a_c = _a - _a.mean()
+            _den = (_adv_c.norm() * _a_c.norm()).clamp_min(1e-8)
+            _corr.append(((_adv_c * _a_c).sum() / _den).abs())
+        adv_action_corr = (torch.stack(_corr).mean()
+                           if _corr else torch.zeros((), device=device))
+    return {
+        'actor_loss': actor_loss,
+        'critic_loss': critic_loss,
+        'entropy_mean': entropy.mean().detach(),
+        'realsim_return_mean': target_returns.mean().detach(),
+        'imagined_return_mean': target_returns.mean().detach(),
+        'realsim_reward_mean': rew.mean().detach(),
+        'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
+        'adv_global_std': adv_raw.std().detach(),
+        'return_scale': scale.detach().squeeze(),
+        'critic_rew_to_tgt_var': (rew_var / tgt_var).clamp_max(10.0).detach(),
+        'imag_adv_action_corr': adv_action_corr.detach(),
+        'actor_logp_mean': logp.mean().detach(),
+        'actor_logp_std': logp.std().detach(),
+        'pmpo_pos_frac': (adv_flat >= 0).float().mean().detach(),
+    }
+
+
 def imagination_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                       cfg: TrainConfig) -> Dict[str, torch.Tensor]:
     """Phase 3: roll out H imagined steps, compute PMPO + TD-λ.
@@ -8887,47 +9018,60 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # (recon/sf + reward MTP), (b) one actor/critic step
                 # via imagination from a possibly different batch.
                 _t = time.time()
-                # ---- (a) WM + reward-head update -----------------
-                # The WM + reward heads train on the SAME on-policy ``batch`` the
-                # actor/critic imagine from (joint/P3 co-training).
-                with torch.amp.autocast(device_type=device.type,
-                                          dtype=torch.bfloat16,
-                                          enabled=(device.type == 'cuda')):
-                    wm_losses, _, agent_hid = world_model_loss(model, batch,
-                                                                  cfg)
-                    ag_losses = agent_finetune_loss(model, batch,
-                                                      agent_hid, cfg)
-                    # Drop BC term in P3 (the actor is now driven by
-                    # imagination/PMPO; BC against random-action data
-                    # would just pull it back toward uniform).  Keep
-                    # reward MTP because that head is what the actor's
-                    # value target depends on.
-                    # Use non-detached ``reward_mtp_total`` (see the
-                    # P1 comment above for the detach-bug rationale).
-                    if _wm_frozen_now:
-                        # WM core frozen (freeze-after-pretrain): drop wm_total
-                        # (its grads would hit frozen params); only the reward
-                        # head (still trainable) trains via reward-MTP.
-                        p3_total_world = (cfg.reward_scale_loss
-                                          * ag_losses['reward_mtp_total'])
+                # mbrl2 real-sim (``actor_train_source='realsim'``): the
+                # WM(RSSM)+DOB is a FROZEN OBSERVER — skip the P3 world-model
+                # update and train ONLY the actor+critic on REAL-env λ-returns.
+                # ``wm_losses``/``ag_losses`` are emptied so the log-row merge
+                # (``{**wm_losses, **ag_losses, **ac_losses}``) is a clean no-op.
+                _realsim = (str(getattr(cfg, 'actor_train_source',
+                                        'imagination')) == 'realsim')
+                agent_hid = None
+                wm_grad_norm = 0.0
+                wm_losses, ag_losses = {}, {}
+                if not _realsim:
+                    # ---- (a) WM + reward-head update -----------------
+                    # The WM + reward heads train on the SAME on-policy ``batch`` the
+                    # actor/critic imagine from (joint/P3 co-training).
+                    with torch.amp.autocast(device_type=device.type,
+                                              dtype=torch.bfloat16,
+                                              enabled=(device.type == 'cuda')):
+                        wm_losses, _, agent_hid = world_model_loss(model, batch,
+                                                                      cfg)
+                        ag_losses = agent_finetune_loss(model, batch,
+                                                          agent_hid, cfg)
+                        # Drop BC term in P3 (the actor is now driven by
+                        # imagination/PMPO; BC against random-action data
+                        # would just pull it back toward uniform).  Keep
+                        # reward MTP because that head is what the actor's
+                        # value target depends on.
+                        # Use non-detached ``reward_mtp_total`` (see the
+                        # P1 comment above for the detach-bug rationale).
+                        if _wm_frozen_now:
+                            # WM core frozen (freeze-after-pretrain): drop wm_total
+                            # (its grads would hit frozen params); only the reward
+                            # head (still trainable) trains via reward-MTP.
+                            p3_total_world = (cfg.reward_scale_loss
+                                              * ag_losses['reward_mtp_total'])
+                        else:
+                            p3_total_world = (wm_losses['wm_total']
+                                               + cfg.reward_scale_loss
+                                                 * ag_losses['reward_mtp_total'])
+                    opt_world.zero_grad(set_to_none=True)
+                    p3_total_world.backward()
+                    wm_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters_world(), cfg.grad_clip)
+                    if torch.isfinite(wm_grad_norm):
+                        opt_world.step()
                     else:
-                        p3_total_world = (wm_losses['wm_total']
-                                           + cfg.reward_scale_loss
-                                             * ag_losses['reward_mtp_total'])
-                opt_world.zero_grad(set_to_none=True)
-                p3_total_world.backward()
-                wm_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters_world(), cfg.grad_clip)
-                if torch.isfinite(wm_grad_norm):
-                    opt_world.step()
-                else:
-                    n_grad_skip += 1
+                        n_grad_skip += 1
 
-                # ---- (b) Actor + Critic via imagination ----------
+                # ---- (b) Actor + Critic ----------
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
-                    ac_losses = imagination_step(model, batch, cfg)
+                    ac_losses = (_realsim_actor_critic_step(model, batch, cfg)
+                                 if _realsim
+                                 else imagination_step(model, batch, cfg))
                 # ---- P83: decaying masked expert-BC actor anchor -----
                 # Keep the policy mean grounded near the expert THROUGH P3
                 # (the P2 anchor was dropped at the boundary, which is when
@@ -8936,7 +9080,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # the WM update stays isolated.  Kickstarting decay 1→floor
                 # over P3 hands the optimum back to RL late in the phase.
                 _actor_loss = ac_losses['actor_loss']
-                if (cfg.expert_bc_p3
+                if (not _realsim and cfg.expert_bc_p3
                         and getattr(cfg, '_expert_active', False)):
                     with torch.amp.autocast(device_type=device.type,
                                               dtype=torch.bfloat16,

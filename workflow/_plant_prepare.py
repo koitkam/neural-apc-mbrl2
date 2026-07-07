@@ -435,6 +435,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_P3_CRITIC_WARMUP_ITERS':     ('p3_critic_warmup_iters',         int),
     'DREAMER_WM_TRUNK_STOPGRAD_IN_P2':    ('wm_trunk_stopgrad_in_p2',        _as_bool),
     'DREAMER_TRAIN_MODE':                 ('train_mode',                     str),
+    'DREAMER_ACTOR_SOURCE':               ('actor_train_source',             str),
     'DREAMER_JOINT_PRIOR_REFRESH_ITERS':  ('joint_prior_refresh_iters',      int),
     # Early-stop knobs (mirror train.py _cfg_from_env names) so single_run/bo
     # runs can relax/disable the stops for diagnostic runs (e.g. let a run
