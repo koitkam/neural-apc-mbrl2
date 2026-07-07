@@ -27,6 +27,21 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`DREAMER_DOB_ENABLED=1`) until the cont disturbance is verified to recover
 > (detrended r ≥ the DOB's 0.354). First run: p137.
 
+> **2026-07-07 — neural-apc-mbrl2 fork (REAL-SIM controller):** the actor is no
+> longer trained in WM imagination. **Imagination is deleted** (`imagination_step`
+> / `_imagination_step_rssm`, ~880 lines removed). The WM (RSSM) + DOB are now a
+> **frozen OBSERVER only**; the **actor-critic trains on λ-returns from REAL
+> rollouts of the true simulator** (`_realsim_actor_critic_step`) with **domain
+> randomisation** enabled at P3 (`set_domain_randomization(True)`). This removes
+> the objective-mismatch / model-exploitation that drove the p106→p143 actor
+> failures, grounds the critic in **real returns** (no `return_scale` cascade, no
+> MC-grounding hack), and keeps DreamerV3's scale-invariant normalisation
+> (symlog/twohot/percentile ⇒ fixed hyperparameters across sims). The
+> imagination-specific parts of §1 (the Phase-3 rollout, imagination gain-rand)
+> are **superseded**; the WM losses (recon/KL/DOB + overshoot/held-rollout) are
+> KEPT — they train the OBSERVER, not the deleted imagination actor.
+> `actor_train_source='realsim'` (default).
+
 ---
 
 ## 1. Full architecture (training)
@@ -69,21 +84,18 @@ flowchart TB
   FEAT --> DHEAD
   VAL -. EMA .-> TGT
 
-  subgraph IMAG["Imagination (Phase 3) — actor+critic learning"]
-    WARM["warm-start posterior\n(rollout_observed, frozen WM)"]
-    ROLL["roll PRIOR H steps\nimg_step(a_h)  [+ propagate d_t planned]"]
-    Lam["lambda-returns (TD-lambda)\nreward + gamma*bootstrap(V)"]
-    MC["MC real-return-to-go\nfrom replay  [current]"]
-    WARM --> ROLL --> Lam
+  subgraph REALSIM["Real-sim controller (Phase 3) — actor+critic on the TRUE plant"]
+    ROLLR["roll the REAL sim (DR on)\ncollect_episode -> {obs, act, rew}"]
+    ENCR["frozen OBSERVER encode\nrollout_observed(sample=False) -> feat"]
+    Lam["lambda-returns (TD-lambda)\nREAL reward + gamma*bootstrap(V)"]
+    ROLLR --> ENCR --> Lam
   end
 
-  POL --> ROLL
-  REW --> Lam
+  POL --> ROLLR
   TGT --> Lam
   Lam --> ADV["advantage = return - V(feat)"]
   ADV --> POL
   Lam --> VAL
-  MC --> VAL
 
   POL --> ACT["action a_t (MV)"]
   ACT --> PLANT
@@ -97,13 +109,15 @@ flowchart TB
   (recon + KL + overshoot/held-rollout). The **disturbance head** [opt-in] is a
   gradient-isolated read-out probe today; the **DOB `d_t`** [planned] replaces
   it with a real state (Section 3).
-- **Critic** `V(feat)` [`opt_critic`] is trained two ways: the imagined
-  **λ-returns** (TD-λ, bootstrapped by the EMA `target_value`) **and** the
-  **MC real-return-to-go** grounding (`critic_mc_grounding_coef`, the p106 win)
-  so the value reflects realised economics, not just self-consistent imagination.
+- **Critic** `V(feat)` [`opt_critic`] is trained on **λ-returns** (TD-λ,
+  bootstrapped by the EMA `target_value`) computed from the **REAL** environment
+  rewards of the on-policy rollout — no imagined bootstrap, so the value is
+  grounded in realised economics by construction (the old MC-grounding hack is
+  unnecessary).
 - **Actor** `π(a|feat)` [`opt_actor`] is trained on the **advantage**
-  `return − V(feat)` via REINFORCE/PMPO (+ a decaying masked expert-BC anchor).
-  It is the ONLY thing that drives `action → plant`.
+  `return − V(feat)` (÷ the percentile return-scale) via REINFORCE on the REAL
+  taken action (`policy.log_prob_of`). It is the ONLY thing that drives
+  `action → plant`.
 - **Three optimizers are strictly partitioned** (verified by
   `tools/_smoke_grad_isolation.py`): `opt_world` (encoder/core/decoder + reward
   head [+ disturbance head]), `opt_actor` (policy), `opt_critic` (value).
@@ -126,7 +140,7 @@ flowchart LR
 ```
 
 Only the **encoder + posterior + actor** run in closed loop at deploy time (the
-critic, reward head and imagination are training-only). With the DOB enabled,
+critic is training-only). With the DOB enabled,
 `d_t` is estimated online from the prediction error and fed forward to the actor
 (it is appended to `feat`, so the deployed actor conditions on it directly).
 
@@ -268,9 +282,9 @@ disturbance present** — the cont gain channel + gain-match de-confound the gai
 *inherently*, so there is **no clean-P1 / frozen-g-P2 staging** (that existed only
 to protect the gain from the disturbance/DR confound), and the cont disturbance
 channel learns from the disturbance being present — then **actor on the frozen WM
-(P3)**. DR stays **off** (robustness via imagination gain-rand). **DR-on for
-in-context gain ADAPTIVITY is the next-run item, gated on a gain-tracking probe
-(verify the gain channel infers the per-episode gain before enabling DR-on).**
+(P3)**. **mbrl2 real-sim:** DR is **off** during observer id (P1/P2, clean plant)
+and **on in P3** (`set_domain_randomization(True)`) so the real-sim actor trains
+on the randomised true plant for sim-to-real robustness.
 
 ---
 
@@ -298,7 +312,7 @@ The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 | **DOB `d_t`** | suppressed (`≡0`) | active | active (feeds actor via `feat`) |
 | **unmeasured disturbance** | **OFF** (prob 0) | **ON** (prob 1.0) | ON (prob 0.85) |
 | **measured DV (FEED)** | ON | ON | ON |
-| **domain randomization** | ON (±10% τ/gain/dead-time) | ON | ON |
+| **domain randomization** | **OFF** (clean plant id) | **OFF** | **ON** (±10% τ/gain/dead-time — real-sim actor robustness) |
 | **process+meas noise** | ramped 0→full (≈40% prog) | ~full | **full** (curriculum →1.0 in P3) |
 | **collection** | random-action (open-loop) + seed buffer | random-action (now disturbed) + expert reinject | **on-policy** (actor closes loop) + eval + expert reinject |
 | **what it learns** | unbiased input→CV **gain** | Kalman `(A,K)` on the fixed plant | reject disturbances (`d_t` feedforward) + economics |

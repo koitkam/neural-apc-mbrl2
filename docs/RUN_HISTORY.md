@@ -5,6 +5,18 @@ Lab-notebook ledger of every training run: the **change/hypothesis**, the
 `dreamer-training-diagnosis` skill — a new row is appended (or the run's row
 updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 
+> **2026-07-07 — neural-apc-mbrl2 fork (real-sim controller).** From here the
+> actor no longer trains in WM imagination: imagination is **deleted**, the
+> WM(RSSM)+DOB is a **frozen observer**, and the actor-critic trains on λ-returns
+> from **real rollouts of the true simulator** with domain randomisation
+> (`_realsim_actor_critic_step`, `actor_train_source='realsim'` default). The
+> p95→p143 rows below are **imagination-era history** (inherited from the source
+> `neural-apc-mbrl` repo), kept for context. New mbrl2 runs
+> (`run_YYYYMMDD_realsimN`) are model-free on the real plant — judge them on the
+> same validation suite (econ vs baseline, CV/MV violation, disturbance
+> rejection); the imagination-only metrics (`imag_adv_action_corr`, the
+> `return_scale` cascade, the WM-@H-gain-as-seen-by-the-actor) no longer apply.
+
 - Plant unless noted: `test_sim` (SISO, gain≈−0.28, τ=53, θ=8, sample_rate=4,
   ep_len=1220, H=55; 1 MV REFLUX / 1 CV CONTROL_TEMP 78.5–85.5 / 1 DV FEED).
 - Metric glossary: **gain** = `wm_gain_rel_err` (0=perfect; ≤0.186 = p106-good);

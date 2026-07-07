@@ -7,6 +7,18 @@ multi-backbone world model (RSSM default; transformer opt-in), beyond the
 staged Dreamer-4 curriculum. Sibling of `neural-apc-pytorch` (model-FREE
 SAC/PPO/TD3); this repo is the model-BASED line.
 
+> **⚠ 2026-07-07 — this is the `neural-apc-mbrl2` REAL-SIM fork.** The actor is
+> NO LONGER trained in world-model imagination. **Imagination is deleted**; the
+> WM(RSSM)+DOB is a **frozen OBSERVER** and the actor-critic trains on λ-returns
+> from **real rollouts of the true simulator** with domain randomisation
+> (`_realsim_actor_critic_step`, `actor_train_source='realsim'` default). This
+> removes the model-exploitation behind the p106→p143 actor failures while
+> keeping DreamerV3's scale-invariant normalisation (fixed hyperparameters
+> across sims). The "Phase 3 = imagination" descriptions and the imagination
+> env-vars below are **superseded** — see `docs/architecture.md` for the current
+> data flow; the WM losses (recon/KL/DOB + overshoot/held-rollout) still train
+> the observer.
+
 Reference: Hafner, Yan, Lillicrap (2025), "Training Agents Inside of Scalable
 World Models" (Dreamer 4), [arXiv:2509.24527](https://arxiv.org/abs/2509.24527),
 plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
