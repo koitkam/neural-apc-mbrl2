@@ -1230,14 +1230,14 @@ class TrainConfig:
     # only (the SF backbone's shortcut-forcing is its native multi-step term).
     # ``coef=0`` = OFF (legacy / paper-faithful).  Cost ~ O(B·max_starts·len)
     # GRU steps.  Env DREAMER_WM_OVERSHOOT_{COEF,LEN,MAX_STARTS}.
-    # Default 0.5 = p143 (was 0.3 p117): the open-loop compounding lever AND the
-    # actor-horizon RISE supervisor.  Raised 0.3->0.5 (p142 RCA: the categorical
-    # WM over-estimates tau -> MV@H 0.70 / DV@H 0.80 within the actor horizon
-    # while the @4xH DC gain is 0.98; the posterior-prior decomp lever is
-    # COMPOUNDING, not autoencoder/free_bits, so STRONGER multi-step supervision
-    # - not more data/excitation - is the lever).  ``wm_overshoot_len`` is set =
-    # horizon in single_run.
-    wm_overshoot_coef: float = 0.5
+    # Default 0.3 = p117 recipe: the open-loop compounding lever (promoted
+    # 2026-06-14; was 0.0).  ``wm_overshoot_len`` is set = horizon in single_run.
+    # (p143 TESTED coef 0.5 + tail_power 1.0 to fix the categorical MV@H slow-
+    # rise; the calibrated transfer matrix on wm_best showed it made MV@H WORSE
+    # 0.86->0.68 (de-emphasising the settled tail where the MV gain compounds)
+    # while only marginally helping DV -> REVERTED.  The proven MV@H fix is the
+    # cont-gain latent, p140 MV@H 0.94, not the categorical overshoot.)
+    wm_overshoot_coef: float = 0.3
     wm_overshoot_len: int = 15            # K open-loop prior steps to supervise
     wm_overshoot_max_starts: int = 24     # cap start positions (stride) for cost
     # Steady-state TAIL emphasis (2026-06-20, p131 RCA): per-step weight
@@ -1249,13 +1249,9 @@ class TrainConfig:
     # the WM; the noisy early transient (already covered by 1-step recon/KL) is
     # de-emphasised.  ``2.0`` ≈ last step gets ~3× its uniform weight.  ``0.0``
     # recovers the exact uniform mean.  Env DREAMER_WM_OVERSHOOT_TAIL_POWER.
-    # p143 (2026-07-01): 2.0->1.0.  The overshoot rolls only K=horizon steps but
-    # the WM's tau is ~2x the plant, so at k=K it is still MID-RISE (NOT settled)
-    # -> p=2 concentrated the gradient on the k=K endpoint whose value is itself
-    # a CUMULATIVE result of under-rising over [theta,K]; a linear p=1 spreads
-    # the supervision across the rise (shorter, less-vanishing BPTT paths to the
-    # rise-determining mid steps) so the WM tracks the real rise -> MV@H/DV@H up.
-    wm_overshoot_tail_power: float = 1.0
+    # (p143 tested 1.0 to weight the mid-rise; it HURT MV@H 0.86->0.68 -> the
+    # p131 tail emphasis was right, reverted to 2.0.)
+    wm_overshoot_tail_power: float = 2.0
     # Soft recon-fidelity gate (mirrors the disturbance head): the overshoot
     # term is scaled by ``min(1, gate_recon / recon_loss)`` so it RAMPS IN only
     # as 1-step reconstruction converges — early in P1 the WM cannot predict
@@ -4903,16 +4899,20 @@ def _imagination_step_rssm(model: DreamerV4, batch: Dict[str, torch.Tensor],
             # part.  DV is EXOGENOUS (action-independent within a rollout) => the
             # policy gradient stays UNBIASED while the disturbance variance that
             # buried the action signal drops.  Ridge-regularised (a constant DV
-            # -> no-op), float32, sim-agnostic; no-op when dv_dim=0.
+            # -> no-op), sim-agnostic; no-op when dv_dim=0.  Run the small
+            # regression with autocast OFF: under bf16 autocast the matmuls are
+            # silently downcast (linalg.solve then hits a Float/BFloat16 dtype
+            # mismatch, p143 crash) AND the solve wants float32 precision anyway.
             if _dv_hold is not None:
-                _dvc = _dv_hold.float()
-                _dvc = _dvc - _dvc.mean(dim=0, keepdim=True)          # (B, dv)
-                _advc = adv_raw.float()                               # (B, H)
-                _XtX = _dvc.t() @ _dvc                                # (dv, dv)
-                _XtX = _XtX + 1e-3 * torch.eye(
-                    _dvc.shape[1], device=device, dtype=_dvc.dtype)
-                _beta = torch.linalg.solve(_XtX, _dvc.t() @ _advc)    # (dv, H)
-                adv_raw = (_advc - _dvc @ _beta).to(adv_raw.dtype)
+                _dt = adv_raw.dtype
+                with torch.autocast(device_type=device.type, enabled=False):
+                    _dvc = _dv_hold.float()
+                    _dvc = _dvc - _dvc.mean(dim=0, keepdim=True)      # (B, dv)
+                    _advc = adv_raw.float()                           # (B, H)
+                    _XtX = _dvc.t() @ _dvc + 1e-3 * torch.eye(
+                        _dvc.shape[1], device=device, dtype=torch.float32)
+                    _beta = torch.linalg.solve(_XtX, _dvc.t() @ _advc)  # (dv, H)
+                    adv_raw = (_advc - _dvc @ _beta).to(_dt)
         scale = model.update_return_scale(
             target_returns,
             abs_cap=float(getattr(
