@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO))
 
 from training.train import (  # noqa: E402
     TrainConfig, build_model, world_model_loss, agent_finetune_loss,
-    imagination_step, expert_bc_p3_loss, _disturbance_head_loss,
+    _realsim_actor_critic_step, expert_bc_p3_loss, _disturbance_head_loss,
 )
 
 
@@ -231,27 +231,29 @@ def audit_isolation(wm_type):
     check2('agent_total (P1/P2 BC+rmtp)', ag2b['agent_total'],
            expect=['actor', 'world'], forbid=['critic'])
 
-    # 4. imagination actor_loss -> actor only; critic_loss -> critic only
-    cfg3, model3, batch3 = _mk(wm_type, stop_grad=True)
-    _g3, id2g3 = _group_ids(model3)
-    ac = imagination_step(model3, batch3, cfg3)
+    # 4. real-sim actor_loss -> actor only; critic_loss -> critic only.
+    #    RSSM/TSSM only — the SF-transformer actor path was imagination (removed).
+    if wm_type in ('rssm', 'tssm'):
+        cfg3, model3, batch3 = _mk(wm_type, stop_grad=True)
+        _g3, id2g3 = _group_ids(model3)
+        ac = _realsim_actor_critic_step(model3, batch3, cfg3)
 
-    def check3(name, loss, expect, forbid):
-        _zero(model3)
-        loss.backward(retain_graph=True)
-        got, fr, orph = _which_groups_got_grad(model3, id2g3)
-        assert not fr, f'{name}: grad reached FROZEN {set(fr)}'
-        assert not orph, f'{name}: grad reached ORPHAN {set(orph)}'
-        for g in expect:
-            assert g in got, f'{name}: expected {g}, got {sorted(got)}'
-        for g in forbid:
-            assert g not in got, f'{name}: LEAK to {g}; got {sorted(got)}'
-        print(f'[ok] {name:28} -> grad in {sorted(got)} (expect {expect}, forbid {forbid})')
+        def check3(name, loss, expect, forbid):
+            _zero(model3)
+            loss.backward(retain_graph=True)
+            got, fr, orph = _which_groups_got_grad(model3, id2g3)
+            assert not fr, f'{name}: grad reached FROZEN {set(fr)}'
+            assert not orph, f'{name}: grad reached ORPHAN {set(orph)}'
+            for g in expect:
+                assert g in got, f'{name}: expected {g}, got {sorted(got)}'
+            for g in forbid:
+                assert g not in got, f'{name}: LEAK to {g}; got {sorted(got)}'
+            print(f'[ok] {name:28} -> grad in {sorted(got)} (expect {expect}, forbid {forbid})')
 
-    check3('imag actor_loss', ac['actor_loss'],
-           expect=['actor'], forbid=['world', 'critic'])
-    check3('imag critic_loss', ac['critic_loss'],
-           expect=['critic'], forbid=['world', 'actor'])
+        check3('realsim actor_loss', ac['actor_loss'],
+               expect=['actor'], forbid=['world', 'critic'])
+        check3('realsim critic_loss', ac['critic_loss'],
+               expect=['critic'], forbid=['world', 'actor'])
 
     # 5. expert_bc_p3 anchor (detaches agent_hid) -> actor only
     cfg4, model4, batch4 = _mk(wm_type, stop_grad=True)

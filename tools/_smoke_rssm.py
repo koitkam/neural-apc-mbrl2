@@ -7,7 +7,7 @@ env:
   * V4 heads on RSSM feat (reward MTP, value, policy).
   * train.world_model_loss   (P1/P2 WM loss)
   * train.agent_finetune_loss (P2 BC + reward MTP)
-  * train.imagination_step    (P3 actor/critic via RSSM imagination)
+  * train._realsim_actor_critic_step    (P3 actor/critic via RSSM imagination)
 
 All outputs must be finite.  Run:
   CONTROL_SETUP_JSON=... PYTHONPATH=$PWD \
@@ -16,7 +16,7 @@ All outputs must be finite.  Run:
 import torch
 
 from training.train import (TrainConfig, build_model, world_model_loss,
-                            agent_finetune_loss, imagination_step,
+                            agent_finetune_loss, _realsim_actor_critic_step,
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _critic_anchor_lambda,
                             _critic_anchor_coef)
@@ -117,18 +117,18 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  agent_total.backward()')
 
     # ---- P3 imagination ----
-    diag = imagination_step(model, batch, cfg)
-    _finite('imagination_step', diag)
+    diag = _realsim_actor_critic_step(model, batch, cfg)
+    _finite('_realsim_actor_critic_step', diag)
 
     # (B) imagination with the long-horizon anchor ENGAGED — exercise the
     # ``lam_anchor`` recursion + raised coef and confirm the critic loss is
     # finite and backprops through the engaged path.
     cfg.critic_anchor_lambda = 0.97
     cfg.critic_anchor_coef_long = 1.0
-    diagB = imagination_step(model, batch, cfg)
-    _finite('imagination_step[anchorB]', diagB)
+    diagB = _realsim_actor_critic_step(model, batch, cfg)
+    _finite('_realsim_actor_critic_step[anchorB]', diagB)
     diagB['critic_loss'].backward()
-    print('[smoke] OK  imagination_step critic_loss.backward() with anchor B engaged')
+    print('[smoke] OK  _realsim_actor_critic_step critic_loss.backward() with anchor B engaged')
     cfg.critic_anchor_lambda = None
     cfg.critic_anchor_coef_long = None
 
@@ -214,12 +214,4 @@ if __name__ == '__main__':
         print(f'\n[smoke] ===== {name} (obs={obs_dim} act={act_dim}) =====')
         main(obs_dim=obs_dim, action_dim=act_dim, label=name)
         ran += 1
-        # Also exercise the legacy transformer backbone on test_sim so the
-        # (a)/(b) transformer code paths are covered without quadrupling time.
-        if name == 'test_sim':
-            print(f'\n[smoke] ===== {name} [sf_transformer] '
-                  f'(obs={obs_dim} act={act_dim}) =====')
-            main(obs_dim=obs_dim, action_dim=act_dim,
-                 label=name, wm_type='sf_transformer')
-            ran += 1
     print(f'\n[smoke] DONE: {ran} simulator config(s) passed')

@@ -127,7 +127,7 @@ def test_end_to_end_dreamer_tssm():
     disturbance estimator head is present (granted automatically by the
     feat-dim build branch)."""
     from training.train import (TrainConfig, build_model, world_model_loss,
-                                imagination_step)
+                                _realsim_actor_critic_step)
     torch.manual_seed(0)
     cfg = TrainConfig()
     cfg.obs_dim, cfg.action_dim = 6, 2
@@ -158,7 +158,7 @@ def test_end_to_end_dreamer_tssm():
     assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0
     assert float(losses.get('wm_held_rollout_loss', 0.0)) == 0.0
     losses['wm_total'].backward()
-    diag = imagination_step(model, batch, cfg)
+    diag = _realsim_actor_critic_step(model, batch, cfg)
     assert torch.isfinite(diag['critic_loss']).all()
     assert torch.isfinite(diag['actor_loss']).all()
     print("[smoke] OK end-to-end DreamerV4(tssm): WM loss + imagination run, "
