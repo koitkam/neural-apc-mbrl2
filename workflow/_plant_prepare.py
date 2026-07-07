@@ -331,9 +331,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # suppressed near a constraint.  Policy-invariant.  0.0 disables Φ_econ.
     'DREAMER_SHAPING_ECON_COEF':          ('shaping_econ_coef',              float),
     'DREAMER_SHAPING_ECON_MARGIN_FRAC':   ('shaping_econ_margin_frac',       float),
-    # Fix 2b (2026-06-19, p129): disturbance-aware advantage baseline (subtract
-    # the per-horizon batch-mean advantage = the uncontrollable common-mode).
-    'DREAMER_ACTOR_DISTURBANCE_BASELINE': ('actor_disturbance_baseline',     _as_bool),
     'DREAMER_CRITIC_REPLAY_ANCHOR_COEF':  ('critic_replay_anchor_coef',      float),
     # (B) P85 (2026-06-04): long-horizon critic-anchor grounding.  The
     # replay anchor's own λ (decoupled from the cascade-sensitive
@@ -345,13 +342,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Both None (unset) ⇒ exact legacy behaviour.  Sim-agnostic.
     'DREAMER_CRITIC_ANCHOR_LAMBDA':       ('critic_anchor_lambda',           _as_opt_float),
     'DREAMER_CRITIC_ANCHOR_COEF_LONG':    ('critic_anchor_coef_long',        _as_opt_float),
-    # Real-return (Monte-Carlo) critic grounding (Option #1 / TD-MPC, 2026-06-09):
-    # a PURE discounted return-to-go over the real buffer (no value bootstrap)
-    # added to the critic target so it is pinned to realised economics.  Pair
-    # the coef with a reduced DREAMER_CRITIC_IMAG_LOSS_COEF so the MC target
-    # dominates.  Coef 0 (default) = off; _TAIL_BOOTSTRAP adds a single γ^N tail.
-    'DREAMER_CRITIC_MC_GROUNDING_COEF':   ('critic_mc_grounding_coef',       float),
-    'DREAMER_CRITIC_MC_TAIL_BOOTSTRAP':   ('critic_mc_tail_bootstrap',       _as_bool),
     'DREAMER_MV_HARD_CLAMP':              ('mv_hard_clamp',                  _as_bool),
     'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
     'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),
@@ -469,10 +459,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # + DOB identification (clean nominal-plant gain), back ON for the Stage-3
     # actor.  =0 to keep DR on throughout (the old, gain-biasing behaviour).
     'DREAMER_CURRICULUM_WM_ID_DR_OFF':    ('curriculum_wm_id_dr_off',        _as_bool),
-    # Stage A (p135): actor-imagination loop-gain randomization spread (replaces
-    # the Stage-3 real-data DR).  Float; 0 disables; unset -> auto (inherit the
-    # sim's DR output-gain frac).  See TrainConfig.actor_imag_gain_random_frac.
-    'DREAMER_ACTOR_IMAG_GAIN_RANDOM_FRAC':('actor_imag_gain_random_frac',    float),
     # p136: actor KL trust region (damps policy hunting) + phased-P3 prior
     # refresh cadence.  actor_kl_coef=0 disables (legacy); see TrainConfig.
     'DREAMER_ACTOR_KL_COEF':              ('actor_kl_coef',                  float),

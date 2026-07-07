@@ -208,16 +208,13 @@ class TrainConfig:
     # critic warmup (p3_critic_warmup_iters) still runs at the very start so
     # the value head calibrates before actor coupling.  DREAMER_TRAIN_MODE.
     train_mode: str = 'phased'
-    # ----- Actor training data source (mbrl2 fork, 2026-07-07) -----
-    # ``imagination`` (legacy Dreamer): the actor-critic trains in the WM's
-    # latent imagination — sample-efficient but imports the WM's gain/dynamics
-    # BIAS into the policy gradient (objective mismatch; the p106->p143 actor
-    # failures).  ``realsim``: the WM(RSSM)+DOB are a FROZEN OBSERVER only; the
-    # actor-critic trains on λ-returns from REAL rollouts of the (cheap) true
-    # simulator with domain randomisation (``_realsim_actor_critic_step``).
-    # Exact policy gradient w.r.t. the true dynamics, real-return-grounded
-    # critic (no cascade), same DreamerV3 scale-invariant normalisation (=>
-    # fixed hyperparameters across sims).  DREAMER_ACTOR_SOURCE.
+    # ----- Actor training data source (mbrl2 fork) -----
+    # ``realsim`` (default; the only supported mode — imagination was removed):
+    # the WM(RSSM)+DOB are a FROZEN OBSERVER and the actor-critic trains on
+    # λ-returns from REAL rollouts of the true simulator with domain
+    # randomisation (``_realsim_actor_critic_step``).  Exact policy gradient
+    # w.r.t. the true dynamics, real-return-grounded critic (no cascade),
+    # DreamerV3 scale-invariant normalisation.  DREAMER_ACTOR_SOURCE.
     actor_train_source: str = 'realsim'
     # joint mode: re-snapshot the PMPO prior policy every N iters (0 = once at
     # start, like phased P3).  A slowly-refreshed prior keeps the KL anchor
@@ -460,16 +457,6 @@ class TrainConfig:
     # Cursor reference clamps at ±4 (single-MV) / ±8 (multi-MV); we default
     # to 8.0.  Set ``advantage_clip=0.0`` to disable (legacy unclamped).
     advantage_clip: float = 8.0
-    # Fix 2b (2026-06-19, p129 RC-A): disturbance-aware advantage baseline.
-    # Subtract the per-horizon batch-mean advantage so the COMMON-MODE return
-    # offset driven by the (uncontrollable) disturbance level — identical across
-    # the actions a given imagined rollout could take — is removed, leaving the
-    # CONTROLLABLE action-relative advantage.  A pure control variate ⇒ the
-    # policy gradient stays UNBIASED while the disturbance-driven noise that
-    # buried the economic signal (the p129 passive-actor cause) drops.  Pairs
-    # with Fix 1 (the value baseline now SEES the DV).  Sim-agnostic; ``False``
-    # recovers the raw ``return − V`` advantage.
-    actor_disturbance_baseline: bool = True
 
     # ---- C : replay-grounded critic anchor (P66-RCA, 2026-05-29) ----
     # The cascade's root cause is that the P3 critic regresses purely on
@@ -529,30 +516,6 @@ class TrainConfig:
     # target so it can't self-inflate (promoted 2026-06-14; was 1.0).
     critic_imag_loss_coef: float = 0.3
 
-    # ---- Real-return (Monte-Carlo) critic grounding (Option #1 / TD-MPC, 2026-06-09) ----
-    # The replay anchor above (``critic_replay_anchor_coef``) builds a TD-λ
-    # target on REAL states but STILL bootstraps off the slow-target value
-    # ``tv_real`` at every recursion step — so when the value self-inflates the
-    # anchor target inflates WITH it (the cascade through-line: across p79-p105
-    # ``critic_rew_to_tgt_var`` stays <0.015 = realised reward is <1.5% of the
-    # critic target's variance, so the actor's advantages carry almost no real
-    # economic signal -> a noisy, non-economic policy that doesn't ride the
-    # CV limit for profit).  This term adds a PURE Monte-Carlo return-to-go over
-    # the real buffer segment — a discounted sum of the ACTUAL observed rewards
-    # with NO intermediate value bootstrap — so the critic is pinned to realised
-    # economics and cannot float on its own fiction.  ``coef`` weights it
-    # against the imagined critic CE; pair with a REDUCED
-    # ``critic_imag_loss_coef`` (and ``critic_replay_anchor_coef=0``) so the MC
-    # target dominates.  Default 1.0 = p117 recipe — THIS is the knob that keeps
-    # ``critic_rew_to_tgt_var`` healthy and stops the return_scale runaway/
-    # bootstrap cascade (p120 regressed to 0.0 -> return_scale 139).  Promoted
-    # 2026-06-14 (was 0.0).  2026-06-20 (p132 RCA): raised 1.0->2.0 — at 1.0 the
-    # grounding held EARLY P3 (rew_to_tgt_var 0.019) but DECAYED to 0.002 by P3
-    # end (bootstrap re-dominated -> the actor's advantage oscillated, imag_adv_
-    # action_corr swung 0.01<->0.59).  A stronger real-MC anchor (2.0, now ~6.7x
-    # the imag CE 0.3) pins the critic baseline to realised economics through all
-    # of P3 -> a STABLE advantage -> a calmer actor.  Env DREAMER_CRITIC_MC_GROUNDING_COEF.
-    critic_mc_grounding_coef: float = 2.0
     # When True, cap the MC return with a single discounted tail bootstrap
     # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
     # (default) the return is PURE MC (truncated at the segment end).  At
@@ -743,20 +706,6 @@ class TrainConfig:
     # randomizer).  ``DREAMER_CURRICULUM_WM_ID_DR_OFF``.
     curriculum_wm_id_dr_off: bool = True
 
-    # ---- Actor-imagination loop-gain randomization (Stage A, p135, 2026-06-21)
-    # Replaces the Stage-3 REAL-data DR.  Each imagined rollout scales the action
-    # fed into the (frozen) WM dynamics by a per-rollout g~U(1-frac, 1+frac), held
-    # CONSTANT over the horizon (a per-episode plant-gain offset), so the actor
-    # optimises E_g[return] -> a loop-gain-robust policy with NO real/imagination
-    # mismatch (the real plant stays nominal).  For a SISO loop an INPUT (actuator)
-    # gain scale is equivalent to the real DR's OUTPUT (sensor) gain scale, and for
-    # the common LINEAR MV economic cost the expected cost is unbiased.  None =
-    # AUTO: inherit the sim's own DR output-gain spread (robust to exactly the
-    # gain uncertainty the plant carries); unitless 0.10 fallback when the sim has
-    # no randomizer.  0.0 = OFF.  Sim-adaptive + backbone-agnostic (RSSM + TSSM
-    # both route through _imagination_step_rssm).
-    # ``DREAMER_ACTOR_IMAG_GAIN_RANDOM_FRAC``.
-    actor_imag_gain_random_frac: Optional[float] = None
 
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
@@ -4653,34 +4602,6 @@ def expert_bc_p3_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
 # Phase 3 — Imagination training (PMPO + TD-λ)
 # ---------------------------------------------------------------------------
 
-def _read_env_dr_gain_frac(env) -> Optional[float]:
-    """Return the sim's configured domain-randomization OUTPUT-GAIN spread
-    (``output_gain_pct``, defaulting to the randomizer's top-level ``frac``),
-    or ``None`` when the sim has no randomizer.  Used to auto-size the
-    actor-imagination loop-gain randomization so the actor is made robust to
-    exactly the gain uncertainty the plant carries (sim-adaptive).  The
-    randomizer's ``frac`` persists even when DR is toggled off for the clean
-    WM identification, so this reads the configured magnitude regardless of
-    the current enabled state.
-    """
-    sim = getattr(env, 'sim', None)
-    rd = getattr(sim, '_randomizer', None)
-    if rd is None and sim is not None:
-        rd = getattr(getattr(sim, '_sim', None), '_randomizer', None)
-    if rd is None:
-        return None
-    frac = float(getattr(rd, 'frac', 0.0) or 0.0)
-    cfg_block = getattr(rd, '_config_block', None)
-    if isinstance(cfg_block, dict):
-        v = cfg_block.get('output_gain_pct', None)
-        if v is not None:
-            try:
-                frac = float(v)
-            except (TypeError, ValueError):
-                pass
-    return frac if frac > 0.0 else None
-
-
 def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                                 cfg: TrainConfig) -> Dict[str, torch.Tensor]:
     """Phase 3 (real-sim mode): actor-critic on REAL-environment λ-returns.
@@ -7455,28 +7376,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                              f'innovation, disturbance '
                              f'{env._disturbance_prob_override:.2f})')
                 else:
-                    # Freeze g AND the observer; actor/critic train on the
-                    # static unbiased WM.  _wm_frozen_now drops wm_total in the
-                    # P3 path so only reward-MTP + actor/critic optimise.
+                    # Freeze g AND the observer; the real-sim actor/critic train
+                    # on the FROZEN WM(+DOB) observer.  _wm_frozen_now drops
+                    # wm_total in the P3 path so only the actor/critic optimise.
                     model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
                     _fz = model.set_world_model_trainable(
                         g=False, dob=False, reward=True)
                     _wm_frozen_now = True
-                    # Stage A (p135): DR stays OFF on the REAL plant.  The old
-                    # Stage-3 re-enable created a train/imagination mismatch (the
-                    # actor saw a ±frac-randomised real loop gain but imagined on
-                    # the nominal frozen WM -> p134 actor regression).  Actor
-                    # loop-gain robustness now comes from IMAGINATION-time gain
-                    # randomization (cfg.actor_imag_gain_random_frac, applied in
-                    # _imagination_step_rssm).  The unmeasured OU disturbance
-                    # still rides the real P3 data (it is a feed-forward target,
-                    # not a robustness perturbation).
-                    _igf = float(getattr(cfg, 'actor_imag_gain_random_frac', 0.0) or 0.0)
+                    # mbrl2 real-sim: the actor/critic train on REAL rollouts of
+                    # the true plant with domain randomisation ENABLED at this
+                    # transition (set_domain_randomization(True)); the observer
+                    # was identified CLEAN in P1/P2.  The unmeasured OU
+                    # disturbance rides the real P3 data (a feed-forward target
+                    # the actor rejects via the DOB estimate in feat).
                     _wmtag = 'WM+DOB' if bool(getattr(cfg, 'dob_enabled', False)) else 'WM'
-                    _desc = (f'actor/critic on FROZEN {_wmtag} (disturbance '
-                             f'{env._disturbance_prob_override:.2f}; real-plant '
-                             f'DR OFF; imagination loop-gain rand '
-                             f'±{_igf:.3f} -> runtime robustness)')
+                    _desc = (f'real-sim actor/critic on FROZEN {_wmtag} observer '
+                             f'(disturbance {env._disturbance_prob_override:.2f}; '
+                             f'real-plant DR ON for actor robustness)')
                 print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
                       f"steps{total_env_steps}: {_desc} "
                       f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
