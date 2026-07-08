@@ -6924,10 +6924,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             float(getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
             if _cont_curric else 0.0)
         # DR RCA (2026-06-20): turn OFF domain randomization for the clean WM/DOB
-        # identification.  Stage A (p135): DR now stays OFF for ALL stages (the
-        # actor's loop-gain robustness is injected in IMAGINATION instead, see
-        # actor_imag_gain_random_frac) so the gain is fit to the NOMINAL plant
-        # and the actor has no real/imagination mismatch.
+        # identification in P1/P2 (curriculum_wm_id_dr_off).  mbrl2 real-sim: DR is
+        # then turned ON at the P2->P3 transition (set_domain_randomization(True)),
+        # so the real-sim actor gets loop-gain robustness on the RANDOMISED true
+        # plant — the imagination gain-rand path was removed with the imagination stack.
         _dr_gated = bool(getattr(cfg, 'curriculum_wm_id_dr_off', True))
         _dr_found = env.set_domain_randomization(False) if _dr_gated else False
         if _cont_curric:
@@ -6938,7 +6938,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   'so the cont disturbance channel learns the amortized-Kalman '
                   f'estimate (g={_fz["g"]} dob={_fz["dob"]} reward={_fz["reward"]} '
                   f'tensors; domain_randomization='
-                  f'{"OFF (all stages; actor robustness via imagination gain-rand)" if (_dr_gated and _dr_found) else "on"}).',
+                  f'{"OFF in P1/P2 (clean WM/DOB id) -> ON in P3 (real-plant DR)" if (_dr_gated and _dr_found) else "on"}).',
                   flush=True)
         else:
             print('[curriculum] ENABLED — staged clean->disturbance curriculum '
@@ -6946,7 +6946,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   'Stage 1 (P1): CLEAN data -> WM '
                   f'learns the unbiased gain (g={_fz["g"]} dob={_fz["dob"]} '
                   f'reward={_fz["reward"]} tensors; disturbance prob=0; '
-                  f'domain_randomization={"OFF (all stages; actor robustness via imagination gain-rand)" if (_dr_gated and _dr_found) else "on"}).',
+                  f'domain_randomization={"OFF in P1/P2 (clean WM/DOB id) -> ON in P3 (real-plant DR)" if (_dr_gated and _dr_found) else "on"}).',
                   flush=True)
         # NOTE (2026-06-16, p124 RCA): the p123 experiment that DISABLED the
         # P1->P2 wm_best warm-restore in curriculum mode was REVERTED — it
