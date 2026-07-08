@@ -3771,11 +3771,17 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
-    state = RSSMState(
-        h=h,
-        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                             device=device, dtype=f0.dtype),
-        z=z)
+    # Per-step REAL action + DV sequences for k=1..K (gathered ONCE).
+    k_off = torch.arange(1, K + 1, device=device)                 # (K,)
+    idx = starts.view(S, 1) + k_off.view(1, K)                    # (S, K) time idx
+    a_all = act[:, idx].reshape(Bm, K, -1)                        # (Bm, K, A)
+    dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
+              if getattr(rssm, 'dv_dim', 0) > 0 else None)         # (Bm,K,dv)|None
+    # COMPILED prior rollout (whole K-step img_step loop = ONE graph) + ONE
+    # batched decode (the per-step decode was the launch-bound killer, exactly
+    # what rollout_observed hoists out).
+    roll_feats = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True)  # (Bm,K,F)
+    preds = rssm.decode(roll_feats).reshape(B, S, K, -1)          # (B, S, K, D)
     total = zero
     # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
     # contraction (decomp 1step→openloop ×0.876; probe: sampled open-loop gain
@@ -3794,25 +3800,14 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # step fraction), backbone-agnostic.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
     tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 0.0) or 0.0)
     wsum = 0.0
-    for k in range(1, K + 1):
-        a_idx = starts + k                                        # (S,)
-        a_k = act[:, a_idx].reshape(Bm, -1)                       # (B*S, A)
-        # DV-as-input: teacher-force the REAL DV at each predicted step so the
-        # WM learns dCV/dDV (consistent with rollout_observed).  None = off.
-        dv_k = (obs[:, a_idx].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
-                if getattr(rssm, 'dv_dim', 0) > 0 else None)
-        state = rssm.img_step(state, a_k, dv=dv_k, sample=True)
-        pred = rssm.decode(state.feat).reshape(B, S, -1)
-        tgt = obs[:, a_idx].detach()                             # (B, S, D)
-        # CV-weight the multi-step MSE (2026-06-16, p124 RCA): this open-loop
-        # term IS the horizon-gain supervisor, but a UNIFORM MSE drowns the
-        # small-variance CV step-response under the high-variance PRBS'd MV/DV
-        # channels — so the WM nails the 1-step transient yet plateaus BELOW the
-        # true steady-state gain (decomp 1step→openloop ~0.91; vision: "rises
-        # fast then plateaus early").  Reusing the recon CV-weight directly
-        # supervises the CV's open-loop settling toward the real gain.  Identity
-        # when wm_recon_cv_weight==1.0 or no CV indices.
-        w_k = (float(k) / float(K)) ** tail_power if tail_power > 0.0 else 1.0
+    # Per-step CV-weighted MSE on the PRE-DECODED rollout (no per-step decode /
+    # img_step launches now — those are batched above).  The CV-weight (p124)
+    # keeps the small-variance CV step-response from being drowned by the
+    # high-variance MV/DV channels so the open-loop gain stays supervised.
+    for ki in range(K):
+        pred = preds[:, :, ki]                                    # (B, S, D)
+        tgt = obs[:, idx[:, ki]].detach()                        # (B, S, D)
+        w_k = (float(ki + 1) / float(K)) ** tail_power if tail_power > 0.0 else 1.0
         total = total + w_k * _weighted_recon_mse(pred, tgt, cfg)
         wsum += w_k
     loss = total / max(wsum, 1e-8)
@@ -3881,11 +3876,6 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
-    state = RSSMState(
-        h=h,
-        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                             device=device, dtype=f0.dtype),
-        z=z)
     a_hold = act[:, starts].reshape(Bm, -1).detach()              # HELD action a_t
     # DV-as-input: hold the measured DV CONSTANT at its start value across the
     # rollout too — so this probes true held-(action+DV) stationarity and the
@@ -3893,11 +3883,14 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     dv_hold = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
                .detach()
                if getattr(rssm, 'dv_dim', 0) > 0 else None)
-    hs = []
-    for _ in range(K):
-        state = rssm.img_step(state, a_hold, dv=dv_hold, sample=True)
-        hs.append(state.h)                                       # (B*S, deter)
-    Hroll = torch.stack(hs, dim=1)                               # (B*S, K, deter)
+    # HELD action + DV constant across the rollout: broadcast to K so the whole
+    # loop runs through the COMPILED img_rollout (one graph, no per-step launch).
+    a_hold_seq = a_hold.unsqueeze(1).expand(Bm, K, a_hold.shape[-1])   # (Bm,K,A)
+    dv_hold_seq = (dv_hold.unsqueeze(1).expand(Bm, K, dv_hold.shape[-1])
+                   if dv_hold is not None else None)
+    roll_feats = rssm.img_rollout(h, z, a_hold_seq, dvs=dv_hold_seq,
+                                  sample=True)                    # (Bm, K, F)
+    Hroll = roll_feats[..., :rssm.deter_dim]                      # (Bm, K, deter)
     h_scale = Hroll.detach().std().clamp_min(1e-3)
     early = Hroll[:, s:s + win].mean(dim=1)                      # (B*S, deter)
     late = Hroll[:, K - win:].mean(dim=1)                        # (B*S, deter)
@@ -4273,15 +4266,30 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     wm_total = wm_total + dist_term
 
     # ----- (#2, P88) multi-step latent overshooting (RSSM) -----
+    # mbrl2 real-sim perf (2026-07-08): the two multi-step aux rollouts
+    # (overshoot + held) are ~73% of the WM step but supervise SLOW DC-gain /
+    # drift properties — run them every OTHER WM step (the compiled img_rollout
+    # already fuses each into one graph; halving frequency ~halves the residual
+    # cost with negligible quality impact).
+    _wm_aux_n = int(getattr(model, '_wm_aux_step', 0)) + 1
+    model._wm_aux_step = _wm_aux_n
+    _run_aux = (_wm_aux_n % 2 == 0)
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
-    overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
-        model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+    if _run_aux and overshoot_coef > 0.0:
+        overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
+            model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+    else:
+        overshoot_loss = torch.zeros((), device=feats.device)
+        overshoot_starts = 0.0
     wm_total = wm_total + overshoot_coef * overshoot_loss
 
     # ----- (b2, P89) multi-step held-action rollout stationarity (RSSM) -----
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
-    held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
-        model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+    if _run_aux and held_coef > 0.0:
+        held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
+            model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+    else:
+        held_loss = torch.zeros((), device=feats.device)
     wm_total = wm_total + held_coef * held_loss
 
     # ----- C(1) gain-matching step-response asymptote (RSSM) -----

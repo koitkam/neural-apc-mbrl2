@@ -1494,6 +1494,17 @@ class DreamerV4(nn.Module):
                     _imgs = '(img_step skipped)'
                     print(f'[dreamer_v4] img_step compile skipped ({_e2!r})',
                           flush=True)
+                # img_rollout: the whole K-step prior loop for the WM aux losses
+                # (latent-overshoot + held-rollout) as ONE graph (mirrors the
+                # rollout_observed CUDA-graph) — removes the per-step launch
+                # overhead that kept those losses ~73% of the WM step.
+                try:
+                    self.dynamics.img_rollout = torch.compile(
+                        self.dynamics.img_rollout, mode=mode, dynamic=False)
+                    _imgs = _imgs + ' + img_rollout'
+                except Exception as _e3:
+                    print(f'[dreamer_v4] img_rollout compile skipped '
+                          f'({_e3!r})', flush=True)
                 self._compiled = True
                 print(f'[dreamer_v4] torch.compile(mode={mode}, dynamic=False) '
                       f'enabled on RSSM rollout_observed {_imgs}', flush=True)

@@ -725,6 +725,38 @@ class RSSMDynamics(nn.Module):
             }
         return feats, post_logits, prior_logits, state, ds, cont
 
+    def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,
+                    actions: torch.Tensor,
+                    dvs: Optional[torch.Tensor] = None,
+                    sample: bool = True) -> torch.Tensor:
+        """Prior-only (imagined) rollout of K steps from ``(h0, z0)`` under a
+        per-step action (and optional per-step DV) sequence.
+
+        ``h0`` (Bm, deter_dim), ``z0`` (Bm, n_categoricals, n_classes),
+        ``actions`` (Bm, K, A), ``dvs`` (Bm, K, dv_dim) | None.  Returns the
+        stacked per-step feature ``(Bm, K, F)`` (``feat`` = [h, z_flat, (dv)]).
+
+        Compiled the SAME way as ``rollout_observed`` (see ``maybe_compile``):
+        capturing the whole K-step ``img_step`` loop as ONE graph removes the
+        per-step Python / kernel-launch overhead that otherwise makes the
+        multi-step WM aux losses (latent-overshoot + held-rollout) launch-bound
+        (~73% of the WM step).  Batched, single-graph analogue of the Python
+        loops those losses used to run inline.
+        """
+        Bm = h0.shape[0]
+        K = actions.shape[1]
+        state = RSSMState(
+            h=h0,
+            z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
+                                 device=h0.device, dtype=h0.dtype),
+            z=z0)
+        feats = []
+        for k in range(K):
+            dv_k = dvs[:, k] if dvs is not None else None
+            state = self.img_step(state, actions[:, k], dv=dv_k, sample=sample)
+            feats.append(state.feat)
+        return torch.stack(feats, dim=1)                          # (Bm, K, F)
+
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the
         # DV (when fed forward) sits right after the latent core so it is part
