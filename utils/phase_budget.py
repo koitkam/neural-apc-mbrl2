@@ -7,17 +7,24 @@ def derive_phase_budgets(*, episode_length, complexity_score, model_size,
     Derives total_steps and phase fractions based on model_size, plant complexity, and episode_length.
     Anchored to paper and P52 evidence for iter targets.
     """
-    P1_ITERS_BY_SIZE = {'S': 50, 'M': 65, 'L': 80}
+    # mbrl2 real-sim (2026-07-08): P1 raised for OBSERVER convergence.  p01
+    # (run_20260707_realsim1) hit the P1 extension CAP WITHOUT plateauing (WM
+    # next-state r 0.48, just under the 0.5 fidelity gate).  The WM(RSSM)+DOB
+    # observer is the value-critical phase for the real-sim controller (LQG
+    # separation — the actor acts on the observer's state estimate), so give it
+    # room to cross the gate.
+    P1_ITERS_BY_SIZE = {'S': 65, 'M': 82, 'L': 100}
     P2_ITERS_BY_SIZE = {'S': 25, 'M': 35, 'L': 45}
-    # P3 reduced 2026-06-14 (p121 RCA): the generic Dreamer split made P3 ≥ P1
-    # (S/M/L = 50/70/90), which (a) under-budgeted the staged curriculum's WM-
-    # identification phases (Stage-1 clean gain id + Stage-2 observer id are
-    # the value-critical phases here, not actor training) and (b) exposed a
-    # slow late-P3 actor-critic drift (p121 ema_return collapsed in the back
-    # half of a 391-iter P3 that p117's shorter P3 never reached).  Setting
-    # P3 ≈ 0.67·P1 restores the proven p117 ~0.45/0.25/0.30 split: more WM-id
-    # budget, and P3 ends before the drift regime.
-    P3_ITERS_BY_SIZE = {'S': 35, 'M': 45, 'L': 55}
+    # P3 RESTORED for the real-sim on-policy actor-critic (2026-07-08).  The
+    # p121 reduction (S/M/L = 35/45/55) targeted the IMAGINATION actor, whose
+    # slow late-P3 drift was an imagination + off-policy-REINFORCE artefact —
+    # BOTH now removed (imagination deleted; the P3 actor trains on a dedicated
+    # ON-POLICY buffer, not the seed replay buffer).  The real-sim actor learns
+    # from REAL λ-returns and needs more P3 iters to converge after the critic
+    # warmup.  (P3's env-step budget already maps to ~5× these nominal iters —
+    # P3 collects ~1 ep/iter vs P1/P2's ~6 — so this is a comfortable ceiling;
+    # the performance-aware P3 early-stop ends the phase once it has converged.)
+    P3_ITERS_BY_SIZE = {'S': 45, 'M': 58, 'L': 72}
     factor = min(max(complexity_score / 4, 1.0), complexity_factor_cap)
     p1_iters = int(P1_ITERS_BY_SIZE[model_size] * factor)
     p2_iters = int(P2_ITERS_BY_SIZE[model_size] * factor)
