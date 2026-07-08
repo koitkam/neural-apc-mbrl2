@@ -363,8 +363,14 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                     _o = torch.from_numpy(
                         obs_window[-1]).to(device).unsqueeze(0)
                     _emb = model.dynamics.embed(_o)
+                    # mbrl2 real-sim: certainty-equivalent (posterior MODE) belief
+                    # for control — matches training (``_realsim_actor_critic_step``
+                    # re-encodes sample=False) and ``collect_episode``.  A SAMPLED
+                    # belief here would inject latent-sampling noise into the
+                    # deterministic-eval MV (part of the p01 chatter the user saw
+                    # in the disturbance-rejection plots).
                     _post, _ = model.dynamics.obs_step(
-                        _rssm_state, _rssm_prev_a, _emb, sample=True)
+                        _rssm_state, _rssm_prev_a, _emb, sample=False)
                     agent_hid = _post.feat
                     _rssm_state = _post
                 else:

@@ -203,6 +203,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAMMA':              ('gamma',                      float),
     'DREAMER_TARGET_CRITIC_TAU':  ('target_critic_tau',          float),
     'DREAMER_P3_COLLECT_EVERY':   ('phase3_collect_every_iters', int),
+    # mbrl2 real-sim (2026-07-08): the dedicated ON-POLICY buffer for the P3
+    # actor-critic REINFORCE update (recent current-policy episodes only — the
+    # shared replay buffer's off-policy seed actions corrupt the policy gradient,
+    # the p01 MV-chatter RCA).  buffer_eps = rolling capacity, prefill_eps = P3-entry warmup.
+    'DREAMER_P3_ONPOLICY_BUFFER_EPS':  ('phase3_onpolicy_buffer_eps',  int),
+    'DREAMER_P3_ONPOLICY_PREFILL_EPS': ('phase3_onpolicy_prefill_eps', int),
     'DREAMER_BUFFER_CAP_STEPS':   ('buffer_capacity_steps',      int),
     # (DREAMER_EXCITATION_REINJECT_EVERY removed 2026-06-12 — the shared-buffer
     #  re-injection was the p105 anti-pattern; use DREAMER_WM_EXCITATION_BUFFER_

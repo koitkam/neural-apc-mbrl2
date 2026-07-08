@@ -1338,6 +1338,17 @@ class TrainConfig:
     # env-step budget — Optuna's pruner gets more samples and we get
     # finer-grained logs of actor / entropy progression.
     phase3_train_steps_per_iter: int = 25
+    # mbrl2 real-sim (2026-07-08): the P3 actor-critic REINFORCE update is
+    # ON-POLICY, so it samples a SEPARATE rolling buffer holding ONLY the last
+    # ``phase3_onpolicy_buffer_eps`` current-policy episodes — NOT the shared
+    # replay buffer, whose Phase-1/2 PRBS / random / step-test / expert seed
+    # actions would corrupt the on-policy policy gradient (the p01 MV-chatter
+    # root cause: vanilla REINFORCE on off-policy actions pulls the policy toward
+    # imitating the full-range excitation).  ``phase3_onpolicy_prefill_eps`` warms
+    # it at P3 entry so the critic warmup + first actor steps see current-policy
+    # data.  Staleness is bounded to ≈ buffer_eps P3 iters (lr_actor is small).
+    phase3_onpolicy_buffer_eps: int = 16
+    phase3_onpolicy_prefill_eps: int = 8
     # P3 warmup before reporting EMA to pruner (avoid pruning trials on
     # the first few P3 returns which are dominated by the snapshot
     # actor that hasn't been updated by imagination yet).
@@ -2545,8 +2556,17 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                                          enabled=(device.type == 'cuda')):
                     _o = torch.from_numpy(obs_window[-1]).to(device).unsqueeze(0)
                     _emb = model.dynamics.embed(_o)
+                    # mbrl2 real-sim: advance the posterior with the MODE
+                    # (sample=False) when the POLICY drives.  The actor is TRAINED
+                    # on the mode belief (``_realsim_actor_critic_step`` re-encodes
+                    # with sample=False) and LQG separation puts control on the
+                    # OPTIMAL STATE ESTIMATE — so acting on a SAMPLED belief here is
+                    # a train/inference mismatch that injects latent-sampling noise
+                    # into the MV (part of the p01 chatter, esp. at deterministic
+                    # eval).  Random-exploration collection above keeps sample=True
+                    # (diverse latents for WM training).
                     _post, _ = model.dynamics.obs_step(
-                        _rssm_state, _rssm_prev_a, _emb, sample=True)
+                        _rssm_state, _rssm_prev_a, _emb, sample=False)
                     action_t, _, _ = model.policy(_post.feat,
                                                    deterministic=deterministic)
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
@@ -6544,6 +6564,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     if buf.dist is not None:
         buf._dist_source = env
 
+    # mbrl2 real-sim (2026-07-08): a SEPARATE rolling ON-POLICY buffer for the P3
+    # actor-critic update.  Vanilla REINFORCE (``_realsim_actor_critic_step``) is
+    # on-policy-only, so it MUST NOT sample the shared replay buffer above (which
+    # holds Phase-1/2 PRBS / random / step-test / expert seed actions — off-policy
+    # actions pull the policy toward imitating the full-range excitation, the p01
+    # MV-chatter RCA).  This ring buffer keeps ONLY the last
+    # ``phase3_onpolicy_buffer_eps`` current-policy episodes (n_dist=0: the frozen
+    # observer needs no disturbance target at P3).
+    onpol_buf = None
+    if str(getattr(cfg, 'actor_train_source', 'realsim')) == 'realsim':
+        _onpol_eps = max(2, int(getattr(cfg, 'phase3_onpolicy_buffer_eps', 16) or 16))
+        onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
+                                     cfg.obs_dim, cfg.action_dim, n_dist=0)
+
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / 'train_log.jsonl'
@@ -7855,11 +7889,30 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # update below, so the WM remains aligned with the actor's
             # current state-visit distribution.
             collect_every = max(1, int(cfg.phase3_collect_every_iters))
+            # mbrl2 real-sim: warm the dedicated ON-POLICY buffer at P3 entry so
+            # the critic warmup + first actor steps train on current-policy data
+            # (never the seed/replay buffer's off-policy PRBS/random/expert eps).
+            if onpol_buf is not None and onpol_buf.filled == 0:
+                _n_pref = max(1, int(getattr(cfg, 'phase3_onpolicy_prefill_eps', 8) or 8))
+                for _ in range(_n_pref):
+                    ep0 = collect_episode(env, model, device, cfg,
+                                          random_action=False,
+                                          deterministic=False)
+                    buf.add_episode(ep0['obs'], ep0['act'], ep0['rew'], ep0['cont'])
+                    onpol_buf.add_episode(
+                        ep0['obs'], ep0['act'], ep0['rew'], ep0['cont'])
+                    total_env_steps += cfg.episode_length
+                print(f"[realsim] on-policy buffer pre-filled with {_n_pref} "
+                      f"episodes (P3 actor-critic trains on current-policy data "
+                      f"only)", flush=True)
             if (total_iters % collect_every) == 0:
                 ep = collect_episode(env, model, device, cfg,
                                        random_action=False,
                                        deterministic=False)
                 buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+                if onpol_buf is not None:
+                    onpol_buf.add_episode(
+                        ep['obs'], ep['act'], ep['rew'], ep['cont'])
                 total_env_steps += cfg.episode_length
                 ret = float(ep['rew'].sum())
                 ema_return = (ret if ema_return is None
@@ -7944,7 +7997,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                           if current_phase != 3
                           else max(1, int(cfg.phase3_train_steps_per_iter))):
             _t = time.time()
-            batch_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
+            # mbrl2 real-sim: P3 actor-critic REINFORCE is ON-POLICY — sample the
+            # dedicated on-policy buffer (recent current-policy episodes only), NOT
+            # the shared replay buffer (whose Phase-1/2 PRBS/random/expert seed
+            # actions corrupt the policy gradient → the p01 MV-chatter RCA).  P1/P2
+            # WM training still samples the full replay buffer.
+            _src_buf = (onpol_buf
+                        if (current_phase == 3 and onpol_buf is not None
+                            and onpol_buf.filled > 0)
+                        else buf)
+            batch_np = _src_buf.sample(cfg.batch_size, cfg.seq_len, rng)
             batch: Dict[str, torch.Tensor] = {}
             for k, v in batch_np.items():
                 t = torch.from_numpy(v)
@@ -9058,6 +9120,8 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
         ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
         ('DREAMER_P3_COLLECT_EVERY', 'phase3_collect_every_iters', int),
+        ('DREAMER_P3_ONPOLICY_BUFFER_EPS', 'phase3_onpolicy_buffer_eps', int),
+        ('DREAMER_P3_ONPOLICY_PREFILL_EPS', 'phase3_onpolicy_prefill_eps', int),
         ('DREAMER_BUFFER_CAP_STEPS', 'buffer_capacity_steps', int),
         ('DREAMER_ATTN_IMPL', 'attn_impl', str),
         ('DREAMER_COMPILE_MODE', 'compile_mode', str),
