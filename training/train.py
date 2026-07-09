@@ -516,6 +516,15 @@ class TrainConfig:
     # target so it can't self-inflate (promoted 2026-06-14; was 1.0).
     critic_imag_loss_coef: float = 0.3
 
+    # mbrl2 real-sim (p04, 2026-07-09): Monte-Carlo GROUNDING weight for the
+    # real-sim actor-critic critic.  The critic target is the λ-return CE plus
+    # ``critic_mc_grounding_coef`` × the PURE discounted reward-to-go (λ=1, no
+    # bootstrap) CE.  p03 RCA: the bootstrap-only λ-return let the value head
+    # drift/INVERT (val critic_r -0.23 → MV railed high); a full-real-episode MC
+    # anchor pins V to realised economics so the advantage sign stays correct.
+    # 0.0 = OFF (legacy).  Env ``DREAMER_CRITIC_MC_GROUNDING_COEF``.
+    critic_mc_grounding_coef: float = 1.0
+
     # When True, cap the MC return with a single discounted tail bootstrap
     # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
     # (default) the return is PURE MC (truncated at the segment end).  At
@@ -4268,14 +4277,17 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # ----- (#2, P88) multi-step latent overshooting (RSSM) -----
     # mbrl2 real-sim perf (2026-07-08): the two multi-step aux rollouts
     # (overshoot + held) are ~73% of the WM step but supervise SLOW DC-gain /
-    # drift properties — run them every OTHER WM step (the compiled img_rollout
-    # already fuses each into one graph; halving frequency ~halves the residual
-    # cost with negligible quality impact).
+    # drift properties.  p03 RCA (2026-07-09): the OVERSHOOT loss is the
+    # OPEN-LOOP GAIN supervisor — gating it to every-other step slipped the MV
+    # gain (5.7%→12.3% rel-err) and let the DV compound open-loop, so run
+    # OVERSHOOT EVERY step now (the compiled ``img_rollout`` keeps it cheap).
+    # The HELD-rollout (drift/stationarity, less gain-critical) stays
+    # every-other for the residual speedup.
     _wm_aux_n = int(getattr(model, '_wm_aux_step', 0)) + 1
     model._wm_aux_step = _wm_aux_n
-    _run_aux = (_wm_aux_n % 2 == 0)
+    _run_held = (_wm_aux_n % 2 == 0)
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
-    if _run_aux and overshoot_coef > 0.0:
+    if overshoot_coef > 0.0:
         overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
             model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
     else:
@@ -4285,7 +4297,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
 
     # ----- (b2, P89) multi-step held-action rollout stationarity (RSSM) -----
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
-    if _run_aux and held_coef > 0.0:
+    if _run_held and held_coef > 0.0:
         held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
             model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
     else:
@@ -4631,7 +4643,9 @@ def expert_bc_p3_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
 # ---------------------------------------------------------------------------
 
 def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
-                                cfg: TrainConfig) -> Dict[str, torch.Tensor]:
+                                cfg: TrainConfig,
+                                critic_batch: Optional[Dict[str, torch.Tensor]] = None,
+                                ) -> Dict[str, torch.Tensor]:
     """Phase 3 (real-sim mode): actor-critic on REAL-environment λ-returns.
 
     The mbrl2 pivot: the actor is NOT trained in the world model's imagination
@@ -4694,9 +4708,58 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     if _ret_cap is not None:
         target_returns = target_returns.clamp(-_ret_cap, _ret_cap)
 
-    # ----- critic loss (twohot CE) — REUSED -----
+    # ----- CRITIC loss (twohot CE): DIVERSE replay states + MC-grounding -----
+    # p03 RCA (2026-07-09): training the critic ONLY on the narrow on-policy
+    # buffer STARVED it of state diversity — once the actor drifted to a corner
+    # the buffer held only corner states, so the value head INVERTED (val
+    # critic_r -0.23) → wrong-signed advantage → MV railed high.  Train the
+    # CRITIC on the DIVERSE shared replay ``critic_batch`` (an action-independent
+    # value baseline is UNBIASED for REINFORCE) while the ACTOR stays on-policy
+    # (the advantage/log-prob below are on ``batch``).  ``critic_batch`` None =
+    # legacy (critic shares the on-policy states).
+    if critic_batch is not None:
+        with torch.no_grad():
+            _fc, _cpl, _cprl, _clast, _cds, _ccont = rssm.rollout_observed(
+                critic_batch['obs'], critic_batch['act'], sample=False)
+        Bc, Tc = critic_batch['obs'].shape[:2]
+        feat_c = _fc.detach().reshape(Bc * Tc, -1)
+        rew_c = critic_batch['rew'].float()
+        with torch.no_grad():
+            v_slow_c = model.target_value.expectation(
+                model.target_value(feat_c)).reshape(Bc, Tc)
+            if _ret_cap is not None:
+                v_slow_c = v_slow_c.clamp(-_ret_cap, _ret_cap)
+        value_logits_c = model.value(feat_c)
+    else:
+        Bc, Tc = B, T
+        rew_c, v_slow_c, value_logits_c = rew, v_slow, value_logits
+    # λ-return target on the critic's (replay) states
+    ret_c = torch.zeros_like(v_slow_c)
+    ret_c[:, -1] = v_slow_c[:, -1]
+    for _tc in reversed(range(Tc - 1)):
+        _bc = (1.0 - lam) * v_slow_c[:, _tc + 1] + lam * ret_c[:, _tc + 1]
+        ret_c[:, _tc] = rew_c[:, _tc] + gamma * _bc
+    ret_c = ret_c.detach()
+    if _ret_cap is not None:
+        ret_c = ret_c.clamp(-_ret_cap, _ret_cap)
     critic_loss = model.value.loss(
-        value_logits, target_returns.reshape(-1)).mean()
+        value_logits_c, ret_c.reshape(-1)).mean()
+    # ----- Fix 1: Monte-Carlo GROUNDING (anchor V to REAL returns) -----
+    # Add a PURE discounted reward-to-go (λ=1, no bootstrap) CE so the critic is
+    # pinned to realised economics and cannot drift/invert (replaces the deleted
+    # imagination MC-grounding — now cleaner because real-sim gives full real
+    # episodes).  ``critic_mc_grounding_coef`` (re-added).
+    _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
+    if _mc_coef > 0.0:
+        ret_mc = torch.zeros_like(v_slow_c)
+        ret_mc[:, -1] = v_slow_c[:, -1]
+        for _tm in reversed(range(Tc - 1)):
+            ret_mc[:, _tm] = rew_c[:, _tm] + gamma * ret_mc[:, _tm + 1]
+        ret_mc = ret_mc.detach()
+        if _ret_cap is not None:
+            ret_mc = ret_mc.clamp(-_ret_cap, _ret_cap)
+        critic_loss = critic_loss + _mc_coef * model.value.loss(
+            value_logits_c, ret_mc.reshape(-1)).mean()
 
     # ----- advantage + percentile return-scale normalisation — REUSED -----
     with torch.no_grad():
@@ -5185,9 +5248,14 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     }
 
     # ---- policy_init_log_std (universal default) -----------------------
+    # p03 RCA (2026-07-09): the actor's entropy collapsed early (locked below the
+    # early-stop floor) before the critic calibrated.  Start the policy with MORE
+    # exploration (σ≈0.22 vs 0.135) so the early on-policy data is diverse enough
+    # to keep the (now MC-grounded, replay-trained) critic well-conditioned; the
+    # plant-adaptive ``policy_log_std_max`` clamp still bounds it from above.
     out['policy_init_log_std'] = {
-        'value': -2.0,
-        'source': 'universal_default(σ≈0.135)',
+        'value': -1.5,
+        'source': 'realsim_exploration_default(σ≈0.22)',
     }
 
     # ---- policy_log_std_max (plant-adaptive σ ceiling) -----------------
@@ -8249,10 +8317,29 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # ``{**wm_losses, **ag_losses, **ac_losses}`` is a clean no-op.
                 wm_grad_norm = 0.0
                 wm_losses, ag_losses = {}, {}
+                # Fix 2 (p03 RCA): the CRITIC trains on the DIVERSE shared replay
+                # buffer (``buf``) — not the narrow on-policy ``batch`` — to keep
+                # the value head from inverting once the actor drifts to a corner.
+                # The ACTOR stays on-policy (``batch``).  When there is no separate
+                # on-policy buffer (fallback), ``batch`` already IS the replay, so
+                # leave ``critic_batch`` None (critic shares the actor states).
+                _critic_batch = None
+                if (onpol_buf is not None and onpol_buf.filled > 0
+                        and buf.filled > 0):
+                    _cb_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
+                    _critic_batch = {}
+                    for _k, _v in _cb_np.items():
+                        _t = torch.from_numpy(_v)
+                        if device.type == 'cuda':
+                            _t = _t.pin_memory().to(device, non_blocking=True)
+                        else:
+                            _t = _t.to(device)
+                        _critic_batch[_k] = _t
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
-                    ac_losses = _realsim_actor_critic_step(model, batch, cfg)
+                    ac_losses = _realsim_actor_critic_step(
+                        model, batch, cfg, critic_batch=_critic_batch)
                 _actor_loss = ac_losses['actor_loss']
                 opt_actor.zero_grad(set_to_none=True)
                 opt_critic.zero_grad(set_to_none=True)

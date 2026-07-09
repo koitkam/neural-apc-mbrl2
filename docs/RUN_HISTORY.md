@@ -1031,6 +1031,71 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Judge by**: disturbance det_r → toward 0.354 (DOB d_t estimator) + MV gain @H toward 1.0 & stable @H==@4H
   (clean Stage-1) + `critic_r` recovers off 0.085 + actor `cum_raw`/`cv_viol`/`mv_tv` improve — val CIs.
 
+---
+
+## Real-sim controller runs (mbrl2 fork — separate `pNN` numbering)
+
+> **2026-07-07 — the pivot.** Imagination is **deleted**; the WM(RSSM)+DOB is a **frozen observer** and the
+> actor-critic trains on λ-returns from **real rollouts of the true simulator** (`_realsim_actor_critic_step`,
+> `actor_train_source='realsim'`) with domain randomisation. These `p01…` rows are the **fork's own** runs (a fresh
+> counter — NOT the imagination-era `p95–p142` above). Imagination-only metrics (`imag_adv_action_corr`, the
+> `return_scale` cascade, the WM-@H-gain-as-seen-by-the-actor) no longer apply; judge on validation econ /
+> CV-MV-violation / disturbance-rejection + the P3 actor-critic canaries (`critic_r`, `critic_rew_to_tgt_var`).
+
+### p01 (`run_20260707_realsim1`) — VERDICT: FAILED, entropy-collapse @ iter153 — off-policy REINFORCE
+- MV = high-freq **CHATTER** spanning 70-90 % of range (eval deterministic ⇒ it's the POLICY, not sampling);
+  validation cum_raw ≈ **−560k**; critic_r 0.23, critic_rew_to_tgt_var 0.0023, adv_corr 0.013.
+- **ROOT CAUSE (confirmed)**: the P3 loop sampled the **shared replay `buf`** (Phase-1/2 PRBS/random/step-test/expert
+  seed actions + stale-policy eps) and did **vanilla REINFORCE `−(adv·logp)` on those OFF-POLICY actions**. REINFORCE
+  is on-policy-only ⇒ the gradient pulls π toward imitating whatever full-range seed actions scored +adv = exactly the
+  chatter. (Imagination was safe because `buf.sample` gave only START STATES; the actions were freshly sampled from the
+  current policy INSIDE the WM rollout, and `batch['rew']` was ignored.) `mv_move_weights=0` in control_objective.json
+  was a secondary contributor, not the primary lever. Observer/WM FINE (wm_gain 5.7 %, next-state r 0.48).
+- **FIX (p02/p03)**: a dedicated rolling **on-policy buffer** `onpol_buf` (recent current-policy eps only) — the P3
+  actor-critic samples IT, not `buf` — + certainty-equivalent belief (posterior MODE, sample=False, in both collection
+  and eval).
+
+### p02 — deleted (on-policy-buffer attempt; superseded/cleaned before a full verdict).
+
+### p03 (`run_p03_wmopt`) — VERDICT: FAILED, entropy-collapse @ iter204 — INVERTED CRITIC, MV pinned high
+- On-policy buffer + the wm-opt (compiled `img_rollout` + every-other-step aux, commit 3c26649). **VISION-confirmed**:
+  MV/REFLUX **PINNED FLAT at max ~95-100 %** of the episode; CV crashed **~13-15 °C BELOW** band ~95 % of the time
+  (too cold from max reflux). mean_mv_viol 448.9, mean_cv_viol 580.7, cum_raw −934235, best_p3_det_return **−1972**
+  (WORSE than p01's −1235).
+- **SMOKING GUNS**: **critic_r_observed −0.231 (INVERTED!)** (p01 was +0.229) ⇒ wrong-signed advantage ⇒ actor
+  **maximizes** reflux (should minimize); critic_rew_to_tgt_var **0.0003** (healthy >0.015 = severe bootstrap
+  dominance); return_scale **49.5** (pinned at cap); wm_gain_rel_err **0.123** (12.3 % MV — WORSE than p01's 5.7 %,
+  regressed by the overshoot every-other-step gating). DV decomp gain_ratio_post_vs_real 0.933 (6.7 % under),
+  dominant_lever "faithful", "residual TM bias is open-loop COMPOUNDING".
+- **ROOT CAUSE**: the p02/p03 on-policy fix **cured the chatter but removed the critic's two stabilizers**:
+  (a) **no MC-grounding** (the bootstrap-only λ-return drifts with no real anchor → rew_to_tgt_var 0.0003), and
+  (b) the **on-policy buffer STARVED the critic of state diversity** — once the actor drifts to a corner, the buffer
+  holds only corner states → the value head inverts. p01's diverse replay buffer kept critic +0.229. Budget was NOT the
+  bottleneck (46 of ~444 P3-iter ceiling used; P1-cap = plateau-detector artifact).
+
+### p04 (`run_p04_criticfix`) — fixes: MC-ground + critic-diversity buffer-split + un-gate overshoot + more exploration
+- **Fix 1 (MC-ground the critic)**: re-added `critic_mc_grounding_coef` (default **1.0**, `DREAMER_CRITIC_MC_GROUNDING_COEF`;
+  pruned during the imagination cull). The critic target is the λ-return CE **plus** `coef ×` the PURE discounted
+  reward-to-go (λ=1, no bootstrap) CE — anchors V to realised economics so the advantage sign can't invert. Real-sim
+  gives full real episodes ⇒ a cleaner MC anchor than the deleted imagination version.
+- **Fix 2 (critic diversity — actor/critic buffer split)**: `_realsim_actor_critic_step(…, critic_batch=None)`. The
+  ACTOR advantage + REINFORCE + entropy stay **on-policy** (`batch` from `onpol_buf`, unbiased policy gradient); the
+  CRITIC λ-return CE + MC now train on the **DIVERSE shared replay** (`critic_batch` sampled from `buf` in the P3 loop).
+  A value BASELINE is action-independent ⇒ off-policy replay is UNBIASED for REINFORCE, and it keeps the value head
+  well-conditioned when the actor sits in a corner.
+- **Fix 3 (un-gate the overshoot gain-supervisor)**: the overshoot loss (the OPEN-LOOP gain supervisor) runs **every**
+  WM step again (p03's every-other gating slipped MV gain 5.7→12.3 % + let the DV compound open-loop). The held-rollout
+  (drift, less gain-critical) stays every-other for the compiled-`img_rollout` speedup (~360→~461 ms, still 1.37×
+  faster than pre-opt 676 ms).
+- **Fix 4 (more early exploration)**: `policy_init_log_std` auto-tune **−2.0 (σ0.135) → −1.5 (σ0.22)** so the early
+  on-policy data is diverse enough to keep the now-grounded critic conditioned before entropy can collapse
+  (plant-adaptive `policy_log_std_max` still bounds it from above).
+- **Verification**: `get_errors` clean; `_smoke_rssm test_sim` green incl. the new `critic_batch` split + MC-grounding
+  path (critic_loss ≈ 2·log(255) confirms both CE terms present; overshoot runs every step). Launched env-free
+  (tmux `mbrl2_p04`, CVD=0, DOB=1, dedicated venv).
+- **Judge by**: **critic_r > 0** (NOT inverted — the primary canary) AND `critic_rew_to_tgt_var` > 0.015 AND
+  `return_scale` NOT pinned AND entropy NOT collapsed AND MV NOT railed high AND `wm_gain_rel_err` back < ~0.07 — val CIs.
+
 
 
 

@@ -34,8 +34,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > rollouts of the true simulator** (`_realsim_actor_critic_step`) with **domain
 > randomisation** enabled at P3 (`set_domain_randomization(True)`). This removes
 > the objective-mismatch / model-exploitation that drove the p106→p143 actor
-> failures, grounds the critic in **real returns** (no `return_scale` cascade, no
-> MC-grounding hack), and keeps DreamerV3's scale-invariant normalisation
+> failures, grounds the critic in **real returns** (an MC anchor over full real
+> episodes + a diverse-replay critic keep the value head well-conditioned; no
+> `return_scale` cascade), and keeps DreamerV3's scale-invariant normalisation
 > (symlog/twohot/percentile ⇒ fixed hyperparameters across sims). The
 > imagination-specific parts of §1 (the Phase-3 rollout, imagination gain-rand)
 > are **superseded**; the WM losses (recon/KL/DOB + overshoot/held-rollout) are
@@ -111,13 +112,18 @@ flowchart TB
   it with a real state (Section 3).
 - **Critic** `V(feat)` [`opt_critic`] is trained on **λ-returns** (TD-λ,
   bootstrapped by the EMA `target_value`) computed from the **REAL** environment
-  rewards of the on-policy rollout — no imagined bootstrap, so the value is
-  grounded in realised economics by construction (the old MC-grounding hack is
-  unnecessary).
+  rewards, **plus a Monte-Carlo grounding term** — `critic_mc_grounding_coef ×`
+  the pure discounted reward-to-go (λ=1, no bootstrap) CE — that anchors the
+  value to realised economics so it cannot drift/invert (the p03 failure: a
+  bootstrap-only λ-return let critic_r go **−0.23**). The critic trains on the
+  **diverse shared replay** (a value baseline is action-independent ⇒ off-policy
+  replay is unbiased and keeps the head conditioned when the actor sits in a
+  corner), while the **actor** stays on-policy (`_realsim_actor_critic_step(…,
+  critic_batch=<replay sample>)`).
 - **Actor** `π(a|feat)` [`opt_actor`] is trained on the **advantage**
   `return − V(feat)` (÷ the percentile return-scale) via REINFORCE on the REAL
-  taken action (`policy.log_prob_of`). It is the ONLY thing that drives
-  `action → plant`.
+  taken action (`policy.log_prob_of`) from the **on-policy** buffer. It is the
+  ONLY thing that drives `action → plant`.
 - **Three optimizers are strictly partitioned** (verified by
   `tools/_smoke_grad_isolation.py`): `opt_world` (encoder/core/decoder + reward
   head [+ disturbance head]), `opt_actor` (policy), `opt_critic` (value).

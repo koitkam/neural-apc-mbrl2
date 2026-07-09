@@ -120,6 +120,24 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     diag = _realsim_actor_critic_step(model, batch, cfg)
     _finite('_realsim_actor_critic_step', diag)
 
+    # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
+    # DISTINCT replay critic_batch; the critic loss must stay finite and
+    # backprop through the diverse-state path, and the MC-grounding term
+    # (critic_mc_grounding_coef > 0) must be exercised without NaN.
+    assert float(cfg.critic_mc_grounding_coef) > 0.0, 'MC-grounding coef off'
+    critic_batch = {
+        'obs': torch.randn(B, T, obs_dim),
+        'act': torch.rand(B, T, action_dim) * 2 - 1,
+        'rew': torch.randn(B, T),
+        'cont': torch.ones(B, T),
+    }
+    diagC = _realsim_actor_critic_step(model, batch, cfg,
+                                       critic_batch=critic_batch)
+    _finite('_realsim_actor_critic_step[critic_split+MC]', diagC)
+    (diagC['actor_loss'] + diagC['critic_loss']).backward()
+    print('[smoke] OK  _realsim_actor_critic_step critic_batch split + '
+          'MC-grounding backward()')
+
     # (B) imagination with the long-horizon anchor ENGAGED — exercise the
     # ``lam_anchor`` recursion + raised coef and confirm the critic loss is
     # finite and backprops through the engaged path.
