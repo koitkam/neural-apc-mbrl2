@@ -1113,6 +1113,33 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   collapsed, MV not railed, `wm_gain_rel_err` < ~0.07) — PLUS watch the workflow.log for a `[log-row] coerced …` line
   that would name the p04-crash root.
 
+### p05 — VERDICT: same collapse as p03 — actor-collapse-ON-UNFREEZE (not a critic-health problem)
+- MV pinned at the high limit, `entropy_collapse` early-stop @ iter193, `cum_raw −942k` (all 9 seeds −366k…−1274k).
+- **The critic fixes WORKED at warmup** (`critic_rew_to_tgt_var ≈ 0.015` healthy for iters 149–158, actor frozen; p03
+  was 0.0003). But the **actor collapses the instant it unfreezes** (iter 159): `actor_loss −498`, entropy → floor
+  (−1.017), `return_scale` → cap (49.5), μ → MV=max. `critic_r = −0.04` is DOWNSTREAM (collapsed actor → no validation
+  state diversity), not a primary inversion.
+- **RCA**: the auto-tuned σ floor `σ_min = σ_max/2.5 = 0.0875` sits **below** the −0.817 entropy early-stop trip, so on
+  unfreeze REINFORCE crashes σ to that floor → tiny σ makes `logp` explode → `actor_loss −498` → μ commits to the
+  max-reflux corner → cascade. (The KL trust region was already tried + reverted in p136 — it chases the collapse.)
+- The **logging fix (a5e147a) named the p04-crash root**: `[log-row] coerced … ['t_ac_s']` — the Fix 2 critic_batch
+  loop reused `_t` (the AC-step timer) → `t_ac_s` became a Tensor. Fixed (renamed `_t`→`_ct`).
+- WM MV gain now **over-reads** (ratio 1.15 / 15% — un-gating overshoot made it worse); DV gain near-perfect (0.99).
+
+### p06 — fix: stop the actor-collapse-on-unfreeze (raise the σ floor) + gentler actor + stronger econ potential
+- **(1) σ FLOOR** (`sigma_min_ratio` 2.5→1.6, σ_min 0.0875→0.137, entropy floor −1.017→**−0.57** > trip) + the auto-tune
+  `max(2.0,…)` clamp → `max(1.3,…)`: σ can no longer collapse to a near-deterministic corner; on-policy exploration stays
+  alive so the warmup-healthy critic keeps getting diverse states to guide μ.
+- **(2) `phase3_train_steps_per_iter` 25→8**: the real-sim on-policy buffer is FIXED per iter, so 25 reuses overfit the
+  corner in one unfreeze iter.
+- **(3) `shaping_econ_coef` 0.25→0.5**: strengthen the EXISTING margin-gated economic potential
+  (`_shaping_potential`/`_economic_potential`) — potential-based / policy-invariant (Ng 1999), sim-adaptive, validation on
+  the UNSHAPED reward — so the tiny economic gradient is visible against the ~2500× larger cv-violation term driving
+  μ→max. (Objective-preserving; the deeper reward-asymmetry redesign is deferred.)
+- **Judge by**: the actor does NOT collapse — entropy stays > −0.817 (no early-stop), MV **explores** (not pinned at
+  max), `return_scale` not pinned, `critic_r > 0` on validation (diverse states). If μ still drifts to max without fully
+  collapsing → the reward asymmetry needs the bigger fix next.
+
 
 
 
