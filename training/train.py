@@ -130,7 +130,15 @@ class TrainConfig:
     sigma_max_mult: float = 1.0       # σ_max = sigma_max_mult × σ_seed
     sigma_max_floor: float = 0.10     # hard floor on σ_max
     sigma_max_cap: float = 0.30       # hard ceiling on σ_max
-    sigma_min_ratio: float = 2.5      # σ_min = σ_max / sigma_min_ratio
+    # mbrl2 real-sim (p06, 2026-07-10): 2.5 → 1.6 RAISES the σ FLOOR (σ_min =
+    # σ_max/1.6 ≈ 0.63·σ_max).  The REINFORCE actor was collapsing σ all the way
+    # to the old 0.40·σ_max floor on unfreeze (p03/p05): σ→0.0875 ⇒ entropy
+    # −1.017 < the −0.817 early-stop trip, and the tiny σ made logp explode
+    # (actor_loss −498) → MV railed to the max corner.  A higher floor caps that
+    # collapse, keeps entropy above the trip, and keeps on-policy exploration
+    # alive so the (warmup-healthy) critic keeps getting diverse states to guide
+    # μ.  Deterministic EVAL uses μ, so the wider training σ is exploration-only.
+    sigma_min_ratio: float = 1.6      # σ_min = σ_max / sigma_min_ratio
     # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
     # ``auto_initialize_hyperparams`` as ``η = η_v3 × σ_max / σ_v3_ref``
     # (V3 paper default 3e-4 anchored at σ=1.0). Recovers V3 exactly
@@ -414,7 +422,13 @@ class TrainConfig:
     # A gentler 0.25 lets the now-active actor track the WM while it heals
     # (D1 removal recovers the gain) instead of chasing economics into the WM's
     # bias.  Restore 0.5 once the WM gain is back >0.9.
-    shaping_econ_coef: float = 0.25
+    # mbrl2 real-sim (p06, 2026-07-10): RESTORED 0.25→0.5.  The p130 over-drive
+    # concern was an IMAGINATION artefact (the actor planned against a biased
+    # WM); in the real-sim fork the actor trains on the TRUE plant, so a stronger
+    # — but still potential-based, policy-invariant (Ng 1999), margin-gated —
+    # economic pull is what makes the tiny economic gradient VISIBLE against the
+    # ~2500×-larger CV-violation term that was driving μ to max reflux.
+    shaping_econ_coef: float = 0.5
     # Width (as a fraction of the CV half-band) of the inner SAFE zone over which
     # the economic gate ramps 0→1: gate = clip(margin_to_edge / (frac·half), 0,
     # 1).  ``0.5`` ⇒ economics is fully active only in the inner 50 % and fully
@@ -1346,7 +1360,12 @@ class TrainConfig:
     # Reduce inner train steps in P3 so more iters happen per fixed
     # env-step budget — Optuna's pruner gets more samples and we get
     # finer-grained logs of actor / entropy progression.
-    phase3_train_steps_per_iter: int = 25
+    # mbrl2 real-sim (p06, 2026-07-10): 25 → 8.  Each P3 iter collects ONE fresh
+    # on-policy episode then does N REINFORCE steps sampling the SMALL on-policy
+    # buffer; 25 reuses of a FIXED per-iter buffer is heavily off-policy and let
+    # the actor overfit the max-reflux corner within a single unfreeze iter (the
+    # p05 collapse).  Fewer steps keep each update closer to on-policy.
+    phase3_train_steps_per_iter: int = 8
     # mbrl2 real-sim (2026-07-08): the P3 actor-critic REINFORCE update is
     # ON-POLICY, so it samples a SEPARATE rolling buffer holding ONLY the last
     # ``phase3_onpolicy_buffer_eps`` current-policy episodes — NOT the shared
@@ -5362,9 +5381,9 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # field (default 2.5).  Legacy ``SIGMA_MIN_RATIO_OF_MAX`` env-var
     # still honoured for back-compat.
     _legacy_ratio_env = os.environ.get('SIGMA_MIN_RATIO_OF_MAX', None)
-    sigma_min_ratio = max(2.0,
+    sigma_min_ratio = max(1.3,
         float(_legacy_ratio_env) if _legacy_ratio_env is not None
-        else float(getattr(cfg, 'sigma_min_ratio', 2.5)))
+        else float(getattr(cfg, 'sigma_min_ratio', 1.6)))
     target_sigma_min = target_sigma_max / sigma_min_ratio
     log_std_min_val = float(np.log(target_sigma_min))
     out['policy_log_std_min'] = {
@@ -8359,12 +8378,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _cb_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
                     _critic_batch = {}
                     for _k, _v in _cb_np.items():
-                        _t = torch.from_numpy(_v)
+                        # NB: do NOT reuse ``_t`` here — it is the AC-step
+                        # wall-clock timer (``_t = time.time()`` above), consumed
+                        # by ``t_ac_acc += time.time() - _t`` below.  Clobbering
+                        # it with a tensor made ``t_ac_s`` a Tensor -> the p04
+                        # json.dumps crash (2026-07-10).
+                        _ct = torch.from_numpy(_v)
                         if device.type == 'cuda':
-                            _t = _t.pin_memory().to(device, non_blocking=True)
+                            _ct = _ct.pin_memory().to(device, non_blocking=True)
                         else:
-                            _t = _t.to(device)
-                        _critic_batch[_k] = _t
+                            _ct = _ct.to(device)
+                        _critic_batch[_k] = _ct
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
