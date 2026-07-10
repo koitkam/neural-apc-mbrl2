@@ -1096,6 +1096,23 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Judge by**: **critic_r > 0** (NOT inverted — the primary canary) AND `critic_rew_to_tgt_var` > 0.015 AND
   `return_scale` NOT pinned AND entropy NOT collapsed AND MV NOT railed high AND `wm_gain_rel_err` back < ~0.07 — val CIs.
 
+### p04 — CRASHED at the P2→P3 boundary (logging bug, not a training result)
+- Crashed on the **first P3 log row** (iter 159, ~2.5 h into P1/P2) with `TypeError: Object of type Tensor is not JSON
+  serializable` at `json.dumps(row)`. A stray non-JSON diagnostic value (0-d torch Tensor / numpy scalar) reached the
+  per-iter train-log write. The row is normally all-scalar (base dict + the float() loss merge + the diag-per-head
+  float()/str loop; the `_realsim_actor_critic_step` return dict is provably all 0-d scalars — reproduced with
+  DOB+dv+bf16 autocast). p03 logged 46 P3 rows fine (44 keys, all float/int/str/None), so it is a latent heisenbug.
+- **FIX (a5e147a, training-neutral)**: `_coerce_row_for_json(row)` coerces any torch/numpy value in the row to a Python
+  scalar IN PLACE before `json.dumps` + prints a **one-time** `[log-row] coerced non-JSON …` warning NAMING the key (so
+  p05 captures the true source). Fresh restart (init_from_ckpt only loads weights, doesn't skip phases) reproduces the
+  same P1/P2 and clears P3. No p04 P3/validation result — the 4 critic fixes are evaluated in **p05**.
+
+### p05 — relaunch of the p04 recipe (4 critic fixes) with the logging fix
+- Identical recipe to p04 (MC-ground + critic-diversity split + un-gate overshoot + more exploration), env-free, DOB on.
+- **Judge by**: same as p04 (`critic_r > 0`, `critic_rew_to_tgt_var` > 0.015, `return_scale` not pinned, entropy not
+  collapsed, MV not railed, `wm_gain_rel_err` < ~0.07) — PLUS watch the workflow.log for a `[log-row] coerced …` line
+  that would name the p04-crash root.
+
 
 
 
