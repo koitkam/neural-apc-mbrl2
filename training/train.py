@@ -6073,6 +6073,33 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
         print(f'[train] training_diagnostics.csv skipped: {e!r}', flush=True)
 
 
+def _coerce_row_for_json(row: Dict) -> List[str]:
+    """Coerce any non-JSON-native value in a train-log ``row`` to a Python
+    scalar IN PLACE; return the list of coerced keys.
+
+    The per-iter train-log write assumes every value was already reduced to a
+    Python float/int/str, but a diagnostic that slips through as a 0-d torch
+    Tensor / numpy scalar must NEVER crash a multi-hour run at ``json.dumps``
+    (observed p04 2026-07-10: a stray Tensor in the FIRST P3 row killed the run
+    at the P2->P3 boundary, after ~2.5 h of P1/P2).  This hardens the logging
+    boundary and returns the offending key(s) so a one-time warning can name
+    the true source for a targeted follow-up.
+    """
+    coerced: List[str] = []
+    for _k, _v in list(row.items()):
+        if torch.is_tensor(_v):
+            row[_k] = (_v.item() if _v.numel() == 1
+                       else _v.detach().cpu().reshape(-1).tolist())
+            coerced.append(_k)
+        elif isinstance(_v, np.generic):
+            row[_k] = _v.item()
+            coerced.append(_k)
+        elif isinstance(_v, np.ndarray):
+            row[_k] = _v.reshape(-1).tolist()
+            coerced.append(_k)
+    return coerced
+
+
 # ---------------------------------------------------------------------------
 # Main trainer (three explicit phases)
 # ---------------------------------------------------------------------------
@@ -6936,6 +6963,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # sits inside the inner train-steps loop, which would otherwise repeat it
     # once per step for the whole first warmup iter (~25x).
     _critic_warmup_logged = False
+    # One-shot guard so the log-row JSON-coercion warning logs EXACTLY once
+    # (names the diagnostic key that slipped through as a torch/numpy value).
+    _row_coerce_warned = False
     wm_trunk_stopgrad_in_p2 = bool(getattr(cfg, 'wm_trunk_stopgrad_in_p2', False))
     # neural-apc-mbrl JOINT training mode (DreamerV1/V2/V3 style).
     joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
@@ -8505,6 +8535,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         p2_reward_mtp_recent.append(float(_rml))
                 except (TypeError, ValueError):
                     pass
+            # Harden the train-log write: a diagnostic value that is still a
+            # torch/numpy object (0-d tensor, np scalar) must never crash the
+            # run at ``json.dumps`` (p04 2026-07-10).  Coerce in place + warn
+            # ONCE naming the offending key so the source is captured.
+            _coerced_keys = _coerce_row_for_json(row)
+            if _coerced_keys and not _row_coerce_warned:
+                print(f"[log-row] coerced non-JSON diagnostic value(s) to "
+                      f"scalar at iter {total_iters} (phase {current_phase}): "
+                      f"{_coerced_keys}", flush=True)
+                _row_coerce_warned = True
             log_f.write(json.dumps(row) + '\n')
             log_f.flush()
             rwm = row.get('return_window_mean')
