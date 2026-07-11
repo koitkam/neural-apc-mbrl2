@@ -537,7 +537,16 @@ class TrainConfig:
     # drift/INVERT (val critic_r -0.23 → MV railed high); a full-real-episode MC
     # anchor pins V to realised economics so the advantage sign stays correct.
     # 0.0 = OFF (legacy).  Env ``DREAMER_CRITIC_MC_GROUNDING_COEF``.
-    critic_mc_grounding_coef: float = 1.0
+    # p07 RCA (2026-07-11): 1.0→2.0.  The on-policy critic fixed the INVERSION
+    # (critic_r -0.20→+0.20) but the critic stayed WEAK and DECAYED into
+    # bootstrap-dominance as P3 ran (rew_to_tgt_var 0.014→0.0002, return_scale →
+    # cap) → a noisy advantage the actor could not use to distinguish smooth vs
+    # OSCILLATING control → a high-frequency MV limit cycle that degraded after
+    # the early-best checkpoint.  A stronger real-return anchor keeps V grounded
+    # in realised economics through ALL of P3 (proven p133), so the advantage
+    # keeps correctly penalising the oscillation's violations → the actor LEARNS
+    # smooth control from the objective (no move penalty needed).
+    critic_mc_grounding_coef: float = 2.0
 
     # When True, cap the MC return with a single discounted tail bootstrap
     # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
