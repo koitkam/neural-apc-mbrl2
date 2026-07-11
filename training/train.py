@@ -4727,15 +4727,38 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     if _ret_cap is not None:
         target_returns = target_returns.clamp(-_ret_cap, _ret_cap)
 
-    # ----- CRITIC loss (twohot CE): DIVERSE replay states + MC-grounding -----
-    # p03 RCA (2026-07-09): training the critic ONLY on the narrow on-policy
-    # buffer STARVED it of state diversity — once the actor drifted to a corner
-    # the buffer held only corner states, so the value head INVERTED (val
-    # critic_r -0.23) → wrong-signed advantage → MV railed high.  Train the
-    # CRITIC on the DIVERSE shared replay ``critic_batch`` (an action-independent
-    # value baseline is UNBIASED for REINFORCE) while the ACTOR stays on-policy
-    # (the advantage/log-prob below are on ``batch``).  ``critic_batch`` None =
-    # legacy (critic shares the on-policy states).
+    # ----- CRITIC loss (twohot CE): ON-POLICY (advantage accuracy) + replay -----
+    # p06 RCA (2026-07-10): the p05 buffer-split trained the critic ONLY on the
+    # DIVERSE replay ``critic_batch``, but the ADVANTAGE baseline V is evaluated
+    # on the ACTOR's ON-POLICY states (``batch``) — states the critic never fit,
+    # so V(on-policy) was a wrong EXTRAPOLATION (val critic_r -0.20, INVERTED) →
+    # wrong-signed advantage → the actor learned a degenerate rail-to-rail
+    # BANG-BANG policy.  The critic MUST fit the states where the advantage is
+    # taken (DreamerV3-faithful: critic trains where the actor acts).  So train
+    # it on the ON-POLICY ``batch`` (accuracy) AND the replay ``critic_batch``
+    # (diversity — prevents the p03 corner-starvation inversion).  A correct
+    # advantage lets the actor LEARN that bang-bang control is bad (no move
+    # penalty needed).  MC-grounding (``critic_mc_grounding_coef``) on BOTH.
+    _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
+
+    def _critic_ce(vl, vslow, rew_b, Tb, lam_ret):
+        """twohot-CE to the λ-return + optional PURE-MC (λ=1) grounding."""
+        loss = model.value.loss(vl, lam_ret.reshape(-1)).mean()
+        if _mc_coef > 0.0:
+            rmc = torch.zeros_like(vslow)
+            rmc[:, -1] = vslow[:, -1]
+            for _tt in reversed(range(Tb - 1)):
+                rmc[:, _tt] = rew_b[:, _tt] + gamma * rmc[:, _tt + 1]
+            rmc = rmc.detach()
+            if _ret_cap is not None:
+                rmc = rmc.clamp(-_ret_cap, _ret_cap)
+            loss = loss + _mc_coef * model.value.loss(vl, rmc.reshape(-1)).mean()
+        return loss
+
+    # (a) ON-POLICY term — the distribution the advantage is evaluated on.
+    critic_loss = _critic_ce(value_logits, v_slow, rew, T, target_returns)
+
+    # (b) DIVERSE replay term — anti-starvation diversity (skipped if no split).
     if critic_batch is not None:
         with torch.no_grad():
             _fc, _cpl, _cprl, _clast, _cds, _ccont = rssm.rollout_observed(
@@ -4749,36 +4772,16 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             if _ret_cap is not None:
                 v_slow_c = v_slow_c.clamp(-_ret_cap, _ret_cap)
         value_logits_c = model.value(feat_c)
-    else:
-        Bc, Tc = B, T
-        rew_c, v_slow_c, value_logits_c = rew, v_slow, value_logits
-    # λ-return target on the critic's (replay) states
-    ret_c = torch.zeros_like(v_slow_c)
-    ret_c[:, -1] = v_slow_c[:, -1]
-    for _tc in reversed(range(Tc - 1)):
-        _bc = (1.0 - lam) * v_slow_c[:, _tc + 1] + lam * ret_c[:, _tc + 1]
-        ret_c[:, _tc] = rew_c[:, _tc] + gamma * _bc
-    ret_c = ret_c.detach()
-    if _ret_cap is not None:
-        ret_c = ret_c.clamp(-_ret_cap, _ret_cap)
-    critic_loss = model.value.loss(
-        value_logits_c, ret_c.reshape(-1)).mean()
-    # ----- Fix 1: Monte-Carlo GROUNDING (anchor V to REAL returns) -----
-    # Add a PURE discounted reward-to-go (λ=1, no bootstrap) CE so the critic is
-    # pinned to realised economics and cannot drift/invert (replaces the deleted
-    # imagination MC-grounding — now cleaner because real-sim gives full real
-    # episodes).  ``critic_mc_grounding_coef`` (re-added).
-    _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
-    if _mc_coef > 0.0:
-        ret_mc = torch.zeros_like(v_slow_c)
-        ret_mc[:, -1] = v_slow_c[:, -1]
-        for _tm in reversed(range(Tc - 1)):
-            ret_mc[:, _tm] = rew_c[:, _tm] + gamma * ret_mc[:, _tm + 1]
-        ret_mc = ret_mc.detach()
+        ret_c = torch.zeros_like(v_slow_c)
+        ret_c[:, -1] = v_slow_c[:, -1]
+        for _tc in reversed(range(Tc - 1)):
+            _bc = (1.0 - lam) * v_slow_c[:, _tc + 1] + lam * ret_c[:, _tc + 1]
+            ret_c[:, _tc] = rew_c[:, _tc] + gamma * _bc
+        ret_c = ret_c.detach()
         if _ret_cap is not None:
-            ret_mc = ret_mc.clamp(-_ret_cap, _ret_cap)
-        critic_loss = critic_loss + _mc_coef * model.value.loss(
-            value_logits_c, ret_mc.reshape(-1)).mean()
+            ret_c = ret_c.clamp(-_ret_cap, _ret_cap)
+        critic_loss = critic_loss + _critic_ce(
+            value_logits_c, v_slow_c, rew_c, Tc, ret_c)
 
     # ----- advantage + percentile return-scale normalisation — REUSED -----
     with torch.no_grad():
