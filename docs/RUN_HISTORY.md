@@ -1140,6 +1140,30 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   max), `return_scale` not pinned, `critic_r > 0` on validation (diverse states). If μ still drifts to max without fully
   collapsing → the reward asymmetry needs the bigger fix next.
 
+### p06 — VERDICT: anti-collapse worked, but exposed a critic INVERSION → rail-to-rail bang-bang MV
+- The σ-floor held (entropy pinned at the floor -0.571, no collapse to a corner) so the **MV now moves** — but the actor
+  learned a degenerate **rail-to-rail BANG-BANG** policy (vision: REFLUX slams 15%↔85%; cum_raw -530k, mv_viol 422,
+  cv_viol 98.6). `actor_loss` runs away on unfreeze (iter 169: -69 → -2039).
+- **RCA: val `critic_r = -0.20` (INVERTED)** — a *different* inversion than p03. The p05 buffer-split (Fix 2) trains the
+  critic ONLY on the diverse replay `buf`, but the ADVANTAGE baseline V is evaluated on the actor's **on-policy** states
+  — states the critic never fit → V(on-policy) is a wrong extrapolation → wrong-signed advantage → bang-bang. The
+  tanh-boundary `logp` explosion is the numerical signature of μ driven to the action rails. (The early-stop is
+  performance-aware — it tripped with `adv_corr 0.044`, correctly flagging the degenerate policy.)
+- **WM (confirmed):** MV gain near-perfect (ss ratio **0.99**); DV gain **0.91** (9% under) — decomp says the bias is the
+  **autoencoder** (real→post 0.888) while the **dynamics/prior is perfect** (post→1step 0.9995): DV is a subdominant
+  regressor drowned in the categorical latent. **DOB/Kalman:** detrended r **0.65** (dynamic OK) but a large slow
+  **drift** (raw r negative), partly downstream of the DV-gain bias.
+
+### p07 — fix: train the critic on the ON-POLICY states too (correct advantage → learn good control)
+- The p05/p06 buffer-split made V an extrapolation on the actor's states. Fix (DreamerV3-faithful — the critic must fit
+  where the actor acts): `_realsim_actor_critic_step` now trains the critic on **BOTH** the on-policy `batch` (advantage
+  accuracy) AND the replay `critic_batch` (diversity, still prevents the p03 corner-starvation), MC-grounded on both.
+  **NOT a move penalty** — a correct advantage lets the actor *learn* that bang-bang is worse than smooth low-reflux
+  control (the user's constraint).
+- **Judge by**: `critic_r > 0` (not inverted), `adv_corr` up off ~0.04, `actor_loss` bounded (no tanh-rail runaway), MV
+  **smooth** (not bang-bang), CV in band with low reflux, cum_raw → 0. DV-gain representation fix + DOB drift are
+  deferred follow-ups (the actor is the blocker; the observer bias is minor since the actor trains on the real plant).
+
 
 
 
