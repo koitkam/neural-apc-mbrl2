@@ -761,7 +761,13 @@ class TrainConfig:
     # model.  When enabled the dims are auto-resolved from the plant
     # (cont_dist_dim=n_cv, cont_gain_dim=n_cv·(n_mv+n_dv)).  Backbone-agnostic
     # (RSSM + TSSM); every field is a TrainConfig knob so BO inherits it.
-    cont_latent_enabled: bool = False
+    # p08 (2026-07-10): DEFAULT ON.  Auto-resolves to GAIN-ONLY when the DOB is
+    # on (cont_gain_dim = n_cv·(n_mv+n_dv) = one un-quantized gain channel per
+    # input→output pair; cont_dist_dim=0, DOB owns the disturbance).  Gives every
+    # (input, output) gain an un-quantized home the categorical latent's shared
+    # bottleneck otherwise attenuates for SUBDOMINANT inputs — input-symmetric
+    # (MV or DV) and MIMO-general (auto-sized).
+    cont_latent_enabled: bool = True
     cont_gain_dim: int = 0
     cont_dist_dim: int = 0
     cont_min_std: float = 0.1
@@ -782,7 +788,21 @@ class TrainConfig:
     gain_match_dv_target: Tuple[Tuple[float, ...], ...] = ()
     # Gain-channel persistence: a light L2 on the step-to-step change of the
     # gain block (the gain is a per-episode CONSTANT, so it should not wander).
-    cont_gain_persist_coef: float = 0.0
+    # p08 (2026-07-10): 0.0→0.1 (enabled now that the gain channel is default-on).
+    cont_gain_persist_coef: float = 0.1
+    # ---- MIMO self-supervised per-INPUT isolation (2026-07-10) ----
+    # The DATA-DRIVEN generalisation of C(1) gain-match: on isolated-excitation
+    # episodes (ONE input swept, all others held) the CV response is driven by
+    # that single input, so matching the WM's PRIOR-rolled CV trajectory to the
+    # REAL CV supervises that input→CV response (gain + dynamics) UNDILUTED, with
+    # NO identified gain (works on NONLINEAR / black-box plants, per operating
+    # point) and INPUT-SYMMETRIC (MV or DV — the loss never looks at which input
+    # it is).  ``sample=False`` routes the gradient into the continuous gain
+    # channel (bypassing the categorical bottleneck that attenuates SUBDOMINANT
+    # inputs).  Auto-enabled (coef→0.5, len→horizon) when the cont gain channel
+    # is on AND isolated episodes exist.  ``DREAMER_WM_INPUT_ISOLATION_COEF``.
+    wm_input_isolation_coef: float = 0.0
+    wm_input_isolation_len: int = 0    # K-step prior rollout (auto = horizon)
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -4072,6 +4092,84 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     return loss, diag
 
 
+def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
+                             act: torch.Tensor, cfg: TrainConfig
+                             ) -> torch.Tensor:
+    """MIMO self-supervised per-INPUT isolation (2026-07-10).
+
+    The DATA-DRIVEN generalisation of ``_wm_gain_match_loss`` for NONLINEAR /
+    black-box plants with no identified gains.  ``obs``/``act`` come from an
+    ISOLATED-EXCITATION episode (ONE input swept with PRBS, all others held) so
+    the CV movement is driven by that single input.  From a strided set of
+    posterior start states we roll the PRIOR forward ``K`` steps under the REAL
+    action + DV sequence, decode each step, and match the predicted CV
+    trajectory to the REAL CV.  This supervises that input→CV response (gain +
+    dynamics) UNDILUTED, per operating point (nonlinear-safe), from REAL data (no
+    identified gain), and INPUT-SYMMETRIC — the loss never looks at WHICH input
+    is being swept (MV or DV), so it "just works" for any number of inputs.
+
+    ``sample=False`` freezes the categorical at its argmax so the gradient flows
+    into the CONTINUOUS gain channel + decoder + GRU, bypassing the categorical
+    bottleneck that attenuates SUBDOMINANT inputs (the same routing C(1)
+    gain-match uses).  RSSM-only; ``0`` for other backbones / when off.
+    """
+    zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
+    coef = float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0)
+    if coef <= 0.0:
+        return zero
+    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+        return zero
+    rssm = model.dynamics
+    if rssm.n_cv <= 0:
+        return zero
+    from models.dreamer_v4_rssm import RSSMState
+    B, T = obs.shape[:2]
+    K = int(getattr(cfg, 'wm_input_isolation_len', 0) or 0)
+    K = min(K, T - 1) if K > 0 else (T - 1)
+    if K < 2:
+        return zero
+    n_valid = T - K
+    if n_valid < 1:
+        return zero
+    # Frozen-observer encode → posterior features (mode); detached start states
+    # (like gain-match: the gradient trains the prior/decoder/cont-gain roll, not
+    # the encoder — the un-cheatable open-loop path).
+    with torch.no_grad():
+        feats, *_ = rssm.rollout_observed(obs, act, sample=False)
+    feats = feats.detach()
+    max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
+    stride = max(1, n_valid // max_starts)
+    starts = torch.arange(0, n_valid, stride, device=obs.device)
+    S = int(starts.numel())
+    f0 = feats[:, starts]                                     # (B, S, F)
+    Bm = B * S
+    h0 = f0[..., :rssm.deter_dim].reshape(Bm, -1)
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    z0 = f0[..., rssm.deter_dim:_ze].reshape(
+        Bm, rssm.n_categoricals, rssm.n_classes)
+    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
+          if rssm.cont_dim > 0 else None)
+    cv_idx = rssm.cv_index_t
+    k_off = torch.arange(1, K + 1, device=obs.device)
+    idx = starts.view(S, 1) + k_off.view(1, K)                # (S, K) time idx
+    a_all = act[:, idx].reshape(Bm, K, -1)                     # (Bm, K, A)
+    dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
+              if getattr(rssm, 'dv_dim', 0) > 0 else None)
+    cv_real = obs[:, idx].index_select(-1, cv_idx).reshape(Bm, K, -1).detach()
+    st = RSSMState(
+        h=h0.clone(),
+        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
+                             device=obs.device, dtype=f0.dtype),
+        z=z0.clone(), c=(c0.clone() if c0 is not None else None))
+    total = zero
+    for k in range(K):
+        dvk = dv_all[:, k] if dv_all is not None else None
+        st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
+        cv_pred = rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
+        total = total + (cv_pred - cv_real[:, k]).pow(2).mean()
+    return coef * (total / float(K))
+
+
 def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
     """C(1): convert the identified steady-state gains (engineering units) into
     the WM's NORMALIZED units and store them on ``cfg`` for the gain-match loss.
@@ -6205,6 +6303,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # gain_match still pins g, so d_t cleanly gets the load residual.
             cfg.cont_dist_dim = 0
             cfg.dist_match_coef = 0.0
+            # p08: auto-enable the self-supervised per-INPUT isolation loss (the
+            # nonlinear / black-box, no-known-gain generaliser) alongside the
+            # gain channel.  Input-symmetric; graceful no-op if no isolated eps.
+            if float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) <= 0.0:
+                cfg.wm_input_isolation_coef = 0.5
+            if int(getattr(cfg, 'wm_input_isolation_len', 0) or 0) <= 0:
+                cfg.wm_input_isolation_len = int(getattr(cfg, 'horizon', 15) or 15)
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
                   f'gain_dim={cfg.cont_gain_dim} '
                   f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
@@ -6702,6 +6807,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _onpol_eps = max(2, int(getattr(cfg, 'phase3_onpolicy_buffer_eps', 16) or 16))
         onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
                                      cfg.obs_dim, cfg.action_dim, n_dist=0)
+
+    # MIMO per-INPUT isolation buffer (2026-07-10): holds the isolated-excitation
+    # seed episodes (MV-PRBS + DV-PRBS — ONE input swept, all others held) for the
+    # self-supervised ``_wm_input_isolation_loss`` (the nonlinear / black-box,
+    # no-known-gain generalisation of C(1) gain-match).  Input-symmetric: it holds
+    # every input's isolated episodes.  Populated at seed time.
+    isolation_buf = None
+    if bool(getattr(cfg, 'cont_latent_enabled', False)):
+        _iso_cap = max(4, int(getattr(cfg, 'baseline_seed_episodes', 8) or 8)
+                       + int(getattr(cfg, 'dv_prbs_seed_episodes', 0) or 0) + 8)
+        isolation_buf = TrajectoryBuffer(_iso_cap, cfg.episode_length,
+                                         cfg.obs_dim, cfg.action_dim, n_dist=0)
 
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -7201,6 +7318,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     action_std=baseline_seed_std,
                                     op_band=prbs_op_band)
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+        if isolation_buf is not None:   # MV-isolated (MV swept, DV/others held)
+            isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
 
     # Constant-action / step-and-settle seed (run_p31 RCA 2026-05-21
@@ -7317,6 +7436,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         for lvl in dvp_levels:
             ep = collect_dv_prbs_episode(env, cfg, mv_level=float(lvl))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            if isolation_buf is not None:   # DV-isolated (DV swept, MV held)
+                isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
+                                          ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] dv-prbs={n_dv_prbs_seed} "
               f"(n_dv={n_dv}, op_frac={cfg.dv_prbs_op_frac:.2f}, "
@@ -8224,6 +8346,27 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                          * ag_losses['reward_mtp_total'])
                 else:
                     total_loss = wm_losses['wm_total']
+
+                # MIMO self-supervised per-INPUT isolation (P1/P2 only): the
+                # general nonlinear/black-box DV+MV gain supervisor.  Sample the
+                # isolated-excitation buffer + roll the prior ``sample=False`` so
+                # the gradient lands in the cont-gain channel (bypassing the
+                # categorical bottleneck that attenuates subdominant inputs).
+                if (isolation_buf is not None and isolation_buf.filled > 0
+                        and current_phase in (1, 2)
+                        and float(getattr(cfg, 'wm_input_isolation_coef', 0.0)
+                                  or 0.0) > 0.0):
+                    _iso_np = isolation_buf.sample(cfg.batch_size, cfg.seq_len,
+                                                   rng)
+                    _iso_obs = torch.from_numpy(_iso_np['obs']).to(device)
+                    _iso_act = torch.from_numpy(_iso_np['act']).to(device)
+                    with torch.amp.autocast(device_type=device.type,
+                                              dtype=torch.bfloat16,
+                                              enabled=(device.type == 'cuda')):
+                        _iso_loss = _wm_input_isolation_loss(
+                            model, _iso_obs, _iso_act, cfg)
+                    total_loss = total_loss + _iso_loss
+                    wm_losses['wm_input_isolation_loss'] = _iso_loss.detach()
 
                 opt_world.zero_grad(set_to_none=True)
                 if current_phase == 2:
