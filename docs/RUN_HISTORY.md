@@ -1164,6 +1164,33 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   **smooth** (not bang-bang), CV in band with low reflux, cum_raw → 0. DV-gain representation fix + DOB drift are
   deferred follow-ups (the actor is the blocker; the observer bias is minor since the actor trains on the real plant).
 
+### p07 — VERDICT: inversion FIXED (best run so far), residual actor OSCILLATION
+- **The on-policy-critic fix WORKED.** Val `critic_r = **+0.204**` (was **-0.20** INVERTED in p06) — correct-signed,
+  no more bang-bang. **`best_p3_det_return = -1223`** — the BEST since p01 (-1235); p03/p05/p06 were -1700…-1972.
+  `cum_raw` -444k (p06 -578k), `mv_viol` 230 (p06 422), `wm_gain_rel_err` 0.045 (healthy). P3 ran 221 iters (vs ~45).
+- **Residual: a high-frequency actor OSCILLATION (limit cycle).** Vision: MV toggles fast ~20%↔80% (NOT pinned at one
+  rail = "less severe" than p06's bang-bang), CV sawtooths across the band, `cum_raw` spirals. Best policy is **early**
+  (iter 186) then DEGRADES.
+- **RCA — the critic is correct-signed but WEAK and DECAYS into bootstrap-dominance.** `critic_rew_to_tgt_var` decays
+  0.0138 → **0.0002**; `return_scale` runs to its cap 49.5; `realsim_return` spirals -8 → -193. A weak/noisy advantage
+  can't clearly credit *smooth-vs-oscillating* control → the actor settles into a high-gain limit cycle → CV violations
+  → returns spiral → `return_scale` cascade → noisier advantage → sustained oscillation + degradation after iter 186.
+  **Not a WM problem** (gain 4.5%, `wm_next_state_r` 0.447). Not the actor collapse anymore.
+
+### p08 — fix: strengthen the critic's real-return grounding (keep the advantage accurate)
+- **`critic_mc_grounding_coef` 1.0 → 2.0.** The on-policy critic fixed the *sign* but not the *strength*; the fix keeps
+  V anchored to **realised economics** through ALL of P3 (not just the bootstrap) so the advantage keeps correctly
+  penalising the oscillation's violations → the actor **learns smooth control from the objective** — **NOT a move
+  penalty** (the user's constraint; the agent must learn that oscillation is bad control). Proven lever (imagination p133).
+- **p08 carries ALL fixes**: on-policy critic (p07) + MIMO WM gain fix (cont-gain `gain_dim=2` + self-supervised input
+  isolation 0.5, `gain_match` DISABLED = fully unsupervised) + MC-grounding 2.0. `test_sim` is LINEAR → a clean
+  isolation-only test of the WM gain fix, and the MC-grounding boost targets the actor oscillation.
+- **Judge by**: (actor) `critic_r > 0.3` (was 0.204), `critic_rew_to_tgt_var` stays > 0.015 (not → 0.0002),
+  `return_scale` NOT pinned at 49.5, MV **smooth** (not oscillating), `cum_raw` → 0; (WM) `wm_input_isolation_loss`
+  present + decreasing in P1/P2, `wm_dv_transfer` ratio > 0.93 (was 0.91), DV decomp real→post ~0.94+ (was 0.888), MV
+  holds ~0.99; (DOB) raw r positive + drift down. If it still oscillates but less → escalate MC-grounding further or add
+  a REINFORCE-variance lever (fresher on-policy data / lower `lr_actor`).
+
 
 
 
