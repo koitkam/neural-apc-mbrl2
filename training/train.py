@@ -6707,19 +6707,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         except Exception as exc:  # pragma: no cover — diagnostic only
             print(f"[snr] SKIPPED ({exc!r})", flush=True)
 
-    # ---- C(1) gain-match target resolution (2026-06-22) ----
-    # Now that obs-norm is populated (calibration ran episodes), convert the
-    # identified steady-state gains into WM-normalized units for the gain-match
-    # loss.  Only when the continuous gain channel is on; graceful no-op (coef
-    # stays 0, the channel still trains via recon) if the gains are unavailable.
-    if int(getattr(cfg, 'cont_gain_dim', 0) or 0) > 0:
-        try:
-            _resolve_gain_match_targets(env, cfg)
-        except Exception as _gm_exc:
-            print(f'[gain-match] target resolution SKIPPED ({_gm_exc!r}); '
-                  f'gain_match_coef=0 (cont gain channel still trains via '
-                  f'recon).', flush=True)
-            cfg.gain_match_coef = 0.0
+    # ---- gain-match DISABLED — fully self-supervised (2026-07-10) ----
+    # We rely ONLY on the data-driven ``_wm_input_isolation_loss`` (the
+    # nonlinear-correct, per-operating-point, no-known-gain input-isolation
+    # supervisor) — no identified-gain / linear-plant assumption and no
+    # linear-vs-nonlinear branching.  ``gain_match_coef=0`` makes
+    # ``_wm_gain_match_loss`` a no-op.  (The now-dead gain-match code +
+    # identified-gain target resolution are removed in a follow-up once p08
+    # confirms the isolation-only WM gain fix.)
+    cfg.gain_match_coef = 0.0
 
     model = build_model(cfg).to(device)
 
