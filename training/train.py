@@ -6716,15 +6716,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         except Exception as exc:  # pragma: no cover — diagnostic only
             print(f"[snr] SKIPPED ({exc!r})", flush=True)
 
-    # ---- gain-match DISABLED — fully self-supervised (2026-07-10) ----
-    # We rely ONLY on the data-driven ``_wm_input_isolation_loss`` (the
-    # nonlinear-correct, per-operating-point, no-known-gain input-isolation
-    # supervisor) — no identified-gain / linear-plant assumption and no
-    # linear-vs-nonlinear branching.  ``gain_match_coef=0`` makes
-    # ``_wm_gain_match_loss`` a no-op.  (The now-dead gain-match code +
-    # identified-gain target resolution are removed in a follow-up once p08
-    # confirms the isolation-only WM gain fix.)
-    cfg.gain_match_coef = 0.0
+    # ---- gain-match RE-ENABLED (p08 RCA, 2026-08-03) ----
+    # p08 ran isolation-ONLY (gain_match off) and BOTH WM steady-state gains
+    # SHRANK (CV←MV ×0.86, CV←DV ×0.78 — worse than p07's 0.99/0.888): the
+    # self-supervised isolation loss enforces input SEPARATION but does not pin
+    # gain MAGNITUDE, so the cont GAIN block under-shoots.  Under-estimated gains
+    # make the actor believe its control authority is weak → it OVER-ACTUATES
+    # (noisy MV) and mis-reacts to disturbances (condition-dependent MV noise).
+    # Re-enable the identified-gain anchor ALONGSIDE isolation — gain_match pins
+    # magnitude (linear/identifiable plants), isolation keeps the MIMO structure
+    # + nonlinear generality.  Targets are resolved just before the training loop
+    # (below), once the seed buffer has fitted obs-norm.
 
     model = build_model(cfg).to(device)
 
@@ -7549,6 +7551,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"co-trained every step from prefill "
               f"(critic_warmup={p3_critic_warmup_iters} iters, "
               f"prior_refresh={joint_prior_refresh_iters})", flush=True)
+
+    # p08 RCA: resolve the gain-match targets from the identified gains now that
+    # obs-norm is fitted (seed buffer collected above) → re-anchor the WM
+    # steady-state gains that isolation-only let shrink.  Graceful no-op if the
+    # identification data is missing (isolation loss still supervises the gain).
+    try:
+        _resolve_gain_match_targets(env, cfg)
+    except Exception as _gm_exc:
+        cfg.gain_match_coef = 0.0
+        print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
+              f'falling back to isolation-only WM gain supervision.', flush=True)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value
