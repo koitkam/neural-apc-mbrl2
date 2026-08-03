@@ -78,6 +78,23 @@ def main():
     print('[iso] OK: finite, off-when-disabled, grad reaches the cont-gain '
           'channel (bypasses the categorical bottleneck)')
 
+    # ---- steady-state (DC-gain) match term (2026-08-03) ----
+    base = float(_wm_input_isolation_loss(model, obs, act, cfg))  # ss off
+    cfg.wm_ss_match_coef = 0.5
+    ss = _wm_input_isolation_loss(model, obs, act, cfg)
+    print(f'[ss] base(traj)={base:.5f}  with_ss={float(ss):.5f} '
+          f'(coef={cfg.wm_ss_match_coef})')
+    assert torch.isfinite(ss).all(), float(ss)
+    assert float(ss) >= base - 1e-6, 'ss term should ADD to the trajectory loss'
+    model.zero_grad(set_to_none=True)
+    ss.backward()
+    cont_grad_ss = sum(float(p.grad.abs().sum())
+                       for n, p in model.dynamics.named_parameters()
+                       if p.grad is not None and 'cont' in n)
+    assert cont_grad_ss > 0.0, 'ss-match grad did NOT reach the cont-gain params!'
+    print(f'[ss] OK: finite, adds to traj loss, grad reaches cont-gain '
+          f'({cont_grad_ss:.4e})')
+
 
 if __name__ == '__main__':
     main()

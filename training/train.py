@@ -812,6 +812,19 @@ class TrainConfig:
     # is on AND isolated episodes exist.  ``DREAMER_WM_INPUT_ISOLATION_COEF``.
     wm_input_isolation_coef: float = 0.0
     wm_input_isolation_len: int = 0    # K-step prior rollout (auto = horizon)
+    # ---- Self-supervised STEADY-STATE (DC-gain) match (2026-08-03, p08 RCA) ----
+    # The isolation loss's per-step trajectory MSE is TRANSIENT-dominated, so it
+    # under-determines the DC (steady-state) gain → both WM gains SHRANK (p08:
+    # CV←MV ×0.86, CV←DV ×0.78).  This term matches the WM's SETTLED asymptote
+    # (MEAN over the terminal window of the prior roll) to the REAL settled CV —
+    # timing-INSENSITIVE, so it pins the DC gain WITHOUT the identified value
+    # (nonlinear / black-box safe, local per operating point).  It is the
+    # self-supervised generalisation of C(1) gain-match; fed by dedicated
+    # long-hold isolated SETTLE episodes.  Auto-enabled with isolation.
+    # ``DREAMER_WM_SS_MATCH_COEF``.
+    wm_ss_match_coef: float = 0.0
+    wm_ss_match_window_frac: float = 0.34   # terminal fraction of K used as the SS window
+    wm_isolation_settle_episodes: int = 0   # dedicated long-hold isolated settle eps (auto)
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -2709,6 +2722,7 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                           n_segments: Optional[int] = None,
                           op_band: float = 0.95,
                           n_strata: Optional[int] = None,
+                          long_hold: bool = False,
                           ) -> Dict[str, np.ndarray]:
     """Collect one episode that PRBS-toggles MV across the operating band.
 
@@ -2760,6 +2774,11 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # leaves the WM compounding-error blind.
     seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
     seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
+    if long_hold:                       # dedicated isolated SETTLE episode
+        _iso_len = int(getattr(cfg, 'wm_input_isolation_len', 0)
+                       or getattr(cfg, 'horizon', 15) or 15)
+        seg_max = min(max(seg_max, 2 * _iso_len), max(8, T // 4))
+        seg_min = seg_max               # uniform long holds → full steady state
     multi_timescale = (seg_min < seg_max)
     if multi_timescale:
         # Pre-roll segment lengths log-uniformly; expand episode in
@@ -3326,7 +3345,8 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
 
-def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig) -> List[Dict]:
+def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
+                            long_hold: bool = False) -> List[Dict]:
     """Full-range, multi-timescale, stratified DV-PRBS disturbance schedule.
 
     Schedule-construction core shared by the DV-PRBS SEED episodes
@@ -3360,6 +3380,11 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig) -> List[Dict]:
     seg_max = max(8, min(seg_max if seg_max > 0 else T // 12, T // 4))
     seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
     seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
+    if long_hold:                       # dedicated isolated SETTLE episode
+        _iso_len = int(getattr(cfg, 'wm_input_isolation_len', 0)
+                       or getattr(cfg, 'horizon', 15) or 15)
+        seg_max = min(max(seg_max, 2 * _iso_len), max(8, T // 4))
+        seg_min = seg_max
     # Pre-roll segment start times (log-uniform multi-timescale).
     seg_starts: List[int] = []
     t = 0
@@ -3422,6 +3447,7 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig) -> List[Dict]:
 
 def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                              mv_level: float = 0.0,
+                             long_hold: bool = False,
                              ) -> Dict[str, np.ndarray]:
     """DV-PRBS seed episode (2026-06-14): the DV analogue of
     ``collect_prbs_episode``.  Holds the MV at a (stratified) operating
@@ -3497,7 +3523,7 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # Full-range, multi-timescale, stratified DV-PRBS schedule (shared
     # builder; byte-identical excitation statistics to the R1a Stage-1
     # on-policy DV excitation in ``APCEnv.reset``).
-    env._schedule = _build_dv_prbs_schedule(env, cfg)
+    env._schedule = _build_dv_prbs_schedule(env, cfg, long_hold=long_hold)
 
     # ----- Run the episode (MV held, DV swept by the schedule) ----------
     obs_buf = np.zeros((T, D), dtype='float32')
@@ -4170,13 +4196,30 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
         z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
                              device=obs.device, dtype=f0.dtype),
         z=z0.clone(), c=(c0.clone() if c0 is not None else None))
+    # Self-supervised STEADY-STATE (DC-gain) match: accumulate the terminal
+    # settled window so we can match MEAN(pred) vs MEAN(real) — timing-insensitive
+    # → pins the DC gain the transient-dominated per-step MSE under-shoots.
+    ss_coef = float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0)
+    w_frac = float(getattr(cfg, 'wm_ss_match_window_frac', 0.34) or 0.34)
+    ss_k0 = K - max(1, int(round(min(max(w_frac, 0.05), 0.9) * K)))
     total = zero
+    ss_pred_sum = zero
+    ss_real_sum = zero
+    ss_n = 0
     for k in range(K):
         dvk = dv_all[:, k] if dv_all is not None else None
         st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
         cv_pred = rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
         total = total + (cv_pred - cv_real[:, k]).pow(2).mean()
-    return coef * (total / float(K))
+        if ss_coef > 0.0 and k >= ss_k0:
+            ss_pred_sum = ss_pred_sum + cv_pred
+            ss_real_sum = ss_real_sum + cv_real[:, k]
+            ss_n += 1
+    out = coef * (total / float(K))
+    if ss_coef > 0.0 and ss_n > 0:
+        ss = ((ss_pred_sum - ss_real_sum) / float(ss_n)).pow(2).mean()
+        out = out + coef * ss_coef * ss
+    return out
 
 
 def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
@@ -4262,7 +4305,12 @@ def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
             for j, cvn in enumerate(cv_names)))
     cfg.gain_match_mv_target = tuple(mv_target)
     cfg.gain_match_dv_target = tuple(dv_target)
-    if float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0:
+    # Respect an EXPLICIT disable (e.g. DREAMER_GAIN_MATCH_COEF=0 on a NONLINEAR
+    # plant, where a single identified gain is wrong → rely on the self-supervised
+    # wm_ss_match instead).  Only auto-enable when the coef was left at default.
+    _explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    if ('gain_match_coef' not in _explicit
+            and float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0):
         cfg.gain_match_coef = 1.0
     if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
         cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
@@ -6319,6 +6367,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 cfg.wm_input_isolation_coef = 0.5
             if int(getattr(cfg, 'wm_input_isolation_len', 0) or 0) <= 0:
                 cfg.wm_input_isolation_len = int(getattr(cfg, 'horizon', 15) or 15)
+            # p08 RCA: auto-enable the self-supervised steady-state (DC-gain)
+            # match + its long-hold isolated settle episodes so the WM gain is
+            # UNBIASED with NO identified value (nonlinear / black-box safe).
+            if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) <= 0.0:
+                cfg.wm_ss_match_coef = 0.5
+            if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
+                cfg.wm_isolation_settle_episodes = 4
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
                   f'gain_dim={cfg.cont_gain_dim} '
                   f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
@@ -7452,6 +7507,40 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"seg=[{int(getattr(cfg, 'prbs_seed_segment_steps_min', 0))}.."
               f"{int(getattr(cfg, 'prbs_seed_segment_steps', 0))}])",
               flush=True)
+
+    # ---------- Isolated STEADY-STATE (settle) seed episodes (p08 RCA) ----------
+    # Long-hold isolated excitation (one input held at a level for >=2*K steps so
+    # a full K-rollout window reaches steady state), all OTHER inputs held → feeds
+    # the self-supervised ``wm_ss_match`` DC-gain term.  The isolation loss's
+    # per-step MSE is transient-dominated; without settled content it under-shoots
+    # the DC gain (p08: WM gains ×0.86 / ×0.78).  MV-isolated (MV swept long, DV
+    # held) + DV-isolated (DV swept long, MV held) → unbiased gain, NO identified
+    # value (nonlinear / black-box safe, local per operating point).
+    n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
+    if isolation_buf is not None and n_settle > 0:
+        _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
+                                 dtype='float32')
+        _st_jit = env.rng.uniform(-0.05, 0.05,
+                                  size=_st_levels.shape).astype('float32')
+        _st_levels = np.clip(_st_levels + _st_jit * const_op_band, -1.0, 1.0)
+        _n_mv_settle = 0
+        _n_dv_settle = 0
+        for _lvl in _st_levels:          # MV-isolated settle (MV swept long, DV held)
+            ep = collect_prbs_episode(env, cfg, action_std=baseline_seed_std,
+                                      op_band=prbs_op_band, long_hold=True)
+            isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
+            total_env_steps += cfg.episode_length
+            _n_mv_settle += 1
+        if n_dv > 0:
+            for _lvl in _st_levels:      # DV-isolated settle (DV swept long, MV held)
+                ep = collect_dv_prbs_episode(env, cfg, mv_level=float(_lvl),
+                                             long_hold=True)
+                isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
+                                          ep['cont'])
+                total_env_steps += cfg.episode_length
+                _n_dv_settle += 1
+        print(f"[seed] isolated-settle MV={_n_mv_settle} DV={_n_dv_settle} "
+              f"(long-hold ≥2·K → feeds wm_ss_match DC-gain term)", flush=True)
 
     # ---------- APC expert seed episodes (P81 design, 2026-06-03) ----------
     # Build the steady-state expert (static gain-schedule or NN surrogate),

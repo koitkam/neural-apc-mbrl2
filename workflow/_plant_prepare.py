@@ -502,6 +502,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_LEN':             ('gain_match_len',                 int),
     'DREAMER_GAIN_MATCH_MAX_STARTS':      ('gain_match_max_starts',          int),
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
+    # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
+    # per-input isolation trajectory match + the steady-state DC-gain match (the
+    # nonlinear / black-box unbiased-gain path; no identified value needed).
+    'DREAMER_WM_INPUT_ISOLATION_COEF':    ('wm_input_isolation_coef',        float),
+    'DREAMER_WM_INPUT_ISOLATION_LEN':     ('wm_input_isolation_len',         int),
+    'DREAMER_WM_SS_MATCH_COEF':           ('wm_ss_match_coef',               float),
+    'DREAMER_WM_ISOLATION_SETTLE_EPISODES': ('wm_isolation_settle_episodes', int),
     # Fix B: performance-aware entropy-collapse early-stop gate (only trip when
     # the policy is also degenerate: low imag_adv_action_corr).
     'DREAMER_EARLY_STOP_ENT_COLLAPSE_MIN_ADV_CORR': ('early_stop_entropy_collapse_min_adv_corr', float),

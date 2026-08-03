@@ -207,6 +207,7 @@ if __name__ == '__main__':
     import sys
     sims = [
         ('test_sim', 'simulation/test_sim/control_setup.json'),
+        ('nonlinear_sim', 'simulation/nonlinear_sim/control_setup.json'),
         ('generic', 'simulation/generic/control_setup.json'),
         ('distillation', 'simulation/distillation/control_setup.json'),
         ('softsensor_lab', 'simulation/softsensor_lab/control_setup.json'),

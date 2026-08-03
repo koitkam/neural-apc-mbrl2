@@ -1,0 +1,39 @@
+{
+    "model": "nonlinear_heat_exchanger_single_loop",
+    "description": "Objective for a NONLINEAR steam-heated exchanger: hold outlet temperature in spec while minimizing steam-valve opening (energy). The equal-percentage valve makes dCV/dMV vary ~2.5x across the operating band, so the WM must learn the LOCAL gain (a single identified gain is wrong). Violation/move weights auto-derived from cv_priority + identified dynamics. HIGH-side temperature limit 2.5x more urgent than LOW-side via cv_side_scale.",
+    "objective_use_normalized": 1,
+    "bounds": {
+        "mvs": {
+            "mv_0": [
+                20.0,
+                80.0
+            ]
+        },
+        "outputs": {
+            "cv_0": [
+                80.0,
+                90.0
+            ]
+        }
+    },
+    "cv_priority": [
+        "cv_0"
+    ],
+    "cv_side_scale": {
+        "cv_0": {
+            "lo": 0.4,
+            "hi": 1.0
+        }
+    },
+    "weights": {
+        "mv_economic": {
+            "mv_0": 5.0
+        },
+        "cv_economic": {
+            "cv_0": 0.0
+        }
+    },
+    "runtime_setpoints": {
+        "targets_enabled": [false]
+    }
+}

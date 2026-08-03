@@ -1,0 +1,14 @@
+{
+    "simulator": {
+        "module": "simulation.nonlinear_sim.nonlinear_sim",
+        "class": "HeatExchangerTower",
+        "kwargs": {}
+    },
+    "noise_and_randomization": {
+        "_comment": "Mirrors test_sim: wrapper-level DR stacks on top of HeatExchangerTower._sample_episode_dynamics (which randomizes tau/heat_gain/rangeability/dead by +/-10%). These knobs add output gain/bias drift, input jitter, and DV mean shift on the outside of the plant. Each value is a magnitude; the randomizer draws per-episode within +/- value. Disable via DREAMER_DOMAIN_RANDOMIZATION=0 or SIM_DOMAIN_RANDOMIZATION=0.",
+        "output_gain_pct":   0.08,
+        "output_bias_pct":   0.02,
+        "input_jitter_pct":  0.005,
+        "dv_mean_shift_pct": 0.05
+    }
+}
