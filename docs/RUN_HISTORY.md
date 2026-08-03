@@ -1191,6 +1191,34 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   holds ~0.99; (DOB) raw r positive + drift down. If it still oscillates but less → escalate MC-grounding further or add
   a REINFORCE-variance lever (fresher on-policy data / lower `lr_actor`).
 
+### p08 — VERDICT: MC-grounding is a BIG win (first all-gates-pass), but isolation-only REGRESSED the WM gains
+- **The MC-grounding 2.0 fix worked well.** Val `critic_r` **0.204 → 0.733**, `wm_next_state_r` **0.447 → 0.721**, and
+  p08 is the **FIRST run where ALL fidelity gates pass** (`critic_pass`, `wm_pass`, `wm_gain_pass`, `reward_pass`). No more
+  hard bang-bang; `mv_violation` mean 230 → 112.
+- **But two residual symptoms (user-reported): a WM bias and "the MV is noisy sometimes."** Both trace to ONE root cause.
+- **WM bias:** the transfer matrix shows BOTH steady-state gains **under-estimated** — CV←MV real −0.32 wm −0.275 (**×0.86**,
+  was 0.99 in p07) and CV←DV real +0.18 wm +0.141 (**×0.78**, was 0.888). Disabling `gain_match` (the isolation-only
+  experiment) **regressed** both gains: `_wm_input_isolation_loss` enforces input *separation* but does not pin gain
+  *magnitude*, so the cont GAIN block under-shoots.
+- **MV noise (intermittent, condition-dependent):** per-episode `mv_violation` = [159, **21.6**, **425**]; seed box-plots
+  smooth for s3/s5 (~40-58) but noisy for s6 (~240). Mechanism = the WM gain bias: under-est **MV gain (0.86)** → the actor
+  believes its authority is weak → **over-actuates** (noisy MV, mv_viol ≫ baseline 0); under-est **DV gain (0.78)** →
+  mis-predicts disturbance effects → **mis-reacts during disturbances** → the noise is condition/seed-dependent. As the
+  curriculum ramps disturbances through P3 the mis-reaction worsens → `realsim_return` spirals (−2 → −216), `return_scale`
+  → cap 49.5, best is **early** (iter 161) then degrades. Agent is still worse than the baseline (cum_raw −417k vs ~−130k).
+
+### p09 — fix: re-enable `gain_match` (pin the WM gain magnitude the isolation loss can't)
+- **Re-enable the identified-gain anchor ALONGSIDE isolation** (the intended MIMO design). `gain_match` pins magnitude
+  (linear/identifiable plants — test_sim's identified gains −0.32/+0.18 exactly match the transfer-matrix truth), isolation
+  keeps the MIMO structure + nonlinear generality. Removed the forced `gain_match_coef=0`; wired
+  `_resolve_gain_match_targets(env, cfg)` just before the training loop (obs-norm fitted by then), guarded so a missing
+  `dynamics_identification.json` falls back to isolation-only. Fixes BOTH symptoms via the shared root cause: correct WM
+  gains → the actor no longer over-actuates (MV gain) or mis-reacts to disturbances (DV gain).
+- **Judge by**: (WM) transfer matrix CV←MV → ~1.0×, CV←DV → ~0.95×+ (both were 0.86/0.78); `wm_gain_rel_err` ≪ 0.14;
+  watch for the `[gain-match] targets …` banner in the log (confirms the anchor is active, not the fallback). (Actor) MV
+  **smooth across all seeds** (not just some), `mv_violation` ≪ 112, agent beats the baseline, `realsim_return` doesn't
+  spiral. If the WM is now correct but the actor still degrades late → that's an independent actor-stability issue for p10.
+
 
 
 
