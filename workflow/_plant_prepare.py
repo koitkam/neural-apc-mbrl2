@@ -509,6 +509,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_INPUT_ISOLATION_LEN':     ('wm_input_isolation_len',         int),
     'DREAMER_WM_SS_MATCH_COEF':           ('wm_ss_match_coef',               float),
     'DREAMER_WM_ISOLATION_SETTLE_EPISODES': ('wm_isolation_settle_episodes', int),
+    # p09 RCA: tight SEPARATE actor grad clip (the tanh-squashed REINFORCE actor
+    # explodes in P3; the shared grad_clip=100 is too loose for it).
+    'DREAMER_ACTOR_GRAD_CLIP':            ('actor_grad_clip',                float),
     # Fix B: performance-aware entropy-collapse early-stop gate (only trip when
     # the policy is also degenerate: low imag_adv_action_corr).
     'DREAMER_EARLY_STOP_ENT_COLLAPSE_MIN_ADV_CORR': ('early_stop_entropy_collapse_min_adv_corr', float),

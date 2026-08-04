@@ -248,6 +248,13 @@ class TrainConfig:
     grad_clip: float = 100.0  # DreamerV3 default; was 1000 (too loose,
                               # let the actor explode at the BC→PMPO
                               # transition).
+    # p09 RCA (2026-08-04): the tanh-squashed REINFORCE actor's logp gradient
+    # EXPLODES in P3 (grad_norm 100→600, actor_loss ±600, return crashes
+    # −400→−2300) when μ is driven to the action rails (MV over-actuation).  The
+    # shared grad_clip=100 is far too loose for it (the WM/critic are fine at
+    # 100).  A tight SEPARATE actor clip restores the DreamerV3-intended O(1)
+    # actor step and stops the thrash.  ``DREAMER_ACTOR_GRAD_CLIP``.
+    actor_grad_clip: float = 3.0
 
     # ----- Loss weights -----
     # recon_scale: Phase-1 tokenizer reconstruction weight on **z-scored**
@@ -1079,7 +1086,10 @@ class TrainConfig:
     # sweep amplitude (|offset| ≤ op_frac·span/2).  0.6 = sweep ~60% of the
     # range each side of baseline: large enough that Var(DV) ≫ Var(noise)
     # (kills regression dilution) yet safely inside the channel bounds.
-    dv_prbs_op_frac: float = 0.6
+    # p09 RCA (2026-08-04): 0.6→0.8 — the DV gain stayed under-estimated
+    # (≈0.79–0.84) vs the well-excited MV; a larger sweep raises Var(DV) further
+    # (less errors-in-variables dilution) + covers more nonlinear operating points.
+    dv_prbs_op_frac: float = 0.8
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -6373,7 +6383,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) <= 0.0:
                 cfg.wm_ss_match_coef = 0.5
             if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
-                cfg.wm_isolation_settle_episodes = 4
+                cfg.wm_isolation_settle_episodes = 8  # p09: 4→8 (DV still under)
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
                   f'gain_dim={cfg.cont_gain_dim} '
                   f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
@@ -8589,7 +8599,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     model.parameters_world(), cfg.grad_clip)
                 if current_phase == 2:
                     actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters_actor(), cfg.grad_clip)
+                        model.parameters_actor(), cfg.actor_grad_clip)
                 if not torch.isfinite(wm_grad_norm):
                     n_grad_skip += 1
                     opt_world.zero_grad(set_to_none=True)
@@ -8653,7 +8663,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 (_actor_loss
                  + ac_losses['critic_loss']).backward()
                 actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters_actor(), cfg.grad_clip)
+                    model.parameters_actor(), cfg.actor_grad_clip)
                 critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters_critic(), cfg.grad_clip)
                 if (not torch.isfinite(actor_grad_norm)
