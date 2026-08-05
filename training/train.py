@@ -138,7 +138,7 @@ class TrainConfig:
     # collapse, keeps entropy above the trip, and keeps on-policy exploration
     # alive so the (warmup-healthy) critic keeps getting diverse states to guide
     # μ.  Deterministic EVAL uses μ, so the wider training σ is exploration-only.
-    sigma_min_ratio: float = 1.6      # σ_min = σ_max / sigma_min_ratio
+    sigma_min_ratio: float = 1.2      # σ_min = σ_max / sigma_min_ratio (p10 RCA: 1.6→1.2, raise σ floor)
     # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
     # ``auto_initialize_hyperparams`` as ``η = η_v3 × σ_max / σ_v3_ref``
     # (V3 paper default 3e-4 anchored at σ=1.0). Recovers V3 exactly
@@ -248,13 +248,14 @@ class TrainConfig:
     grad_clip: float = 100.0  # DreamerV3 default; was 1000 (too loose,
                               # let the actor explode at the BC→PMPO
                               # transition).
-    # p09 RCA (2026-08-04): the tanh-squashed REINFORCE actor's logp gradient
-    # EXPLODES in P3 (grad_norm 100→600, actor_loss ±600, return crashes
-    # −400→−2300) when μ is driven to the action rails (MV over-actuation).  The
-    # shared grad_clip=100 is far too loose for it (the WM/critic are fine at
-    # 100).  A tight SEPARATE actor clip restores the DreamerV3-intended O(1)
-    # actor step and stops the thrash.  ``DREAMER_ACTOR_GRAD_CLIP``.
-    actor_grad_clip: float = 3.0
+    # p09/p10 RCA: the actor's logp gradient ∂logp/∂μ = (u−μ)/σ² EXPLODES in P3
+    # because σ COLLAPSES (small σ² denom) while taken actions sit near the tanh
+    # rails (large u−μ) → thrash + return crash.  p10's tight clip=3 capped the
+    # STEP but not the direction (and over-suppressed the log_std grad → worse
+    # collapse).  The real fixes are the σ FLOOR (sigma_min_ratio↓) + the μ CAP
+    # (policy cap 8→3); this SEPARATE clip is now just a loose safety net.
+    # ``DREAMER_ACTOR_GRAD_CLIP``.
+    actor_grad_clip: float = 10.0
 
     # ----- Loss weights -----
     # recon_scale: Phase-1 tokenizer reconstruction weight on **z-scored**
@@ -287,6 +288,17 @@ class TrainConfig:
     # Default 4.0 = p117 curriculum-recipe (promoted 2026-06-14; was 1.0).
     wm_recon_cv_weight: float = 4.0
     cv_obs_indices: Tuple[int, ...] = ()
+    # p10 RCA: DV recon weight — 0.0 makes the measured DV INPUT-ONLY (fed to the
+    # WM transition like the action, never a recon target).  Symmetric with the
+    # MV; drops the trivial dv-feedforward→dv identity recon that competed for
+    # latent capacity.  Uses cfg.dv_indices.  ``DREAMER_WM_RECON_DV_WEIGHT``.
+    wm_recon_dv_weight: float = 0.0
+    # p10 RCA: low-pass the measured DV before the WM/obs-norm see it.  The DV is
+    # a NOISY measurement (meas + OU) vs the MV's clean command → errors-in-
+    # variables dilutes the learned DV gain (persists despite excitation).  EMA τ
+    # in WM-samples: 0 = auto (tau_dom/sr/4, clip[2,12]); <0 = OFF.  Applied in
+    # _build_obs_vec (train + deploy consistent).  ``DREAMER_DV_LOWPASS_TAU``.
+    dv_lowpass_tau: float = 0.0
     sf_scale: float = 1.0
     # P2+P3 reward-MTP loss weight (Dreamer-V4 paper Eq. 9).  Lowered
     # 1.0 → 0.3 on 2026-05-23 (P43 RCA, run_20260523_p43_data_fixed):
@@ -1975,9 +1987,46 @@ class APCEnv:
         # Guard against pathological values (numerical edge cases).
         return np.clip(out.astype('float32'), -10.0, 10.0)
 
+    def _dv_lowpass_alpha(self) -> float:
+        """EMA coefficient for the measured-DV low-pass (0 = OFF).  Auto-derived
+        once from the plant τ (tau_dom/sr/4, clip [2,12] samples)."""
+        a = getattr(self, '_dv_lp_alpha_cached', -1.0)
+        if a >= 0.0:
+            return a
+        tau_cfg = float(getattr(self.cfg, 'dv_lowpass_tau', 0.0) or 0.0)
+        if tau_cfg < 0.0 or not self.dv_indices:
+            self._dv_lp_alpha_cached = 0.0
+            return 0.0
+        if tau_cfg > 0.0:
+            tau_f = tau_cfg
+        else:
+            tau_plant, _ = self._resolve_plant_timing()
+            sr = max(1.0, float(getattr(self.cfg, 'sample_rate', 1) or 1))
+            tau_samples = (tau_plant / sr) if tau_plant > 0 else 12.0
+            tau_f = float(np.clip(tau_samples / 4.0, 2.0, 12.0))
+        a = float(1.0 - np.exp(-1.0 / max(tau_f, 1e-6)))
+        self._dv_lp_alpha_cached = a
+        print(f'[dv-lowpass] EMA τ={tau_f:.1f} samples (α={a:.3f}) on DV obs '
+              f'{list(self.dv_indices)} — denoise the measured DV for the WM '
+              f'(errors-in-variables fix).', flush=True)
+        return a
+
     def _build_obs_vec(self, state: np.ndarray) -> np.ndarray:
+        state = np.asarray(state, dtype='float32').reshape(-1)
+        # p10 RCA: low-pass the measured DV (per-channel EMA, reset per episode,
+        # unity DC gain) so the WM regresses on a CLEAN DV — the MV is a clean
+        # command, the DV a noisy measurement (errors-in-variables → gain dilution).
+        _a = self._dv_lowpass_alpha()
+        if _a > 0.0:
+            state = state.copy()
+            st = getattr(self, '_dv_lp_state', None) or {}
+            for _j in self.dv_indices:
+                _v = float(state[_j])
+                st[_j] = _v if _j not in st else (_a * _v + (1.0 - _a) * st[_j])
+                state[_j] = st[_j]
+            self._dv_lp_state = st
         aug = self.setpoint_mgr.get_augmented_obs_channels()
-        parts = [np.asarray(state, dtype='float32').reshape(-1),
+        parts = [state,
                  np.asarray(aug, dtype='float32').reshape(-1)]
         if self._derived_features is not None:
             # Update with the current CV slice + current CV setpoints,
@@ -2083,6 +2132,7 @@ class APCEnv:
         self._prev_mv_violation_per_channel = None
         self._prev_cv_violation_per_channel = None
         self._integral_cv = np.zeros_like(self._integral_cv)
+        self._dv_lp_state = None          # reset the measured-DV low-pass per episode
         self._last_cv_violation_sum = 0.0
         self._last_mv_violation_sum = 0.0
         self._prev_potential = None
@@ -4015,14 +4065,19 @@ def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
     """
     cv_w = float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0)
     cv_idx = tuple(getattr(cfg, 'cv_obs_indices', ()) or ())
-    if cv_w == 1.0 or not cv_idx:
+    dv_w = float(getattr(cfg, 'wm_recon_dv_weight', 1.0))
+    dv_idx = tuple(getattr(cfg, 'dv_indices', ()) or ())
+    dv_active = (dv_w != 1.0 and len(dv_idx) > 0)
+    if (cv_w == 1.0 or not cv_idx) and not dv_active:
         return F.mse_loss(recon, target)
     D = int(target.shape[-1])
-    valid = [int(i) for i in cv_idx if 0 <= int(i) < D]
-    if not valid:
-        return F.mse_loss(recon, target)
     w = torch.ones(D, device=target.device, dtype=torch.float32)
-    w[torch.tensor(valid, device=target.device, dtype=torch.long)] = cv_w
+    valid_cv = [int(i) for i in cv_idx if 0 <= int(i) < D]
+    if cv_w != 1.0 and valid_cv:
+        w[torch.tensor(valid_cv, device=target.device, dtype=torch.long)] = cv_w
+    valid_dv = [int(i) for i in dv_idx if 0 <= int(i) < D]
+    if dv_active and valid_dv:
+        w[torch.tensor(valid_dv, device=target.device, dtype=torch.long)] = dv_w
     w = w * (float(w.numel()) / w.sum().clamp_min(1e-8))  # renorm: mean→1.0
     se = (recon.float() - target.float()).pow(2)           # (..., D)
     return (se * w).mean()

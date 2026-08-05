@@ -509,6 +509,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_INPUT_ISOLATION_LEN':     ('wm_input_isolation_len',         int),
     'DREAMER_WM_SS_MATCH_COEF':           ('wm_ss_match_coef',               float),
     'DREAMER_WM_ISOLATION_SETTLE_EPISODES': ('wm_isolation_settle_episodes', int),
+    # p10 RCA: treat the DV like a clean input — low-pass the noisy measured DV
+    # into the WM (errors-in-variables gain fix) + make it input-only (no recon).
+    'DREAMER_DV_LOWPASS_TAU':             ('dv_lowpass_tau',                 float),
+    'DREAMER_WM_RECON_DV_WEIGHT':         ('wm_recon_dv_weight',             float),
     # p09 RCA: tight SEPARATE actor grad clip (the tanh-squashed REINFORCE actor
     # explodes in P3; the shared grad_clip=100 is too loose for it).
     'DREAMER_ACTOR_GRAD_CLIP':            ('actor_grad_clip',                float),

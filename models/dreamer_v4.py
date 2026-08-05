@@ -1030,7 +1030,10 @@ class ContinuousPolicyHead(nn.Module):
         # ``mu`` here would clip the deterministic action range.  We do
         # however soft-cap ``mu`` to keep gradients well-behaved when the
         # head is overconfident — same idea as the dynamics ``soft_cap``.
-        cap = 8.0
+        # p10 RCA: 8.0→3.0.  tanh(8)≈1.0 let μ drive the action to the exact
+        # rails, where the tanh-Jacobian makes logp (and its μ-gradient) EXPLODE
+        # → actor thrash.  tanh(3)=0.995 keeps ~full authority but bounds logp.
+        cap = 3.0
         mu = cap * torch.tanh(out[..., 0] / cap)                  # (B,L,A)
         log_std = out[..., 1] + self.log_std_init.view(1, 1, -1)
         log_std = log_std.clamp(self.log_std_min, self.log_std_max)
