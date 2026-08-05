@@ -1666,6 +1666,10 @@ class APCEnv:
         self.action_dim = int(self.meta['action_dim'])
         self.state_dim = int(self.meta['state_dim'] or 0)
         self.cv_indices = list(self.meta['cv_indices'])
+        # Measured-DV obs indices (state-space; lead the obs vector).  Used by
+        # the measured-DV low-pass in _build_obs_vec.  Empty for 0-DV sims.
+        self.dv_indices = [int(x) for x in (self.meta.get('dv_indices') or [])
+                           if x is not None]
         self.mv_norm_ranges = list(self.meta['mv_normalization_ranges'])
         self.cv_norm_ranges = list(self.meta['cv_normalization_ranges'])
 
