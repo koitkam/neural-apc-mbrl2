@@ -513,6 +513,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # into the WM (errors-in-variables gain fix) + make it input-only (no recon).
     'DREAMER_DV_LOWPASS_TAU':             ('dv_lowpass_tau',                 float),
     'DREAMER_WM_RECON_DV_WEIGHT':         ('wm_recon_dv_weight',             float),
+    # p11 RCA: DCS-style output VELOCITY (rate) limit on the applied MV command —
+    # a physical actuator/DCS CONSTRAINT (not a reward move-penalty) that kills
+    # the degenerate full-range bang-bang the objective otherwise rewards.
+    'DREAMER_MV_RATE_LIMIT':              ('mv_rate_limit',                  float),
     # p09 RCA: tight SEPARATE actor grad clip (the tanh-squashed REINFORCE actor
     # explodes in P3; the shared grad_clip=100 is too loose for it).
     'DREAMER_ACTOR_GRAD_CLIP':            ('actor_grad_clip',                float),

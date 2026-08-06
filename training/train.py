@@ -299,6 +299,14 @@ class TrainConfig:
     # in WM-samples: 0 = auto (tau_dom/sr/4, clip[2,12]); <0 = OFF.  Applied in
     # _build_obs_vec (train + deploy consistent).  ``DREAMER_DV_LOWPASS_TAU``.
     dv_lowpass_tau: float = 0.0
+    # p11 RCA: the actor learns a full-range BANG-BANG (mv_reversal≈1.0) — the
+    # objective rewards CV control at low mean-MV cost and NOTHING penalises
+    # high-frequency movement.  DCS-style output VELOCITY limit on the applied MV
+    # command: a realistic actuator/DCS CONSTRAINT (not a reward move-penalty)
+    # that makes bang-bang physically impossible → forces smooth control.
+    # Normalized [-1,1] units/step; 0 = auto (2.5/tau_samples clip [0.05,0.4]);
+    # <0 = OFF.  ``DREAMER_MV_RATE_LIMIT``.
+    mv_rate_limit: float = 0.0
     sf_scale: float = 1.0
     # P2+P3 reward-MTP loss weight (Dreamer-V4 paper Eq. 9).  Lowered
     # 1.0 → 0.3 on 2026-05-23 (P43 RCA, run_20260523_p43_data_fixed):
@@ -1991,6 +1999,29 @@ class APCEnv:
         # Guard against pathological values (numerical edge cases).
         return np.clip(out.astype('float32'), -10.0, 10.0)
 
+    def _mv_rate_limit(self) -> float:
+        """DCS output-velocity limit (normalized action units/step; 0 = OFF).
+        Auto = 2.5/tau_samples clip [0.05, 0.4]."""
+        r = getattr(self, '_mv_rl_cached', -1.0)
+        if r >= 0.0:
+            return r
+        rl_cfg = float(getattr(self.cfg, 'mv_rate_limit', 0.0) or 0.0)
+        if rl_cfg < 0.0:
+            self._mv_rl_cached = 0.0
+            return 0.0
+        if rl_cfg > 0.0:
+            r = rl_cfg
+        else:
+            tau_plant, _ = self._resolve_plant_timing()
+            sr = max(1.0, float(getattr(self.cfg, 'sample_rate', 1) or 1))
+            tau_samples = (tau_plant / sr) if tau_plant > 0 else 12.0
+            r = float(np.clip(2.5 / max(tau_samples, 1.0), 0.05, 0.4))
+        self._mv_rl_cached = r
+        print(f'[mv-rate-limit] {r:.3f} normalized units/step (DCS output '
+              f'velocity limit) — prevents bang-bang, forces smooth control.',
+              flush=True)
+        return r
+
     def _dv_lowpass_alpha(self) -> float:
         """EMA coefficient for the measured-DV low-pass (0 = OFF).  Auto-derived
         once from the plant τ (tau_dom/sr/4, clip [2,12] samples)."""
@@ -2137,6 +2168,7 @@ class APCEnv:
         self._prev_cv_violation_per_channel = None
         self._integral_cv = np.zeros_like(self._integral_cv)
         self._dv_lp_state = None          # reset the measured-DV low-pass per episode
+        self._prev_cmd_norm = None        # reset the MV rate-limit state per episode
         self._last_cv_violation_sum = 0.0
         self._last_mv_violation_sum = 0.0
         self._prev_potential = None
@@ -2332,7 +2364,18 @@ class APCEnv:
 
     def step(self, action_norm: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         action_norm = np.asarray(action_norm, dtype='float32').reshape(self.action_dim)
-        action_01 = 0.5 * (np.clip(action_norm, -1.0, 1.0) + 1.0)
+        action_norm = np.clip(action_norm, -1.0, 1.0)
+        # p11 RCA: DCS-style output VELOCITY limit — the applied MV command can't
+        # slew faster than mv_rate_limit/step (a real actuator/DCS constraint, NOT
+        # a reward move-penalty).  Kills the degenerate full-range bang-bang.
+        _rl = self._mv_rate_limit()
+        if _rl > 0.0:
+            _pc = getattr(self, '_prev_cmd_norm', None)
+            if _pc is None:
+                _pc = action_norm.copy()
+            action_norm = np.clip(action_norm, _pc - _rl, _pc + _rl).astype('float32')
+        self._prev_cmd_norm = action_norm.copy()
+        action_01 = 0.5 * (action_norm + 1.0)
         control = action_to_control(action_01, self.bounds, self.setpoint_mgr)
         self.setpoint_mgr.step(self._t)
         # P86 MV hard-clamp: DCS-style RUNTIME SAFETY limiter only.  Default

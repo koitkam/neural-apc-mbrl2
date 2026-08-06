@@ -2007,10 +2007,41 @@ def run_validation(*,
                 'reward_pass': bool(rw_r0 >= 0.3),
                 'critic_pass': bool(critic_r >= 0.3),
             }
+            # p11 RCA: CONTROL-QUALITY gates.  Every gate above is INTERNAL
+            # WM/critic fidelity — they PASS even when the actor learns a
+            # degenerate full-range BANG-BANG (mv_reversal≈1.0) that keeps the
+            # CV in band only because the actuator lag averages the fast square
+            # wave, at huge move cost.  Without these two gates such a policy
+            # (which is WORSE than the open-loop baseline) falsely PASSES
+            # validation.  smooth_pass flags the oscillation directly;
+            # beats_baseline_pass flags any policy no better than doing nothing.
+            try:
+                _dr = locals().get('disturbance_records') or []
+                _rev = [float((r.get('episode_metrics_agent') or {}).get(
+                    'mv_reversal_rate', 0.0)) for r in _dr]
+                _ae = [float((r.get('episode_metrics_agent') or {}).get(
+                    'economic_score', 0.0)) for r in _dr]
+                _be = [float((r.get('episode_metrics_baseline') or {}).get(
+                    'economic_score', 0.0)) for r in _dr]
+                rev_mean = float(np.mean(_rev)) if _rev else 0.0
+                agent_econ = float(np.mean(_ae)) if _ae else 0.0
+                base_econ = float(np.mean(_be)) if _be else 0.0
+                fidelity_gates['mv_reversal_rate_max'] = 0.5
+                fidelity_gates['mv_reversal_rate_observed'] = rev_mean
+                fidelity_gates['agent_economic_score'] = agent_econ
+                fidelity_gates['baseline_economic_score'] = base_econ
+                fidelity_gates['smooth_pass'] = bool(rev_mean <= 0.5)
+                fidelity_gates['beats_baseline_pass'] = bool(agent_econ >= base_econ)
+            except Exception as _cge:
+                fidelity_gates['smooth_pass'] = True
+                fidelity_gates['beats_baseline_pass'] = True
+                fidelity_gates['control_gate_error'] = repr(_cge)
             fidelity_gates['all_pass'] = bool(
                 fidelity_gates['wm_pass']
                 and fidelity_gates['reward_pass']
                 and fidelity_gates['critic_pass']
+                and fidelity_gates['smooth_pass']
+                and fidelity_gates['beats_baseline_pass']
             )
             diag['fidelity_gates'] = fidelity_gates
             if not fidelity_gates['all_pass']:
@@ -2024,10 +2055,22 @@ def run_validation(*,
                 if not fidelity_gates['critic_pass']:
                     print(f'        - critic V vs MC r={critic_r:+.3f} < 0.3'
                           ' (value head uncorrelated with returns)', flush=True)
+                if not fidelity_gates.get('smooth_pass', True):
+                    print(f'        - mv_reversal_rate='
+                          f'{fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f}'
+                          ' > 0.5 (BANG-BANG: MV reverses direction most steps)',
+                          flush=True)
+                if not fidelity_gates.get('beats_baseline_pass', True):
+                    print(f'        - agent economic_score='
+                          f'{fidelity_gates.get("agent_economic_score", 0.0):+.4f}'
+                          f' < baseline={fidelity_gates.get("baseline_economic_score", 0.0):+.4f}'
+                          ' (policy WORSE than open-loop baseline)', flush=True)
             else:
                 print(f'[val] internal-fidelity gates PASSED '
                       f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '
-                      f'critic_r={critic_r:+.3f})', flush=True)
+                      f'critic_r={critic_r:+.3f} '
+                      f'mv_rev={fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f})',
+                      flush=True)
         except Exception as _ge:
             print(f'[val] fidelity-gate computation skipped: {_ge!r}',
                   flush=True)
