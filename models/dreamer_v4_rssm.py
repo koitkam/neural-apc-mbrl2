@@ -156,15 +156,6 @@ class RSSMConfig:
     # GAIN block stays sampled (gain-uncertainty exploration).  No-op when
     # sample=False (gain-match / probes already use the mean) or no dist block.
     cont_dist_deterministic_roll: bool = True
-    # Static DV→obs feedthrough skip (p132).  DEFAULT OFF (2026-06-29, p140 RCA):
-    # a memoryless ``W·dv_t`` added to the decoded obs gives a PHYSICALLY-WRONG
-    # instant t=0 jump (DV→CV has dead-time, not feedthrough) AND acts as a
-    # CRUTCH — gain_match measures the full decode (decoder([h,z,c]) + skip), so
-    # the skip lets gain_match be satisfied with a WEAK dynamic path (slow DV
-    # rise).  The cont GAIN block + gain_match (p134+) are the principled DYNAMIC
-    # gain mechanism that SUPERSEDES it.  Retained as an ablation lever only;
-    # True restores the p132 static skip.
-    dv_static_skip: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -368,27 +359,6 @@ class RSSMDynamics(nn.Module):
         self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim + self.cont_dim
                             + self._dv_decode_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
-        # Direct DV→obs FEEDFORWARD SKIP (2026-06-20, p132 RCA).  The measured
-        # DV is a single channel concatenated into the ~1500-d decoder MLP input
-        # — its gradient is diluted ~1/1500, so the decoder under-uses it and the
-        # DV→CV gain still dies in the autoencoder (p132 DV real→post 0.67 < MV
-        # 0.84, i.e. the "direct" dv-feedforward is NOT actually direct).  This
-        # linear skip gives the exogenous DV a CLEAN, high-gradient path straight
-        # to the reconstructed obs (g(h,z,dv) + W·dv), bypassing BOTH the dilution
-        # AND the categorical bottleneck — exactly the role dv-feedforward was
-        # meant to play.  ZERO-INIT ⇒ starts as an exact no-op (byte-identical to
-        # the pre-skip decode) and learns the clean ∂CV/∂dv from the residual.
-        # DEFAULT OFF (2026-06-29, p140 RCA): the memoryless W·dv_t is a physically
-        # wrong instant feedthrough AND a gain_match crutch (lets the dynamic DV
-        # path stay weak); the cont GAIN block + gain_match supersede it.  Gated
-        # behind ``dv_static_skip`` as an ablation lever.
-        self.dv_static_skip = bool(getattr(cfg, 'dv_static_skip', False))
-        self.dv_skip = (nn.Linear(self._dv_feed_dim, self.obs_dim)
-                        if (self._dv_feed_dim > 0 and self.dv_static_skip)
-                        else None)
-        if self.dv_skip is not None:
-            nn.init.zeros_(self.dv_skip.weight)
-            nn.init.zeros_(self.dv_skip.bias)
         # Recurrent dynamics: pre-GRU projection then GRUCell.
         self.pre_gru = _MLP(trans_in, trans_in,
                             hidden_dim=self.hidden_dim, num_layers=1)
@@ -790,10 +760,6 @@ class RSSMDynamics(nn.Module):
         # are both off, ``feat`` is already core-width so this is a no-op slice.
         x = feat[..., :self._decode_in_dim]
         out = self.decoder(x)
-        if self.dv_skip is not None:
-            core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
-            dv = feat[..., core:core + self._dv_feed_dim]
-            out = out + self.dv_skip(dv)
         return out
 
 

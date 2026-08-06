@@ -5,16 +5,12 @@
        MEAN (no per-rollout sampling noise = clean feedforward) while the GAIN
        block stays STOCHASTIC.  With ``cont_dist_deterministic_roll=False`` the
        disturbance block varies again (the flag genuinely gates it).
-
-  R3 — the static DV->obs feedthrough skip is REMOVED by default
-       (``dv_static_skip=False`` => ``dynamics.dv_skip is None``) and restored
-       only as an ablation lever (``dv_static_skip=True`` => module present).
 """
 import torch
 from training.train import TrainConfig, build_model
 
 
-def _build(wm_type, *, det_roll=True, dv=False, dv_static_skip=False):
+def _build(wm_type, *, det_roll=True, dv=False):
     torch.manual_seed(0)
     cfg = TrainConfig()
     cfg.obs_dim = 6
@@ -38,7 +34,6 @@ def _build(wm_type, *, det_roll=True, dv=False, dv_static_skip=False):
     cfg.cont_dist_dim = 1                  # n_cv = 1
     cfg.cv_obs_indices = (0,)
     cfg.cont_dist_deterministic_roll = det_roll
-    cfg.dv_static_skip = dv_static_skip
     if dv:
         cfg.dv_as_input = True
         cfg.dv_feedforward = True
@@ -89,18 +84,8 @@ def run(wm_type):
     print('[smoke] OK  R1 det_roll=False -> disturbance block stochastic again '
           '(flag gates it)')
 
-    # R3: dv_skip removed by default; present only when re-enabled.
-    _, m_nodv = _build(wm_type, dv=True, dv_static_skip=False)
-    assert m_nodv.dynamics.dv_skip is None, \
-        'R3: dv_skip should be None by default (dv_static_skip=False)'
-    _, m_skip = _build(wm_type, dv=True, dv_static_skip=True)
-    assert m_skip.dynamics.dv_skip is not None, \
-        'R3: dv_static_skip=True should restore the skip module'
-    print('[smoke] OK  R3 dv_skip removed by default; restorable via '
-          'dv_static_skip=True (ablation lever)')
-
 
 if __name__ == '__main__':
     run('rssm')
     run('tssm')
-    print('\n[smoke] ALL CONT-DIST-ROLL (p140 R1+R3) CHECKS PASSED both backbones')
+    print('\n[smoke] ALL CONT-DIST-ROLL (p140 R1) CHECKS PASSED both backbones')

@@ -273,12 +273,15 @@ default on). Threaded through all 5 `DreamerV4Config` build sites.
 real recompute impl — `cont_kl`, `gain_match_loss`, the innovation 2-pass all
 smoke-pass on both backbones).
 
-> **DV→obs static skip removed (p141)**: the p132 zero-init `W·dv_t` decoder
-> skip (`dv_static_skip`, now **default OFF**) was a memoryless feedthrough —
-> physically wrong (DV→CV has dead-time) and a `gain_match` crutch that let the
-> dynamic DV path stay weak. The cont GAIN block + `gain_match` supersede it;
-> the measured DV still feeds the decoder via `dv_feedforward` (p129) and drives
-> the CV through the recurrence. `DREAMER_DV_STATIC_SKIP=1` restores it (ablation).
+> **DV→decoder paths removed (p141 + p146)**: the measured DV drives the CV
+> ONLY through the recurrent transition (like the MV) — no instantaneous decoder
+> feedthrough. The p132 zero-init `W·dv_t` decoder skip (`dv_static_skip`) is
+> **deleted** (p141: a memoryless feedthrough + `gain_match` crutch, superseded
+> by the cont GAIN block + `gain_match`). The p129 `dv_feedforward` decoder half
+> is **default OFF** (p146 RCA: appending `dv_t` to the decoder input made the WM
+> DV response LEAD the plant and settle low; `DREAMER_DV_DECODER_FEEDFORWARD=1`
+> restores it). The measured DV still feeds the head-facing `feat` so the
+> actor/critic see the load.
 
 ### Continuous-latent curriculum (the simplified path)
 

@@ -867,12 +867,6 @@ class TrainConfig:
     # imag_reward_dv_corr 0.44 → imag_adv_action_corr 0.095 → actor thrash +
     # return_scale cap cascade).  GAIN block stays sampled.  ``DREAMER_CONT_DIST_DET_ROLL``.
     cont_dist_deterministic_roll: bool = True
-    # Static DV→obs feedthrough skip (p132).  DEFAULT OFF (2026-06-29, p140 RCA):
-    # the memoryless ``W·dv_t`` is a physically-wrong instant feedthrough (DV→CV
-    # has dead-time) AND a gain_match crutch (lets the dynamic DV path stay weak
-    # → slow rise); the cont GAIN block + gain_match supersede it.  Ablation
-    # lever only — ``DREAMER_DV_STATIC_SKIP=1`` restores the p132 skip.
-    dv_static_skip: bool = False
     # DV-as-input (Option B, 2026-06-07): feed the measured disturbance-variable
     # channels as an EXOGENOUS transition input (teacher-forced from the real
     # obs in WM training; HELD CONSTANT over the imagination horizon = the MPC
@@ -5181,7 +5175,6 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
         cont_dist_deterministic_roll=bool(getattr(
             cfg, 'cont_dist_deterministic_roll', True)),
-        dv_static_skip=bool(getattr(cfg, 'dv_static_skip', False)),
     )
     model = DreamerV4(model_cfg)
     # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths

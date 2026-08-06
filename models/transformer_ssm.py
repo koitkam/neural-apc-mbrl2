@@ -168,10 +168,9 @@ class TransformerSSMConfig:
     cont_dist_dim: int = 0
     cont_min_std: float = 0.1
     cont_max_std: float = 2.0
-    # Deterministic cont-disturbance roll (p140 RCA) + static DV skip OFF (p132
-    # superseded) — mirror of RSSMConfig; see there for the full rationale.
+    # Deterministic cont-disturbance roll (p140 RCA) — mirror of RSSMConfig; see
+    # there for the full rationale.
     cont_dist_deterministic_roll: bool = True
-    dv_static_skip: bool = False
 
 
 @dataclass
@@ -367,23 +366,6 @@ class TransformerSSMDynamics(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
-        # Direct DV→obs FEEDFORWARD SKIP (2026-06-20, p132 RCA; mirror of
-        # RSSMDynamics).  The single measured-DV channel is diluted ~1/(d_model)
-        # inside the decoder MLP, so the DV→CV gain still dies in the autoencoder
-        # (p132 DV real→post < MV).  This zero-init linear skip gives the DV a
-        # clean direct path to the reconstructed obs (decode + W·dv), bypassing
-        # the dilution + the categorical bottleneck.  Zero-init ⇒ exact no-op at
-        # start; learns ∂CV/∂dv from the residual.
-        # DEFAULT OFF (2026-06-29, p140 RCA): memoryless feedthrough + gain_match
-        # crutch; superseded by the cont GAIN block + gain_match.  Gated behind
-        # ``dv_static_skip`` as an ablation lever.
-        self.dv_static_skip = bool(getattr(cfg, 'dv_static_skip', False))
-        self.dv_skip = (nn.Linear(self._dv_feed_dim, self.obs_dim)
-                        if (self._dv_feed_dim > 0 and self.dv_static_skip)
-                        else None)
-        if self.dv_skip is not None:
-            nn.init.zeros_(self.dv_skip.weight)
-            nn.init.zeros_(self.dv_skip.bias)
         # Token projection: [z_{t-1}_flat ; (c) ; a_t ; (dv_t)] -> d_model.
         self.token_proj = nn.Linear(
             self.stoch_flat_dim + self.cont_dim + self.action_dim + self.dv_dim,
@@ -484,10 +466,6 @@ class TransformerSSMDynamics(nn.Module):
         # DV-feedforward and the DOB are off.
         x = feat[..., :self._decode_in_dim]
         out = self.decoder(x)
-        if self.dv_skip is not None:
-            core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
-            dv = feat[..., core:core + self._dv_feed_dim]
-            out = out + self.dv_skip(dv)
         return out
 
     def initial_state(self, batch_size: int,

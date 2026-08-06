@@ -1279,10 +1279,8 @@ class DreamerV4Config:
     cont_dist_dim: int = 0
     cont_min_std: float = 0.1
     cont_max_std: float = 2.0
-    # Deterministic cont-disturbance roll (p140 RCA, default on) + static DV
-    # feedthrough skip (p132, default OFF — superseded by cont-gain+gain_match).
+    # Deterministic cont-disturbance roll (p140 RCA, default on).
     cont_dist_deterministic_roll: bool = True
-    dv_static_skip: bool = False
 
 
 class DreamerV4(nn.Module):
@@ -1319,7 +1317,6 @@ class DreamerV4(nn.Module):
                 cont_dist_deterministic_roll=bool(getattr(
                     cfg, 'cont_dist_deterministic_roll', True)),
                 dv_decoder_feedforward=bool(getattr(cfg, 'dv_decoder_feedforward', False)),
-                dv_static_skip=bool(getattr(cfg, 'dv_static_skip', False)),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
             D = self.dynamics.feat_dim
@@ -1354,7 +1351,6 @@ class DreamerV4(nn.Module):
                 cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
                 cont_dist_deterministic_roll=bool(getattr(
                     cfg, 'cont_dist_deterministic_roll', True)),
-                dv_static_skip=bool(getattr(cfg, 'dv_static_skip', False)),
             )
             self.dynamics = TransformerSSMDynamics(tssm_cfg)
             D = self.dynamics.feat_dim
