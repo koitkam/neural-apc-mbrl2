@@ -2002,10 +2002,12 @@ class APCEnv:
 
     def _mv_rate_limit(self):
         """DCS output-velocity limit, PER MV (normalized units/step; 0 = OFF).
-        Auto = 2.5/tau_samples clip [0.05, 0.4], using each MV's identified τ
-        so every actuator gets a physically-appropriate slew cap (fast loops
-        may move faster).  Falls back to the dominant τ (then 12 samples) when
-        per-MV dynamics are unavailable.  Returns an (action_dim,) array."""
+        Absolute scale anchors on the canonical dominant τ (stable, per-sim):
+        ``base = clip(2.5/(tau_dom/sr), 0.05, 0.4)`` = full-range traverse in
+        ~1τ.  Each MV is then scaled by its RELATIVE speed τ_i/median (slower
+        actuator → tighter cap) so multi-MV plants get per-actuator limits;
+        degrades to the uniform dominant-τ cap when per-MV dynamics are
+        unavailable.  Returns an (action_dim,) array."""
         r = getattr(self, '_mv_rl_cached', None)
         if r is not None:
             return r
@@ -2018,22 +2020,29 @@ class APCEnv:
         if rl_cfg > 0.0:
             vec = np.full(n, rl_cfg, dtype='float32')
         else:
+            tau_dom, _ = self._resolve_plant_timing()
+            tau_dom_samples = (tau_dom / sr) if tau_dom > 0 else 12.0
+            base = float(np.clip(2.5 / max(tau_dom_samples, 1.0), 0.05, 0.4))
+            # Per-MV RELATIVE speed only (absolute scale stays on the dominant
+            # τ).  _per_mv_tau returns a uniform default when the dynamics JSON
+            # keys MVs by name rather than index → ratio 1.0 → uniform cap.
             try:
                 from utils.auto_weights import _per_mv_tau, _load_dynamics_json
                 _dyn = _load_dynamics_json()
                 taus = _per_mv_tau(n, _dyn) if _dyn else []
             except Exception:
                 taus = []
-            tau_dom, _ = self._resolve_plant_timing()
+            pos = [t for t in taus if t > 0]
+            med = float(np.median(pos)) if pos else 0.0
             vec = np.empty(n, dtype='float32')
             for i in range(n):
-                tau_i = float(taus[i]) if (i < len(taus) and taus[i] > 0) else tau_dom
-                tau_samples = (tau_i / sr) if tau_i > 0 else 12.0
-                vec[i] = float(np.clip(2.5 / max(tau_samples, 1.0), 0.05, 0.4))
+                ratio = (float(taus[i]) / med) if (med > 0 and i < len(taus)
+                                                   and taus[i] > 0) else 1.0
+                vec[i] = float(np.clip(base / max(ratio, 1e-6), 0.05, 0.4))
         self._mv_rl_cached = vec
         print(f'[mv-rate-limit] per-MV {np.round(vec, 3).tolist()} normalized '
-              f'units/step (DCS output velocity limit) — prevents bang-bang, '
-              f'forces smooth control.', flush=True)
+              f'units/step (DCS output velocity limit, anchored on dominant τ) '
+              f'— prevents bang-bang, forces smooth control.', flush=True)
         return vec
 
     def _dv_lowpass_alpha(self) -> float:
