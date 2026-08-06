@@ -714,6 +714,24 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         for tau in taus
     ]
 
+    # ---- Adaptive MV reversal (oscillation) suppression (2026-08-06) ----
+    # Companion to move_weights but targets ONLY direction REVERSALS (self-
+    # induced chatter / bang-bang), never purposeful sustained moves.  The
+    # runtime term is ``osc_i = relu(-du_t * du_prev)`` (normalised MV²), which
+    # is exactly zero for any monotonic ramp — however fast — and grows with
+    # the amplitude of a back-and-forth.  Calibrated as a fraction of cv_base
+    # and HARD-capped at cv_base so CV control + economics always strictly
+    # dominate: the penalty removes gratuitous oscillation but can never force
+    # a CV excursion, so the agent stays a fast controller ("not too strong").
+    # Per-MV τ scaling mirrors move_weights.  ``OBJ_AUTO_REVERSAL_GAIN`` (0
+    # disables); a full-rate bang-bang then costs ~gain*cv_base*rate² per step.
+    reversal_gain = max(0.0, _env_float('OBJ_AUTO_REVERSAL_GAIN', 0.3))
+    reversal_base = float(min(reversal_gain * cv_base, cv_base))
+    reversal_weights = [
+        float(reversal_base * max(0.2, tau / median_tau))
+        for tau in taus
+    ]
+
     # ---- Adaptive DMC violation-rate coefficient (2026-05-26) ----
     # Sliding-mode "reaching law" gain auto-derived from identified
     # plant dynamics. Larger gain = faster constraint recovery; smaller
@@ -746,6 +764,7 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         'cv_violation_weights_lo': cv_weights_lo,
         'cv_violation_weights_hi': cv_weights_hi,
         'mv_move_weights': move_weights,
+        'mv_reversal_weights': reversal_weights,
         'mv_target_weights': mv_target_weights,
         'cv_target_weights': cv_target_weights,
         'cv_ranks': ranks,

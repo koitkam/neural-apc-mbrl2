@@ -31,7 +31,7 @@ def _drive(rate_cfg: float):
     cfg.mv_rate_limit = rate_cfg
     env = APCEnv(cfg, np.random.default_rng(0))
     env.reset()
-    rate = env._mv_rate_limit()
+    rate = float(np.max(env._mv_rate_limit()))   # per-MV vector -> worst-case scalar
     prev = None
     max_slew = 0.0
     for t in range(30):

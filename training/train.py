@@ -1803,6 +1803,7 @@ class APCEnv:
         self._window: Optional[np.ndarray] = None
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
+        self._prev_prev_control = np.zeros(self.action_dim, dtype='float32')
         # Previous-step raw per-channel violation depth (lo_viol+hi_viol),
         # consumed by ``compute_objective_components`` for the optional
         # derivative (violation-rate) term.  ``None`` on the first step of
@@ -1999,28 +2000,41 @@ class APCEnv:
         # Guard against pathological values (numerical edge cases).
         return np.clip(out.astype('float32'), -10.0, 10.0)
 
-    def _mv_rate_limit(self) -> float:
-        """DCS output-velocity limit (normalized action units/step; 0 = OFF).
-        Auto = 2.5/tau_samples clip [0.05, 0.4]."""
-        r = getattr(self, '_mv_rl_cached', -1.0)
-        if r >= 0.0:
+    def _mv_rate_limit(self):
+        """DCS output-velocity limit, PER MV (normalized units/step; 0 = OFF).
+        Auto = 2.5/tau_samples clip [0.05, 0.4], using each MV's identified τ
+        so every actuator gets a physically-appropriate slew cap (fast loops
+        may move faster).  Falls back to the dominant τ (then 12 samples) when
+        per-MV dynamics are unavailable.  Returns an (action_dim,) array."""
+        r = getattr(self, '_mv_rl_cached', None)
+        if r is not None:
             return r
+        n = int(self.action_dim)
         rl_cfg = float(getattr(self.cfg, 'mv_rate_limit', 0.0) or 0.0)
+        sr = max(1.0, float(getattr(self.cfg, 'sample_rate', 1) or 1))
         if rl_cfg < 0.0:
-            self._mv_rl_cached = 0.0
-            return 0.0
+            self._mv_rl_cached = np.zeros(n, dtype='float32')
+            return self._mv_rl_cached
         if rl_cfg > 0.0:
-            r = rl_cfg
+            vec = np.full(n, rl_cfg, dtype='float32')
         else:
-            tau_plant, _ = self._resolve_plant_timing()
-            sr = max(1.0, float(getattr(self.cfg, 'sample_rate', 1) or 1))
-            tau_samples = (tau_plant / sr) if tau_plant > 0 else 12.0
-            r = float(np.clip(2.5 / max(tau_samples, 1.0), 0.05, 0.4))
-        self._mv_rl_cached = r
-        print(f'[mv-rate-limit] {r:.3f} normalized units/step (DCS output '
-              f'velocity limit) — prevents bang-bang, forces smooth control.',
-              flush=True)
-        return r
+            try:
+                from utils.auto_weights import _per_mv_tau, _load_dynamics_json
+                _dyn = _load_dynamics_json()
+                taus = _per_mv_tau(n, _dyn) if _dyn else []
+            except Exception:
+                taus = []
+            tau_dom, _ = self._resolve_plant_timing()
+            vec = np.empty(n, dtype='float32')
+            for i in range(n):
+                tau_i = float(taus[i]) if (i < len(taus) and taus[i] > 0) else tau_dom
+                tau_samples = (tau_i / sr) if tau_i > 0 else 12.0
+                vec[i] = float(np.clip(2.5 / max(tau_samples, 1.0), 0.05, 0.4))
+        self._mv_rl_cached = vec
+        print(f'[mv-rate-limit] per-MV {np.round(vec, 3).tolist()} normalized '
+              f'units/step (DCS output velocity limit) — prevents bang-bang, '
+              f'forces smooth control.', flush=True)
+        return vec
 
     def _dv_lowpass_alpha(self) -> float:
         """EMA coefficient for the measured-DV low-pass (0 = OFF).  Auto-derived
@@ -2164,6 +2178,7 @@ class APCEnv:
         state = np.asarray(state, dtype='float32').reshape(-1)
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
+        self._prev_prev_control = np.zeros(self.action_dim, dtype='float32')
         self._prev_mv_violation_per_channel = None
         self._prev_cv_violation_per_channel = None
         self._integral_cv = np.zeros_like(self._integral_cv)
@@ -2369,7 +2384,7 @@ class APCEnv:
         # slew faster than mv_rate_limit/step (a real actuator/DCS constraint, NOT
         # a reward move-penalty).  Kills the degenerate full-range bang-bang.
         _rl = self._mv_rate_limit()
-        if _rl > 0.0:
+        if np.any(_rl > 0.0):
             _pc = getattr(self, '_prev_cmd_norm', None)
             if _pc is None:
                 _pc = action_norm.copy()
@@ -2451,6 +2466,7 @@ class APCEnv:
             prev_mv_violation_per_channel=self._prev_mv_violation_per_channel,
             prev_cv_violation_per_channel=self._prev_cv_violation_per_channel,
             prev_integral_cv_per_channel=self._integral_cv,
+            prev_prev_control=self._prev_prev_control,
         )
         raw_reward = float(comps['reward'])
         # Apply raw clip BEFORE scaling so calibration (which percentile-
@@ -2509,6 +2525,7 @@ class APCEnv:
                 # densifier cannot reintroduce an unbounded scale.
                 b = self._bound_reward_max
                 reward = float(np.clip(reward, -b, b))
+        self._prev_prev_control = self._prev_control
         self._prev_control = np.asarray(control, dtype='float32')
         # Stash raw per-channel violation depths for next step's
         # derivative (violation-rate) term (off unless its coef > 0).

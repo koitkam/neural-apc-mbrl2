@@ -164,6 +164,7 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
         not obj_w.get('mv_violation_weights')
         or not obj_w.get('cv_violation_weights')
         or not obj_w.get('mv_move_weights')
+        or not obj_w.get('mv_reversal_weights')
         or not obj_w.get('cv_target_weights')
         or not obj_w.get('mv_target_weights')
     )
@@ -180,6 +181,7 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
                                cv_norm_ranges=cv_norm_ranges)
     merged = dict(obj_w)
     for k in ('mv_violation_weights', 'cv_violation_weights', 'mv_move_weights',
+              'mv_reversal_weights',
               'mv_target_weights', 'cv_target_weights',
               'cv_violation_weights_lo', 'cv_violation_weights_hi'):
         if not merged.get(k):
@@ -347,10 +349,16 @@ def compute_objective_components(
     prev_mv_violation_per_channel=None,
     prev_cv_violation_per_channel=None,
     prev_integral_cv_per_channel=None,
+    prev_prev_control=None,
 ) -> Dict[str, float]:
     state = np.asarray(state, dtype='float32').reshape(-1)
     control = np.asarray(control, dtype='float32').reshape(-1)
     prev_control = np.asarray(prev_control, dtype='float32').reshape(-1)
+    # 2-step MV history for the reversal (oscillation) term.  Defaulting to
+    # prev_control makes du_prev=0 on the first step -> no spurious penalty.
+    prev_prev_control = (prev_control if prev_prev_control is None
+                         else np.asarray(prev_prev_control,
+                                         dtype='float32').reshape(-1))
 
     mv_dim = len(control)
     cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
@@ -394,6 +402,7 @@ def compute_objective_components(
     else:
         cv_violation_weights_hi = list(cv_violation_weights)
     mv_move_weights = _resolve_vector(obj_w.get('mv_move_weights', []), mv_dim, 0.0)
+    mv_reversal_weights = _resolve_vector(obj_w.get('mv_reversal_weights', []), mv_dim, 0.0)
     mv_economic_weights = _resolve_vector(obj_w.get('mv_economic_weights', []), mv_dim, 0.0)
     cv_economic_weights = _resolve_vector(obj_w.get('cv_economic_weights', []), cv_dim, 0.0)
     # Economic *typical* operating point (normalised [0, 1]). The economic
@@ -529,6 +538,31 @@ def compute_objective_components(
     mv_move_penalty = float(
         np.sum(np.asarray(mv_move_terms, dtype='float32')
                * np.asarray(mv_move_weights, dtype='float32'))
+    )
+
+    # ---- MV reversal / oscillation suppression (adaptive move suppression) ----
+    # osc_i = relu(-du_t * du_prev): ZERO for any monotonic move (however fast),
+    # positive only on a DIRECTION REVERSAL and quadratic in its per-step
+    # amplitude.  Fast SUSTAINED control is free; only self-induced back-and-
+    # forth (bang-bang) is penalised.  A slow disturbance-driven reversal has
+    # tiny per-step du -> negligible; sustained fast oscillation accumulates.
+    mv_reversal_terms = []
+    for i in range(mv_dim):
+        r_lo, r_hi = mv_norm_ranges[i]
+        if use_normalized:
+            u_term = _normalize(float(control[i]), r_lo, r_hi)
+            p_term = _normalize(float(prev_control[i]), r_lo, r_hi)
+            pp_term = _normalize(float(prev_prev_control[i]), r_lo, r_hi)
+        else:
+            u_term = float(control[i])
+            p_term = float(prev_control[i])
+            pp_term = float(prev_prev_control[i])
+        du_t = u_term - p_term
+        du_prev = p_term - pp_term
+        mv_reversal_terms.append(float(max(0.0, -du_t * du_prev)))
+    mv_reversal_penalty = float(
+        np.sum(np.asarray(mv_reversal_terms, dtype='float32')
+               * np.asarray(mv_reversal_weights, dtype='float32'))
     )
 
     # ---- CV economic (clipped to bounds: no gradient outside limits) ----
@@ -750,6 +784,7 @@ def compute_objective_components(
     mv_target_penalty *= feasibility
     cv_target_penalty *= feasibility
     mv_move_penalty *= feasibility
+    mv_reversal_penalty *= feasibility
     movement_term *= feasibility
 
     mv_violation_penalty = _saturate_one_sided(mv_violation_penalty, penalty_clip, sat_mode)
@@ -759,6 +794,7 @@ def compute_objective_components(
     mv_target_penalty = _saturate_one_sided(mv_target_penalty, penalty_clip, sat_mode)
     cv_target_penalty = _saturate_one_sided(cv_target_penalty, penalty_clip, sat_mode)
     mv_move_penalty = _saturate_one_sided(mv_move_penalty, penalty_clip, sat_mode)
+    mv_reversal_penalty = _saturate_one_sided(mv_reversal_penalty, penalty_clip, sat_mode)
     movement_term = _saturate_two_sided(movement_term, penalty_clip, sat_mode)
 
     reward = 0.0
@@ -767,6 +803,7 @@ def compute_objective_components(
     reward -= mv_target_penalty
     reward -= cv_target_penalty
     reward -= mv_move_penalty
+    reward -= mv_reversal_penalty
     reward -= violation_rate_penalty
     reward -= integral_penalty
     reward -= _safe_float(obj_w.get('movement', 0.0), 0.0) * movement_term
@@ -813,6 +850,8 @@ def compute_objective_components(
         'cv_target_penalty': float(cv_target_penalty),
         'mv_move_terms': [float(x) for x in mv_move_terms],
         'mv_move_penalty': float(mv_move_penalty),
+        'mv_reversal_terms': [float(x) for x in mv_reversal_terms],
+        'mv_reversal_penalty': float(mv_reversal_penalty),
         'cv_penalty': float(cv_penalty),
         'reward': float(reward),
         # Econ-derived reward-shape scale (adaptive_penalty_clip output).
