@@ -101,6 +101,17 @@ class RSSMConfig:
     # reward heads finally SEE the disturbance (fixes the passive actor).
     # ``dv_dim = 0`` ⇒ no-op (byte-identical to the pre-feedforward model).
     dv_feedforward: bool = True
+    # DV→DECODER half of the feedforward (2026-08-06, p146 RCA).  The measured
+    # dv_t appended to the DECODER input is a MEMORYLESS dv_t→CV_t path: it
+    # SKIPS the GRU dead-time (the WM DV response LEADS the plant) and fits
+    # dv_step to the TRANSIENT CV (biases the DC gain LOW + starves the dynamic
+    # path).  Net-harmful vs the MV, which has NO feedforward yet settles ×0.85
+    # with correct dynamics while the DV (with ff) was ×0.76 AND led.  When
+    # False the decoder reconstructs CV from the latent core alone (the DV
+    # drives CV ONLY through the transition, like the MV), while the DV STAYS in
+    # the head-facing ``feat`` (``dv_feedforward``) so the actor still sees the
+    # load.  No-op when ``dv_feedforward`` is off or the plant has no DV.
+    dv_decoder_feedforward: bool = False
     # ---- Neural Kalman filter / disturbance observer (DOB), 2026-06-11 ----
     # When ``dob_enabled`` the WM carries an explicit additive output-disturbance
     # state ``d_t`` (one scalar per CV channel) that INTEGRATES the one-step
@@ -333,6 +344,13 @@ class RSSMDynamics(nn.Module):
         self.dv_feedforward = bool(getattr(cfg, 'dv_feedforward', True)) \
             and self.dv_dim > 0
         self._dv_feed_dim = self.dv_dim if self.dv_feedforward else 0
+        # DV→DECODER half (p146): decoupled from the head feat.  When off the
+        # decoder reconstructs CV from the latent core alone (dynamic path);
+        # ``_dv_feed_dim`` still keeps the DV in ``feat`` for the heads.
+        self.dv_decoder_feedforward = (
+            bool(getattr(cfg, 'dv_decoder_feedforward', False))
+            and self.dv_feedforward)
+        self._dv_decode_dim = self.dv_dim if self.dv_decoder_feedforward else 0
         # Transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
         # latent feeds the GRU so ``h`` carries the gain/disturbance forward.
         trans_in = (self.stoch_flat_dim + self.cont_dim
@@ -348,7 +366,7 @@ class RSSMDynamics(nn.Module):
         # (Scope 2) is sliced off in ``decode`` and re-added via ``apply_dob``
         # (the g + d factorisation).
         self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim + self.cont_dim
-                            + self._dv_feed_dim, self.obs_dim,
+                            + self._dv_decode_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
         # Direct DV→obs FEEDFORWARD SKIP (2026-06-20, p132 RCA).  The measured
         # DV is a single channel concatenated into the ~1500-d decoder MLP input
@@ -446,9 +464,10 @@ class RSSMDynamics(nn.Module):
 
     @property
     def _decode_in_dim(self) -> int:
-        # Width of the decoder input slice = latent core + cont latent + DV ff.
+        # Width of the decoder input slice = latent core + cont latent + DV
+        # DECODER feedforward (0 unless dv_decoder_feedforward is on).
         return (self.deter_dim + self.stoch_flat_dim + self.cont_dim
-                + self._dv_feed_dim)
+                + self._dv_decode_dim)
 
     # ----- embedding ----------------------------------------------------
     def embed(self, obs: torch.Tensor) -> torch.Tensor:
@@ -624,7 +643,13 @@ class RSSMDynamics(nn.Module):
                if self.dv_dim > 0 else None)           # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
-        dec_in = self._decode_in_dim                   # core (+ cont + dv ff)
+        # Head-facing feat width = [h, z, (c), (dv)] (the DOB d-tail is appended
+        # separately below).  p146: KEEP the DV in the head feat for the actor/
+        # critic even when it is dropped from the DECODER input — ``decode()``
+        # slices its own (narrower) ``_decode_in_dim`` internally, so the recon
+        # path stays DV-free while the heads still see the measured load.
+        dec_in = (self.deter_dim + self.stoch_flat_dim + self.cont_dim
+                  + self._dv_feed_dim)
         # Option B (2026-06-26, p139 RCA): the innovation-driven cont DISTURBANCE
         # posterior needs the one-step CV innovation ν, which needs a PRIOR
         # DECODE — too expensive PER STEP inside the compiled loop (the same

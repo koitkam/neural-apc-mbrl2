@@ -897,6 +897,13 @@ class TrainConfig:
     # actor).  Sim-adaptive: no-op when the plant has no measured DV (dv_dim=0).
     # Backbone-agnostic (RSSM + TSSM).  Opt out with DREAMER_DV_FEEDFORWARD=0.
     dv_feedforward: bool = True
+    # DV→DECODER half of the feedforward (2026-08-06, p146 RCA).  Keep the DV in
+    # the head feat (actor sees the load) but REMOVE the memoryless dv_t→CV_t
+    # decoder path: it made the WM DV response LEAD the plant (skips the GRU
+    # dead-time) and SETTLE LOW (fits dv_step to the transient CV, ×0.76 vs the
+    # MV's ×0.85 correct-dynamics).  Default off = decoder reconstructs CV from
+    # the dynamic latent alone, like the MV.  ``DREAMER_DV_DECODER_FEEDFORWARD``.
+    dv_decoder_feedforward: bool = False
     # De-contaminate the disturbance head from the MEASURED dv (2026-06-19, p130
     # RCA).  ``dv_feedforward`` routes the measured DV into ``feat`` (decoder +
     # heads).  The disturbance head predicts the UNMEASURED load — but it reads

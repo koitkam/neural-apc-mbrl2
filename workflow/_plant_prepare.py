@@ -245,6 +245,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # around the categorical bottleneck (where the DV→CV gain dies) directly
     # into the decoder + heads.  Default ON; =0 reverts to transition-only DV.
     'DREAMER_DV_FEEDFORWARD':             ('dv_feedforward',             _as_bool),
+    'DREAMER_DV_DECODER_FEEDFORWARD':     ('dv_decoder_feedforward',     _as_bool),
     # De-contaminate the disturbance head from the MEASURED dv (2026-06-19,
     # p130): zero the dv-feedforward columns of feat before the disturbance
     # head so it predicts the UNMEASURED load, not the measured DV.  Default ON.

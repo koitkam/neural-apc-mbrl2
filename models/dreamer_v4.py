@@ -1318,6 +1318,7 @@ class DreamerV4(nn.Module):
                 cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
                 cont_dist_deterministic_roll=bool(getattr(
                     cfg, 'cont_dist_deterministic_roll', True)),
+                dv_decoder_feedforward=bool(getattr(cfg, 'dv_decoder_feedforward', False)),
                 dv_static_skip=bool(getattr(cfg, 'dv_static_skip', False)),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
