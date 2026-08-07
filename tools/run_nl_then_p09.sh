@@ -23,16 +23,16 @@ export DREAMER_COMPILE=0
 STATUS=output/orchestrator_status.log
 log(){ echo "[orchestrator] $(date '+%F %T') $*" | tee -a "$STATUS"; }
 
-log "START nonlinear run — gain_match OFF; p146 DV decoder-feedforward REMOVED (fix DV lead + gain)"
+log "START nonlinear run — gain_match OFF; p147 return_scale cap 500→8 + DV gain (ss_match+recon_cv)"
 DREAMER_GAIN_MATCH_COEF=0 python -m workflow.single_run \
     --simulation-dir simulation/nonlinear_sim \
-    --out-dir output/nonlinear_sim/run_p06_dvdecoupled
+    --out-dir output/nonlinear_sim/run_p07_actorwmfix
 nl_rc=$?
 log "nonlinear run EXITED rc=${nl_rc}"
 
-log "START P09 restart — test_sim; p146 DV decoder-feedforward REMOVED (fix DV lead + gain)"
+log "START P09 restart — test_sim; p147 return_scale cap 500→8 + DV gain (ss_match+recon_cv)"
 python -m workflow.single_run \
     --simulation-dir simulation/test_sim \
-    --out-dir output/test_sim/run_p14_dvdecoupled
+    --out-dir output/test_sim/run_p15_actorwmfix
 p9_rc=$?
 log "P09 EXITED rc=${p9_rc} — orchestrator DONE (nl_rc=${nl_rc} p9_rc=${p9_rc})"

@@ -286,7 +286,11 @@ class TrainConfig:
     # TSSM.  ``1.0`` = uniform = paper / p106-baseline behaviour (identity).
     # Resolved CV obs indices live in ``cv_obs_indices`` (set at runtime).
     # Default 4.0 = p117 curriculum-recipe (promoted 2026-06-14; was 1.0).
-    wm_recon_cv_weight: float = 4.0
+    # p147 RCA (2026-08-07): 4.0→6.0 — the CV gain still dies in the autoencoder
+    # (MV ×0.89, DV ×0.73); up-weighting the CV recon raises the decode's gain
+    # fidelity for BOTH inputs toward the ground truth (the autoencoder capacity
+    # caps even a perfect DC-anchor — gain_match only reaches ~0.80).
+    wm_recon_cv_weight: float = 6.0
     cv_obs_indices: Tuple[int, ...] = ()
     # p10 RCA: DV recon weight — 0.0 makes the measured DV INPUT-ONLY (fed to the
     # WM transition like the action, never a recon target).  Symmetric with the
@@ -394,7 +398,13 @@ class TrainConfig:
     # spread is implausibly large.  Dimensionless (return units) and
     # sim-agnostic because returns are themselves bounded by the
     # bounded-reward remap (≈ B·H).  Set 0.0 to disable (uncapped EMA).
-    return_scale_abs_cap: float = 500.0
+    # p147 RCA (2026-08-07): 500→8.  The actor was HEALTHY early (rscale 2-4,
+    # rew2tgt 0.027, advcorr 0.20) then DEGRADED as this EMA cascaded to ~30
+    # (the 500 cap never bit) → the advantage was normalised to death
+    # (advcorr→0.01, return spiral, agent < baseline).  8 leaves the healthy
+    # regime (2-4) untouched and only arrests the actor-killing runaway (matches
+    # advantage_clip=8).  ``DREAMER_RETURN_SCALE_ABS_CAP``.
+    return_scale_abs_cap: float = 8.0
 
     # ---- A' : dense potential-based reward shaping (P66-RCA, 2026-05-29) ----
     # The economic objective is a one-sided cliff (raw_abs_p95≈38 on the
@@ -6509,7 +6519,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # match + its long-hold isolated settle episodes so the WM gain is
             # UNBIASED with NO identified value (nonlinear / black-box safe).
             if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) <= 0.0:
-                cfg.wm_ss_match_coef = 0.5
+                cfg.wm_ss_match_coef = 1.0  # p147: 0.5→1.0 (DV DC-gain still under ~0.73)
             if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
                 cfg.wm_isolation_settle_episodes = 8  # p09: 4→8 (DV still under)
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
