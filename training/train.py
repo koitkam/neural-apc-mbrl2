@@ -398,13 +398,12 @@ class TrainConfig:
     # spread is implausibly large.  Dimensionless (return units) and
     # sim-agnostic because returns are themselves bounded by the
     # bounded-reward remap (≈ B·H).  Set 0.0 to disable (uncapped EMA).
-    # p147 RCA (2026-08-07): 500→8.  The actor was HEALTHY early (rscale 2-4,
-    # rew2tgt 0.027, advcorr 0.20) then DEGRADED as this EMA cascaded to ~30
-    # (the 500 cap never bit) → the advantage was normalised to death
-    # (advcorr→0.01, return spiral, agent < baseline).  8 leaves the healthy
-    # regime (2-4) untouched and only arrests the actor-killing runaway (matches
-    # advantage_clip=8).  ``DREAMER_RETURN_SCALE_ABS_CAP``.
-    return_scale_abs_cap: float = 8.0
+    # NOTE (p148, 2026-08-10): this DEFAULT is OVERRIDDEN by auto_tune_seed_buffer
+    # (max(20, 0.30·B·H)≈50, ~L5826) — p147's 500→8 attempt never bit (auto-tune
+    # won) AND was misguided: p137 showed a LOW cap UNDER-normalises the advantage
+    # → actor BLOW-UP.  The high (~50) cap is correct; the actor divergence has a
+    # DIFFERENT cause (BC-anchor evaporation — see expert_bc_p3_floor).
+    return_scale_abs_cap: float = 500.0
 
     # ---- A' : dense potential-based reward shaping (P66-RCA, 2026-05-29) ----
     # The economic objective is a one-sided cliff (raw_abs_p95≈38 on the
@@ -1173,7 +1172,11 @@ class TrainConfig:
     # (p135 8%).  Decay the anchor fully to 0 so it warm-starts the policy in the
     # expert basin then RELEASES it to find the economic optimum.  Re-add a small
     # floor only if the actor reverts/diverges without the anchor late in P3.
-    expert_bc_p3_floor: float = 0.0
+    # p148 RCA (2026-08-10): 0.0→0.1 — the actor DID diverge exactly as warned
+    # (run_p07: best -351 @it156 → -904 @it163 as return_scale cascaded 25→33 and
+    # the anchor evaporated).  Decay is 1→floor so the early warmstart is
+    # unchanged; a 0.1 LATE-P3 floor re-anchors the policy to arrest the drift.
+    expert_bc_p3_floor: float = 0.1
     # TD3+BC return-scale normalisation (Fujimoto 2021).  OPT-IN (default
     # off): REINFORCE already divides the advantage by return_scale, so the
     # PG gradient on μ is already O(1) regardless of scale and a fixed-weight

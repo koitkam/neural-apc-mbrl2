@@ -23,16 +23,16 @@ export DREAMER_COMPILE=0
 STATUS=output/orchestrator_status.log
 log(){ echo "[orchestrator] $(date '+%F %T') $*" | tee -a "$STATUS"; }
 
-log "START nonlinear run — gain_match OFF; p147 return_scale cap 500→8 + DV gain (ss_match+recon_cv)"
+log "START nonlinear run — gain_match OFF; p148 BC-floor 0→0.1 (anti-divergence) + revert cap"
 DREAMER_GAIN_MATCH_COEF=0 python -m workflow.single_run \
     --simulation-dir simulation/nonlinear_sim \
-    --out-dir output/nonlinear_sim/run_p07_actorwmfix
+    --out-dir output/nonlinear_sim/run_p08_bcfloor
 nl_rc=$?
 log "nonlinear run EXITED rc=${nl_rc}"
 
-log "START P09 restart — test_sim; p147 return_scale cap 500→8 + DV gain (ss_match+recon_cv)"
+log "START P09 restart — test_sim; p148 BC-floor 0→0.1 (anti-divergence) + revert cap"
 python -m workflow.single_run \
     --simulation-dir simulation/test_sim \
-    --out-dir output/test_sim/run_p15_actorwmfix
+    --out-dir output/test_sim/run_p16_bcfloor
 p9_rc=$?
 log "P09 EXITED rc=${p9_rc} — orchestrator DONE (nl_rc=${nl_rc} p9_rc=${p9_rc})"
