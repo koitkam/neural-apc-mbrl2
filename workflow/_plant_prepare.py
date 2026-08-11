@@ -365,6 +365,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RSSM_FREE_BITS':             ('rssm_free_bits',                 float),
     'DREAMER_RSSM_KL_DYN_W':              ('rssm_kl_dyn_w',                  float),
     'DREAMER_RSSM_KL_REPR_W':             ('rssm_kl_repr_w',                 float),
+    # SimNorm (TD-MPC2) latent + joint-embedding consistency (2026-08-11).
+    'DREAMER_RSSM_LATENT_TYPE':           ('rssm_latent_type',               str),
+    'DREAMER_RSSM_SIMNORM_TEMP':          ('rssm_simnorm_temp',              float),
+    'DREAMER_RSSM_JOINT_EMBED_COEF':      ('rssm_joint_embed_coef',          float),
     # TSSM (transformer-SSM) backbone dims (world_model_type='tssm').
     'DREAMER_TSSM_D_MODEL':               ('tssm_d_model',                   int),
     'DREAMER_TSSM_N_LAYERS':              ('tssm_n_layers',                  int),
