@@ -39,3 +39,4 @@ _smoke_*
 
 # Vision API credentials (never commit secrets)
 vision_endpoints.txt
+/scratch/
