@@ -81,13 +81,11 @@ class RSSMConfig:
     embed_dim: int = 256
     hidden_dim: int = 256
     unimix: float = 0.01            # paper 1% uniform mixture
-    # SimNorm (TD-MPC2, 2026-08-11).  ``latent_type='simnorm'`` replaces the
-    # hard straight-through categorical with a SOFT simplicial latent (per-group
-    # softmax) that does NOT quantize the continuous CV/DV gain (validated:
-    # hard-cat gain 0.877 vs SimNorm 0.996).  KL is unchanged (reads logits).
-    # ``'categorical'`` = paper DreamerV3 (default, byte-identical).
+    # Latent type (2026-08-12).  ``'categorical'`` = paper DreamerV3 (default).
+    # ``'deterministic'`` = a continuous tanh latent with NO variational KL
+    # (prior/posterior consistency via joint-embedding) — no quantization, so
+    # the continuous CV/DV gain is not attenuated (bias-free observer).
     latent_type: str = 'categorical'
-    simnorm_temp: float = 1.0       # SimNorm softmax temperature (τ)
     # DV-as-input (Option B, 2026-06-07).  When ``dv_dim > 0`` the measured
     # disturbance-variable channels (at ``dv_indices`` within the obs vector)
     # are fed as an EXOGENOUS input to the transition (concatenated with the
@@ -230,31 +228,29 @@ class RSSMState:
 
 
 class _CategoricalLatent(nn.Module):
-    """Feature → (n_categoricals × n_classes) stochastic latent head.
+    """Feature → (n_categoricals × n_classes) latent head.
 
     ``latent_type='categorical'`` (default, DreamerV3): straight-through
-    one-hot sample with a ``unimix`` uniform mixture.
+    one-hot sample with a ``unimix`` uniform mixture; prior/posterior
+    consistency is the categorical KL (``rssm_kl_loss``, reads ``logits``).
 
-    ``latent_type='simnorm'`` (TD-MPC2, arXiv 2310.16828): SimNorm — the
-    forward latent is the per-group ``softmax(logits/τ)`` (a SOFT
-    vector-of-categoricals / simplicial normalization), NOT a hard one-hot.
-    The soft simplex does not QUANTIZE the continuous CV/DV gain the
-    straight-through one-hot attenuates (validated: hard-cat gain 0.877 vs
-    SimNorm 0.996 on a continuous-gain autoencoder).  Deterministic
-    (mode==sample) so it also removes the imagined-latent jitter; no unimix.
-    ``rssm_kl_loss`` still reads ``logits`` in both modes, so the
-    prior/posterior consistency is unchanged.
+    ``latent_type='deterministic'``: a DETERMINISTIC CONTINUOUS latent
+    (``tanh`` of the head output) — NO quantization and NO variational KL, so
+    the continuous CV/DV gain is not attenuated (the categorical straight-
+    through quantizes it → biased gain).  The forward value IS the latent (no
+    sampling); prior/posterior consistency is the joint-embedding predict-
+    next-latent MSE (``rssm_joint_embed_loss``).  The returned ``logits`` slot
+    carries the same continuous latent (fed to that MSE).
     """
 
     def __init__(self, in_dim: int, n_categoricals: int, n_classes: int,
                  hidden_dim: int = 256, unimix: float = 0.01,
-                 latent_type: str = 'categorical', simnorm_temp: float = 1.0):
+                 latent_type: str = 'categorical'):
         super().__init__()
         self.n_categoricals = int(n_categoricals)
         self.n_classes = int(n_classes)
         self.unimix = float(unimix)
         self.latent_type = str(latent_type).lower()
-        self.simnorm_temp = float(simnorm_temp)
         self.net = _MLP(in_dim, n_categoricals * n_classes, hidden_dim,
                         num_layers=2)
 
@@ -262,18 +258,12 @@ class _CategoricalLatent(nn.Module):
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.net(x).view(*x.shape[:-1], self.n_categoricals,
                                    self.n_classes)
-        if self.latent_type == 'simnorm':
-            # SimNorm: soft simplices at temperature τ, WITH a unimix floor
-            # (anti-collapse — round-9 RCA: the plain soft latent collapsed to
-            # near-uniform, encoder_var_ratio→0, so the decoder ignored it and
-            # the CV/DV gain died).  Deterministic, no straight-through.  The
-            # unimix-adjusted logits feed the (unchanged) KL below so the KL
-            # sees the same τ-scaled simplex used forward.
-            probs = F.softmax(logits / self.simnorm_temp, dim=-1)
-            if self.unimix > 0.0:
-                probs = (1.0 - self.unimix) * probs + self.unimix / self.n_classes
-            logits = torch.log(probs.clamp(min=1e-8))
-            return logits, probs
+        if self.latent_type == 'deterministic':
+            # Continuous bounded latent: no softmax quantization, no KL.  The
+            # same tensor is returned as both the consistency target (``logits``
+            # slot → joint-embedding MSE) and the forward sample.
+            z = torch.tanh(logits)
+            return z, z
         # ---- categorical (DreamerV3) ----
         # Unimix: (1-u)·softmax + u·uniform, re-expressed as logits.
         probs = F.softmax(logits, dim=-1)
@@ -399,15 +389,13 @@ class RSSMDynamics(nn.Module):
         self.gru = nn.GRUCell(trans_in, self.deter_dim)
         # Prior p(z'|h') and posterior q(z'|h', embed).
         _lt = str(getattr(cfg, 'latent_type', 'categorical'))
-        _st = float(getattr(cfg, 'simnorm_temp', 1.0))
         self.prior_net = _CategoricalLatent(
             self.deter_dim, self.n_categoricals, self.n_classes,
-            hidden_dim=self.hidden_dim, unimix=cfg.unimix,
-            latent_type=_lt, simnorm_temp=_st)
+            hidden_dim=self.hidden_dim, unimix=cfg.unimix, latent_type=_lt)
         self.post_net = _CategoricalLatent(
             self.deter_dim + self.embed_dim, self.n_categoricals,
             self.n_classes, hidden_dim=self.hidden_dim, unimix=cfg.unimix,
-            latent_type=_lt, simnorm_temp=_st)
+            latent_type=_lt)
         # Continuous-latent prior p(c'|h') and posterior q(c'|h', embed).
         if self.cont_dim > 0:
             self.cont_prior_net = _ContinuousLatent(
@@ -879,19 +867,17 @@ def rssm_cont_kl_loss(post_mean: torch.Tensor, post_std: torch.Tensor,
     return kl_loss, diag
 
 
-def rssm_joint_embed_loss(post_logits: torch.Tensor,
-                          prior_logits: torch.Tensor,
-                          temp: float = 1.0) -> torch.Tensor:
-    """TD-MPC2-style joint-embedding (predict-next-latent) consistency.
+def rssm_joint_embed_loss(post_latent: torch.Tensor,
+                          prior_latent: torch.Tensor) -> torch.Tensor:
+    """Joint-embedding (predict-next-latent) consistency for the deterministic
+    continuous latent.
 
-    Trains the prior (dynamics) to predict the posterior's SOFT SimNorm latent
-    in simplex space:  ``‖ softmax(prior/τ) − sg(softmax(post/τ)) ‖²`` summed
-    over the K×C latent, averaged over (B, T).  A latent-SPACE (Euclidean-on-
-    the-simplex) consistency that complements the categorical KL and shapes the
-    representation to be dynamics-predictable rather than only reconstructive
-    (objective mismatch, Lambert 2020) — matching the soft SimNorm forward
-    latent.  Stop-grad on the posterior target (the encoder is the anchor).
+    Trains the prior (dynamics) to predict the posterior's latent:
+    ``mean‖ prior − sg(posterior) ‖²`` (mean over the latent dims and (B, T)).
+    REPLACES the variational KL for imagination consistency (the deterministic
+    latent has no distribution to KL) and shapes the latent to be dynamics-
+    predictable (TD-MPC2 / objective mismatch, Lambert 2020).  Mean (not sum)
+    over dims keeps it scale-stable across latent sizes.  Stop-grad on the
+    posterior (the encoder is the anchor).
     """
-    p_prior = F.softmax(prior_logits / temp, dim=-1)
-    p_post = F.softmax(post_logits / temp, dim=-1).detach()
-    return (p_prior - p_post).pow(2).sum(dim=-1).sum(dim=-1).mean()
+    return (prior_latent - post_latent.detach()).pow(2).mean()

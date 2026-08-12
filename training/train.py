@@ -790,13 +790,12 @@ class TrainConfig:
     rssm_embed_dim: int = 256
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01          # paper 1% uniform mixture
-    # SimNorm (TD-MPC2, 2026-08-11): 'simnorm' swaps the hard categorical for a
-    # soft simplicial latent that preserves the continuous CV/DV gain the
-    # straight-through one-hot quantizes (hard-cat 0.877 vs SimNorm 0.996).
-    # ``rssm_joint_embed_coef`` > 0 adds the predict-next-latent consistency.
+    # Latent type (2026-08-12): 'categorical' (DreamerV3) or 'deterministic' (a
+    # continuous tanh latent, NO variational KL — no quantization, so the CV/DV
+    # gain is not attenuated).  Deterministic uses the joint-embedding predict-
+    # next-latent MSE (coef below) for prior/posterior imagination consistency.
     rssm_latent_type: str = 'categorical'
-    rssm_simnorm_temp: float = 0.5
-    rssm_joint_embed_coef: float = 0.0
+    rssm_joint_embed_coef: float = 1.0   # deterministic-latent consistency weight
     rssm_free_bits: float = 0.5        # p117 recipe (promoted 2026-06-14; paper=1.0)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
     rssm_kl_repr_w: float = 0.1        # paper KL-balance repr weight
@@ -4505,24 +4504,25 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     if dob_on:
         recon = rssm.apply_dob(recon, ds)
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
-    kl_loss, kl_diag = rssm_kl_loss(
-        post_logits, prior_logits,
-        free_bits=float(getattr(cfg, 'rssm_free_bits', 1.0)),
-        dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
-        repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
-    wm_total = cfg.recon_scale * recon_loss + kl_loss
-    # TD-MPC2 joint-embedding (predict-next-latent) consistency (2026-08-11).
-    # Opt-in (coef>0): trains the prior to predict the posterior's soft SimNorm
-    # latent, complementing the KL with a latent-space consistency (pairs with
-    # rssm_latent_type='simnorm').  Default coef 0 ⇒ byte-clean no-op.
+    latent_type = str(getattr(cfg, 'rssm_latent_type', 'categorical')).lower()
     joint_embed_loss = torch.zeros((), device=feats.device)
-    je_coef = float(getattr(cfg, 'rssm_joint_embed_coef', 0.0) or 0.0)
-    if je_coef > 0.0:
+    if latent_type == 'deterministic':
+        # Deterministic continuous latent: NO variational KL — prior/posterior
+        # consistency (for imagination) is the joint-embedding predict-next-
+        # latent MSE.  post_logits/prior_logits are the continuous latents here.
         from models.dreamer_v4_rssm import rssm_joint_embed_loss
-        joint_embed_loss = rssm_joint_embed_loss(
+        kl_loss = torch.zeros((), device=feats.device)
+        kl_diag = {}
+        joint_embed_loss = rssm_joint_embed_loss(post_logits, prior_logits)
+        je_coef = float(getattr(cfg, 'rssm_joint_embed_coef', 1.0) or 0.0)
+        wm_total = cfg.recon_scale * recon_loss + je_coef * joint_embed_loss
+    else:
+        kl_loss, kl_diag = rssm_kl_loss(
             post_logits, prior_logits,
-            temp=float(getattr(cfg, 'rssm_simnorm_temp', 1.0)))
-        wm_total = wm_total + je_coef * joint_embed_loss
+            free_bits=float(getattr(cfg, 'rssm_free_bits', 1.0)),
+            dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
+            repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
+        wm_total = cfg.recon_scale * recon_loss + kl_loss
     # ----- continuous-latent KL (gain + disturbance channels) -----
     # The Gaussian analogue of the categorical KL: trains the prior to ROLL the
     # gain (persist) + disturbance (OU) forward so imagination carries them.
@@ -5189,7 +5189,6 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
         rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
-        rssm_simnorm_temp=float(getattr(cfg, 'rssm_simnorm_temp', 1.0)),
         tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
         tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
         tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
