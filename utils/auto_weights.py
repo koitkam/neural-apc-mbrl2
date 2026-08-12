@@ -219,19 +219,31 @@ def _load_dynamics_json() -> Optional[Dict]:
 
 
 def _per_mv_tau(n_mv: int, dynamics: Optional[Dict]) -> List[float]:
-    """Return a list of τ estimates per MV index.  Falls back to uniform."""
+    """Return a list of τ estimates per MV index.  Falls back to uniform.
+
+    The dynamics JSON keys each pair's MV by NAME (``mv``); its 0-based
+    position is ``input_index``.  DV pairs REUSE the same ``input_index``
+    space, so MV pairs must be filtered by ``input_type`` first.
+    """
     default_tau = 20.0
     if not isinstance(dynamics, dict):
         return [default_tau] * n_mv
-    # The dynamics JSON stores per-pair estimates; aggregate max τ per MV
+    # The dynamics JSON stores per-pair estimates; aggregate median τ per MV
     # across its CV pairs so slow dynamics dominate the move penalty.
     pairs = dynamics.get('per_pair_estimates') or dynamics.get('pairs') or []
     per_mv: Dict[int, List[float]] = {}
     for p in pairs if isinstance(pairs, list) else []:
+        if not isinstance(p, dict):
+            continue
+        # DV pairs share the 0-based ``input_index`` space — MV inputs only.
+        if str(p.get('input_type', 'mv')).lower() not in ('mv', ''):
+            continue
+        # MV is keyed by NAME; its 0-based index is ``input_index``.
+        mv_idx = p.get('mv_index', p.get('input_index'))
         try:
-            mv_idx = int(p.get('mv_index', p.get('mv', -1)))
+            mv_idx = int(mv_idx)
             tau = float(p.get('tau', p.get('tau_est', 0.0)))
-        except Exception:
+        except (TypeError, ValueError):
             continue
         if mv_idx < 0 or tau <= 0.0:
             continue

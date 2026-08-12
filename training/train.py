@@ -2045,8 +2045,8 @@ class APCEnv:
             tau_dom_samples = (tau_dom / sr) if tau_dom > 0 else 12.0
             base = float(np.clip(2.5 / max(tau_dom_samples, 1.0), 0.05, 0.4))
             # Per-MV RELATIVE speed only (absolute scale stays on the dominant
-            # τ).  _per_mv_tau returns a uniform default when the dynamics JSON
-            # keys MVs by name rather than index → ratio 1.0 → uniform cap.
+            # τ).  _per_mv_tau maps each MV via its ``input_index`` in the
+            # dynamics JSON (MVs are keyed by name) → true per-MV τ ratios.
             try:
                 from utils.auto_weights import _per_mv_tau, _load_dynamics_json
                 _dyn = _load_dynamics_json()
