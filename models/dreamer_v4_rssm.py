@@ -263,11 +263,17 @@ class _CategoricalLatent(nn.Module):
         logits = self.net(x).view(*x.shape[:-1], self.n_categoricals,
                                    self.n_classes)
         if self.latent_type == 'simnorm':
-            # SimNorm: soft simplices.  Differentiable + deterministic, so no
-            # sampling / straight-through / unimix; the raw ``logits`` still
-            # feed the (unchanged) KL below.
-            sample_st = F.softmax(logits / self.simnorm_temp, dim=-1)
-            return logits, sample_st
+            # SimNorm: soft simplices at temperature τ, WITH a unimix floor
+            # (anti-collapse — round-9 RCA: the plain soft latent collapsed to
+            # near-uniform, encoder_var_ratio→0, so the decoder ignored it and
+            # the CV/DV gain died).  Deterministic, no straight-through.  The
+            # unimix-adjusted logits feed the (unchanged) KL below so the KL
+            # sees the same τ-scaled simplex used forward.
+            probs = F.softmax(logits / self.simnorm_temp, dim=-1)
+            if self.unimix > 0.0:
+                probs = (1.0 - self.unimix) * probs + self.unimix / self.n_classes
+            logits = torch.log(probs.clamp(min=1e-8))
+            return logits, probs
         # ---- categorical (DreamerV3) ----
         # Unimix: (1-u)·softmax + u·uniform, re-expressed as logits.
         probs = F.softmax(logits, dim=-1)

@@ -1236,7 +1236,7 @@ class DreamerV4Config:
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01
     rssm_latent_type: str = 'categorical'   # 'simnorm' = TD-MPC2 soft latent
-    rssm_simnorm_temp: float = 1.0
+    rssm_simnorm_temp: float = 0.5
     # ===== TSSM (transformer-SSM) backbone (neural-apc-mbrl) =====
     # ``'tssm'`` swaps the GRU recurrent core for a causal transformer that does
     # in-context system-ID over the lookback (sharp per-domain fixed point for

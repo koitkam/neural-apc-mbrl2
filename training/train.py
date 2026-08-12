@@ -795,7 +795,7 @@ class TrainConfig:
     # straight-through one-hot quantizes (hard-cat 0.877 vs SimNorm 0.996).
     # ``rssm_joint_embed_coef`` > 0 adds the predict-next-latent consistency.
     rssm_latent_type: str = 'categorical'
-    rssm_simnorm_temp: float = 1.0
+    rssm_simnorm_temp: float = 0.5
     rssm_joint_embed_coef: float = 0.0
     rssm_free_bits: float = 0.5        # p117 recipe (promoted 2026-06-14; paper=1.0)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
