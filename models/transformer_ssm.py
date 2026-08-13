@@ -145,6 +145,7 @@ class TransformerSSMConfig:
     # ``'deterministic'`` (continuous tanh latent, no KL) via the shared
     # ``_CategoricalLatent`` head, so behaviour matches the RSSM path.
     latent_type: str = 'categorical'
+    latent_noise: float = 0.0     # reparam noise on the deterministic sample
     max_seq_len: int = 256        # context window cap (>= lookback + horizon)
     # DV-as-input (Option B, 2026-06-07) — mirror of RSSMConfig: measured DV
     # channels (at ``dv_indices`` in the obs vector) become an exogenous token
@@ -383,12 +384,14 @@ class TransformerSSMDynamics(nn.Module):
         # [h, embed]).  prior_net is read by the smoke tests + the overshoot /
         # held-rollout losses, so the attribute name MUST match the RSSM.
         _lt = str(getattr(cfg, 'latent_type', 'categorical'))
+        _ln = float(getattr(cfg, 'latent_noise', 0.0) or 0.0)
         self.prior_net = _CategoricalLatent(
             self.deter_dim, self.n_categoricals, self.n_classes,
-            unimix=cfg.unimix, latent_type=_lt)
+            unimix=cfg.unimix, latent_type=_lt, latent_noise=_ln)
         self.post_net = _CategoricalLatent(
             self.deter_dim + cfg.embed_dim, self.n_categoricals,
-            self.n_classes, unimix=cfg.unimix, latent_type=_lt)
+            self.n_classes, unimix=cfg.unimix, latent_type=_lt,
+            latent_noise=_ln)
         # Continuous-latent prior p(c'|h') and posterior q(c'|h', embed).
         if self.cont_dim > 0:
             self.cont_prior_net = _ContinuousLatent(

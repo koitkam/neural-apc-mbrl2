@@ -1236,6 +1236,7 @@ class DreamerV4Config:
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01
     rssm_latent_type: str = 'categorical'   # or 'deterministic' (continuous, no-KL)
+    rssm_latent_noise: float = 0.0          # reparam noise on deterministic latent
     # ===== TSSM (transformer-SSM) backbone (neural-apc-mbrl) =====
     # ``'tssm'`` swaps the GRU recurrent core for a causal transformer that does
     # in-context system-ID over the lookback (sharp per-domain fixed point for
@@ -1305,6 +1306,7 @@ class DreamerV4(nn.Module):
                 hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
                 latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
+                latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
                 dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
                 dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
                 dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
@@ -1340,6 +1342,7 @@ class DreamerV4(nn.Module):
                 n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
                 latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
+                latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
                 max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
                 dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
                 dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),

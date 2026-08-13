@@ -85,7 +85,10 @@ class RSSMConfig:
     # ``'deterministic'`` = a continuous tanh latent with NO variational KL
     # (prior/posterior consistency via joint-embedding) — no quantization, so
     # the continuous CV/DV gain is not attenuated (bias-free observer).
+    # ``latent_noise`` > 0 adds reparameterization noise to the deterministic
+    # sample (information-bottleneck regularizer; anti-overfit, no quantization).
     latent_type: str = 'categorical'
+    latent_noise: float = 0.0
     # DV-as-input (Option B, 2026-06-07).  When ``dv_dim > 0`` the measured
     # disturbance-variable channels (at ``dv_indices`` within the obs vector)
     # are fed as an EXOGENOUS input to the transition (concatenated with the
@@ -245,12 +248,13 @@ class _CategoricalLatent(nn.Module):
 
     def __init__(self, in_dim: int, n_categoricals: int, n_classes: int,
                  hidden_dim: int = 256, unimix: float = 0.01,
-                 latent_type: str = 'categorical'):
+                 latent_type: str = 'categorical', latent_noise: float = 0.0):
         super().__init__()
         self.n_categoricals = int(n_categoricals)
         self.n_classes = int(n_classes)
         self.unimix = float(unimix)
         self.latent_type = str(latent_type).lower()
+        self.latent_noise = float(latent_noise)
         self.net = _MLP(in_dim, n_categoricals * n_classes, hidden_dim,
                         num_layers=2)
 
@@ -259,11 +263,18 @@ class _CategoricalLatent(nn.Module):
         logits = self.net(x).view(*x.shape[:-1], self.n_categoricals,
                                    self.n_classes)
         if self.latent_type == 'deterministic':
-            # Continuous bounded latent: no softmax quantization, no KL.  The
-            # same tensor is returned as both the consistency target (``logits``
-            # slot → joint-embedding MSE) and the forward sample.
-            z = torch.tanh(logits)
-            return z, z
+            # Continuous bounded latent: no softmax quantization, no KL.  With
+            # ``latent_noise`` > 0 the FORWARD sample gets reparameterization
+            # noise — an information-bottleneck regularizer that replaces the
+            # categorical's stochastic-sampling regularization WITHOUT
+            # quantizing (curbs the overfit-to-wrong-gain the pure-deterministic
+            # latent showed).  The clean ``mean`` is the joint-embedding target.
+            mean = torch.tanh(logits)
+            if sample and self.latent_noise > 0.0:
+                z = mean + self.latent_noise * torch.randn_like(mean)
+            else:
+                z = mean
+            return mean, z
         # ---- categorical (DreamerV3) ----
         # Unimix: (1-u)·softmax + u·uniform, re-expressed as logits.
         probs = F.softmax(logits, dim=-1)
@@ -389,13 +400,15 @@ class RSSMDynamics(nn.Module):
         self.gru = nn.GRUCell(trans_in, self.deter_dim)
         # Prior p(z'|h') and posterior q(z'|h', embed).
         _lt = str(getattr(cfg, 'latent_type', 'categorical'))
+        _ln = float(getattr(cfg, 'latent_noise', 0.0) or 0.0)
         self.prior_net = _CategoricalLatent(
             self.deter_dim, self.n_categoricals, self.n_classes,
-            hidden_dim=self.hidden_dim, unimix=cfg.unimix, latent_type=_lt)
+            hidden_dim=self.hidden_dim, unimix=cfg.unimix, latent_type=_lt,
+            latent_noise=_ln)
         self.post_net = _CategoricalLatent(
             self.deter_dim + self.embed_dim, self.n_categoricals,
             self.n_classes, hidden_dim=self.hidden_dim, unimix=cfg.unimix,
-            latent_type=_lt)
+            latent_type=_lt, latent_noise=_ln)
         # Continuous-latent prior p(c'|h') and posterior q(c'|h', embed).
         if self.cont_dim > 0:
             self.cont_prior_net = _ContinuousLatent(

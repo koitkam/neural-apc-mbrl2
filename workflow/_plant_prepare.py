@@ -367,6 +367,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RSSM_KL_REPR_W':             ('rssm_kl_repr_w',                 float),
     # Latent type (categorical|deterministic) + joint-embedding consistency.
     'DREAMER_RSSM_LATENT_TYPE':           ('rssm_latent_type',               str),
+    'DREAMER_RSSM_LATENT_NOISE':          ('rssm_latent_noise',              float),
     'DREAMER_RSSM_JOINT_EMBED_COEF':      ('rssm_joint_embed_coef',          float),
     # TSSM (transformer-SSM) backbone dims (world_model_type='tssm').
     'DREAMER_TSSM_D_MODEL':               ('tssm_d_model',                   int),

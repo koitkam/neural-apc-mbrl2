@@ -795,6 +795,7 @@ class TrainConfig:
     # gain is not attenuated).  Deterministic uses the joint-embedding predict-
     # next-latent MSE (coef below) for prior/posterior imagination consistency.
     rssm_latent_type: str = 'categorical'
+    rssm_latent_noise: float = 0.0       # reparam noise on deterministic latent (regularizer)
     rssm_joint_embed_coef: float = 1.0   # deterministic-latent consistency weight
     rssm_free_bits: float = 0.5        # p117 recipe (promoted 2026-06-14; paper=1.0)
     rssm_kl_dyn_w: float = 0.5         # paper KL-balance dyn weight
@@ -5189,6 +5190,7 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
         rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
+        rssm_latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
         tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
         tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
         tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
