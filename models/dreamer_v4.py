@@ -1266,6 +1266,11 @@ class DreamerV4Config:
     # directly into the WM decoder + reward/value/policy heads (skips the
     # categorical bottleneck where the DV→CV gain dies).  No-op when dv_dim=0.
     dv_feedforward: bool = True
+    # Dynamic measured-DV feedforward transfer function (2026-08-13): additive-
+    # linear g_dv.lpf(dv) CV term so the DOB innovation is DV-free (the observer
+    # estimates ONLY the unmeasured load).  Threaded to RSSM+TSSM.  Disable with
+    # DREAMER_DV_FF_DYNAMIC=0 (revert to latent-only DV).
+    dv_ff_dynamic: bool = True
     # Neural Kalman filter / disturbance observer (DOB, 2026-06-11).  Threaded
     # to RSSM/TSSM config; ``cv_obs_indices`` = the CV positions in the obs
     # vector.  ``dob_enabled=False`` ⇒ disabled (pre-DOB behaviour).
@@ -1321,6 +1326,7 @@ class DreamerV4(nn.Module):
                 cont_dist_deterministic_roll=bool(getattr(
                     cfg, 'cont_dist_deterministic_roll', True)),
                 dv_decoder_feedforward=bool(getattr(cfg, 'dv_decoder_feedforward', False)),
+                dv_ff_dynamic=bool(getattr(cfg, 'dv_ff_dynamic', True)),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
             D = self.dynamics.feat_dim
@@ -1357,6 +1363,7 @@ class DreamerV4(nn.Module):
                 cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
                 cont_dist_deterministic_roll=bool(getattr(
                     cfg, 'cont_dist_deterministic_roll', True)),
+                dv_ff_dynamic=bool(getattr(cfg, 'dv_ff_dynamic', True)),
             )
             self.dynamics = TransformerSSMDynamics(tssm_cfg)
             D = self.dynamics.feat_dim

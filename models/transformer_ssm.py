@@ -158,6 +158,12 @@ class TransformerSSMConfig:
     # DIRECT exogenous-DV path that skips the categorical bottleneck (the DV gain
     # dies in the autoencoder, p129), and the heads see the disturbance.
     dv_feedforward: bool = True
+    # Dynamic measured-DV FEEDFORWARD transfer function (2026-08-13) — mirror of
+    # RSSMConfig.  Additive-linear ``g_dv . lpf(dv)`` CV term (un-attenuated gain
+    # via a per-DV first-order lag) so the DOB innovation is DV-free and the
+    # observer estimates ONLY the unmeasured load.  When on, the decoder MLP
+    # reads only the latent core (the raw DV drives CV via the feedforward).
+    dv_ff_dynamic: bool = True
     # Neural Kalman filter / disturbance observer (DOB) — mirror of RSSMConfig.
     # See models/dreamer_v4_rssm.RSSMConfig + docs/architecture.md §3.  Shared
     # feat->decode interface, so the observer math is identical to the RSSM.
@@ -355,6 +361,14 @@ class TransformerSSMDynamics(nn.Module):
         self.dv_feedforward = bool(getattr(cfg, 'dv_feedforward', True)) \
             and self.dv_dim > 0
         self._dv_feed_dim = self.dv_dim if self.dv_feedforward else 0
+        # Dynamic measured-DV feedforward (2026-08-13, mirror of RSSMDynamics):
+        # when on, the decoder MLP reads ONLY the latent core (the raw dv drives
+        # CV via the dedicated additive-linear feedforward, not the MLP).  Params
+        # (zero-init gain + per-DV first-order lag) are built after n_cv below.
+        self.dv_ff_dynamic = (bool(getattr(cfg, 'dv_ff_dynamic', True))
+                              and self.dv_feedforward and self.dv_dim > 0
+                              and len(getattr(cfg, 'cv_indices', ()) or ()) > 0)
+        self._dv_decoder_in = 0 if self.dv_ff_dynamic else self._dv_feed_dim
 
         # ----- shared, low-risk pieces (real implementations) -----
         self.encoder = nn.Sequential(
@@ -367,7 +381,7 @@ class TransformerSSMDynamics(nn.Module):
             # bottleneck); the DOB d-tail is sliced off in ``decode`` and
             # re-added via ``apply_dob``.
             nn.Linear(self.deter_dim + self.stoch_flat_dim + self.cont_dim
-                      + self._dv_feed_dim, cfg.embed_dim),
+                      + self._dv_decoder_in, cfg.embed_dim),
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
@@ -432,6 +446,11 @@ class TransformerSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
+        # Dynamic measured-DV feedforward params (2026-08-13, mirror of RSSM):
+        # additive-linear g_dv.lpf(dv) gain (zero-init) + per-DV first-order lag.
+        if self.dv_ff_dynamic:
+            self.dv_ff_gain = nn.Parameter(torch.zeros(self.n_cv, self.dv_dim))
+            self.dv_ff_log_pole = nn.Parameter(torch.zeros(self.dv_dim))
 
     @property
     def feat_dim(self) -> int:
@@ -444,9 +463,11 @@ class TransformerSSMDynamics(nn.Module):
 
     @property
     def _decode_in_dim(self) -> int:
-        # Width of the decoder input slice = latent core + cont latent + DV ff.
+        # Width of the decoder MLP input slice = latent core + cont latent + the
+        # raw-DV feedforward ONLY when the dynamic feedforward is OFF (else the
+        # DV reaches CV via the additive-linear ``g_dv`` term, not the MLP).
         return (self.deter_dim + self.stoch_flat_dim + self.cont_dim
-                + self._dv_feed_dim)
+                + self._dv_decoder_in)
 
     # ----- DOB helpers (mirror RSSMDynamics) -----
     def dob_decay(self) -> torch.Tensor:
@@ -474,6 +495,15 @@ class TransformerSSMDynamics(nn.Module):
         # DV-feedforward and the DOB are off.
         x = feat[..., :self._decode_in_dim]
         out = self.decoder(x)
+        if self.dv_ff_dynamic:
+            # Additive-linear measured-DV feedforward ``g_dv . lpf(dv)`` on the
+            # CV channels (mirror of RSSMDynamics.decode): the lagged dv sits in
+            # ``feat`` right after the latent core; bypasses the MLP so the DV
+            # DC-gain is not attenuated -> DV-free innovation for the observer.
+            core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
+            dv_lpf = feat[..., core:core + self.dv_dim]
+            ff = torch.matmul(dv_lpf, self.dv_ff_gain.t())       # (..., n_cv)
+            out = out.index_add(-1, self.cv_index_t, ff.to(out.dtype))
         return out
 
     def initial_state(self, batch_size: int,
@@ -574,7 +604,17 @@ class TransformerSSMDynamics(nn.Module):
                      c_mean[..., self.cont_gain_dim:]], dim=-1)
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
-        dv_new = dv if self.dv_feedforward else None
+        # DV feedforward: carry the first-order LAGGED dv when the dynamic
+        # feedforward is on (correct DV->CV dead-time for the additive-linear
+        # decode term; the token above saw the RAW dv).  Mirror of RSSMDynamics.
+        if not self.dv_feedforward:
+            dv_new = None
+        elif self.dv_ff_dynamic:
+            pole = torch.sigmoid(self.dv_ff_log_pole)
+            dv_prev = prev.dv if prev.dv is not None else torch.zeros_like(dv)
+            dv_new = pole * dv_prev + (1.0 - pole) * dv
+        else:
+            dv_new = dv
         return TSSMState(h=h, z_logits=z_logits, z=z,
                          kv_cache=new_cache, pos=pos + 1, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
@@ -648,7 +688,11 @@ class TransformerSSMDynamics(nn.Module):
                if self.dv_dim > 0 else None)             # (B, T, dv_dim) | None
         state = self.initial_state(B, device)
         core = self.deter_dim + self.stoch_flat_dim
-        dec_in = self._decode_in_dim                     # core (+ cont + dv ff)
+        # Stack the FULL decoder feat INCLUDING the DV slot (the dynamic DV
+        # feedforward reads lpf(dv) from it in ``decode``) even though the MLP
+        # reads a narrower slice; mirror of RSSMDynamics.rollout_observed.
+        dec_in = (self.deter_dim + self.stoch_flat_dim + self.cont_dim
+                  + self._dv_feed_dim)
         # Option B (2026-06-26, mirror of RSSMDynamics): when the cont
         # disturbance block is on, the innovation-driven posterior needs the CV
         # innovation ν (a prior decode) — too expensive per step in the compiled
