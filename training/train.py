@@ -921,6 +921,10 @@ class TrainConfig:
     # separation).  Zero-init gain -> starts at the pre-ff behaviour + grows.
     # Supersedes dv_decoder_feedforward.  ``DREAMER_DV_FF_DYNAMIC`` (default on).
     dv_ff_dynamic: bool = True
+    # DV→GRU transition gate (2026-08-16): =False removes the measured DV from the
+    # GRU/token transition so it drives CV ONLY via the feedforward (no double DV
+    # path that confounds the MV dynamics).  ``DREAMER_DV_FF_TRANSITION`` (def on).
+    dv_ff_transition: bool = True
     # De-contaminate the disturbance head from the MEASURED dv (2026-06-19, p130
     # RCA).  ``dv_feedforward`` routes the measured DV into ``feat`` (decoder +
     # heads).  The disturbance head predicts the UNMEASURED load — but it reads
@@ -5209,6 +5213,7 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
         dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
         dv_ff_dynamic=bool(getattr(cfg, 'dv_ff_dynamic', True)),
+        dv_ff_transition=bool(getattr(cfg, 'dv_ff_transition', True)),
         dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
         cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),

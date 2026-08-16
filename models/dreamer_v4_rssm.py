@@ -134,6 +134,13 @@ class RSSMConfig:
     # free separation).  Zero-init gain => starts byte-close to the pre-ff model
     # and grows.  Supersedes ``dv_decoder_feedforward`` (mutually exclusive).
     dv_ff_dynamic: bool = True
+    # DV→GRU TRANSITION gate (2026-08-16).  When the dynamic DV feedforward is
+    # on, ``dv_ff_transition=False`` REMOVES the measured DV from the GRU
+    # transition so it drives CV ONLY through the feedforward (MV→latent→CV;
+    # DV→feedforward→CV) — no double DV path to confound the MV dynamics /
+    # rotate MV↔DV gain.  True keeps the DV in the transition (original path).
+    # No-op (DV kept) when the feedforward is off (else the DV has no CV path).
+    dv_ff_transition: bool = True
     # ---- Neural Kalman filter / disturbance observer (DOB), 2026-06-11 ----
     # When ``dob_enabled`` the WM carries an explicit additive output-disturbance
     # state ``d_t`` (one scalar per CV channel) that INTEGRATES the one-step
@@ -391,10 +398,20 @@ class RSSMDynamics(nn.Module):
             bool(getattr(cfg, 'dv_decoder_feedforward', False))
             and self.dv_feedforward)
         self._dv_decode_dim = self.dv_dim if self.dv_decoder_feedforward else 0
-        # Transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
+        # DV→GRU transition gate (2026-08-16): drop the measured DV from the GRU
+        # when the dynamic feedforward carries it (no double DV path).  Keep it
+        # in the transition if the feedforward is OFF (else DV has no CV path).
+        self.dv_ff_transition = bool(getattr(cfg, 'dv_ff_transition', True))
+        _ff_on = (bool(getattr(cfg, 'dv_ff_dynamic', True)) and self.dv_feedforward
+                  and self.dv_dim > 0 and not self.dv_decoder_feedforward
+                  and len(getattr(cfg, 'cv_indices', ()) or ()) > 0)
+        self._dv_trans_dim = (self.dv_dim
+                              if (self.dv_dim > 0 and (self.dv_ff_transition or not _ff_on))
+                              else 0)
+        # Transition input = [z_flat ; (c) ; action ; (dv?)].  The continuous
         # latent feeds the GRU so ``h`` carries the gain/disturbance forward.
         trans_in = (self.stoch_flat_dim + self.cont_dim
-                    + self.action_dim + self.dv_dim)
+                    + self.action_dim + self._dv_trans_dim)
 
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
@@ -562,11 +579,11 @@ class RSSMDynamics(nn.Module):
                                      dtype=prev_action.dtype)
             parts.append(c_prev)
         parts.append(prev_action)
-        if self.dv_dim > 0:
-            if dv is None:
-                dv = torch.zeros(prev_action.shape[0], self.dv_dim,
-                                 device=prev_action.device,
-                                 dtype=prev_action.dtype)
+        if self.dv_dim > 0 and dv is None:
+            dv = torch.zeros(prev_action.shape[0], self.dv_dim,
+                             device=prev_action.device,
+                             dtype=prev_action.dtype)
+        if self._dv_trans_dim > 0:
             parts.append(dv)
         x = torch.cat(parts, dim=-1)
         x = self.pre_gru(x)

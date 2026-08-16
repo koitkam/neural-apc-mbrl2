@@ -164,6 +164,10 @@ class TransformerSSMConfig:
     # observer estimates ONLY the unmeasured load.  When on, the decoder MLP
     # reads only the latent core (the raw DV drives CV via the feedforward).
     dv_ff_dynamic: bool = True
+    # DV→transition gate (2026-08-16) — mirror of RSSMConfig.  dv_ff_transition=
+    # False removes the measured DV from the token transition (DV drives CV ONLY
+    # via the feedforward) — no double DV path.  No-op when the feedforward is off.
+    dv_ff_transition: bool = True
     # Neural Kalman filter / disturbance observer (DOB) — mirror of RSSMConfig.
     # See models/dreamer_v4_rssm.RSSMConfig + docs/architecture.md §3.  Shared
     # feat->decode interface, so the observer math is identical to the RSSM.
@@ -369,6 +373,13 @@ class TransformerSSMDynamics(nn.Module):
                               and self.dv_feedforward and self.dv_dim > 0
                               and len(getattr(cfg, 'cv_indices', ()) or ()) > 0)
         self._dv_decoder_in = 0 if self.dv_ff_dynamic else self._dv_feed_dim
+        # DV→transition gate (2026-08-16, mirror of RSSMDynamics): drop the DV from
+        # the token transition when the feedforward carries it (no double path);
+        # keep it if the feedforward is off (else the DV has no CV path).
+        self.dv_ff_transition = bool(getattr(cfg, 'dv_ff_transition', True))
+        self._dv_trans_dim = (self.dv_dim
+                              if (self.dv_dim > 0 and (self.dv_ff_transition or not self.dv_ff_dynamic))
+                              else 0)
 
         # ----- shared, low-risk pieces (real implementations) -----
         self.encoder = nn.Sequential(
@@ -385,9 +396,9 @@ class TransformerSSMDynamics(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
-        # Token projection: [z_{t-1}_flat ; (c) ; a_t ; (dv_t)] -> d_model.
+        # Token projection: [z_{t-1}_flat ; (c) ; a_t ; (dv_t?)] -> d_model.
         self.token_proj = nn.Linear(
-            self.stoch_flat_dim + self.cont_dim + self.action_dim + self.dv_dim,
+            self.stoch_flat_dim + self.cont_dim + self.action_dim + self._dv_trans_dim,
             self.deter_dim)
         # Causal transformer (custom blocks: support full + KV-cached step).
         self.n_heads = int(cfg.n_heads)
@@ -535,10 +546,10 @@ class TransformerSSMDynamics(nn.Module):
                                 device=action.device, dtype=action.dtype)
             parts.append(c)
         parts.append(action)
-        if self.dv_dim > 0:
-            if dv is None:
-                dv = torch.zeros(action.shape[0], self.dv_dim,
-                                 device=action.device, dtype=action.dtype)
+        if self.dv_dim > 0 and dv is None:
+            dv = torch.zeros(action.shape[0], self.dv_dim,
+                             device=action.device, dtype=action.dtype)
+        if self._dv_trans_dim > 0:
             parts.append(dv)
         return self.token_proj(torch.cat(parts, dim=-1))
 
