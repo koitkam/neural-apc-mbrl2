@@ -11,6 +11,16 @@ expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 Status legend: **[current]** = implemented & default · **[opt-in]** = implemented,
 env-gated off · **[planned]** = designed, not yet built.
 
+> **2026-08-17:** measured-DV **feedforward transfer function** (§3b, `dv_ff_dynamic`,
+> default ON, both backbones) — an additive-linear `g_dv · lpf(dv)` CV term + a
+> learnable first-order lag composed in `decode()` so the DOB innovation is DV-free
+> and the observer estimates ONLY the unmeasured load. Fixed the open-loop DV-gain
+> collapse (×0.20→×0.84). `dv_ff_transition` (default ON) keeps the DV in the GRU too
+> (removing it cleans the MV but under-drives the subdominant DV — see §3b). Reload
+> sites (`validate.py`, `wm_steady_state_diagnostic._load_model`, `bo_runner.py`,
+> `export_onnx.py`) now thread the DV-feedforward flags (else a non-default reload
+> mismatches the checkpoint).
+
 > **2026-06-11:** the neural-Kalman-filter / DOB disturbance observer (§3) is now
 > **implemented** in both backbones (`models/dreamer_v4_rssm.py`,
 > `models/transformer_ssm.py`), env-gated **off** by default
@@ -273,15 +283,28 @@ default on). Threaded through all 5 `DreamerV4Config` build sites.
 real recompute impl — `cont_kl`, `gain_match_loss`, the innovation 2-pass all
 smoke-pass on both backbones).
 
-> **DV→decoder paths removed (p141 + p146)**: the measured DV drives the CV
-> ONLY through the recurrent transition (like the MV) — no instantaneous decoder
-> feedthrough. The p132 zero-init `W·dv_t` decoder skip (`dv_static_skip`) is
-> **deleted** (p141: a memoryless feedthrough + `gain_match` crutch, superseded
-> by the cont GAIN block + `gain_match`). The p129 `dv_feedforward` decoder half
-> is **default OFF** (p146 RCA: appending `dv_t` to the decoder input made the WM
-> DV response LEAD the plant and settle low; `DREAMER_DV_DECODER_FEEDFORWARD=1`
-> restores it). The measured DV still feeds the head-facing `feat` so the
-> actor/critic see the load.
+> **Measured-DV FEEDFORWARD transfer function (2026-08, `dv_ff_dynamic`, default ON)**:
+> the measured DV is a KNOWN input, so the observer models it EXPLICITLY and the DOB
+> estimates only the UNMEASURED load (textbook offset-free feedforward/feedback split).
+> `decode()` adds an **additive-linear `g_dv · lpf(dv)`** term to the CV channels
+> (bypasses the decoder MLP → un-attenuated, identifiable gain) driven by a learnable
+> per-DV **first-order lag** (correct dead-time; a memoryless `dv_t` LED the plant,
+> p146). Composed in `decode()`, so the recon, the DOB innovation, AND the open-loop
+> rollout all become DV-free → the DOB stops absorbing the measured DV (open-loop DV
+> gain ×0.20→×0.84; DOB `K`→0.045). Zero-init gain (starts at the pre-ff model).
+> `DREAMER_DV_FF_DYNAMIC`; both backbones; supersedes the memoryless decoder half.
+> - **`dv_ff_transition` (default ON, `DREAMER_DV_FF_TRANSITION`)**: the DV ALSO feeds
+>   the GRU/token transition. Setting it OFF (DV → feedforward ONLY) cleans up the MV
+>   dynamics (at-horizon ×0.58→×0.95) but the LINEAR feedforward alone under-drives the
+>   subdominant/nonlinear DV (×0.84→×0.52) — so the GRU is KEPT (default ON) to carry
+>   the DV's nonlinear/higher-order response while the feedforward supplies the
+>   un-attenuated DC gain that stops the DOB absorption.
+>
+> Superseded history: the p132 `dv_static_skip` decoder skip is **deleted** (p141:
+> memoryless feedthrough + `gain_match` crutch). The p129 `dv_feedforward` decoder
+> half is **default OFF** (p146 RCA: appending `dv_t` to the decoder input made the WM
+> DV response LEAD the plant + settle low; `DREAMER_DV_DECODER_FEEDFORWARD=1` restores
+> it). The measured DV still feeds the head-facing `feat` so the actor/critic see the load.
 
 ### Continuous-latent curriculum (the simplified path)
 
