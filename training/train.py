@@ -867,6 +867,11 @@ class TrainConfig:
     # ``DREAMER_WM_SS_MATCH_COEF``.
     wm_ss_match_coef: float = 0.0
     wm_ss_match_window_frac: float = 0.34   # terminal fraction of K used as the SS window
+    # Option 1 (2026-08-17): weight the DC-gain match by how SETTLED each seq's
+    # REAL CV window is (exp(-Var/ss_var), normalized units) so the per-input
+    # steady-state gain is identified ONLY from settled data — undilutes the
+    # signal a mixed PRBS+settle isolation batch drowns.  0 = off (unweighted).
+    wm_ss_match_settle_var: float = 0.0
     wm_isolation_settle_episodes: int = 0   # dedicated long-hold isolated settle eps (auto)
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
@@ -4360,23 +4365,30 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     # → pins the DC gain the transient-dominated per-step MSE under-shoots.
     ss_coef = float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0)
     w_frac = float(getattr(cfg, 'wm_ss_match_window_frac', 0.34) or 0.34)
+    ss_var = float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0)
     ss_k0 = K - max(1, int(round(min(max(w_frac, 0.05), 0.9) * K)))
     total = zero
-    ss_pred_sum = zero
-    ss_real_sum = zero
-    ss_n = 0
+    cv_pred_win = []
     for k in range(K):
         dvk = dv_all[:, k] if dv_all is not None else None
         st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
         cv_pred = rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
         total = total + (cv_pred - cv_real[:, k]).pow(2).mean()
         if ss_coef > 0.0 and k >= ss_k0:
-            ss_pred_sum = ss_pred_sum + cv_pred
-            ss_real_sum = ss_real_sum + cv_real[:, k]
-            ss_n += 1
+            cv_pred_win.append(cv_pred)
     out = coef * (total / float(K))
-    if ss_coef > 0.0 and ss_n > 0:
-        ss = ((ss_pred_sum - ss_real_sum) / float(ss_n)).pow(2).mean()
+    if ss_coef > 0.0 and cv_pred_win:
+        pred_ss = torch.stack(cv_pred_win, dim=1).mean(dim=1)     # (Bm, n_cv)
+        real_win = cv_real[:, ss_k0:ss_k0 + len(cv_pred_win)]     # (Bm, W, n_cv)
+        ss_err = (pred_ss - real_win.mean(dim=1)).pow(2)         # (Bm, n_cv)
+        if ss_var > 0.0:
+            # Option 1: only SETTLED sequences carry a DC-gain signal — weight by
+            # exp(-Var(real CV window)/ss_var) so transient (PRBS) episodes don't
+            # dilute the per-input steady-state match (undiluted, symmetric).
+            w = torch.exp(-real_win.var(dim=1) / ss_var)
+            ss = (ss_err * w).sum() / w.sum().clamp_min(1e-6)
+        else:
+            ss = ss_err.mean()
         out = out + coef * ss_coef * ss
     return out
 
@@ -6538,16 +6550,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # nonlinear / black-box, no-known-gain generaliser) alongside the
             # gain channel.  Input-symmetric; graceful no-op if no isolated eps.
             if float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) <= 0.0:
-                cfg.wm_input_isolation_coef = 0.5
+                cfg.wm_input_isolation_coef = 1.0  # opt1: 0.5→1.0 (per-input ID first-class)
             if int(getattr(cfg, 'wm_input_isolation_len', 0) or 0) <= 0:
                 cfg.wm_input_isolation_len = int(getattr(cfg, 'horizon', 15) or 15)
-            # p08 RCA: auto-enable the self-supervised steady-state (DC-gain)
-            # match + its long-hold isolated settle episodes so the WM gain is
-            # UNBIASED with NO identified value (nonlinear / black-box safe).
+            # Option 1 (2026-08-17): elevate the STEADY-STATE (DC-gain) match to a
+            # FIRST-CLASS, CLEAN, SYMMETRIC per-input objective — the control-
+            # relevant target (Lambert objective-mismatch: recon likelihood is not
+            # correlated with control accuracy).  Strong weight + settledness-gate
+            # (settle_var, undilutes the DC signal) + more long-hold settle data,
+            # identical for every input (MV & DV) — no asymmetric feedforward.
             if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) <= 0.0:
-                cfg.wm_ss_match_coef = 1.0  # p147: 0.5→1.0 (DV DC-gain still under ~0.73)
+                cfg.wm_ss_match_coef = 3.0  # opt1: 1.0→3.0 (DC gain = first-class)
+            if float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0) <= 0.0:
+                cfg.wm_ss_match_settle_var = 0.05  # settled-only DC-gain signal
             if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
-                cfg.wm_isolation_settle_episodes = 8  # p09: 4→8 (DV still under)
+                cfg.wm_isolation_settle_episodes = 24  # opt1: 8→24 (clean per-input settled data)
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
                   f'gain_dim={cfg.cont_gain_dim} '
                   f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
