@@ -19,13 +19,17 @@ env-gated off · **[planned]** = designed, not yet built.
 > real→posterior 0.77→0.94, confirming the unmeasured load was an omitted
 > variable attenuating the gain — exactly what the DOB de-confounds.
 
-> **2026-06-22:** the **continuous gain+disturbance latent (§3b, C3)** supersedes
-> the DOB as the default direction (`DREAMER_CONT_LATENT_ENABLED=1`). One Gaussian
-> latent fixes BOTH the subdominant DV-gain categorical-attenuation bias (≈0.85,
-> via the C(1) gain-match) AND the unmeasured-disturbance estimate (an inherent
-> amortized Kalman, **no DOB**). The DOB stays in the code as a one-flag fallback
+> **2026-06-22 [SUPERSEDED 2026-08-18 — see below]:** the **continuous
+> gain+disturbance latent (§3b, C3)** supersedes the DOB as the default direction
+> (`DREAMER_CONT_LATENT_ENABLED=1`). One Gaussian latent fixes BOTH the
+> subdominant DV-gain categorical-attenuation bias (≈0.85, via the C(1)
+> gain-match) AND the unmeasured-disturbance estimate (an inherent amortized
+> Kalman, **no DOB**). The DOB stays in the code as a one-flag fallback
 > (`DREAMER_DOB_ENABLED=1`) until the cont disturbance is verified to recover
-> (detrended r ≥ the DOB's 0.354). First run: p137.
+> (detrended r ≥ the DOB's 0.354). First run: p137. *(The cont **disturbance**
+> channel FAILED to recover — p137–p141 held-out r ≤ 0 — and was reverted at
+> p142; the cont latent now keeps only the **gain** block. See the 2026-08-18
+> note.)*
 
 > **2026-07-07 — neural-apc-mbrl2 fork (REAL-SIM controller):** the actor is no
 > longer trained in WM imagination. **Imagination is deleted** (`imagination_step`
@@ -42,6 +46,32 @@ env-gated off · **[planned]** = designed, not yet built.
 > are **superseded**; the WM losses (recon/KL/DOB + overshoot/held-rollout) are
 > KEPT — they train the OBSERVER, not the deleted imagination actor.
 > `actor_train_source='realsim'` (default).
+
+> **2026-08-18 — observer sharpened (GAIN + DISTURBANCE).** Terminology note: the
+> RSSM is still a **world model** (a learned plant-dynamics model `g`/`f`; the
+> `wm_*` diagnostics show it *imagining* open-loop step responses to measure its
+> fidelity). Its **role** in this fork is a **frozen OBSERVER** (state +
+> disturbance estimator) that the real-rollout actor-critic reads. Three updates:
+> **(1) DOB reinstated as the default disturbance estimator (p142).** The
+> continuous *disturbance* latent (2026-06-22) was dropped — it competed with the
+> DOB for the same CV innovation (the gain↔disturbance identifiability confound)
+> and never recovered (p137–p141 held-out r ≤ 0). The cont latent now keeps ONLY
+> the **gain** block (the C(1) gain-match de-confounder); the neural-Kalman
+> **DOB `d_t` owns the unmeasured load** (`DREAMER_DOB_ENABLED=1` auto-selects the
+> GAIN-ONLY cont latent). **(2) Option 1 — symmetric per-input steady-state
+> DC-gain ID (p18).** A first-class, input-symmetric `wm_ss_match` DC-gain
+> objective (settledness-gated via `wm_ss_match_settle_var`, MV & DV identical)
+> makes the observer's gain **bias-free** on the linear plant (MV ×0.92, DV ×1.14,
+> ss ≈ at-horizon ⇒ stable open-loop). **(3) P19 — KalmanNet-style DOB grounding**
+> (`DREAMER_DOB_GROUND_COEF`, §3). P18 showed the DOB *under-tracked* the load
+> (d_t vs true r=0.42, ~0.3× amplitude): in Stage-2 the recon innovation alone
+> under-drives `d_t` (the slow load is a small share of the recon MSE) and
+> `dob_reg` opposes it, so imagination + the critic stayed disturbance-blind and
+> the actor collapsed below the open-loop baseline. Grounding adds a direct
+> `dob_ground_coef · ‖d_t − true_load‖²` (unit-matched via the running CV
+> obs-norm std) that tunes the Kalman `A,K` to TRACK the load — the structural fix
+> for the manual `dob_gain_init` amplitude tuning. `dob_reg_coef → 0` when
+> grounding is on. First run: p19 (`run_p19_dobground`).
 
 ---
 
@@ -185,6 +215,15 @@ flowchart LR
   recon loss compares `g(feat)+d_t` vs `obs`, and an L2 prior on `d_t`
   (`dob_reg_coef`, the Kalman "process-noise-is-small" assumption) keeps the
   model using `d_t` only for the genuine residual.
+- **Grounding (KalmanNet, P19)**: the recon innovation alone under-drives `d_t`
+  in Stage-2 (the slow load is a small share of the recon MSE and `dob_reg`
+  opposes it, so the load amplitude is under-estimated — p18: `d_t` vs true load
+  r=0.42, ~0.3× amplitude). When `dob_ground_coef > 0` a direct target
+  `‖d_t − true_load‖²` (the sim's known hidden load, unit-matched to `d_t`'s
+  normalized space via the running CV obs-norm std, threaded as `cfg._cv_obs_std`)
+  tunes the Kalman `A,K` to TRACK the load — the structural replacement for the
+  manual `dob_gain_init` amplitude tuning and the `dob_reg` prior
+  (`dob_reg_coef → 0` when grounding is on). `DREAMER_DOB_GROUND_COEF`.
 - **Disturbance estimate**: `d_t` itself is the estimate — `wm_disturbance_prediction`
   reads it directly (converted to engineering units via the obs-norm std),
   superseding the read-out head when DOB is on.
@@ -207,7 +246,14 @@ decay/correct, CV-only add, grad-isolated into `opt_world`).
 
 ---
 
-## 3b. [current] Continuous gain+disturbance latent (C3) — the DOB-free direction
+## 3b. [current] Continuous GAIN latent (C3) — DV-gain de-confounder
+
+> **GAIN-ONLY (2026-08-18):** the continuous **gain** block below is current; the
+> continuous **disturbance** block it originally shipped with was reverted at p142
+> (it competed with the DOB for the same CV innovation and never recovered). With
+> `DREAMER_DOB_ENABLED=1` the cont latent auto-resolves to **gain-only**
+> (`cont_dist_dim=0`, `dist_match` off) and the neural-Kalman **DOB `d_t` owns the
+> unmeasured load** (§3). See the 2026-08-18 changelog note above.
 
 Shipped 2026-06-22 (`DREAMER_CONT_LATENT_ENABLED=1`, first run p137). A small
 **Gaussian latent alongside the categorical** (`_ContinuousLatent` in
