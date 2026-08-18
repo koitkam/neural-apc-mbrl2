@@ -181,13 +181,9 @@ def _load_model(ckpt_path: Path, device: torch.device):
         tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
         dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
         dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
-        # DV feedforward flags (2026-08): MUST thread — they change the model
-        # STRUCTURE (GRU/decoder input dims + the dv_ff params), so a reload
-        # that defaults them mismatches the checkpoint (dv_ff_transition=False
-        # -> pre_gru 1027 vs default-True 1028).
+        # dv_feedforward changes feat_dim (DV in the head feat); thread it so a
+        # non-default reload matches the checkpoint structure.
         dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        dv_ff_dynamic=bool(getattr(cfg, 'dv_ff_dynamic', True)),
-        dv_ff_transition=bool(getattr(cfg, 'dv_ff_transition', True)),
         # Neural Kalman filter / DOB (2026-06-11): thread so the rebuilt model
         # has the d_t observer params (else load_state_dict fails on DOB keys).
         dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),

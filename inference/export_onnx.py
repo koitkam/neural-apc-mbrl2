@@ -165,8 +165,6 @@ if __name__ == '__main__':
         dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
         dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
         dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        dv_ff_dynamic=bool(getattr(cfg, 'dv_ff_dynamic', True)),
-        dv_ff_transition=bool(getattr(cfg, 'dv_ff_transition', True)),
         dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
         cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),

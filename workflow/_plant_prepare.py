@@ -246,10 +246,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # into the decoder + heads.  Default ON; =0 reverts to transition-only DV.
     'DREAMER_DV_FEEDFORWARD':             ('dv_feedforward',             _as_bool),
     'DREAMER_DV_DECODER_FEEDFORWARD':     ('dv_decoder_feedforward',     _as_bool),
-    # Dynamic measured-DV feedforward transfer function (2026-08-13): additive-
-    # linear g_dv.lpf(dv) so the DOB innovation is DV-free.  Default ON; =0 off.
-    'DREAMER_DV_FF_DYNAMIC':              ('dv_ff_dynamic',              _as_bool),
-    'DREAMER_DV_FF_TRANSITION':           ('dv_ff_transition',           _as_bool),
     # De-contaminate the disturbance head from the MEASURED dv (2026-06-19,
     # p130): zero the dv-feedforward columns of feat before the disturbance
     # head so it predicts the UNMEASURED load, not the measured DV.  Default ON.

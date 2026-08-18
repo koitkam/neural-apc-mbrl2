@@ -120,27 +120,6 @@ class RSSMConfig:
     # the head-facing ``feat`` (``dv_feedforward``) so the actor still sees the
     # load.  No-op when ``dv_feedforward`` is off or the plant has no DV.
     dv_decoder_feedforward: bool = False
-    # Dynamic measured-DV FEEDFORWARD transfer function (2026-08-13).  The
-    # subdominant measured DV is attenuated in the shared latent (it competes
-    # with the dominant MV for capacity -> DV DC-gain ~0.6 while MV ~0.85), and
-    # the omitted gain leaks into the DOB innovation so the observer ABSORBS the
-    # measured DV (open-loop DV gain collapses).  Fix = a dedicated feedforward
-    # transfer function on the CV output: an ADDITIVE-LINEAR ``g_dv . lpf(dv)``
-    # term (bypasses the decoder MLP -> un-attenuated, identifiable gain) driven
-    # by a learnable per-DV FIRST-ORDER LAG (the memoryless dv_t path LED the
-    # plant + settled low, p146).  Composed inside ``decode`` so recon, the DOB
-    # innovation, and the open-loop rollout all become DV-free -> the observer
-    # estimates ONLY the unmeasured load (textbook feedforward/feedback offset-
-    # free separation).  Zero-init gain => starts byte-close to the pre-ff model
-    # and grows.  Supersedes ``dv_decoder_feedforward`` (mutually exclusive).
-    dv_ff_dynamic: bool = True
-    # DV→GRU TRANSITION gate (2026-08-16).  When the dynamic DV feedforward is
-    # on, ``dv_ff_transition=False`` REMOVES the measured DV from the GRU
-    # transition so it drives CV ONLY through the feedforward (MV→latent→CV;
-    # DV→feedforward→CV) — no double DV path to confound the MV dynamics /
-    # rotate MV↔DV gain.  True keeps the DV in the transition (original path).
-    # No-op (DV kept) when the feedforward is off (else the DV has no CV path).
-    dv_ff_transition: bool = True
     # ---- Neural Kalman filter / disturbance observer (DOB), 2026-06-11 ----
     # When ``dob_enabled`` the WM carries an explicit additive output-disturbance
     # state ``d_t`` (one scalar per CV channel) that INTEGRATES the one-step
@@ -398,20 +377,10 @@ class RSSMDynamics(nn.Module):
             bool(getattr(cfg, 'dv_decoder_feedforward', False))
             and self.dv_feedforward)
         self._dv_decode_dim = self.dv_dim if self.dv_decoder_feedforward else 0
-        # DV→GRU transition gate (2026-08-16): drop the measured DV from the GRU
-        # when the dynamic feedforward carries it (no double DV path).  Keep it
-        # in the transition if the feedforward is OFF (else DV has no CV path).
-        self.dv_ff_transition = bool(getattr(cfg, 'dv_ff_transition', True))
-        _ff_on = (bool(getattr(cfg, 'dv_ff_dynamic', True)) and self.dv_feedforward
-                  and self.dv_dim > 0 and not self.dv_decoder_feedforward
-                  and len(getattr(cfg, 'cv_indices', ()) or ()) > 0)
-        self._dv_trans_dim = (self.dv_dim
-                              if (self.dv_dim > 0 and (self.dv_ff_transition or not _ff_on))
-                              else 0)
-        # Transition input = [z_flat ; (c) ; action ; (dv?)].  The continuous
+        # Transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
         # latent feeds the GRU so ``h`` carries the gain/disturbance forward.
         trans_in = (self.stoch_flat_dim + self.cont_dim
-                    + self.action_dim + self._dv_trans_dim)
+                    + self.action_dim + self.dv_dim)
 
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
@@ -491,18 +460,6 @@ class RSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
-        # Dynamic measured-DV feedforward transfer function (2026-08-13): an
-        # additive-linear ``g_dv . lpf(dv)`` CV term (un-attenuated gain) with a
-        # learnable per-DV first-order lag.  Makes the DOB innovation DV-free so
-        # the observer estimates ONLY the unmeasured load.  Mutually exclusive
-        # with the memoryless ``dv_decoder_feedforward`` (p146).  Zero-init gain.
-        self.dv_ff_dynamic = (bool(getattr(cfg, 'dv_ff_dynamic', True))
-                              and self.dv_feedforward and self.dv_dim > 0
-                              and self.n_cv > 0
-                              and not self.dv_decoder_feedforward)
-        if self.dv_ff_dynamic:
-            self.dv_ff_gain = nn.Parameter(torch.zeros(self.n_cv, self.dv_dim))
-            self.dv_ff_log_pole = nn.Parameter(torch.zeros(self.dv_dim))
 
     @property
     def feat_dim(self) -> int:
@@ -579,11 +536,11 @@ class RSSMDynamics(nn.Module):
                                      dtype=prev_action.dtype)
             parts.append(c_prev)
         parts.append(prev_action)
-        if self.dv_dim > 0 and dv is None:
-            dv = torch.zeros(prev_action.shape[0], self.dv_dim,
-                             device=prev_action.device,
-                             dtype=prev_action.dtype)
-        if self._dv_trans_dim > 0:
+        if self.dv_dim > 0:
+            if dv is None:
+                dv = torch.zeros(prev_action.shape[0], self.dv_dim,
+                                 device=prev_action.device,
+                                 dtype=prev_action.dtype)
             parts.append(dv)
         x = torch.cat(parts, dim=-1)
         x = self.pre_gru(x)
@@ -607,19 +564,9 @@ class RSSMDynamics(nn.Module):
         # DOB predict step: decay the disturbance estimate (no obs to correct).
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
-        # DV feedforward: carry the measured DV into the state so ``feat`` +
-        # ``decode`` expose it.  With the dynamic feedforward on, carry the
-        # first-order LAGGED dv (lpf) so the additive-linear ``g_dv`` term in
-        # ``decode`` has the plant's DV->CV dead-time (a memoryless dv_t LED the
-        # plant, p146); the GRU above still sees the RAW dv for the dynamic path.
-        if not self.dv_feedforward:
-            dv_new = None
-        elif self.dv_ff_dynamic:
-            pole = torch.sigmoid(self.dv_ff_log_pole)
-            dv_prev = prev.dv if prev.dv is not None else torch.zeros_like(dv)
-            dv_new = pole * dv_prev + (1.0 - pole) * dv
-        else:
-            dv_new = dv
+        # DV feedforward: carry the (real / held / zero-filled) DV into the
+        # state so ``feat`` + ``decode`` expose it to the decoder and heads.
+        dv_new = dv if self.dv_feedforward else None
         return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
 
@@ -852,16 +799,6 @@ class RSSMDynamics(nn.Module):
         # are both off, ``feat`` is already core-width so this is a no-op slice.
         x = feat[..., :self._decode_in_dim]
         out = self.decoder(x)
-        if self.dv_ff_dynamic:
-            # Additive-linear measured-DV feedforward ``g_dv . lpf(dv)`` on the
-            # CV channels: the lagged dv sits in ``feat`` right after the latent
-            # core (the dv_feedforward slot).  Bypasses the MLP so the DV DC-gain
-            # is not attenuated (the subdominant DV dies to ~0.6 through the
-            # latent), giving the observer a DV-free innovation to work from.
-            core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
-            dv_lpf = feat[..., core:core + self.dv_dim]
-            ff = torch.matmul(dv_lpf, self.dv_ff_gain.t())       # (..., n_cv)
-            out = out.index_add(-1, self.cv_index_t, ff.to(out.dtype))
         return out
 
 
