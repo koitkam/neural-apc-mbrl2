@@ -702,17 +702,17 @@ class TrainConfig:
     # the unmeasured-disturbance estimate (feeds the disturbance diagnostic).
     # See docs/architecture.md §3.  ``dob_enabled=False`` = byte-identical to the
     # pre-DOB model.  Backbone-agnostic (RSSM + TSSM share feat->decode).  ENV:
-    # DREAMER_DOB_ENABLED / _REG_COEF / _DECAY_INIT / _GAIN_INIT.
-    # Default False (p136, 2026-06-21): the DOB was added to DE-CONFOUND the gain
-    # (omitted-variable attenuation), but the REAL confound was domain
-    # randomization — fixed in Stage A (DR-off ID → gain 0.84→0.97).  With the
-    # gain de-confounded, the DOB's job is subsumed: the frozen-g GRU latent
-    # already tracks the unmeasured disturbance (p109 read-out r=0.95) and the
-    # always-trainable disturbance_head reads it out.  So we identify clean
-    # (DR off, g frozen in Stage 2) WITHOUT the DOB and let the head be the
-    # disturbance estimator.  The DOB code is retained + gated (verify-then-strip):
-    # set True to restore the additive d_t observer.  ``DREAMER_DOB_ENABLED=1``.
-    dob_enabled: bool = False
+    # DREAMER_DOB_ENABLED / _REG_COEF / _DECAY_INIT / _GAIN_INIT / _GROUND_COEF.
+    # Default True (reinstated p142, 2026-08-18): the DOB was briefly defaulted
+    # OFF (p136) when the continuous-disturbance latent looked like a DOB-free
+    # replacement — but that latent COMPETED with the DOB for the same CV
+    # innovation (gain↔disturbance identifiability) and never recovered (p137–
+    # p141 held-out r ≤ 0), so it was reverted at p142.  The neural-Kalman DOB
+    # ``d_t`` is now the DEFAULT disturbance estimator of the OBSERVER (RSSM+DOB):
+    # clean gain ID in Stage-1, DOB A,K identified (now GROUNDED, below) in
+    # Stage-2, frozen observer in Stage-3 while the agent trains on real rollouts.
+    # ``DREAMER_DOB_ENABLED=0`` restores the pre-DOB model.
+    dob_enabled: bool = True
     dob_reg_coef: float = 0.01      # L2 "process-noise-is-small" prior on d_t
     dob_decay_init: float = 3.0     # sigmoid(3.0)=0.953 — slow persistence (A)
     # sigmoid(-2.0)=0.119 — modest Kalman correction (K).  History: -2.2 (p121)

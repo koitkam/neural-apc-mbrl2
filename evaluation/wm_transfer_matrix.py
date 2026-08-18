@@ -511,14 +511,14 @@ def plot_transfer_matrix(result: Dict, out_path: Path, title: str = '') -> None:
         Line2D([0], [0], color='k', lw=1.8, ls='-',
                label='real sim (ground truth)'),
         Line2D([0], [0], color='C0', lw=1.8, ls='--',
-               label='world model (imagination)'),
+               label='observer model (open-loop rollout)'),
         Patch(facecolor='grey', alpha=0.2,
               label='shaded = min–max across operating region'),
         Line2D([0], [0], color='grey', lw=0.6, label='zero gain'),
     ]
     fig.legend(handles=legend_handles, loc='lower center', ncol=4,
                fontsize=8, framealpha=0.9, bbox_to_anchor=(0.5, 0.085))
-    sup = title or ('World-model vs real-plant transfer-function matrix '
+    sup = title or ('Observer process-model vs real-plant transfer matrix '
                     '(MV→CV step response)')
     fig.suptitle(sup, fontsize=11, y=0.99)
     # Two-line "how to read it" caption (the colour key lives in the legend
@@ -583,19 +583,19 @@ def plot_dv_transfer_matrix(result: Dict, out_path: Path,
             ax.grid(alpha=0.25)
     legend_handles = [
         Line2D([0], [0], color='k', lw=1.8, ls='-', label='real sim (ground truth)'),
-        Line2D([0], [0], color='C0', lw=1.8, ls='--', label='world model (DV held)'),
+        Line2D([0], [0], color='C0', lw=1.8, ls='--', label='observer model (DV held)'),
         Patch(facecolor='grey', alpha=0.2, label='shaded = min–max across operating region'),
         Line2D([0], [0], color='grey', lw=0.6, label='zero gain'),
     ]
     fig.legend(handles=legend_handles, loc='lower center', ncol=4, fontsize=8,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.085))
-    sup = title or ('World-model vs real-plant DV→CV transfer matrix '
+    sup = title or ('Observer process-model vs real-plant DV→CV transfer matrix '
                     '(measured-disturbance step response)')
     fig.suptitle(sup, fontsize=11, y=0.99)
     fig.text(0.5, 0.02,
-             'How to read: world model (blue dashed) should OVERLAP real sim '
-             '(black solid).\nThe WM holds the stepped DV constant (Option B '
-             'feedforward); flatter/smaller ⇒ WM ∂CV/∂DV too small.',
+             'How to read: observer model (blue dashed) should OVERLAP real sim '
+             '(black solid).\nThe observer holds the stepped DV constant (Option B '
+             'feedforward); flatter/smaller ⇒ observer ∂CV/∂DV too small.',
              ha='center', va='bottom', fontsize=8)
     fig.tight_layout(rect=(0, 0.16, 1, 0.95))
     out_path = Path(out_path)
@@ -681,19 +681,19 @@ def plot_combined_transfer_matrix(mv_result: Dict, dv_result: Optional[Dict],
                  va='top', ha='left')
     legend_handles = [
         Line2D([0], [0], color='k', lw=2.2, ls='-', label='real sim (ground truth)'),
-        Line2D([0], [0], color='C0', lw=2.2, ls='--', label='world model'),
+        Line2D([0], [0], color='C0', lw=2.2, ls='--', label='observer model'),
         Patch(facecolor='grey', alpha=0.2,
               label='shaded = GAIN range across operating points (NOT noise)'),
     ]
     fig.legend(handles=legend_handles, loc='lower center', ncol=3, fontsize=8,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.075))
-    sup = title or ('World-model vs real-plant transfer matrix '
+    sup = title or ('Observer process-model vs real-plant transfer matrix '
                     '(DMC-style: input rows × CV cols)')
     fig.suptitle(sup, fontsize=12, y=0.99)
     fig.text(0.5, 0.018,
              'How to read: each cell = step response of that CV to that input '
              '(engineering gain); read the GAIN at the SETTLED (right) end — the '
-             'cell title gives the SS gains.\nWM (blue dashed) should overlap '
+             'cell title gives the SS gains.\nObserver model (blue dashed) should overlap '
              'real (black solid).  The shaded band is the GAIN RANGE across '
              'operating points (each curve = a realised ΔCV/Δinput): it COLLAPSES '
              'to the line for a linear / consistent-gain plant and widens ONLY '

@@ -357,7 +357,7 @@ def plot_disturbance_prediction(result: Dict, out_path) -> bool:
     sg = 'read-out probe (stop-grad)' if result.get('stop_grad') else 'latent-shaping'
     est = result.get('estimator', 'readout_head')
     fig.suptitle(
-        f"WM unmeasured-disturbance prediction [{est}] — DETRENDED (control-relevant) "
+        f"Observer — unmeasured-disturbance estimate [{est}] — DETRENDED (control-relevant) "
         f"r={result.get('mean_pearson_r_detrended', float('nan')):.2f} "
         f"R²={result.get('mean_r2_detrended', float('nan')):.2f}  "
         f"(raw R²={result['mean_r2']:.2f} drift-dominated)  [{sg}]",

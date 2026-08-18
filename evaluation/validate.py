@@ -2105,7 +2105,7 @@ def run_validation(*,
                     pass
             tf_result = compute_and_plot(
                 model, tf_env, cfg, device, out_dir, obs_std=tf_obs_std,
-                title=f'{controller_dir.name}  WM transfer matrix')
+                title=f'{controller_dir.name}  observer transfer matrix')
             # GAIN-FIDELITY GATE (control-relevant; the correlation-based
             # wm_next_state_r does NOT measure gain).  Mean relative SS-gain
             # error across MV/CV pairs; a WM usable for control needs the gain

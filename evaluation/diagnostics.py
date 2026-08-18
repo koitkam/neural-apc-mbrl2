@@ -766,7 +766,7 @@ def _plot_diagnostics(diag: Dict, out_path: Path, title: str = '') -> None:
             ax.set_xlabel('k-step open-loop offset')
             ax.set_ylabel('obs[0] (norm)')
         ax.legend(loc='best', fontsize=8)
-    ax.set_title('WM open-loop fidelity (1 start, channel 0)')
+    ax.set_title('Observer open-loop fidelity (1 start, channel 0)')
     ax.grid(alpha=0.3)
 
     # ---- (0,1) Reward MTP scatter: pred vs real at offset 0
