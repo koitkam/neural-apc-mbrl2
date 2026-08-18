@@ -724,6 +724,20 @@ class TrainConfig:
     # actor's d_t toward the p117 active-actor regime.  Pairs with the DV-PRBS
     # fix (a correct DV gain cleans the innovation feeding K).
     dob_gain_init: float = -2.0
+    # DOB GROUNDING (KalmanNet-style, P19 2026-08-18): supervise the neural-Kalman
+    # disturbance state ``d_t`` DIRECTLY against the TRUE unmeasured load so the
+    # observer TRACKS it, instead of relying on the recon innovation alone.  In
+    # Stage-2 (g frozen) the innovation under-drives d_t — the slow load is a
+    # small share of the recon MSE and ``dob_reg_coef`` pulls d→0 — so d_t
+    # under-reaches (p18: pred vs true load r=0.42, amplitude ~0.3x) and BOTH
+    # imagination AND the critic input stay disturbance-blind (→ critic can't fit
+    # the disturbance-driven returns → actor collapses).  A direct target on d_t
+    # tunes A,K to track (the structural fix for the manual ``dob_gain_init``
+    # amplitude tuning above).  Target ``batch['dist']`` is ENGINEERING CV units,
+    # d_t is NORMALIZED obs space → the loss divides the target by the running CV
+    # obs-norm std (threaded as ``cfg._cv_obs_std``).  0.0 = off (byte-identical).
+    # ``DREAMER_DOB_GROUND_COEF``.
+    dob_ground_coef: float = 0.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
     # The textbook system-ID / Kalman recipe applied to the DOB: identify the
@@ -4604,6 +4618,29 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         dob_reg = ds.float().pow(2).mean()
         wm_total = wm_total + float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0) * dob_reg
 
+    # DOB GROUNDING (KalmanNet-style, P19): supervise the neural-Kalman
+    # disturbance state d_t against the TRUE unmeasured load.  The Stage-2 recon
+    # innovation alone under-drives d_t (the slow load is a small share of the
+    # recon MSE and dob_reg opposes it) so d_t under-tracks (r~0.42) and
+    # imagination + the critic stay disturbance-blind.  A direct target tunes the
+    # Kalman gain/decay (A,K — the only unfrozen DOB params in Stage-2) so the
+    # estimate TRACKS the load.  recon and this term AGREE (decode(post) is
+    # frozen-clean → both want d_t = disturbance), so there is no conflict.  The
+    # target batch['dist'] is in ENGINEERING CV units and d_t is NORMALIZED, so
+    # divide by the running CV obs-norm std (threaded on cfg as _cv_obs_std).
+    dob_ground = torch.zeros((), device=feats.device)
+    dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
+    if dob_on and dgc > 0.0 and dist_target is not None:
+        dtgt = dist_target.to(ds.dtype)
+        if dtgt.shape == ds.shape:
+            cvs = getattr(cfg, '_cv_obs_std', None)
+            if cvs is not None and len(cvs) == int(ds.shape[-1]):
+                cv_std_t = torch.tensor(list(cvs), device=ds.device,
+                                        dtype=ds.dtype).clamp_min(1e-6)
+                dtgt = dtgt / cv_std_t
+            dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
+            wm_total = wm_total + dgc * dob_ground
+
     # ----- (b) held-action steady-state consistency (RSSM) -----
     # P89 consolidation: the multi-step held-action ROLLOUT stationarity loss
     # (wm_held_rollout_*) supersedes this starved 1-step fixed-point term for
@@ -4692,6 +4729,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'gain_match_loss': gain_match_loss.detach(),
         'dist_match_loss': dist_match_loss.detach(),
         'dob_reg': dob_reg.detach(),
+        'dob_ground': dob_ground.detach(),
         'dob_d_absmean': (ds.abs().mean().detach() if dob_on
                           else torch.zeros((), device=feats.device)),
     }
@@ -6565,6 +6603,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 cfg.wm_ss_match_settle_var = 0.05  # settled-only DC-gain signal
             if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
                 cfg.wm_isolation_settle_episodes = 24  # opt1: 8→24 (clean per-input settled data)
+            # P19 (2026-08-18): GROUND the DOB d_t on the true load (KalmanNet-
+            # style) so the observer TRACKS the disturbance instead of under-
+            # reaching it (p18: d_t vs load r=0.42, ~0.3x amplitude → imagination
+            # + the critic go disturbance-blind → actor collapses worse-than-
+            # baseline).  Direct A,K supervision is the STRUCTURAL fix for the
+            # manual dob_gain_init amplitude tuning.  Drop dob_reg (the "d small"
+            # prior fights the grounding; the grounded target IS the prior now).
+            if float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) <= 0.0:
+                cfg.dob_ground_coef = 2.0
+                cfg.dob_reg_coef = 0.0
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
                   f'gain_dim={cfg.cont_gain_dim} '
                   f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
@@ -8568,6 +8616,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if current_phase in (1, 2):
                 # World-model losses (always live in P1 + P2).
                 _t = time.time()
+                # P19: thread the running CV obs-norm std so the DOB grounding
+                # loss converts the engineering disturbance target into the
+                # normalized-CV units d_t lives in (no-op unless dob_ground_coef>0).
+                if float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) > 0.0:
+                    try:
+                        _ovar = np.asarray(env.get_obs_norm_stats().get('var'),
+                                           dtype='float64')
+                        cfg._cv_obs_std = [  # type: ignore[attr-defined]
+                            float(np.sqrt(max(_ovar[int(i)], 1e-8)))
+                            for i in env.cv_indices]
+                    except Exception:
+                        pass
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):

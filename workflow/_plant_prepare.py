@@ -461,6 +461,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_DOB_REG_COEF':               ('dob_reg_coef',                   float),
     'DREAMER_DOB_DECAY_INIT':             ('dob_decay_init',                 float),
     'DREAMER_DOB_GAIN_INIT':              ('dob_gain_init',                  float),
+    'DREAMER_DOB_GROUND_COEF':            ('dob_ground_coef',                float),
     # Staged clean->disturbance curriculum (2026-06-12; default off).  Requires
     # dob_enabled + phased mode.  See TrainConfig.curriculum_enabled.
     'DREAMER_CURRICULUM_ENABLED':         ('curriculum_enabled',             _as_bool),
