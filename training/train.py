@@ -5042,6 +5042,7 @@ def expert_bc_p3_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
 def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                                 cfg: TrainConfig,
                                 critic_batch: Optional[Dict[str, torch.Tensor]] = None,
+                                expert_bc_weight: float = 0.0,
                                 ) -> Dict[str, torch.Tensor]:
     """Phase 3 (real-sim mode): actor-critic on REAL-environment λ-returns.
 
@@ -5136,6 +5137,11 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # (a) ON-POLICY term — the distribution the advantage is evaluated on.
     critic_loss = _critic_ce(value_logits, v_slow, rew, T, target_returns)
 
+    # P83 expert-BC anchor accumulator (wired below on the seed-buffer batch,
+    # which retains expert-flagged steps via the every-20-iter P3 expert inject).
+    bc_term = torch.zeros((), device=device)
+    bc_loss_p3 = torch.zeros((), device=device)
+
     # (b) DIVERSE replay term — anti-starvation diversity (skipped if no split).
     if critic_batch is not None:
         with torch.no_grad():
@@ -5160,6 +5166,16 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             ret_c = ret_c.clamp(-_ret_cap, _ret_cap)
         critic_loss = critic_loss + _critic_ce(
             value_logits_c, v_slow_c, rew_c, Tc, ret_c)
+        # P83 FIX (p19 RCA, 2026-08-19): re-wire the P3 expert-BC anchor — it was
+        # DEAD CODE (expert_bc_p3_loss defined + unit-tested but NEVER called),
+        # so the P3 actor had NO anchor and diverged off the good BC-seeded
+        # policy once the critic advantage went noisy (return_scale runaway ->
+        # econ collapse worse than the open-loop baseline).  MSE-on-μ over the
+        # expert-flagged steps in the seed batch; grad reaches ONLY the policy
+        # (feat is detached inside expert_bc_p3_loss).
+        if expert_bc_weight > 0.0:
+            bc_loss_p3, _n_exp = expert_bc_p3_loss(model, critic_batch, _fc)
+            bc_term = expert_bc_weight * bc_loss_p3
 
     # ----- advantage + percentile return-scale normalisation — REUSED -----
     with torch.no_grad():
@@ -5180,7 +5196,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     logp = model.policy.log_prob_of(feat_flat, act_flat)     # (B*T,)
     entropy = model.policy.entropy(feat_flat)                # (B*T,)
     ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
-    actor_loss = -(adv_flat * logp).mean() - ent_coef * entropy.mean()
+    actor_loss = -(adv_flat * logp).mean() - ent_coef * entropy.mean() + bc_term
 
     # ----- diagnostics (mirror the imagination keys the P3 logger reads) -----
     with torch.no_grad():
@@ -5210,6 +5226,8 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'actor_logp_mean': logp.mean().detach(),
         'actor_logp_std': logp.std().detach(),
         'pmpo_pos_frac': (adv_flat >= 0).float().mean().detach(),
+        'bc_loss': bc_loss_p3.detach(),
+        'expert_bc_weight': torch.tensor(float(expert_bc_weight), device=device),
     }
 
 
@@ -7399,6 +7417,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_freeze_after_iters = int(getattr(cfg, 'wm_freeze_after_iters', 0) or 0)
     _wm_frozen_now = False
     p3_critic_warmup_iters = int(getattr(cfg, 'p3_critic_warmup_iters', 0) or 0)
+    expert_bc_p3 = bool(getattr(cfg, 'expert_bc_p3', True))
     # One-shot guard so the critic-warmup banner logs EXACTLY once.  The print
     # sits inside the inner train-steps loop, which would otherwise repeat it
     # once per step for the whole first warmup iter (~25x).
@@ -8893,11 +8912,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         else:
                             _ct = _ct.to(device)
                         _critic_batch[_k] = _ct
+                # P83 FIX (p19 RCA): P3 expert-BC anchor weight — decay
+                # expert_bc_scale·(1→floor) across P3 so the actor starts pinned to
+                # the good BC-seeded policy and is progressively released to let
+                # RL improve on it (prevents the anchorless divergence).
+                _bc_w = 0.0
+                if expert_bc_p3:
+                    _bc_floor = float(getattr(cfg, 'expert_bc_p3_floor', 0.1) or 0.0)
+                    _bc_scale = float(getattr(cfg, 'expert_bc_scale', 0.15) or 0.0)
+                    _p3_span = max(1, int(cfg.total_steps) - int(p3_start_steps))
+                    _p3_prog = min(1.0, max(0.0,
+                        (total_env_steps - p3_start_steps) / _p3_span))
+                    _bc_w = _bc_scale * (1.0 - _p3_prog * (1.0 - _bc_floor))
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
                     ac_losses = _realsim_actor_critic_step(
-                        model, batch, cfg, critic_batch=_critic_batch)
+                        model, batch, cfg, critic_batch=_critic_batch,
+                        expert_bc_weight=_bc_w)
                 _actor_loss = ac_losses['actor_loss']
                 opt_actor.zero_grad(set_to_none=True)
                 opt_critic.zero_grad(set_to_none=True)
