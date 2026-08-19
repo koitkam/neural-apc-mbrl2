@@ -9257,17 +9257,26 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # P52 RCA: history feeds the P1→P2 gate.
                         p1_score_ema_history.append(
                             (int(total_iters), float(wm_score_ema)))
-                        # Track raw-best (checkpoint promotion) and
-                        # EMA-best (ES decisions) separately.
-                        if _score > wm_best_score:
-                            wm_best_score = _score
+                        # Promote wm_best on the EMA score, NOT the raw probe.
+                        # p19 RCA (2026-08-19): the raw score oscillates ±0.10-
+                        # 0.40 per probe (see wm_score_ema rationale above), so
+                        # raw-best promotion grabbed a FLUKE-high single batch —
+                        # run_p19 froze an early, low-GAIN g (transfer-matrix MV
+                        # x0.43 vs run_p18 x0.92) that merely scored high on one
+                        # lucky isolation batch (iso 0.003 @it40 vs 0.10 regime).
+                        # The EMA (used for the phase gate + ES) is robust to that
+                        # single-probe noise, so the frozen g tracks a genuinely
+                        # sustained-best (higher, stabler gain run-to-run).
+                        if wm_score_ema > wm_best_score:
+                            wm_best_score = float(wm_score_ema)
                             wm_best_iter = int(total_iters)
                             wm_best_ckpt_path = out_dir / 'wm_best.pt'
                             torch.save({
                                 'model': model.state_dict(),
                                 'cfg': asdict(cfg),
                                 'obs_norm': env.get_obs_norm_stats(),
-                                'wm_fidelity_score': float(_score),
+                                'wm_fidelity_score': float(wm_score_ema),
+                                'wm_fidelity_score_raw': float(_score),
                                 'wm_fidelity_probe': {
                                     'iter': int(total_iters),
                                     'env_steps': int(total_env_steps),
@@ -9285,9 +9294,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                         is not None else None),
                                 },
                             }, wm_best_ckpt_path)
-                            print(f"[wm-best] new best fidelity score "
-                                  f"{_score:.3f} at iter {total_iters} "
-                                  f"-> saved {wm_best_ckpt_path.name}",
+                            print(f"[wm-best] new best fidelity score (EMA) "
+                                  f"{wm_score_ema:.3f} (raw {_score:.3f}) at iter "
+                                  f"{total_iters} -> saved {wm_best_ckpt_path.name}",
                                   flush=True)
                         # EMA-best tracking for the phase gates.
                         # 2026-05-26 (P53 RCA): previously scoped to
