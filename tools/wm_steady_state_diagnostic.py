@@ -263,6 +263,7 @@ def _imagine_open_loop_rssm(model, lookback_obs: np.ndarray,
                              action_seq: np.ndarray, n_steps: int,
                              device: torch.device,
                              dv_hold_override: Optional[np.ndarray] = None,
+                             sample: bool = True,
                              ) -> np.ndarray:
     """RSSM open-loop rollout (mirrors training warmup + imagination).
 
@@ -289,7 +290,7 @@ def _imagine_open_loop_rssm(model, lookback_obs: np.ndarray,
         a = torch.from_numpy(lookback_act[l]).to(device).unsqueeze(0)
         emb = rssm.embed(o)
         dv = o.index_select(-1, rssm.dv_index_t) if _dv_on else None
-        post, _ = rssm.obs_step(state, a, emb, dv=dv, sample=True)
+        post, _ = rssm.obs_step(state, a, emb, dv=dv, sample=sample)
         state = post
     # Held DV over imagination: override (DV→CV step) else last-lookback value.
     dv_hold = None
@@ -304,7 +305,7 @@ def _imagine_open_loop_rssm(model, lookback_obs: np.ndarray,
     out = np.zeros((n_steps, obs_dim), dtype='float32')
     for kk in range(n_steps):
         a_step = torch.from_numpy(action_seq[kk]).to(device).unsqueeze(0)
-        state = rssm.img_step(state, a_step, dv=dv_hold, sample=True)
+        state = rssm.img_step(state, a_step, dv=dv_hold, sample=sample)
         obs_hat = rssm.decode(state.feat).squeeze(0).float().cpu().numpy()
         out[kk] = obs_hat[:obs_dim]
     return out

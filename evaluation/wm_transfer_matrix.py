@@ -106,10 +106,11 @@ def _real_step_rollout(env, action: np.ndarray, horizon: int,
 
 
 def _wm_rollout(model, lookback_obs, lookback_act, act_seq, horizon, device,
-                k_max: int) -> np.ndarray:
+                k_max: int, sample: bool = True) -> np.ndarray:
     if _is_rssm_model(model):
         return _imagine_open_loop_rssm(
-            model, lookback_obs, lookback_act, act_seq, horizon, device)
+            model, lookback_obs, lookback_act, act_seq, horizon, device,
+            sample=sample)
     import torch
     with torch.no_grad():
         z_hist = model.tokenizer.encode(
@@ -200,6 +201,7 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
                                obs_std: Optional[np.ndarray] = None,
                                n_levels: int = 3, step_frac: float = 0.4,
                                horizon: int = 0, settle_steps: int = 0,
+                               sample: bool = False,
                                seed: int = 20260607) -> Dict:
     """WM-vs-real **DV→CV** step-response matrix (Option B DV-as-input only).
 
@@ -265,7 +267,7 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
                 act_seq = np.tile(base_action, (H, 1)).astype('float32')
                 pred = _imagine_open_loop_rssm(
                     model, lb_obs, lb_act, act_seq, H, device,
-                    dv_hold_override=dv_override)
+                    dv_hold_override=dv_override, sample=sample)
                 for ci, c in enumerate(cv_idx):
                     sd = float(obs_std[c]) if c < len(obs_std) else 1.0
                     g_wm = (pred[:, c] - pre[c]) * sd / d_dv_eng
@@ -286,6 +288,7 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
         ss = arr[:, max(1, int(0.8 * arr.shape[1])):].mean(axis=1)
         return {'mean': arr.mean(axis=0).tolist(), 'lo': arr.min(axis=0).tolist(),
                 'hi': arr.max(axis=0).tolist(), 'ss_gain_mean': float(ss.mean()),
+                'ss_per_curve': [float(x) for x in ss],
                 'n': int(arr.shape[0])}
 
     result['cv_names'] = cv_names
@@ -318,6 +321,7 @@ def compute_transfer_matrix(model, env, cfg, device, *,
                             n_levels: int = 5, level_span: float = 0.6,
                             step_frac: float = 0.4, horizon: int = 0,
                             settle_steps: int = 0, max_starts_note: str = '',
+                            sample: bool = False,
                             seed: int = 20260605) -> Dict:
     """Build the WM-vs-real step-response matrix over the operating region.
 
@@ -373,7 +377,7 @@ def compute_transfer_matrix(model, env, cfg, device, *,
                     env, base_action, S, L)
                 act_seq = np.tile(stepped, (H, 1)).astype('float32')
                 pred_obs = _wm_rollout(model, lb_obs, lb_act, act_seq, H,
-                                       device, k_max)
+                                       device, k_max, sample=sample)
                 real_obs, stepped_ctrl = _real_step_rollout(env, stepped, H)
                 # ΔMV from the OBSERVED actuator position (settled base ->
                 # settled stepped), de-normalised — robust to actuator clipping
@@ -423,6 +427,7 @@ def compute_transfer_matrix(model, env, cfg, device, *,
             'ss_gain_mean': float(ss.mean()),
             'ss_gain_lo': float(ss.min()),
             'ss_gain_hi': float(ss.max()),
+            'ss_per_curve': [float(x) for x in ss],
             'n': int(arr.shape[0]),
         }
 

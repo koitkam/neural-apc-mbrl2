@@ -5493,6 +5493,126 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     return result
 
 
+def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
+    """Controlled multi-level step-response GAIN-readiness probe (p20, 2026-08-19).
+
+    Certifies the observer is READY before P1->P2 freezes it — the correlation /
+    gain_fid / per-batch-iso proxies are too noisy (p19 froze a x0.43 g on a
+    lucky batch).  For every MV and DV input, at ``n_levels`` operating points
+    spanning the band, it settles the env, steps the input, rolls the WM
+    open-loop AND the REAL sim, and compares dCV/dinput.  Certifies THREE
+    control-relevant properties the user requires:
+
+      * UNBIASED   — the aggregate DC-gain AND at-horizon gain match the real
+        plant (ratio in [lo, hi]);
+      * NOT NOISY  — the WM's open-loop gain is CONSISTENT across operating points
+        (its per-level gain band is not much wider than the REAL plant's own, and
+        never flips sign vs the real gain).  p19's bad g had a gain band
+        [-1.65, +1.30] (sign flips) — exactly the "noisy observer" symptom;
+      * STABLE     — measured on the SETTLED open-loop rollout (a diverging WM
+        fails the ratio/at-horizon check).
+
+    simulator-AGNOSTIC (the REAL plant is the reference; operating band from the
+    env) and NONLINEAR-ROBUST (the noise check compares the WM's gain spread to
+    the REAL plant's OWN spread, so a genuinely curved plant is allowed while
+    excess WM variance is flagged).  Returns a diag dict or ``None`` (never fatal).
+    """
+    _wmt = getattr(model, 'world_model_type', 'sf_transformer')
+    if _wmt not in ('rssm', 'tssm'):
+        return None
+    try:
+        from evaluation.wm_transfer_matrix import (
+            compute_transfer_matrix, compute_dv_transfer_matrix)
+    except Exception as e:
+        print(f'[gain-ready-probe] import failed: {e!r}', flush=True)
+        return None
+    band_lo = float(os.environ.get('DREAMER_GAIN_READY_LO', '0.80'))
+    band_hi = float(os.environ.get('DREAMER_GAIN_READY_HI', '1.30'))
+    n_levels = int(os.environ.get('DREAMER_GAIN_READY_LEVELS', '5'))
+    _dprob = getattr(env, '_disturbance_prob_override', None)
+    obs_std = None
+    try:
+        _var = np.asarray(env.get_obs_norm_stats().get('var'), dtype='float32')
+        obs_std = np.clip(np.sqrt(np.maximum(_var, 1e-6)), 1e-3, None)
+    except Exception:
+        pass
+    try:
+        env._disturbance_prob_override = 0.0
+        # sample=False = the DETERMINISTIC belief the actor acts on
+        # (_realsim_actor_critic_step uses sample=False).  Verified STABLE +
+        # repeatable across env seeds (p20: P18 gain 1.09 +/-0.05, P19 0.76
+        # +/-0.00) whereas the SAMPLED rollout is noisy (P18 +/-0.90) -- so the
+        # deterministic gain is both the control-relevant AND the reliable
+        # readiness signal.  The per-level figures below are a reported
+        # noise/consistency diagnostic (now stable under sample=False).
+        mv = compute_transfer_matrix(model, env, cfg, device, obs_std=obs_std,
+                                     n_levels=n_levels, sample=False)
+        dv = compute_dv_transfer_matrix(model, env, cfg, device, obs_std=obs_std,
+                                        n_levels=n_levels, sample=False)
+    except Exception as e:
+        print(f'[gain-ready-probe] measure failed: {e!r}', flush=True)
+        return None
+    finally:
+        try:
+            env._disturbance_prob_override = _dprob
+        except Exception:
+            pass
+
+    ss_ratios: List[Tuple[str, float]] = []   # aggregate DC-gain ratio (HARD gate)
+    ath_ratios: List[float] = []              # at-horizon ratio (diagnostic)
+    noises: List[float] = []                  # per-pair WM/real gain-spread (diag)
+    flips = 0                                 # WM open-loop gain sign flips (diag)
+
+    def _collect(res, tag):
+        nonlocal flips
+        for key, P in (res.get('pairs', {}) or {}).items():
+            sr = P.get('ss_gain_ratio_wm_over_real')
+            if sr is not None and np.isfinite(sr):
+                ss_ratios.append((f'{tag} {key}', float(sr)))
+            ar = P.get('gain_ratio_at_h')
+            if ar is not None and np.isfinite(ar):
+                ath_ratios.append(float(ar))
+            wm_ss = list((P.get('wm') or {}).get('ss_per_curve') or [])
+            real_ss = list((P.get('real') or {}).get('ss_per_curve') or [])
+            real_mean = float(P.get('real_ss_gain', 0.0) or 0.0)
+            if wm_ss and real_ss and abs(real_mean) > 1e-6:
+                wm_spread = float(max(wm_ss) - min(wm_ss))
+                real_spread = float(max(real_ss) - min(real_ss))
+                noises.append(wm_spread / (real_spread + abs(real_mean)))
+                sgn = 1.0 if real_mean > 0 else -1.0
+                flips += sum(1 for w in wm_ss if (float(w) * sgn) < -1e-9)
+
+    _collect(mv, 'MV')
+    if isinstance(dv, dict) and dv.get('enabled'):
+        _collect(dv, 'DV')
+    if not ss_ratios:
+        return None
+    srs = [r for _, r in ss_ratios]
+    noise_max = float(os.environ.get('DREAMER_GAIN_READY_NOISE_MAX', '3.0'))
+    flip_max = int(os.environ.get('DREAMER_GAIN_READY_FLIP_MAX', '1'))
+    worst_noise = float(max(noises)) if noises else 0.0
+    # READY = UNBIASED (every MV+DV DC-gain ratio in band) AND NOT-NOISY (the
+    # deterministic open-loop gain is consistent across operating points: its
+    # spread is not >>the real plant's own, and it never flips sign vs the real
+    # gain).  Both are STABLE under sample=False (p20: P18 gain 1.1 / noise 1.5x
+    # / 0 flips = ready; P19 gain 0.67 / noise 6.3x / 4 flips = not ready).
+    unbiased = all(band_lo <= r <= band_hi for r in srs)
+    not_noisy = (worst_noise <= noise_max) and (flips <= flip_max)
+    worst_name, worst_ratio = min(
+        ss_ratios, key=lambda x: min(x[1] - band_lo, band_hi - x[1]))
+    return {
+        'gain_ready': bool(unbiased and not_noisy),
+        'unbiased': bool(unbiased), 'not_noisy': bool(not_noisy),
+        'r_min': float(min(srs)), 'r_max': float(max(srs)),
+        'worst_ratio': float(worst_ratio), 'worst_input': worst_name,
+        'atH_min': float(min(ath_ratios)) if ath_ratios else None,
+        'atH_max': float(max(ath_ratios)) if ath_ratios else None,
+        'noise_worst': worst_noise, 'sign_flips': int(flips),
+        'n_checks': int(len(srs)), 'band': [band_lo, band_hi],
+        'noise_max': noise_max,
+    }
+
+
 def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                             ) -> Dict[str, Dict[str, object]]:
     """Derive plant-adaptive defaults for the cold-start seed buffer.
@@ -8082,13 +8202,37 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 _band = max(1e-6, _band_static, _band_noise)
                 _plateau_ok = all(
                     abs(e - wm_score_ema_best) <= _band for _, e in recent)
-            if _ema_ok and _plateau_ok:
+            # p20 gain-readiness gate: don't freeze g until the observer's
+            # controlled step-response GAIN matches the real plant across the
+            # operating band (the correlation/EMA fidelity above is gain-blind —
+            # p19 froze a x0.43 g).  Probed only when fidelity already passed, so
+            # the real-sim measurement runs a handful of times near P1 end.
+            _gain_ok = True
+            _gain_probe = None
+            if (_ema_ok and _plateau_ok
+                    and os.environ.get('DREAMER_P1_GAIN_GATE', '1').lower()
+                        not in ('0', 'off', 'false', 'no')):
+                _gain_probe = _probe_observer_gain_ready(model, env, device, cfg)
+                if _gain_probe is not None:
+                    _gain_ok = bool(_gain_probe.get('gain_ready', True))
+                    print(f"[gate p1->p2] gain-probe ready={_gain_ok} "
+                          f"DCgain_ratio[{_gain_probe['r_min']:.2f},"
+                          f"{_gain_probe['r_max']:.2f}] "
+                          f"worst={_gain_probe['worst_ratio']:.2f}"
+                          f"@{_gain_probe['worst_input']} "
+                          f"band={_gain_probe['band']} | noise: "
+                          f"spread_x{_gain_probe['noise_worst']:.1f} "
+                          f"signflips={_gain_probe['sign_flips']} "
+                          f"({_gain_probe['n_checks']} inputs)", flush=True)
+            if _ema_ok and _plateau_ok and _gain_ok:
                 phase_gate_decisions.append({
                     'gate': 'p1->p2', 'iter': int(total_iters),
                     'env_steps': int(total_env_steps),
                     'pass': True, 'ext_steps': int(p1_ext_steps),
                     'wm_ema_best': float(wm_score_ema_best),
                     'wm_ema_best_iter': int(wm_score_ema_best_iter),
+                    'gain_worst_ratio': (float(_gain_probe['worst_ratio'])
+                                          if _gain_probe else None),
                 })
                 print(f'[gate p1->p2] PASS at iter {total_iters}: '
                       f'wm_ema_best={wm_score_ema_best:.3f} '
@@ -8100,7 +8244,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             elif p1_ext_steps + p1_gate_check_step <= p1_gate_max_ext_steps:
                 p1_ext_steps += p1_gate_check_step
                 reason = ('ema_below_floor' if not _ema_ok
-                          else 'not_plateaued')
+                          else 'not_plateaued' if not _plateau_ok
+                          else 'gain_not_ready')
                 phase_gate_decisions.append({
                     'gate': 'p1->p2', 'iter': int(total_iters),
                     'env_steps': int(total_env_steps),
@@ -8131,7 +8276,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                       f'{p1_gate_max_ext_steps} steps reached)',
                       flush=True)
                 mid_check_flags.append(
-                    f'p1_gate_capped: wm_ema_best={wm_score_ema_best:.3f}')
+                    f'p1_gate_capped: wm_ema_best={wm_score_ema_best:.3f}'
+                    + (f' GAIN_NOT_READY(worst={_gain_probe["worst_ratio"]:.2f}'
+                       f'@{_gain_probe["worst_input"]})'
+                       if (_gain_probe is not None
+                           and not _gain_probe.get('gain_ready', True)) else ''))
         elif (current_phase == 2 and _candidate_phase == 3
                 and p2_gate_reward_mtp_max_v > 0.0):
             _rml_med = (float(np.median(p2_reward_mtp_recent))
