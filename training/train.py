@@ -902,6 +902,16 @@ class TrainConfig:
     # imag_reward_dv_corr 0.44 → imag_adv_action_corr 0.095 → actor thrash +
     # return_scale cap cascade).  GAIN block stays sampled.  ``DREAMER_CONT_DIST_DET_ROLL``.
     cont_dist_deterministic_roll: bool = True
+    # Roll the cont GAIN block DETERMINISTICALLY (prior MEAN) in imagination
+    # (2026-08-14, p20 observer-bias RCA).  The open-loop gain enters
+    # NONLINEARLY through the multi-step GRU+decoder, so the strong sample=True
+    # gain supervisor (wm_overshoot_loss) optimizes E[f(c_sampled)] (~×0.79)
+    # while the ACTOR + transfer matrix use sample=False = f(mean) (~×0.61) — the
+    # supervisor never trains the actor's path and the sampled gain injects the
+    # run-to-run gain variance (×0.61↔×1.09).  Rolling the gain at its MEAN
+    # redirects the supervisor onto the actor's belief AND removes the sampling
+    # variance → a stable, unbiased observer gain.  ``DREAMER_CONT_GAIN_DET_ROLL``.
+    cont_gain_deterministic_roll: bool = True
     # DV-as-input (Option B, 2026-06-07): feed the measured disturbance-variable
     # channels as an EXOGENOUS transition input (teacher-forced from the real
     # obs in WM training; HELD CONSTANT over the imagination horizon = the MPC
@@ -5279,6 +5289,8 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
         cont_dist_deterministic_roll=bool(getattr(
             cfg, 'cont_dist_deterministic_roll', True)),
+        cont_gain_deterministic_roll=bool(getattr(
+            cfg, 'cont_gain_deterministic_roll', True)),
     )
     model = DreamerV4(model_cfg)
     # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths

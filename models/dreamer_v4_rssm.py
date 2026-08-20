@@ -160,10 +160,22 @@ class RSSMConfig:
     # not a per-rollout sampled realization that injects uncontrollable noise
     # into the imagined reward (p140: imag_reward_dv_corr 0.44 buried the action
     # signal → imag_adv_action_corr 0.095 → actor thrash + return_scale cap
-    # cascade).  Mirrors the DOB persistence roll (d_t = A·d, no sampling).  The
-    # GAIN block stays sampled (gain-uncertainty exploration).  No-op when
-    # sample=False (gain-match / probes already use the mean) or no dist block.
+    # cascade).  Mirrors the DOB persistence roll (d_t = A·d, no sampling).
+    # No-op when sample=False (gain-match / probes already use the mean) or no
+    # dist block.
     cont_dist_deterministic_roll: bool = True
+    # Roll the GAIN block of the cont latent DETERMINISTICALLY (prior MEAN) in
+    # imagination too (2026-08-14, p20 observer-bias RCA).  The GAIN was left
+    # SAMPLED here, but the open-loop gain enters NONLINEARLY through the
+    # multi-step GRU+decoder, so the strong sample=True gain supervisor
+    # (wm_overshoot_loss) optimizes E[f(c_sampled)] (~×0.79) while the ACTOR +
+    # transfer matrix use sample=False = f(mean) (~×0.61) — the strong
+    # supervisor never trains the actor's path and the sampled gain injects the
+    # run-to-run gain variance (×0.61↔×1.09).  Rolling the gain at its MEAN
+    # redirects the supervisor onto f(mean) (the actor's belief) AND removes the
+    # sampling variance → a stable, unbiased observer gain.  No-op when
+    # sample=False or no gain block.
+    cont_gain_deterministic_roll: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +370,12 @@ class RSSMDynamics(nn.Module):
         # Deterministic cont-disturbance roll in imagination (p140 RCA).
         self.cont_dist_deterministic_roll = bool(
             getattr(cfg, 'cont_dist_deterministic_roll', True))
+        # Deterministic cont-GAIN roll in imagination (p20 observer-bias RCA):
+        # roll the gain block at its prior MEAN so the strong sample=True gain
+        # supervisor trains the actor's sample=False (mean) belief, not the
+        # nonlinearly-inflated sampled gain.
+        self.cont_gain_deterministic_roll = bool(
+            getattr(cfg, 'cont_gain_deterministic_roll', True))
         # DV-as-input (Option B): exogenous measured-DV channels fed into the
         # transition.  ``dv_index_t`` selects them out of the obs vector.
         self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
@@ -551,16 +569,28 @@ class RSSMDynamics(nn.Module):
         c_new = c_mean = c_std = None
         if self.cont_dim > 0:
             c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
-            # R1 (p140 RCA): roll the DISTURBANCE block deterministically (prior
-            # MEAN) in imagination so the actor gets the PREDICTED load as a
-            # clean feedforward, not a per-rollout sample that buries the action
-            # signal in the imagined reward.  GAIN block stays sampled.  No-op
-            # when sample=False (c_new == c_mean already) or no disturbance block.
-            if (self.cont_dist_deterministic_roll and sample
-                    and self.cont_dist_dim > 0):
-                c_new = torch.cat(
-                    [c_new[..., :self.cont_gain_dim],
-                     c_mean[..., self.cont_gain_dim:]], dim=-1)
+            # Roll selected blocks DETERMINISTICALLY (prior MEAN) in imagination.
+            # DISTURBANCE block (p140 RCA): the actor needs the PREDICTED load as
+            # a clean feedforward, not a per-rollout sample that buries the action
+            # signal in the imagined reward.  GAIN block (p20 observer-bias RCA):
+            # the open-loop gain enters nonlinearly through the multi-step
+            # rollout, so E[f(c_sampled)] (what the sample=True supervisor trains)
+            # ≠ f(mean) (what the sample=False actor/transfer-matrix use) — roll
+            # the gain at its mean so the strong supervisor trains the actor's
+            # belief and the gain stops varying run-to-run.  No-op when
+            # sample=False (c_new == c_mean already) or the block is absent.
+            if sample and self.cont_dim > 0 and (
+                    self.cont_gain_deterministic_roll
+                    or self.cont_dist_deterministic_roll):
+                gain_part = (
+                    c_mean[..., :self.cont_gain_dim]
+                    if self.cont_gain_deterministic_roll
+                    else c_new[..., :self.cont_gain_dim])
+                dist_part = (
+                    c_mean[..., self.cont_gain_dim:]
+                    if self.cont_dist_deterministic_roll
+                    else c_new[..., self.cont_gain_dim:])
+                c_new = torch.cat([gain_part, dist_part], dim=-1)
         # DOB predict step: decay the disturbance estimate (no obs to correct).
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)

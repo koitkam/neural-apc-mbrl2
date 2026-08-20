@@ -1,16 +1,18 @@
-"""Targeted smoke for the p140 RCA fixes (both backbones):
+"""Targeted smoke for the cont-latent deterministic-roll fixes (both backbones):
 
-  R1 — deterministic cont-DISTURBANCE roll in imagination.  ``img_step(sample=
-       True)`` must return the DISTURBANCE block of ``c`` equal to its prior
-       MEAN (no per-rollout sampling noise = clean feedforward) while the GAIN
-       block stays STOCHASTIC.  With ``cont_dist_deterministic_roll=False`` the
-       disturbance block varies again (the flag genuinely gates it).
+  R1 — deterministic cont-DISTURBANCE roll in imagination (p140 RCA).
+  R2 — deterministic cont-GAIN roll in imagination (p20 observer-bias RCA):
+       ``img_step(sample=True)`` must return the GAIN block of ``c`` equal to
+       its prior MEAN so the strong sample=True gain supervisor trains the
+       actor's sample=False (mean) belief.  With
+       ``cont_gain_deterministic_roll=False`` the gain block varies again (the
+       flag genuinely gates it).  Both blocks default to deterministic.
 """
 import torch
 from training.train import TrainConfig, build_model
 
 
-def _build(wm_type, *, det_roll=True, dv=False):
+def _build(wm_type, *, det_roll=True, gain_det_roll=True, dv=False):
     torch.manual_seed(0)
     cfg = TrainConfig()
     cfg.obs_dim = 6
@@ -34,6 +36,7 @@ def _build(wm_type, *, det_roll=True, dv=False):
     cfg.cont_dist_dim = 1                  # n_cv = 1
     cfg.cv_obs_indices = (0,)
     cfg.cont_dist_deterministic_roll = det_roll
+    cfg.cont_gain_deterministic_roll = gain_det_roll
     if dv:
         cfg.dv_as_input = True
         cfg.dv_feedforward = True
@@ -42,7 +45,7 @@ def _build(wm_type, *, det_roll=True, dv=False):
     return cfg, build_model(cfg)
 
 
-def _img2(model, *, det_roll, dv_dim=0, B=3):
+def _img2(model, *, dv_dim=0, B=3):
     """Two sampled img_steps from the SAME state + action (so ``h`` and the
     prior MEAN are identical) — the only difference is the internal sampling
     noise, which isolates the deterministic-roll behaviour."""
@@ -57,28 +60,39 @@ def _img2(model, *, det_roll, dv_dim=0, B=3):
 
 def run(wm_type):
     print(f'\n===== {wm_type} =====')
-    cfg, model = _build(wm_type, det_roll=True)
+    cfg, model = _build(wm_type, det_roll=True, gain_det_roll=True)
     dyn = model.dynamics
     g = dyn.cont_gain_dim
 
-    # R1: two sampled img_steps from the SAME state+action.  Disturbance block
-    # must be IDENTICAL (== prior mean, deterministic) across both; gain block
-    # STOCHASTIC (the only varying part).
-    s1, s2 = _img2(model, det_roll=True)
-    d1, d2 = s1.c[..., g:], s2.c[..., g:]
+    # R1+R2 (both flags default ON): two sampled img_steps from the SAME
+    # state+action.  BOTH the disturbance AND the gain block must be IDENTICAL
+    # (== prior mean, deterministic) across the two samples.
+    s1, s2 = _img2(model)
     assert torch.allclose(s1.c[..., g:], s1.c_mean[..., g:]), \
         'R1: disturbance block of sampled c != prior mean'
-    assert torch.allclose(d1, d2), \
+    assert torch.allclose(s1.c[..., g:], s2.c[..., g:]), \
         'R1: disturbance block varied across samples (not deterministic)'
-    gain1, gain2 = s1.c[..., :g], s2.c[..., :g]
-    assert (gain1 - gain2).abs().max().item() > 1e-4, \
-        'R1: gain block did NOT vary (should stay stochastic)'
-    print('[smoke] OK  R1 det-roll: disturbance block = prior mean (clean '
-          'feedforward); gain block still stochastic')
+    assert torch.allclose(s1.c[..., :g], s1.c_mean[..., :g]), \
+        'R2: gain block of sampled c != prior mean'
+    assert torch.allclose(s1.c[..., :g], s2.c[..., :g]), \
+        'R2: gain block varied across samples (should be deterministic)'
+    print('[smoke] OK  R1+R2 det-roll: BOTH gain and disturbance blocks = '
+          'prior mean (deterministic) under sample=True')
 
-    # R1 (flag off): disturbance block must VARY again.
-    _, model_off = _build(wm_type, det_roll=False)
-    o1, o2 = _img2(model_off, det_roll=False)
+    # R2 (gain flag off): the gain block must VARY again while the disturbance
+    # block stays deterministic (flags gate independently).
+    _, model_goff = _build(wm_type, det_roll=True, gain_det_roll=False)
+    g1, g2 = _img2(model_goff)
+    assert (g1.c[..., :g] - g2.c[..., :g]).abs().max().item() > 1e-4, \
+        'R2: gain_det_roll=False should leave the gain block stochastic'
+    assert torch.allclose(g1.c[..., g:], g2.c[..., g:]), \
+        'R2: disturbance block should stay deterministic when only gain flag off'
+    print('[smoke] OK  R2 gain_det_roll=False -> gain block stochastic again '
+          '(flag gates it independently)')
+
+    # R1 (dist flag off): disturbance block must VARY again.
+    _, model_off = _build(wm_type, det_roll=False, gain_det_roll=True)
+    o1, o2 = _img2(model_off)
     assert (o1.c[..., g:] - o2.c[..., g:]).abs().max().item() > 1e-4, \
         'R1: det_roll=False should leave the disturbance block stochastic'
     print('[smoke] OK  R1 det_roll=False -> disturbance block stochastic again '
@@ -88,4 +102,4 @@ def run(wm_type):
 if __name__ == '__main__':
     run('rssm')
     run('tssm')
-    print('\n[smoke] ALL CONT-DIST-ROLL (p140 R1) CHECKS PASSED both backbones')
+    print('\n[smoke] ALL CONT-ROLL (p140 R1 + p20 R2) CHECKS PASSED both backbones')

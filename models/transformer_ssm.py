@@ -176,6 +176,10 @@ class TransformerSSMConfig:
     # Deterministic cont-disturbance roll (p140 RCA) — mirror of RSSMConfig; see
     # there for the full rationale.
     cont_dist_deterministic_roll: bool = True
+    # Deterministic cont-GAIN roll (p20 observer-bias RCA) — mirror of
+    # RSSMConfig; roll the gain block at its prior mean in imagination so the
+    # strong sample=True gain supervisor trains the actor's sample=False belief.
+    cont_gain_deterministic_roll: bool = True
 
 
 @dataclass
@@ -343,6 +347,9 @@ class TransformerSSMDynamics(nn.Module):
         # Deterministic cont-disturbance roll in imagination (p140 RCA).
         self.cont_dist_deterministic_roll = bool(
             getattr(cfg, 'cont_dist_deterministic_roll', True))
+        # Deterministic cont-GAIN roll in imagination (p20 observer-bias RCA).
+        self.cont_gain_deterministic_roll = bool(
+            getattr(cfg, 'cont_gain_deterministic_roll', True))
         # DV-as-input (Option B): exogenous measured-DV channels appended to the
         # token input; ``dv_index_t`` selects them out of the obs vector.
         self.dv_dim = int(getattr(cfg, 'dv_dim', 0) or 0)
@@ -564,14 +571,24 @@ class TransformerSSMDynamics(nn.Module):
         c_new = c_mean = c_std = None
         if self.cont_dim > 0:
             c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
-            # R1 (p140 RCA): deterministic DISTURBANCE roll (prior MEAN) in
-            # imagination — clean feedforward, no per-rollout sampling noise in
-            # the imagined reward.  GAIN block stays sampled.  Mirror of RSSM.
-            if (self.cont_dist_deterministic_roll and sample
-                    and self.cont_dist_dim > 0):
-                c_new = torch.cat(
-                    [c_new[..., :self.cont_gain_dim],
-                     c_mean[..., self.cont_gain_dim:]], dim=-1)
+            # Deterministic block rolls (prior MEAN) in imagination — mirror of
+            # RSSM.  DISTURBANCE (p140): clean feedforward, no sampling noise in
+            # the imagined reward.  GAIN (p20 observer-bias RCA): roll at the mean
+            # so the strong sample=True gain supervisor trains the actor's
+            # sample=False belief (E[f(c_sampled)] ≠ f(mean) under the nonlinear
+            # rollout) and the gain stops varying run-to-run.
+            if sample and self.cont_dim > 0 and (
+                    self.cont_gain_deterministic_roll
+                    or self.cont_dist_deterministic_roll):
+                gain_part = (
+                    c_mean[..., :self.cont_gain_dim]
+                    if self.cont_gain_deterministic_roll
+                    else c_new[..., :self.cont_gain_dim])
+                dist_part = (
+                    c_mean[..., self.cont_gain_dim:]
+                    if self.cont_dist_deterministic_roll
+                    else c_new[..., self.cont_gain_dim:])
+                c_new = torch.cat([gain_part, dist_part], dim=-1)
         d_new = (self.dob_decay() * prev.d
                  if (self.dob_enabled and prev.d is not None) else prev.d)
         dv_new = dv if self.dv_feedforward else None
