@@ -5465,11 +5465,12 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     # (p121–p126), under-reading the DV→CV gain (~0.78) so the actor under-reacts
     # to disturbances → catastrophic CV overshoot.  Measure the CV-channel
     # std-ratio over the k-step open-loop rollout (under REAL actions + DV teacher-
-    # forced): when the WM under-reads the gain, the predicted CV varies LESS than
-    # the real CV → ratio < 1.  ``min(ratio, 1)`` credits a faithful/over-reading
-    # gain fully and penalises only under-prediction (the actual bias).  Averaged
-    # over CV channels; NaN-safe (returns None on degenerate std).  cv_obs_indices
-    # is set at runtime from env.cv_indices.
+    # forced): a faithful WM matches the real CV variance → ratio ≈ 1.  The
+    # two-sided ``min(ratio, 1/ratio)`` peaks at 1 and penalises BOTH under- and
+    # over-reading (p21: the deterministic gain-roll makes early checkpoints
+    # OVER-read, which the old one-sided ``min(ratio,1)`` rewarded fully → froze
+    # garbage).  Averaged over CV channels; NaN-safe (returns None on degenerate
+    # std).  cv_obs_indices is set at runtime from env.cv_indices.
     try:
         cv_idx = [int(i) for i in (getattr(cfg, 'cv_obs_indices', ()) or ())]
         po = np.asarray(wm.get('pred_obs'), dtype='float64')   # (S, K, D)
@@ -5481,7 +5482,15 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
                     rs = float(ro[..., c].std())
                     ps = float(po[..., c].std())
                     if rs > 1e-6:
-                        ratios.append(min(ps / rs, 1.0))
+                        # TWO-SIDED (p21 RCA): penalise OVER-reading as well as
+                        # under-reading — ``min(r, 1/r)`` peaks at r=1 and decays
+                        # both ways.  The old one-sided ``min(r, 1)`` credited an
+                        # over-reader fully, so with the deterministic gain-roll a
+                        # garbage early checkpoint (MV std-ratio x13) scored MAX
+                        # gain-fidelity and was frozen as wm_best (p21: iter-10
+                        # x13.47 frozen, near-perfect iter-80 x1.07 discarded).
+                        _r = ps / rs
+                        ratios.append(min(_r, 1.0 / _r) if _r > 1e-6 else 0.0)
             if ratios:
                 result['wm_gain_fidelity'] = float(np.mean(ratios))
     except Exception as e:
@@ -8379,16 +8388,72 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         and (total_iters - wm_best_iter)
                                 >= wm_best_restore_min_gap
                         and wm_best_ckpt_path.exists()):
+                    _wb_iter0 = int(wm_best_iter)
                     try:
+                        # p21 RCA: the fidelity-score wm_best can freeze a
+                        # garbage-GAIN checkpoint (iter-10 MV ×13.47) while the
+                        # CURRENT model learned a near-perfect gain (iter-80
+                        # ×1.07) — fidelity (correlation + clamped std-ratio) is
+                        # decoupled from the open-loop gain.  Gate the restore on
+                        # the AUTHORITATIVE transfer-matrix gain: keep whichever
+                        # of {wm_best, current} is more gain-ready.
+                        # DREAMER_WM_BEST_GAIN_GATE=0 disables.
+                        _gain_gate = os.environ.get(
+                            'DREAMER_WM_BEST_GAIN_GATE', '1').lower() \
+                            not in ('0', 'off', 'false', 'no')
+
+                        def _gain_badness(_pr):
+                            if not _pr:
+                                return None
+                            _rmn, _rmx = _pr.get('r_min'), _pr.get('r_max')
+                            if _rmn is None or _rmx is None:
+                                return None
+                            return max(abs(1.0 - float(_rmn)),
+                                       abs(1.0 - float(_rmx)))
+
+                        _cur_sd = None
+                        _bad_cur = None
+                        if _gain_gate:
+                            _bad_cur = _gain_badness(_probe_observer_gain_ready(
+                                model, env, device, cfg))
+                            if _bad_cur is not None:
+                                _cur_sd = {k: v.detach().clone() for k, v
+                                           in model.state_dict().items()}
                         _blob = torch.load(wm_best_ckpt_path,
                                             map_location=device,
                                             weights_only=False)
                         model.load_state_dict(_blob['model'])
-                        print(f"[p1→p2] WM warm-restore: loaded "
-                              f"wm_best.pt (iter {wm_best_iter}, "
-                              f"score {wm_best_score:.3f}) — discarded "
-                              f"{total_iters - wm_best_iter} iters of "
-                              f"post-peak drift", flush=True)
+                        _bad_best = (_gain_badness(_probe_observer_gain_ready(
+                            model, env, device, cfg)) if _gain_gate else None)
+                        if (_cur_sd is not None and _bad_best is not None
+                                and _bad_cur is not None
+                                and _bad_best > _bad_cur + 0.10):
+                            # wm_best is materially WORSE on gain — keep current
+                            # and re-save it as wm_best so later stages agree.
+                            model.load_state_dict(_cur_sd)
+                            wm_best_iter = int(total_iters)
+                            try:
+                                torch.save({
+                                    'model': model.state_dict(),
+                                    'cfg': asdict(cfg),
+                                    'obs_norm': env.get_obs_norm_stats(),
+                                    'wm_fidelity_score': float(wm_best_score),
+                                }, wm_best_ckpt_path)
+                            except Exception:
+                                pass
+                            print(f"[p1→p2] WM warm-restore OVERRIDDEN by gain "
+                                  f"gate: kept CURRENT model (gain badness "
+                                  f"{_bad_cur:.2f}) over wm_best iter {_wb_iter0}"
+                                  f" (badness {_bad_best:.2f}) — the fidelity "
+                                  f"peak had a worse open-loop gain", flush=True)
+                        else:
+                            print(f"[p1→p2] WM warm-restore: loaded wm_best.pt "
+                                  f"(iter {_wb_iter0}, score {wm_best_score:.3f}"
+                                  + (f", gain badness {_bad_best:.2f}"
+                                     if _bad_best is not None else "")
+                                  + f") — discarded "
+                                  f"{total_iters - _wb_iter0} iters of "
+                                  f"post-peak drift", flush=True)
                     except Exception as _e:
                         print(f"[p1→p2] WM warm-restore failed: {_e} "
                               f"— continuing with current weights",
