@@ -4288,6 +4288,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     cv_base = _roll(a_base, dv0)
     total = zero
     nterm = 0
+    # HUBER not MSE (p23 RCA): the MSE gradient ∝ gain error is UNBOUNDED, so a
+    # large transient gain swing (p23 coef 2.0: ×1.09→×2.42→×-5.61) produces an
+    # exploding gradient that overshoots and DIVERGES.  smooth_l1 caps the
+    # gradient at ±1 beyond ``beta`` → damps the oscillation to a stable pin.
+    _hb = float(os.environ.get('DREAMER_GAIN_MATCH_HUBER_BETA', '1.0') or 1.0)
     for j, tgt_row in enumerate(mv_target):                # MV: step the action
         if j >= a_base.shape[-1]:
             break
@@ -4295,7 +4300,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         a_step[:, j] = a_step[:, j] + step
         g_wm = (_roll(a_step, dv0) - cv_base) / step        # (Bm, n_cv)
         tgt = torch.tensor(list(tgt_row), device=obs.device, dtype=g_wm.dtype)
-        total = total + (g_wm - tgt).pow(2).mean()
+        total = total + F.smooth_l1_loss(g_wm, tgt.expand_as(g_wm), beta=_hb)
         nterm += 1
     if dv0 is not None:
         for j, tgt_row in enumerate(dv_target):            # DV: step the DV input
@@ -4306,7 +4311,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
             g_wm = (_roll(a_base, dv_step) - cv_base) / step
             tgt = torch.tensor(list(tgt_row), device=obs.device,
                                dtype=g_wm.dtype)
-            total = total + (g_wm - tgt).pow(2).mean()
+            total = total + F.smooth_l1_loss(g_wm, tgt.expand_as(g_wm), beta=_hb)
             nterm += 1
     if nterm == 0:
         return zero, diag
