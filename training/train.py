@@ -248,6 +248,11 @@ class TrainConfig:
     grad_clip: float = 100.0  # DreamerV3 default; was 1000 (too loose,
                               # let the actor explode at the BC→PMPO
                               # transition).
+    # Skip the WM optimiser step when the pre-clip grad norm exceeds this (p24
+    # RCA): a huge-but-finite norm clipped to grad_clip is a garbage direction
+    # (one exploded BPTT component dominates) that corrupts the WM.  ``0`` = only
+    # skip on non-finite (legacy).  ``DREAMER_WM_GRAD_SKIP_NORM``.
+    wm_grad_skip_norm: float = 1.0e4
     # p09/p10 RCA: the actor's logp gradient ∂logp/∂μ = (u−μ)/σ² EXPLODES in P3
     # because σ COLLAPSES (small σ² denom) while taken actions sit near the tanh
     # rails (large u−μ) → thrash + return crash.  p10's tight clip=3 capped the
@@ -4281,10 +4286,18 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
 
     def _roll(a_held, dv_held):
         st = _state()
-        for _ in range(K):
+        for _i in range(K):
             st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
+            # Truncated BPTT (p24 RCA): at gain≈1.0 the recurrence is marginally
+            # stable, so the gradient through the full K-step roll explodes
+            # (grad_norm→1e13/inf → grad-skip storm → P1 abort).  Detach every
+            # ``_tbptt`` steps to bound the BPTT path.  ``0`` = full BPTT.
+            if (_tbptt > 0 and _i < K - 1 and (_i + 1) % _tbptt == 0
+                    and hasattr(st, 'detach')):
+                st = st.detach()
         return rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
 
+    _tbptt = int(os.environ.get('DREAMER_AUX_TBPTT_STEPS', '16') or 0)
     cv_base = _roll(a_base, dv0)
     total = zero
     nterm = 0
@@ -4398,6 +4411,7 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     ss_k0 = K - max(1, int(round(min(max(w_frac, 0.05), 0.9) * K)))
     total = zero
     cv_pred_win = []
+    _tbptt = int(os.environ.get('DREAMER_AUX_TBPTT_STEPS', '16') or 0)
     for k in range(K):
         dvk = dv_all[:, k] if dv_all is not None else None
         st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
@@ -4405,6 +4419,11 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
         total = total + (cv_pred - cv_real[:, k]).pow(2).mean()
         if ss_coef > 0.0 and k >= ss_k0:
             cv_pred_win.append(cv_pred)
+        # Truncated BPTT (p24 RCA): bound the gradient path so the marginally-
+        # stable gain≈1.0 recurrence can't explode over the full K-step roll.
+        if (_tbptt > 0 and k < K - 1 and (k + 1) % _tbptt == 0
+                and hasattr(st, 'detach')):
+            st = st.detach()
     out = coef * (total / float(K))
     if ss_coef > 0.0 and cv_pred_win:
         pred_ss = torch.stack(cv_pred_win, dim=1).mean(dim=1)     # (Bm, n_cv)
@@ -9091,7 +9110,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 if current_phase == 2:
                     actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters_actor(), cfg.actor_grad_clip)
-                if not torch.isfinite(wm_grad_norm):
+                # Skip on non-finite OR huge-but-finite grad (p24 RCA): a 1e13
+                # norm clipped to grad_clip is a GARBAGE direction (one exploded
+                # component dominates) that corrupts the WM — skip it, don't apply.
+                _wm_skip_thr = float(getattr(cfg, 'wm_grad_skip_norm', 0.0) or 0.0)
+                if (not torch.isfinite(wm_grad_norm)) or (
+                        _wm_skip_thr > 0.0 and float(wm_grad_norm) > _wm_skip_thr):
                     n_grad_skip += 1
                     opt_world.zero_grad(set_to_none=True)
                     if current_phase == 2:

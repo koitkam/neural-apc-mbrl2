@@ -218,6 +218,16 @@ class RSSMState:
     def stoch_flat(self) -> torch.Tensor:
         return self.z.flatten(start_dim=-2)
 
+    def detach(self) -> 'RSSMState':
+        """Detach every state tensor — truncated-BPTT cut that bounds the
+        gradient path through the recurrence without altering the forward roll."""
+        def _d(t):
+            return t.detach() if t is not None else None
+        return RSSMState(
+            h=_d(self.h), z_logits=_d(self.z_logits), z=_d(self.z),
+            d=_d(self.d), dv=_d(self.dv), c=_d(self.c),
+            c_mean=_d(self.c_mean), c_std=_d(self.c_std))
+
     @property
     def feat(self) -> torch.Tensor:
         # Scope 2 (DOB feed-forward, 2026-06-11) + DV feed-forward (2026-06-19)
