@@ -742,6 +742,9 @@ class TrainConfig:
     # d_t is NORMALIZED obs space → the loss divides the target by the running CV
     # obs-norm std (threaded as ``cfg._cv_obs_std``).  0.0 = off (byte-identical).
     # ``DREAMER_DOB_GROUND_COEF``.
+    # P25 RCA: the replay buffer MUST store ``n_dist = n_cv`` whenever this
+    # is >0 OR the DOB is on — do not key storage off ``disturbance_head_dim``
+    # (that field is forced 0 when DOB replaces the head).
     dob_ground_coef: float = 0.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
@@ -2621,6 +2624,32 @@ class APCEnv:
 # Replay buffer — episode-major
 # ---------------------------------------------------------------------------
 
+def _replay_n_dist(cfg: 'TrainConfig', env: Optional['APCEnv'] = None) -> int:
+    """Hidden-load target width stored in the WM replay buffer.
+
+    P25 RCA: when the neural-Kalman DOB is on, ``disturbance_head_dim`` is
+    forced to 0 (the read-out head is retired so it cannot echo ``d_t``).
+    Keying the buffer on that field then stored ``n_dist=0`` →
+    ``batch['dist']`` was missing → ``dob_ground`` was identically 0 for
+    every P2 iter (P19 and P25).  Store ``n_cv`` whenever the DOB is on
+    or grounding is requested, otherwise the (optional) head width.
+    Sim-agnostic: ``n_cv`` comes from the env / ``cv_obs_indices``.
+    """
+    n_head = int(getattr(cfg, 'disturbance_head_dim', 0) or 0)
+    n_cv = 0
+    if env is not None:
+        n_cv = len(getattr(env, 'cv_indices', ()) or ())
+    if n_cv <= 0:
+        n_cv = len(getattr(cfg, 'cv_obs_indices', ()) or ())
+    ground_on = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) > 0.0
+    dob_on = bool(getattr(cfg, 'dob_enabled', False))
+    if n_head > 0:
+        return n_head
+    if (ground_on or dob_on) and n_cv > 0:
+        return int(n_cv)
+    return 0
+
+
 class TrajectoryBuffer:
     def __init__(self, capacity_eps: int, episode_length: int,
                  obs_dim: int, action_dim: int,
@@ -4285,19 +4314,16 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
            if getattr(rssm, 'dv_dim', 0) > 0 else None)
 
     def _roll(a_held, dv_held):
+        # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
+        # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
+        # gradient that pins transfer-matrix gain (forward loss still
+        # looks tiny; val MV stayed ×0.74).  Explosion defence for this
+        # path is Huber + ``wm_grad_skip_norm`` (P24/P25), not a detach.
         st = _state()
         for _i in range(K):
             st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
-            # Truncated BPTT (p24 RCA): at gain≈1.0 the recurrence is marginally
-            # stable, so the gradient through the full K-step roll explodes
-            # (grad_norm→1e13/inf → grad-skip storm → P1 abort).  Detach every
-            # ``_tbptt`` steps to bound the BPTT path.  ``0`` = full BPTT.
-            if (_tbptt > 0 and _i < K - 1 and (_i + 1) % _tbptt == 0
-                    and hasattr(st, 'detach')):
-                st = st.detach()
         return rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
 
-    _tbptt = int(os.environ.get('DREAMER_AUX_TBPTT_STEPS', '16') or 0)
     cv_base = _roll(a_base, dv0)
     total = zero
     nterm = 0
@@ -4419,11 +4445,14 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
         total = total + (cv_pred - cv_real[:, k]).pow(2).mean()
         if ss_coef > 0.0 and k >= ss_k0:
             cv_pred_win.append(cv_pred)
-        # Truncated BPTT (p24 RCA): bound the gradient path so the marginally-
-        # stable gain≈1.0 recurrence can't explode over the full K-step roll.
+        # Truncated BPTT (p24 RCA / p25 RCA): bound the GRU path so a
+        # marginally-stable recurrence can't explode, but NEVER cut the
+        # continuous gain channel ``c`` and NEVER cut inside the
+        # settled SS-match window (that window IS the DC-gain supervisor).
         if (_tbptt > 0 and k < K - 1 and (k + 1) % _tbptt == 0
+                and (ss_coef <= 0.0 or k < ss_k0 - 1)
                 and hasattr(st, 'detach')):
-            st = st.detach()
+            st = st.detach(keep_c=True)
     out = coef * (total / float(K))
     if ss_coef > 0.0 and cv_pred_win:
         pred_ss = torch.stack(cv_pred_win, dim=1).mean(dim=1)     # (Bm, n_cv)
@@ -4664,16 +4693,40 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # divide by the running CV obs-norm std (threaded on cfg as _cv_obs_std).
     dob_ground = torch.zeros((), device=feats.device)
     dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
-    if dob_on and dgc > 0.0 and dist_target is not None:
-        dtgt = dist_target.to(ds.dtype)
-        if dtgt.shape == ds.shape:
-            cvs = getattr(cfg, '_cv_obs_std', None)
-            if cvs is not None and len(cvs) == int(ds.shape[-1]):
-                cv_std_t = torch.tensor(list(cvs), device=ds.device,
-                                        dtype=ds.dtype).clamp_min(1e-6)
-                dtgt = dtgt / cv_std_t
-            dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
-            wm_total = wm_total + dgc * dob_ground
+    if dob_on and dgc > 0.0:
+        if dist_target is None:
+            if not getattr(cfg, '_dob_ground_missing_warned', False):
+                print('[dob-ground] WARNING: dob_ground_coef>0 but batch has '
+                      'no dist target — grounding is a silent no-op.  The '
+                      'replay buffer must store n_dist=n_cv whenever DOB '
+                      'grounding is on (P25 RCA: keyed off disturbance_head_dim '
+                      'which is forced 0 when DOB replaces the head).',
+                      flush=True)
+                cfg._dob_ground_missing_warned = True  # type: ignore[attr-defined]
+        else:
+            dtgt = dist_target.to(device=ds.device, dtype=ds.dtype)
+            # Broadcast a missing trailing CV dim (T,) → (T, n_cv) and drop
+            # extra channels so a plant with any n_cv cannot silently skip.
+            if dtgt.dim() == ds.dim() - 1:
+                dtgt = dtgt.unsqueeze(-1)
+            if dtgt.shape[:2] == ds.shape[:2] and dtgt.shape[-1] != ds.shape[-1]:
+                if dtgt.shape[-1] == 1 and ds.shape[-1] > 1:
+                    dtgt = dtgt.expand_as(ds)
+                elif dtgt.shape[-1] > ds.shape[-1]:
+                    dtgt = dtgt[..., :ds.shape[-1]]
+            if dtgt.shape == ds.shape:
+                cvs = getattr(cfg, '_cv_obs_std', None)
+                if cvs is not None and len(cvs) == int(ds.shape[-1]):
+                    cv_std_t = torch.tensor(list(cvs), device=ds.device,
+                                            dtype=ds.dtype).clamp_min(1e-6)
+                    dtgt = dtgt / cv_std_t
+                dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
+                wm_total = wm_total + dgc * dob_ground
+            elif not getattr(cfg, '_dob_ground_shape_warned', False):
+                print(f'[dob-ground] WARNING: dist_target shape {tuple(dtgt.shape)} '
+                      f'!= d_t shape {tuple(ds.shape)} — grounding skipped.',
+                      flush=True)
+                cfg._dob_ground_shape_warned = True  # type: ignore[attr-defined]
 
     # ----- (b) held-action steady-state consistency (RSSM) -----
     # P89 consolidation: the multi-step held-action ROLLOUT stationarity loss
@@ -7270,13 +7323,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                    eps=1e-8, weight_decay=0.0)
 
     capacity_eps = max(1, cfg.buffer_capacity_steps // cfg.episode_length)
+    # P25 RCA: n_dist must be n_cv whenever the neural-Kalman needs a load
+    # target.  Do NOT key this off disturbance_head_dim (forced 0 when DOB
+    # replaces the head — that made P19/P25 grounding a silent no-op).
+    _n_dist = _replay_n_dist(cfg, env)
     buf = TrajectoryBuffer(capacity_eps, cfg.episode_length,
-                            cfg.obs_dim, cfg.action_dim,
-                            n_dist=int(getattr(cfg, 'disturbance_head_dim', 0) or 0))
-    # P87: bind the single training env so add_episode() can pull each
-    # episode's recorded hidden-disturbance trace (zero call-site edits).
+                            cfg.obs_dim, cfg.action_dim, n_dist=_n_dist)
+    # Bind the training env so add_episode() pulls each episode's recorded
+    # hidden-disturbance trace (zero call-site edits).
     if buf.dist is not None:
         buf._dist_source = env
+        print(f'[dob-ground] replay n_dist={_n_dist} '
+              f'(dob={bool(getattr(cfg, "dob_enabled", False))} '
+              f'ground_coef={float(getattr(cfg, "dob_ground_coef", 0.0) or 0.0):.3g} '
+              f'head_dim={int(getattr(cfg, "disturbance_head_dim", 0) or 0)})',
+              flush=True)
 
     # mbrl2 real-sim (2026-07-08): a SEPARATE rolling ON-POLICY buffer for the P3
     # actor-critic update.  Vanilla REINFORCE (``_realsim_actor_critic_step``) is

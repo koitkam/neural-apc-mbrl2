@@ -25,15 +25,21 @@ plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
 
 ## Goals
 
-- Model-based control with a learned world model (RSSM default, transformer opt-in).
-- Stay close to the Dreamer papers. Add adaptive knobs only when they remain a strict
-  superset of the paper recipe (paper defaults as floors / minimums).
-- Simulator-agnostic via small, focused Bayesian Optimization on two axes
-  only: `model_size`, `horizon` (initialized from plant ID; lookback is
-  pinned to the identified value).
+- **Simulator-agnostic / sim-adaptive** neural APC: any chemical plant
+  (linear or nonlinear, any number of MVs / CVs / DVs). Knobs are unitless
+  or derived from dynamics-ID (τ, θ, authority, episode length) — never
+  hard-coded engineering units.
+- **Neural observer** (RSSM default, transformer-SSM opt-in) + **neural
+  Kalman DOB** for the unmeasured load. Bias-free DC gains on every
+  MV→CV and DV→CV pair; the DOB estimates only the hidden disturbance.
+- **Neural actor/critic** trained on real simulator rollouts (supervised
+  expert-BC is a launchpad, not a ceiling). The agent must **beat**
+  supervised / expert performance with RL.
+- Stay close to Dreamer paper defaults where they still apply. Add knobs
+  only when they remain a strict superset of the paper recipe.
 - One ONNX artifact per workflow: a single integrated graph
-  `(obs_window, prev_actions) → action`. No separate observer model — the
-  causal tokenizer + dynamics transformer *is* the observer.
+  `(obs_window, prev_actions) → action`. The RSSM/TSSM + DOB *is* the
+  observer the deployed policy reads.
 
 ## Training modes (`DREAMER_TRAIN_MODE`)
 

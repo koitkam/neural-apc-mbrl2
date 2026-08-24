@@ -207,6 +207,26 @@ class TSSMState:
     def stoch_flat(self) -> torch.Tensor:
         return self.z.flatten(start_dim=-2)
 
+    def detach(self, keep_c: bool = False) -> 'TSSMState':
+        """Truncated-BPTT cut — mirror of ``RSSMState.detach`` (P25 RCA).
+
+        ``keep_c`` leaves the continuous gain channel attached so an ``h``
+        cut cannot kill the DC-gain supervisor.  KV-cache entries are
+        detached with ``h`` (they ARE the transformer recurrence).
+        """
+        def _d(t):
+            return t.detach() if t is not None else None
+        kv = None
+        if self.kv_cache is not None:
+            kv = [(_d(k), _d(v)) for k, v in self.kv_cache]
+        return TSSMState(
+            h=_d(self.h), z_logits=_d(self.z_logits), z=_d(self.z),
+            kv_cache=kv, pos=self.pos,
+            d=_d(self.d), dv=_d(self.dv),
+            c=(self.c if keep_c else _d(self.c)),
+            c_mean=(self.c_mean if keep_c else _d(self.c_mean)),
+            c_std=(self.c_std if keep_c else _d(self.c_std)))
+
     @property
     def feat(self) -> torch.Tensor:
         # DV feedforward (2026-06-19) + Scope 2 DOB (2026-06-11) + continuous

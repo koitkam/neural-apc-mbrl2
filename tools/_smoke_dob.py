@@ -24,7 +24,9 @@ import torch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from training.train import TrainConfig, build_model, world_model_loss  # noqa: E402
+from training.train import (  # noqa: E402
+    TrainConfig, build_model, world_model_loss, _replay_n_dist,
+)
 
 
 def _mk(wm_type='rssm', dob=False, cv_idx=(2,)):
@@ -235,9 +237,44 @@ def _check_compile_equiv(wm_type):
           f'(max|Δfeats|={fe:.2e}, max|Δds|={de:.2e}) [{wm_type}]')
 
 
+def _check_grounding():
+    """P25 RCA: grounding must fire when DOB is on + batch['dist'] present,
+    even if disturbance_head_dim=0 (the production DOB-replaces-head layout).
+    Buffer width must be n_cv in that case — not keyed off the head dim."""
+    print('\n=== dob_ground (P25 RCA) ===')
+    cfg = TrainConfig()
+    cfg.cv_obs_indices = (0,)
+    cfg.dob_enabled = True
+    cfg.dob_ground_coef = 2.0
+    cfg.disturbance_head_dim = 0
+    assert _replay_n_dist(cfg) == 1, _replay_n_dist(cfg)
+    cfg.dob_enabled = False
+    cfg.dob_ground_coef = 0.0
+    assert _replay_n_dist(cfg) == 0, _replay_n_dist(cfg)
+    print('[smoke] OK  _replay_n_dist = n_cv when DOB/grounding on, 0 otherwise')
+
+    cfg, model, batch = _mk('rssm', dob=True, cv_idx=(2,))
+    cfg.dob_ground_coef = 2.0
+    cfg.dob_reg_coef = 0.0
+    cfg.disturbance_head_dim = 0
+    cfg._cv_obs_std = [1.0]
+    losses, _, _ = world_model_loss(model, batch, cfg)
+    g = float(losses['dob_ground'])
+    assert g > 0.0 and np.isfinite(g), f'dob_ground must be >0, got {g}'
+    print(f'[smoke] OK  dob_ground={g:.4f} with head_dim=0 + batch[dist]')
+
+    cfg2, model2, batch2 = _mk('rssm', dob=True, cv_idx=(2,))
+    cfg2.dob_ground_coef = 2.0
+    batch2.pop('dist', None)
+    losses2, _, _ = world_model_loss(model2, batch2, cfg2)
+    assert float(losses2['dob_ground']) == 0.0, 'missing dist must no-op'
+    print('[smoke] OK  missing dist_target → dob_ground=0 (warned)')
+
+
 if __name__ == '__main__':
     for wm in ('rssm', 'tssm'):
         _check(wm)
         _check_scope2(wm)
         _check_compile_equiv(wm)
+    _check_grounding()
     print('\n[smoke] ALL DOB CHECKS PASSED (both backbones)')

@@ -4,7 +4,7 @@ continuous gain channel (the routing that bypasses the categorical bottleneck).
 import torch
 
 from training.train import (TrainConfig, build_model,
-                            _wm_input_isolation_loss)
+                            _wm_input_isolation_loss, _wm_gain_match_loss)
 
 
 def main():
@@ -94,6 +94,41 @@ def main():
     assert cont_grad_ss > 0.0, 'ss-match grad did NOT reach the cont-gain params!'
     print(f'[ss] OK: finite, adds to traj loss, grad reaches cont-gain '
           f'({cont_grad_ss:.4e})')
+
+    # ---- P25 RCA: isolation TBPTT must keep_c so the gain channel still trains
+    import os
+    os.environ['DREAMER_AUX_TBPTT_STEPS'] = '2'
+    cfg.wm_ss_match_coef = 0.5
+    cfg.wm_input_isolation_len = 6
+    model.zero_grad(set_to_none=True)
+    tb = _wm_input_isolation_loss(model, obs, act, cfg)
+    assert torch.isfinite(tb).all() and float(tb) > 0.0, float(tb)
+    tb.backward()
+    cont_grad_tb = sum(float(p.grad.abs().sum())
+                       for n, p in model.dynamics.named_parameters()
+                       if p.grad is not None and 'cont' in n)
+    assert cont_grad_tb > 0.0, 'TBPTT keep_c still must reach cont-gain!'
+    print(f'[tbptt] OK: isolation TBPTT(keep_c) still trains cont-gain '
+          f'({cont_grad_tb:.4e})')
+
+    # ---- P25 RCA: gain-match is FULL BPTT (no detach) so the K-step
+    # asymptote still reaches the continuous gain channel.
+    cfg.gain_match_coef = 1.0
+    cfg.gain_match_len = 6
+    cfg.gain_match_mv_target = ((-1.0,),)
+    cfg.gain_match_dv_target = ((0.5,),)
+    with torch.no_grad():
+        feats, *_ = model.dynamics.rollout_observed(obs, act, sample=False)
+    model.zero_grad(set_to_none=True)
+    gm, _diag = _wm_gain_match_loss(model, feats, obs, act, cfg)
+    assert torch.isfinite(gm).all() and float(gm) > 0.0, float(gm)
+    gm.backward()
+    cont_grad_gm = sum(float(p.grad.abs().sum())
+                       for n, p in model.dynamics.named_parameters()
+                       if p.grad is not None and 'cont' in n)
+    assert cont_grad_gm > 0.0, 'gain-match (full BPTT) did NOT reach cont-gain!'
+    print(f'[gain-match] OK: full-BPTT asymptote trains cont-gain '
+          f'({cont_grad_gm:.4e})')
 
 
 if __name__ == '__main__':

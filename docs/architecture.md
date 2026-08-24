@@ -73,6 +73,21 @@ env-gated off · **[planned]** = designed, not yet built.
 > for the manual `dob_gain_init` amplitude tuning. `dob_reg_coef → 0` when
 > grounding is on. First run: p19 (`run_p19_dobground`).
 
+> **2026-08-24 — P25 RCA / P26 observer fixes (branch `grok`).** Two silent
+> bugs made the observer look trained while staying biased. **(1) TBPTT killed
+> DC-gain.** P24's `st.detach()` every 16 of K=55 on the gain-match *asymptote*
+> roll left the forward Huber loss tiny but cut the gradient through the rise
+> that sets transfer-matrix gain (P25 freeze MV ×0.74 / @H ×0.60). Gain-match
+> now runs **full BPTT** (explosion defence = Huber + `wm_grad_skip_norm`);
+> isolation may still TBPTT **`h` only** (`keep_c=True`) and **never inside the
+> SS-match settle window**. **(2) DOB grounding was dead code** whenever the
+> DOB replaced the read-out head: `disturbance_head_dim` is forced to 0, the
+> replay buffer stored `n_dist=0`, `batch['dist']` was missing, and
+> `dob_ground` was identically 0 for every P2 iter of P19 *and* P25. Buffer
+> width is now `n_cv` whenever DOB or `dob_ground_coef>0` (`_replay_n_dist`).
+> Stage 2 (critic ensemble + freeze `return_scale`) waits until the P1→P2
+> gain-probe is READY.
+
 ---
 
 ## 1. Full architecture (training)
@@ -224,6 +239,11 @@ flowchart LR
   tunes the Kalman `A,K` to TRACK the load — the structural replacement for the
   manual `dob_gain_init` amplitude tuning and the `dob_reg` prior
   (`dob_reg_coef → 0` when grounding is on). `DREAMER_DOB_GROUND_COEF`.
+  **P25 RCA:** the replay buffer must store `n_dist = n_cv` whenever grounding
+  or the DOB is on. Do **not** key storage off `disturbance_head_dim` (forced
+  0 when the DOB replaces the head — that made P19/P25 `dob_ground` a silent
+  no-op). `_replay_n_dist` is the single resolver; a missing/`shape`-mismatch
+  target logs a one-shot warning instead of failing closed.
 - **Disturbance estimate**: `d_t` itself is the estimate — `wm_disturbance_prediction`
   reads it directly (converted to engineering units via the obs-norm std),
   superseding the read-out head when DOB is on.

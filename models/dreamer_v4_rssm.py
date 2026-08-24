@@ -218,15 +218,23 @@ class RSSMState:
     def stoch_flat(self) -> torch.Tensor:
         return self.z.flatten(start_dim=-2)
 
-    def detach(self) -> 'RSSMState':
-        """Detach every state tensor — truncated-BPTT cut that bounds the
-        gradient path through the recurrence without altering the forward roll."""
+    def detach(self, keep_c: bool = False) -> 'RSSMState':
+        """Truncated-BPTT cut that bounds the recurrent gradient path.
+
+        P25 RCA: detaching the CONTINUOUS gain channel ``c`` on a K-step
+        gain-match / isolation roll severs the DC-gain supervisor (forward
+        loss still looks healthy; transfer-matrix gain does not).  ``keep_c``
+        leaves ``c`` / ``c_mean`` / ``c_std`` attached so the un-quantized
+        gain path survives a GRU ``h`` cut.  Forward values are unchanged.
+        """
         def _d(t):
             return t.detach() if t is not None else None
         return RSSMState(
             h=_d(self.h), z_logits=_d(self.z_logits), z=_d(self.z),
-            d=_d(self.d), dv=_d(self.dv), c=_d(self.c),
-            c_mean=_d(self.c_mean), c_std=_d(self.c_std))
+            d=_d(self.d), dv=_d(self.dv),
+            c=(self.c if keep_c else _d(self.c)),
+            c_mean=(self.c_mean if keep_c else _d(self.c_mean)),
+            c_std=(self.c_std if keep_c else _d(self.c_std)))
 
     @property
     def feat(self) -> torch.Tensor:

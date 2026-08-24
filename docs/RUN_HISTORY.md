@@ -1219,6 +1219,17 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
   **smooth across all seeds** (not just some), `mv_violation` ≪ 112, agent beats the baseline, `realsim_return` doesn't
   spiral. If the WM is now correct but the actor still degrades late → that's an independent actor-stability issue for p10.
 
+### p25 (`run_p25_tbptt`) — VERDICT: TBPTT stopped the P24 blow-up; DC-gain + DOB grounding still dead
+- P1 completed (0 grad-skips, max `wm_grad` 40 vs P24 57 skips / 7e13). P1→P2 **capped GAIN_NOT_READY** (DC [0.72, 1.00]).
+- Val (best.pt = P3 it176): MV ss/**@H ×0.74 / ×0.60**, DV ×1.16 / ×1.12; WM r 0.167; disturbance det_r 0.24; critic_r 0.087; econ −194 vs baseline −102. Entropy-collapse early-stop @345. `return_scale` 1.12→49.5 by P3 it185.
+- **ROOT (observer):** (1) `RSSMState.detach()` every 16 of K=55 on the gain-match *asymptote* cut the DC-gain gradient (forward Huber loss ~0.002, transfer still ×0.74). (2) DOB-on forces `disturbance_head_dim=0` → buffer `n_dist=0` → `batch['dist']` missing → `dob_ground` identically 0 for all 54 P2 iters. **P19 was the same** — the P19 "grounding win" was not this loss.
+- **ROOT (actor):** independent critic cascade (single twohot + λ-bootstrap + p95–p5 `return_scale` EMA). Stage 2 after the observer freeze is READY.
+
+### p26 (branch `grok`) — FIX: full-BPTT gain-match + live DOB grounding
+- Gain-match roll: **no TBPTT** (Huber + `wm_grad_skip_norm` remain the explosion defence). Isolation TBPTT **`h` only** (`keep_c=True`) and never inside the SS-match settle window. TSSMState gets the same `detach(keep_c=)`.
+- `_replay_n_dist`: store `n_cv` whenever DOB or `dob_ground_coef>0` (do not key off `disturbance_head_dim`). Broadcast/reshape the load target; one-shot warn if missing.
+- **Judge by**: P1 0 skip-storm; P1→P2 READY; MV+DV ss ≈ 1.0 ± 0.1 and @H not collapsed; P2 `dob_ground` **>0** and falling; val det_r >0.7; open-loop converges >0. Actor not judged until the freeze is READY.
+
 
 
 
