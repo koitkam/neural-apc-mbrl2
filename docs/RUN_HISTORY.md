@@ -1225,9 +1225,10 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **ROOT (observer):** (1) `RSSMState.detach()` every 16 of K=55 on the gain-match *asymptote* cut the DC-gain gradient (forward Huber loss ~0.002, transfer still ×0.74). (2) DOB-on forces `disturbance_head_dim=0` → buffer `n_dist=0` → `batch['dist']` missing → `dob_ground` identically 0 for all 54 P2 iters. **P19 was the same** — the P19 "grounding win" was not this loss.
 - **ROOT (actor):** independent critic cascade (single twohot + λ-bootstrap + p95–p5 `return_scale` EMA). Stage 2 after the observer freeze is READY.
 
-### p26 (branch `grok`) — FIX: full-BPTT gain-match + live DOB grounding
+### p26 (`run_p26_gainbptt`, branch `grok` @ 1517d91) — LAUNCHED 2026-08-24 12:26 — full-BPTT gain-match + live DOB grounding
 - Gain-match roll: **no TBPTT** (Huber + `wm_grad_skip_norm` remain the explosion defence). Isolation TBPTT **`h` only** (`keep_c=True`) and never inside the SS-match settle window. TSSMState gets the same `detach(keep_c=)`.
 - `_replay_n_dist`: store `n_cv` whenever DOB or `dob_ground_coef>0` (do not key off `disturbance_head_dim`). Broadcast/reshape the load target; one-shot warn if missing.
+- **Launch:** tmux `mbrl2_p26`, out `output/test_sim/run_p26_gainbptt`. Env **identical to P25** (only code delta). Startup confirmed: `device=cuda`, `[dob-ground] replay n_dist=1 (dob=True ground_coef=2 head_dim=0)`.
 - **Judge by**: P1 0 skip-storm; P1→P2 READY; MV+DV ss ≈ 1.0 ± 0.1 and @H not collapsed; P2 `dob_ground` **>0** and falling; val det_r >0.7; open-loop converges >0. Actor not judged until the freeze is READY.
 
 
