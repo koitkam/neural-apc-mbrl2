@@ -410,7 +410,8 @@ def main() -> int:
     print(json.dumps({k: v for k, v in plan.items() if k != 'config'},
                      indent=2), flush=True)
 
-    print('[run] phase 2: training', flush=True)
+    print('[run] workflow-step 2: training '
+          '(Dreamer P1 WM / P2 observer / P3 actor-critic)', flush=True)
     summary = run_training(cfg)
     with open(out_dir / 'run_summary.json', 'w') as f:
         json.dump({'plan': plan, 'summary': summary}, f, indent=2)
@@ -418,7 +419,9 @@ def main() -> int:
     # ── Phase 3: validation (parity with workflow.bo_runner final retrain) ──
     val_summary: Dict = {}
     if not args.no_validate:
-        print('[run] phase 3: validation', flush=True)
+        print('[run] workflow-step 3: held-out validation '
+              '(seed_*/disturbance_rejection plots; NOT Dreamer P3)',
+              flush=True)
         try:
             from evaluation.validate import run_validation
             # Validate best.pt (deterministic-best P3 ckpt) rather than final.pt
@@ -431,11 +434,29 @@ def main() -> int:
             # crashing with FileNotFoundError and emitting no plots at all.
             val_ckpt = 'best.pt'
             if not (out_dir / 'best.pt').exists():
+                # P27 RCA: this line used to say "likely P3 collapse" even when
+                # training never LEFT Dreamer P1 (grad_skip_storm @iter 50).
+                # Workflow "phase 3" is VALIDATION (seed_*/disturbance_rejection
+                # plots), not Dreamer Stage 3 / ``P3 iter`` actor-critic.
                 val_ckpt = 'final.pt'
-                print('[run] validation: best.pt not found '
-                      '(no improving P3 ckpt — likely P3 collapse/early-stop); '
-                      'falling back to final.pt (degraded controller)',
-                      flush=True)
+                _es = summary.get('early_stop_reason')
+                _p3it = summary.get('best_p3_iter')
+                _nit = summary.get('iters')
+                if _p3it is None:
+                    print('[run] validation: best.pt not found — Dreamer P3 '
+                          f'actor-critic NEVER RAN (stopped after {_nit} '
+                          f'iters'
+                          + (f': {_es}' if _es else '')
+                          + '). Validating final.pt (P1/P2 weights + P1 '
+                          'expert-BC policy). Seed plots are held-out eval, '
+                          'not evidence that Stage 3 finished.',
+                          flush=True)
+                else:
+                    print('[run] validation: best.pt not found '
+                          '(no improving P3 ckpt — likely P3 collapse/'
+                          'early-stop); falling back to final.pt '
+                          '(degraded controller)',
+                          flush=True)
             val_summary = run_validation(controller_dir=out_dir,
                                           episodes=int(args.val_episodes),
                                           seeds=int(args.val_seeds),
