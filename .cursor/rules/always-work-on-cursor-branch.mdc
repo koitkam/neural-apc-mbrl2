@@ -1,0 +1,11 @@
+---
+description: Work only in neural-APC-mbrl2-cursor on a cursor* branch
+alwaysApply: true
+---
+
+# Workspace
+
+- Edit and launch training only in `/home/koitkam/neural-APC-mbrl2-cursor`.
+- Do not modify files under `/home/koitkam/neural-APC-mbrl2`.
+- Stay on a git branch whose name contains `cursor`. Confirm with `git rev-parse --abbrev-ref HEAD` before commits or runs.
+- One GPU job at a time (`CUDA_VISIBLE_DEVICES=0`). Launch from this copy: `scratch/run_p28_absgain_qens.sh`.

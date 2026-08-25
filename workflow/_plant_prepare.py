@@ -329,6 +329,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
         'return_scale_freeze_after_warmup', _as_bool),
     # P26 RCA / P27: TD3 min-of-N twohot critics (default 2).
     'DREAMER_N_CRITICS':                  ('n_critics',                      int),
+    # P27 RCA / P28: restore wm_best and continue to P2 on a P1 skip-storm
+    # instead of aborting the run (default ON).
+    'DREAMER_SKIP_STORM_RECOVER_P1':      ('skip_storm_recover_p1',          _as_bool),
     # Cascade RCA (2026-05-29): the two corrected anti-cascade fixes.
     # A' — potential-based reward shaping (dense, policy-invariant, same
     # γ; training-only, validation scores on unshaped raw_reward).
@@ -513,6 +516,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_LEN':             ('gain_match_len',                 int),
     'DREAMER_GAIN_MATCH_MAX_STARTS':      ('gain_match_max_starts',          int),
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
+    # P27 RCA / P28: relative Huber is OFF by default (exploded P1).  1 = opt-in.
     'DREAMER_GAIN_MATCH_RELATIVE':        ('gain_match_relative',            float),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
     # per-input isolation trajectory match + the steady-state DC-gain match (the

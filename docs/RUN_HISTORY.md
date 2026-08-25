@@ -1231,12 +1231,19 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Actor FAIL (independent, Stage 2):** `return_scale` 1.19→**49.5 cap**, `critic_rew_to_tgt_var` 0.041→**0.00015**, entropy-collapse @262 (`adv_corr=0.05`), critic_r 0.079, econ **−424 vs baseline −117**, MV reversal 0.665, noisy MV near the high limit. Same cascade as P25.
 - Log noise (not training bugs): `[val] P1: shortcut-forcing loss did not drop` (RSSM `sf_loss≡0`); `[gate p1->p2] FAIL (gain_not_ready) … wm_ema_best=5.211 < 1.50` (wrong reason string).
 
-### p27 (`run_p27_relgain_qens`) — FIX: relative gain-match + min-of-2 critic + freeze return_scale
-- Relative Huber on ΔCV/Δinput vs identified gain (`gain_match_relative=1`, unitless) so MV and DV have O(1) weight.
-- TD3 min-of-2 twohot critics (`n_critics=2`); bootstrap + advantage use min-of-N.
-- Freeze `return_scale` EMA after critic warmup (`return_scale_freeze_after_warmup=True`).
-- Skip identically-zero `sf_loss` flag; print the true P1→P2 fail reason.
-- **Judge by:** DV ss → ~×1.0 ±0.1 (MV holds); P3 `return_scale` plateaus near warmup value (NOT the 49.5 cap); `critic_rew_to_tgt_var` stays >0.015; no entropy-collapse; agent econ > baseline; MV not railed/chattery.
+### p27 (`run_p27_relgain_qens`) — VERDICT: P1 skip-storm abort; relative gain-match exploded the observer; actor/critic NEVER trained
+- **Did not complete.** Early-stop `grad_skip_storm: 42 skips in last 100 iters` at P1 iter 50 (`wm_grad_norm=6.0e12`, recon 0.0039→0.496, `gain_match_loss` 2.6e-4→0.64, isolation 0.005→13.1). P2=0, P3=0. Validation used exploded `final.pt` (`best.pt` missing).
+- **Observer FAIL vs P26:** MV ss/@H **×1.95 / ×1.90** (P26 ×0.97 / ×0.88); DV ss/@H ×1.13 / ×0.80 (P26 ×0.87 / ×1.00); `wm_gain_rel_err` 0.95 vs 0.026; autoencoder lever (real→post **×0.26**). Iter 49 was still healthy — the relative Huber DV boost detonated full-BPTT on the next step (same marginally-stable recurrence as P24).
+- **Apparent actor win is the expert-BC launchpad.** econ **−59 vs baseline −77** (beats_baseline) and cum_raw −68k vs P26 −585k, but `critic_r=NaN`, `reward_head_r=NaN` (heads at twohot prior, pred_std 0), MV reversal 0.70. Closed-loop plots are P1 `bc_scale=0.15` static expert, not min-of-2 / freeze-return_scale.
+- **ROOT:** `gain_match_relative=1` (only observer delta vs P26). Actor knobs (`n_critics=2`, `return_scale_freeze_after_warmup`) never ran.
+
+### p28 (`run_p28_absgain_qens`, branch `cursor`) — FIX: restore P26 observer; keep untested actor knobs; recover P1 skip-storms
+- Revert `gain_match_relative` default **1→0** (absolute Huber, P26 observer). Relative stays opt-in via `DREAMER_GAIN_MATCH_RELATIVE`.
+- Keep TD3 min-of-2 twohot critics + freeze `return_scale` after critic warmup (first real P3 test of the P26 cascade fix).
+- P1 skip-storm: restore `wm_best.pt`, reset `opt_world` AdamW (drop 1e12 moments), cap P1 so the next iter is Stage 2. P2/P3 skip-storms still abort. `DREAMER_SKIP_STORM_RECOVER_P1=0` to disable.
+- Same env stack as P26/P27 so the observer delta is only the relative-Huber revert. Run ALONE from `neural-APC-mbrl2-cursor`.
+- **Judge by:** P1 completes (or recovers); MV ss/@H ~×1.0 ±0.1 (P26-class); P3 actually runs; `return_scale` not pinned at 49.5; `critic_rew_to_tgt_var` stays >0.015; no entropy-collapse; econ beats baseline AND the P27 BC score (−59); MV not railed/chattery.
+
 
 
 

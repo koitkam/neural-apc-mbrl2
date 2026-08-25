@@ -856,11 +856,13 @@ class TrainConfig:
     gain_match_len: int = 0            # K step-response rollout steps (= horizon)
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
-    # P26 RCA / P27: relative (scale-free) Huber on ΔCV/Δinput vs identified
-    # gain.  Absolute Huber on WM-norm targets under-weights the subdominant
-    # DV (P26: |tgt_mv|≈2.46 vs |tgt_dv|≈0.52 → DV ss ×0.87 while MV ×0.97).
-    # Unitless ratio; 1.0 = relative (default), 0.0 = absolute (pre-P27).
-    gain_match_relative: float = 1.0
+    # P27 RCA / P28: relative Huber is OFF by default.  P27's scale-free
+    # residual (divide by |target|) boosted the subdominant DV gradient ~5×
+    # vs MV and exploded full-BPTT gain-match at P1 iter 50 (wm_grad 6e12,
+    # 42 skips, recon 0.004→0.50) — P2/P3 never ran.  Absolute Huber is the
+    # P26 observer that reached MV ss/@H ×0.97/×0.88.  1.0 = relative
+    # (P27, opt-in via DREAMER_GAIN_MATCH_RELATIVE); 0.0 = absolute.
+    gain_match_relative: float = 0.0
     # Resolved gain targets (WM/normalized units): per-input rows of n_cv gains.
     # ``*_kinds``/``*_idx`` map each row to an action col (mv) or dv-vector col.
     gain_match_mv_target: Tuple[Tuple[float, ...], ...] = ()
@@ -1644,6 +1646,13 @@ class TrainConfig:
     # actor or critic gradient is unrecoverable in this run).
     early_stop_grad_skip_window_iters: int = 100
     early_stop_grad_skip_max: int = 5
+    # P27 RCA / P28: a P1 skip-storm is usually a *recoverable* full-BPTT
+    # blow-up of the gain-match roll (P24/P27), not an unrecoverable NaN in
+    # the actor.  Restore ``wm_best.pt``, reset ``opt_world``, cap P1 so the
+    # next iter is Stage 2, and continue.  P2/P3 skip-storms still abort.
+    # Sim-agnostic (uses the existing wm_best checkpoint).  Set 0 to keep
+    # the P27 abort-and-validate-exploded-final.pt behaviour.
+    skip_storm_recover_p1: bool = True
     # P1 mid-check: at the P1→P2 transition, require ``sf_loss`` to have
     # dropped at least ``min_drop_frac`` from its initial value.  If not,
     # WM never learned dynamics; flag the trial so the BO score reflects
@@ -4346,12 +4355,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # large transient gain swing (p23 coef 2.0: ×1.09→×2.42→×-5.61) produces an
     # exploding gradient that overshoots and DIVERGES.  smooth_l1 caps the
     # gradient at ±1 beyond ``beta`` → damps the oscillation to a stable pin.
-    # P26 RCA / P27: RELATIVE Huber (default) — divide residual by |target|
-    # so every MV/DV channel has O(1) weight.  Absolute Huber under-weights
-    # the subdominant DV (P26 |tgt_mv|≈2.46 vs |tgt_dv|≈0.52 → DV ss ×0.87
-    # while MV ×0.97).  Unitless; 0.0 restores absolute (pre-P27).
+    # P27 RCA / P28: RELATIVE Huber is opt-in.  Dividing by |target| gave the
+    # subdominant DV ~5× the MV gradient and exploded full-BPTT at P1 iter 50.
+    # Default 0 = absolute Huber (P26 observer, MV ×0.97).  Unitless.
     _hb = float(os.environ.get('DREAMER_GAIN_MATCH_HUBER_BETA', '1.0') or 1.0)
-    _rel = float(getattr(cfg, 'gain_match_relative', 1.0) or 0.0)
+    _rel = float(getattr(cfg, 'gain_match_relative', 0.0) or 0.0)
 
     def _gm_huber(g_wm, tgt_row):
         tgt = torch.tensor(list(tgt_row), device=obs.device, dtype=g_wm.dtype)
@@ -9759,9 +9767,46 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 window_skips = sum(s for (it_, s) in grad_skip_history
                                     if it_ > total_iters - window_iters)
                 if window_skips > window_max:
-                    early_stop_reason = (
-                        f'grad_skip_storm: {window_skips} skips in last '
-                        f'{window_iters} iters (>{window_max})')
+                    _recover_p1 = (
+                        current_phase == 1
+                        and bool(getattr(cfg, 'skip_storm_recover_p1', True))
+                        and wm_best_ckpt_path is not None
+                        and Path(wm_best_ckpt_path).exists())
+                    if _recover_p1:
+                        # P27 RCA / P28: P1 skip-storm is a full-BPTT blow-up
+                        # of the gain-match roll, not an unrecoverable NaN.
+                        # Restore the last healthy observer, drop AdamW
+                        # moments (they hold the 1e12 direction), and cap
+                        # P1 so the next iter is Stage 2.  Sim-agnostic.
+                        try:
+                            _blob = torch.load(
+                                wm_best_ckpt_path, map_location=device,
+                                weights_only=False)
+                            model.load_state_dict(_blob['model'])
+                            opt_world = torch.optim.AdamW(
+                                model.parameters_world(),
+                                lr=eff_lr_world, eps=1e-8,
+                                weight_decay=0.0)
+                            p1 = int(total_env_steps)
+                            p1_ext_steps = 0
+                            grad_skip_history.clear()
+                            print(
+                                f'[skip-storm] P1 recovered: restored '
+                                f'{Path(wm_best_ckpt_path).name} '
+                                f'(iter {wm_best_iter}); reset opt_world; '
+                                f'capping P1 at {p1} env_steps → P2. '
+                                f'({window_skips} skips in last '
+                                f'{window_iters} iters)',
+                                flush=True)
+                        except Exception as _e_rec:
+                            early_stop_reason = (
+                                f'grad_skip_storm: {window_skips} skips in '
+                                f'last {window_iters} iters (>{window_max}); '
+                                f'wm_best restore failed: {_e_rec}')
+                    else:
+                        early_stop_reason = (
+                            f'grad_skip_storm: {window_skips} skips in last '
+                            f'{window_iters} iters (>{window_max})')
 
                 # P3-only hard fails.
                 if early_stop_reason is None and current_phase == 3:

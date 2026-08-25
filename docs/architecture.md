@@ -88,17 +88,17 @@ env-gated off · **[planned]** = designed, not yet built.
 > Stage 2 (critic ensemble + freeze `return_scale`) waits until the P1→P2
 > gain-probe is READY.
 
-> **2026-08-25 — P26 verdict / P27 (branch `grok`).** Observer GAIN is healthy
-> (MV ss/@H ×0.97/×0.88, `wm_gain_pass=True`) but residual **DV ss ×0.87**
-> (absolute Huber under-weights the smaller DV target |tgt_mv|≈2.46 vs
-> |tgt_dv|≈0.52). Actor still cascaded: `return_scale` 1.19→49.5 cap,
-> `critic_rew_to_tgt_var` 0.041→0.00015, entropy-collapse, MV chatter near the
-> high limit, econ −424 vs baseline −117. Log noise: RSSM `sf_loss≡0` flagged
-> as "shortcut-forcing did not drop"; P1→P2 FAIL printed `wm_ema_best < 1.50`
-> when the real reason was `gain_not_ready`. **P27:** relative (scale-free)
-> Huber on gain-match (`gain_match_relative=1`); TD3 min-of-2 twohot critics
-> (`n_critics=2`); freeze `return_scale` after critic warmup; skip the
-> identically-zero `sf_loss` flag; print the true P1→P2 fail reason.
+> **2026-08-25 — P26 verdict / P27 FAIL / P28 (branch `cursor`).** Observer GAIN
+> was healthy on P26 (MV ss/@H ×0.97/×0.88) with residual DV ss ×0.87. **P27
+> aborted in P1** (`grad_skip_storm` @iter 50, `wm_grad_norm` 6e12, recon
+> 0.004→0.50, 42 skips). Relative Huber (`gain_match_relative=1`) over-weighted
+> the small DV target and exploded full-BPTT; P2/P3 never ran. Validation
+> `final.pt` is the **P1 expert-BC policy** (econ −59 vs baseline −77 looks
+> “better” than P26’s cascaded RL, but `critic_r`/`reward_r` are NaN and MV
+> gain is ×1.95). **P28:** revert relative gain-match to absolute (P26
+> observer); keep min-of-2 critics + freeze `return_scale` (still untested);
+> on a P1 skip-storm restore `wm_best.pt`, reset AdamW, cap P1 and continue
+> to Stage 2 instead of aborting.
 
 ---
 
