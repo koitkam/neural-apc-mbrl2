@@ -1221,6 +1221,8 @@ class DreamerV4Config:
     # exploration; defaults are chosen for stable adaptive operation.
     policy_log_std_min: float = -2.3
     policy_log_std_max: float = 0.0
+    # P26 RCA / P27: TD3-style min-of-N twohot critics.  1 = paper single head.
+    n_critics: int = 2
     # ===== World-model backbone selection =====
     # ``'rssm'`` (new default 2026-05-30) uses the DreamerV3 recurrent
     # state-space model (GRU + categorical latent) whose deterministic
@@ -1397,14 +1399,21 @@ class DreamerV4(nn.Module):
         self.reward = TwohotHead(D, cfg.head_hidden,
                                   n_layers=cfg.head_n_layers,
                                   mtp_length=cfg.mtp_length)
-        self.value = TwohotHead(D, cfg.head_hidden,
-                                 n_layers=cfg.head_n_layers)
-        # EMA target for value (TD-λ stability, paper §3.3).
-        self.target_value = TwohotHead(D, cfg.head_hidden,
-                                         n_layers=cfg.head_n_layers)
-        self.target_value.load_state_dict(self.value.state_dict())
-        for p in self.target_value.parameters():
-            p.requires_grad_(False)
+        # P26 RCA / P27: ensemble of twohot critics; bootstrap + advantage use
+        # min-of-N (TD3).  ``self.value`` aliases head 0 so smoke/validate
+        # call sites stay valid.  n_critics=1 is the paper single-head path.
+        n_c = max(1, int(getattr(cfg, 'n_critics', 1) or 1))
+        self.n_critics = n_c
+        self.values = nn.ModuleList([
+            TwohotHead(D, cfg.head_hidden, n_layers=cfg.head_n_layers)
+            for _ in range(n_c)])
+        self.target_values = nn.ModuleList([
+            TwohotHead(D, cfg.head_hidden, n_layers=cfg.head_n_layers)
+            for _ in range(n_c)])
+        for i in range(n_c):
+            self.target_values[i].load_state_dict(self.values[i].state_dict())
+            for p in self.target_values[i].parameters():
+                p.requires_grad_(False)
         # Frozen prior policy snapshot (PMPO behavioural prior, paper eq. 11).
         if self.policy_type == 'continuous':
             self.prior_policy = ContinuousPolicyHead(
@@ -1562,9 +1571,31 @@ class DreamerV4(nn.Module):
     # ---------------------------------------------------------- target / prior
     def update_target(self, tau: float = 0.02) -> None:
         with torch.no_grad():
-            for p, t in zip(self.value.parameters(),
-                            self.target_value.parameters()):
-                t.data.mul_(1.0 - tau).add_(tau * p.data)
+            for h, th in zip(self.values, self.target_values):
+                for p, t in zip(h.parameters(), th.parameters()):
+                    t.data.mul_(1.0 - tau).add_(tau * p.data)
+
+    @property
+    def value(self):
+        """Head 0 alias so smoke/validate `model.value(...)` stays valid."""
+        return self.values[0]
+
+    @property
+    def target_value(self):
+        return self.target_values[0]
+
+    def critic_min_v(self, feat: torch.Tensor, *, target: bool = False
+                     ) -> torch.Tensor:
+        """Min-of-N twohot expectation (TD3).  n_critics=1 ⇒ the single head."""
+        heads = self.target_values if target else self.values
+        vs = torch.stack([h.expectation(h(feat)) for h in heads], dim=0)
+        return vs.min(dim=0).values
+
+    def critic_ensemble_ce(self, feat: torch.Tensor,
+                           target_returns: torch.Tensor) -> torch.Tensor:
+        """Mean twohot-CE across ensemble heads vs the same target."""
+        t = target_returns.reshape(-1)
+        return torch.stack([h.loss(h(feat), t) for h in self.values]).mean()
 
     def snapshot_prior_policy(self) -> None:
         """Capture the current policy as the frozen PMPO prior (start of Phase 3)."""
@@ -1575,6 +1606,7 @@ class DreamerV4(nn.Module):
     def update_return_scale(self, returns: torch.Tensor,
                              ema: float = 0.99,
                              abs_cap: float = 500.0,
+                             freeze: bool = False,
                              ) -> torch.Tensor:
         """EMA of the (p95-p05) return spread, with an absolute upper cap.
 
@@ -1588,7 +1620,15 @@ class DreamerV4(nn.Module):
         (``abs_cap``, default 500): normal growth is untouched and only
         the implausible runaway is arrested.  ``abs_cap=0`` recovers the
         original DreamerV3-faithful uncapped behaviour.
+
+        P26 RCA / P27: ``freeze=True`` after critic warmup stops the EMA
+        from tracking a growing bootstrap spread (P26: 1.19→49.5 cap,
+        rew_to_tgt_var 0.041→0.00015, entropy collapse).  Warmup still
+        updates the scale so the first actor step sees a calibrated
+        normaliser.
         """
+        if freeze:
+            return self.ret_scale.clamp_min(1.0)
         with torch.no_grad():
             r = returns.detach().reshape(-1).float()
             if r.numel() < 2:
@@ -1636,8 +1676,11 @@ class DreamerV4(nn.Module):
         return list(self.policy.parameters())
 
     def parameters_critic(self):
-        """Value head — trained in Phase 3 only."""
-        return list(self.value.parameters())
+        """Value head(s) — trained in Phase 3 only."""
+        params: list = []
+        for h in self.values:
+            params.extend(h.parameters())
+        return params
 
     # ----------------------------------------- staged curriculum freeze control
     def set_world_model_trainable(self, *, g: bool, dob: bool,

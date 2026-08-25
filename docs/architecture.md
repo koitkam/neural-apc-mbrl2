@@ -88,6 +88,18 @@ env-gated off · **[planned]** = designed, not yet built.
 > Stage 2 (critic ensemble + freeze `return_scale`) waits until the P1→P2
 > gain-probe is READY.
 
+> **2026-08-25 — P26 verdict / P27 (branch `grok`).** Observer GAIN is healthy
+> (MV ss/@H ×0.97/×0.88, `wm_gain_pass=True`) but residual **DV ss ×0.87**
+> (absolute Huber under-weights the smaller DV target |tgt_mv|≈2.46 vs
+> |tgt_dv|≈0.52). Actor still cascaded: `return_scale` 1.19→49.5 cap,
+> `critic_rew_to_tgt_var` 0.041→0.00015, entropy-collapse, MV chatter near the
+> high limit, econ −424 vs baseline −117. Log noise: RSSM `sf_loss≡0` flagged
+> as "shortcut-forcing did not drop"; P1→P2 FAIL printed `wm_ema_best < 1.50`
+> when the real reason was `gain_not_ready`. **P27:** relative (scale-free)
+> Huber on gain-match (`gain_match_relative=1`); TD3 min-of-2 twohot critics
+> (`n_critics=2`); freeze `return_scale` after critic warmup; skip the
+> identically-zero `sf_loss` flag; print the true P1→P2 fail reason.
+
 ---
 
 ## 1. Full architecture (training)

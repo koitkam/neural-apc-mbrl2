@@ -130,6 +130,24 @@ def main():
     print(f'[gain-match] OK: full-BPTT asymptote trains cont-gain '
           f'({cont_grad_gm:.4e})')
 
+    # ---- P26 RCA / P27: RELATIVE Huber equalizes MV vs subdominant DV ----
+    # Absolute Huber on |tgt_mv|>>|tgt_dv| under-weights the DV residual.
+    # Relative (err = (g-tgt)/|tgt|) makes a same-ratio error cost the same.
+    cfg.gain_match_relative = 0.0
+    model.zero_grad(set_to_none=True)
+    gm_abs, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    cfg.gain_match_relative = 1.0
+    model.zero_grad(set_to_none=True)
+    gm_rel, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm_rel).all() and float(gm_rel) > 0.0, float(gm_rel)
+    gm_rel.backward()
+    cont_grad_rel = sum(float(p.grad.abs().sum())
+                        for n, p in model.dynamics.named_parameters()
+                        if p.grad is not None and 'cont' in n)
+    assert cont_grad_rel > 0.0, 'relative gain-match did NOT reach cont-gain!'
+    print(f'[gain-match-rel] OK: abs={float(gm_abs):.5f} rel={float(gm_rel):.5f} '
+          f'cont_grad={cont_grad_rel:.4e}')
+
 
 if __name__ == '__main__':
     main()

@@ -143,7 +143,11 @@ def _parse_train_log(jsonl_path: Path,
     flags: List[str] = []
     p1 = summary['p1']
     if p1.get('n_iters', 0) > 0 and 'sf_loss' in p1:
-        if p1['sf_loss']['last'] >= 0.95 * p1['sf_loss']['first']:
+        # RSSM/TSSM emit sf_loss≡0 (shortcut-forcing is N/A).  Do NOT flag
+        # "did not drop" on a identically-zero series (P26 false positive).
+        _sf0 = float(p1['sf_loss']['first'])
+        _sf1 = float(p1['sf_loss']['last'])
+        if max(abs(_sf0), abs(_sf1)) >= 1e-8 and _sf1 >= 0.95 * _sf0:
             flags.append('P1: shortcut-forcing loss did not drop '
                           '(WM not learning dynamics)')
     p2 = summary['p2']

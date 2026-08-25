@@ -856,6 +856,11 @@ class TrainConfig:
     gain_match_len: int = 0            # K step-response rollout steps (= horizon)
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
+    # P26 RCA / P27: relative (scale-free) Huber on ΔCV/Δinput vs identified
+    # gain.  Absolute Huber on WM-norm targets under-weights the subdominant
+    # DV (P26: |tgt_mv|≈2.46 vs |tgt_dv|≈0.52 → DV ss ×0.87 while MV ×0.97).
+    # Unitless ratio; 1.0 = relative (default), 0.0 = absolute (pre-P27).
+    gain_match_relative: float = 1.0
     # Resolved gain targets (WM/normalized units): per-input rows of n_cv gains.
     # ``*_kinds``/``*_idx`` map each row to an action col (mv) or dv-vector col.
     gain_match_mv_target: Tuple[Tuple[float, ...], ...] = ()
@@ -1525,6 +1530,16 @@ class TrainConfig:
     # couples to the actor, so P3 doesn't open with a self-inflating critic
     # (promoted 2026-06-14; paper co-trains from P3 start = 0).
     p3_critic_warmup_iters: int = 10
+    # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
+    # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
+    # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
+    # 0.041→0.00015, entropy collapse, MV chatter at the high limit).  2 =
+    # min-of-2 (TD3); 1 = paper single head.  ``DREAMER_N_CRITICS``.
+    n_critics: int = 2
+    # Freeze the return-scale EMA after critic warmup so it cannot chase a
+    # growing bootstrap spread.  Warmup still updates the scale.  Default ON.
+    # ``DREAMER_RETURN_SCALE_FREEZE_AFTER_WARMUP=0`` to disable.
+    return_scale_freeze_after_warmup: bool = True
     # ---- (P93, 2026-06-06) protect the WM trunk from agent grads in P2 ----
     # At P1→P2 the BC + reward-MTP losses (agent_finetune_loss, read off
     # ``agent_hid`` = the dynamics' own feature) are added; their gradient
@@ -4331,15 +4346,29 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # large transient gain swing (p23 coef 2.0: ×1.09→×2.42→×-5.61) produces an
     # exploding gradient that overshoots and DIVERGES.  smooth_l1 caps the
     # gradient at ±1 beyond ``beta`` → damps the oscillation to a stable pin.
+    # P26 RCA / P27: RELATIVE Huber (default) — divide residual by |target|
+    # so every MV/DV channel has O(1) weight.  Absolute Huber under-weights
+    # the subdominant DV (P26 |tgt_mv|≈2.46 vs |tgt_dv|≈0.52 → DV ss ×0.87
+    # while MV ×0.97).  Unitless; 0.0 restores absolute (pre-P27).
     _hb = float(os.environ.get('DREAMER_GAIN_MATCH_HUBER_BETA', '1.0') or 1.0)
+    _rel = float(getattr(cfg, 'gain_match_relative', 1.0) or 0.0)
+
+    def _gm_huber(g_wm, tgt_row):
+        tgt = torch.tensor(list(tgt_row), device=obs.device, dtype=g_wm.dtype)
+        tgt_b = tgt.expand_as(g_wm)
+        if _rel > 0.0:
+            scale = tgt.abs().clamp_min(1e-3)
+            err = (g_wm - tgt_b) / scale
+            return F.smooth_l1_loss(err, torch.zeros_like(err), beta=_hb)
+        return F.smooth_l1_loss(g_wm, tgt_b, beta=_hb)
+
     for j, tgt_row in enumerate(mv_target):                # MV: step the action
         if j >= a_base.shape[-1]:
             break
         a_step = a_base.clone()
         a_step[:, j] = a_step[:, j] + step
         g_wm = (_roll(a_step, dv0) - cv_base) / step        # (Bm, n_cv)
-        tgt = torch.tensor(list(tgt_row), device=obs.device, dtype=g_wm.dtype)
-        total = total + F.smooth_l1_loss(g_wm, tgt.expand_as(g_wm), beta=_hb)
+        total = total + _gm_huber(g_wm, tgt_row)
         nterm += 1
     if dv0 is not None:
         for j, tgt_row in enumerate(dv_target):            # DV: step the DV input
@@ -4348,9 +4377,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
             dv_step = dv0.clone()
             dv_step[:, j] = dv_step[:, j] + step
             g_wm = (_roll(a_base, dv_step) - cv_base) / step
-            tgt = torch.tensor(list(tgt_row), device=obs.device,
-                               dtype=g_wm.dtype)
-            total = total + F.smooth_l1_loss(g_wm, tgt.expand_as(g_wm), beta=_hb)
+            total = total + _gm_huber(g_wm, tgt_row)
             nterm += 1
     if nterm == 0:
         return zero, diag
@@ -5130,6 +5157,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                                 cfg: TrainConfig,
                                 critic_batch: Optional[Dict[str, torch.Tensor]] = None,
                                 expert_bc_weight: float = 0.0,
+                                freeze_return_scale: bool = False,
                                 ) -> Dict[str, torch.Tensor]:
     """Phase 3 (real-sim mode): actor-critic on REAL-environment λ-returns.
 
@@ -5172,11 +5200,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     feats = feats.detach()
     feat_flat = feats.reshape(B * T, -1)
 
-    # ----- critic value (grad) + slow-target bootstrap value (frozen) -----
-    value_logits = model.value(feat_flat)                # (B*T, n_bins)
+    # ----- critic value (grad) + slow-target bootstrap (min-of-N, P27) -----
     with torch.no_grad():
-        v_slow = model.target_value.expectation(
-            model.target_value(feat_flat)).reshape(B, T)
+        v_slow = model.critic_min_v(feat_flat, target=True).reshape(B, T)
 
     # ----- λ-returns from REAL rewards (same TD-λ recursion as imagination) --
     gamma = float(cfg.gamma)
@@ -5205,11 +5231,14 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # (diversity — prevents the p03 corner-starvation inversion).  A correct
     # advantage lets the actor LEARN that bang-bang control is bad (no move
     # penalty needed).  MC-grounding (``critic_mc_grounding_coef``) on BOTH.
+    # P26 RCA / P27: every ensemble head is trained on the SAME target; the
+    # BOOTSTRAP and ADVANTAGE use min-of-N (TD3) so a single optimistic head
+    # cannot inflate the λ-return / return_scale.
     _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
 
-    def _critic_ce(vl, vslow, rew_b, Tb, lam_ret):
-        """twohot-CE to the λ-return + optional PURE-MC (λ=1) grounding."""
-        loss = model.value.loss(vl, lam_ret.reshape(-1)).mean()
+    def _critic_ce(feat, vslow, rew_b, Tb, lam_ret):
+        """Ensemble twohot-CE to the λ-return + optional PURE-MC (λ=1)."""
+        loss = model.critic_ensemble_ce(feat, lam_ret)
         if _mc_coef > 0.0:
             rmc = torch.zeros_like(vslow)
             rmc[:, -1] = vslow[:, -1]
@@ -5218,11 +5247,11 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             rmc = rmc.detach()
             if _ret_cap is not None:
                 rmc = rmc.clamp(-_ret_cap, _ret_cap)
-            loss = loss + _mc_coef * model.value.loss(vl, rmc.reshape(-1)).mean()
+            loss = loss + _mc_coef * model.critic_ensemble_ce(feat, rmc)
         return loss
 
     # (a) ON-POLICY term — the distribution the advantage is evaluated on.
-    critic_loss = _critic_ce(value_logits, v_slow, rew, T, target_returns)
+    critic_loss = _critic_ce(feat_flat, v_slow, rew, T, target_returns)
 
     # P83 expert-BC anchor accumulator (wired below on the seed-buffer batch,
     # which retains expert-flagged steps via the every-20-iter P3 expert inject).
@@ -5238,11 +5267,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         feat_c = _fc.detach().reshape(Bc * Tc, -1)
         rew_c = critic_batch['rew'].float()
         with torch.no_grad():
-            v_slow_c = model.target_value.expectation(
-                model.target_value(feat_c)).reshape(Bc, Tc)
+            v_slow_c = model.critic_min_v(feat_c, target=True).reshape(Bc, Tc)
             if _ret_cap is not None:
                 v_slow_c = v_slow_c.clamp(-_ret_cap, _ret_cap)
-        value_logits_c = model.value(feat_c)
         ret_c = torch.zeros_like(v_slow_c)
         ret_c[:, -1] = v_slow_c[:, -1]
         for _tc in reversed(range(Tc - 1)):
@@ -5252,7 +5279,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         if _ret_cap is not None:
             ret_c = ret_c.clamp(-_ret_cap, _ret_cap)
         critic_loss = critic_loss + _critic_ce(
-            value_logits_c, v_slow_c, rew_c, Tc, ret_c)
+            feat_c, v_slow_c, rew_c, Tc, ret_c)
         # P83 FIX (p19 RCA, 2026-08-19): re-wire the P3 expert-BC anchor — it was
         # DEAD CODE (expert_bc_p3_loss defined + unit-tested but NEVER called),
         # so the P3 actor had NO anchor and diverged off the good BC-seeded
@@ -5265,12 +5292,15 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
             bc_term = expert_bc_weight * bc_loss_p3
 
     # ----- advantage + percentile return-scale normalisation — REUSED -----
+    # P26 RCA / P27: advantage baseline is min-of-N (same as the λ bootstrap)
+    # so an optimistic head cannot inflate A.  Freeze the EMA after warmup.
     with torch.no_grad():
-        v_pred = model.value.expectation(value_logits).reshape(B, T)
+        v_pred = model.critic_min_v(feat_flat, target=False).reshape(B, T)
         adv_raw = target_returns - v_pred
         scale = model.update_return_scale(
             target_returns,
             abs_cap=float(getattr(cfg, 'return_scale_abs_cap', 500.0)),
+            freeze=bool(freeze_return_scale),
         ).clamp_min(1.0)
     adv_flat = (adv_raw / scale).reshape(-1)
     _adv_clip = float(getattr(cfg, 'advantage_clip', 0.0) or 0.0)
@@ -5333,6 +5363,7 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         n_action_bins=cfg.n_action_bins,
         head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
         mtp_length=max(1, int(cfg.mtp_length)),
+        n_critics=max(1, int(getattr(cfg, 'n_critics', 1) or 1)),
         policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
         policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
         policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
@@ -7648,6 +7679,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # sits inside the inner train-steps loop, which would otherwise repeat it
     # once per step for the whole first warmup iter (~25x).
     _critic_warmup_logged = False
+    _return_scale_freeze_logged = False
     # One-shot guard so the log-row JSON-coercion warning logs EXACTLY once
     # (names the diagnostic key that slipped through as a torch/numpy value).
     _row_coerce_warned = False
@@ -8362,9 +8394,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'wm_ema_best': float(wm_score_ema_best)
                         if wm_score_ema_best > -1e17 else None,
                 })
+                if reason == 'ema_below_floor':
+                    _why = (f'wm_ema_best={wm_score_ema_best:.3f} < '
+                            f'{p1_gate_wm_ema_min_v:.2f}')
+                elif reason == 'not_plateaued':
+                    _why = (f'wm_ema_best={wm_score_ema_best:.3f} '
+                            f'not plateaued')
+                elif _gain_probe is not None:
+                    _why = (f'gain_not_ready worst='
+                            f'{_gain_probe["worst_ratio"]:.2f}'
+                            f'@{_gain_probe["worst_input"]}')
+                else:
+                    _why = 'gain_not_ready'
                 print(f'[gate p1->p2] FAIL ({reason}) at iter {total_iters}: '
-                      f'wm_ema_best={wm_score_ema_best:.3f} < '
-                      f'{p1_gate_wm_ema_min_v:.2f} — extending P1 by '
+                      f'{_why} — extending P1 by '
                       f'{p1_gate_check_step} steps to '
                       f'{p1 + p1_ext_steps} (cap {p1 + p1_gate_max_ext_steps})',
                       flush=True)
@@ -8376,10 +8419,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'wm_ema_best': float(wm_score_ema_best)
                         if wm_score_ema_best > -1e17 else None,
                 })
+                _cap_why = []
+                if not _ema_ok:
+                    _cap_why.append(
+                        f'wm_ema_best={wm_score_ema_best:.3f} < '
+                        f'{p1_gate_wm_ema_min_v:.2f}')
+                if not _plateau_ok:
+                    _cap_why.append('not_plateaued')
+                if not _gain_ok:
+                    _cap_why.append(
+                        f'GAIN_NOT_READY(worst='
+                        f'{(_gain_probe or {}).get("worst_ratio", float("nan")):.2f}'
+                        f'@{(_gain_probe or {}).get("worst_input", "?")})')
                 print(f'[gate p1->p2] CAPPED — proceeding to P2 despite '
-                      f'wm_ema_best={wm_score_ema_best:.3f} < '
-                      f'{p1_gate_wm_ema_min_v:.2f} (cap '
-                      f'{p1_gate_max_ext_steps} steps reached)',
+                      f'{"; ".join(_cap_why) or "gate unmet"} '
+                      f'(cap {p1_gate_max_ext_steps} steps reached)',
                       flush=True)
                 mid_check_flags.append(
                     f'p1_gate_capped: wm_ema_best={wm_score_ema_best:.3f}'
@@ -9240,12 +9294,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _p3_prog = min(1.0, max(0.0,
                         (total_env_steps - p3_start_steps) / _p3_span))
                     _bc_w = _bc_scale * (1.0 - _p3_prog * (1.0 - _bc_floor))
+                _freeze_rs = (
+                    bool(getattr(cfg, 'return_scale_freeze_after_warmup', True))
+                    and p3_critic_warmup_iters > 0
+                    and p3_iters >= p3_critic_warmup_iters)
+                if _freeze_rs and not _return_scale_freeze_logged:
+                    print('[return-scale] FREEZE after critic warmup '
+                          f'(p3_iter={p3_iters}, scale='
+                          f'{float(model.ret_scale.reshape(-1)[0]):.3f})',
+                          flush=True)
+                    _return_scale_freeze_logged = True
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
                     ac_losses = _realsim_actor_critic_step(
                         model, batch, cfg, critic_batch=_critic_batch,
-                        expert_bc_weight=_bc_w)
+                        expert_bc_weight=_bc_w,
+                        freeze_return_scale=_freeze_rs)
                 _actor_loss = ac_losses['actor_loss']
                 opt_actor.zero_grad(set_to_none=True)
                 opt_critic.zero_grad(set_to_none=True)

@@ -1225,11 +1225,18 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **ROOT (observer):** (1) `RSSMState.detach()` every 16 of K=55 on the gain-match *asymptote* cut the DC-gain gradient (forward Huber loss ~0.002, transfer still ×0.74). (2) DOB-on forces `disturbance_head_dim=0` → buffer `n_dist=0` → `batch['dist']` missing → `dob_ground` identically 0 for all 54 P2 iters. **P19 was the same** — the P19 "grounding win" was not this loss.
 - **ROOT (actor):** independent critic cascade (single twohot + λ-bootstrap + p95–p5 `return_scale` EMA). Stage 2 after the observer freeze is READY.
 
-### p26 (`run_p26_gainbptt`, branch `grok` @ 1517d91) — LAUNCHED 2026-08-24 12:26 — full-BPTT gain-match + live DOB grounding
-- Gain-match roll: **no TBPTT** (Huber + `wm_grad_skip_norm` remain the explosion defence). Isolation TBPTT **`h` only** (`keep_c=True`) and never inside the SS-match settle window. TSSMState gets the same `detach(keep_c=)`.
-- `_replay_n_dist`: store `n_cv` whenever DOB or `dob_ground_coef>0` (do not key off `disturbance_head_dim`). Broadcast/reshape the load target; one-shot warn if missing.
-- **Launch:** tmux `mbrl2_p26`, out `output/test_sim/run_p26_gainbptt`. Env **identical to P25** (only code delta). Startup confirmed: `device=cuda`, `[dob-ground] replay n_dist=1 (dob=True ground_coef=2 head_dim=0)`.
-- **Judge by**: P1 0 skip-storm; P1→P2 READY; MV+DV ss ≈ 1.0 ± 0.1 and @H not collapsed; P2 `dob_ground` **>0** and falling; val det_r >0.7; open-loop converges >0. Actor not judged until the freeze is READY.
+### p26 (`run_p26_gainbptt`, branch `grok` @ 1517d91) — VERDICT: observer GAIN healthy; DV residual + actor cascade remain
+- **Observer WIN:** MV ss/@H **×0.973 / ×0.880** (`wm_gain_rel_err=0.026`, `wm_gain_pass=True`) vs P25 ×0.74/×0.60. Full-BPTT gain-match + live `n_dist=1` worked. P1 0 skip-storm. P2 `dob_ground` live (0→0.010). det_r **0.68** (P25 0.24).
+- Residual DV ss **×0.866** (@H ×0.998). Absolute Huber on WM-norm targets under-weights the smaller DV (|tgt_mv|≈2.46 vs |tgt_dv|≈0.52). P1→P2 CAPPED `gain_not_ready` (DV DC 0.75 at iter 75); freeze still good enough that val GAIN passed.
+- **Actor FAIL (independent, Stage 2):** `return_scale` 1.19→**49.5 cap**, `critic_rew_to_tgt_var` 0.041→**0.00015**, entropy-collapse @262 (`adv_corr=0.05`), critic_r 0.079, econ **−424 vs baseline −117**, MV reversal 0.665, noisy MV near the high limit. Same cascade as P25.
+- Log noise (not training bugs): `[val] P1: shortcut-forcing loss did not drop` (RSSM `sf_loss≡0`); `[gate p1->p2] FAIL (gain_not_ready) … wm_ema_best=5.211 < 1.50` (wrong reason string).
+
+### p27 (`run_p27_relgain_qens`) — FIX: relative gain-match + min-of-2 critic + freeze return_scale
+- Relative Huber on ΔCV/Δinput vs identified gain (`gain_match_relative=1`, unitless) so MV and DV have O(1) weight.
+- TD3 min-of-2 twohot critics (`n_critics=2`); bootstrap + advantage use min-of-N.
+- Freeze `return_scale` EMA after critic warmup (`return_scale_freeze_after_warmup=True`).
+- Skip identically-zero `sf_loss` flag; print the true P1→P2 fail reason.
+- **Judge by:** DV ss → ~×1.0 ±0.1 (MV holds); P3 `return_scale` plateaus near warmup value (NOT the 49.5 cap); `critic_rew_to_tgt_var` stays >0.015; no entropy-collapse; agent econ > baseline; MV not railed/chattery.
 
 
 

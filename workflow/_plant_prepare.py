@@ -324,6 +324,11 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # P63 growth-rate clamp regressed for that reason).  Set 0.0 to recover
     # the paper-faithful uncapped EMA.
     'DREAMER_RETURN_SCALE_ABS_CAP':       ('return_scale_abs_cap',           float),
+    # P26 RCA / P27: freeze the p95-p05 EMA after critic warmup (default ON).
+    'DREAMER_RETURN_SCALE_FREEZE_AFTER_WARMUP': (
+        'return_scale_freeze_after_warmup', _as_bool),
+    # P26 RCA / P27: TD3 min-of-N twohot critics (default 2).
+    'DREAMER_N_CRITICS':                  ('n_critics',                      int),
     # Cascade RCA (2026-05-29): the two corrected anti-cascade fixes.
     # A' — potential-based reward shaping (dense, policy-invariant, same
     # γ; training-only, validation scores on unshaped raw_reward).
@@ -508,6 +513,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_LEN':             ('gain_match_len',                 int),
     'DREAMER_GAIN_MATCH_MAX_STARTS':      ('gain_match_max_starts',          int),
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
+    'DREAMER_GAIN_MATCH_RELATIVE':        ('gain_match_relative',            float),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
     # per-input isolation trajectory match + the steady-state DC-gain match (the
     # nonlinear / black-box unbiased-gain path; no identified value needed).

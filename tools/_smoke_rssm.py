@@ -117,8 +117,16 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  agent_total.backward()')
 
     # ---- P3 imagination ----
+    assert int(getattr(model, 'n_critics', 1)) == int(getattr(cfg, 'n_critics', 1))
+    assert len(model.values) == model.n_critics
     diag = _realsim_actor_critic_step(model, batch, cfg)
     _finite('_realsim_actor_critic_step', diag)
+    # P26 RCA / P27: freeze return_scale — second call must not move ret_scale.
+    s0 = float(model.ret_scale.reshape(-1)[0])
+    _ = _realsim_actor_critic_step(model, batch, cfg, freeze_return_scale=True)
+    s1 = float(model.ret_scale.reshape(-1)[0])
+    assert abs(s1 - s0) < 1e-8, f'return_scale moved under freeze: {s0} -> {s1}'
+    print(f'[smoke] OK  n_critics={model.n_critics} return_scale freeze ({s0:.4f})')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
