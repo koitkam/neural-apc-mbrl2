@@ -43,10 +43,11 @@ plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
 
 ## Training modes (`DREAMER_TRAIN_MODE`)
 
-- **`phased`** (default): the staged Dreamer-4 curriculum — P1 world-model
-  pretraining → P2 reward-head + policy-BC warmup → P3 actor+critic via
-  imagination, with phase boundaries. Best when the world model is expensive
-  to train (transformer backbone) and benefits from amortized pretraining.
+- **`phased`** (default): P1 world-model / observer pretraining → P2
+  reward-head + policy-BC warmup (and DOB A,K when the curriculum is on)
+  → P3 **real-sim** actor-critic (`_realsim_actor_critic_step`; imagination
+  for the actor is deleted). Best when the observer is expensive to train
+  (transformer backbone) and benefits from amortized pretraining.
 - **`joint`** (DreamerV1/V2/V3 style): after the seed-buffer **prefill**,
   co-train the world model, actor, and critic **every step from step 1** — no
   phase boundaries. This eliminates the phase-boundary failure modes (recon

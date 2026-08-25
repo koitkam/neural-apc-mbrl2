@@ -863,6 +863,15 @@ class TrainConfig:
     # P26 observer that reached MV ss/@H ×0.97/×0.88.  1.0 = relative
     # (P27, opt-in via DREAMER_GAIN_MATCH_RELATIVE); 0.0 = absolute.
     gain_match_relative: float = 0.0
+    # Huber β for the gain-match residual (WM-norm gain units).  1.0 matches
+    # the P24–P28 env default.  ``<=0`` = auto at resolve-time: median |tgt|
+    # (sim-adaptive; next attributed observer A/B, not the P28 default).
+    # ``DREAMER_GAIN_MATCH_HUBER_BETA``.
+    gain_match_huber_beta: float = 1.0
+    # Isolation / ss-match TBPTT stride (GRU ``h`` only, ``keep_c``).  Never
+    # cuts inside the settled SS-match window.  16 of K≈55 is the P24/P25
+    # default.  ``DREAMER_AUX_TBPTT_STEPS``.
+    aux_tbptt_steps: int = 16
     # Resolved gain targets (WM/normalized units): per-input rows of n_cv gains.
     # ``*_kinds``/``*_idx`` map each row to an action col (mv) or dv-vector col.
     gain_match_mv_target: Tuple[Tuple[float, ...], ...] = ()
@@ -1652,6 +1661,9 @@ class TrainConfig:
     # next iter is Stage 2, and continue.  P2/P3 skip-storms still abort.
     # Sim-agnostic (uses the existing wm_best checkpoint).  Set 0 to keep
     # the P27 abort-and-validate-exploded-final.pt behaviour.
+    # Cap must also close ``p1_gate_max_ext_steps`` — zeroing ``p1_ext_steps``
+    # alone re-opens the P1 quality-gate extension and re-runs exploding
+    # gain-match instead of entering Stage 2 (g frozen, DOB id).
     skip_storm_recover_p1: bool = True
     # P1 mid-check: at the P1→P2 transition, require ``sf_loss`` to have
     # dropped at least ``min_drop_frac`` from its initial value.  If not,
@@ -2642,6 +2654,21 @@ class APCEnv:
                 'hidden_disturbance': hidden_applied,
                 'raw_state': np.asarray(next_state, dtype='float32').copy()}
         return self._window.copy(), reward, done, info
+
+
+def _force_p1_cap_at(total_env_steps: int) -> Tuple[int, int, int]:
+    """End P1 now and close the quality-gate extension budget.
+
+    P28 skip-storm recovery originally set ``p1 = total_env_steps`` and
+    ``p1_ext_steps = 0`` but left ``p1_gate_max_ext_steps`` at the original
+    (often 1× P1) cap.  The next P1→P2 gate then saw unused headroom and
+    EXTENDED P1, re-running full-BPTT gain-match on the restored weights
+    (the exploding term) instead of Stage 2 (curriculum freezes ``g``).
+    Closing the extension cap forces the CAPPED branch → P2.
+
+    Returns ``(p1, p1_ext_steps, p1_gate_max_ext_steps)``.
+    """
+    return int(total_env_steps), 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -4358,7 +4385,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # P27 RCA / P28: RELATIVE Huber is opt-in.  Dividing by |target| gave the
     # subdominant DV ~5× the MV gradient and exploded full-BPTT at P1 iter 50.
     # Default 0 = absolute Huber (P26 observer, MV ×0.97).  Unitless.
-    _hb = float(os.environ.get('DREAMER_GAIN_MATCH_HUBER_BETA', '1.0') or 1.0)
+    _hb = float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 1.0)
+    _env_hb = os.environ.get('DREAMER_GAIN_MATCH_HUBER_BETA', '').strip()
+    if _env_hb:
+        _hb = float(_env_hb or 1.0)
     _rel = float(getattr(cfg, 'gain_match_relative', 0.0) or 0.0)
 
     def _gm_huber(g_wm, tgt_row):
@@ -4472,7 +4502,10 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     ss_k0 = K - max(1, int(round(min(max(w_frac, 0.05), 0.9) * K)))
     total = zero
     cv_pred_win = []
-    _tbptt = int(os.environ.get('DREAMER_AUX_TBPTT_STEPS', '16') or 0)
+    _tbptt = int(getattr(cfg, 'aux_tbptt_steps', 16) or 0)
+    _env_tb = os.environ.get('DREAMER_AUX_TBPTT_STEPS', '').strip()
+    if _env_tb:
+        _tbptt = int(_env_tb or 0)
     for k in range(K):
         dvk = dv_all[:, k] if dv_all is not None else None
         st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
@@ -4588,6 +4621,13 @@ def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
             for j, cvn in enumerate(cv_names)))
     cfg.gain_match_mv_target = tuple(mv_target)
     cfg.gain_match_dv_target = tuple(dv_target)
+    # ``gain_match_huber_beta <= 0`` → median |target| (sim-adaptive).  Default
+    # 1.0 stays the P24–P28 recipe so test_sim is unchanged.
+    if float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 0.0) <= 0.0:
+        _abs = [abs(x) for row in list(mv_target) + list(dv_target)
+                for x in row if abs(float(x)) > 1e-9]
+        cfg.gain_match_huber_beta = (
+            float(np.median(_abs)) if _abs else 1.0)
     # Respect an EXPLICIT disable (e.g. DREAMER_GAIN_MATCH_COEF=0 on a NONLINEAR
     # plant, where a single identified gain is wrong → rely on the self-supervised
     # wm_ss_match instead).  Only auto-enable when the coef was left at default.
@@ -4599,7 +4639,8 @@ def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
         cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
     print(f'[gain-match] targets (WM-norm) mv={cfg.gain_match_mv_target} '
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
-          f'len={cfg.gain_match_len}', flush=True)
+          f'len={cfg.gain_match_len} huber_beta={cfg.gain_match_huber_beta}',
+          flush=True)
 
 
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
@@ -7470,6 +7511,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     grad_skip_history: 'deque[Tuple[int, int]]' = deque(maxlen=512)  # (iter, skip_count)
     grad_skip_prev_total: int = 0
     early_stop_reason: Optional[str] = None
+    skip_storm_p1_recovered: bool = False
     p1_initial_sf: Optional[float] = None
     p2_final_reward_mtp: Optional[float] = None
     mid_check_flags: List[str] = []
@@ -9787,14 +9829,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 model.parameters_world(),
                                 lr=eff_lr_world, eps=1e-8,
                                 weight_decay=0.0)
-                            p1 = int(total_env_steps)
-                            p1_ext_steps = 0
+                            p1, p1_ext_steps, p1_gate_max_ext_steps = (
+                                _force_p1_cap_at(total_env_steps))
                             grad_skip_history.clear()
+                            skip_storm_p1_recovered = True
+                            mid_check_flags.append(
+                                f'p1_skip_storm_recovered: restored '
+                                f'{Path(wm_best_ckpt_path).name} '
+                                f'(iter {wm_best_iter}); P1 capped at '
+                                f'{p1} env_steps, extension closed')
                             print(
                                 f'[skip-storm] P1 recovered: restored '
                                 f'{Path(wm_best_ckpt_path).name} '
                                 f'(iter {wm_best_iter}); reset opt_world; '
-                                f'capping P1 at {p1} env_steps → P2. '
+                                f'capping P1 at {p1} env_steps '
+                                f'(extension closed) → P2. '
                                 f'({window_skips} skips in last '
                                 f'{window_iters} iters)',
                                 flush=True)
@@ -10203,6 +10252,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'phase_gate_decisions': list(phase_gate_decisions),
         'p1_ext_steps': int(p1_ext_steps),
         'p2_ext_steps': int(p2_ext_steps),
+        'skip_storm_p1_recovered': bool(skip_storm_p1_recovered),
     }
 
 

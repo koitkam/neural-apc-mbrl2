@@ -329,6 +329,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
         'return_scale_freeze_after_warmup', _as_bool),
     # P26 RCA / P27: TD3 min-of-N twohot critics (default 2).
     'DREAMER_N_CRITICS':                  ('n_critics',                      int),
+    'DREAMER_WM_GRAD_SKIP_NORM':          ('wm_grad_skip_norm',              float),
     # P27 RCA / P28: restore wm_best and continue to P2 on a P1 skip-storm
     # instead of aborting the run (default ON).
     'DREAMER_SKIP_STORM_RECOVER_P1':      ('skip_storm_recover_p1',          _as_bool),
@@ -440,7 +441,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_FREEZE_AFTER_ITERS':      ('wm_freeze_after_iters',          int),
     'DREAMER_WM_RECON_CV_WEIGHT':         ('wm_recon_cv_weight',             float),
     'DREAMER_BC_TRACK_EXPERT_EVERY':      ('bc_track_expert_every',          int),
-    'DREAMER_EXPERT_BC_P3_FLOOR':         ('expert_bc_p3_floor',             float),
     'DREAMER_P3_CRITIC_WARMUP_ITERS':     ('p3_critic_warmup_iters',         int),
     'DREAMER_WM_TRUNK_STOPGRAD_IN_P2':    ('wm_trunk_stopgrad_in_p2',        _as_bool),
     'DREAMER_TRAIN_MODE':                 ('train_mode',                     str),
@@ -518,6 +518,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
     # P27 RCA / P28: relative Huber is OFF by default (exploded P1).  1 = opt-in.
     'DREAMER_GAIN_MATCH_RELATIVE':        ('gain_match_relative',            float),
+    'DREAMER_GAIN_MATCH_HUBER_BETA':      ('gain_match_huber_beta',          float),
+    'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
     # per-input isolation trajectory match + the steady-state DC-gain match (the
     # nonlinear / black-box unbiased-gain path; no identified value needed).
@@ -540,7 +542,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Fix B: performance-aware entropy-collapse early-stop gate (only trip when
     # the policy is also degenerate: low imag_adv_action_corr).
     'DREAMER_EARLY_STOP_ENT_COLLAPSE_MIN_ADV_CORR': ('early_stop_entropy_collapse_min_adv_corr', float),
-    'DREAMER_EXPERT_BC_P3_FLOOR':         ('expert_bc_p3_floor',             float),
 }
 
 

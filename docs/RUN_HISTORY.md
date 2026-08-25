@@ -1243,6 +1243,23 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - P1 skip-storm: restore `wm_best.pt`, reset `opt_world` AdamW (drop 1e12 moments), cap P1 so the next iter is Stage 2. P2/P3 skip-storms still abort. `DREAMER_SKIP_STORM_RECOVER_P1=0` to disable.
 - Same env stack as P26/P27 so the observer delta is only the relative-Huber revert. Run ALONE from `neural-APC-mbrl2-cursor`.
 - **Judge by:** P1 completes (or recovers); MV ss/@H ~×1.0 ±0.1 (P26-class); P3 actually runs; `return_scale` not pinned at 49.5; `critic_rew_to_tgt_var` stays >0.015; no entropy-collapse; econ beats baseline AND the P27 BC score (−59); MV not railed/chattery.
+- **Code follow-up (no GPU this session):** skip-storm recovery now closes `p1_gate_max_ext_steps` (`_force_p1_cap_at`) so a recovered P1 cannot re-open the quality-gate extension and re-explode gain-match. `gain_match_huber_beta` / `aux_tbptt_steps` / `wm_grad_skip_norm` promoted to TrainConfig + `ENV_OVERRIDES` (defaults unchanged). `gain_match_huber_beta<=0` auto-sets median |tgt| (opt-in sim-adaptive; not the P28 default).
+
+### Graveyard (P24–P28 observer / actor levers)
+
+| Lever | Tried | Status | Root-cause? |
+|---|---|---|---|
+| TBPTT `st.detach()` on gain-match asymptote | P24/P25 | REVERTED (full-BPTT) | YES — cut DC-gain gradient |
+| Isolation TBPTT `h` only (`keep_c`), never in SS window | P24/P25 | KEPT | YES — bounds GRU without killing DC |
+| Huge-grad skip (`wm_grad_skip_norm=1e4`) | P24 | KEPT | YES — garbage clipped step |
+| Huber gain-match (abs, β=1) | P23/P26 | KEPT | YES — MSE overshoot |
+| Relative Huber (`gain_match_relative=1`) | P27 | REVERTED | YES — DV ~5× grad, skip-storm abort |
+| Live `_replay_n_dist` for DOB ground | P25/P26 | KEPT | YES — grounding was dead |
+| Full-BPTT gain-match | P26 | KEPT | YES — recovered MV ×0.97 |
+| min-of-2 critics + freeze `return_scale` | P27/P28 | KEPT (untested in P3) | PARTIAL — P27 never reached P3 |
+| P1 skip-storm restore `wm_best` + AdamW reset | P28 | KEPT | PARTIAL — recovery without closing ext cap would re-enter exploding P1 |
+| P1 skip-storm close `p1_gate_max_ext_steps` | P28 follow-up | KEPT | YES — zeroed ext re-opened P1 gate |
+
 
 
 

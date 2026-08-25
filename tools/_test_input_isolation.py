@@ -98,6 +98,7 @@ def main():
     # ---- P25 RCA: isolation TBPTT must keep_c so the gain channel still trains
     import os
     os.environ['DREAMER_AUX_TBPTT_STEPS'] = '2'
+    cfg.aux_tbptt_steps = 2
     cfg.wm_ss_match_coef = 0.5
     cfg.wm_input_isolation_len = 6
     model.zero_grad(set_to_none=True)
@@ -146,7 +147,7 @@ def main():
                         if p.grad is not None and 'cont' in n)
     assert cont_grad_rel > 0.0, 'relative gain-match did NOT reach cont-gain!'
     print(f'[gain-match-rel] OK: abs={float(gm_abs):.5f} rel={float(gm_rel):.5f} '
-          f'cont_grad={cont_grad_rel:.4e}')
+          f'cont_grad={cont_grad_rel:.4e} (opt-in; P28 default is absolute)')
 
 
 if __name__ == '__main__':

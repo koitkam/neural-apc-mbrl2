@@ -98,7 +98,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > gain is ×1.95). **P28:** revert relative gain-match to absolute (P26
 > observer); keep min-of-2 critics + freeze `return_scale` (still untested);
 > on a P1 skip-storm restore `wm_best.pt`, reset AdamW, cap P1 and continue
-> to Stage 2 instead of aborting.
+> to Stage 2 instead of aborting. **P28 follow-up:** the original cap only
+> zeroed `p1_ext_steps`, which re-opened the P1 quality-gate extension and
+> would re-run exploding full-BPTT gain-match. Recovery now also closes
+> `p1_gate_max_ext_steps` (`_force_p1_cap_at`) so the next iter is Stage 2.
 
 ---
 

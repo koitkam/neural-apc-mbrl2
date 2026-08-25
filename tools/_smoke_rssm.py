@@ -19,7 +19,7 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             agent_finetune_loss, _realsim_actor_critic_step,
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _critic_anchor_lambda,
-                            _critic_anchor_coef)
+                            _critic_anchor_coef, _force_p1_cap_at)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -127,6 +127,17 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     s1 = float(model.ret_scale.reshape(-1)[0])
     assert abs(s1 - s0) < 1e-8, f'return_scale moved under freeze: {s0} -> {s1}'
     print(f'[smoke] OK  n_critics={model.n_critics} return_scale freeze ({s0:.4f})')
+
+    # P28 skip-storm: capping P1 must close the extension budget so the
+    # next P1→P2 gate cannot re-open full-BPTT gain-match.
+    _p1, _ext, _cap = _force_p1_cap_at(12345)
+    assert (_p1, _ext, _cap) == (12345, 0, 0), (_p1, _ext, _cap)
+    print('[smoke] OK  P1 skip-storm cap closes extension budget')
+    _tc = TrainConfig()
+    assert float(_tc.gain_match_huber_beta) == 1.0
+    assert int(_tc.aux_tbptt_steps) == 16
+    assert float(_tc.gain_match_relative) == 0.0
+    print('[smoke] OK  gain-match defaults (abs Huber, beta=1, TBPTT=16)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
