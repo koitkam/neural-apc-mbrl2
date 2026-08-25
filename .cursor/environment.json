@@ -1,0 +1,4 @@
+{
+  "name": "neural-apc-mbrl2",
+  "install": "python3 -m pip install --break-system-packages -r requirements.txt"
+}
