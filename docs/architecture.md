@@ -159,13 +159,17 @@ env-gated off · **[planned]** = designed, not yet built.
 > Train-start / `[resolved-cfg]` print `compile=`. Compile-on caps
 > inductor worker threads to `min(4, ncpu/4)` so the CPU sim is not
 > starved (P29: 20 workers on 20 cores, collect 22.6 s vs P28 17.6 s).
-> P29 P1 iter 72: recon 0.228 (wrap spike 0.65 @49), isolation live
-> 0.003 (follow-ups 1–14 ARE in this GPU job, still confounded with
-> categorical+compile). Live iter banner on **this** job still prints
-> `sf≡0`/`img_ret`; HEAD now prints `kl`/`jemb`/`gmatch`/`iso` so the
-> leftover class is visible in tmux. Next GPU job after P29 EXIT:
+> P29 P1 iter 92 (still running): recon 0.323 (wrap spike 0.65 @49, min 0.162 @46),
+> isolation live ~0.002 (follow-ups 1–14 ARE in this GPU job, still confounded with
+> categorical+compile). kl 0.30–0.81 (not joint-embed). Overshoot stuck ~0.10
+> (P28 0.22→0.05). z_alive 1024→97. Gates: iter 75 `gain_not_ready` DC[0.58,3.05]
+> worst=3.05@MV; iter 85 `not_plateaued` wm_ema_best=1.889. Live banner on **this**
+> job still prints `sf≡0`/`img_ret`; HEAD prints `kl`/`jemb`/`gmatch`/`iso`/`ss`.
+> `wm_ss_match_loss` was never a jsonl key (folded into iso) — HEAD now splits it
+> + `wm_ss_match_wmean` (settle_var). Host-adaptive OpenBLAS thread cap (numpy
+> scipy-openblas64 MAX_THREADS=64). Next GPU job after P29 EXIT:
 > env-free `cursor/p28` (deterministic + eager; no leftover
-> compile/latent env-vars — do not pass `DREAMER_COMPILE=0`).
+> compile/latent/DOB/act-hist env-vars — do not pass `DREAMER_COMPILE=0`).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

@@ -9,6 +9,11 @@ from training.train import (TrainConfig, build_model,
                             _wm_held_rollout_stationarity_loss)
 
 
+def _iso(model, obs, act, cfg):
+    loss, _extras = _wm_input_isolation_loss(model, obs, act, cfg)
+    return loss
+
+
 def main():
     torch.manual_seed(0)
     cfg = TrainConfig()
@@ -49,11 +54,11 @@ def main():
 
     # ---- off when coef<=0 ----
     cfg.wm_input_isolation_coef = 0.0
-    z = _wm_input_isolation_loss(model, obs, act, cfg)
+    z = _iso(model, obs, act, cfg)
     assert float(z) == 0.0, f'expected 0 when off, got {float(z)}'
     cfg.wm_input_isolation_coef = 0.5
 
-    loss = _wm_input_isolation_loss(model, obs, act, cfg)
+    loss = _iso(model, obs, act, cfg)
     print(f'[iso] loss={float(loss):.5f}')
     assert torch.isfinite(loss).all() and float(loss) > 0.0, float(loss)
 
@@ -81,13 +86,23 @@ def main():
           'channel (bypasses the categorical bottleneck)')
 
     # ---- steady-state (DC-gain) match term (2026-08-03) ----
-    base = float(_wm_input_isolation_loss(model, obs, act, cfg))  # ss off
+    base = float(_iso(model, obs, act, cfg))  # ss off
     cfg.wm_ss_match_coef = 0.5
-    ss = _wm_input_isolation_loss(model, obs, act, cfg)
+    ss, extras = _wm_input_isolation_loss(model, obs, act, cfg)
     print(f'[ss] base(traj)={base:.5f}  with_ss={float(ss):.5f} '
-          f'(coef={cfg.wm_ss_match_coef})')
+          f'(coef={cfg.wm_ss_match_coef}) extras={sorted(extras)}')
     assert torch.isfinite(ss).all(), float(ss)
     assert float(ss) >= base - 1e-6, 'ss term should ADD to the trajectory loss'
+    assert 'wm_isolation_traj_loss' in extras
+    assert 'wm_ss_match_loss' in extras
+    assert float(extras['wm_ss_match_loss']) >= -1e-8
+    cfg.wm_ss_match_settle_var = 0.05
+    _, extras_w = _wm_input_isolation_loss(model, obs, act, cfg)
+    assert 'wm_ss_match_wmean' in extras_w
+    wmean = float(extras_w['wm_ss_match_wmean'])
+    assert 0.0 <= wmean <= 1.0 + 1e-6, wmean
+    print(f'[ss] wmean={wmean:.4f} (settle_var=0.05)')
+    cfg.wm_ss_match_settle_var = 0.0
     model.zero_grad(set_to_none=True)
     ss.backward()
     cont_grad_ss = sum(float(p.grad.abs().sum())
@@ -102,7 +117,7 @@ def main():
     cfg.wm_ss_match_coef = 0.5
     cfg.wm_input_isolation_len = 6
     model.zero_grad(set_to_none=True)
-    tb = _wm_input_isolation_loss(model, obs, act, cfg)
+    tb = _iso(model, obs, act, cfg)
     assert torch.isfinite(tb).all() and float(tb) > 0.0, float(tb)
     tb.backward()
     cont_grad_tb = sum(float(p.grad.abs().sum())

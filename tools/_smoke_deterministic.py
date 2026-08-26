@@ -23,7 +23,8 @@ import torch
 from models.dreamer_v4_rssm import _CategoricalLatent, rssm_joint_embed_loss
 from training.train import (TrainConfig, build_model, world_model_loss,
                             _realsim_actor_critic_step, _resolve_compile_mode,
-                            _batch_np_to_device, _host_cpu_count)
+                            _batch_np_to_device, _host_cpu_count,
+                            _limit_blas_threads)
 
 
 def _small_cfg(obs_dim=6, action_dim=2, wm_type='rssm', latent_type='categorical'):
@@ -180,7 +181,9 @@ def main():
         {'obs': np.zeros((2, 4, 3), dtype='float32')}, torch.device('cpu'))
     assert y['obs'].shape == (2, 4, 3)
     assert _host_cpu_count() >= 1
-    print('[smoke] OK  _batch_np_to_device CPU + host_cpu_count')
+    _btag = _limit_blas_threads(2)
+    assert isinstance(_btag, str) and _btag
+    print(f'[smoke] OK  _batch_np_to_device CPU + host_cpu_count + blas={_btag}')
     _check_head()
     for wm in ('rssm', 'tssm'):
         _check_backbone(wm)

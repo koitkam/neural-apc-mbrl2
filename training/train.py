@@ -2936,8 +2936,68 @@ def _host_cpu_count() -> int:
     return int(os.cpu_count() or 4)
 
 
-def _configure_runtime_threads(device: torch.device) -> int:
-    """Cap PyTorch intra-op threads so the plant sim keeps CPU.
+def _limit_blas_threads(n: int) -> str:
+    """Cap already-loaded OpenBLAS/MKL so numpy collect doesn't fight PyTorch.
+
+    Numpy's manylinux wheel (``scipy-openblas64``, ``MAX_THREADS=64`` on this
+    host) ignores ``OMP_NUM_THREADS`` after import.  Best-effort: known
+    ``set_num_threads`` symbols on loaded BLAS libs + env for later imports.
+    Returns a short tag for the ``[runtime]`` banner.  Never raises.
+    """
+    n = max(1, int(n))
+    for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+        os.environ.setdefault(key, str(n))
+    tags: List[str] = []
+    try:
+        import mkl  # type: ignore
+        mkl.set_num_threads(n)
+        tags.append('mkl')
+    except Exception:
+        pass
+    try:
+        import ctypes
+        syms = (
+            'scipy_openblas_set_num_threads64_',
+            'scipy_openblas_set_num_threads_64_',
+            'openblas_set_num_threads',
+        )
+        seen = set()
+        maps = '/proc/self/maps'
+        if os.path.exists(maps):
+            with open(maps) as fh:
+                for line in fh:
+                    if '.so' not in line:
+                        continue
+                    path = line.rsplit(' ', 1)[-1].strip()
+                    if (path in seen or not path.startswith('/')
+                            or ('blas' not in path.lower()
+                                and 'mkl' not in path.lower())):
+                        continue
+                    seen.add(path)
+                    try:
+                        lib = ctypes.CDLL(path)
+                    except Exception:
+                        continue
+                    for sym in syms:
+                        fn = getattr(lib, sym, None)
+                        if fn is None:
+                            continue
+                        try:
+                            fn.argtypes = [ctypes.c_int]
+                            fn(n)
+                            tags.append(path.rsplit('/', 1)[-1].split('-', 1)[0]
+                                        .split('.', 1)[0])
+                        except Exception:
+                            continue
+                        break
+    except Exception:
+        pass
+    return ','.join(tags) if tags else 'env'
+
+
+def _configure_runtime_threads(device: torch.device) -> Tuple[int, str]:
+    """Cap PyTorch intra-op + BLAS threads so the plant sim keeps CPU.
 
     GPU training is kernel-bound; the default intra-op = all cores
     starves the CPU simulator.  P29 compiled with 20 inductor workers
@@ -2957,7 +3017,8 @@ def _configure_runtime_threads(device: torch.device) -> int:
         torch.set_num_interop_threads(max(1, min(4, nth)))
     except Exception:
         pass
-    return nth
+    blas = _limit_blas_threads(nth)
+    return nth, blas
 
 
 def _batch_np_to_device(batch_np: Dict, device: torch.device
@@ -5233,7 +5294,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
 
 def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
                              act: torch.Tensor, cfg: TrainConfig
-                             ) -> torch.Tensor:
+                             ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """MIMO self-supervised per-INPUT isolation (2026-07-10).
 
     The DATA-DRIVEN generalisation of ``_wm_gain_match_loss`` for NONLINEAR /
@@ -5252,25 +5313,31 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     into the CONTINUOUS gain channel + decoder + GRU, bypassing the categorical
     bottleneck that attenuates SUBDOMINANT inputs (the same routing C(1)
     gain-match uses).  RSSM-only; ``0`` for other backbones / when off.
+
+    Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match
+    (unchanged training objective).  ``extras`` splits the folded DC-gain
+    term that P28/P29 jsonl never logged (``wm_ss_match_loss`` was always
+    missing; settle_var starvation was invisible).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
+    empty: Dict[str, torch.Tensor] = {}
     coef = float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0)
     if coef <= 0.0:
-        return zero
+        return zero, empty
     if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
-        return zero
+        return zero, empty
     rssm = model.dynamics
     if rssm.n_cv <= 0:
-        return zero
+        return zero, empty
     from models.dreamer_v4_rssm import RSSMState
     B, T = obs.shape[:2]
     K = int(getattr(cfg, 'wm_input_isolation_len', 0) or 0)
     K = min(K, T - 1) if K > 0 else (T - 1)
     if K < 2:
-        return zero
+        return zero, empty
     n_valid = T - K
     if n_valid < 1:
-        return zero
+        return zero, empty
     # Frozen-observer encode → posterior features (mode); detached start states
     # so the gradient trains the prior/decoder/cont-gain roll, not the encoder.
     # Gain-match does NOT detach (P26 full-BPTT through the encoder).
@@ -5326,7 +5393,11 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
                 and (ss_coef <= 0.0 or k < ss_k0 - 1)
                 and hasattr(st, 'detach')):
             st = st.detach(keep_c=True)
-    out = coef * (total / float(K))
+    traj = coef * (total / float(K))
+    extras: Dict[str, torch.Tensor] = {
+        'wm_isolation_traj_loss': traj.detach(),
+    }
+    out = traj
     if ss_coef > 0.0 and cv_pred_win:
         pred_ss = torch.stack(cv_pred_win, dim=1).mean(dim=1)     # (Bm, n_cv)
         real_win = cv_real[:, ss_k0:ss_k0 + len(cv_pred_win)]     # (Bm, W, n_cv)
@@ -5337,10 +5408,13 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
             # dilute the per-input steady-state match (undiluted, symmetric).
             w = torch.exp(-real_win.var(dim=1) / ss_var)
             ss = (ss_err * w).sum() / w.sum().clamp_min(1e-6)
+            extras['wm_ss_match_wmean'] = w.mean().detach()
         else:
             ss = ss_err.mean()
-        out = out + coef * ss_coef * ss
-    return out
+        ss_term = coef * ss_coef * ss
+        extras['wm_ss_match_loss'] = ss_term.detach()
+        out = traj + ss_term
+    return out, extras
 
 
 def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
@@ -7651,9 +7725,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             torch.set_float32_matmul_precision('high')
         except Exception:
             pass
-    _nth = _configure_runtime_threads(device)
+    _nth, _blas = _configure_runtime_threads(device)
     print(f'[runtime] cpu_threads={_nth} host_cpus={_host_cpu_count()} '
-          f'device={device.type}', flush=True)
+          f'device={device.type} blas={_blas}', flush=True)
 
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim
@@ -10028,10 +10102,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     with torch.amp.autocast(device_type=device.type,
                                               dtype=torch.bfloat16,
                                               enabled=(device.type == 'cuda')):
-                        _iso_loss = _wm_input_isolation_loss(
+                        _iso_loss, _iso_extra = _wm_input_isolation_loss(
                             model, _iso_obs, _iso_act, cfg)
                     total_loss = total_loss + _iso_loss
                     wm_losses['wm_input_isolation_loss'] = _iso_loss.detach()
+                    for _ek, _ev in _iso_extra.items():
+                        wm_losses[_ek] = _ev
 
                 opt_world.zero_grad(set_to_none=True)
                 if current_phase == 2:
@@ -10456,6 +10532,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                    f"sf {row.get('sf_loss', 0.0):.4f} ")
                 + f"gmatch {row.get('gain_match_loss', 0.0):.4f} "
                 + f"iso {row.get('wm_input_isolation_loss', 0.0):.4f} "
+                + f"ss {row.get('wm_ss_match_loss', 0.0):.4f} "
                 + (f"dobg {row.get('dob_ground', 0.0):.4f} "
                    if current_phase >= 2 or joint_mode else '')
             )
