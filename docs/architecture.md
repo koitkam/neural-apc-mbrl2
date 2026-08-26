@@ -159,8 +159,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > Train-start / `[resolved-cfg]` print `compile=`. Compile-on caps
 > inductor worker threads to `min(4, ncpu/4)` so the CPU sim is not
 > starved (P29: 20 workers on 20 cores, collect 22.6 s vs P28 17.6 s).
-> Next GPU job after P29 EXIT: env-free `cursor/p28` (deterministic +
-> eager; no leftover compile/latent env-vars).
+> P29 P1 iter 72: recon 0.228 (wrap spike 0.65 @49), isolation live
+> 0.003 (follow-ups 1–14 ARE in this GPU job, still confounded with
+> categorical+compile). Live iter banner on **this** job still prints
+> `sf≡0`/`img_ret`; HEAD now prints `kl`/`jemb`/`gmatch`/`iso` so the
+> leftover class is visible in tmux. Next GPU job after P29 EXIT:
+> env-free `cursor/p28` (deterministic + eager; no leftover
+> compile/latent env-vars — do not pass `DREAMER_COMPILE=0`).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
@@ -268,7 +273,7 @@ flowchart TB
     CORE["deterministic core\nGRU (RSSM) / transformer (TSSM)\nstate h"]
     FEAT["feat = [h, z]"]
     DEC["decoder g(feat) -> obs_hat"]
-    DOBS["disturbance state d_t\n(neural Kalman / DOB)  [opt-in]"]
+    DOBS["disturbance state d_t\n(neural Kalman / DOB)  [current]"]
     ENC --> POST --> CORE --> FEAT
     CORE --> PRIOR
     FEAT --> DEC

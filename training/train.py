@@ -5238,7 +5238,8 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
 
     The DATA-DRIVEN generalisation of ``_wm_gain_match_loss`` for NONLINEAR /
     black-box plants with no identified gains.  ``obs``/``act`` come from an
-    ISOLATED-EXCITATION episode (ONE input swept with PRBS, all others held) so
+    isolated-input SETTLE episode (one input at a stratified level, others
+    at 0: MV is a whole-episode hold, DV is a t=0 step — follow-up 9) so
     the CV movement is driven by that single input.  From a strided set of
     posterior start states we roll the PRIOR forward ``K`` steps under the REAL
     action + DV sequence, decode each step, and match the predicted CV
@@ -10312,10 +10313,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             sps = (steps_dt / iter_dt) if iter_dt > 0 else 0.0
             gpu_mem_mb = None
             gpu_mem_peak_mb = None
+            gpu_mem_reserved_mb = None
             if device.type == 'cuda':
                 try:
                     gpu_mem_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                     gpu_mem_peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                    gpu_mem_reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
                     torch.cuda.reset_peak_memory_stats(device)
                 except Exception:
                     pass
@@ -10340,6 +10343,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                             else critic_grad_norm),
                 'gpu_mem_mb': gpu_mem_mb,
                 'gpu_mem_peak_mb': gpu_mem_peak_mb,
+                'gpu_mem_reserved_mb': gpu_mem_reserved_mb,
                 't_collect_s': t_collect_acc,
                 't_sample_s': t_sample_acc,
                 't_wm_s': t_wm_acc,
@@ -10440,19 +10444,41 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # JOINT mode has no phases -> tag rows 'joint' instead of 'P3';
             # phased mode keeps the informative P1/P2/P3 label.
             phase_tag = 'joint' if joint_mode else f'P{current_phase}'
+            # Observer discriminators on the live line (P29 leftover class:
+            # categorical KL vs deterministic joint-embed was only in jsonl
+            # while the banner printed RSSM ``sf≡0`` + deleted ``img_ret``).
+            _rssm = str(getattr(cfg, 'world_model_type', 'rssm')) == 'rssm'
+            _obs = (
+                f"recon {row.get('recon_loss', 0.0):.4f} "
+                + (f"kl {row.get('kl_loss', 0.0):.3f} "
+                   f"jemb {row.get('joint_embed_loss', 0.0):.4f} "
+                   if _rssm else
+                   f"sf {row.get('sf_loss', 0.0):.4f} ")
+                + f"gmatch {row.get('gain_match_loss', 0.0):.4f} "
+                + f"iso {row.get('wm_input_isolation_loss', 0.0):.4f} "
+                + (f"dobg {row.get('dob_ground', 0.0):.4f} "
+                   if current_phase >= 2 or joint_mode else '')
+            )
+            _enc = (
+                f"encvar {row.get('encoder_var_ratio', 0.0):.2f} "
+                f"zrank {row.get('z_eff_rank', 0.0):.1f}/{int(row.get('z_dim', 0))} "
+                f"alive {int(row.get('z_alive_dims', 0))} "
+                f"bc {row.get('bc_loss', 0.0):.3f} "
+            )
+            if current_phase >= 3 or joint_mode:
+                _ac = (
+                    f"actor {row.get('actor_loss', 0.0):+.3f} "
+                    f"critic {row.get('critic_loss', 0.0):.3f} "
+                    f"ent {row.get('entropy_mean', 0.0):.3f} "
+                    f"rscale {row.get('return_scale', 0.0):.2f} "
+                    f"rtgt {row.get('critic_rew_to_tgt_var', 0.0):.4f} "
+                )
+            else:
+                _ac = ''
             print(f"[{row['timestamp']}] {phase_tag} iter {total_iters:4d} "
                   f"steps {total_env_steps:6d} sps {sps:5.1f} "
                   f"ret_ema {ema_str} ret_w {rwm_str} "
-                  f"recon {row.get('recon_loss', 0.0):.4f} "
-                  f"sf {row.get('sf_loss', 0.0):.4f} "
-                  f"encvar {row.get('encoder_var_ratio', 0.0):.2f} "
-                  f"zrank {row.get('z_eff_rank', 0.0):.1f}/{int(row.get('z_dim', 0))} "
-                  f"alive {int(row.get('z_alive_dims', 0))} "
-                  f"bc {row.get('bc_loss', 0.0):.3f} "
-                  f"actor {row.get('actor_loss', 0.0):+.3f} "
-                  f"critic {row.get('critic_loss', 0.0):.3f} "
-                  f"ent {row.get('entropy_mean', 0.0):.3f} "
-                  f"img_ret {row.get('imagined_return_mean', 0.0):+.3f} "
+                  f"{_obs}{_enc}{_ac}"
                   f"skip {row.get('n_grad_skip', 0)}",
                   flush=True)
             last_log_time = now
