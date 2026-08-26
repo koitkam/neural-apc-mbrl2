@@ -120,6 +120,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > records `actor_experiment_valid=False` when the freeze is
 > `GAIN_NOT_READY` or skip-storm fell back to `wm_best` — P3 still
 > runs, but econ must not be attributed to actor knobs.
+> **P28 follow-up 4:** last-ok restore was still undone on the next
+> iter. Default `DREAMER_WM_BEST_RESTORE_AT_P2=1` reloads the
+> fidelity-peak `wm_best.pt` at the P1→P2 boundary (healthy-P1 win,
+> p124). After a skip-storm the next iter *is* that boundary, so
+> last-ok was overwritten by the same gain-blind spike follow-up 3
+> exists to avoid. Recovery now skips the P1→P2 (and P2→P3) wm_best
+> reload when `skip_storm_p1_recovered`. Healthy P1 still restores.
+> The restore knobs are TrainConfig + `ENV_OVERRIDES` (defaults
+> unchanged).
 
 ---
 

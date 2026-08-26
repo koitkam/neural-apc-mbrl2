@@ -1672,6 +1672,18 @@ class TrainConfig:
     # exploded 0.004 → 0.50 (~125×); 5× still accepts mild recon jitter
     # and rejects a skip-storm detonation.  ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
     skip_storm_last_ok_recon_ratio: float = 5.0
+    # P39: reload fidelity-peak ``wm_best.pt`` at P1→P2 (healthy P1 only).
+    # After a P1 skip-storm last-ok restore this MUST stay False-effective
+    # — the next-iter phase transition would otherwise overwrite last-ok
+    # with the gain-blind peak (P28 follow-up 3 undone).  Healthy P1 still
+    # restores (p124: disabling it in curriculum mode regressed MV gain).
+    # ``DREAMER_WM_BEST_RESTORE_AT_P2``.
+    wm_best_restore_at_p2: bool = True
+    # P90: full-model reload at P2→P3.  Default OFF (wipes P2 reward/BC).
+    wm_best_restore_at_p3: bool = False
+    # Skip the boundary reload when ``total_iters - wm_best_iter`` is below
+    # this (wm_best ≈ current).  ``DREAMER_WM_BEST_RESTORE_MIN_GAP``.
+    wm_best_restore_min_gap: int = 10
     # P1 mid-check: at the P1→P2 transition, require ``sf_loss`` to have
     # dropped at least ``min_drop_frac`` from its initial value.  If not,
     # WM never learned dynamics; flag the trial so the BO score reflects
@@ -2722,6 +2734,32 @@ def _skip_storm_restore_ckpt(
         if p.exists():
             return p, 'wm_best'
     return None, 'none'
+
+
+def _should_warm_restore_wm_best(
+        *,
+        restore_enabled: bool,
+        skip_storm_recovered: bool,
+        wm_best_iter: int,
+        total_iters: int,
+        min_gap: int,
+        wm_best_exists: bool,
+) -> bool:
+    """Whether to reload ``wm_best.pt`` at a phase boundary.
+
+    Healthy P1→P2 still restores the fidelity peak (p124: turning this
+    off in curriculum mode regressed MV gain).  After a P1 skip-storm
+    last-ok restore the next iter IS the P1→P2 transition — reloading
+    ``wm_best`` would overwrite last-ok with the gain-blind spike that
+    skip-storm recovery exists to avoid.
+    """
+    if skip_storm_recovered:
+        return False
+    if not restore_enabled or not wm_best_exists:
+        return False
+    if int(wm_best_iter) <= 0:
+        return False
+    return (int(total_iters) - int(wm_best_iter)) >= int(min_gap)
 
 
 def _actor_experiment_valid(*,
@@ -7794,9 +7832,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # the P1→P2 boundary gives critic training the cleanest available
     # latent dynamics.  Skipped when wm_best.pt is essentially the
     # current state (gap < ``min_gap``) to avoid wasted I/O.  Disable
-    # with DREAMER_WM_BEST_RESTORE_AT_P2=0.
-    wm_best_restore_at_p2 = bool(int(
-        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P2', '1') or 0))
+    # with DREAMER_WM_BEST_RESTORE_AT_P2=0.  After skip-storm last-ok this
+    # reload is skipped (see ``_should_warm_restore_wm_best``).
+    wm_best_restore_at_p2 = bool(getattr(cfg, 'wm_best_restore_at_p2', True))
     # ----- wm_best.pt warm-restore at P2→P3 (P90, 2026-06-06) -----
     # The WM keeps training through P2 (paper Algorithm 1 co-trains it during
     # critic warmup), but its held-action fixed point is UNSTABLE — the probe
@@ -7810,8 +7848,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # freezes only the WM CORE via requires_grad, preserving reward/policy
     # training).  Opt in with DREAMER_WM_BEST_RESTORE_AT_P3=1 only if not using
     # the freeze.
-    wm_best_restore_at_p3 = bool(int(
-        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P3', '0') or 0))
+    wm_best_restore_at_p3 = bool(getattr(cfg, 'wm_best_restore_at_p3', False))
     # P90: freeze the WM core after P1 (restore best at P1→P2, then no WM-core
     # training in P2/P3) for critic/WM coherence + drift immunity.  cfg flag,
     # env-overridable via DREAMER_WM_FREEZE_AFTER_P1.
@@ -7929,7 +7966,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # real gain fix is the CV-weighted overshoot loss (supervises the
         # open-loop CV gain directly), not the checkpoint-selection policy.
     wm_best_restore_min_gap = int(
-        os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
+        getattr(cfg, 'wm_best_restore_min_gap', 10) or 10)
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
     # All four are cheap and gated by env vars.  A + D are standing
     # observability (default ON, run at probe cadence → <2% overhead).
@@ -8675,12 +8712,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     print(f"[p1→p2] sf_loss {p1_initial_sf:.4f} → "
                           f"{last_sf:.4f}", flush=True)
                 # P39: warm-restore WM to its fidelity peak before P2.
-                if (wm_best_restore_at_p2
-                        and wm_best_ckpt_path is not None
-                        and wm_best_iter > 0
-                        and (total_iters - wm_best_iter)
-                                >= wm_best_restore_min_gap
-                        and wm_best_ckpt_path.exists()):
+                # Skip after skip-storm last-ok: this transition is the
+                # very next iter, and wm_best is the gain-blind peak.
+                _wb_exists = bool(wm_best_ckpt_path is not None
+                                  and wm_best_ckpt_path.exists())
+                if (skip_storm_p1_recovered and wm_best_restore_at_p2):
+                    print('[p1→p2] WM warm-restore SKIPPED: skip-storm already '
+                          f'restored {skip_storm_restore_source} (iter '
+                          f'{skip_storm_restore_iter}); wm_best is gain-blind '
+                          'and must not overwrite last-ok', flush=True)
+                elif _should_warm_restore_wm_best(
+                        restore_enabled=wm_best_restore_at_p2,
+                        skip_storm_recovered=bool(skip_storm_p1_recovered),
+                        wm_best_iter=int(wm_best_iter),
+                        total_iters=int(total_iters),
+                        min_gap=int(wm_best_restore_min_gap),
+                        wm_best_exists=_wb_exists):
                     _wb_iter0 = int(wm_best_iter)
                     try:
                         # p21 RCA: the fidelity-score wm_best can freeze a
@@ -8784,12 +8831,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # P90: warm-restore WM to its conv-aware fidelity peak before
                 # the P2→P3 FREEZE so P3 + the post-training diagnostics use the
                 # best-converged WM, not the drifted end-of-P2 one.
-                if (wm_best_restore_at_p3
-                        and wm_best_ckpt_path is not None
-                        and wm_best_iter > 0
-                        and (total_iters - wm_best_iter)
-                                >= wm_best_restore_min_gap
-                        and wm_best_ckpt_path.exists()):
+                if _should_warm_restore_wm_best(
+                        restore_enabled=wm_best_restore_at_p3,
+                        skip_storm_recovered=bool(skip_storm_p1_recovered),
+                        wm_best_iter=int(wm_best_iter),
+                        total_iters=int(total_iters),
+                        min_gap=int(wm_best_restore_min_gap),
+                        wm_best_exists=bool(
+                            wm_best_ckpt_path is not None
+                            and wm_best_ckpt_path.exists())):
                     try:
                         _blob = torch.load(wm_best_ckpt_path,
                                             map_location=device,
@@ -10531,6 +10581,11 @@ def _cfg_from_env() -> TrainConfig:
             'early_stop_p1_min_sf_drop_frac', float),
         ('DREAMER_ES_P2_MAX_RMTP',
             'early_stop_p2_max_reward_mtp_loss', float),
+        ('DREAMER_WM_BEST_RESTORE_AT_P2', 'wm_best_restore_at_p2',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_WM_BEST_RESTORE_AT_P3', 'wm_best_restore_at_p3',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_WM_BEST_RESTORE_MIN_GAP', 'wm_best_restore_min_gap', int),
         # 2026-05-26 (P52 RCA): phase-transition quality gates.
         ('DREAMER_P1_GATE_WM_EMA_MIN', 'p1_gate_wm_ema_min', float),
         ('DREAMER_P1_GATE_PLATEAU_FRAC', 'p1_gate_plateau_frac', float),

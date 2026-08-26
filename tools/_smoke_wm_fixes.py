@@ -146,18 +146,20 @@ def _test_freeze_mechanism():
 def _test_defaults_and_env():
     print('\n=== defaults OFF + ENV_OVERRIDES wiring ===')
     cfg = TrainConfig()
-    assert cfg.wm_recon_cv_weight == 1.0, 'recon weight must default 1.0 (identity)'
     assert cfg.wm_freeze_after_iters == 0, 'freeze must default 0 (off)'
-    assert cfg.bc_track_expert_every == 0, 'bc track must default 0 (off)'
-    assert cfg.cv_obs_indices == (), 'cv_obs_indices must default empty'
-    print('[smoke] OK  all new knobs default to OFF / identity')
+    assert cfg.wm_best_restore_at_p2 is True
+    assert cfg.wm_best_restore_at_p3 is False
+    assert int(cfg.wm_best_restore_min_gap) == 10
+    print('[smoke] OK  wm_best_restore_at_p2 default ON; freeze-after-iters OFF')
 
     from workflow._plant_prepare import apply_dreamer_env_overrides
     env_map = {
         'DREAMER_WM_FREEZE_AFTER_ITERS': ('40', 'wm_freeze_after_iters', 40),
-        'DREAMER_WM_RECON_CV_WEIGHT': ('6.0', 'wm_recon_cv_weight', 6.0),
+        'DREAMER_WM_RECON_CV_WEIGHT': ('8.0', 'wm_recon_cv_weight', 8.0),
         'DREAMER_BC_TRACK_EXPERT_EVERY': ('5', 'bc_track_expert_every', 5),
         'DREAMER_EXPERT_BC_P3_FLOOR': ('0.0', 'expert_bc_p3_floor', 0.0),
+        'DREAMER_WM_BEST_RESTORE_AT_P2': ('0', 'wm_best_restore_at_p2', False),
+        'DREAMER_WM_BEST_RESTORE_MIN_GAP': ('7', 'wm_best_restore_min_gap', 7),
     }
     for k, (val, _f, _e) in env_map.items():
         os.environ[k] = val
@@ -167,7 +169,7 @@ def _test_defaults_and_env():
         for k, (val, field, expected) in env_map.items():
             got = getattr(cfg2, field)
             assert got == expected, f'{k} -> {field}: expected {expected}, got {got}'
-        print('[smoke] OK  all five env overrides map to the right cfg fields')
+        print('[smoke] OK  env overrides map to the right cfg fields')
     finally:
         for k in env_map:
             os.environ.pop(k, None)

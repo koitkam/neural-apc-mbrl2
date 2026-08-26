@@ -358,7 +358,8 @@ steady-state behaviour. Mitigations:
 |---|---|
 | `DREAMER_CONST_ACTION_INJECT_EVERY` | Inject N fresh const-action episodes every K P1 iters (default K=20; set 0 to disable). |
 | `DREAMER_CONST_ACTION_INJECT_N` | Episodes per injection (default 5, stratified across `constant_action_seed_op_band`). |
-| `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (default 1; set 0 to disable). |
+| `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (default 1; set 0 to disable). **Skipped after a P1 skip-storm last-ok restore** so the gain-blind fidelity peak cannot overwrite last-ok. Healthy P1 still restores. |
+| `DREAMER_WM_BEST_RESTORE_AT_P3` | Reload `wm_best.pt` at P2→P3 (default 0; also skipped after skip-storm). |
 | `DREAMER_WM_BEST_RESTORE_MIN_GAP` | Skip restore when `total_iters - wm_best_iter` is below this (default 10). |
 
 Both knobs are sim-agnostic and adaptive: injection uses

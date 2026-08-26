@@ -22,7 +22,8 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             _critic_anchor_coef, _force_p1_cap_at,
                             _resolve_aux_tbptt_steps,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
-                            _actor_experiment_valid)
+                            _actor_experiment_valid,
+                            _should_warm_restore_wm_best)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -192,7 +193,25 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _actor_experiment_valid(skip_storm_source=None,
                                        gain_not_ready_capped=True)
     assert float(TrainConfig().skip_storm_last_ok_recon_ratio) == 5.0
+    assert bool(TrainConfig().wm_best_restore_at_p2) is True
+    assert bool(TrainConfig().wm_best_restore_at_p3) is False
+    assert int(TrainConfig().wm_best_restore_min_gap) == 10
+    # Healthy P1→P2 still restores wm_best (p124).
+    assert _should_warm_restore_wm_best(
+        restore_enabled=True, skip_storm_recovered=False,
+        wm_best_iter=20, total_iters=80, min_gap=10, wm_best_exists=True)
+    # Skip-storm last-ok must not be overwritten by the fidelity peak.
+    assert not _should_warm_restore_wm_best(
+        restore_enabled=True, skip_storm_recovered=True,
+        wm_best_iter=20, total_iters=50, min_gap=10, wm_best_exists=True)
+    assert not _should_warm_restore_wm_best(
+        restore_enabled=True, skip_storm_recovered=False,
+        wm_best_iter=75, total_iters=80, min_gap=10, wm_best_exists=True)
+    assert not _should_warm_restore_wm_best(
+        restore_enabled=False, skip_storm_recovered=False,
+        wm_best_iter=20, total_iters=80, min_gap=10, wm_best_exists=True)
     print('[smoke] OK  skip-storm last-ok restore prefers late-P1 observer')
+    print('[smoke] OK  skip-storm blocks P1→P2 wm_best overwrite')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
