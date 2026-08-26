@@ -3347,6 +3347,60 @@ def collect_baseline_episode(env: APCEnv, cfg: TrainConfig, *,
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
 
+def _isolated_hold_action(
+        n_mv: int, isolate_dim: Optional[int],
+        hold_level: float, isolated_level: Optional[float],
+) -> np.ndarray:
+    """Constant MV command for isolation-settle: one input at ``isolated_level``.
+
+    Other actuators stay at ``hold_level`` (default 0).  SISO (n_mv=1) is
+    just the isolated level.  ``isolated_level is None`` holds the
+    isolated dim at 0.
+    """
+    a = int(max(0, n_mv))
+    hold = float(np.clip(hold_level, -1.0, 1.0))
+    out = np.full((a,), hold, dtype='float32')
+    if a == 0:
+        return out
+    lvl = 0.0 if isolated_level is None else float(isolated_level)
+    lvl = float(np.clip(lvl, -1.0, 1.0))
+    if isolate_dim is None:
+        out[:] = lvl
+        return out
+    i = int(isolate_dim)
+    if 0 <= i < a:
+        out[i] = lvl
+    return out
+
+
+def _collect_held_action_episode(
+        env: 'APCEnv', cfg: 'TrainConfig', obs_window: np.ndarray,
+        action: np.ndarray) -> Dict[str, np.ndarray]:
+    """Run ``episode_length`` steps at a constant action (already reset)."""
+    T, D = int(cfg.episode_length), env.obs_dim
+    a_np = np.asarray(action, dtype='float32').reshape(-1)
+    if a_np.size != env.action_dim:
+        held = np.zeros((env.action_dim,), dtype='float32')
+        n = min(int(a_np.size), int(env.action_dim))
+        held[:n] = a_np[:n]
+        a_np = held
+    np.clip(a_np, -1.0, 1.0, out=a_np)
+    obs_buf = np.zeros((T, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window[-1]
+        next_window, reward, done, _ = env.step(a_np)
+        act_buf[t] = a_np
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
 def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                           action_std: float = 0.05,
                           n_segments: Optional[int] = None,
@@ -3355,6 +3409,7 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                           long_hold: bool = False,
                           isolate_dim: Optional[int] = None,
                           hold_level: float = 0.0,
+                          isolated_level: Optional[float] = None,
                           ) -> Dict[str, np.ndarray]:
     """Collect one episode that PRBS-toggles MV across the operating band.
 
@@ -3375,12 +3430,18 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     sampling under-covers when #segments per episode is small).
 
     ``isolate_dim`` (P28 follow-up 7): sweep only that MV and hold every
-    other actuator at ``hold_level``.  ``long_hold`` also suppresses the
-    curriculum DV schedule + hidden OU so ss-match is unconfounded, and
-    (P28 follow-up 8) zeros process/measurement noise when
-    ``clean_steady_seeds`` is on — the same P89 gate as const-action /
-    step-settle.  ``isolate_dim is None`` keeps legacy MIMO PRBS
-    (test_sim n_mv=1 is unchanged).
+    other actuator at ``hold_level``.  ``long_hold`` is the isolation-
+    settle path (P28 follow-up 9): a **whole-episode constant hold** of
+    the isolated input at ``isolated_level`` (others at ``hold_level``),
+    curriculum DV + hidden OU off, process/measurement noise off when
+    ``clean_steady_seeds`` is on, **action_std forced to 0**.  Follow-up
+    8 still PRBS-stepped inside the episode (seg capped at T/4, ~11
+    holds of 2K on test_sim) and dithered the isolated MV with
+    ``baseline_seed_std`` — random seq_len windows from isolation_buf
+    straddled steps (~half) so ``wm_ss_match``'s settle_var gate starved
+    the DC-gain term, and ``_st_levels`` was wired to *other* MVs
+    (no-op on test_sim n_mv=1).  ``isolate_dim is None`` keeps legacy
+    MIMO PRBS (test_sim n_mv=1 ordinary PRBS is unchanged).
 
     Returns the same dict shape as ``collect_episode``.
     """
@@ -3395,6 +3456,9 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
         env._hidden_disturbance = None
     if long_hold:
         _maybe_clean_steady_seed(env, cfg)
+        a_hold = _isolated_hold_action(
+            int(env.action_dim), isolate_dim, hold_level, isolated_level)
+        return _collect_held_action_episode(env, cfg, obs_window, a_hold)
     T, D = cfg.episode_length, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
@@ -3424,11 +3488,6 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # leaves the WM compounding-error blind.
     seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
     seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
-    if long_hold:                       # dedicated isolated SETTLE episode
-        _iso_len = int(getattr(cfg, 'wm_input_isolation_len', 0)
-                       or getattr(cfg, 'horizon', 15) or 15)
-        seg_max = min(max(seg_max, 2 * _iso_len), max(8, T // 4))
-        seg_min = seg_max               # uniform long holds → full steady state
     multi_timescale = (seg_min < seg_max)
     if multi_timescale:
         # Pre-roll segment lengths log-uniformly; expand episode in
@@ -4005,7 +4064,8 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
 
 def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
                             long_hold: bool = False,
-                            isolate_dv_idx: Optional[int] = None) -> List[Dict]:
+                            isolate_dv_idx: Optional[int] = None,
+                            isolated_level: Optional[float] = None) -> List[Dict]:
     """Full-range, multi-timescale, stratified DV-PRBS disturbance schedule.
 
     Schedule-construction core shared by the DV-PRBS SEED episodes
@@ -4016,6 +4076,12 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
     (``delta_k = L_k − L_{k−1}``) so the accumulated offset tracks the
     stratified level sequence.  Returns an empty list when the sim has no
     measured-DV channels (caller leaves the existing schedule untouched).
+
+    ``long_hold`` (P28 follow-up 9): one step at t=0 to
+    ``isolated_level × amp`` on the isolated DV, then hold for the rest
+    of the episode (DC-gain settle).  ``isolated_level`` is the same
+    normalized [-1, 1] units as MV action (seed linspace uses
+    ``constant_action_seed_op_band``).
 
     Why (RC-W1, p119–p127 DV-gain RCA): the WM's DV→CV gain is identified on
     the SLOW on-policy FEED motion (≈0.29 std OU) plus only ~1-5 sparse step
@@ -4034,6 +4100,33 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
         dv_chs = [dv_chs[i]] if 0 <= i < len(dv_chs) else []
     if not dv_chs:
         return []
+    op_frac = float(np.clip(getattr(cfg, 'dv_prbs_op_frac', 0.6), 0.05, 0.95))
+    if long_hold:
+        # Whole-episode hold at isolated_level (DC-gain).  One step at t=0;
+        # delta=0 (level 0) is a valid baseline hold — emit nothing.
+        dv_schedule: List[Dict] = []
+        frac = 0.0 if isolated_level is None else float(
+            np.clip(isolated_level, -1.0, 1.0))
+        for ch in dv_chs:
+            b = ch.get('bounds')
+            span = (float(b[1]) - float(b[0])) if (isinstance(b, list)
+                                                    and len(b) >= 2) else 1.0
+            amp = op_frac * 0.5 * abs(span)
+            delta = float(frac * amp)
+            if abs(delta) < 1e-9:
+                continue
+            dv_schedule.append({
+                'name': f"dv_iso_{ch.get('name', ch.get('pos', '?'))}_t0",
+                'target_group': 'dv',
+                'target_pos': int(ch.get('pos', 0)),
+                'start': 0,
+                'duration': 1,
+                'shape': 'step',
+                'delta': delta,
+                'source': 'dv_isolation_settle',
+                '_applied': False,
+            })
+        return dv_schedule
     # ----- Multi-timescale segment lengths (mirror collect_prbs_episode) -
     # seg_max ≈ (θ+4τ)/sr (settling time, from auto_tune_seed_buffer) so the
     # DV settles at each level (steady-state gain identifiable); seg_min ≈
@@ -4042,11 +4135,6 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
     seg_max = max(8, min(seg_max if seg_max > 0 else T // 12, T // 4))
     seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
     seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
-    if long_hold:                       # dedicated isolated SETTLE episode
-        _iso_len = int(getattr(cfg, 'wm_input_isolation_len', 0)
-                       or getattr(cfg, 'horizon', 15) or 15)
-        seg_max = min(max(seg_max, 2 * _iso_len), max(8, T // 4))
-        seg_min = seg_max
     # Pre-roll segment start times (log-uniform multi-timescale).
     seg_starts: List[int] = []
     t = 0
@@ -4111,6 +4199,7 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                              mv_level: float = 0.0,
                              long_hold: bool = False,
                              isolate_dv_idx: Optional[int] = None,
+                             isolated_level: Optional[float] = None,
                              ) -> Dict[str, np.ndarray]:
     """DV-PRBS seed episode (2026-06-14): the DV analogue of
     ``collect_prbs_episode``.  Holds the MV at a (stratified) operating
@@ -4150,8 +4239,10 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     ``mv_level`` (normalized action space) sets the held MV operating
     point; vary it across the seed batch for MV-level coverage.
     ``long_hold`` + ``isolate_dv_idx`` is the isolation-settle path
-    (P28 follow-up 7/8): one DV, uniform long holds, hidden OU off,
-    ``clean_steady_seeds`` zeros process/measurement noise.  Returns
+    (P28 follow-up 9): one DV, **one step at t=0** to ``isolated_level``
+    then hold, MV held at ``mv_level`` (seed uses 0 so ∂CV/∂DV is
+    unconfounded), hidden OU off, ``clean_steady_seeds`` zeros
+    process/measurement noise.  Returns
     the same dict shape as ``collect_episode``.
     """
     from utils.training_disturbance import _channel_catalog
@@ -4192,7 +4283,8 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # builder; byte-identical excitation statistics to the R1a Stage-1
     # on-policy DV excitation in ``APCEnv.reset``).
     env._schedule = _build_dv_prbs_schedule(
-        env, cfg, long_hold=long_hold, isolate_dv_idx=isolate_dv_idx)
+        env, cfg, long_hold=long_hold, isolate_dv_idx=isolate_dv_idx,
+        isolated_level=isolated_level)
 
     # ----- Run the episode (MV held, DV swept by the schedule) ----------
     obs_buf = np.zeros((T, D), dtype='float32')
@@ -7836,11 +7928,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
                                      cfg.obs_dim, cfg.action_dim, n_dist=0)
 
-    # MIMO per-INPUT isolation buffer (2026-07-10 / P28 follow-up 8): holds
-    # ONLY the isolated long-hold settle episodes (one input swept, all
-    # others held, process+meas noise off) that train
-    # ``_wm_input_isolation_loss`` / ``wm_ss_match``.  Ordinary MIMO PRBS
-    # and all-DV PRBS stay in the main replay buffer.
+    # MIMO per-INPUT isolation buffer (2026-07-10 / P28 follow-up 9): holds
+    # ONLY the isolated whole-episode settle holds (one input at a
+    # stratified level, others at 0, action_std=0, process+meas noise off)
+    # that train ``_wm_input_isolation_loss`` / ``wm_ss_match``.  Ordinary
+    # MIMO PRBS and all-DV PRBS stay in the main replay buffer.
     isolation_buf = None
     if bool(getattr(cfg, 'cont_latent_enabled', False)):
         _n_mv_iso = int(len(getattr(env.sim, 'mv_indices', []) or []))
@@ -8557,13 +8649,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               flush=True)
 
     # ---------- Isolated STEADY-STATE (settle) seed episodes (p08 RCA) ----------
-    # Long-hold isolated excitation (one input held at a level for >=2*K steps so
-    # a full K-rollout window reaches steady state), all OTHER inputs held → feeds
-    # the self-supervised ``wm_ss_match`` DC-gain term.  These are the ONLY
-    # episodes written to ``isolation_buf`` (P28 follow-up 8): ordinary MIMO
-    # PRBS / all-DV PRBS are WM-coverage data, not isolation data, and
-    # auto-tune-inflated cap used to wrap them back in.  Noise-free when
-    # ``clean_steady_seeds`` (P89 / follow-up 8).
+    # Whole-episode isolated hold at a stratified ``_st_levels`` operating
+    # point (P28 follow-up 9): ONE input at that level, all others at 0,
+    # action_std=0, noise-free.  Random seq_len windows from isolation_buf
+    # are then settled (after the IC transient) so ``wm_ss_match``'s
+    # settle_var gate actually fires.  Follow-up 8 still PRBS-stepped
+    # inside the episode (T/4 cap) and dithered the isolated MV, and
+    # wired ``_st_levels`` to *other* MVs (no-op on test_sim).  These
+    # are the ONLY episodes written to ``isolation_buf`` (follow-up 8):
+    # ordinary MIMO PRBS / all-DV PRBS stay in the main replay buffer.
     n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
     if isolation_buf is not None and n_settle > 0:
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
@@ -8579,9 +8673,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         for _mv_i in range(max(0, n_mv)):
             for _lvl in _st_levels:
                 ep = collect_prbs_episode(
-                    env, cfg, action_std=baseline_seed_std,
+                    env, cfg, action_std=0.0,
                     op_band=prbs_op_band, long_hold=True,
-                    isolate_dim=int(_mv_i), hold_level=float(_lvl))
+                    isolate_dim=int(_mv_i), hold_level=0.0,
+                    isolated_level=float(_lvl))
                 isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
                                           ep['cont'])
                 total_env_steps += cfg.episode_length
@@ -8590,15 +8685,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             for _dv_j in range(n_dv):
                 for _lvl in _st_levels:
                     ep = collect_dv_prbs_episode(
-                        env, cfg, mv_level=float(_lvl), long_hold=True,
-                        isolate_dv_idx=int(_dv_j))
+                        env, cfg, mv_level=0.0, long_hold=True,
+                        isolate_dv_idx=int(_dv_j),
+                        isolated_level=float(_lvl))
                     isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
                                               ep['cont'])
                     total_env_steps += cfg.episode_length
                     _n_dv_settle += 1
         print(f"[seed] isolated-settle MV={_n_mv_settle} DV={_n_dv_settle} "
               f"(per_input={n_settle}, n_mv={n_mv}, n_dv={n_dv}; "
-              f"long-hold ≥2·K → feeds wm_ss_match DC-gain term)", flush=True)
+              f"whole-ep hold @ stratified level, action_std=0 → "
+              f"wm_ss_match)", flush=True)
 
     # ---------- APC expert seed episodes (P81 design, 2026-06-03) ----------
     # Build the steady-state expert (static gain-schedule or NN surrogate),

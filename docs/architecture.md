@@ -156,6 +156,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > Long-hold settle also uses P89 `clean_steady_seeds` (process OU +
 > measurement noise off) — const-action/step-settle already did;
 > isolation settle is the buffer that actually trains DC-gain.
+> **P28 follow-up 9 (no GPU this session):** follow-up 8 still
+> PRBS-stepped *inside* each settle episode (seg capped at T/4 → ~11
+> holds of 2K on test_sim) and dithered the isolated MV with
+> `baseline_seed_std`, and wired `_st_levels` to *other* MVs (`hold_level`,
+> a no-op on test_sim n_mv=1). Random `seq_len` windows from
+> `isolation_buf` straddled those steps (~half) so `wm_ss_match`'s
+> `settle_var` gate starved the DC-gain term. Isolation settle is now a
+> **whole-episode constant hold** at the stratified `isolated_level`
+> (`action_std=0`, others at 0). DV settle is one step at t=0 to
+> `isolated_level × amp`, MV held at 0.
 
 ---
 

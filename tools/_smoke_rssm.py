@@ -22,8 +22,9 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             _critic_anchor_coef, _force_p1_cap_at,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
-                            collect_prbs_episode,
-                            _hold_other_action_dims, _isolation_settle_counts,
+                            collect_prbs_episode, _build_dv_prbs_schedule,
+                            _isolated_hold_action, _hold_other_action_dims,
+                            _isolation_settle_counts,
                             _isolation_buf_capacity, _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
@@ -307,9 +308,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
             self._schedule = ['x']
             self._hidden_disturbance = 'ou'
             self.noise_scale = 1.0
+            self.acts = []
         def reset(self, exploration=True):
             return _np.zeros((1, self.obs_dim), dtype='float32')
         def step(self, a):
+            self.acts.append(_np.asarray(a, dtype='float32').copy())
             return (_np.zeros((1, self.obs_dim), dtype='float32'),
                     0.0, False, {})
         def set_sim_noise_scale(self, s):
@@ -332,6 +335,50 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _maybe_clean_steady_seed(_e3, _iso_cfg)
     assert _e3.noise_scale == 1.0
     print('[smoke] OK  isolation settle clean_steady_seeds (long_hold zeros noise)')
+
+    # P28 follow-up 9: whole-episode hold at isolated_level, others at 0,
+    # no action dither.  ``_st_levels`` must land on the isolated dim.
+    _a = _isolated_hold_action(2, isolate_dim=0, hold_level=0.0,
+                               isolated_level=0.4)
+    assert _np.allclose(_a, [0.4, 0.0]), _a
+    _a1 = _isolated_hold_action(1, isolate_dim=0, hold_level=0.25,
+                                isolated_level=-0.3)
+    assert _np.allclose(_a1, [-0.3]), _a1
+    _iso_cfg.clean_steady_seeds = True
+    _e4 = _DummyIsoEnv()
+    ep = collect_prbs_episode(
+        _e4, _iso_cfg, action_std=0.05, long_hold=True,
+        isolate_dim=0, hold_level=0.0, isolated_level=0.4)
+    acts = _np.stack(ep['act'])
+    assert acts.shape == (12, 2), acts.shape
+    assert _np.allclose(acts[:, 0], 0.4) and _np.allclose(acts[:, 1], 0.0), acts[:3]
+    assert _np.unique(_np.round(acts[:, 0], 6)).size == 1
+    class _DvSim:
+        cv_indices = [0]
+        dv_indices = [1]
+        dv_normalization_ranges = [[0.0, 10.0]]
+        state_variables = ['cv', 'dv']
+    class _DvEnv:
+        def __init__(self):
+            self.sim = _DvSim()
+            self.rng = _np.random.default_rng(0)
+    _iso_cfg.dv_prbs_op_frac = 0.8
+    _iso_cfg.episode_length = 40
+    sched = _build_dv_prbs_schedule(
+        _DvEnv(), _iso_cfg, long_hold=True, isolate_dv_idx=0,
+        isolated_level=0.5)
+    assert len(sched) == 1, sched
+    assert sched[0]['start'] == 0 and sched[0]['source'] == 'dv_isolation_settle'
+    # amp = 0.8 * 0.5 * 10 = 4 → delta = 0.5 * 4 = 2
+    assert abs(float(sched[0]['delta']) - 2.0) < 1e-6, sched[0]
+    sched0 = _build_dv_prbs_schedule(
+        _DvEnv(), _iso_cfg, long_hold=True, isolate_dv_idx=0,
+        isolated_level=0.0)
+    assert sched0 == []
+    sched_prbs = _build_dv_prbs_schedule(_DvEnv(), _iso_cfg, long_hold=False)
+    assert len(sched_prbs) > 1
+    print('[smoke] OK  isolation settle whole-episode hold (isolated_level, '
+          'action_std=0, DV one-step-at-t0)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
