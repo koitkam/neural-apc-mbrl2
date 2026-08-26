@@ -383,6 +383,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_SKIP_STORM_RECOVER_P1':      ('skip_storm_recover_p1',          _as_bool),
     'DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO': (
         'skip_storm_last_ok_recon_ratio', float),
+    # P31: first skip-storm continues P1; Nth caps (default 2).
+    'DREAMER_SKIP_STORM_P1_CAP_AFTER':     ('skip_storm_p1_cap_after',     int),
     # P28 GPU RCA: P1→P2 fidelity-peak restore is gain-blind. Default OFF.
     'DREAMER_WM_BEST_RESTORE_AT_P2':      ('wm_best_restore_at_p2',       _as_bool),
     'DREAMER_WM_BEST_RESTORE_AT_P3':      ('wm_best_restore_at_p3',       _as_bool),

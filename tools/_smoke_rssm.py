@@ -22,6 +22,9 @@ from training.train import (
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _critic_anchor_lambda,
                             _critic_anchor_coef, _force_p1_cap_at,
+                            _skip_storm_continue_p1,
+                            _skip_storm_should_continue_p1,
+                            _wm_fidelity_es_suppressed_frozen_g,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
                             collect_prbs_episode, _build_dv_prbs_schedule,
@@ -150,6 +153,17 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _p1, _ext, _cap = _force_p1_cap_at(12345)
     assert (_p1, _ext, _cap) == (12345, 0, 0), (_p1, _ext, _cap)
     print('[smoke] OK  P1 skip-storm cap closes extension budget')
+    # P31: first storm keeps original P1; second caps. Extension closed
+    # on continue so the quality gate cannot re-open exploding BPTT.
+    _p1c, _extc, _capc = _skip_storm_continue_p1(753960, 12000)
+    assert (_p1c, _extc, _capc) == (753960, 0, 0), (_p1c, _extc, _capc)
+    assert int(TrainConfig().skip_storm_p1_cap_after) == 2
+    assert _skip_storm_should_continue_p1(1, 2) is True
+    assert _skip_storm_should_continue_p1(2, 2) is False
+    assert _skip_storm_should_continue_p1(1, 1) is False
+    assert _wm_fidelity_es_suppressed_frozen_g(False) is True
+    assert _wm_fidelity_es_suppressed_frozen_g(True) is False
+    print('[smoke] OK  P1 skip-storm continue first / cap second; frozen-g ES')
     _tc = TrainConfig()
     assert float(_tc.gain_match_huber_beta) == 1.0
     assert int(_tc.aux_tbptt_steps) == 16

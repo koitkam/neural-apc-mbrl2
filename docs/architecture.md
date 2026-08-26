@@ -180,6 +180,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > (not P29 leftover). GPU occupied; no second job. HEAD eager-path opt
 > (batched isolation decode + vectorized overshoot MSE) is for the *next*
 > launch; the live process is still `2f0aec9`.
+> **P30 EXIT (2026-08-26 ~17:36):** skip-storm @iter 19 restored last-ok
+> (KEEP — P2 recon 0.0125) then **capped P1 at iter 18**, throwing away
+> remaining original P1. Cap-time DC 1.44@MV. P2 `wm_fidelity_degradation`
+> then killed DOB after ~40 iters (g frozen; first P2 probe cannot
+> improve). Val MV mean ×1.88 (median ~×1.06 + OP outlier); DV ×0.77;
+> det_r 0.05. Actor never ran (`skip_invalid_p3`). **P31:** first
+> skip-storm **continues original P1** (`skip_storm_p1_cap_after=2`,
+> extension still closed); second storm still caps. Storm-time
+> GAIN_NOT_READY does not stick if P1 continues. Fidelity ES suppressed
+> while `_dynamics_g_trainable` is false.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

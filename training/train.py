@@ -1700,16 +1700,19 @@ class TrainConfig:
     # best recon — NOT the fidelity-peak ``wm_best.pt``, which can freeze a
     # lucky early spike and discard late-P1 excitation (P27: iter 49 was
     # still healthy).  Falls back to ``wm_best`` if no last-ok snapshot
-    # exists.  Then reset ``opt_world``, cap P1 so the next iter is Stage 2.
-    # P2/P3 skip-storms still abort.  Set 0 to keep the P27 abort behaviour.
-    # Cap must also close ``p1_gate_max_ext_steps`` — zeroing ``p1_ext_steps``
-    # alone re-opens the P1 quality-gate extension and re-runs exploding
-    # gain-match instead of entering Stage 2 (g frozen, DOB id).
+    # exists.  Then reset ``opt_world``.  P30 capped P1 on the *first*
+    # storm and froze an under-trained observer (iter 18 of ~90).  Default
+    # ``skip_storm_p1_cap_after=2`` continues original P1 on the first
+    # recovery (extension still closed) and caps on the second.  P2/P3
+    # skip-storms still abort.  Set 0 to keep the P27 abort behaviour.
     skip_storm_recover_p1: bool = True
     # Unitless recon-health band for ``wm_last_ok`` (sim-agnostic).  P27
     # exploded 0.004 → 0.50 (~125×); 5× still accepts mild recon jitter
     # and rejects a skip-storm detonation.  ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
     skip_storm_last_ok_recon_ratio: float = 5.0
+    # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first then cap.
+    # ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
+    skip_storm_p1_cap_after: int = 2
     # P28 GPU RCA: fidelity-peak ``wm_best`` is gain-blind.  Restoring it
     # at P1→P2 on a *healthy* P1 discarded 37 late-P1 iters (val MV ×0.52
     # vs P26 ×0.97, which skipped only because gap < min_gap).  Default
@@ -2761,6 +2764,33 @@ def _force_p1_cap_at(total_env_steps: int) -> Tuple[int, int, int]:
     return int(total_env_steps), 0, 0
 
 
+def _skip_storm_should_continue_p1(storm_n: int, cap_after: int) -> bool:
+    """True if this 1-indexed P1 skip-storm should keep the original P1 budget.
+
+    ``cap_after=1`` is the P30 policy (cap on first storm). Default 2
+    continues the first recovery and caps the second so a repeated
+    explosion still exits to Stage 2.
+    """
+    return int(storm_n) < max(1, int(cap_after))
+
+
+def _skip_storm_continue_p1(p1: int, p1_ext_steps: int = 0) -> Tuple[int, int, int]:
+    """Keep original P1; close quality-gate extension only.
+
+    P30 restored last-ok then ``_force_p1_cap_at`` set ``p1`` to the
+    storm iter (~18), throwing away the remaining original budget
+    (P26 needed ~90).  Extension stays closed so the P1 quality gate
+    cannot re-open exploding full-BPTT.
+    """
+    del p1_ext_steps
+    return int(p1), 0, 0
+
+
+def _wm_fidelity_es_suppressed_frozen_g(g_trainable: bool) -> bool:
+    """P2 curriculum freezes ``g``; a gain-blind probe cannot improve."""
+    return not bool(g_trainable)
+
+
 def _recon_still_healthy(recon: float, recon_best: Optional[float],
                          ratio: float = 5.0) -> bool:
     """True if ``recon`` is finite and not a skip-storm detonation vs best.
@@ -3100,6 +3130,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
+        f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -8406,6 +8437,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
           f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
           f"compile={_resolve_compile_mode(cfg) or 'eager'} "
           f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
+          f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
           f"phases={p1}/{p2}/{p3}",
           flush=True)
 
@@ -8455,8 +8487,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     grad_skip_prev_total: int = 0
     early_stop_reason: Optional[str] = None
     skip_storm_p1_recovered: bool = False
+    skip_storm_p1_n: int = 0
     skip_storm_restore_source: Optional[str] = None
     skip_storm_restore_iter: Optional[int] = None
+    wm_fid_es_frozen_g_logged: bool = False
     p1_last_ok_ckpt_path: Optional[Path] = None
     p1_last_ok_sd: Optional[Dict[str, torch.Tensor]] = None
     p1_last_ok_iter: int = -1
@@ -10859,6 +10893,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                       f"{p1_gate_check_step}; deferring "
                                       f"to natural P2→P3 transition",
                                       flush=True)
+                            elif _wm_fidelity_es_suppressed_frozen_g(
+                                    _dynamics_g_trainable(model)):
+                                # Curriculum P2 freezes g.  A gain-blind
+                                # P2-open probe cannot improve, so patience
+                                # otherwise kills DOB after ~40 iters (P30).
+                                if not wm_fid_es_frozen_g_logged:
+                                    wm_fid_es_frozen_g_logged = True
+                                    print(
+                                        '[wm-fidelity-ES] suppressed: '
+                                        'dynamics g frozen (P2 cannot '
+                                        'improve a gain-blind P2-open probe)',
+                                        flush=True)
                             else:
                                 early_stop_reason = (
                                     f'wm_fidelity_degradation: EMA score '
@@ -10905,12 +10951,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         and bool(getattr(cfg, 'skip_storm_recover_p1', True))
                         and (p1_last_ok_sd is not None or _ckpt is not None))
                     if _recover_p1:
-                        # P27 RCA / P28: P1 skip-storm is a full-BPTT blow-up
-                        # of the gain-match roll, not an unrecoverable NaN.
-                        # Restore the last skip-free observer (wm_last_ok),
-                        # not the fidelity-peak wm_best (lucky early spike).
-                        # Drop AdamW moments (they hold the 1e12 direction)
-                        # and cap P1 so the next iter is Stage 2.
+                        # P27 RCA / P28 / P31: P1 skip-storm is a full-BPTT
+                        # blow-up of the gain-match roll, not an unrecoverable
+                        # NaN.  Restore the last skip-free observer
+                        # (wm_last_ok), not the fidelity-peak wm_best (lucky
+                        # early spike).  Drop AdamW moments (they hold the
+                        # 1e12 direction).  First storm keeps original P1
+                        # (P30 froze iter 18); Nth caps → Stage 2.
                         try:
                             if p1_last_ok_sd is not None:
                                 model.load_state_dict({
@@ -10935,8 +10982,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 model.parameters_world(),
                                 lr=eff_lr_world, eps=1e-8,
                                 weight_decay=0.0)
-                            p1, p1_ext_steps, p1_gate_max_ext_steps = (
-                                _force_p1_cap_at(total_env_steps))
+                            skip_storm_p1_n += 1
+                            _cap_after = max(1, int(getattr(
+                                cfg, 'skip_storm_p1_cap_after', 2)))
+                            _continue_p1 = _skip_storm_should_continue_p1(
+                                skip_storm_p1_n, _cap_after)
+                            if _continue_p1:
+                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
+                                    _skip_storm_continue_p1(p1, p1_ext_steps))
+                            else:
+                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
+                                    _force_p1_cap_at(total_env_steps))
                             grad_skip_history.clear()
                             skip_storm_p1_recovered = True
                             skip_storm_restore_source = _src
@@ -10944,32 +11000,56 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 int(p1_last_ok_iter)
                                 if _src == 'wm_last_ok'
                                 else int(wm_best_iter))
-                            try:
-                                _gp = _probe_observer_gain_ready(
-                                    model, env, device, cfg)
-                                if (_gp is not None
-                                        and not bool(_gp.get(
-                                            'gain_ready', True))):
-                                    p1_gain_not_ready_capped = True
-                            except Exception:
-                                pass
+                            # Storm-time FAIL must not stick if P1 continues —
+                            # the real P1→P2 gate decides.  Probe only when
+                            # this storm caps (actor_experiment_valid).
+                            if not _continue_p1:
+                                try:
+                                    _gp = _probe_observer_gain_ready(
+                                        model, env, device, cfg)
+                                    if (_gp is not None
+                                            and not bool(_gp.get(
+                                                'gain_ready', True))):
+                                        p1_gain_not_ready_capped = True
+                                except Exception:
+                                    pass
                             _restored = (Path(_ckpt).name
                                          if _ckpt is not None else _src)
-                            mid_check_flags.append(
-                                f'p1_skip_storm_recovered: restored '
-                                f'{_restored} ({_src} iter '
-                                f'{skip_storm_restore_iter}); P1 capped at '
-                                f'{p1} env_steps, extension closed')
-                            print(
-                                f'[skip-storm] P1 recovered: restored '
-                                f'{_restored} ({_src} iter '
-                                f'{skip_storm_restore_iter}); reset '
-                                f'opt_world; capping P1 at {p1} env_steps '
-                                f'(extension closed) → P2 '
-                                f'(g freeze applies on the P1→P2 iter). '
-                                f'({window_skips} skips in last '
-                                f'{window_iters} iters)',
-                                flush=True)
+                            if _continue_p1:
+                                mid_check_flags.append(
+                                    f'p1_skip_storm_recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); continuing '
+                                    f'P1 (storm {skip_storm_p1_n}/'
+                                    f'{_cap_after}, extension closed)')
+                                print(
+                                    f'[skip-storm] P1 recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); reset '
+                                    f'opt_world; continuing P1 '
+                                    f'(storm {skip_storm_p1_n}/{_cap_after}, '
+                                    f'extension closed at {p1} steps). '
+                                    f'({window_skips} skips in last '
+                                    f'{window_iters} iters)',
+                                    flush=True)
+                            else:
+                                mid_check_flags.append(
+                                    f'p1_skip_storm_recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); P1 capped at '
+                                    f'{p1} env_steps, extension closed '
+                                    f'(storm {skip_storm_p1_n}/{_cap_after})')
+                                print(
+                                    f'[skip-storm] P1 recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); reset '
+                                    f'opt_world; capping P1 at {p1} env_steps '
+                                    f'(storm {skip_storm_p1_n}/{_cap_after}, '
+                                    f'extension closed) → P2 '
+                                    f'(g freeze applies on the P1→P2 iter). '
+                                    f'({window_skips} skips in last '
+                                    f'{window_iters} iters)',
+                                    flush=True)
                         except Exception as _e_rec:
                             early_stop_reason = (
                                 f'grad_skip_storm: {window_skips} skips in '
@@ -11376,6 +11456,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'p1_ext_steps': int(p1_ext_steps),
         'p2_ext_steps': int(p2_ext_steps),
         'skip_storm_p1_recovered': bool(skip_storm_p1_recovered),
+        'skip_storm_p1_n': int(skip_storm_p1_n),
+        'skip_storm_p1_cap_after': int(getattr(
+            cfg, 'skip_storm_p1_cap_after', 2)),
         'skip_storm_restore_source': skip_storm_restore_source,
         'skip_storm_restore_iter': skip_storm_restore_iter,
         'p1_last_ok_iter': (int(p1_last_ok_iter)
