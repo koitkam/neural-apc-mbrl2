@@ -34,7 +34,8 @@ from training.train import (
                             _actor_experiment_valid,
                             _should_skip_invalid_p3,
                             _should_warm_restore_wm_best,
-                            _auto_if_unset, _write_resolved_run_plan)
+                            _auto_if_unset, _write_resolved_run_plan,
+                            _resolve_compile_mode)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -584,6 +585,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.dob_enabled is True
     assert float(c.gain_match_relative) == 0.0
     assert c.cont_gain_deterministic_roll is True
+    assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
     print('[smoke] OK  env-free TrainConfig = P26 observer / P28 actor recipe')
 
 
@@ -618,6 +620,32 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     print('[smoke] OK  _write_resolved_run_plan rewrites run_plan.json config')
 
 
+def _test_dv_gain_gate(tmp_path: str) -> None:
+    """MV-only wm_gain_pass must not hide a biased DV (P29 ×0.56)."""
+    import json
+    from pathlib import Path
+    from evaluation.validate import _dv_gain_gate_from_json, _ss_gain_rel_errs
+    p = Path(tmp_path) / 'wm_dv_transfer_matrix.json'
+    p.write_text(json.dumps({
+        'pairs': {
+            'CV0<-DV0': {
+                'real_ss_gain': 0.18,
+                'wm_ss_gain': 0.101,
+                'ss_gain_abs_err': 0.079,
+                'ss_gain_ratio_wm_over_real': 0.5616,
+            }
+        }
+    }))
+    g = _dv_gain_gate_from_json(p)
+    assert g is not None
+    assert g['wm_dv_gain_pass'] is True   # rel_err 0.44 < 1.0 (loose 2×)
+    assert g['wm_dv_gain_healthy'] is False  # 0.44 > 0.35
+    assert abs(g['wm_dv_ss_ratio_worst'] - 0.5616) < 1e-6
+    rel = _ss_gain_rel_errs({'a': {'real_ss_gain': 0.32, 'ss_gain_abs_err': 0.031}})
+    assert abs(rel[0] - 0.031 / 0.32) < 1e-9
+    print('[smoke] OK  DV gain gate fields (MV-only wm_gain_pass unchanged)')
+
+
 if __name__ == '__main__':
     import os
     import sys
@@ -635,6 +663,7 @@ if __name__ == '__main__':
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         _test_write_resolved_run_plan(td)
+        _test_dv_gain_gate(td)
     ran = 0
     for name, path in sims:
         if only and only != name:

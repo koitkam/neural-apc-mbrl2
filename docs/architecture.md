@@ -164,15 +164,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > Train-start / `[resolved-cfg]` print `compile=`. Compile-on caps
 > inductor worker threads to `min(4, ncpu/4)` so the CPU sim is not
 > starved (P29: 20 workers on 20 cores, collect 22.6 s vs P28 17.6 s).
-> P29 (GPU still running, **P3 started @iter 151**, confounded): recon 0.26–0.32,
-> isolation live in P1 (~0.002; follow-ups 1–14 ARE in this job). kl 0.30–0.81,
-> joint_embed≡0, overshoot stuck ~0.10, z_alive ~94. P1 CAPPED `not_plateaued`
-> after iter-75 `gain_not_ready` DC 3.05@MV — cap-time probe was skipped so
-> `actor_experiment_valid` would stay True and `[actor] NOT an actor experiment`
-> never printed. Skip-restore **did** fire (`WM warm-restore SKIPPED`). P2
-> `dob_ground≈0.008` (n_dist live). P3 on this job is INVALID (do not read econ).
-> HEAD: cap-time gain probe + `skip_invalid_p3` default-on. Next GPU job after
-> EXIT: env-free deterministic + eager (no leftover compile/latent/DOB/act-hist).
+> **P29 EXIT=0 (2026-08-26):** categorical leftover + compile-on. Val MV
+> ss/@H ×1.10/×1.23, DV ×0.56/×0.65 (autoencoder), det_r 0.725 (amplitude
+> poor). Skip-restore DID fire — still not an A/B. Actor INVALID
+> (`actor_experiment_valid` bookkeeping True; entropy-collapse @234; econ
+> −411 vs −83). Freeze `return_scale` 1.48→4.85 (KEEP). HEAD already has
+> deterministic + eager + `skip_invalid_p3`. Next GPU job: env-free P30
+> (`run_p30_deteager`). Validation now logs `wm_dv_gain_*` so MV-only
+> `wm_gain_pass` cannot hide a biased DV.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

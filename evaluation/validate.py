@@ -88,6 +88,54 @@ def _resolve_sim_dir(arg: str | None, controller_dir: Path,
         f'pass --simulation-dir explicitly.')
 
 
+def _ss_gain_rel_errs(pairs: Dict) -> List[float]:
+    """``|wm-real|/|real|`` per pair with a non-tiny real SS gain."""
+    rel_errs: List[float] = []
+    for v in (pairs or {}).values():
+        rg = abs(float(v.get('real_ss_gain', 0.0)))
+        if rg > 1e-6:
+            rel_errs.append(abs(float(v.get('ss_gain_abs_err', 0.0))) / rg)
+    return rel_errs
+
+
+def _dv_gain_gate_from_json(path: Path) -> Optional[Dict]:
+    """MV-only ``wm_gain_*`` hid P29 DV ss ×0.56 behind HEALTHY MV rel_err.
+
+    Same thresholds as the MV gate (pass <1.0, healthy <0.35). Does **not**
+    change ``wm_gain_pass`` so lineage comparisons stay MV-only.
+    """
+    if not path.exists():
+        return None
+    try:
+        dv = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    pairs = dv.get('pairs') or {}
+    rel_errs = _ss_gain_rel_errs(pairs)
+    if not rel_errs:
+        return None
+    ratios = []
+    for v in pairs.values():
+        r = v.get('ss_gain_ratio_wm_over_real')
+        if r is None:
+            continue
+        rf = float(r)
+        if np.isfinite(rf):
+            ratios.append(rf)
+    mean_err = float(np.mean(rel_errs))
+    gate = {
+        'wm_dv_gain_rel_err': mean_err,
+        'wm_dv_gain_rel_err_max': float(np.max(rel_errs)),
+        'wm_dv_gain_pass': bool(mean_err < 1.0),
+        'wm_dv_gain_healthy': bool(mean_err < 0.35),
+        'n_dv_pairs': len(rel_errs),
+    }
+    if ratios:
+        gate['wm_dv_ss_ratio_worst'] = float(
+            max(ratios, key=lambda r: abs(r - 1.0)))
+    return gate
+
+
 def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
                                   ) -> List[Dict]:
     """Flatten schedule events into ``(start_step, label)`` markers."""
@@ -2112,11 +2160,7 @@ def run_validation(*,
             # within ~2× of the real plant (rel_err < 1.0; healthy < 0.35).
             try:
                 pairs = (tf_result or {}).get('pairs', {}) if tf_result else {}
-                rel_errs = []
-                for v in pairs.values():
-                    rg = abs(float(v.get('real_ss_gain', 0.0)))
-                    if rg > 1e-6:
-                        rel_errs.append(abs(float(v.get('ss_gain_abs_err', 0.0))) / rg)
+                rel_errs = _ss_gain_rel_errs(pairs)
                 if rel_errs:
                     gain_rel_err = float(np.mean(rel_errs))
                     gate = {
@@ -2126,6 +2170,13 @@ def run_validation(*,
                         'wm_gain_healthy': bool(gain_rel_err < 0.35),
                         'n_pairs': len(rel_errs),
                     }
+                    # DV is a separate JSON (not in MV wm_gain_rel_err). P29
+                    # printed wm_gain_healthy=True at MV rel_err=0.10 while
+                    # DV ss was ×0.56 — the MV-only aggregate hid it.
+                    dv_gate = _dv_gain_gate_from_json(
+                        out_dir / 'wm_dv_transfer_matrix.json')
+                    if dv_gate:
+                        gate.update(dv_gate)
                     if isinstance(locals().get('fidelity_gates'), dict):
                         fidelity_gates.update(gate)
                     else:
@@ -2136,6 +2187,17 @@ def run_validation(*,
                           f'({status}; correlation gates can pass while this '
                           f'fails — gain is the control-relevant metric)',
                           flush=True)
+                    if dv_gate:
+                        dv_status = (
+                            'HEALTHY' if dv_gate['wm_dv_gain_healthy']
+                            else ('PASS' if dv_gate['wm_dv_gain_pass']
+                                  else 'FAIL'))
+                        print(f'[val] WM DV gain fidelity: rel_err='
+                              f'{dv_gate["wm_dv_gain_rel_err"]:.2f} '
+                              f'ss_ratio_worst='
+                              f'{dv_gate.get("wm_dv_ss_ratio_worst", float("nan")):.2f} '
+                              f'({dv_status}; not counted in wm_gain_pass)',
+                              flush=True)
             except Exception as _ge:
                 print(f'[val] WM gain-gate skipped: {_ge!r}', flush=True)
         except Exception as e:
