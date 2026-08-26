@@ -26,6 +26,7 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             _isolated_hold_action, _hold_other_action_dims,
                             _isolation_settle_counts,
                             _isolation_buf_capacity, _isolation_sample_seq_len,
+                            _wm_train_seq_len, wm_train_seq_len_for_plant,
                             _dv_isolation_delta, _dynamics_g_trainable,
                             _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
@@ -397,8 +398,24 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _isolation_sample_seq_len(_sl) == 121, _isolation_sample_seq_len(_sl)
     _sl.episode_length = 80
     assert _isolation_sample_seq_len(_sl) == 80, _isolation_sample_seq_len(_sl)
+    # Main P1/P2 WM batch must also fit K (follow-up 13).  Isolation-only
+    # growth left overshoot/gain-match truncating at seq_len-1.
+    _sl.seq_len = 64
+    _sl.horizon = 55
+    _sl.wm_overshoot_len = 55
+    _sl.gain_match_len = 55
+    _sl.episode_length = 1220
+    assert _wm_train_seq_len(_sl) == 64, _wm_train_seq_len(_sl)
+    assert wm_train_seq_len_for_plant(64, 55, 1220) == 64
+    _sl.horizon = 120
+    _sl.wm_overshoot_len = 120
+    _sl.gain_match_len = 120
+    assert _wm_train_seq_len(_sl) == 121, _wm_train_seq_len(_sl)
+    assert wm_train_seq_len_for_plant(64, 120, 1220) == 121
+    assert wm_train_seq_len_for_plant(64, 120, 80) == 80
     print('[smoke] OK  isolation settle whole-episode hold (isolated_level, '
           'action_std=0, DV MV-action-isomorphic, sample len ≥ K+1)')
+    print('[smoke] OK  P1/P2 wm_train_T = max(seq_len, K+1) (test_sim unchanged)')
 
     # Frozen-g skip: isolation extra unroll (follow-up 10) AND the in-graph
     # g-only aux (overshoot / held-rollout / full-BPTT gain-match,

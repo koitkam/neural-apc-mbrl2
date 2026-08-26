@@ -47,10 +47,17 @@ from typing import Dict, List, Tuple
 import numpy as np
 import optuna
 
-from training.train import TrainConfig, train as run_training
+from training.train import (TrainConfig, train as run_training,
+                            wm_train_seq_len_for_plant)
 from inference.export_onnx import export_dreamer_v4_onnx
 from models.dreamer_v4 import DreamerV4, DreamerV4Config
 import torch
+
+
+def _wm_probe_T(cfg: TrainConfig, horizon: int) -> int:
+    """GPU-probe unroll T = max(seq_len, H+1) (P1/P2 DC-gain window)."""
+    return wm_train_seq_len_for_plant(
+        int(cfg.seq_len), int(horizon), int(cfg.episode_length))
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +359,8 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
 
     # Empirical per-trial batch sizing (cached on (model_size, seq, lb,
     # horizon) so repeated trials with same shape skip the ~10 s probe).
+    # Probe T is the P1/P2 DC-gain window (follow-up 13), not seq_len.
+    _probe_T = _wm_probe_T(base, horizon)
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
@@ -359,14 +368,14 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
             bs_info = {'batch_size': bs, 'source': 'env_override'}
         except Exception:
             bs_info = pick_batch_size_for_plant(
-                model_size=model_size, seq_len=int(base.seq_len),
+                model_size=model_size, seq_len=_probe_T,
                 lookback=lookback, horizon=horizon, k_max=int(base.k_max),
                 sample_rate=int(base.sample_rate),
                 episode_length=int(base.episode_length))
             bs = int(bs_info['batch_size'])
     else:
         bs_info = pick_batch_size_for_plant(
-            model_size=model_size, seq_len=int(base.seq_len),
+            model_size=model_size, seq_len=_probe_T,
             lookback=lookback, horizon=horizon, k_max=int(base.k_max),
             sample_rate=int(base.sample_rate),
             episode_length=int(base.episode_length))
@@ -490,18 +499,19 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
     H_init = horizon
 
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
+    _probe_T = _wm_probe_T(base, horizon)
     if bs_env:
         try:
             bs = max(1, int(bs_env))
         except Exception:
             bs = int(pick_batch_size_for_plant(
-                model_size=model_size, seq_len=int(base.seq_len),
+                model_size=model_size, seq_len=_probe_T,
                 lookback=lookback, horizon=horizon, k_max=int(base.k_max),
                 sample_rate=int(base.sample_rate),
                 episode_length=int(base.episode_length))['batch_size'])
     else:
         bs = int(pick_batch_size_for_plant(
-            model_size=model_size, seq_len=int(base.seq_len),
+            model_size=model_size, seq_len=_probe_T,
             lookback=lookback, horizon=horizon, k_max=int(base.k_max),
             sample_rate=int(base.sample_rate),
             episode_length=int(base.episode_length))['batch_size'])
@@ -715,6 +725,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     seed_horizon = horizon_init(float(plant.get('tau', 0.0)),
                                 float(plant.get('dead_time', 0.0)),
                                 int(base.sample_rate))
+    _probe_T = _wm_probe_T(base, seed_horizon)
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
@@ -723,7 +734,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         except Exception:
             bs_info = pick_batch_size_for_plant(
                 model_size=derived_model_size,
-                seq_len=int(base.seq_len), lookback=int(plant['lookback']),
+                seq_len=_probe_T, lookback=int(plant['lookback']),
                 horizon=int(seed_horizon), k_max=int(base.k_max),
                 sample_rate=int(base.sample_rate),
                 episode_length=int(base.episode_length))
@@ -731,7 +742,7 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     else:
         bs_info = pick_batch_size_for_plant(
             model_size=derived_model_size,
-            seq_len=int(base.seq_len), lookback=int(plant['lookback']),
+            seq_len=_probe_T, lookback=int(plant['lookback']),
             horizon=int(seed_horizon), k_max=int(base.k_max),
             sample_rate=int(base.sample_rate),
             episode_length=int(base.episode_length))

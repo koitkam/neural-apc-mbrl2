@@ -147,7 +147,23 @@ def main():
                         if p.grad is not None and 'cont' in n)
     assert cont_grad_rel > 0.0, 'relative gain-match did NOT reach cont-gain!'
     print(f'[gain-match-rel] OK: abs={float(gm_abs):.5f} rel={float(gm_rel):.5f} '
-          f'cont_grad={cont_grad_rel:.4e} (opt-in; P28 default is absolute)')
+          f'cont-grad={cont_grad_rel:.4e}')
+    cfg.gain_match_relative = 0.0
+
+    # P28 follow-up 13: open-loop FD K is not min(K, T-1).  A short
+    # window (T=16) with K=20 used to return 0 (n_valid=T-K<1).
+    cfg.gain_match_len = 20
+    model.zero_grad(set_to_none=True)
+    gm_long, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm_long).all() and float(gm_long) > 0.0, float(gm_long)
+    gm_long.backward()
+    cont_grad_long = sum(float(p.grad.abs().sum())
+                         for n, p in model.dynamics.named_parameters()
+                         if p.grad is not None and 'cont' in n)
+    assert cont_grad_long > 0.0, 'gain-match K>T did NOT reach cont-gain!'
+    print(f'[gain-match-K] OK: open-loop K>T still trains cont-gain '
+          f'({cont_grad_long:.4e})')
+    cfg.gain_match_len = 6
 
     # Resolve-time Huber β must not be overwritten by a leftover env ``0``
     # (auto-median sentinel) on every loss call.

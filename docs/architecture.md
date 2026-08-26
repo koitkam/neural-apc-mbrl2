@@ -196,6 +196,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > `img_rollout` now takes `c0`; overshoot/held slice it from feat
 > like isolation. test_sim recipe unchanged. `c0=None` still
 > zero-fills (back-compat).
+> **P28 follow-up 13 (no GPU this session):** follow-up 10 grew only
+> `isolation_buf` samples to `max(seq_len, K+1)`. P1/P2 still sampled
+> the MAIN replay at `cfg.seq_len`, so overshoot (`K=min(K,T-1)`) and
+> gain-match (`n_valid=T-K`) truncated the identified settling length
+> whenever `H >= seq_len` (slow plant or `DREAMER_SEQ_LEN` pin) — the
+> same DC-gain miss as TBPTT-on-asymptote (P25). P1/P2 now sample
+> `_wm_train_seq_len = max(seq_len, K+1)` (P3 on-policy stays
+> `seq_len`). Gain-match rolls the full open-loop `K` even when
+> `T <= K` (held a/dv; no future obs). GPU calib probes the same T.
+> test_sim (64 / H≈55) unchanged.
 
 ---
 

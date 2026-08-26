@@ -3019,6 +3019,21 @@ def _isolation_buf_capacity(
     return max(4, n_mv_s + n_dv_s)
 
 
+def _seq_len_for_k_parts(seq_len: int, k: int, episode_length: int) -> int:
+    """``max(seq_len, K+1)`` capped at the episode (DC-gain window)."""
+    seq = max(2, int(seq_len or 64))
+    need = max(seq, int(k) + 1)
+    cap = max(2, int(episode_length or need))
+    return int(min(need, cap))
+
+
+def _seq_len_for_k(cfg: 'TrainConfig', k: int) -> int:
+    return _seq_len_for_k_parts(
+        int(getattr(cfg, 'seq_len', 64) or 64),
+        int(k),
+        int(getattr(cfg, 'episode_length', 0) or 0))
+
+
 def _isolation_sample_seq_len(cfg: 'TrainConfig') -> int:
     """Window length so isolation/ss-match can roll K steps to SS.
 
@@ -3030,12 +3045,35 @@ def _isolation_sample_seq_len(cfg: 'TrainConfig') -> int:
     ``max(seq_len, K+1)`` capped at the episode.  test_sim
     (seq_len ≥ 64, H≈55) is unchanged.
     """
-    seq = max(2, int(getattr(cfg, 'seq_len', 64) or 64))
     k = int(getattr(cfg, 'wm_input_isolation_len', 0)
             or getattr(cfg, 'horizon', 15) or 15)
-    need = max(seq, int(k) + 1)
-    cap = max(2, int(getattr(cfg, 'episode_length', need) or need))
-    return int(min(need, cap))
+    return _seq_len_for_k(cfg, k)
+
+
+def _wm_train_seq_len(cfg: 'TrainConfig') -> int:
+    """P1/P2 main-replay window so overshoot / gain-match can roll K to SS.
+
+    Follow-up 10 grew *isolation_buf* samples to ``max(seq_len, K+1)``.
+    The MAIN WM batch still used ``cfg.seq_len``, so overshoot
+    (``K = min(K, T-1)``, needs future obs) and gain-match
+    (``n_valid = T-K``) truncated the identified settling length when
+    ``H >= seq_len`` (slow plant or ``DREAMER_SEQ_LEN`` pin) — P25-family
+    (forward Huber tiny, transfer-matrix DC dead).  P3 on-policy stays
+    ``seq_len`` (actor λ-returns, not the open-loop gain supervisor).
+    test_sim (seq_len=64, H≈55) is unchanged.
+    """
+    k = max(
+        int(getattr(cfg, 'wm_overshoot_len', 0) or 0),
+        int(getattr(cfg, 'gain_match_len', 0) or 0),
+        int(getattr(cfg, 'horizon', 15) or 15),
+    )
+    return _seq_len_for_k(cfg, k)
+
+
+def wm_train_seq_len_for_plant(seq_len: int, horizon: int,
+                               episode_length: int) -> int:
+    """GPU-probe T matching P1/P2 WM samples (K auto-tunes to H)."""
+    return _seq_len_for_k_parts(int(seq_len), int(horizon), int(episode_length))
 
 
 def _dynamics_g_trainable(model: 'DreamerV4') -> bool:
@@ -4862,6 +4900,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     flows into the CONTINUOUS gain channel + decoder + GRU (not the categorical
     we are trying to bypass).  RSSM + TSSM (the TSSM rolls from a fresh
     KV-cache); ``(0, {})`` for other backbones / when off.
+
+    P28 follow-up 13: ``K`` is the identified settling length, not
+    ``min(K, T-1)``.  The roll is open-loop held a/dv from the start
+    state — it does not need future obs in the window.  Truncating K to
+    the main-buffer ``seq_len`` was the same DC-gain miss isolation
+    follow-up 10 already plugged for ``isolation_buf``.
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
@@ -4883,12 +4927,21 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         from models.dreamer_v4_rssm import RSSMState as _State
     B, T = obs.shape[:2]
     K = int(getattr(cfg, 'gain_match_len', 0) or 0)
-    K = min(K, T - 1) if K > 0 else (T - 1)
+    if K <= 0:
+        K = T - 1
     if K < 2:
         return zero, diag
+    # Open-loop FD from start states: do NOT truncate K to T-1.
+    # Isolation windows grew to K+1 (follow-up 10); the MAIN replay
+    # batch still used seq_len, so ``min(K, T-1)`` + ``n_valid = T-K``
+    # never reached the identified settling length when H >= seq_len
+    # (P25-family: forward Huber tiny, transfer-matrix DC dead).  The
+    # roll holds a/dv from the start — no future obs needed.  When
+    # T > K keep the historical start restriction (test_sim T=64,
+    # K=55 → n_valid=9).  When T <= K roll the full K from every start.
     step = float(getattr(cfg, 'gain_match_step', 1.0) or 1.0)
     max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
-    n_valid = T - K
+    n_valid = (T - K) if T > K else T
     if n_valid < 1:
         return zero, diag
     stride = max(1, n_valid // max_starts)
@@ -8036,7 +8089,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     print(f"# train start: {time.strftime('%Y-%m-%d %H:%M:%S')} "
           f"device={device.type} bs={cfg.batch_size} "
-          f"seq_len={cfg.seq_len} horizon={cfg.horizon} "
+          f"seq_len={cfg.seq_len} wm_train_T={_wm_train_seq_len(cfg)} "
+          f"horizon={cfg.horizon} "
           f"d_model={cfg.d_model} layers={cfg.n_layers} heads={cfg.n_heads} "
           f"z_dim={cfg.z_dim} lookback={cfg.lookback} "
           f"phases={p1}/{p2}/{p3}",
@@ -9639,7 +9693,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         if (current_phase == 3 and onpol_buf is not None
                             and onpol_buf.filled > 0)
                         else buf)
-            batch_np = _src_buf.sample(cfg.batch_size, cfg.seq_len, rng)
+            # P1/P2: window must fit overshoot/gain-match K (follow-up 13).
+            # P3 on-policy stays seq_len (actor λ-returns, not DC-gain).
+            _sample_T = (int(cfg.seq_len) if current_phase == 3
+                         else _wm_train_seq_len(cfg))
+            batch_np = _src_buf.sample(cfg.batch_size, _sample_T, rng)
             batch: Dict[str, torch.Tensor] = {}
             for k, v in batch_np.items():
                 t = torch.from_numpy(v)

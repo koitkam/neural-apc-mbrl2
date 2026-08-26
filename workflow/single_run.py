@@ -279,7 +279,8 @@ def main() -> int:
         print(f"[run] phase_fracs: {phase1_frac:.2f} / {phase2_frac:.2f} / {phase3_frac:.2f}", flush=True)
 
     # Build TrainConfig — every value either plant-tied or paper-faithful default.
-    from training.train import TrainConfig, train as run_training
+    from training.train import (TrainConfig, train as run_training,
+                                wm_train_seq_len_for_plant)
     from tools.gpu_calibrate import pick_batch_size_for_plant
     # Empirical batch sizing: spend ~10 s on a real fwd+bwd probe of
     # world_model_loss on synthetic data with the actual derived
@@ -299,6 +300,10 @@ def main() -> int:
     except ValueError:
         _wm_overhead = 1.30
     _wm_overhead = max(1.0, _wm_overhead)
+    # Probe the P1/P2 WM unroll T (max(seq_len, H+1)), not lookback-seq_len,
+    # so a slow plant's DC-gain window is in the memory budget (follow-up 13).
+    # test_sim seq_len=64, H≈55 → unchanged.
+    _probe_T = wm_train_seq_len_for_plant(seq_len, horizon, int(episode_length))
     bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     if bs_env:
         try:
@@ -306,14 +311,14 @@ def main() -> int:
             bs_info = {'batch_size': batch_size, 'source': 'env_override'}
         except Exception:
             bs_info = pick_batch_size_for_plant(
-                model_size=model_size, seq_len=seq_len, lookback=lookback,
+                model_size=model_size, seq_len=_probe_T, lookback=lookback,
                 horizon=horizon, k_max=k_max, sample_rate=sample_rate,
                 episode_length=int(episode_length),
                 wm_overhead_factor=_wm_overhead)
             batch_size = int(bs_info['batch_size'])
     else:
         bs_info = pick_batch_size_for_plant(
-            model_size=model_size, seq_len=seq_len, lookback=lookback,
+            model_size=model_size, seq_len=_probe_T, lookback=lookback,
             horizon=horizon, k_max=k_max, sample_rate=sample_rate,
             episode_length=int(episode_length),
             wm_overhead_factor=_wm_overhead)
