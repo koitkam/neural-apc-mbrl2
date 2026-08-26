@@ -370,8 +370,11 @@ steady-state behaviour. Mitigations:
 
 Both knobs are sim-agnostic and adaptive: injection cadence is a
 fraction of the replay-buffer FIFO lap (episode length already scales
-with τ+θ); inject **N** scales with `n_mv`/`n_dv`; warm-restore no-ops
-when `wm_best.pt` is essentially the current state.
+with τ+θ); inject **N** scales with `n_mv`/`n_dv`; isolation settle is
+**per isolated input** (`DREAMER_WM_ISOLATION_SETTLE_EPISODES`, auto 24:
+test_sim 24+24 / isolation-buf cap 48; distillation 4 MV + 1 DV →
+96+24 / cap 120); warm-restore no-ops when `wm_best.pt` is essentially
+the current state.
 
 #### Reward-MTP / WM-coupling diagnostics (P39)
 

@@ -910,7 +910,7 @@ class TrainConfig:
     # steady-state gain is identified ONLY from settled data — undilutes the
     # signal a mixed PRBS+settle isolation batch drowns.  0 = off (unweighted).
     wm_ss_match_settle_var: float = 0.0
-    wm_isolation_settle_episodes: int = 0   # dedicated long-hold isolated settle eps (auto)
+    wm_isolation_settle_episodes: int = 0   # long-hold settle eps PER isolated input (auto 24)
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -2968,6 +2968,51 @@ def _resolve_inject_cadence(
     return out
 
 
+def _hold_other_action_dims(
+        targets: np.ndarray, isolate_dim: Optional[int],
+        hold_level: float = 0.0) -> np.ndarray:
+    """Freeze non-isolated MV channels so isolation/ss-match is unconfounded.
+
+    ``targets`` is ``(n_seg, n_mv)``.  ``isolate_dim is None`` is a no-op
+    (legacy MIMO PRBS).  test_sim ``n_mv=1`` is unchanged: the only
+    column is copied through.
+    """
+    if isolate_dim is None or targets.size == 0:
+        return targets
+    i = int(isolate_dim)
+    a = int(targets.shape[-1])
+    if i < 0 or i >= a:
+        return targets
+    hold = float(np.clip(hold_level, -1.0, 1.0))
+    out = np.full_like(targets, hold)
+    out[:, i] = targets[:, i]
+    return out
+
+
+def _isolation_settle_counts(
+        n_mv: int, n_dv: int, n_per: int) -> Tuple[int, int]:
+    """Isolated-settle episode counts. ``n_per`` is per input (test_sim 24)."""
+    n = max(0, int(n_per or 0))
+    return max(0, int(n_mv or 0)) * n, max(0, int(n_dv or 0)) * n
+
+
+def _isolation_buf_capacity(
+        *, baseline_seed: int, dv_prbs_seed: int,
+        n_mv: int, n_dv: int, n_settle_per: int) -> int:
+    """Ring-buffer width for isolation/ss-match seed episodes.
+
+    P28 follow-up 7: dataclass 24 is per-input.  The previous cap
+    (baseline + dv_prbs + 8 = 48 on test_sim) equalled 24+24 settle,
+    so wrap left a 100% settle mix — intended.  On MIMO the same 48
+    dropped all but the last 48 settle episodes (missing MV channels).
+    Size to ``max(legacy, n_mv×n_per + n_dv×n_per)`` so every isolated
+    channel stays in the buffer.  test_sim stays 48.
+    """
+    n_mv_s, n_dv_s = _isolation_settle_counts(n_mv, n_dv, n_settle_per)
+    legacy = max(4, int(baseline_seed or 0) + int(dv_prbs_seed or 0) + 8)
+    return max(legacy, n_mv_s + n_dv_s)
+
+
 def _cfg_on(cfg: 'TrainConfig', name: str, default: bool = True) -> bool:
     """Bool cfg field; strings like ``'0'``/``'off'`` count as False."""
     v = getattr(cfg, name, default)
@@ -3296,6 +3341,8 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                           op_band: float = 0.95,
                           n_strata: Optional[int] = None,
                           long_hold: bool = False,
+                          isolate_dim: Optional[int] = None,
+                          hold_level: float = 0.0,
                           ) -> Dict[str, np.ndarray]:
     """Collect one episode that PRBS-toggles MV across the operating band.
 
@@ -3315,9 +3362,23 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     across the full range, including near boundaries (which uniform
     sampling under-covers when #segments per episode is small).
 
+    ``isolate_dim`` (P28 follow-up 7): sweep only that MV and hold every
+    other actuator at ``hold_level``.  ``long_hold`` also suppresses the
+    curriculum DV schedule + hidden OU so ss-match is unconfounded.
+    ``isolate_dim is None`` keeps legacy MIMO PRBS (test_sim n_mv=1 is
+    unchanged).
+
     Returns the same dict shape as ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
+    # Isolation / long-hold settle must not share the curriculum DV
+    # schedule or hidden OU that ``reset()`` just installed — those
+    # confound ss-match (CV motion attributed to the swept MV).
+    # ``collect_constant_action_episode`` / ``collect_dv_prbs_episode``
+    # already suppress both.  Ordinary PRBS seeds keep the curriculum.
+    if long_hold or isolate_dim is not None:
+        env._schedule = []
+        env._hidden_disturbance = None
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
@@ -3423,6 +3484,10 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
         targets = env.rng.uniform(-op, +op,
                                     size=(n_seg_int, A)
                                     ).astype('float32')
+    # One-input isolation (P28 follow-up 7): hold every other MV so
+    # ss-match / isolation see ∂CV/∂u_i undiluted.  No-op when
+    # isolate_dim is None or A=1 (test_sim).
+    targets = _hold_other_action_dims(targets, isolate_dim, hold_level)
     # Build per-step segment-index map from variable seg_lens.
     seg_index_for_t = np.zeros(T, dtype='int32')
     for k in range(n_seg_int):
@@ -3437,6 +3502,12 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
         center = targets[seg_idx]
         noise = env.rng.normal(0.0, float(action_std),
                                  size=(env.action_dim,)).astype('float32')
+        if isolate_dim is not None:
+            _mask = np.zeros(env.action_dim, dtype='float32')
+            _i = int(isolate_dim)
+            if 0 <= _i < env.action_dim:
+                _mask[_i] = 1.0
+            noise = noise * _mask
         a_np = (center + noise).astype('float32')
         np.clip(a_np, -1.0, 1.0, out=a_np)
         next_window, reward, done, _ = env.step(a_np)
@@ -3919,7 +3990,8 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
-                            long_hold: bool = False) -> List[Dict]:
+                            long_hold: bool = False,
+                            isolate_dv_idx: Optional[int] = None) -> List[Dict]:
     """Full-range, multi-timescale, stratified DV-PRBS disturbance schedule.
 
     Schedule-construction core shared by the DV-PRBS SEED episodes
@@ -3943,6 +4015,9 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
     from utils.training_disturbance import _channel_catalog
     T = int(cfg.episode_length)
     dv_chs = list(_channel_catalog(env.sim).get('dv', []))
+    if isolate_dv_idx is not None:
+        i = int(isolate_dv_idx)
+        dv_chs = [dv_chs[i]] if 0 <= i < len(dv_chs) else []
     if not dv_chs:
         return []
     # ----- Multi-timescale segment lengths (mirror collect_prbs_episode) -
@@ -4021,6 +4096,7 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
 def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                              mv_level: float = 0.0,
                              long_hold: bool = False,
+                             isolate_dv_idx: Optional[int] = None,
                              ) -> Dict[str, np.ndarray]:
     """DV-PRBS seed episode (2026-06-14): the DV analogue of
     ``collect_prbs_episode``.  Holds the MV at a (stratified) operating
@@ -4096,7 +4172,8 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # Full-range, multi-timescale, stratified DV-PRBS schedule (shared
     # builder; byte-identical excitation statistics to the R1a Stage-1
     # on-policy DV excitation in ``APCEnv.reset``).
-    env._schedule = _build_dv_prbs_schedule(env, cfg, long_hold=long_hold)
+    env._schedule = _build_dv_prbs_schedule(
+        env, cfg, long_hold=long_hold, isolate_dv_idx=isolate_dv_idx)
 
     # ----- Run the episode (MV held, DV swept by the schedule) ----------
     obs_buf = np.zeros((T, D), dtype='float32')
@@ -7221,7 +7298,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0) <= 0.0:
                 cfg.wm_ss_match_settle_var = 0.05  # settled-only DC-gain signal
             if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
-                cfg.wm_isolation_settle_episodes = 24  # opt1: 8→24 (clean per-input settled data)
+                # Per isolated input (test_sim 1 MV + 1 DV → 24+24).  The
+                # seed loop emits n_per × n_mv MV-isolation episodes and
+                # n_per × n_dv DV-isolation episodes so MIMO plants keep
+                # the same per-channel SS coverage (P28 follow-up 7).
+                cfg.wm_isolation_settle_episodes = 24  # opt1: 8→24 per input
             # P19 (2026-08-18): GROUND the DOB d_t on the true load (KalmanNet-
             # style) so the observer TRACKS the disturbance instead of under-
             # reaching it (p18: d_t vs load r=0.42, ~0.3x amplitude → imagination
@@ -7743,10 +7824,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # every input's isolated episodes.  Populated at seed time.
     isolation_buf = None
     if bool(getattr(cfg, 'cont_latent_enabled', False)):
-        _iso_cap = max(4, int(getattr(cfg, 'baseline_seed_episodes', 8) or 8)
-                       + int(getattr(cfg, 'dv_prbs_seed_episodes', 0) or 0) + 8)
+        _n_mv_iso = int(len(getattr(env.sim, 'mv_indices', []) or []))
+        _n_dv_iso = int(len(getattr(env.sim, 'dv_indices', []) or []))
+        _n_settle_iso = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
+        _iso_cap = _isolation_buf_capacity(
+            baseline_seed=int(getattr(cfg, 'baseline_seed_episodes', 8) or 8),
+            dv_prbs_seed=int(getattr(cfg, 'dv_prbs_seed_episodes', 0) or 0),
+            n_mv=_n_mv_iso, n_dv=_n_dv_iso, n_settle_per=_n_settle_iso)
         isolation_buf = TrajectoryBuffer(_iso_cap, cfg.episode_length,
                                          cfg.obs_dim, cfg.action_dim, n_dist=0)
+        print(f'[isolation-buf] cap={_iso_cap} '
+              f'(settle per_input={_n_settle_iso} → '
+              f'{_n_mv_iso}×{_n_settle_iso}+{_n_dv_iso}×{_n_settle_iso}; '
+              f'n_mv={_n_mv_iso} n_dv={_n_dv_iso})',
+              flush=True)
 
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -8470,22 +8561,32 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _st_levels = np.clip(_st_levels + _st_jit * const_op_band, -1.0, 1.0)
         _n_mv_settle = 0
         _n_dv_settle = 0
-        for _lvl in _st_levels:          # MV-isolated settle (MV swept long, DV held)
-            ep = collect_prbs_episode(env, cfg, action_std=baseline_seed_std,
-                                      op_band=prbs_op_band, long_hold=True)
-            isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-            total_env_steps += cfg.episode_length
-            _n_mv_settle += 1
-        if n_dv > 0:
-            for _lvl in _st_levels:      # DV-isolated settle (DV swept long, MV held)
-                ep = collect_dv_prbs_episode(env, cfg, mv_level=float(_lvl),
-                                             long_hold=True)
+        # Per isolated input (P28 follow-up 7): 24 levels × n_mv + 24 × n_dv.
+        # test_sim 1+1 stays 24+24.  Hold every other MV/DV so ss-match
+        # is not a MIMO-confounded mixture.
+        for _mv_i in range(max(0, n_mv)):
+            for _lvl in _st_levels:
+                ep = collect_prbs_episode(
+                    env, cfg, action_std=baseline_seed_std,
+                    op_band=prbs_op_band, long_hold=True,
+                    isolate_dim=int(_mv_i), hold_level=float(_lvl))
                 isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
                                           ep['cont'])
                 total_env_steps += cfg.episode_length
-                _n_dv_settle += 1
+                _n_mv_settle += 1
+        if n_dv > 0:
+            for _dv_j in range(n_dv):
+                for _lvl in _st_levels:
+                    ep = collect_dv_prbs_episode(
+                        env, cfg, mv_level=float(_lvl), long_hold=True,
+                        isolate_dv_idx=int(_dv_j))
+                    isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
+                                              ep['cont'])
+                    total_env_steps += cfg.episode_length
+                    _n_dv_settle += 1
         print(f"[seed] isolated-settle MV={_n_mv_settle} DV={_n_dv_settle} "
-              f"(long-hold ≥2·K → feeds wm_ss_match DC-gain term)", flush=True)
+              f"(per_input={n_settle}, n_mv={n_mv}, n_dv={n_dv}; "
+              f"long-hold ≥2·K → feeds wm_ss_match DC-gain term)", flush=True)
 
     # ---------- APC expert seed episodes (P81 design, 2026-06-03) ----------
     # Build the steady-state expert (static gain-schedule or NN surrogate),

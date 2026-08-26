@@ -138,6 +138,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > dropped 130+ knobs including skip-storm / aux TBPTT / `n_critics`).
 > Cascade / grad-skip early-stop env-vars were missing from the
 > whitelist entirely (ignored by `single_run`).
+> **P28 follow-up 7 (no GPU this session):** isolation settle was a
+> flat 24 (all MVs PRBS'd together, all DVs swept together) and the
+> isolation ring-buffer cap was 48 — MIMO wrap-killed per-channel
+> settle. `wm_isolation_settle_episodes` is now **per isolated
+> input** (test_sim 24+24 / cap 48 unchanged). Distillation 4+1
+> emits 96+24 and the cap grows to 120. Long-hold MV settle holds
+> every other MV, suppresses curriculum DV + hidden OU, and DV
+> settle isolates one DV channel.
 
 ---
 

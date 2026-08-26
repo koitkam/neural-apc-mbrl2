@@ -22,6 +22,8 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             _critic_anchor_coef, _force_p1_cap_at,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
+                            _hold_other_action_dims, _isolation_settle_counts,
+                            _isolation_buf_capacity,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
                             _should_warm_restore_wm_best)
@@ -277,6 +279,27 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _exn._explicit_fields = {'step_test_inject_n'}
     assert _resolve_inject_cadence(_exn, n_mv=4, n_dv=1)['step_test_inject_n'] == 2
     print('[smoke] OK  inject cadence sim-adaptive (test_sim 20/10 n 5/2/2/3; 0=off)')
+
+    # P28 follow-up 7: isolation settle is per-input; isolation_buf cap
+    # holds every channel's settle episodes.  test_sim 1+1 stays 24+24 / 48.
+    import numpy as _np
+    _tgt = _np.array([[0.4, -0.2, 0.9], [0.1, 0.3, -0.5]], dtype='float32')
+    _held = _hold_other_action_dims(_tgt, isolate_dim=1, hold_level=0.25)
+    assert _np.allclose(_held[:, 1], _tgt[:, 1])
+    assert _np.allclose(_held[:, 0], 0.25) and _np.allclose(_held[:, 2], 0.25)
+    _passthru = _hold_other_action_dims(_tgt, None)
+    assert _passthru is _tgt
+    assert _isolation_settle_counts(1, 1, 24) == (24, 24)
+    assert _isolation_settle_counts(4, 1, 24) == (96, 24)
+    assert _isolation_buf_capacity(
+        baseline_seed=16, dv_prbs_seed=24, n_mv=1, n_dv=1,
+        n_settle_per=24) == 48
+    assert _isolation_buf_capacity(
+        baseline_seed=16, dv_prbs_seed=24, n_mv=4, n_dv=1,
+        n_settle_per=24) == 120
+    assert _isolation_settle_counts(2, 0, 0) == (0, 0)
+    print('[smoke] OK  isolation settle per-input (test_sim 24+24/cap 48; '
+          'distillation 96+24/cap 120)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and

@@ -1248,15 +1248,14 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Code follow-up 3 (no GPU this session):** skip-storm recovery restored fidelity-peak `wm_best` (gain-blind / noise-led). P27's last healthy observer was iter 49 — restoring an early lucky spike would discard late-P1 excitation. Keep an in-memory last-ok snapshot on skip-free P1 iters whose recon is within 5× the best (unitless); restore that first, `wm_best` only as fallback (`wm_last_ok.pt` written only if a storm fires). Summary `actor_experiment_valid=False` when the freeze is `GAIN_NOT_READY` or skip-storm fell back to `wm_best`.
 - **Code follow-up 4 (no GPU this session):** follow-up 3 was still undone on the next iter. Default `wm_best_restore_at_p2` reloads fidelity-peak `wm_best.pt` at P1→P2 (p124: required on a *healthy* P1). After skip-storm the next iter **is** P1→P2, so last-ok was overwritten by the same gain-blind spike. Skip the boundary wm_best reload when `skip_storm_p1_recovered`. Healthy P1 path unchanged. Knobs promoted to TrainConfig + `ENV_OVERRIDES`.
 - **Code follow-up 5 (no GPU this session):** P1 re-inject EVERY (const/step 20, DV-PRBS 10) was a raw iter count — one test_sim buffer-lap fraction (`400k/(1220×5)≈66`). `_resolve_inject_cadence` now sets const/step/expert = `round(0.30×lap)` and DV-PRBS = `min(round(0.15×lap), warmup/4)` so a longer-τ plant (fewer episodes in the same step-cap) injects more often and a faster plant less often, while p122's "inject before typical wm_best" still holds. test_sim stays 20/10. `0` still disables. Gain-ready / wm-fidelity knobs promoted to TrainConfig + `ENV_OVERRIDES` (defaults unchanged; already unitless).
-- **Code follow-up 6 (no GPU this session):** inject **N** was still a count (const 5 / step-test 2 / DV-PRBS 2 / expert 3) — one 1-MV+1-DV shot. Auto is now `max(sentinel, f(n_mv,n_dv))`: const `max(5, n_in)`, step-test `max(2, n_in)`, DV-PRBS `max(2, n_mv)`, expert `max(3, n_mv)`. test_sim stays 5/2/2/3; distillation (4+1) becomes 5/5/4/4. `python -m training.train` now applies the shared `ENV_OVERRIDES` whitelist (it had silently dropped skip-storm / aux TBPTT / `n_critics` / …). Cascade + grad-skip early-stop env-vars added to the whitelist (`single_run` had been ignoring `DREAMER_ES_GRADSKIP_MAX`).
+- **Code follow-up 7 (no GPU this session):** `wm_isolation_settle_episodes=24` was a **side-total** (24 MV-together + 24 DV-together) and isolation_buf cap ignored it (48 = baseline+dv_prbs+8). MIMO wrap dropped all but the last 48 settle episodes; MV settle PRBS'd every actuator at once and inherited the curriculum DV schedule from `reset()`. Auto 24 is now **per isolated input** (test_sim stays 24+24 / cap 48; distillation 4+1 → 96+24 / cap 120). Collectors hold other MVs / isolate one DV; long-hold settle suppresses curriculum DV + hidden OU (same as const-action seeds).
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
-Already unitless / derived: isolation TBPTT `max(8, round(K/3.5))`; `gain_match_len` / isolation len = H; `skip_storm_last_ok_recon_ratio=5` (recon/recon); `p1_gate_wm_ema_min=1.5` (fidelity mix); inject EVERY = f(buffer lap) (test_sim 20/10); inject N = f(n_mv, n_dv) (test_sim 5/2/2/3). Opt-in: `gain_match_huber_beta<=0` → median |tgt| (P28 still uses β=1). Gain-ready band `[0.80, 1.30]` and wm-fidelity mix weights are unitless TrainConfig (were os.environ).
+Already unitless / derived: isolation TBPTT `max(8, round(K/3.5))`; `gain_match_len` / isolation len = H; `skip_storm_last_ok_recon_ratio=5` (recon/recon); `p1_gate_wm_ema_min=1.5` (fidelity mix); inject EVERY = f(buffer lap) (test_sim 20/10); inject N = f(n_mv, n_dv) (test_sim 5/2/2/3); isolation settle = 24 **per input** (test_sim 24+24 / cap 48; distillation 96+24 / cap 120). Opt-in: `gain_match_huber_beta<=0` → median |tgt| (P28 still uses β=1). Gain-ready band `[0.80, 1.30]` and wm-fidelity mix weights are unitless TrainConfig (were os.environ).
 
 Still not sim-adaptive:
 - `wm_fidelity_{warmup,patience}_iters` and `wm_probe_every_iters` stay in *iters* (one WM update ≈ one iter).
-- `wm_isolation_settle_episodes` default 24 is a count (not f(n_mv+n_dv)); each episode already isolates one input.
 - `rssm_latent_type` default still `categorical` (do not flip without a dedicated observer run)
 - `dv_feedforward=True` still appends measured DV to **head** feat (decoder half is off). `dv_as_input` is the symmetric path; do not re-add decoder FF.
 
@@ -1281,6 +1280,7 @@ Still not sim-adaptive:
 | P1 inject EVERY = f(buffer lap) | P28 follow-up 5 | KEPT | YES — 20/10 were test_sim iters, not f(τ) |
 | P1 inject N = f(n_mv, n_dv) | P28 follow-up 6 | KEPT | YES — 5/2/2/3 were 1-MV+1-DV counts |
 | `_cfg_from_env` uses `ENV_OVERRIDES` | P28 follow-up 6 | KEPT | YES — train.py CLI silently dropped 130+ knobs |
+| Isolation settle per-input + isolation_buf cap | P28 follow-up 7 | KEPT | YES — 24 was a side-total; cap 48 wrap-killed MIMO channels; MV settle was not isolated |
 
 
 
