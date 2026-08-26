@@ -146,6 +146,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > emits 96+24 and the cap grows to 120. Long-hold MV settle holds
 > every other MV, suppresses curriculum DV + hidden OU, and DV
 > settle isolates one DV channel.
+> **P28 follow-up 8 (no GPU this session):** isolation_buf still mixed
+> MIMO PRBS + all-DV PRBS with settle. Follow-up 7 sized the cap
+> `max(baseline+dv_prbs+8, settle)` so dataclass test_sim stayed 48,
+> but `auto_tune_seed_buffer` raises baseline ~16→26 → cap 58, and
+> wrap kept ~10 confounded all-DV episodes in front of the 48 settle
+> (errors-in-variables / gain↔disturbance on `wm_ss_match`). Cap is
+> now settle-only; ordinary PRBS stays in the main replay buffer.
+> Long-hold settle also uses P89 `clean_steady_seeds` (process OU +
+> measurement noise off) — const-action/step-settle already did;
+> isolation settle is the buffer that actually trains DC-gain.
 
 ---
 

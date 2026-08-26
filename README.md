@@ -297,7 +297,7 @@ held-action seed episodes fully noise-free, and the **process-noise curriculum**
 | `DREAMER_HIDDEN_DIST_P_ISOLATED` | P(gap ≥ settle, i.e. event fully settles before the next) vs overlap/serial (default 0.5). |
 | `DREAMER_HIDDEN_DIST_P_REVERT` | P(an event reverts to baseline) vs holds permanently (default 0.5; `pulse` always reverts). |
 | `DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS` | `"step,ramp,pulse,ou"` sampling weights (default `0.3,0.3,0.2,0.2`). |
-| `DREAMER_CLEAN_STEADY_SEEDS` | `0` to keep noise on the const-action / step-settle steady-state seeds (default ON = noise-free seeds). |
+| `DREAMER_CLEAN_STEADY_SEEDS` | `0` to keep noise on the const-action / step-settle / isolation-settle seeds (default ON = noise-free seeds). |
 | `DREAMER_PROCESS_NOISE_CURRICULUM` | `0` to disable the P1 process+measurement noise ramp (default ON). |
 | `DREAMER_PROCESS_NOISE_AMP_RAMP` | `"<start>:<reach>"` (default `0.0:0.4`): noise scale ramps from `start` at progress=0 to full by `progress=reach` in P1/P2; P3 always full. |
 | `DREAMER_DISTURBANCE_PROB_WM` | Per-episode probability cap in P1/P2 (default 0.10). In P1 acts as the upper bound of the adaptive ramp; in P2 acts as the floor (P2 starts at this value). Observable schedule events (SP/DV) fire on 100% of episodes, so 0.10 gives the WM ~10× more clean episodes than disturbed ones during early learning. |
@@ -372,9 +372,10 @@ Both knobs are sim-agnostic and adaptive: injection cadence is a
 fraction of the replay-buffer FIFO lap (episode length already scales
 with τ+θ); inject **N** scales with `n_mv`/`n_dv`; isolation settle is
 **per isolated input** (`DREAMER_WM_ISOLATION_SETTLE_EPISODES`, auto 24:
-test_sim 24+24 / isolation-buf cap 48; distillation 4 MV + 1 DV →
-96+24 / cap 120); warm-restore no-ops when `wm_best.pt` is essentially
-the current state.
+test_sim 24+24 / isolation-buf cap 48 settle-only; distillation 4 MV + 1 DV →
+96+24 / cap 120). Isolation_buf does **not** ingest ordinary MIMO PRBS;
+long-hold settle is noise-free when `clean_steady_seeds` (default ON).
+Warm-restore no-ops when `wm_best.pt` is essentially the current state.
 
 #### Reward-MTP / WM-coupling diagnostics (P39)
 

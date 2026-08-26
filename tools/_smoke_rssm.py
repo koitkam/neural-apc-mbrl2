@@ -22,8 +22,9 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             _critic_anchor_coef, _force_p1_cap_at,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
+                            collect_prbs_episode,
                             _hold_other_action_dims, _isolation_settle_counts,
-                            _isolation_buf_capacity,
+                            _isolation_buf_capacity, _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
                             _should_warm_restore_wm_best)
@@ -291,15 +292,46 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _passthru is _tgt
     assert _isolation_settle_counts(1, 1, 24) == (24, 24)
     assert _isolation_settle_counts(4, 1, 24) == (96, 24)
-    assert _isolation_buf_capacity(
-        baseline_seed=16, dv_prbs_seed=24, n_mv=1, n_dv=1,
-        n_settle_per=24) == 48
-    assert _isolation_buf_capacity(
-        baseline_seed=16, dv_prbs_seed=24, n_mv=4, n_dv=1,
-        n_settle_per=24) == 120
+    assert _isolation_buf_capacity(n_mv=1, n_dv=1, n_settle_per=24) == 48
+    assert _isolation_buf_capacity(n_mv=4, n_dv=1, n_settle_per=24) == 120
     assert _isolation_settle_counts(2, 0, 0) == (0, 0)
     print('[smoke] OK  isolation settle per-input (test_sim 24+24/cap 48; '
-          'distillation 96+24/cap 120)')
+          'distillation 96+24/cap 120; cap settle-only)')
+
+    # P28 follow-up 8: long-hold isolation settle zeros sim noise (P89 gate).
+    class _DummyIsoEnv:
+        def __init__(self):
+            self.action_dim = 2
+            self.obs_dim = 3
+            self.rng = _np.random.default_rng(0)
+            self._schedule = ['x']
+            self._hidden_disturbance = 'ou'
+            self.noise_scale = 1.0
+        def reset(self, exploration=True):
+            return _np.zeros((1, self.obs_dim), dtype='float32')
+        def step(self, a):
+            return (_np.zeros((1, self.obs_dim), dtype='float32'),
+                    0.0, False, {})
+        def set_sim_noise_scale(self, s):
+            self.noise_scale = float(s)
+    _iso_cfg = TrainConfig()
+    _iso_cfg.episode_length = 12
+    _iso_cfg.horizon = 4
+    _iso_cfg.wm_input_isolation_len = 4
+    _iso_cfg.prbs_seed_segment_steps = 8
+    _iso_cfg.clean_steady_seeds = True
+    _e = _DummyIsoEnv()
+    collect_prbs_episode(_e, _iso_cfg, long_hold=True, isolate_dim=0)
+    assert _e.noise_scale == 0.0, _e.noise_scale
+    assert _e._schedule == [] and _e._hidden_disturbance is None
+    _e2 = _DummyIsoEnv()
+    collect_prbs_episode(_e2, _iso_cfg, long_hold=False)
+    assert _e2.noise_scale == 1.0, _e2.noise_scale
+    _e3 = _DummyIsoEnv()
+    _iso_cfg.clean_steady_seeds = False
+    _maybe_clean_steady_seed(_e3, _iso_cfg)
+    assert _e3.noise_scale == 1.0
+    print('[smoke] OK  isolation settle clean_steady_seeds (long_hold zeros noise)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and

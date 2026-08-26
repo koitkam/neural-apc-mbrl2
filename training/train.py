@@ -1345,6 +1345,11 @@ class TrainConfig:
     #      default 0.0:0.4) so the WM learns base dynamics + the attractor
     #      first.  P3 always full noise (robust rejection).  Set False / ramp
     #      "1.0:1e-6" for legacy full-noise-from-step-0.
+    # Isolation/ss-match settle (P28 follow-up 8) uses the same gate:
+    # long-hold per-input episodes must also be noise-free or process OU
+    # + measurement noise confound DC-gain (errors-in-variables / never
+    # truly settled — the same P89 RCA, now on the buffer that actually
+    # trains ``wm_ss_match``).
     clean_steady_seeds: bool = True
     process_noise_curriculum: bool = True
 
@@ -2997,20 +3002,27 @@ def _isolation_settle_counts(
 
 
 def _isolation_buf_capacity(
-        *, baseline_seed: int, dv_prbs_seed: int,
-        n_mv: int, n_dv: int, n_settle_per: int) -> int:
-    """Ring-buffer width for isolation/ss-match seed episodes.
+        *, n_mv: int, n_dv: int, n_settle_per: int) -> int:
+    """Ring-buffer width for isolation/ss-match **settle** episodes.
 
-    P28 follow-up 7: dataclass 24 is per-input.  The previous cap
-    (baseline + dv_prbs + 8 = 48 on test_sim) equalled 24+24 settle,
-    so wrap left a 100% settle mix — intended.  On MIMO the same 48
-    dropped all but the last 48 settle episodes (missing MV channels).
-    Size to ``max(legacy, n_mv×n_per + n_dv×n_per)`` so every isolated
-    channel stays in the buffer.  test_sim stays 48.
+    P28 follow-up 8: this buffer trains per-input isolation + ss-match.
+    Size it to the isolated-settle count only.  Follow-up 7 used
+    ``max(baseline + dv_prbs + 8, settle)`` so test_sim dataclass 16+24+8
+    equalled 24+24.  After ``auto_tune_seed_buffer`` baseline is ~26 on
+    test_sim, the cap grew to 58, and wrap kept ~10 confounded all-DV
+    PRBS episodes in front of the 48 settle — MIMO-mixture gradients on
+    the DC-gain objective.  Ordinary PRBS / all-DV PRBS stay in the
+    main replay buffer (WM coverage); they are not isolation data.
+    test_sim stays 48; distillation 4+1 stays 120.
     """
     n_mv_s, n_dv_s = _isolation_settle_counts(n_mv, n_dv, n_settle_per)
-    legacy = max(4, int(baseline_seed or 0) + int(dv_prbs_seed or 0) + 8)
-    return max(legacy, n_mv_s + n_dv_s)
+    return max(4, n_mv_s + n_dv_s)
+
+
+def _maybe_clean_steady_seed(env: 'APCEnv', cfg: 'TrainConfig') -> None:
+    """P89: noise-free held-action / isolation-settle seeds (override after reset)."""
+    if bool(getattr(cfg, 'clean_steady_seeds', True)):
+        env.set_sim_noise_scale(0.0)
 
 
 def _cfg_on(cfg: 'TrainConfig', name: str, default: bool = True) -> bool:
@@ -3364,9 +3376,11 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
 
     ``isolate_dim`` (P28 follow-up 7): sweep only that MV and hold every
     other actuator at ``hold_level``.  ``long_hold`` also suppresses the
-    curriculum DV schedule + hidden OU so ss-match is unconfounded.
-    ``isolate_dim is None`` keeps legacy MIMO PRBS (test_sim n_mv=1 is
-    unchanged).
+    curriculum DV schedule + hidden OU so ss-match is unconfounded, and
+    (P28 follow-up 8) zeros process/measurement noise when
+    ``clean_steady_seeds`` is on — the same P89 gate as const-action /
+    step-settle.  ``isolate_dim is None`` keeps legacy MIMO PRBS
+    (test_sim n_mv=1 is unchanged).
 
     Returns the same dict shape as ``collect_episode``.
     """
@@ -3379,7 +3393,9 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     if long_hold or isolate_dim is not None:
         env._schedule = []
         env._hidden_disturbance = None
-    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    if long_hold:
+        _maybe_clean_steady_seed(env, cfg)
+    T, D = cfg.episode_length, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
@@ -3563,9 +3579,8 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     # held-action fixed point because EVERY training trajectory (incl. these
     # seeds) carried persistent OU + measurement noise so the plant never
     # truly settled.  Off-switch: DREAMER_CLEAN_STEADY_SEEDS=0.
-    if bool(getattr(cfg, 'clean_steady_seeds', True)):
-        env.set_sim_noise_scale(0.0)
-    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    _maybe_clean_steady_seed(env, cfg)
+    T, D = cfg.episode_length, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
@@ -3707,9 +3722,8 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     env._hidden_disturbance = None
     # P89 Fix A: noise-free so the step transient + settled tail give the WM
     # clean gain + fixed-point supervision (DREAMER_CLEAN_STEADY_SEEDS=0 off).
-    if bool(getattr(cfg, 'clean_steady_seeds', True)):
-        env.set_sim_noise_scale(0.0)
-    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    _maybe_clean_steady_seed(env, cfg)
+    T, D = cfg.episode_length, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
@@ -4134,7 +4148,10 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
 
     Falls back to an MV-hold episode when the sim has no DV channels.
     ``mv_level`` (normalized action space) sets the held MV operating
-    point; vary it across the seed batch for MV-level coverage.  Returns
+    point; vary it across the seed batch for MV-level coverage.
+    ``long_hold`` + ``isolate_dv_idx`` is the isolation-settle path
+    (P28 follow-up 7/8): one DV, uniform long holds, hidden OU off,
+    ``clean_steady_seeds`` zeros process/measurement noise.  Returns
     the same dict shape as ``collect_episode``.
     """
     from utils.training_disturbance import _channel_catalog
@@ -4143,6 +4160,8 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     obs_window = env.reset(exploration=True)
     env._schedule = []
     env._hidden_disturbance = None
+    if long_hold:
+        _maybe_clean_steady_seed(env, cfg)
 
     channels = _channel_catalog(env.sim)
     dv_chs = list(channels.get('dv', []))
@@ -7817,24 +7836,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
                                      cfg.obs_dim, cfg.action_dim, n_dist=0)
 
-    # MIMO per-INPUT isolation buffer (2026-07-10): holds the isolated-excitation
-    # seed episodes (MV-PRBS + DV-PRBS — ONE input swept, all others held) for the
-    # self-supervised ``_wm_input_isolation_loss`` (the nonlinear / black-box,
-    # no-known-gain generalisation of C(1) gain-match).  Input-symmetric: it holds
-    # every input's isolated episodes.  Populated at seed time.
+    # MIMO per-INPUT isolation buffer (2026-07-10 / P28 follow-up 8): holds
+    # ONLY the isolated long-hold settle episodes (one input swept, all
+    # others held, process+meas noise off) that train
+    # ``_wm_input_isolation_loss`` / ``wm_ss_match``.  Ordinary MIMO PRBS
+    # and all-DV PRBS stay in the main replay buffer.
     isolation_buf = None
     if bool(getattr(cfg, 'cont_latent_enabled', False)):
         _n_mv_iso = int(len(getattr(env.sim, 'mv_indices', []) or []))
         _n_dv_iso = int(len(getattr(env.sim, 'dv_indices', []) or []))
         _n_settle_iso = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
         _iso_cap = _isolation_buf_capacity(
-            baseline_seed=int(getattr(cfg, 'baseline_seed_episodes', 8) or 8),
-            dv_prbs_seed=int(getattr(cfg, 'dv_prbs_seed_episodes', 0) or 0),
             n_mv=_n_mv_iso, n_dv=_n_dv_iso, n_settle_per=_n_settle_iso)
         isolation_buf = TrajectoryBuffer(_iso_cap, cfg.episode_length,
                                          cfg.obs_dim, cfg.action_dim, n_dist=0)
         print(f'[isolation-buf] cap={_iso_cap} '
-              f'(settle per_input={_n_settle_iso} → '
+              f'(settle-only; per_input={_n_settle_iso} → '
               f'{_n_mv_iso}×{_n_settle_iso}+{_n_dv_iso}×{_n_settle_iso}; '
               f'n_mv={_n_mv_iso} n_dv={_n_dv_iso})',
               flush=True)
@@ -8416,8 +8433,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     action_std=baseline_seed_std,
                                     op_band=prbs_op_band)
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-        if isolation_buf is not None:   # MV-isolated (MV swept, DV/others held)
-            isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
 
     # Constant-action / step-and-settle seed (run_p31 RCA 2026-05-21
@@ -8534,9 +8549,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         for lvl in dvp_levels:
             ep = collect_dv_prbs_episode(env, cfg, mv_level=float(lvl))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-            if isolation_buf is not None:   # DV-isolated (DV swept, MV held)
-                isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
-                                          ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] dv-prbs={n_dv_prbs_seed} "
               f"(n_dv={n_dv}, op_frac={cfg.dv_prbs_op_frac:.2f}, "
@@ -8547,11 +8559,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # ---------- Isolated STEADY-STATE (settle) seed episodes (p08 RCA) ----------
     # Long-hold isolated excitation (one input held at a level for >=2*K steps so
     # a full K-rollout window reaches steady state), all OTHER inputs held → feeds
-    # the self-supervised ``wm_ss_match`` DC-gain term.  The isolation loss's
-    # per-step MSE is transient-dominated; without settled content it under-shoots
-    # the DC gain (p08: WM gains ×0.86 / ×0.78).  MV-isolated (MV swept long, DV
-    # held) + DV-isolated (DV swept long, MV held) → unbiased gain, NO identified
-    # value (nonlinear / black-box safe, local per operating point).
+    # the self-supervised ``wm_ss_match`` DC-gain term.  These are the ONLY
+    # episodes written to ``isolation_buf`` (P28 follow-up 8): ordinary MIMO
+    # PRBS / all-DV PRBS are WM-coverage data, not isolation data, and
+    # auto-tune-inflated cap used to wrap them back in.  Noise-free when
+    # ``clean_steady_seeds`` (P89 / follow-up 8).
     n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
     if isolation_buf is not None and n_settle > 0:
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
