@@ -869,8 +869,10 @@ class TrainConfig:
     # ``DREAMER_GAIN_MATCH_HUBER_BETA``.
     gain_match_huber_beta: float = 1.0
     # Isolation / ss-match TBPTT stride (GRU ``h`` only, ``keep_c``).  Never
-    # cuts inside the settled SS-match window.  16 of K≈55 is the P24/P25
-    # default.  ``DREAMER_AUX_TBPTT_STEPS``.
+    # cuts inside the settled SS-match window.  Dataclass 16 is the P24/P25
+    # test_sim point (16 of K≈55).  ``_resolve_aux_tbptt_steps`` replaces the
+    # default with ``max(8, round(K/3.5))`` so fast/slow plants scale; explicit
+    # ``DREAMER_AUX_TBPTT_STEPS`` wins.  ``<=0`` always auto.
     aux_tbptt_steps: int = 16
     # Resolved gain targets (WM/normalized units): per-input rows of n_cv gains.
     # ``*_kinds``/``*_idx`` map each row to an action col (mv) or dv-vector col.
@@ -2671,6 +2673,28 @@ def _force_p1_cap_at(total_env_steps: int) -> Tuple[int, int, int]:
     return int(total_env_steps), 0, 0
 
 
+def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
+    """Isolation / ss-match TBPTT stride from the rollout length K.
+
+    P24/P25 used 16 of K≈55 (one detach per ~τ of a 4τ settle).  That ratio
+    is unitless: ``max(8, round(K / 3.5))``.  Explicit
+    ``DREAMER_AUX_TBPTT_STEPS`` (``_explicit_fields``) or any in-code value
+    other than the dataclass default 16 is left alone.  ``<=0`` always auto.
+    Isolation still never TBPTT inside the SS-match window (``keep_c``).
+    """
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    cur = int(getattr(cfg, 'aux_tbptt_steps', 16) or 0)
+    if cur > 0 and (
+            'aux_tbptt_steps' in explicit or cur != 16):
+        return cur
+    k = int(getattr(cfg, 'wm_input_isolation_len', 0)
+            or getattr(cfg, 'gain_match_len', 0)
+            or getattr(cfg, 'horizon', 15) or 15)
+    auto = max(8, int(round(float(max(1, k)) / 3.5)))
+    cfg.aux_tbptt_steps = int(auto)
+    return int(auto)
+
+
 # ---------------------------------------------------------------------------
 # Replay buffer — episode-major
 # ---------------------------------------------------------------------------
@@ -4385,10 +4409,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # P27 RCA / P28: RELATIVE Huber is opt-in.  Dividing by |target| gave the
     # subdominant DV ~5× the MV gradient and exploded full-BPTT at P1 iter 50.
     # Default 0 = absolute Huber (P26 observer, MV ×0.97).  Unitless.
-    _hb = float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 1.0)
-    _env_hb = os.environ.get('DREAMER_GAIN_MATCH_HUBER_BETA', '').strip()
-    if _env_hb:
-        _hb = float(_env_hb or 1.0)
+    # Trust TrainConfig (ENV_OVERRIDES + resolve-time auto).  Do NOT re-read
+    # ``DREAMER_GAIN_MATCH_HUBER_BETA`` here: env ``<=0`` (median |tgt|) would
+    # overwrite the resolved β and pass β=0 into smooth_l1.
+    _hb = max(1e-6, float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 1.0))
     _rel = float(getattr(cfg, 'gain_match_relative', 0.0) or 0.0)
 
     def _gm_huber(g_wm, tgt_row):
@@ -4503,9 +4527,6 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     total = zero
     cv_pred_win = []
     _tbptt = int(getattr(cfg, 'aux_tbptt_steps', 16) or 0)
-    _env_tb = os.environ.get('DREAMER_AUX_TBPTT_STEPS', '').strip()
-    if _env_tb:
-        _tbptt = int(_env_tb or 0)
     for k in range(K):
         dvk = dv_all[:, k] if dv_all is not None else None
         st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
@@ -4637,9 +4658,11 @@ def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
         cfg.gain_match_coef = 1.0
     if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
         cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
+    _resolve_aux_tbptt_steps(cfg)
     print(f'[gain-match] targets (WM-norm) mv={cfg.gain_match_mv_target} '
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
-          f'len={cfg.gain_match_len} huber_beta={cfg.gain_match_huber_beta}',
+          f'len={cfg.gain_match_len} huber_beta={cfg.gain_match_huber_beta} '
+          f'aux_tbptt={cfg.aux_tbptt_steps}',
           flush=True)
 
 
@@ -7892,6 +7915,88 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             return 2
         return 3
 
+    def _apply_curriculum_stage(phase: int) -> None:
+        """Latch freeze/DOB to ``phase``.  Call at loop start AND after a
+        same-iter phase transition — otherwise the first P2 train step still
+        has g trainable (full-BPTT gain-match on skip-storm-restored weights).
+        """
+        nonlocal _cur_stage, _wm_frozen_now
+        if not curriculum:
+            return
+        phase = int(phase)
+        if _cont_curric:
+            env._disturbance_prob_override = (
+                float(getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
+                if phase < 3
+                else float(getattr(cfg, 'curriculum_stage3_disturbance_prob',
+                                   0.85)))
+            if _cur_stage != phase:
+                _cur_stage = phase
+                model.set_dob_active(False)
+                if _cur_stage < 3:
+                    _fz = model.set_world_model_trainable(
+                        g=True, dob=False, reward=True)
+                    _desc = (f'WM-id (cont gain+disturbance latent; g TRAINS, '
+                             f'disturbance {env._disturbance_prob_override:.2f}, '
+                             f'gain-match supervises the gain)')
+                else:
+                    _fz = model.set_world_model_trainable(
+                        g=False, dob=False, reward=True)
+                    _wm_frozen_now = True
+                    _igf = float(getattr(cfg,
+                            'actor_imag_gain_random_frac', 0.0) or 0.0)
+                    _desc = (f'actor/critic on FROZEN cont-WM (disturbance '
+                             f'{env._disturbance_prob_override:.2f}; real-plant '
+                             f'DR OFF; imagination loop-gain rand '
+                             f'±{_igf:.3f}; DOB-free disturbance via cont '
+                             f'channel)')
+                print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
+                      f"steps{total_env_steps}: {_desc} "
+                      f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']}]",
+                      flush=True)
+            return
+        if phase == 1:
+            env._disturbance_prob_override = 0.0
+        elif phase == 2:
+            env._disturbance_prob_override = float(
+                getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
+        else:
+            env._disturbance_prob_override = float(
+                getattr(cfg, 'curriculum_stage3_disturbance_prob', 0.85))
+        if _cur_stage == phase:
+            return
+        _cur_stage = phase
+        if _cur_stage == 1:
+            model.set_dob_active(False)
+            _fz = model.set_world_model_trainable(
+                g=True, dob=False, reward=True)
+            _desc = ('CLEAN-WM id (g trains, '
+                     + ('DOB suppressed, ' if bool(getattr(cfg, 'dob_enabled', False)) else '')
+                     + 'disturbance 0)')
+        elif _cur_stage == 2:
+            _dob_on = bool(getattr(cfg, 'dob_enabled', False))
+            model.set_dob_active(_dob_on)
+            _fz = model.set_world_model_trainable(
+                g=False, dob=_dob_on, reward=True)
+            _est = ('DOB id (observer A,K)' if _dob_on
+                    else 'disturbance-head id (frozen-g readout)')
+            _desc = (f'{_est} (g FROZEN + reward train via recon '
+                     f'innovation, disturbance '
+                     f'{env._disturbance_prob_override:.2f})')
+        else:
+            model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
+            _fz = model.set_world_model_trainable(
+                g=False, dob=False, reward=True)
+            _wm_frozen_now = True
+            _wmtag = 'WM+DOB' if bool(getattr(cfg, 'dob_enabled', False)) else 'WM'
+            _desc = (f'real-sim actor/critic on FROZEN {_wmtag} observer '
+                     f'(disturbance {env._disturbance_prob_override:.2f}; '
+                     f'real-plant DR ON for actor robustness)')
+        print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
+              f"steps{total_env_steps}: {_desc} "
+              f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
+              f"trainable-flags set]", flush=True)
+
     # Seed buffer.  P0 (2026-05-05): instead of two uniform-random episodes
     # — which on cliff-shaped reward landscapes (this plant: raw_min=-250,
     # raw_max=+0.1) produce nothing but violation transitions and leave
@@ -8217,6 +8322,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         cfg.gain_match_coef = 0.0
         print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
               f'falling back to isolation-only WM gain supervision.', flush=True)
+    _resolve_aux_tbptt_steps(cfg)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value
@@ -8260,100 +8366,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             pass
 
         # ---------- Staged curriculum stage control (2026-06-12) ----------
-        # Stage == current_phase.  Override the disturbance prob per stage
-        # (cheap, every iter) and apply the freeze/dob_active partition ONCE
-        # per stage via the ``_cur_stage`` latch (idempotent; survives the
-        # quality-gate phase extensions since it keys off the actual phase).
-        if curriculum:
-            if _cont_curric:
-                # Continuous-latent curriculum: WM-id (g trains + disturbance
-                # present) for stages 1-2, then actor on the frozen WM (stage 3).
-                # Disturbance ON throughout; the cont gain channel + gain-match
-                # hold the gain unbiased (no clean-data / frozen-g protection).
-                env._disturbance_prob_override = (
-                    float(getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
-                    if int(current_phase) < 3
-                    else float(getattr(cfg, 'curriculum_stage3_disturbance_prob',
-                                       0.85)))
-                if _cur_stage != int(current_phase):
-                    _cur_stage = int(current_phase)
-                    model.set_dob_active(False)
-                    if _cur_stage < 3:
-                        _fz = model.set_world_model_trainable(
-                            g=True, dob=False, reward=True)
-                        _desc = (f'WM-id (cont gain+disturbance latent; g TRAINS, '
-                                 f'disturbance {env._disturbance_prob_override:.2f}, '
-                                 f'gain-match supervises the gain)')
-                    else:
-                        _fz = model.set_world_model_trainable(
-                            g=False, dob=False, reward=True)
-                        _wm_frozen_now = True
-                        _igf = float(getattr(cfg,
-                                'actor_imag_gain_random_frac', 0.0) or 0.0)
-                        _desc = (f'actor/critic on FROZEN cont-WM (disturbance '
-                                 f'{env._disturbance_prob_override:.2f}; real-plant '
-                                 f'DR OFF; imagination loop-gain rand '
-                                 f'±{_igf:.3f}; DOB-free disturbance via cont '
-                                 f'channel)')
-                    print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
-                          f"steps{total_env_steps}: {_desc} "
-                          f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']}]",
-                          flush=True)
-            elif int(current_phase) == 1:
-                env._disturbance_prob_override = 0.0
-            elif int(current_phase) == 2:
-                env._disturbance_prob_override = float(
-                    getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
-            else:
-                env._disturbance_prob_override = float(
-                    getattr(cfg, 'curriculum_stage3_disturbance_prob', 0.85))
-            if _cur_stage != int(current_phase):
-                _cur_stage = int(current_phase)
-                if _cur_stage == 1:
-                    model.set_dob_active(False)
-                    _fz = model.set_world_model_trainable(
-                        g=True, dob=False, reward=True)
-                    _desc = ('CLEAN-WM id (g trains, '
-                             + ('DOB suppressed, ' if bool(getattr(cfg, 'dob_enabled', False)) else '')
-                             + 'disturbance 0)')
-                elif _cur_stage == 2:
-                    # Freeze g (protect the clean Stage-1 gain), turn the
-                    # disturbance estimator ON, keep wm_total so its innovation
-                    # trains the estimator on the FROZEN g.  With the DOB on this
-                    # is the neural-Kalman A,K; with the DOB off (p136 default)
-                    # it is the always-trainable disturbance_head reading the
-                    # frozen GRU latent's disturbance tracking.
-                    _dob_on = bool(getattr(cfg, 'dob_enabled', False))
-                    model.set_dob_active(_dob_on)
-                    _fz = model.set_world_model_trainable(
-                        g=False, dob=_dob_on, reward=True)
-                    _est = ('DOB id (observer A,K)' if _dob_on
-                            else 'disturbance-head id (frozen-g readout)')
-                    _desc = (f'{_est} (g FROZEN + reward train via recon '
-                             f'innovation, disturbance '
-                             f'{env._disturbance_prob_override:.2f})')
-                else:
-                    # Freeze g AND the observer; the real-sim actor/critic train
-                    # on the FROZEN WM(+DOB) observer.  _wm_frozen_now drops
-                    # wm_total in the P3 path so only the actor/critic optimise.
-                    model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
-                    _fz = model.set_world_model_trainable(
-                        g=False, dob=False, reward=True)
-                    _wm_frozen_now = True
-                    # mbrl2 real-sim: the actor/critic train on REAL rollouts of
-                    # the true plant with domain randomisation ENABLED at this
-                    # transition (set_domain_randomization(True)); the observer
-                    # was identified CLEAN in P1/P2.  The unmeasured OU
-                    # disturbance rides the real P3 data (a feed-forward target
-                    # the actor rejects via the DOB estimate in feat).
-                    _wmtag = 'WM+DOB' if bool(getattr(cfg, 'dob_enabled', False)) else 'WM'
-                    _desc = (f'real-sim actor/critic on FROZEN {_wmtag} observer '
-                             f'(disturbance {env._disturbance_prob_override:.2f}; '
-                             f'real-plant DR ON for actor robustness)')
-                print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
-                      f"steps{total_env_steps}: {_desc} "
-                      f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
-                      f"trainable-flags set]", flush=True)
+        # Stage == current_phase.  Disturbance-prob every iter; freeze/DOB
+        # once per stage.  Re-applied after a same-iter phase transition
+        # (see after ``current_phase = new_phase``) so P2 train does not
+        # run full-BPTT gain-match with g still trainable.
+        _apply_curriculum_stage(int(current_phase))
 
         # ---------- P52 RCA: phase-transition quality gates ----------
         # When the env-step budget says "leave the current phase", check
@@ -8708,6 +8725,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                               f"— continuing with current weights",
                               flush=True)
             current_phase = new_phase
+            # Same-iter freeze: the loop-start latch still saw the OLD phase.
+            # Without this, the first P2 train step runs full-BPTT gain-match
+            # with g trainable (skip-storm recovery re-explodes; every P1→P2
+            # also leaked one extra gain-match step onto the freeze).
+            _apply_curriculum_stage(int(current_phase))
             if current_phase == 3:
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
                 model.snapshot_prior_policy()
@@ -9843,7 +9865,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 f'{Path(wm_best_ckpt_path).name} '
                                 f'(iter {wm_best_iter}); reset opt_world; '
                                 f'capping P1 at {p1} env_steps '
-                                f'(extension closed) → P2. '
+                                f'(extension closed) → P2 '
+                                f'(g freeze applies on the P1→P2 iter). '
                                 f'({window_skips} skips in last '
                                 f'{window_iters} iters)',
                                 flush=True)

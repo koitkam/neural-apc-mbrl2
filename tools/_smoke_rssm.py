@@ -19,7 +19,8 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             agent_finetune_loss, _realsim_actor_critic_step,
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _critic_anchor_lambda,
-                            _critic_anchor_coef, _force_p1_cap_at)
+                            _critic_anchor_coef, _force_p1_cap_at,
+                            _resolve_aux_tbptt_steps)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -138,6 +139,28 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert int(_tc.aux_tbptt_steps) == 16
     assert float(_tc.gain_match_relative) == 0.0
     print('[smoke] OK  gain-match defaults (abs Huber, beta=1, TBPTT=16)')
+
+    # Isolation TBPTT is sim-adaptive: 16 of K≈55 (test_sim) scales as K/3.5.
+    _tb = TrainConfig()
+    _tb.wm_input_isolation_len = 55
+    assert _resolve_aux_tbptt_steps(_tb) == 16, _tb.aux_tbptt_steps
+    _tb_fast = TrainConfig()
+    _tb_fast.wm_input_isolation_len = 15
+    assert _resolve_aux_tbptt_steps(_tb_fast) == 8, _tb_fast.aux_tbptt_steps
+    _tb_slow = TrainConfig()
+    _tb_slow.horizon = 120
+    _tb_slow.wm_input_isolation_len = 120
+    assert _resolve_aux_tbptt_steps(_tb_slow) == 34, _tb_slow.aux_tbptt_steps
+    _tb_set = TrainConfig()
+    _tb_set.aux_tbptt_steps = 2
+    _tb_set.wm_input_isolation_len = 55
+    assert _resolve_aux_tbptt_steps(_tb_set) == 2
+    _tb_ex = TrainConfig()
+    _tb_ex.aux_tbptt_steps = 16
+    _tb_ex.wm_input_isolation_len = 120
+    _tb_ex._explicit_fields = {'aux_tbptt_steps'}
+    assert _resolve_aux_tbptt_steps(_tb_ex) == 16
+    print('[smoke] OK  aux_tbptt_steps sim-adaptive (16-of-55; explicit wins)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and

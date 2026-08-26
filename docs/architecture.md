@@ -102,6 +102,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > zeroed `p1_ext_steps`, which re-opened the P1 quality-gate extension and
 > would re-run exploding full-BPTT gain-match. Recovery now also closes
 > `p1_gate_max_ext_steps` (`_force_p1_cap_at`) so the next iter is Stage 2.
+> **P28 follow-up 2:** closing the extension cap was not enough — the
+> curriculum freeze latched at *loop start*, so the first P2 train step
+> still had `g` trainable (one extra full-BPTT gain-match on the restored
+> weights). Freeze/DOB now re-apply on the same iter as `current_phase`
+> changes. Isolation TBPTT stride is sim-adaptive (`max(8, round(K/3.5))`,
+> 16-of-55 on test_sim); Huber β is not re-read from env on the hot path
+> (that undid `<=0` auto-median).
 
 ---
 

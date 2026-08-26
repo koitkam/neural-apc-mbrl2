@@ -96,8 +96,6 @@ def main():
           f'({cont_grad_ss:.4e})')
 
     # ---- P25 RCA: isolation TBPTT must keep_c so the gain channel still trains
-    import os
-    os.environ['DREAMER_AUX_TBPTT_STEPS'] = '2'
     cfg.aux_tbptt_steps = 2
     cfg.wm_ss_match_coef = 0.5
     cfg.wm_input_isolation_len = 6
@@ -148,6 +146,19 @@ def main():
     assert cont_grad_rel > 0.0, 'relative gain-match did NOT reach cont-gain!'
     print(f'[gain-match-rel] OK: abs={float(gm_abs):.5f} rel={float(gm_rel):.5f} '
           f'cont_grad={cont_grad_rel:.4e} (opt-in; P28 default is absolute)')
+
+    # Resolve-time Huber β must not be overwritten by a leftover env ``0``
+    # (auto-median sentinel) on every loss call.
+    import os
+    os.environ['DREAMER_GAIN_MATCH_HUBER_BETA'] = '0'
+    cfg.gain_match_relative = 0.0
+    cfg.gain_match_huber_beta = 0.52
+    model.zero_grad(set_to_none=True)
+    gm_auto, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm_auto).all() and float(gm_auto) > 0.0, float(gm_auto)
+    os.environ.pop('DREAMER_GAIN_MATCH_HUBER_BETA', None)
+    print(f'[gain-match-beta] OK: resolved beta used despite env=0 '
+          f'(loss={float(gm_auto):.5f})')
 
 
 if __name__ == '__main__':
