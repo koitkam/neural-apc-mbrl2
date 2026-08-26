@@ -833,9 +833,11 @@ class RSSMDynamics(nn.Module):
         Compiled the SAME way as ``rollout_observed`` (see ``maybe_compile``):
         capturing the whole K-step ``img_step`` loop as ONE graph removes the
         per-step Python / kernel-launch overhead that otherwise makes the
-        multi-step WM aux losses (latent-overshoot + held-rollout) launch-bound
-        (~73% of the WM step).  Batched, single-graph analogue of the Python
-        loops those losses used to run inline.
+        multi-step WM aux losses (latent-overshoot + held-rollout +
+        gain-match FD) launch-bound.  Eager default still wins by stacking
+        independent rolls on the batch dim (gain-match: baseline + one
+        step per MV/DV).  Batched analogue of the Python loops those
+        losses used to run inline.
         """
         Bm = h0.shape[0]
         K = actions.shape[1]

@@ -299,6 +299,73 @@ def main():
           f'(ignored); mean-shift {float(ov_m0):.5f}→{float(ov_m_mean):.5f}; '
           f'gain-match mean-shift {float(gm_m0):.5f}→{float(gm_m_mean):.5f}')
 
+    # Batched img_rollout FD (eager default) must match sequential img_step
+    # rolls — same last-step ΔCV/Δu Huber that pins DC gain (P26).
+    from models.dreamer_v4_rssm import RSSMState
+    torch.manual_seed(5)
+    cfg.gain_match_len = 6
+    cfg.gain_match_step = 1.0
+    cfg.gain_match_relative = 0.0
+    cfg.gain_match_huber_beta = 1.0
+    cfg.gain_match_mv_target = ((0.4,),)
+    cfg.gain_match_dv_target = ((-0.2,),)
+    gm_batched, _ = _wm_gain_match_loss(
+        model, feats_live_c, obs, act, cfg, c_mean=c_mean)
+
+    def _seq_gain_match():
+        K = int(cfg.gain_match_len)
+        max_starts = max(1, int(cfg.gain_match_max_starts))
+        B, T = obs.shape[:2]
+        n_valid = T if T <= K else (T - K)
+        stride = max(1, n_valid // max_starts)
+        starts = torch.arange(0, n_valid, stride, device=obs.device)
+        S = int(starts.numel())
+        f0 = feats_live_c[:, starts]
+        Bm = B * S
+        h0 = f0[..., :rssm.deter_dim].reshape(Bm, -1)
+        _ze = rssm.deter_dim + rssm.stoch_flat_dim
+        z0 = f0[..., rssm.deter_dim:_ze].reshape(
+            Bm, rssm.n_categoricals, rssm.n_classes)
+        from training.train import _openloop_c0
+        c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
+        a_base = act[:, starts].reshape(Bm, -1)
+        dv0 = obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+        cv_idx = rssm.cv_index_t
+        step = float(cfg.gain_match_step)
+
+        def _roll(a_held, dv_held):
+            st = RSSMState(
+                h=h0.clone(),
+                z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
+                                     device=obs.device, dtype=f0.dtype),
+                z=z0.clone(),
+                c=(c0.clone() if c0 is not None else None))
+            for _ in range(K):
+                st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
+            return rssm.decode(st.feat).index_select(-1, cv_idx)
+
+        cv_base = _roll(a_base, dv0)
+        a_mv = a_base.clone()
+        a_mv[:, 0] = a_mv[:, 0] + step
+        g_mv = (_roll(a_mv, dv0) - cv_base) / step
+        dv_s = dv0.clone()
+        dv_s[:, 0] = dv_s[:, 0] + step
+        g_dv = (_roll(a_base, dv_s) - cv_base) / step
+        tgt_mv = torch.tensor([0.4], device=obs.device, dtype=g_mv.dtype)
+        tgt_dv = torch.tensor([-0.2], device=obs.device, dtype=g_dv.dtype)
+        import torch.nn.functional as F
+        l_mv = F.smooth_l1_loss(g_mv, tgt_mv.expand_as(g_mv), beta=1.0)
+        l_dv = F.smooth_l1_loss(g_dv, tgt_dv.expand_as(g_dv), beta=1.0)
+        return (l_mv + l_dv) / 2.0
+
+    gm_seq = _seq_gain_match()
+    assert torch.isfinite(gm_batched).all() and torch.isfinite(gm_seq).all()
+    assert abs(float(gm_batched) - float(gm_seq)) < 1e-5, (
+        f'batched gain-match {float(gm_batched):.6f} != sequential '
+        f'{float(gm_seq):.6f}')
+    print(f'[gain-match-batched] OK: batched={float(gm_batched):.6f} '
+          f'seq={float(gm_seq):.6f}')
+
 
 if __name__ == '__main__':
     main()

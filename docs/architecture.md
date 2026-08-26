@@ -190,6 +190,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > extension still closed); second storm still caps. Storm-time
 > GAIN_NOT_READY does not stick if P1 continues. Fidelity ES suppressed
 > while `_dynamics_g_trainable` is false.
+> **P31 LIVE (2026-08-26 18:50):** P1 iter 16, recon 0.0415 after a 2-skip
+> dv-prbs blip (not a storm). GPU occupied; no second job. HEAD batches
+> gain-match FD (baseline + one step per MV/DV) through `img_rollout` —
+> same last-step Huber as the sequential rolls (CPU test match 1e-6);
+> next launch, not this process (`4ffe11f`).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

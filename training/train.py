@@ -5231,6 +5231,14 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     state — it does not need future obs in the window.  Truncating K to
     the main-buffer ``seq_len`` was the same DC-gain miss isolation
     follow-up 10 already plugged for ``isolation_buf``.
+
+    Eager (P31 default): RSSM stacks the baseline + one step per MV/DV
+    into a single ``img_rollout`` (batch ``Bm·(1+n_mv+n_dv)``) so the
+    K-step GRU loop runs once.  Sequential ``img_step`` paid
+    ``1+n_mv+n_dv`` Python K-loops — linear in plant width, the remaining
+    full-BPTT cost after isolation decode was batched.  Same last-step
+    ``ΔCV/Δu`` Huber (P26 DC-gain).  TSSM stays sequential (no
+    ``img_rollout``; scaffold).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
@@ -5246,10 +5254,6 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     dv_target = list(getattr(cfg, 'gain_match_dv_target', ()) or ())
     if not mv_target and not dv_target:
         return zero, diag
-    if _wmt == 'tssm':
-        from models.transformer_ssm import TSSMState as _State
-    else:
-        from models.dreamer_v4_rssm import RSSMState as _State
     B, T = obs.shape[:2]
     K = int(getattr(cfg, 'gain_match_len', 0) or 0)
     if K <= 0:
@@ -5283,34 +5287,25 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     cv_idx = rssm.cv_index_t
 
-    def _state():
-        kw = dict(
-            h=h0.clone(),
-            z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                                 device=obs.device, dtype=f0.dtype),
-            z=z0.clone(), c=(c0.clone() if c0 is not None else None))
-        if _wmt == 'tssm':
-            kw.update(kv_cache=None, pos=0)   # roll from a fresh transformer ctx
-        return _State(**kw)
-
     a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
     dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
            if getattr(rssm, 'dv_dim', 0) > 0 else None)
 
-    def _roll(a_held, dv_held):
-        # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
-        # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
-        # gradient that pins transfer-matrix gain (forward loss still
-        # looks tiny; val MV stayed ×0.74).  Explosion defence for this
-        # path is Huber + ``wm_grad_skip_norm`` (P24/P25), not a detach.
-        st = _state()
-        for _i in range(K):
-            st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
-        return rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
+    mv_tgts = []
+    for j, tgt_row in enumerate(mv_target):
+        if j >= a_base.shape[-1]:
+            break
+        mv_tgts.append(tgt_row)
+    dv_tgts = []
+    if dv0 is not None:
+        for j, tgt_row in enumerate(dv_target):
+            if j >= dv0.shape[-1]:
+                break
+            dv_tgts.append(tgt_row)
+    nterm = len(mv_tgts) + len(dv_tgts)
+    if nterm == 0:
+        return zero, diag
 
-    cv_base = _roll(a_base, dv0)
-    total = zero
-    nterm = 0
     # HUBER not MSE (p23 RCA): the MSE gradient ∝ gain error is UNBOUNDED, so a
     # large transient gain swing (p23 coef 2.0: ×1.09→×2.42→×-5.61) produces an
     # exploding gradient that overshoots and DIVERGES.  smooth_l1 caps the
@@ -5333,25 +5328,100 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
             return F.smooth_l1_loss(err, torch.zeros_like(err), beta=_hb)
         return F.smooth_l1_loss(g_wm, tgt_b, beta=_hb)
 
-    for j, tgt_row in enumerate(mv_target):                # MV: step the action
-        if j >= a_base.shape[-1]:
-            break
-        a_step = a_base.clone()
-        a_step[:, j] = a_step[:, j] + step
-        g_wm = (_roll(a_step, dv0) - cv_base) / step        # (Bm, n_cv)
-        total = total + _gm_huber(g_wm, tgt_row)
-        nterm += 1
-    if dv0 is not None:
-        for j, tgt_row in enumerate(dv_target):            # DV: step the DV input
-            if j >= dv0.shape[-1]:
-                break
-            dv_step = dv0.clone()
-            dv_step[:, j] = dv_step[:, j] + step
-            g_wm = (_roll(a_base, dv_step) - cv_base) / step
+    def _huber_from_cv(cv_base, cv_steps, tgts):
+        total = zero
+        for i, tgt_row in enumerate(tgts):
+            g_wm = (cv_steps[i] - cv_base) / step
             total = total + _gm_huber(g_wm, tgt_row)
-            nterm += 1
-    if nterm == 0:
-        return zero, diag
+        return total
+
+    # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
+    # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
+    # gradient that pins transfer-matrix gain (forward loss still
+    # looks tiny; val MV stayed ×0.74).  Explosion defence for this
+    # path is Huber + ``wm_grad_skip_norm`` (P24/P25), not a detach.
+    _use_batched = (_wmt == 'rssm' and hasattr(rssm, 'img_rollout'))
+    if _use_batched:
+        a_list = [a_base]
+        dv_list = ([dv0] if dv0 is not None else None)
+        for j in range(len(mv_tgts)):
+            a_j = a_base.clone()
+            a_j[:, j] = a_j[:, j] + step
+            a_list.append(a_j)
+            if dv_list is not None:
+                dv_list.append(dv0)
+        if dv0 is not None:
+            for j in range(len(dv_tgts)):
+                a_list.append(a_base)
+                dv_j = dv0.clone()
+                dv_j[:, j] = dv_j[:, j] + step
+                dv_list.append(dv_j)
+        n_rolls = len(a_list)
+
+        def _repeat_starts(t):
+            return (t.unsqueeze(0).expand(n_rolls, *t.shape)
+                    .reshape(n_rolls * Bm, *t.shape[1:]).contiguous())
+
+        h_b = _repeat_starts(h0)
+        z_b = _repeat_starts(z0)
+        c_b = _repeat_starts(c0) if c0 is not None else None
+        a_held = torch.stack(a_list, dim=0)
+        a_seq = (a_held.unsqueeze(2)
+                 .expand(n_rolls, Bm, K, a_held.shape[-1])
+                 .reshape(n_rolls * Bm, K, a_held.shape[-1])
+                 .contiguous())
+        dv_seq = None
+        if dv_list is not None:
+            dv_held = torch.stack(dv_list, dim=0)
+            dv_seq = (dv_held.unsqueeze(2)
+                      .expand(n_rolls, Bm, K, dv_held.shape[-1])
+                      .reshape(n_rolls * Bm, K, dv_held.shape[-1])
+                      .contiguous())
+        roll_feats = rssm.img_rollout(
+            h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b)
+        cv_last = rssm.decode(roll_feats[:, -1]).index_select(-1, cv_idx)
+        cv_last = cv_last.view(n_rolls, Bm, -1)
+        cv_base = cv_last[0]
+        n_mv = len(mv_tgts)
+        total = _huber_from_cv(cv_base, cv_last[1:1 + n_mv], mv_tgts)
+        total = total + _huber_from_cv(
+            cv_base, cv_last[1 + n_mv:], dv_tgts)
+    else:
+        if _wmt == 'tssm':
+            from models.transformer_ssm import TSSMState as _State
+        else:
+            from models.dreamer_v4_rssm import RSSMState as _State
+
+        def _state():
+            kw = dict(
+                h=h0.clone(),
+                z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
+                                     device=obs.device, dtype=f0.dtype),
+                z=z0.clone(), c=(c0.clone() if c0 is not None else None))
+            if _wmt == 'tssm':
+                kw.update(kv_cache=None, pos=0)
+            return _State(**kw)
+
+        def _roll(a_held, dv_held):
+            st = _state()
+            for _i in range(K):
+                st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
+            return rssm.decode(st.feat).index_select(-1, cv_idx)
+
+        cv_base = _roll(a_base, dv0)
+        cv_mv = []
+        for j in range(len(mv_tgts)):
+            a_step = a_base.clone()
+            a_step[:, j] = a_step[:, j] + step
+            cv_mv.append(_roll(a_step, dv0))
+        cv_dv = []
+        if dv0 is not None:
+            for j in range(len(dv_tgts)):
+                dv_step = dv0.clone()
+                dv_step[:, j] = dv_step[:, j] + step
+                cv_dv.append(_roll(a_base, dv_step))
+        total = _huber_from_cv(cv_base, cv_mv, mv_tgts)
+        total = total + _huber_from_cv(cv_base, cv_dv, dv_tgts)
     loss = total / float(nterm)
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     return loss, diag
@@ -5789,9 +5859,11 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # drift properties.  p03 RCA (2026-07-09): the OVERSHOOT loss is the
     # OPEN-LOOP GAIN supervisor — gating it to every-other step slipped the MV
     # gain (5.7%→12.3% rel-err) and let the DV compound open-loop, so run
-    # OVERSHOOT EVERY step now (the compiled ``img_rollout`` keeps it cheap).
-    # The HELD-rollout (drift/stationarity, less gain-critical) stays
-    # every-other for the residual speedup.
+    # OVERSHOOT EVERY step now (``img_rollout`` is one K-loop; compile-on
+    # fuses it, eager still avoids per-start Python).  The HELD-rollout
+    # (drift/stationarity, less gain-critical) stays every-other.
+    # Gain-match (full-BPTT FD) batches baseline+per-input into the same
+    # ``img_rollout`` so MIMO width does not multiply sequential K-loops.
     # P28 follow-up 11: skip when g is frozen (DOB curriculum P2).  Same
     # reason as isolation extra unroll (follow-up 10): these K-step prior
     # rolls train encoder/decoder/GRU/cont-gain, which ``set_world_model_
