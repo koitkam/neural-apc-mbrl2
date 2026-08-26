@@ -1286,6 +1286,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **One attributed change vs P29 GPU job:** TrainConfig defaults that P29 never had at launch — `rssm_latent_type=deterministic`, compile **eager**, `skip_invalid_p3=True` (cap-time gain probe). Do **not** pass leftover `DREAMER_COMPILE=0` / latent / DOB / act-hist.
 - Skip-restore stays OFF. min-of-2 + freeze `return_scale` stay (valid actor test only if GAIN-READY).
 - **Judge by:** train-start `latent=deterministic compile=eager`; no `torch.compile` banner; P1 `kl≈0` / `jemb>0` / recon like P28; `[p1→p2] WM warm-restore SKIPPED`; if CAPPED, cap-time gain-probe. Val MV ~×1.0 ±0.1, DV not ×0.56. If GAIN_NOT_READY: `[p3-skip]`. If GAIN-READY: `return_scale` near warmup, `rtgt>0.015`, econ vs baseline **and** vs P27 BC −59.
+- **LIVE (2026-08-26 16:01, HEAD `2f0aec9`, tmux `mbrl2_p30`):** train-start `device=cuda bs=128 latent=deterministic compile=eager skip_invalid_p3=True`. `[resolved-cfg]` same + `gain_match=1 isolation=1 ss_match=3 n_critics=2 rs_freeze=True restore_p2=False`. No `torch.compile` banner. No leftover `[env-override]` (P29 had `dob_enabled=True`). `dob-ground` `n_dist=1`. Isolation cap=48 settle-only. **P1 iter 1:** `kl 0.000` `jemb 0.185` recon 0.497 `alive 1023` (P29 leftover was `kl~0.3` `jemb≡0` `alive~93`). Not yet a skip-restore A/B — wait P1 drop (P28 recon ~0.003 by iter 50) then `[p1→p2] WM warm-restore SKIPPED`.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 

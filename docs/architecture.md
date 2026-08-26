@@ -169,8 +169,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > poor). Skip-restore DID fire — still not an A/B. Actor INVALID
 > (`actor_experiment_valid` bookkeeping True; entropy-collapse @234; econ
 > −411 vs −83). Freeze `return_scale` 1.48→4.85 (KEEP). HEAD already has
-> deterministic + eager + `skip_invalid_p3`. Next GPU job: env-free P30
-> (`run_p30_deteager`). Validation now logs `wm_dv_gain_*` so MV-only
+> deterministic + eager + `skip_invalid_p3`. **P30 LIVE** (`run_p30_deteager`,
+> HEAD `2f0aec9`, 2026-08-26 16:01): env-free CUDA only. Train-start
+> `latent=deterministic compile=eager skip_invalid_p3=True device=cuda bs=128`.
+> `[resolved-cfg]` same + `gain_match=1 isolation=1 ss_match=3 n_critics=2
+> rs_freeze=True restore_p2=False`. No leftover `[env-override]`, no
+> `torch.compile` banner. Validation now logs `wm_dv_gain_*` so MV-only
 > `wm_gain_pass` cannot hide a biased DV.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
