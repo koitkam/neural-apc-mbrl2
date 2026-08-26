@@ -165,7 +165,19 @@ env-gated off · **[planned]** = designed, not yet built.
 > `settle_var` gate starved the DC-gain term. Isolation settle is now a
 > **whole-episode constant hold** at the stratified `isolated_level`
 > (`action_std=0`, others at 0). DV settle is one step at t=0 to
-> `isolated_level × amp`, MV held at 0.
+> `isolated_level × (span/2)` (MV-action units; follow-up 10 dropped the
+> extra `dv_prbs_op_frac` shrink), MV held at 0.
+> **P28 follow-up 10 (no GPU this session):** follow-up 9 reused
+> `dv_prbs_op_frac` as the DV isolation amplitude (`delta = isolated_level
+> × op_frac × span/2`). Isolation linspace is already in
+> `[-constant_action_seed_op_band, +…]` like the isolated MV, so DV steps
+> were 0.8× smaller than the matching MV action → smaller |ΔCV| →
+> absolute isolation/ss-match MSE under-trained DV (same family as
+> abs-Huber on unequal |tgt|). Isolation DV step is now MV-action-
+> isomorphic (`±1 ↔ ±half-span`). Isolation sample windows are
+> `max(seq_len, K+1)` so a slow plant with H > seq_len still reaches SS
+> (test_sim seq_len ≥ H unchanged). Isolation extra unroll is skipped
+> when `g` is frozen (DOB curriculum P2 — dead hot-path forward).
 
 ---
 

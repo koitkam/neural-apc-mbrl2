@@ -25,7 +25,9 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             collect_prbs_episode, _build_dv_prbs_schedule,
                             _isolated_hold_action, _hold_other_action_dims,
                             _isolation_settle_counts,
-                            _isolation_buf_capacity, _maybe_clean_steady_seed,
+                            _isolation_buf_capacity, _isolation_sample_seq_len,
+                            _dv_isolation_delta, _dynamics_g_trainable,
+                            _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
                             _should_warm_restore_wm_best)
@@ -369,16 +371,43 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         isolated_level=0.5)
     assert len(sched) == 1, sched
     assert sched[0]['start'] == 0 and sched[0]['source'] == 'dv_isolation_settle'
-    # amp = 0.8 * 0.5 * 10 = 4 → delta = 0.5 * 4 = 2
-    assert abs(float(sched[0]['delta']) - 2.0) < 1e-6, sched[0]
+    # Follow-up 10: isolated_level × span/2 (MV-action units).  span=10
+    # → delta = 0.5 * 5 = 2.5.  Extra dv_prbs_op_frac must NOT apply.
+    assert abs(float(sched[0]['delta']) - 2.5) < 1e-6, sched[0]
+    assert abs(_dv_isolation_delta(0.5, 10.0) - 2.5) < 1e-9
+    assert abs(_dv_isolation_delta(-0.6, 10.0) + 3.0) < 1e-9
+    assert _dv_isolation_delta(0.0, 10.0) == 0.0
     sched0 = _build_dv_prbs_schedule(
         _DvEnv(), _iso_cfg, long_hold=True, isolate_dv_idx=0,
         isolated_level=0.0)
     assert sched0 == []
     sched_prbs = _build_dv_prbs_schedule(_DvEnv(), _iso_cfg, long_hold=False)
     assert len(sched_prbs) > 1
+    assert all(e['source'] == 'dv_prbs_seed' for e in sched_prbs)
+    # Isolation windows must fit K (test_sim seq_len≥H → unchanged;
+    # slow plant seq_len < H → grow to K+1).
+    _sl = TrainConfig()
+    _sl.seq_len = 64
+    _sl.wm_input_isolation_len = 55
+    _sl.horizon = 55
+    _sl.episode_length = 1220
+    assert _isolation_sample_seq_len(_sl) == 64, _isolation_sample_seq_len(_sl)
+    _sl.wm_input_isolation_len = 120
+    _sl.horizon = 120
+    assert _isolation_sample_seq_len(_sl) == 121, _isolation_sample_seq_len(_sl)
+    _sl.episode_length = 80
+    assert _isolation_sample_seq_len(_sl) == 80, _isolation_sample_seq_len(_sl)
     print('[smoke] OK  isolation settle whole-episode hold (isolated_level, '
-          'action_std=0, DV one-step-at-t0)')
+          'action_std=0, DV MV-action-isomorphic, sample len ≥ K+1)')
+
+    # Frozen-g skip: isolation extra unroll is dead when DOB curriculum
+    # freezes the plant model (P2).  Restore g=True so later smokes stay live.
+    assert _dynamics_g_trainable(model)
+    model.set_world_model_trainable(g=False, dob=True, reward=True)
+    assert not _dynamics_g_trainable(model)
+    model.set_world_model_trainable(g=True, dob=False, reward=True)
+    assert _dynamics_g_trainable(model)
+    print('[smoke] OK  isolation skip when g frozen (_dynamics_g_trainable)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and

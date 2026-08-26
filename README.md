@@ -375,6 +375,8 @@ with τ+θ); inject **N** scales with `n_mv`/`n_dv`; isolation settle is
 test_sim 24+24 / isolation-buf cap 48 settle-only; distillation 4 MV + 1 DV →
 96+24 / cap 120). Isolation_buf does **not** ingest ordinary MIMO PRBS;
 long-hold settle is noise-free when `clean_steady_seeds` (default ON).
+Isolation DV settle uses MV-action units (`isolated_level × span/2`);
+sample windows are `max(seq_len, K+1)` so ss-match can reach SS.
 Warm-restore no-ops when `wm_best.pt` is essentially the current state.
 
 #### Reward-MTP / WM-coupling diagnostics (P39)

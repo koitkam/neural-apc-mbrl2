@@ -3019,6 +3019,54 @@ def _isolation_buf_capacity(
     return max(4, n_mv_s + n_dv_s)
 
 
+def _isolation_sample_seq_len(cfg: 'TrainConfig') -> int:
+    """Window length so isolation/ss-match can roll K steps to SS.
+
+    Isolation K auto-tunes to H.  WM ``seq_len`` is a separate context
+    derivation and can be < K (slow plant, or ``DREAMER_SEQ_LEN`` pin).
+    ``K = min(isolation_len, T-1)`` then never reaches the settle window
+    and ``settle_var`` starves DC-gain — the same symptom follow-up 9
+    fixed for intra-episode PRBS, but for *window length*.  Use
+    ``max(seq_len, K+1)`` capped at the episode.  test_sim
+    (seq_len ≥ 64, H≈55) is unchanged.
+    """
+    seq = max(2, int(getattr(cfg, 'seq_len', 64) or 64))
+    k = int(getattr(cfg, 'wm_input_isolation_len', 0)
+            or getattr(cfg, 'horizon', 15) or 15)
+    need = max(seq, int(k) + 1)
+    cap = max(2, int(getattr(cfg, 'episode_length', need) or need))
+    return int(min(need, cap))
+
+
+def _dynamics_g_trainable(model: 'DreamerV4') -> bool:
+    """True iff the plant model ``g`` (not DOB A,K) still takes gradients."""
+    dyn = getattr(model, 'dynamics', None)
+    if dyn is None:
+        return False
+    dob_names = ('dob_log_decay', 'dob_log_gain')
+    for n, p in dyn.named_parameters():
+        if n in dob_names:
+            continue
+        if p.requires_grad:
+            return True
+    return False
+
+
+def _dv_isolation_delta(isolated_level: Optional[float], span: float) -> float:
+    """Engineering DV step in MV-action units: ±1 ↔ ±half-span.
+
+    P28 follow-up 9 multiplied ``isolated_level`` by ``dv_prbs_op_frac``
+    (the ordinary all-DV PRBS band).  Isolation linspace is already in
+    ``[-constant_action_seed_op_band, +…]`` like the isolated MV, so the
+    extra op_frac shrank |ΔDV| vs |ΔMV| → smaller |ΔCV| → absolute
+    isolation/ss-match MSE under-trained DV (same family as abs-Huber
+    on unequal |tgt|).  Ordinary DV-PRBS still uses ``dv_prbs_op_frac``.
+    """
+    frac = 0.0 if isolated_level is None else float(
+        np.clip(isolated_level, -1.0, 1.0))
+    return float(frac * 0.5 * abs(float(span)))
+
+
 def _maybe_clean_steady_seed(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     """P89: noise-free held-action / isolation-settle seeds (override after reset)."""
     if bool(getattr(cfg, 'clean_steady_seeds', True)):
@@ -4077,11 +4125,12 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
     stratified level sequence.  Returns an empty list when the sim has no
     measured-DV channels (caller leaves the existing schedule untouched).
 
-    ``long_hold`` (P28 follow-up 9): one step at t=0 to
-    ``isolated_level × amp`` on the isolated DV, then hold for the rest
-    of the episode (DC-gain settle).  ``isolated_level`` is the same
-    normalized [-1, 1] units as MV action (seed linspace uses
-    ``constant_action_seed_op_band``).
+    ``long_hold`` (P28 follow-up 9/10): one step at t=0 to
+    ``isolated_level × (span/2)`` on the isolated DV, then hold for the
+    rest of the episode (DC-gain settle).  ``isolated_level`` is the
+    same normalized [-1, 1] units as MV action (seed linspace uses
+    ``constant_action_seed_op_band``).  Follow-up 10 dropped the extra
+    ``dv_prbs_op_frac`` factor so |ΔDV| matches |ΔMV| in half-span units.
 
     Why (RC-W1, p119–p127 DV-gain RCA): the WM's DV→CV gain is identified on
     the SLOW on-policy FEED motion (≈0.29 std OU) plus only ~1-5 sparse step
@@ -4100,19 +4149,16 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
         dv_chs = [dv_chs[i]] if 0 <= i < len(dv_chs) else []
     if not dv_chs:
         return []
-    op_frac = float(np.clip(getattr(cfg, 'dv_prbs_op_frac', 0.6), 0.05, 0.95))
     if long_hold:
         # Whole-episode hold at isolated_level (DC-gain).  One step at t=0;
         # delta=0 (level 0) is a valid baseline hold — emit nothing.
+        # MV-action-isomorphic: isolated_level ±1 ↔ ±half-span (follow-up 10).
         dv_schedule: List[Dict] = []
-        frac = 0.0 if isolated_level is None else float(
-            np.clip(isolated_level, -1.0, 1.0))
         for ch in dv_chs:
             b = ch.get('bounds')
             span = (float(b[1]) - float(b[0])) if (isinstance(b, list)
                                                     and len(b) >= 2) else 1.0
-            amp = op_frac * 0.5 * abs(span)
-            delta = float(frac * amp)
+            delta = _dv_isolation_delta(isolated_level, span)
             if abs(delta) < 1e-9:
                 continue
             dv_schedule.append({
@@ -4239,10 +4285,10 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     ``mv_level`` (normalized action space) sets the held MV operating
     point; vary it across the seed batch for MV-level coverage.
     ``long_hold`` + ``isolate_dv_idx`` is the isolation-settle path
-    (P28 follow-up 9): one DV, **one step at t=0** to ``isolated_level``
-    then hold, MV held at ``mv_level`` (seed uses 0 so ∂CV/∂DV is
-    unconfounded), hidden OU off, ``clean_steady_seeds`` zeros
-    process/measurement noise.  Returns
+    (P28 follow-up 9/10): one DV, **one step at t=0** to
+    ``isolated_level × (span/2)`` then hold, MV held at ``mv_level``
+    (seed uses 0 so ∂CV/∂DV is unconfounded), hidden OU off,
+    ``clean_steady_seeds`` zeros process/measurement noise.  Returns
     the same dict shape as ``collect_episode``.
     """
     from utils.training_disturbance import _channel_catalog
@@ -8650,14 +8696,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     # ---------- Isolated STEADY-STATE (settle) seed episodes (p08 RCA) ----------
     # Whole-episode isolated hold at a stratified ``_st_levels`` operating
-    # point (P28 follow-up 9): ONE input at that level, all others at 0,
-    # action_std=0, noise-free.  Random seq_len windows from isolation_buf
-    # are then settled (after the IC transient) so ``wm_ss_match``'s
-    # settle_var gate actually fires.  Follow-up 8 still PRBS-stepped
-    # inside the episode (T/4 cap) and dithered the isolated MV, and
-    # wired ``_st_levels`` to *other* MVs (no-op on test_sim).  These
-    # are the ONLY episodes written to ``isolation_buf`` (follow-up 8):
-    # ordinary MIMO PRBS / all-DV PRBS stay in the main replay buffer.
+    # point (P28 follow-up 9/10): ONE input at that level, all others at 0,
+    # action_std=0, noise-free.  DV step is MV-action-isomorphic
+    # (isolated_level × span/2, no extra dv_prbs_op_frac).  Sampled
+    # windows are max(seq_len, K+1) so ss-match can reach SS.  Follow-up
+    # 8 still PRBS-stepped inside the episode (T/4 cap) and dithered the
+    # isolated MV, and wired ``_st_levels`` to *other* MVs (no-op on
+    # test_sim).  These are the ONLY episodes written to ``isolation_buf``
+    # (follow-up 8): ordinary MIMO PRBS / all-DV PRBS stay in the main
+    # replay buffer.
     n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
     if isolation_buf is not None and n_settle > 0:
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
@@ -9668,17 +9715,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 else:
                     total_loss = wm_losses['wm_total']
 
-                # MIMO self-supervised per-INPUT isolation (P1/P2 only): the
-                # general nonlinear/black-box DV+MV gain supervisor.  Sample the
-                # isolated-excitation buffer + roll the prior ``sample=False`` so
-                # the gradient lands in the cont-gain channel (bypassing the
-                # categorical bottleneck that attenuates subdominant inputs).
+                # MIMO self-supervised per-INPUT isolation (P1, and P2 only
+                # while g still trains): isolated-excitation buffer + prior
+                # roll ``sample=False`` so the gradient lands in the cont-gain
+                # channel.  Skip when g is frozen (DOB curriculum P2) — the
+                # extra unroll cannot update frozen params (dead hot-path
+                # forward).  Window length is max(seq_len, K+1) so a slow
+                # plant's settle horizon still fits (test_sim unchanged).
                 if (isolation_buf is not None and isolation_buf.filled > 0
                         and current_phase in (1, 2)
+                        and _dynamics_g_trainable(model)
                         and float(getattr(cfg, 'wm_input_isolation_coef', 0.0)
                                   or 0.0) > 0.0):
-                    _iso_np = isolation_buf.sample(cfg.batch_size, cfg.seq_len,
-                                                   rng)
+                    _iso_np = isolation_buf.sample(
+                        cfg.batch_size, _isolation_sample_seq_len(cfg), rng)
                     _iso_obs = torch.from_numpy(_iso_np['obs']).to(device)
                     _iso_act = torch.from_numpy(_iso_np['act']).to(device)
                     with torch.amp.autocast(device_type=device.type,
