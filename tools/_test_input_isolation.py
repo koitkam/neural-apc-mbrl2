@@ -233,6 +233,57 @@ def main():
     print(f'[overshoot-c0] OK: overshoot {float(ov_a):.5f}→{float(ov_b):.5f} '
           f'(c-slice shift); held finite {float(hd_a):.5f} (gain-neutral)')
 
+    # ---- P28 follow-up 14: production path starts from posterior MEAN c,
+    # not the reparameterized sample packed into feat.  Shifting only the
+    # feat c-slice must NOT move overshoot/gain-match when c_mean is passed;
+    # shifting c_mean must.
+    with torch.no_grad():
+        feats_live, *_, cont = rssm.rollout_observed(obs, act, sample=True)
+    assert cont is not None and 'post_mean' in cont
+    c_mean = cont['post_mean'].detach().clone()
+    c_shift = c_mean.clone() + 1.0
+    feats_live_c = feats_live.detach().clone()
+    feats_live_shift = feats_live_c.clone()
+    feats_live_shift[..., _ze:_ze + rssm.cont_dim] = (
+        feats_live_shift[..., _ze:_ze + rssm.cont_dim] + 1.0)
+    torch.manual_seed(3)
+    ov_m0, _ = _wm_latent_overshoot_loss(
+        model, feats_live_c, obs, act, cfg, c_mean=c_mean)
+    torch.manual_seed(3)
+    ov_m_feat, _ = _wm_latent_overshoot_loss(
+        model, feats_live_shift, obs, act, cfg, c_mean=c_mean)
+    torch.manual_seed(3)
+    ov_m_mean, _ = _wm_latent_overshoot_loss(
+        model, feats_live_c, obs, act, cfg, c_mean=c_shift)
+    assert torch.isfinite(ov_m0).all() and torch.isfinite(ov_m_feat).all()
+    assert torch.isfinite(ov_m_mean).all()
+    assert abs(float(ov_m0) - float(ov_m_feat)) < 1e-7, (
+        'overshoot with c_mean must ignore feat c-slice (sample vs mean)')
+    assert abs(float(ov_m0) - float(ov_m_mean)) > 1e-8, (
+        'overshoot must follow posterior mean c')
+    cfg.gain_match_coef = 1.0
+    cfg.gain_match_len = 6
+    cfg.gain_match_mv_target = ((0.5,),)
+    cfg.gain_match_dv_target = ((0.2,),)
+    torch.manual_seed(4)
+    gm_m0, _ = _wm_gain_match_loss(
+        model, feats_live_c, obs, act, cfg, c_mean=c_mean)
+    torch.manual_seed(4)
+    gm_m_feat, _ = _wm_gain_match_loss(
+        model, feats_live_shift, obs, act, cfg, c_mean=c_mean)
+    torch.manual_seed(4)
+    gm_m_mean, _ = _wm_gain_match_loss(
+        model, feats_live_c, obs, act, cfg, c_mean=c_shift)
+    assert torch.isfinite(gm_m0).all() and torch.isfinite(gm_m_feat).all()
+    assert torch.isfinite(gm_m_mean).all()
+    assert abs(float(gm_m0) - float(gm_m_feat)) < 1e-7, (
+        'gain-match with c_mean must ignore feat c-slice')
+    assert abs(float(gm_m0) - float(gm_m_mean)) > 1e-8, (
+        'gain-match must follow posterior mean c')
+    print(f'[overshoot-c-mean] OK: feat-slice Δ={abs(float(ov_m0)-float(ov_m_feat)):.2e} '
+          f'(ignored); mean-shift {float(ov_m0):.5f}→{float(ov_m_mean):.5f}; '
+          f'gain-match mean-shift {float(gm_m0):.5f}→{float(gm_m_mean):.5f}')
+
 
 if __name__ == '__main__':
     main()

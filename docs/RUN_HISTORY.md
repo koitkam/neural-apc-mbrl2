@@ -1255,6 +1255,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Code follow-up 11 (no GPU this session):** follow-up 10 skipped only the isolation extra unroll. P2 `world_model_loss` still ran overshoot + held-rollout (~73% of the WM step) and full-BPTT gain-match (baseline + one K-step FD roll per input) after `g` was frozen. Those losses cannot update encoder/decoder/GRU/cont-gain; P2 is DOB A,K on recon + ground/reg. Skip the g-only aux when `_dynamics_g_trainable` is false (cadence counter still ticks). P1 unchanged.
 - **Code follow-up 12 (no GPU this session):** overshoot + held-rollout `img_rollout` dropped posterior `c` (RSSMState constructed from `h,z` only → `img_step` zero-fills `prev.c`). The open-loop gain supervisor (~73% of the P1 WM step) therefore trained a **c=0 GRU path** while isolation / gain-match / actor / transfer-matrix start from posterior `c` (p20 family). `img_rollout(..., c0=)` now threads it; omit ≡ zeros (back-compat). test_sim recipe unchanged.
 - **Code follow-up 13 (no GPU this session):** follow-up 10 grew *isolation_buf* windows to `max(seq_len, K+1)`, but P1/P2 still sampled the MAIN replay at `cfg.seq_len`. Overshoot (`K=min(K,T-1)`, needs future obs) and gain-match (`n_valid=T-K`) therefore truncated the identified settling length when `H >= seq_len` (slow plant or `DREAMER_SEQ_LEN` pin) — P25-family (forward Huber tiny, transfer-matrix DC dead). P1/P2 now sample `_wm_train_seq_len = max(seq_len, K+1)` (P3 on-policy stays `seq_len`). Gain-match no longer truncates open-loop `K` to `T-1` (held a/dv from the start; no future obs needed; test_sim T=64, K=55 start restriction unchanged). GPU probe uses the same T. Log: `wm_train_T=`. test_sim 64/55 unchanged.
+- **Code follow-up 14 (no GPU this session):** follow-up 12 threaded posterior `c` into overshoot/held `img_rollout`, but sliced it from `rollout_observed(sample=True)` feat (the reparameterized sample). p20 already rolls *subsequent* gain at the prior mean (`cont_gain_deterministic_roll`); the **first GRU step** still saw `c_sampled` → supervisor trained `E[f(c_sampled)]` while isolation / actor / transfer-matrix start from the posterior MEAN (`sample=False`). Open-loop aux (overshoot, held, gain-match, 1-step steady) now start from `cont['post_mean']`. Recon still uses the sample. `_rssm_steady_consistency` also threads `c` + measured DV (was zero-filling both; gated off on the P28 recipe). test_sim recipe unchanged.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
@@ -1265,7 +1266,7 @@ Still not sim-adaptive:
 - `rssm_latent_type` default still `categorical` (do not flip without a dedicated observer run)
 - `dv_feedforward=True` still appends measured DV to **head** feat (decoder half is off). `dv_as_input` is the symmetric path; do not re-add decoder FF.
 - `dv_prbs_seed_episodes=24` / `expert_seed_episodes=24` / `constant_action_seed_episodes=40` are flat episode counts (each DV-PRBS episode already sweeps every DV; episode length already scales with τ). `phase3_onpolicy_buffer_eps=16` is an on-policy episode count (same).
-- Isolation/ss-match trajectory MSE is still absolute (same family as abs Huber). Variance-normalized isolation is the next observer A/B **if** P28 DV ss stays ~×0.87 after follow-up 10 isomorphic |Δu| + follow-up 13 full-K gain-match — do not revive relative Huber.
+- Isolation/ss-match trajectory MSE is still absolute (same family as abs Huber). Variance-normalized isolation is the next observer A/B **if** P28 DV ss stays ~×0.87 after follow-up 10 isomorphic |Δu| + follow-up 13 full-K gain-match + follow-up 14 mean-c0 — do not revive relative Huber.
 
 ### Graveyard (P24–P28 observer / actor levers)
 
@@ -1297,6 +1298,7 @@ Still not sim-adaptive:
 | Isolation extra unroll skipped when g frozen | P28 follow-up 10 | KEPT | YES — DOB-curriculum P2 cannot update frozen g (dead hot-path) |
 | Skip overshoot / held-rollout / gain-match when g frozen | P28 follow-up 11 | KEPT | YES — same dead hot-path inside `world_model_loss`; ~73% of WM step + full-BPTT FD rolls |
 | `img_rollout` threads posterior `c` (overshoot/held) | P28 follow-up 12 | KEPT | YES — aux rolls started `c=None` → GRU saw zeros; supervisor ≠ isolation/gain-match/actor path (p20) |
+| Open-loop aux start from posterior MEAN c (not feat sample) | P28 follow-up 14 | KEPT | YES — follow-up 12 sliced sampled c from feat; first GRU step still E[f(c_sampled)] ≠ f(mean) |
 
 
 

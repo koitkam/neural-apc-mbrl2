@@ -206,6 +206,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > `seq_len`). Gain-match rolls the full open-loop `K` even when
 > `T <= K` (held a/dv; no future obs). GPU calib probes the same T.
 > test_sim (64 / H≈55) unchanged.
+> **P28 follow-up 14 (no GPU this session):** follow-up 12 threaded
+> posterior `c` into `img_rollout`, but sliced it from
+> `rollout_observed(sample=True)` feat — the reparameterized *sample*.
+> `cont_gain_deterministic_roll` already rolls *subsequent* gain at the
+> prior mean (p20), so the first GRU step was the remaining
+> `E[f(c_sampled)] ≠ f(mean)` hole vs isolation / actor / transfer-matrix
+> (`sample=False`). Open-loop aux (overshoot, held, gain-match, 1-step
+> steady) now start from `cont['post_mean']`. Recon still uses the
+> sample. test_sim recipe unchanged.
 
 ---
 

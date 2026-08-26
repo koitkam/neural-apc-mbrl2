@@ -816,15 +816,19 @@ class RSSMDynamics(nn.Module):
 
         ``h0`` (Bm, deter_dim), ``z0`` (Bm, n_categoricals, n_classes),
         ``actions`` (Bm, K, A), ``dvs`` (Bm, K, dv_dim) | None,
-        ``c0`` (Bm, cont_dim) | None = posterior continuous latent at the
-        start (gain + optional cont-dist).  ``c0=None`` with ``cont_dim>0``
-        zero-fills — same as ``img_step`` when ``prev.c is None``.  Returns
-        stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
+        ``c0`` (Bm, cont_dim) | None = posterior continuous latent MEAN at
+        the start (gain + optional cont-dist).  Prefer ``cont['post_mean']``
+        (P28 follow-up 14 / p20: isolation, actor, transfer-matrix are
+        ``sample=False`` = f(mean); slicing the sample from feat trains
+        ``E[f(c_sampled)]`` on the first GRU step).  ``c0=None`` with
+        ``cont_dim>0`` zero-fills — same as ``img_step`` when ``prev.c is None``.
+        Returns stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
 
         P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
         the open-loop gain supervisor trained a ``c=0`` GRU path while
         isolation / gain-match / the actor / transfer-matrix start from
         posterior ``c`` (p20 family: supervisor ≠ metric path).
+        Follow-up 14: pass the posterior MEAN, not the reparameterized sample.
 
         Compiled the SAME way as ``rollout_observed`` (see ``maybe_compile``):
         capturing the whole K-step ``img_step`` loop as ONE graph removes the

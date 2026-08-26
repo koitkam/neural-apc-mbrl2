@@ -4473,9 +4473,37 @@ def _steady_held_mask(obs: torch.Tensor, act: torch.Tensor,
     return held * settled
 
 
+def _openloop_c0(rssm, f0: torch.Tensor,
+                 c_mean: Optional[torch.Tensor] = None,
+                 starts: Optional[torch.Tensor] = None
+                 ) -> Optional[torch.Tensor]:
+    """Posterior continuous latent at open-loop start states.
+
+    P28 follow-up 14 / p20: ``img_step``'s first GRU consumes ``prev.c``.
+    ``rollout_observed(sample=True)`` packs the reparameterized *sample*
+    into feat, so slicing c from feat trains ``E[f(c_sampled)]``. Isolation,
+    the actor, and the transfer matrix start from the posterior MEAN
+    (``sample=False``). ``cont_gain_deterministic_roll`` already rolls
+    *subsequent* gain at the prior mean — this fills the first-step hole.
+
+    ``c_mean`` is ``(B, T, cont_dim)`` from ``cont['post_mean']``. ``starts``
+    indexes time. When ``c_mean`` is omitted, fall back to the feat c-slice
+    (direct unit-test calls / no-cont models).
+    """
+    cd = int(getattr(rssm, 'cont_dim', 0) or 0)
+    if cd <= 0:
+        return None
+    if c_mean is not None:
+        c = c_mean if starts is None else c_mean[:, starts]
+        return c.reshape(-1, cd)
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    return f0[..., _ze:_ze + cd].reshape(-1, cd)
+
+
 def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
                               obs: torch.Tensor, act: torch.Tensor,
                               cfg: TrainConfig,
+                              c_mean: Optional[torch.Tensor] = None,
                               ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Option (b), RSSM: held-action one-step fixed-point penalty.
 
@@ -4501,13 +4529,20 @@ def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z_flat = f[..., rssm.deter_dim:_ze]
     z = z_flat.reshape(Bm, rssm.n_categoricals, rssm.n_classes)
+    # Follow-up 12/14: start from posterior c (mean when supplied) and
+    # pass the measured DV — img_step zero-fills both when omitted, which
+    # is a different GRU path than overshoot / isolation / the actor.
+    t_idx = torch.arange(T - 1, device=device)
+    c = _openloop_c0(rssm, f, c_mean=c_mean, starts=t_idx)
+    dv_next = (obs[:, 1:].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+               if getattr(rssm, 'dv_dim', 0) > 0 else None)
     state = RSSMState(
         h=h,
         z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
                              device=device, dtype=f.dtype),
-        z=z)
+        z=z, c=c)
     a_next = act[:, 1:].reshape(Bm, -1)                # action driving t+1
-    nxt = rssm.img_step(state, a_next, sample=False)
+    nxt = rssm.img_step(state, a_next, dv=dv_next, sample=False)
     pred_obs = rssm.decode(nxt.feat).reshape(B, T - 1, -1)
     tgt = obs[:, 1:].detach()
     se = (pred_obs - tgt).pow(2).mean(dim=-1)          # (B, T-1)
@@ -4656,6 +4691,7 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
                                obs: torch.Tensor, act: torch.Tensor,
                                cfg: TrainConfig,
                                recon_loss: Optional[torch.Tensor] = None,
+                               c_mean: Optional[torch.Tensor] = None,
                                ) -> Tuple[torch.Tensor, float]:
     """Option #2 (P88): multi-step LATENT OVERSHOOTING — open-loop prior
     rollout accuracy.
@@ -4687,7 +4723,6 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
         return zero, 0.0
     if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
         return zero, 0.0
-    from models.dreamer_v4_rssm import RSSMState
     rssm = model.dynamics
     B, T = obs.shape[:2]
     K = min(K, T - 1)
@@ -4705,12 +4740,11 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
-    # Posterior continuous gain (feat = [h, z, (c), (dv), (d)]).  Must start
-    # the prior roll from this c — img_rollout used to omit it (c=0 GRU
-    # input) so overshoot trained a different path than isolation /
-    # gain-match / the actor (P28 follow-up 12 / p20 family).
-    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
-          if int(getattr(rssm, 'cont_dim', 0) or 0) > 0 else None)
+    # Posterior continuous gain (feat = [h, z, (c), (dv), (d)]).  Follow-up
+    # 12 threaded c so img_rollout no longer zero-fills; follow-up 14 uses
+    # the posterior MEAN when supplied so the first GRU step matches
+    # isolation / actor / transfer-matrix (sample=False), not E[f(c_sampled)].
+    c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     # Per-step REAL action + DV sequences for k=1..K (gathered ONCE).
     k_off = torch.arange(1, K + 1, device=device)                 # (K,)
     idx = starts.view(S, 1) + k_off.view(1, K)                    # (S, K) time idx
@@ -4766,6 +4800,7 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
                                         obs: torch.Tensor, act: torch.Tensor,
                                         cfg: TrainConfig,
                                         recon_loss: Optional[torch.Tensor] = None,
+                                        c_mean: Optional[torch.Tensor] = None,
                                         ) -> Tuple[torch.Tensor, float]:
     """Option (b2, P89): multi-step HELD-ACTION rollout stationarity.
 
@@ -4797,7 +4832,6 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
         return zero, 0.0
     if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
         return zero, 0.0
-    from models.dreamer_v4_rssm import RSSMState
     rssm = model.dynamics
     B, T = obs.shape[:2]
     win = max(1, int(getattr(cfg, 'wm_held_rollout_win', 8) or 8))
@@ -4817,8 +4851,7 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
-    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
-          if int(getattr(rssm, 'cont_dim', 0) or 0) > 0 else None)
+    c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     a_hold = act[:, starts].reshape(Bm, -1).detach()              # HELD action a_t
     # DV-as-input: hold the measured DV CONSTANT at its start value across the
     # rollout too — so this probes true held-(action+DV) stationarity and the
@@ -4884,7 +4917,8 @@ def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
 
 
 def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
-                        obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig
+                        obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig,
+                        c_mean: Optional[torch.Tensor] = None,
                         ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """C(1): finite-difference step-response asymptote gain-matching (RSSM).
 
@@ -4953,8 +4987,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z0 = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
-    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
-          if rssm.cont_dim > 0 else None)
+    # Follow-up 14: first GRU step of the FD roll must see posterior MEAN c
+    # (actor / TM / isolation path), not the sample packed into feat.
+    c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     cv_idx = rssm.cv_index_t
 
     def _state():
@@ -5071,8 +5106,8 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     if n_valid < 1:
         return zero
     # Frozen-observer encode → posterior features (mode); detached start states
-    # (like gain-match: the gradient trains the prior/decoder/cont-gain roll, not
-    # the encoder — the un-cheatable open-loop path).
+    # so the gradient trains the prior/decoder/cont-gain roll, not the encoder.
+    # Gain-match does NOT detach (P26 full-BPTT through the encoder).
     with torch.no_grad():
         feats, *_ = rssm.rollout_observed(obs, act, sample=False)
     feats = feats.detach()
@@ -5267,6 +5302,10 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     rssm = model.dynamics
     feats, post_logits, prior_logits, _last, ds, cont = rssm.rollout_observed(
         obs_cur, act, sample=True)               # feats (B,T,F); ds (B,T,n_cv)|None
+    # P28 follow-up 14: open-loop aux (overshoot / held / gain-match /
+    # 1-step steady) start from posterior MEAN c.  sample=True packed the
+    # reparameterized sample into feat; recon still uses that sample.
+    _c_mean = (cont.get('post_mean') if cont is not None else None)
     recon = rssm.decode(feats)                    # (B, T, obs_dim) = g(feat)
     # DOB (neural Kalman filter): add the disturbance estimate d_t into the CV
     # channels so the recon target the decoder/dynamics ``g`` must fit becomes
@@ -5424,7 +5463,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     steady_held_frac = 0.0
     if steady_coef > 0.0 and not _held_active:
         steady_loss, steady_diag = _rssm_steady_consistency(
-            model, feats, obs_cur, act, cfg)
+            model, feats, obs_cur, act, cfg, c_mean=_c_mean)
         steady_held_frac = float(steady_diag.get('wm_steady_held_frac', 0.0))
         wm_total = wm_total + steady_coef * steady_loss
 
@@ -5461,7 +5500,8 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
     if overshoot_coef > 0.0 and _g_live:
         overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
-            model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+            model, feats, obs_cur, act, cfg, recon_loss=recon_loss,
+            c_mean=_c_mean)
     else:
         overshoot_loss = torch.zeros((), device=feats.device)
         overshoot_starts = 0.0
@@ -5471,7 +5511,8 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
     if _run_held and held_coef > 0.0 and _g_live:
         held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
-            model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+            model, feats, obs_cur, act, cfg, recon_loss=recon_loss,
+            c_mean=_c_mean)
     else:
         held_loss = torch.zeros((), device=feats.device)
     wm_total = wm_total + held_coef * held_loss
@@ -5484,7 +5525,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     gm_coef = float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0)
     if gm_coef > 0.0 and _g_live:
         gain_match_loss, gain_match_diag = _wm_gain_match_loss(
-            model, feats, obs_cur, act, cfg)
+            model, feats, obs_cur, act, cfg, c_mean=_c_mean)
     else:
         gain_match_loss = torch.zeros((), device=feats.device)
         gain_match_diag = {}
