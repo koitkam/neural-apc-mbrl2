@@ -1705,13 +1705,12 @@ class TrainConfig:
     # exploded 0.004 → 0.50 (~125×); 5× still accepts mild recon jitter
     # and rejects a skip-storm detonation.  ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
     skip_storm_last_ok_recon_ratio: float = 5.0
-    # P39: reload fidelity-peak ``wm_best.pt`` at P1→P2 (healthy P1 only).
-    # After a P1 skip-storm last-ok restore this MUST stay False-effective
-    # — the next-iter phase transition would otherwise overwrite last-ok
-    # with the gain-blind peak (P28 follow-up 3 undone).  Healthy P1 still
-    # restores (p124: disabling it in curriculum mode regressed MV gain).
-    # ``DREAMER_WM_BEST_RESTORE_AT_P2``.
-    wm_best_restore_at_p2: bool = True
+    # P28 GPU RCA: fidelity-peak ``wm_best`` is gain-blind.  Restoring it
+    # at P1→P2 on a *healthy* P1 discarded 37 late-P1 iters (val MV ×0.52
+    # vs P26 ×0.97, which skipped only because gap < min_gap).  Default
+    # OFF: freeze end-of-P1 ``g``.  Skip-storm last-ok still blocks a
+    # reload if this is opted back on.  ``DREAMER_WM_BEST_RESTORE_AT_P2=1``.
+    wm_best_restore_at_p2: bool = False
     # P90: full-model reload at P2→P3.  Default OFF (wipes P2 reward/BC).
     wm_best_restore_at_p3: bool = False
     # Skip the boundary reload when ``total_iters - wm_best_iter`` is below
@@ -2806,11 +2805,10 @@ def _should_warm_restore_wm_best(
 ) -> bool:
     """Whether to reload ``wm_best.pt`` at a phase boundary.
 
-    Healthy P1→P2 still restores the fidelity peak (p124: turning this
-    off in curriculum mode regressed MV gain).  After a P1 skip-storm
-    last-ok restore the next iter IS the P1→P2 transition — reloading
-    ``wm_best`` would overwrite last-ok with the gain-blind spike that
-    skip-storm recovery exists to avoid.
+    Default OFF (P28 GPU RCA: gain-blind fidelity peak).  After a P1
+    skip-storm last-ok restore the next iter IS the P1→P2 transition —
+    reloading ``wm_best`` would overwrite last-ok even if this flag is
+    opted back on.
     """
     if skip_storm_recovered:
         return False
@@ -8354,16 +8352,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     expert_inject_n = int(getattr(cfg, 'expert_inject_n', 3) or 0)
     expert_inject_in_p3 = bool(getattr(cfg, 'expert_inject_in_p3', True))
     # ----- wm_best.pt warm-restore at P1→P2 (P39, 2026-05-22) -----
-    # When the WM's fidelity peak is reached well before P1 ends and the
-    # subsequent iters drift to a lower-quality basin (P38: peak iter 50,
-    # collapse by iter 70), starting critic training from the final P1
-    # weights hands P2 an already-degraded WM.  Restoring wm_best.pt at
-    # the P1→P2 boundary gives critic training the cleanest available
-    # latent dynamics.  Skipped when wm_best.pt is essentially the
-    # current state (gap < ``min_gap``) to avoid wasted I/O.  Disable
-    # with DREAMER_WM_BEST_RESTORE_AT_P2=0.  After skip-storm last-ok this
-    # reload is skipped (see ``_should_warm_restore_wm_best``).
-    wm_best_restore_at_p2 = bool(getattr(cfg, 'wm_best_restore_at_p2', True))
+    # P28 GPU RCA: default OFF (gain-blind fidelity peak).  Opt in with
+    # DREAMER_WM_BEST_RESTORE_AT_P2=1.  After skip-storm last-ok this
+    # reload is skipped even if opted in (see ``_should_warm_restore_wm_best``).
+    wm_best_restore_at_p2 = bool(getattr(cfg, 'wm_best_restore_at_p2', False))
+    print(f'[p1→p2] wm_best_restore_at_p2={wm_best_restore_at_p2} '
+          f'(OFF freezes end-of-P1 g; ON reloads fidelity-peak wm_best)',
+          flush=True)
     # ----- wm_best.pt warm-restore at P2→P3 (P90, 2026-06-06) -----
     # The WM keeps training through P2 (paper Algorithm 1 co-trains it during
     # critic warmup), but its held-action fixed point is UNSTABLE — the probe
@@ -8486,14 +8481,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f'reward={_fz["reward"]} tensors; disturbance prob=0; '
                   f'domain_randomization={"OFF in P1/P2 (clean WM/DOB id) -> ON in P3 (real-plant DR)" if (_dr_gated and _dr_found) else "on"}).',
                   flush=True)
-        # NOTE (2026-06-16, p124 RCA): the p123 experiment that DISABLED the
-        # P1->P2 wm_best warm-restore in curriculum mode was REVERTED — it
-        # regressed the MV gain (warm-restore OFF p124 MV 0.849 vs ON p121-123
-        # avg 0.926).  P1 recon is non-monotonic (p124: bottoms iter40 0.085,
-        # rises to iter70 0.108), so freezing the END-of-P1 WM froze a WORSE
-        # checkpoint than wm_best.  The warm-restore (P39 default) stays ON; the
-        # real gain fix is the CV-weighted overshoot loss (supervises the
-        # open-loop CV gain directly), not the checkpoint-selection policy.
+        # P28 GPU RCA (supersedes p124): curriculum P1→P2 wm_best restore
+        # is OFF by default.  p124's small ON vs OFF delta (MV 0.926 vs
+        # 0.849) does not hold when the fidelity peak is early and
+        # gain-blind (P28 restored iter 60, discarded 37 late-P1 iters,
+        # val MV ×0.52; P26 skipped restore via min_gap and froze MV
+        # ×0.97).  Opt in with DREAMER_WM_BEST_RESTORE_AT_P2=1.
     wm_best_restore_min_gap = int(
         getattr(cfg, 'wm_best_restore_min_gap', 10) or 10)
     # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
@@ -9255,7 +9248,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # very next iter, and wm_best is the gain-blind peak.
                 _wb_exists = bool(wm_best_ckpt_path is not None
                                   and wm_best_ckpt_path.exists())
-                if (skip_storm_p1_recovered and wm_best_restore_at_p2):
+                if skip_storm_p1_recovered:
                     print('[p1→p2] WM warm-restore SKIPPED: skip-storm already '
                           f'restored {skip_storm_restore_source} (iter '
                           f'{skip_storm_restore_iter}); wm_best is gain-blind '
@@ -9335,6 +9328,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         print(f"[p1→p2] WM warm-restore failed: {_e} "
                               f"— continuing with current weights",
                               flush=True)
+                else:
+                    if not wm_best_restore_at_p2:
+                        _skip_why = ('default-off — freeze end-of-P1 g '
+                                     '(P28 RCA: gain-blind wm_best)')
+                    elif not _wb_exists:
+                        _skip_why = 'wm_best.pt missing'
+                    elif int(wm_best_iter) <= 0:
+                        _skip_why = 'no wm_best.pt yet'
+                    else:
+                        _skip_why = (
+                            f'gap {total_iters - wm_best_iter} '
+                            f'< min_gap {wm_best_restore_min_gap}')
+                    print(f'[p1→p2] WM warm-restore SKIPPED ({_skip_why})',
+                          flush=True)
                 # P90: freeze the WM CORE for P2+P3 (after the restore) so the
                 # critic warms up on the exact WM P3 uses and the fixed point
                 # can't re-drift.  Freeze dynamics (+ tokenizer for SF); KEEP

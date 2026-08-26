@@ -201,10 +201,10 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _actor_experiment_valid(skip_storm_source=None,
                                        gain_not_ready_capped=True)
     assert float(TrainConfig().skip_storm_last_ok_recon_ratio) == 5.0
-    assert bool(TrainConfig().wm_best_restore_at_p2) is True
+    assert bool(TrainConfig().wm_best_restore_at_p2) is False
     assert bool(TrainConfig().wm_best_restore_at_p3) is False
     assert int(TrainConfig().wm_best_restore_min_gap) == 10
-    # Healthy P1→P2 still restores wm_best (p124).
+    # Helper still restores when explicitly enabled (opt-in).
     assert _should_warm_restore_wm_best(
         restore_enabled=True, skip_storm_recovered=False,
         wm_best_iter=20, total_iters=80, min_gap=10, wm_best_exists=True)
