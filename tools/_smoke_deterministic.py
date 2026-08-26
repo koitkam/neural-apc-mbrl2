@@ -15,7 +15,7 @@ Verifies, WITHOUT a real env, that:
      ``wm_total.backward()`` works; P3 imagination is finite for deterministic.
 
 Run:
-  cd ~/neural-APC-mbrl2 && CUDA_VISIBLE_DEVICES="" DREAMER_COMPILE=0 PYTHONPATH=$PWD \
+  cd ~/neural-APC-mbrl2-cursor && CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
     ~/neural-APC-mbrl2-env/bin/python tools/_smoke_deterministic.py
 """
 import torch

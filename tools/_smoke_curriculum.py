@@ -12,15 +12,15 @@ the properties that make the staged Kalman/DOB identification correct:
     (frozen) -> the observer is identified on the fixed plant (identifiable).
   Stage 3 (actor):    g + DOB both FROZEN, reward trainable ->
     recon backward gives NO gradient to g or DOB (the WM is static); the
-    actor/critic train via imagination (covered by the existing rssm smoke).
+    actor/critic train on real-sim rollouts (covered by the rssm smoke).
 
 Also checks: set_world_model_trainable partitions requires_grad exactly;
 set_dob_active toggles d_t between zero (suppressed) and non-zero (active);
 feat width stays core+n_cv across stages (no head-dim hiccup).
 
 Run (CPU):
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD DREAMER_COMPILE=0 \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_curriculum.py
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
+  ~/neural-APC-mbrl2-env/bin/python tools/_smoke_curriculum.py
 """
 import sys
 from pathlib import Path

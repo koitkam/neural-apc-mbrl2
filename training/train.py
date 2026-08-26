@@ -5001,7 +5001,7 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     roll_feats = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True,
                                   c0=c0)                          # (Bm,K,F)
     preds = rssm.decode(roll_feats).reshape(B, S, K, -1)          # (B, S, K, D)
-    total = zero
+    tgt = obs[:, idx].detach()                                    # (B, S, K, D)
     # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
     # contraction (decomp 1step→openloop ×0.876; probe: sampled open-loop gain
     # 0.79 vs real, and sample=False is WORSE 0.32 → the gain lives in the
@@ -5017,19 +5017,23 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # early transient less — which the 1-step recon/KL already cover).
     # ``tail_power=0`` recovers the exact uniform mean.  Sim-agnostic (unitless
     # step fraction), backbone-agnostic.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
+    # Vectorized over K (same as the old per-step ``_weighted_recon_mse``
+    # loop: mean_{B,S,D} then weighted mean_k).  Eager P30: this was 55
+    # Python MSE calls per WM step.
     tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 0.0) or 0.0)
-    wsum = 0.0
-    # Per-step CV-weighted MSE on the PRE-DECODED rollout (no per-step decode /
-    # img_step launches now — those are batched above).  The CV-weight (p124)
-    # keeps the small-variance CV step-response from being drowned by the
-    # high-variance MV/DV channels so the open-loop gain stays supervised.
-    for ki in range(K):
-        pred = preds[:, :, ki]                                    # (B, S, D)
-        tgt = obs[:, idx[:, ki]].detach()                        # (B, S, D)
-        w_k = (float(ki + 1) / float(K)) ** tail_power if tail_power > 0.0 else 1.0
-        total = total + w_k * _weighted_recon_mse(pred, tgt, cfg)
-        wsum += w_k
-    loss = total / max(wsum, 1e-8)
+    se = (preds.float() - tgt.float()).pow(2)
+    ch_w = _recon_channel_weights(cfg, int(preds.shape[-1]),
+                                  preds.device, torch.float32)
+    if ch_w is not None:
+        se = se * ch_w.view(*([1] * (se.dim() - 1)), -1)
+    mse_k = se.mean(dim=(0, 1, 3))                                # (K,)
+    if tail_power > 0.0:
+        k_idx = torch.arange(1, K + 1, device=mse_k.device,
+                             dtype=mse_k.dtype)
+        wk = (k_idx / float(K)) ** tail_power
+    else:
+        wk = torch.ones(K, device=mse_k.device, dtype=mse_k.dtype)
+    loss = (mse_k * wk).sum() / wk.sum().clamp_min(1e-8)
     # Soft recon-fidelity gate: ramp the term in only as 1-step recon converges
     # (early P1 the WM can't predict multi-step; an ungated term would swamp the
     # encoder/decoder).  ``gate_recon<=0`` disables.
@@ -5125,6 +5129,30 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     return loss, float(S)
 
 
+def _recon_channel_weights(cfg: TrainConfig, n_ch: int, device,
+                           dtype) -> Optional[torch.Tensor]:
+    """Per-channel recon weights, or ``None`` for uniform ``F.mse_loss``.
+
+    CV (and optional DV) up-weighting is renormalised to mean 1.0 so the
+    overall recon magnitude is unchanged.  ``None`` ⇔ identity path.
+    """
+    cv_w = float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0)
+    cv_idx = tuple(getattr(cfg, 'cv_obs_indices', ()) or ())
+    dv_w = float(getattr(cfg, 'wm_recon_dv_weight', 1.0))
+    dv_idx = tuple(getattr(cfg, 'dv_indices', ()) or ())
+    dv_active = (dv_w != 1.0 and len(dv_idx) > 0)
+    if (cv_w == 1.0 or not cv_idx) and not dv_active:
+        return None
+    w = torch.ones(int(n_ch), device=device, dtype=dtype)
+    valid_cv = [int(i) for i in cv_idx if 0 <= int(i) < n_ch]
+    if cv_w != 1.0 and valid_cv:
+        w[torch.tensor(valid_cv, device=device, dtype=torch.long)] = cv_w
+    valid_dv = [int(i) for i in dv_idx if 0 <= int(i) < n_ch]
+    if dv_active and valid_dv:
+        w[torch.tensor(valid_dv, device=device, dtype=torch.long)] = dv_w
+    return w * (float(w.numel()) / w.sum().clamp_min(1e-8))
+
+
 def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
                         cfg: TrainConfig) -> torch.Tensor:
     """Reconstruction MSE with optional CV-channel up-weighting.
@@ -5140,22 +5168,10 @@ def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
     shifts toward the CV.  ``cv_weight == 1.0`` or no CV indices ⇒ byte-for-byte
     ``F.mse_loss`` (identity = p106-baseline).  Backbone-agnostic.
     """
-    cv_w = float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0)
-    cv_idx = tuple(getattr(cfg, 'cv_obs_indices', ()) or ())
-    dv_w = float(getattr(cfg, 'wm_recon_dv_weight', 1.0))
-    dv_idx = tuple(getattr(cfg, 'dv_indices', ()) or ())
-    dv_active = (dv_w != 1.0 and len(dv_idx) > 0)
-    if (cv_w == 1.0 or not cv_idx) and not dv_active:
+    w = _recon_channel_weights(cfg, int(target.shape[-1]),
+                               target.device, torch.float32)
+    if w is None:
         return F.mse_loss(recon, target)
-    D = int(target.shape[-1])
-    w = torch.ones(D, device=target.device, dtype=torch.float32)
-    valid_cv = [int(i) for i in cv_idx if 0 <= int(i) < D]
-    if cv_w != 1.0 and valid_cv:
-        w[torch.tensor(valid_cv, device=target.device, dtype=torch.long)] = cv_w
-    valid_dv = [int(i) for i in dv_idx if 0 <= int(i) < D]
-    if dv_active and valid_dv:
-        w[torch.tensor(valid_dv, device=target.device, dtype=torch.long)] = dv_w
-    w = w * (float(w.numel()) / w.sum().clamp_min(1e-8))  # renorm: mean→1.0
     se = (recon.float() - target.float()).pow(2)           # (..., D)
     return (se * w).mean()
 
@@ -5393,16 +5409,12 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     w_frac = float(getattr(cfg, 'wm_ss_match_window_frac', 0.34) or 0.34)
     ss_var = float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0)
     ss_k0 = K - max(1, int(round(min(max(w_frac, 0.05), 0.9) * K)))
-    total = zero
-    cv_pred_win = []
+    feat_steps = []
     _tbptt = int(getattr(cfg, 'aux_tbptt_steps', 16) or 0)
     for k in range(K):
         dvk = dv_all[:, k] if dv_all is not None else None
         st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
-        cv_pred = rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
-        total = total + (cv_pred - cv_real[:, k]).pow(2).mean()
-        if ss_coef > 0.0 and k >= ss_k0:
-            cv_pred_win.append(cv_pred)
+        feat_steps.append(st.feat)
         # Truncated BPTT (p24 RCA / p25 RCA): bound the GRU path so a
         # marginally-stable recurrence can't explode, but NEVER cut the
         # continuous gain channel ``c`` and NEVER cut inside the
@@ -5411,14 +5423,19 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
                 and (ss_coef <= 0.0 or k < ss_k0 - 1)
                 and hasattr(st, 'detach')):
             st = st.detach(keep_c=True)
-    traj = coef * (total / float(K))
+    # One decode of (Bm, K, F).  Pointwise MLP ⇒ same as K per-step
+    # decodes; mean_{Bm,K,CV} MSE ≡ mean_k mean_{Bm,CV} of the old loop.
+    # TBPTT still detaches ``h`` between chunks (feats keep their graphs).
+    cv_pred = rssm.decode(torch.stack(feat_steps, dim=1)).index_select(
+        -1, cv_idx)                                               # (Bm, K, n_cv)
+    traj = coef * (cv_pred - cv_real).pow(2).mean()
     extras: Dict[str, torch.Tensor] = {
         'wm_isolation_traj_loss': traj.detach(),
     }
     out = traj
-    if ss_coef > 0.0 and cv_pred_win:
-        pred_ss = torch.stack(cv_pred_win, dim=1).mean(dim=1)     # (Bm, n_cv)
-        real_win = cv_real[:, ss_k0:ss_k0 + len(cv_pred_win)]     # (Bm, W, n_cv)
+    if ss_coef > 0.0 and ss_k0 < K:
+        pred_ss = cv_pred[:, ss_k0:].mean(dim=1)                  # (Bm, n_cv)
+        real_win = cv_real[:, ss_k0:]                             # (Bm, W, n_cv)
         ss_err = (pred_ss - real_win.mean(dim=1)).pow(2)         # (Bm, n_cv)
         if ss_var > 0.0:
             # Option 1: only SETTLED sequences carry a DC-gain signal — weight by

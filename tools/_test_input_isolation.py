@@ -146,9 +146,9 @@ def main():
     print(f'[gain-match] OK: full-BPTT asymptote trains cont-gain '
           f'({cont_grad_gm:.4e})')
 
-    # ---- P26 RCA / P27: RELATIVE Huber equalizes MV vs subdominant DV ----
-    # Absolute Huber on |tgt_mv|>>|tgt_dv| under-weights the DV residual.
-    # Relative (err = (g-tgt)/|tgt|) makes a same-ratio error cost the same.
+    # ---- P27 DISCARDED relative Huber (keep opt-in path finite) ----
+    # Relative (err = (g-tgt)/|tgt|) exploded full-BPTT (skip-storm @P1
+    # iter 50).  Default stays absolute; this only checks the A/B path.
     cfg.gain_match_relative = 0.0
     model.zero_grad(set_to_none=True)
     gm_abs, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)

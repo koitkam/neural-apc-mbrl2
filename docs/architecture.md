@@ -175,7 +175,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > `[resolved-cfg]` same + `gain_match=1 isolation=1 ss_match=3 n_critics=2
 > rs_freeze=True restore_p2=False`. No leftover `[env-override]`, no
 > `torch.compile` banner. Validation now logs `wm_dv_gain_*` so MV-only
-> `wm_gain_pass` cannot hide a biased DV.
+> `wm_gain_pass` cannot hide a biased DV. **P30 P1 iter 17 (2026-08-26 16:55):**
+> recon 0.0098, `kl=0`, `jemb=0.036`, alive 1024, skip 0 — tracking P26/P28
+> (not P29 leftover). GPU occupied; no second job. HEAD eager-path opt
+> (batched isolation decode + vectorized overshoot MSE) is for the *next*
+> launch; the live process is still `2f0aec9`.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

@@ -7,11 +7,12 @@ env:
   * V4 heads on RSSM feat (reward MTP, value, policy).
   * train.world_model_loss   (P1/P2 WM loss)
   * train.agent_finetune_loss (P2 BC + reward MTP)
-  * train._realsim_actor_critic_step    (P3 actor/critic via RSSM imagination)
+  * train._realsim_actor_critic_step    (P3 actor/critic on real-sim rollouts)
 
 All outputs must be finite.  Run:
-  CONTROL_SETUP_JSON=... PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_rssm.py
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
+  CONTROL_SETUP_JSON=$PWD/simulation/test_sim/control_setup.json \
+  ~/neural-APC-mbrl2-env/bin/python tools/_smoke_rssm.py
 """
 import torch
 

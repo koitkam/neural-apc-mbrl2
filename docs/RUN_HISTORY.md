@@ -1286,7 +1286,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **One attributed change vs P29 GPU job:** TrainConfig defaults that P29 never had at launch — `rssm_latent_type=deterministic`, compile **eager**, `skip_invalid_p3=True` (cap-time gain probe). Do **not** pass leftover `DREAMER_COMPILE=0` / latent / DOB / act-hist.
 - Skip-restore stays OFF. min-of-2 + freeze `return_scale` stay (valid actor test only if GAIN-READY).
 - **Judge by:** train-start `latent=deterministic compile=eager`; no `torch.compile` banner; P1 `kl≈0` / `jemb>0` / recon like P28; `[p1→p2] WM warm-restore SKIPPED`; if CAPPED, cap-time gain-probe. Val MV ~×1.0 ±0.1, DV not ×0.56. If GAIN_NOT_READY: `[p3-skip]`. If GAIN-READY: `return_scale` near warmup, `rtgt>0.015`, econ vs baseline **and** vs P27 BC −59.
-- **LIVE (2026-08-26 16:01, HEAD `2f0aec9`, tmux `mbrl2_p30`):** train-start `device=cuda bs=128 latent=deterministic compile=eager skip_invalid_p3=True`. `[resolved-cfg]` same + `gain_match=1 isolation=1 ss_match=3 n_critics=2 rs_freeze=True restore_p2=False`. No `torch.compile` banner. No leftover `[env-override]` (P29 had `dob_enabled=True`). `dob-ground` `n_dist=1`. Isolation cap=48 settle-only. **P1 iter 1:** `kl 0.000` `jemb 0.185` recon 0.497 `alive 1023` (P29 leftover was `kl~0.3` `jemb≡0` `alive~93`). Not yet a skip-restore A/B — wait P1 drop (P28 recon ~0.003 by iter 50) then `[p1→p2] WM warm-restore SKIPPED`.
+- **LIVE (2026-08-26 16:55, tmux `mbrl2_p30`, GPU ~19 GB):** still P1. Launch confirmed det+eager. **P1 iter 17:** recon **0.0098** `kl=0` `jemb=0.036` gmatch 0.0018 iso 0.0021 `ss_wmean=1.00` alive **1024** skip **0** (P28 iter 14 recon 0.012 / P26 0.010; P29 leftover recon ~0.29 alive ~93). t_wm ~160–165 s = P26/P28 eager, not P29 compile. Fidelity probe iter 10 `best_h=1/55` (gain-blind spike — restore is OFF so this is WATCH-only). Wait recon ~0.003 by ~iter 50, then skip-restore SKIPPED. **No second GPU job.** HEAD now has eager-path opt (batched isolation decode + vectorized overshoot MSE; same mean) for the *next* launch — P30 process is still `2f0aec9`.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
@@ -1300,6 +1300,7 @@ Still not sim-adaptive:
 - `run_plan.json → config` is now rewritten after gain-match resolve (`[resolved-cfg]`). Pre-rewrite dump is dataclass defaults (P29 plan still shows `rssm_latent_type=categorical` / `gain_match_coef=0` even though training auto-enabled grounding).
 - Validation `wm_gain_pass` is still **MV-only**. HEAD logs `wm_dv_gain_*` + `wm_dv_ss_ratio_worst` (P29 HEALTHY MV rel_err 0.10 hid DV ×0.56). Does not change `wm_gain_pass`.
 - P30 launch: env-free `cursor/p28` (deterministic + eager). Do not pass leftover P26 env-vars (`DREAMER_COMPILE=0`, `DREAMER_RSSM_LATENT_TYPE`, `DREAMER_DOB_ENABLED`, `DREAMER_ACT_HIST_REQUIRED`). Opt-in compile is `DREAMER_COMPILE=1`. Live iter banner prints `kl`/`jemb`/`iso`/`ss`. jsonl: `wm_ss_match_loss`, `wm_ss_match_wmean`, `wm_isolation_traj_loss`. `skip_invalid_p3` default-on.
+- Eager WM-aux (GPU occupied, P30 unchanged): isolation K-step decode is one batched MLP forward (same mean MSE as the per-step loop; TBPTT `keep_c` unchanged). Overshoot tail-weighted MSE is vectorized over K (same `mean_{B,S,D}` then weighted `mean_k`). Smoke: `_test_input_isolation`, `_smoke_rssm` (5 configs), `_smoke_wm_fixes`, `_smoke_deterministic`. Smoke recipes no longer pass leftover `DREAMER_COMPILE=0`.
 ### Graveyard (P24–P28 observer / actor levers)
 
 | Lever | Tried | Status | Root-cause? |
@@ -1344,7 +1345,8 @@ Still not sim-adaptive:
 | P1 CAPPED skips gain probe if plateau failed | P29 P3 | KEPT (cap-time re-probe) | YES — iter 75 GAIN_NOT_READY 3.05@MV vanished from the cap line; `actor_experiment_valid` would stay True |
 | Warn-and-still-train P3 on GAIN_NOT_READY | P28/P29 | KEPT (`skip_invalid_p3=True`) | YES — hours of INVALID actor; observer val still runs on `final.pt` |
 | MV-only `wm_gain_pass` hid DV ×0.56 | P29 val | KEPT (log `wm_dv_gain_*`; MV gate unchanged) | YES — P29 HEALTHY rel_err 0.10 while DV ss ×0.56 |
-| `tools/run_nl_then_p09.sh` leftover DOB/act-hist/COMPILE=0 | P29 GPU-occupied | KEPT (stripped) | YES — same leftover-env class as P29 launch |
+| Isolation K-step per-decode + overshoot Python MSE loop (eager) | P30-live GPU-occupied | KEPT (batched decode / vectorized MSE, same mean) | YES — extra hot-path forwards; compile leftover was full-model not this |
+| `tools/_smoke_*.py` leftover `DREAMER_COMPILE=0` + mbrl-env path | P30-live GPU-occupied | KEPT (stripped; eager is default) | YES — same leftover-env class as P29 launch |
 
 
 
