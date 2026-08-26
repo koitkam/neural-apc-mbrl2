@@ -198,6 +198,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_PHASE3_FRAC':        ('phase3_frac',                float),
     'DREAMER_LR_CRITIC':          ('lr_critic',                  float),
     'DREAMER_LR_ACTOR':           ('lr_actor',                   float),
+    'DREAMER_LR_WORLD':           ('lr_world',                   float),
+    'DREAMER_BC_SCALE':           ('bc_scale',                   float),
     # 2026-05-24 (P48 RCA): structural γ/H mismatch fix.  See
     # auto_tune_seed_buffer in training/train.py for adaptive formula.
     'DREAMER_GAMMA':              ('gamma',                      float),
@@ -258,8 +260,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.
     'DREAMER_CONST_ACTION_SEEDS': ('constant_action_seed_episodes', int),
-    # P1 re-inject cadence (P28 follow-up 5): EVERY auto-scales from
-    # buffer lap unless explicit; 0 disables.  N and IN_P2/P3 stay as set.
+    # P1 re-inject cadence (P28 follow-up 5/6): EVERY auto-scales from
+    # buffer lap; N auto-scales from n_mv/n_dv.  Explicit env wins; 0 disables.
     'DREAMER_CONST_ACTION_INJECT_EVERY':  ('const_action_inject_every',      int),
     'DREAMER_CONST_ACTION_INJECT_N':      ('const_action_inject_n',          int),
     'DREAMER_CONST_ACTION_INJECT_IN_P2':  ('const_action_inject_in_p2',      _as_bool),
@@ -498,6 +500,16 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_ES_ENT_PATIENCE':            ('early_stop_entropy_collapse_patience_iters', int),
     'DREAMER_ES_ENT_WINDOW':              ('early_stop_entropy_collapse_window_iters',   int),
     'DREAMER_ES_ENT_MIN_BELOW':           ('early_stop_entropy_collapse_min_frac_below', float),
+    # Were only in train.py ``_cfg_from_env`` — single_run/bo silently ignored them.
+    'DREAMER_ES_CRITIC_FACTOR':           ('early_stop_critic_divergence_factor', float),
+    'DREAMER_ES_CRITIC_PATIENCE':         ('early_stop_critic_divergence_patience_iters', int),
+    'DREAMER_ES_CASCADE_REWVAR':          ('early_stop_cascade_min_rew_var_frac', float),
+    'DREAMER_ES_CASCADE_GROWTH':          ('early_stop_cascade_min_return_scale_growth', float),
+    'DREAMER_ES_CASCADE_PATIENCE':        ('early_stop_cascade_patience_iters', int),
+    'DREAMER_ES_GRADSKIP_WINDOW':         ('early_stop_grad_skip_window_iters', int),
+    'DREAMER_ES_GRADSKIP_MAX':            ('early_stop_grad_skip_max', int),
+    'DREAMER_ES_P1_MIN_SF_DROP':          ('early_stop_p1_min_sf_drop_frac', float),
+    'DREAMER_ES_P2_MAX_RMTP':             ('early_stop_p2_max_reward_mtp_loss', float),
     # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),
@@ -599,10 +611,9 @@ def apply_dreamer_env_overrides(cfg) -> Iterable[str]:
 
     Returns the iterable of field names that were overridden.
 
-    NOTE: ``training/train.py``'s ``_cfg_from_env()`` only runs when
-    ``train.py`` is invoked as a CLI; when ``single_run.py`` or
-    ``bo_runner.py`` is the entry-point we must perform the binding
-    ourselves.
+    NOTE: ``training/train.py``'s ``_cfg_from_env()`` (CLI) now also
+    calls this function after architecture extras, so both entry-points
+    share one ``DREAMER_*`` contract.
     """
     overridden = []
     for env_k, (field, cast) in ENV_OVERRIDES.items():

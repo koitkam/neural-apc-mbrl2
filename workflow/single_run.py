@@ -356,12 +356,11 @@ def main() -> int:
     # *after* dataclass construction so auto-tune (which compares
     # against the dataclass default to decide whether to overwrite)
     # treats env-injected values as user overrides and skips them.
-    # Note: ``training/train.py``'s ``_cfg_from_env()`` only runs when
-    # train.py is invoked as a CLI; when ``single_run.py`` is the
-    # entry-point we must perform the binding ourselves.  The whitelist
-    # lives in ``workflow/_plant_prepare.ENV_OVERRIDES`` and is shared
-    # with ``workflow/bo_runner.py`` so future knobs only need to be
-    # added in one place.
+    # Note: ``training/train.py``'s ``_cfg_from_env()`` (CLI) now calls
+    # the same whitelist.  The whitelist lives in
+    # ``workflow/_plant_prepare.ENV_OVERRIDES`` and is shared with
+    # ``workflow/bo_runner.py`` so future knobs only need to be added
+    # in one place.
     apply_dreamer_env_overrides(cfg)
 
     plan = {

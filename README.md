@@ -357,18 +357,21 @@ steady-state behaviour. Mitigations:
 | Var | Effect |
 |---|---|
 | `DREAMER_CONST_ACTION_INJECT_EVERY` | Inject N fresh const-action episodes every K P1 iters. Dataclass default 20 is the **test_sim sentinel**; `_resolve_inject_cadence` sets `K = round(0.30 × buffer_lap)` unless explicit (`0` disables). test_sim stays 20. |
-| `DREAMER_CONST_ACTION_INJECT_N` | Episodes per injection (default 5, stratified across `constant_action_seed_op_band`). |
+| `DREAMER_CONST_ACTION_INJECT_N` | Episodes per injection. Dataclass default 5 is the **test_sim sentinel**; `_resolve_inject_cadence` sets `max(5, n_mv+n_dv)` unless explicit (`0` disables). test_sim stays 5. |
 | `DREAMER_STEP_TEST_INJECT_EVERY` | Same lap-fraction as const-inject (test_sim 20). `0` disables. |
+| `DREAMER_STEP_TEST_INJECT_N` | `max(2, n_mv+n_dv)` (test_sim 2; ≥1 episode per input channel per shot). |
 | `DREAMER_DV_PRBS_INJECT_EVERY` | DV-PRBS cadence: `min(round(0.15 × lap), warmup/4)` (test_sim 10; p122: land before typical `wm_best`). `0` disables. |
+| `DREAMER_DV_PRBS_INJECT_N` | `max(2, n_mv)` MV-hold levels while sweeping all DVs (test_sim 2). |
 | `DREAMER_EXPERT_INJECT_EVERY` | Expert-demo cadence (same 0.30×lap as const; test_sim 20). |
+| `DREAMER_EXPERT_INJECT_N` | `max(3, n_mv)` (test_sim 3). |
 | `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (default 1; set 0 to disable). **Skipped after a P1 skip-storm last-ok restore** so the gain-blind fidelity peak cannot overwrite last-ok. Healthy P1 still restores. |
 | `DREAMER_WM_BEST_RESTORE_AT_P3` | Reload `wm_best.pt` at P2→P3 (default 0; also skipped after skip-storm). |
 | `DREAMER_WM_BEST_RESTORE_MIN_GAP` | Skip restore when `total_iters - wm_best_iter` is below this (default 10). |
 
 Both knobs are sim-agnostic and adaptive: injection cadence is a
 fraction of the replay-buffer FIFO lap (episode length already scales
-with τ+θ); warm-restore no-ops when `wm_best.pt` is essentially the
-current state.
+with τ+θ); inject **N** scales with `n_mv`/`n_dv`; warm-restore no-ops
+when `wm_best.pt` is essentially the current state.
 
 #### Reward-MTP / WM-coupling diagnostics (P39)
 

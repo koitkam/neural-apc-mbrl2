@@ -1188,6 +1188,11 @@ class TrainConfig:
     # often and a faster plant less often.  Episode length is already
     # ``k·(τ+θ)``, so this is f(buffer turnover / τ) with no engineering
     # units.  ``0`` disables.  Explicit ``DREAMER_*_INJECT_EVERY`` wins.
+    # Inject N (P28 follow-up 6): dataclass 5/2/2/3 are test_sim sentinels
+    # (1 MV + 1 DV).  ``_resolve_inject_cadence`` replaces them with
+    # ``max(sentinel, f(n_mv, n_dv))`` so a MIMO plant gets ≥1 episode per
+    # input channel per shot (step-test) and ≥1 MV-hold per DV-PRBS sweep.
+    # Explicit ``DREAMER_*_INJECT_N`` wins.  ``0`` disables.
     const_action_inject_every: int = 20
     const_action_inject_n: int = 5
     const_action_inject_in_p2: bool = False
@@ -2882,27 +2887,52 @@ def _resolve_one_inject_every(
     return int(auto_i)
 
 
+def _resolve_one_inject_n(
+        cfg: 'TrainConfig', field: str, sentinel: int, auto: int) -> int:
+    """Keep 0=off, explicit/non-sentinel, else the per-channel auto value."""
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    cur = int(getattr(cfg, field, sentinel) or 0)
+    if cur <= 0:
+        setattr(cfg, field, 0)
+        return 0
+    if field in explicit or cur != int(sentinel):
+        return cur
+    auto_i = max(1, int(auto))
+    setattr(cfg, field, int(auto_i))
+    return int(auto_i)
+
+
 def _resolve_inject_cadence(
-        cfg: 'TrainConfig', *, log: bool = False) -> Dict[str, int]:
-    """Scale P1 re-inject EVERY from buffer-lap; keep test_sim at 20/10.
+        cfg: 'TrainConfig', *, n_mv: int = 1, n_dv: int = 1,
+        log: bool = False) -> Dict[str, int]:
+    """Scale P1 re-inject EVERY from buffer-lap and N from n_mv/n_dv.
 
-    Const / step-test / expert: 0.30 of a lap → 20 of ~66 on test_sim
-    (~3 injects per FIFO lap, the P39 dilution fix).  DV-PRBS: 0.15 of
-    a lap → 10 of ~66, also capped at ``wm_fidelity_warmup_iters/4`` so
-    ≥4 injects land before a typical early ``wm_best`` (p122: cadence
-    20→10 so injects fire inside the restored window instead of after
-    it and getting rolled back).
+    Cadence (follow-up 5): const / step-test / expert = 0.30 of a lap →
+    20 of ~66 on test_sim (~3 injects per FIFO lap, the P39 dilution
+    fix).  DV-PRBS: 0.15 of a lap → 10 of ~66, also capped at
+    ``wm_fidelity_warmup_iters/4`` so ≥4 injects land before a typical
+    early ``wm_best`` (p122).
 
-    Dataclass 20/20/10/20 are the test_sim sentinels (like
-    ``aux_tbptt_steps=16``).  Explicit ``DREAMER_*_INJECT_EVERY`` wins.
-    ``0`` disables (not auto — 0 has always meant off).
+    Count (follow-up 6): dataclass 5/2/2/3 are the test_sim sentinels
+    (1 MV + 1 DV).  Auto:
+      * const  ``max(5, n_mv+n_dv)``  — operating-point sweep
+      * step-test ``max(2, n_mv+n_dv)`` — ≥1 episode per input channel
+      * DV-PRBS ``max(2, n_mv)`` — MV-hold levels while sweeping all DVs
+      * expert ``max(3, n_mv)`` — demos scale with actuators
+    Distillation (4 MV + 1 DV) becomes 5/5/4/4.  Explicit
+    ``DREAMER_*_INJECT_{EVERY,N}`` wins.  ``0`` disables.
     """
     lap = _buffer_lap_iters(cfg)
     warmup = max(1, int(getattr(cfg, 'wm_fidelity_warmup_iters', 40) or 40))
+    n_mv_i = max(0, int(n_mv or 0))
+    n_dv_i = max(0, int(n_dv or 0))
+    n_in = n_mv_i + n_dv_i
     const_auto = int(round(lap * 0.30))
     dv_auto = min(int(round(lap * 0.15)), max(5, warmup // 4))
     out = {
         'lap_iters': int(round(lap)),
+        'n_mv': n_mv_i,
+        'n_dv': n_dv_i,
         'const_action_inject_every': _resolve_one_inject_every(
             cfg, 'const_action_inject_every', 20, const_auto),
         'step_test_inject_every': _resolve_one_inject_every(
@@ -2911,6 +2941,14 @@ def _resolve_inject_cadence(
             cfg, 'dv_prbs_inject_every', 10, dv_auto),
         'expert_inject_every': _resolve_one_inject_every(
             cfg, 'expert_inject_every', 20, const_auto),
+        'const_action_inject_n': _resolve_one_inject_n(
+            cfg, 'const_action_inject_n', 5, max(5, n_in)),
+        'step_test_inject_n': _resolve_one_inject_n(
+            cfg, 'step_test_inject_n', 2, max(2, n_in)),
+        'dv_prbs_inject_n': _resolve_one_inject_n(
+            cfg, 'dv_prbs_inject_n', 2, max(2, n_mv_i)),
+        'expert_inject_n': _resolve_one_inject_n(
+            cfg, 'expert_inject_n', 3, max(3, n_mv_i)),
     }
     if log:
         print(
@@ -2918,10 +2956,14 @@ def _resolve_inject_cadence(
             f'(cap={int(cfg.buffer_capacity_steps)} / '
             f'ep_len={int(cfg.episode_length)} / '
             f'ep_per_iter={int(cfg.ep_per_iter)}); '
+            f'n_mv={n_mv_i} n_dv={n_dv_i}; '
             f'const/step/expert every={out["const_action_inject_every"]}/'
             f'{out["step_test_inject_every"]}/{out["expert_inject_every"]} '
+            f'n={out["const_action_inject_n"]}/'
+            f'{out["step_test_inject_n"]}/{out["expert_inject_n"]} '
             f'dv-prbs every={out["dv_prbs_inject_every"]} '
-            f'(test_sim sentinels 20/20/10/20; 0=off)',
+            f'n={out["dv_prbs_inject_n"]} '
+            f'(test_sim sentinels every 20/20/10/20 n 5/2/2/3; 0=off)',
             flush=True)
     return out
 
@@ -7872,8 +7914,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # steady-state behaviour even while its short-horizon next-state
     # loss continues to improve.  Periodically inject fresh const-action
     # episodes during P1 to keep the steady-state regime represented in
-    # the buffer.  Cadence is f(buffer lap): see ``_resolve_inject_cadence``.
-    _resolve_inject_cadence(cfg, log=True)
+    # the buffer.  Cadence is f(buffer lap); N is f(n_mv, n_dv).
+    _n_mv_inj = int(len(getattr(env.sim, 'mv_indices', []) or []))
+    _n_dv_inj_ch = int(len(getattr(env.sim, 'dv_indices', []) or []))
+    _resolve_inject_cadence(
+        cfg, n_mv=_n_mv_inj, n_dv=_n_dv_inj_ch, log=True)
     const_inject_every = int(getattr(cfg, 'const_action_inject_every', 20) or 0)
     const_inject_n = int(getattr(cfg, 'const_action_inject_n', 5) or 0)
     # P49 RCA (2026-05-25): WM steady-state probe still shows 0%
@@ -10615,164 +10660,62 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 # CLI
 # ---------------------------------------------------------------------------
 
+# Architecture / runtime keys that ``workflow._plant_prepare.ENV_OVERRIDES``
+# does not own (those are plant-derived in ``single_run`` / ``bo_runner``).
+# ``_cfg_from_env`` applies these first, then the shared whitelist, so
+# ``python -m training.train`` honors the same ``DREAMER_*`` contract.
+_CLI_ONLY_ENV = (
+    ('DREAMER_D_MODEL', 'd_model', int),
+    ('DREAMER_N_LAYERS', 'n_layers', int),
+    ('DREAMER_N_HEADS', 'n_heads', int),
+    ('DREAMER_FF_MULT', 'ff_mult', int),
+    ('DREAMER_N_REGISTER', 'n_register', int),
+    ('DREAMER_Z_DIM', 'z_dim', int),
+    ('DREAMER_TOK_HIDDEN', 'tok_hidden', int),
+    ('DREAMER_HEAD_HIDDEN', 'head_hidden', int),
+    ('DREAMER_K_MAX', 'k_max', int),
+    ('DREAMER_LOOKBACK', 'lookback', int),
+    ('DREAMER_BATCH_SIZE', 'batch_size', int),
+    ('DREAMER_PMPO_BETA', 'pmpo_beta', float),
+    ('DREAMER_PMPO_ALPHA', 'pmpo_alpha', float),
+    ('DREAMER_MAE_PMAX', 'mae_p_max', float),
+    ('DREAMER_POLICY_TYPE', 'policy_type', str),
+    ('DREAMER_POLICY_INIT_LOG_STD', 'policy_init_log_std', float),
+    ('DREAMER_ACTOR_LOSS', 'actor_loss_type', str),
+    ('DREAMER_GRAD_CLIP', 'grad_clip', float),
+    ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
+    ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
+    ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
+    ('DREAMER_ATTN_IMPL', 'attn_impl', str),
+    ('DREAMER_COMPILE_MODE', 'compile_mode', str),
+    ('AGENT_TOTAL_STEPS', 'total_steps', int),
+    ('SIM_EPISODE_LENGTH', 'episode_length', int),
+    ('SIM_SAMPLE_RATE', 'sample_rate', int),
+    ('CONTROLLER_OUT_DIR', 'out_dir', str),
+)
+
+
 def _cfg_from_env() -> TrainConfig:
+    """CLI entry: architecture extras + shared ``ENV_OVERRIDES`` whitelist.
+
+    P28 follow-up 6: the duplicate loop here silently dropped 130+ knobs
+    that ``single_run`` already honors (aux TBPTT, skip-storm, n_critics,
+    grad-skip max, …).  Apply the shared whitelist so both entry points
+    share one contract.
+    """
     cfg = TrainConfig()
     explicit: set = set()
-    for name, attr, cast in [
-        ('DREAMER_D_MODEL', 'd_model', int),
-        ('DREAMER_N_LAYERS', 'n_layers', int),
-        ('DREAMER_N_HEADS', 'n_heads', int),
-        ('DREAMER_FF_MULT', 'ff_mult', int),
-        ('DREAMER_N_REGISTER', 'n_register', int),
-        ('DREAMER_Z_DIM', 'z_dim', int),
-        ('DREAMER_TOK_HIDDEN', 'tok_hidden', int),
-        ('DREAMER_HEAD_HIDDEN', 'head_hidden', int),
-        ('DREAMER_K_MAX', 'k_max', int),
-        ('DREAMER_LOOKBACK', 'lookback', int),
-        ('DREAMER_HORIZON', 'horizon', int),
-        ('DREAMER_SEQ_LEN', 'seq_len', int),
-        ('DREAMER_BATCH_SIZE', 'batch_size', int),
-        ('DREAMER_PHASE1_FRAC', 'phase1_frac', float),
-        ('DREAMER_PHASE2_FRAC', 'phase2_frac', float),
-        ('DREAMER_PHASE3_FRAC', 'phase3_frac', float),
-        ('DREAMER_PMPO_BETA', 'pmpo_beta', float),
-        ('DREAMER_PMPO_ALPHA', 'pmpo_alpha', float),
-        ('DREAMER_BC_SCALE', 'bc_scale', float),
-        ('DREAMER_MAE_PMAX', 'mae_p_max', float),
-        ('DREAMER_MTP_LENGTH', 'mtp_length', int),
-        ('DREAMER_POLICY_TYPE', 'policy_type', str),
-        ('DREAMER_POLICY_INIT_LOG_STD', 'policy_init_log_std', float),
-        ('DREAMER_POLICY_LOG_STD_MIN', 'policy_log_std_min', float),
-        ('DREAMER_POLICY_LOG_STD_MAX', 'policy_log_std_max', float),
-        ('DREAMER_PMPO_ENTROPY_COEF', 'pmpo_entropy_coef', float),
-        ('DREAMER_ACTOR_LOSS', 'actor_loss_type', str),
-        ('DREAMER_GRAD_CLIP', 'grad_clip', float),
-        ('DREAMER_LR_ACTOR', 'lr_actor', float),
-        ('DREAMER_LR_CRITIC', 'lr_critic', float),
-        ('DREAMER_LR_WORLD', 'lr_world', float),
-        ('DREAMER_GAE_LAMBDA', 'gae_lambda', float),
-        ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
-        ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
-        ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
-        ('DREAMER_P3_COLLECT_EVERY', 'phase3_collect_every_iters', int),
-        ('DREAMER_P3_ONPOLICY_BUFFER_EPS', 'phase3_onpolicy_buffer_eps', int),
-        ('DREAMER_P3_ONPOLICY_PREFILL_EPS', 'phase3_onpolicy_prefill_eps', int),
-        ('DREAMER_BUFFER_CAP_STEPS', 'buffer_capacity_steps', int),
-        ('DREAMER_ATTN_IMPL', 'attn_impl', str),
-        ('DREAMER_COMPILE_MODE', 'compile_mode', str),
-        ('AGENT_TOTAL_STEPS', 'total_steps', int),
-        ('SIM_EPISODE_LENGTH', 'episode_length', int),
-        ('SIM_SAMPLE_RATE', 'sample_rate', int),
-        ('CONTROLLER_OUT_DIR', 'out_dir', str),
-        # ----- Early-stop overrides -----
-        ('DREAMER_EARLY_STOP', 'early_stop_enable',
-            lambda v: bool(int(v))),
-        ('DREAMER_ES_P3_PATIENCE', 'early_stop_p3_patience_iters', int),
-        ('DREAMER_ES_P3_MIN_IMPROVEMENT',
-            'early_stop_p3_min_improvement', float),
-        ('DREAMER_ES_ENT_FRAC', 'early_stop_entropy_collapse_frac', float),
-        ('DREAMER_ES_ENT_PATIENCE',
-            'early_stop_entropy_collapse_patience_iters', int),
-        ('DREAMER_ES_ENT_WINDOW',
-            'early_stop_entropy_collapse_window_iters', int),
-        ('DREAMER_ES_ENT_MIN_BELOW',
-            'early_stop_entropy_collapse_min_frac_below', float),
-        ('DREAMER_ES_CRITIC_FACTOR',
-            'early_stop_critic_divergence_factor', float),
-        ('DREAMER_ES_CRITIC_PATIENCE',
-            'early_stop_critic_divergence_patience_iters', int),
-        # 2026-05-23 (P41 RCA): bootstrap-cascade canary thresholds.
-        ('DREAMER_ES_CASCADE_REWVAR',
-            'early_stop_cascade_min_rew_var_frac', float),
-        ('DREAMER_ES_CASCADE_GROWTH',
-            'early_stop_cascade_min_return_scale_growth', float),
-        ('DREAMER_ES_CASCADE_PATIENCE',
-            'early_stop_cascade_patience_iters', int),
-        ('DREAMER_ES_GRADSKIP_WINDOW',
-            'early_stop_grad_skip_window_iters', int),
-        ('DREAMER_ES_GRADSKIP_MAX', 'early_stop_grad_skip_max', int),
-        ('DREAMER_ES_P1_MIN_SF_DROP',
-            'early_stop_p1_min_sf_drop_frac', float),
-        ('DREAMER_ES_P2_MAX_RMTP',
-            'early_stop_p2_max_reward_mtp_loss', float),
-        ('DREAMER_WM_BEST_RESTORE_AT_P2', 'wm_best_restore_at_p2',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_WM_BEST_RESTORE_AT_P3', 'wm_best_restore_at_p3',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_WM_BEST_RESTORE_MIN_GAP', 'wm_best_restore_min_gap', int),
-        # 2026-05-26 (P52 RCA): phase-transition quality gates.
-        ('DREAMER_P1_GATE_WM_EMA_MIN', 'p1_gate_wm_ema_min', float),
-        ('DREAMER_P1_GATE_PLATEAU_FRAC', 'p1_gate_plateau_frac', float),
-        ('DREAMER_P1_GATE_PLATEAU_PROBES', 'p1_gate_plateau_probes', int),
-        ('DREAMER_P1_GATE_MAX_EXTENSION', 'p1_gate_max_extension', float),
-        ('DREAMER_P1_GAIN_GATE', 'p1_gain_gate',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_GAIN_READY_LO', 'gain_ready_lo', float),
-        ('DREAMER_GAIN_READY_HI', 'gain_ready_hi', float),
-        ('DREAMER_GAIN_READY_LEVELS', 'gain_ready_levels', int),
-        ('DREAMER_GAIN_READY_NOISE_MAX', 'gain_ready_noise_max', float),
-        ('DREAMER_GAIN_READY_FLIP_MAX', 'gain_ready_flip_max', int),
-        ('DREAMER_WM_BEST_GAIN_GATE', 'wm_best_gain_gate',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_WM_FIDELITY_EMA_ALPHA', 'wm_fidelity_ema_alpha', float),
-        ('DREAMER_WM_FIDELITY_WARMUP_ITERS', 'wm_fidelity_warmup_iters', int),
-        ('DREAMER_WM_FIDELITY_PATIENCE_ITERS', 'wm_fidelity_patience_iters', int),
-        ('DREAMER_WM_FIDELITY_CONV_PROBE', 'wm_fidelity_conv_probe',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_WM_FIDELITY_CONV_WEIGHT', 'wm_fidelity_conv_weight', float),
-        ('DREAMER_WM_FIDELITY_RECON_WEIGHT', 'wm_fidelity_recon_weight', float),
-        ('DREAMER_WM_FIDELITY_GAIN_WEIGHT', 'wm_fidelity_gain_weight', float),
-        ('DREAMER_WM_FIDELITY_GAIN_GATE_RECON', 'wm_fidelity_gain_gate_recon', float),
-        ('DREAMER_WM_PROBE_EVERY_ITERS', 'wm_probe_every_iters', int),
-        ('DREAMER_HORIZON_R_FLOOR', 'horizon_r_floor', float),
-        ('DREAMER_WM_CONVERGE_EPS_STD', 'wm_converge_eps_std', float),
-        ('DREAMER_CONST_ACTION_INJECT_EVERY', 'const_action_inject_every', int),
-        ('DREAMER_CONST_ACTION_INJECT_N', 'const_action_inject_n', int),
-        ('DREAMER_CONST_ACTION_INJECT_IN_P2', 'const_action_inject_in_p2',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_CONST_ACTION_INJECT_IN_P3', 'const_action_inject_in_p3',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_STEP_TEST_INJECT_EVERY', 'step_test_inject_every', int),
-        ('DREAMER_STEP_TEST_INJECT_N', 'step_test_inject_n', int),
-        ('DREAMER_STEP_TEST_INJECT_IN_P2', 'step_test_inject_in_p2',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_STEP_TEST_INJECT_IN_P3', 'step_test_inject_in_p3',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_DV_PRBS_INJECT_EVERY', 'dv_prbs_inject_every', int),
-        ('DREAMER_DV_PRBS_INJECT_N', 'dv_prbs_inject_n', int),
-        ('DREAMER_DV_PRBS_INJECT_IN_P2', 'dv_prbs_inject_in_p2',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_DV_PRBS_INJECT_IN_P3', 'dv_prbs_inject_in_p3',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_EXPERT_INJECT_EVERY', 'expert_inject_every', int),
-        ('DREAMER_EXPERT_INJECT_N', 'expert_inject_n', int),
-        ('DREAMER_EXPERT_INJECT_IN_P3', 'expert_inject_in_p3',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_P2_GATE_REWARD_MTP_MAX', 'p2_gate_reward_mtp_max', float),
-        ('DREAMER_P2_GATE_RECENT_ITERS', 'p2_gate_recent_iters', int),
-        ('DREAMER_P2_GATE_MAX_EXTENSION', 'p2_gate_max_extension', float),
-        # 2026-05-30 (P70): RSSM imagination steady-state fix.
-        ('DREAMER_RSSM_IMAG_LATENT_MODE', 'rssm_imag_latent_mode',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        # 2026-05-31 (P73): bounded training reward (cascade root-cause fix).
-        ('DREAMER_BOUND_TRAINING_REWARD', 'bound_training_reward',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_BOUND_TRAINING_REWARD_MAX', 'bound_training_reward_max', float),
-        ('DREAMER_BOUND_TRAINING_REWARD_REF', 'bound_training_reward_ref', float),
-        # 2026-05-31 (P74): advantage clipping (Cursor stabilizer #3).
-        ('DREAMER_ADVANTAGE_CLIP', 'advantage_clip', float),
-    ]:
+    for name, attr, cast in _CLI_ONLY_ENV:
         v = os.environ.get(name)
         if v is not None and v != '':
             setattr(cfg, attr, cast(v))
             explicit.add(attr)
-    # Stash explicitly-set field names so the auto-tune apply loop can
-    # skip them even when the env-injected value equals the dataclass
-    # default (e.g. paper-faithful log_std_max=0.0).
     try:
         cfg._explicit_fields = explicit  # type: ignore[attr-defined]
     except Exception:
         pass
+    from workflow._plant_prepare import apply_dreamer_env_overrides
+    apply_dreamer_env_overrides(cfg)
     return cfg
 
 

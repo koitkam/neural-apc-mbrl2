@@ -21,7 +21,7 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             _steady_held_mask, _critic_anchor_lambda,
                             _critic_anchor_coef, _force_p1_cap_at,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
-                            _resolve_inject_cadence,
+                            _resolve_inject_cadence, _cfg_from_env,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
                             _should_warm_restore_wm_best)
@@ -226,35 +226,57 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _inj.buffer_capacity_steps = 400_000
     _inj.ep_per_iter = 5
     assert abs(_buffer_lap_iters(_inj) - 65.57377) < 0.01
-    _got = _resolve_inject_cadence(_inj)
+    _got = _resolve_inject_cadence(_inj, n_mv=1, n_dv=1)
     assert _got['const_action_inject_every'] == 20, _got
     assert _got['step_test_inject_every'] == 20, _got
     assert _got['dv_prbs_inject_every'] == 10, _got
     assert _got['expert_inject_every'] == 20, _got
+    assert _got['const_action_inject_n'] == 5, _got
+    assert _got['step_test_inject_n'] == 2, _got
+    assert _got['dv_prbs_inject_n'] == 2, _got
+    assert _got['expert_inject_n'] == 3, _got
     _slow = TrainConfig()
     _slow.episode_length = 4000
     _slow.buffer_capacity_steps = 400_000
     _slow.ep_per_iter = 5
-    _sg = _resolve_inject_cadence(_slow)
+    _sg = _resolve_inject_cadence(_slow, n_mv=1, n_dv=1)
     assert _sg['const_action_inject_every'] == 6, _sg   # 20-iter lap × 0.30
     assert _sg['dv_prbs_inject_every'] == 5, _sg        # floor 5
     _fast = TrainConfig()
     _fast.episode_length = 500
     _fast.buffer_capacity_steps = 400_000
     _fast.ep_per_iter = 5
-    _fg = _resolve_inject_cadence(_fast)
+    _fg = _resolve_inject_cadence(_fast, n_mv=1, n_dv=1)
     assert _fg['const_action_inject_every'] == 48, _fg  # 160-iter lap × 0.30
     assert _fg['dv_prbs_inject_every'] == 10, _fg       # capped at warmup/4
     _off = TrainConfig()
     _off.episode_length = 1220
     _off.const_action_inject_every = 0
-    assert _resolve_inject_cadence(_off)['const_action_inject_every'] == 0
+    _off.step_test_inject_n = 0
+    _og = _resolve_inject_cadence(_off, n_mv=1, n_dv=1)
+    assert _og['const_action_inject_every'] == 0
+    assert _og['step_test_inject_n'] == 0
     _ex = TrainConfig()
     _ex.episode_length = 4000
     _ex.const_action_inject_every = 20
     _ex._explicit_fields = {'const_action_inject_every'}
-    assert _resolve_inject_cadence(_ex)['const_action_inject_every'] == 20
-    print('[smoke] OK  inject cadence sim-adaptive (test_sim 20/10; 0=off)')
+    assert _resolve_inject_cadence(_ex, n_mv=1, n_dv=1)['const_action_inject_every'] == 20
+    # P28 follow-up 6: inject N is f(n_mv, n_dv).  distillation 4 MV + 1 DV.
+    _mimo = TrainConfig()
+    _mimo.episode_length = 1220
+    _mimo.buffer_capacity_steps = 400_000
+    _mimo.ep_per_iter = 5
+    _mg = _resolve_inject_cadence(_mimo, n_mv=4, n_dv=1)
+    assert _mg['const_action_inject_n'] == 5, _mg      # max(5, 5)
+    assert _mg['step_test_inject_n'] == 5, _mg         # max(2, 5)
+    assert _mg['dv_prbs_inject_n'] == 4, _mg           # max(2, 4)
+    assert _mg['expert_inject_n'] == 4, _mg            # max(3, 4)
+    _exn = TrainConfig()
+    _exn.episode_length = 1220
+    _exn.step_test_inject_n = 2
+    _exn._explicit_fields = {'step_test_inject_n'}
+    assert _resolve_inject_cadence(_exn, n_mv=4, n_dv=1)['step_test_inject_n'] == 2
+    print('[smoke] OK  inject cadence sim-adaptive (test_sim 20/10 n 5/2/2/3; 0=off)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
@@ -338,6 +360,37 @@ def _sim_dims(setup_path: str):
     return state_dim, action_dim
 
 
+def _test_cfg_from_env_whitelist() -> None:
+    """train.py CLI must honor ENV_OVERRIDES (P28 follow-up 6)."""
+    import os
+    keys = {
+        'DREAMER_AUX_TBPTT_STEPS': '9',
+        'DREAMER_SKIP_STORM_RECOVER_P1': '0',
+        'DREAMER_ES_GRADSKIP_MAX': '11',
+        'DREAMER_N_CRITICS': '3',
+        'DREAMER_STEP_TEST_INJECT_N': '7',
+    }
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ.update(keys)
+        cfg = _cfg_from_env()
+        assert int(cfg.aux_tbptt_steps) == 9, cfg.aux_tbptt_steps
+        assert cfg.skip_storm_recover_p1 is False
+        assert int(cfg.early_stop_grad_skip_max) == 11
+        assert int(cfg.n_critics) == 3
+        assert int(cfg.step_test_inject_n) == 7
+        explicit = getattr(cfg, '_explicit_fields', set()) or set()
+        assert 'aux_tbptt_steps' in explicit
+        assert 'step_test_inject_n' in explicit
+        print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+
+
 if __name__ == '__main__':
     import os
     import sys
@@ -349,6 +402,7 @@ if __name__ == '__main__':
         ('softsensor_lab', 'simulation/softsensor_lab/control_setup.json'),
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None
+    _test_cfg_from_env_whitelist()
     ran = 0
     for name, path in sims:
         if only and only != name:

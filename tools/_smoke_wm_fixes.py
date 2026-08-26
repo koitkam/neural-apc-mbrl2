@@ -165,6 +165,9 @@ def _test_defaults_and_env():
         'DREAMER_GAIN_READY_LO': ('0.75', 'gain_ready_lo', 0.75),
         'DREAMER_P1_GAIN_GATE': ('0', 'p1_gain_gate', False),
         'DREAMER_WM_PROBE_EVERY_ITERS': ('8', 'wm_probe_every_iters', 8),
+        'DREAMER_ES_GRADSKIP_MAX': ('11', 'early_stop_grad_skip_max', 11),
+        'DREAMER_STEP_TEST_INJECT_N': ('7', 'step_test_inject_n', 7),
+        'DREAMER_LR_WORLD': ('3e-4', 'lr_world', 3e-4),
     }
     for k, (val, _f, _e) in env_map.items():
         os.environ[k] = val
@@ -178,6 +181,13 @@ def _test_defaults_and_env():
     finally:
         for k in env_map:
             os.environ.pop(k, None)
+
+    from dataclasses import fields
+    from workflow._plant_prepare import ENV_OVERRIDES
+    names = {f.name for f in fields(TrainConfig)}
+    missing = [k for k, (field, _) in ENV_OVERRIDES.items() if field not in names]
+    assert not missing, f'ENV_OVERRIDES fields missing on TrainConfig: {missing}'
+    print(f'[smoke] OK  all {len(ENV_OVERRIDES)} ENV_OVERRIDES map to TrainConfig')
 
 
 if __name__ == '__main__':

@@ -129,15 +129,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > reload when `skip_storm_p1_recovered`. Healthy P1 still restores.
 > The restore knobs are TrainConfig + `ENV_OVERRIDES` (defaults
 > unchanged).
-> **P28 follow-up 5 (no GPU this session):** P1 re-inject EVERY was a
-> raw iter count (const/step 20, DV-PRBS 10). That is one test_sim
-> buffer-lap fraction (~66 iters to FIFO-evict 400k/1220/5). Other
-> plants would under- or over-inject. Cadence is now
-> `round(0.30×lap)` / `round(0.15×lap)` (DV also capped at
-> `wm_fidelity_warmup/4` so p122's "inject before wm_best" still
-> holds). test_sim stays 20/10. Gain-ready + wm-fidelity knobs
-> promoted to TrainConfig + `ENV_OVERRIDES` (same defaults; they
-> were already unitless). `0` still disables inject.
+> **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
+> episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
+> one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
+> `max(sentinel, f(n_mv,n_dv))` so distillation (4 MV + 1 DV) injects
+> 5/5/4/4. test_sim stays 5/2/2/3. **Also:** `training.train._cfg_from_env`
+> now applies the shared `ENV_OVERRIDES` whitelist (it had silently
+> dropped 130+ knobs including skip-storm / aux TBPTT / `n_critics`).
+> Cascade / grad-skip early-stop env-vars were missing from the
+> whitelist entirely (ignored by `single_run`).
 
 ---
 
