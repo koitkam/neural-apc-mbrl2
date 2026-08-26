@@ -364,7 +364,7 @@ steady-state behaviour. Mitigations:
 | `DREAMER_DV_PRBS_INJECT_N` | `max(2, n_mv)` MV-hold levels while sweeping all DVs (test_sim 2). |
 | `DREAMER_EXPERT_INJECT_EVERY` | Expert-demo cadence (same 0.30×lap as const; test_sim 20). |
 | `DREAMER_EXPERT_INJECT_N` | `max(3, n_mv)` (test_sim 3). |
-| `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (default 1; set 0 to disable). **Skipped after a P1 skip-storm last-ok restore** so the gain-blind fidelity peak cannot overwrite last-ok. Healthy P1 still restores. |
+| `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (**default OFF** after P28: freeze end-of-P1 `g`; set `1` to opt in). **Skipped after a P1 skip-storm last-ok restore** so the gain-blind fidelity peak cannot overwrite last-ok. |
 | `DREAMER_WM_BEST_RESTORE_AT_P3` | Reload `wm_best.pt` at P2→P3 (default 0; also skipped after skip-storm). |
 | `DREAMER_WM_BEST_RESTORE_MIN_GAP` | Skip restore when `total_iters - wm_best_iter` is below this (default 10). |
 

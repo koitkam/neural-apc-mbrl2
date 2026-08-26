@@ -140,11 +140,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P29 live (confounded):** env-free launch dropped
 > `DREAMER_RSSM_LATENT_TYPE=deterministic` (P26/P28 env, never a
 > TrainConfig default). P29 is **categorical** (`kl_loss` pinned at
-> free_bits, `joint_embed_loss≡0`, recon ~0.49 at P1 iter 10 vs P26
-> <0.02). Not a skip-restore A/B. **Default is now `deterministic`.**
+> free_bits, `joint_embed_loss≡0`, recon 0.50→0.28 by P1 iter 30 vs
+> P28 0.004). Not a skip-restore A/B. **Default is now `deterministic`.**
 > `z_dim=32` / `zrank/1024` does **not** distinguish the two (same
 > stoch_flat width). Read `kl_loss` vs `joint_embed_loss` or the
-> train-start `latent=` banner.
+> train-start `latent=` banner. After gain-match resolve, train.py
+> rewrites `run_plan.json → config` and prints `[resolved-cfg]` so
+> env-free audits see auto-enabled `gain_match` / `dob_ground` /
+> isolation, not the dataclass sentinels. P29's on-disk plan is the
+> *pre-rewrite* dump (`rssm_latent_type=categorical`).
+> Next GPU job after P29: `DREAMER_COMPILE=0` (P28 was eager).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

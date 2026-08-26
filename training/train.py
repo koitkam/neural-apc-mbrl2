@@ -2864,6 +2864,69 @@ def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
     return int(auto)
 
 
+def _field_is_explicit(cfg: 'TrainConfig', field: str) -> bool:
+    """True when ``single_run`` / ``_cfg_from_env`` recorded an env override."""
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _auto_if_unset(cfg: 'TrainConfig', field: str, value) -> bool:
+    """Apply a proven auto-enable when the field is a ``<=0`` sentinel.
+
+    Env-override ``0`` is honoured (``_explicit_fields``) so A/B disable
+    actually disables — the P19/P26 DOB-ground auto-enable used to ignore
+    ``DREAMER_DOB_GROUND_COEF=0`` and re-arm grounding.
+    """
+    if _field_is_explicit(cfg, field):
+        return False
+    cur = getattr(cfg, field, 0)
+    try:
+        unset = float(cur or 0) <= 0.0
+    except (TypeError, ValueError):
+        unset = not bool(cur)
+    if not unset:
+        return False
+    setattr(cfg, field, value)
+    return True
+
+
+def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
+    """Rewrite ``run_plan.json → config`` after train.py auto-enables.
+
+    ``single_run`` dumps dataclass defaults *before* isolation / DOB-ground /
+    gain-match promotions.  Env-free P29's plan still said
+    ``rssm_latent_type=categorical`` and ``gain_match_coef=0`` while training
+    used the auto-enabled recipe — the same class of silent-drop that missed
+    the latent-type default.  Call after the last promotion (gain-match).
+    """
+    out = Path(getattr(cfg, 'out_dir', None) or '.')
+    plan_path = out / 'run_plan.json'
+    if not plan_path.exists():
+        return
+    try:
+        with open(plan_path) as f:
+            plan = json.load(f)
+        plan['config'] = asdict(cfg)
+        with open(plan_path, 'w') as f:
+            json.dump(plan, f, indent=2, default=str)
+    except Exception as exc:  # noqa: BLE001
+        print(f'[resolved-cfg] WARN could not rewrite run_plan.json: {exc!r}',
+              flush=True)
+        return
+    print(
+        '[resolved-cfg] '
+        f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
+        f"restore_p2={bool(getattr(cfg, 'wm_best_restore_at_p2', False))} "
+        f"gain_match={float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0):.3g} "
+        f"dob_ground={float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0):.3g} "
+        f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
+        f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
+        f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
+        f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
+        f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))}",
+        flush=True,
+    )
+
+
 def _buffer_lap_iters(cfg: 'TrainConfig') -> float:
     """Iters to FIFO-lap the replay buffer (episode-major ring).
 
@@ -7564,26 +7627,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # p08: auto-enable the self-supervised per-INPUT isolation loss (the
             # nonlinear / black-box, no-known-gain generaliser) alongside the
             # gain channel.  Input-symmetric; graceful no-op if no isolated eps.
-            if float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) <= 0.0:
-                cfg.wm_input_isolation_coef = 1.0  # opt1: 0.5→1.0 (per-input ID first-class)
-            if int(getattr(cfg, 'wm_input_isolation_len', 0) or 0) <= 0:
-                cfg.wm_input_isolation_len = int(getattr(cfg, 'horizon', 15) or 15)
+            _auto_if_unset(cfg, 'wm_input_isolation_coef', 1.0)
+            _auto_if_unset(
+                cfg, 'wm_input_isolation_len',
+                int(getattr(cfg, 'horizon', 15) or 15))
             # Option 1 (2026-08-17): elevate the STEADY-STATE (DC-gain) match to a
             # FIRST-CLASS, CLEAN, SYMMETRIC per-input objective — the control-
             # relevant target (Lambert objective-mismatch: recon likelihood is not
             # correlated with control accuracy).  Strong weight + settledness-gate
             # (settle_var, undilutes the DC signal) + more long-hold settle data,
             # identical for every input (MV & DV) — no asymmetric feedforward.
-            if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) <= 0.0:
-                cfg.wm_ss_match_coef = 3.0  # opt1: 1.0→3.0 (DC gain = first-class)
-            if float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0) <= 0.0:
-                cfg.wm_ss_match_settle_var = 0.05  # settled-only DC-gain signal
-            if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
-                # Per isolated input (test_sim 1 MV + 1 DV → 24+24).  The
-                # seed loop emits n_per × n_mv MV-isolation episodes and
-                # n_per × n_dv DV-isolation episodes so MIMO plants keep
-                # the same per-channel SS coverage (P28 follow-up 7).
-                cfg.wm_isolation_settle_episodes = 24  # opt1: 8→24 per input
+            _auto_if_unset(cfg, 'wm_ss_match_coef', 3.0)
+            _auto_if_unset(cfg, 'wm_ss_match_settle_var', 0.05)
+            # Per isolated input (test_sim 1 MV + 1 DV → 24+24).  The
+            # seed loop emits n_per × n_mv MV-isolation episodes and
+            # n_per × n_dv DV-isolation episodes so MIMO plants keep
+            # the same per-channel SS coverage (P28 follow-up 7).
+            _auto_if_unset(cfg, 'wm_isolation_settle_episodes', 24)
             # P19 (2026-08-18): GROUND the DOB d_t on the true load (KalmanNet-
             # style) so the observer TRACKS the disturbance instead of under-
             # reaching it (p18: d_t vs load r=0.42, ~0.3x amplitude → imagination
@@ -7591,9 +7651,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # baseline).  Direct A,K supervision is the STRUCTURAL fix for the
             # manual dob_gain_init amplitude tuning.  Drop dob_reg (the "d small"
             # prior fights the grounding; the grounded target IS the prior now).
-            if float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) <= 0.0:
-                cfg.dob_ground_coef = 2.0
-                cfg.dob_reg_coef = 0.0
+            # Honour explicit ``DREAMER_DOB_GROUND_COEF=0`` (A/B off).
+            if _auto_if_unset(cfg, 'dob_ground_coef', 2.0):
+                if not _field_is_explicit(cfg, 'dob_reg_coef'):
+                    cfg.dob_reg_coef = 0.0
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
                   f'gain_dim={cfg.cont_gain_dim} '
                   f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
@@ -8975,6 +9036,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
               f'falling back to isolation-only WM gain supervision.', flush=True)
     _resolve_aux_tbptt_steps(cfg)
+    _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value

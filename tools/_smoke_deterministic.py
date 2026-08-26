@@ -119,6 +119,10 @@ def main():
     assert TrainConfig().rssm_latent_type == 'deterministic', (
         'TrainConfig default must be deterministic (P26 observer / P29 env-free drop)'
     )
+    c = TrainConfig()
+    assert c.wm_best_restore_at_p2 is False
+    assert int(c.n_critics) == 2
+    assert c.return_scale_freeze_after_warmup is True
     _check_head()
     for wm in ('rssm', 'tssm'):
         _check_backbone(wm)

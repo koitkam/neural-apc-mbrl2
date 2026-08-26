@@ -15,7 +15,8 @@ All outputs must be finite.  Run:
 """
 import torch
 
-from training.train import (TrainConfig, build_model, world_model_loss,
+from training.train import (
+    TrainConfig, build_model, world_model_loss,
                             agent_finetune_loss, _realsim_actor_critic_step,
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _critic_anchor_lambda,
@@ -31,7 +32,8 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
-                            _should_warm_restore_wm_best)
+                            _should_warm_restore_wm_best,
+                            _auto_if_unset, _write_resolved_run_plan)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -566,6 +568,50 @@ def _test_cfg_from_env_whitelist() -> None:
                 os.environ[k] = old
 
 
+def _test_envfree_observer_recipe() -> None:
+    """Env-free TrainConfig must already be the P26 observer / P28 actor stack."""
+    c = TrainConfig()
+    assert c.rssm_latent_type == 'deterministic', c.rssm_latent_type
+    assert c.wm_best_restore_at_p2 is False
+    assert int(c.n_critics) == 2
+    assert c.return_scale_freeze_after_warmup is True
+    assert c.dob_enabled is True
+    assert float(c.gain_match_relative) == 0.0
+    assert c.cont_gain_deterministic_roll is True
+    print('[smoke] OK  env-free TrainConfig = P26 observer / P28 actor recipe')
+
+
+def _test_auto_if_unset_honours_explicit() -> None:
+    cfg = TrainConfig()
+    assert _auto_if_unset(cfg, 'dob_ground_coef', 2.0) is True
+    assert float(cfg.dob_ground_coef) == 2.0
+    cfg2 = TrainConfig()
+    cfg2.dob_ground_coef = 0.0
+    cfg2._explicit_fields = {'dob_ground_coef'}
+    assert _auto_if_unset(cfg2, 'dob_ground_coef', 2.0) is False
+    assert float(cfg2.dob_ground_coef) == 0.0
+    print('[smoke] OK  _auto_if_unset skips explicit 0 (A/B disable)')
+
+
+def _test_write_resolved_run_plan(tmp_path: str) -> None:
+    import json
+    from pathlib import Path
+    cfg = TrainConfig()
+    cfg.out_dir = tmp_path
+    cfg.rssm_latent_type = 'deterministic'
+    cfg.gain_match_coef = 1.0
+    cfg.dob_ground_coef = 2.0
+    plan_path = Path(tmp_path) / 'run_plan.json'
+    plan_path.write_text(json.dumps({'config': {'rssm_latent_type': 'categorical',
+                                                'gain_match_coef': 0.0}}))
+    _write_resolved_run_plan(cfg)
+    plan = json.loads(plan_path.read_text())
+    assert plan['config']['rssm_latent_type'] == 'deterministic'
+    assert float(plan['config']['gain_match_coef']) == 1.0
+    assert float(plan['config']['dob_ground_coef']) == 2.0
+    print('[smoke] OK  _write_resolved_run_plan rewrites run_plan.json config')
+
+
 if __name__ == '__main__':
     import os
     import sys
@@ -578,6 +624,11 @@ if __name__ == '__main__':
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None
     _test_cfg_from_env_whitelist()
+    _test_envfree_observer_recipe()
+    _test_auto_if_unset_honours_explicit()
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _test_write_resolved_run_plan(td)
     ran = 0
     for name, path in sims:
         if only and only != name:
