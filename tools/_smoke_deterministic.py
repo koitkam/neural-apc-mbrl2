@@ -22,7 +22,7 @@ import torch
 
 from models.dreamer_v4_rssm import _CategoricalLatent, rssm_joint_embed_loss
 from training.train import (TrainConfig, build_model, world_model_loss,
-                            _realsim_actor_critic_step)
+                            _realsim_actor_critic_step, _resolve_compile_mode)
 
 
 def _small_cfg(obs_dim=6, action_dim=2, wm_type='rssm', latent_type='categorical'):
@@ -115,6 +115,42 @@ def _check_backbone(wm_type):
                   f'(actor_loss={float(diag["actor_loss"]):.3f})')
 
 
+def _check_compile_default_eager():
+    import os
+    saved = os.environ.pop('DREAMER_COMPILE', None)
+    saved_m = os.environ.pop('DREAMER_COMPILE_MODE', None)
+    try:
+        cfg = TrainConfig()
+        assert cfg.compile_mode == ''
+        assert _resolve_compile_mode(cfg) == '', (
+            'env-free compile must be eager (P29 leftover default-on)'
+        )
+        os.environ['DREAMER_COMPILE'] = '0'
+        assert _resolve_compile_mode(cfg) == ''
+        os.environ['DREAMER_COMPILE'] = '1'
+        assert _resolve_compile_mode(cfg) == 'default'
+        os.environ['DREAMER_COMPILE'] = 'reduce-overhead'
+        assert _resolve_compile_mode(cfg) == 'reduce-overhead'
+        os.environ.pop('DREAMER_COMPILE', None)
+        off = TrainConfig()
+        off.compile_mode = 'off'
+        off._explicit_fields = {'compile_mode'}
+        os.environ['DREAMER_COMPILE'] = '1'
+        assert _resolve_compile_mode(off) == '', (
+            'explicit compile_mode=off must beat DREAMER_COMPILE=1'
+        )
+        print('[smoke] OK  compile default eager; DREAMER_COMPILE=1 opt-in')
+    finally:
+        if saved is None:
+            os.environ.pop('DREAMER_COMPILE', None)
+        else:
+            os.environ['DREAMER_COMPILE'] = saved
+        if saved_m is None:
+            os.environ.pop('DREAMER_COMPILE_MODE', None)
+        else:
+            os.environ['DREAMER_COMPILE_MODE'] = saved_m
+
+
 def main():
     assert TrainConfig().rssm_latent_type == 'deterministic', (
         'TrainConfig default must be deterministic (P26 observer / P29 env-free drop)'
@@ -123,6 +159,7 @@ def main():
     assert c.wm_best_restore_at_p2 is False
     assert int(c.n_critics) == 2
     assert c.return_scale_freeze_after_warmup is True
+    _check_compile_default_eager()
     _check_head()
     for wm in ('rssm', 'tssm'):
         _check_backbone(wm)

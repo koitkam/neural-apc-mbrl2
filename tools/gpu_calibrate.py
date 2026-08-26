@@ -154,10 +154,8 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
     # Mirror the world-model backbone the run will actually build so the
     # measured per-sample memory matches.  Env overrides take precedence
     # over the TrainConfig defaults (which already select the RSSM).
-    # Disable torch.compile for the probe: build_model() now compiles by
-    # default, but the probe only needs a quick EAGER fwd+bwd to measure
-    # memory — compiling would add ~2 min of inductor warmup to startup and
-    # the eager-peak + overhead_factor already sizes the batch conservatively.
+    # Probe pins compile off.  Env-free training is eager (P29 RCA); compiling
+    # the probe would still add ~2 min of inductor warmup for no memory signal.
     cfg.compile_mode = 'off'
     wmt = (os.environ.get('DREAMER_WORLD_MODEL_TYPE', '').strip()
            or str(getattr(cfg, 'world_model_type', 'rssm')))

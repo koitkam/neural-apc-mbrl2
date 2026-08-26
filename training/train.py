@@ -1817,9 +1817,11 @@ class TrainConfig:
     # warmup, etc.) without throwing away weights.  Empty = cold start.
     init_from_ckpt: str = ''
 
-    # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1) -----
+    # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1 opt-in) -----
     attn_impl: str = 'auto'          # 'auto'|'manual'|'sdpa'
-    compile_mode: str = ''           # '' (off) | 'default' | 'reduce-overhead' | 'max-autotune'
+    # '' = eager (P26/P28 observer). Opt in: DREAMER_COMPILE=1 /
+    # DREAMER_COMPILE_MODE=default|reduce-overhead|max-autotune.
+    compile_mode: str = ''
 
     # ----- Resolved at build-time -----
     obs_dim: int = 0
@@ -2889,6 +2891,34 @@ def _auto_if_unset(cfg: 'TrainConfig', field: str, value) -> bool:
     return True
 
 
+def _resolve_compile_mode(cfg: 'TrainConfig') -> str:
+    """Return a ``torch.compile`` mode, or ``''`` for eager.
+
+    ``TrainConfig.compile_mode=''`` is OFF.  A 2026-06-05 leftover treated
+    empty as default-on unless ``DREAMER_COMPILE=0``.  Env-free P29 therefore
+    compiled while P26/P28 (observer win) passed ``DREAMER_COMPILE=0`` and
+    stayed eager — the same silent-drop class as ``rssm_latent_type``.
+    Opt in with ``DREAMER_COMPILE=1`` / ``DREAMER_COMPILE_MODE=default``.
+    Precedence: explicit ``compile_mode`` (incl. ``DREAMER_COMPILE_MODE``)
+    over ``DREAMER_COMPILE`` over eager.
+    """
+    off = {'', '0', 'off', 'false', 'none', 'no'}
+    on = {'1', 'true', 'yes'}
+    cm = str(getattr(cfg, 'compile_mode', None) or '').strip().lower()
+    if _field_is_explicit(cfg, 'compile_mode'):
+        if cm in off:
+            return ''
+        return 'default' if cm in on else cm
+    if cm not in off:
+        return 'default' if cm in on else cm
+    env_cm = os.environ.get('DREAMER_COMPILE', '').strip().lower()
+    if env_cm in off:
+        return ''
+    if env_cm in on:
+        return 'default'
+    return env_cm
+
+
 def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     """Rewrite ``run_plan.json → config`` after train.py auto-enables.
 
@@ -2922,7 +2952,8 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
-        f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))}",
+        f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
+        f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
 
@@ -6175,22 +6206,15 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
             cfg, 'cont_gain_deterministic_roll', True)),
     )
     model = DreamerV4(model_cfg)
-    # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths
-    # (RSSM rollout_observed + img_step; transformer dynamics + tokenizer);
-    # ``maybe_compile`` falls back to eager on any failure.  Precedence:
-    # ``cfg.compile_mode`` (``DREAMER_COMPILE_MODE``) > ``DREAMER_COMPILE`` env
-    # > default-on.  Disable with ``DREAMER_COMPILE=0`` / ``off`` / ``false``.
-    cm = (cfg.compile_mode or '').strip()
-    if cm.lower() in ('0', 'off', 'false', 'none', 'no'):
-        cm = ''                                   # explicit cfg/env-mode disable
-    elif not cm:
-        env_cm = os.environ.get('DREAMER_COMPILE', '').strip().lower()
-        if env_cm in ('0', 'off', 'false', 'no'):
-            cm = ''                               # explicitly disabled
-        elif env_cm and env_cm not in ('1', 'true', 'yes'):
-            cm = env_cm                           # explicit mode string
-        else:
-            cm = 'default'                        # DEFAULT ON (unset / 1 / true)
+    # torch.compile — DEFAULT OFF (P29 RCA).  TrainConfig ``compile_mode=''``
+    # is eager; a 2026-06-05 leftover treated empty as default-on unless
+    # ``DREAMER_COMPILE=0``, so env-free P29 compiled while P26/P28 (observer
+    # win) stayed eager.  Opt in: ``DREAMER_COMPILE=1`` /
+    # ``DREAMER_COMPILE_MODE=default``.  ``maybe_compile`` still falls back
+    # to eager on any failure.
+    cm = _resolve_compile_mode(cfg)
+    if cm and not str(getattr(cfg, 'compile_mode', '') or '').strip():
+        cfg.compile_mode = cm
     if cm:
         model.maybe_compile(mode=cm)
     return model
@@ -8199,6 +8223,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
           f"d_model={cfg.d_model} layers={cfg.n_layers} heads={cfg.n_heads} "
           f"z_dim={cfg.z_dim} lookback={cfg.lookback} "
           f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
+          f"compile={_resolve_compile_mode(cfg) or 'eager'} "
           f"phases={p1}/{p2}/{p3}",
           flush=True)
 

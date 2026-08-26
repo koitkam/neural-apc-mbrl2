@@ -141,7 +141,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > `DREAMER_RSSM_LATENT_TYPE=deterministic` (P26/P28 env, never a
 > TrainConfig default). P29 is **categorical** (`kl_loss` pinned at
 > free_bits, `joint_embed_loss≡0`, recon 0.50→0.28 by P1 iter 30 vs
-> P28 0.004). Not a skip-restore A/B. **Default is now `deterministic`.**
+> P28 0.004; recon spiked 0.18→0.65 at iter 49 after buffer wrap).
+> Not a skip-restore A/B. **Default is now `deterministic`.**
 > `z_dim=32` / `zrank/1024` does **not** distinguish the two (same
 > stoch_flat width). Read `kl_loss` vs `joint_embed_loss` or the
 > train-start `latent=` banner. After gain-match resolve, train.py
@@ -149,7 +150,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > env-free audits see auto-enabled `gain_match` / `dob_ground` /
 > isolation, not the dataclass sentinels. P29's on-disk plan is the
 > *pre-rewrite* dump (`rssm_latent_type=categorical`).
-> Next GPU job after P29: `DREAMER_COMPILE=0` (P28 was eager).
+> **Compile leftover (same class):** `TrainConfig.compile_mode=''` was
+> documented off, but `build_model` treated empty as default-on unless
+> `DREAMER_COMPILE=0`. Env-free P29 compiled; P26/P28 (no compile
+> banner) were eager. Default is now **eager**; opt in
+> `DREAMER_COMPILE=1`. Train-start / `[resolved-cfg]` print `compile=`.
+> Next GPU job after P29 EXIT: env-free `cursor/p28` (deterministic +
+> eager; no leftover compile/latent env-vars).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
