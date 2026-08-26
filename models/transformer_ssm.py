@@ -141,10 +141,10 @@ class TransformerSSMConfig:
     ffn_mult: int = 4
     dropout: float = 0.0
     unimix: float = 0.01          # match RSSM categorical mixing
-    # Latent type — mirror of RSSMConfig.  ``'categorical'`` (default) or
-    # ``'deterministic'`` (continuous tanh latent, no KL) via the shared
-    # ``_CategoricalLatent`` head, so behaviour matches the RSSM path.
-    latent_type: str = 'categorical'
+    # Latent type — mirror of RSSMConfig.  ``'deterministic'`` (default,
+    # continuous tanh, no KL) or ``'categorical'`` (DreamerV3 opt-in) via the
+    # shared ``_CategoricalLatent`` head, so behaviour matches the RSSM path.
+    latent_type: str = 'deterministic'
     latent_noise: float = 0.0     # reparam noise on the deterministic sample
     max_seq_len: int = 256        # context window cap (>= lookback + horizon)
     # DV-as-input (Option B, 2026-06-07) — mirror of RSSMConfig: measured DV
@@ -410,7 +410,7 @@ class TransformerSSMDynamics(nn.Module):
         # Categorical latent heads (reuse RSSM block: prior from h, post from
         # [h, embed]).  prior_net is read by the smoke tests + the overshoot /
         # held-rollout losses, so the attribute name MUST match the RSSM.
-        _lt = str(getattr(cfg, 'latent_type', 'categorical'))
+        _lt = str(getattr(cfg, 'latent_type', 'deterministic'))
         _ln = float(getattr(cfg, 'latent_noise', 0.0) or 0.0)
         self.prior_net = _CategoricalLatent(
             self.deter_dim, self.n_categoricals, self.n_classes,

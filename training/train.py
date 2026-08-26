@@ -810,11 +810,16 @@ class TrainConfig:
     rssm_embed_dim: int = 256
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01          # paper 1% uniform mixture
-    # Latent type (2026-08-12): 'categorical' (DreamerV3) or 'deterministic' (a
-    # continuous tanh latent, NO variational KL — no quantization, so the CV/DV
-    # gain is not attenuated).  Deterministic uses the joint-embedding predict-
-    # next-latent MSE (coef below) for prior/posterior imagination consistency.
-    rssm_latent_type: str = 'categorical'
+    # Latent type (2026-08-12): 'deterministic' (continuous tanh, NO variational
+    # KL — no quantization, so the CV/DV gain is not attenuated) or
+    # 'categorical' (DreamerV3, opt-in).  Deterministic uses the joint-embedding
+    # predict-next-latent MSE (coef below) for prior/posterior consistency.
+    # P26/P28 set this via DREAMER_RSSM_LATENT_TYPE; the TrainConfig default
+    # stayed 'categorical', so env-free P29 silently dropped it (recon stuck
+    # ~0.49, kl_loss pinned at free_bits, joint_embed≡0 vs P26 recon <0.02).
+    # Default is now the north-star / P26 observer.  Opt in to V3 with
+    # DREAMER_RSSM_LATENT_TYPE=categorical.
+    rssm_latent_type: str = 'deterministic'
     rssm_latent_noise: float = 0.0       # reparam noise on deterministic latent (regularizer)
     rssm_joint_embed_coef: float = 1.0   # deterministic-latent consistency weight
     rssm_free_bits: float = 0.5        # p117 recipe (promoted 2026-06-14; paper=1.0)
@@ -5313,7 +5318,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     if dob_on:
         recon = rssm.apply_dob(recon, ds)
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
-    latent_type = str(getattr(cfg, 'rssm_latent_type', 'categorical')).lower()
+    latent_type = str(getattr(cfg, 'rssm_latent_type', 'deterministic')).lower()
     joint_embed_loss = torch.zeros((), device=feats.device)
     if latent_type == 'deterministic':
         # Deterministic continuous latent: NO variational KL — prior/posterior
@@ -6081,7 +6086,7 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
         rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
         rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
         rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-        rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
+        rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'deterministic')),
         rssm_latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
         tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
         tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
@@ -8132,6 +8137,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
           f"horizon={cfg.horizon} "
           f"d_model={cfg.d_model} layers={cfg.n_layers} heads={cfg.n_heads} "
           f"z_dim={cfg.z_dim} lookback={cfg.lookback} "
+          f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
           f"phases={p1}/{p2}/{p3}",
           flush=True)
 

@@ -116,6 +116,9 @@ def _check_backbone(wm_type):
 
 
 def main():
+    assert TrainConfig().rssm_latent_type == 'deterministic', (
+        'TrainConfig default must be deterministic (P26 observer / P29 env-free drop)'
+    )
     _check_head()
     for wm in ('rssm', 'tssm'):
         _check_backbone(wm)

@@ -1265,22 +1265,22 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **ROOT:** gain-blind `wm_best` P1→P2 restore on a healthy P1 (env/TrainConfig default ON). Not relative Huber (off). Not skip-storm.
 
 ### p29 (`run_p29_norestp2`, branch `cursor/p28`) — FIX: freeze end-of-P1 g (skip gain-blind wm_best restore)
-- **One attributed change vs origin:** `wm_best_restore_at_p2` default **True → False**. Log `[p1→p2] WM warm-restore SKIPPED (default-off …)`. Opt-in `DREAMER_WM_BEST_RESTORE_AT_P2=1`.
+- **Intended one attributed change vs origin:** `wm_best_restore_at_p2` default **True → False**. Log `[p1→p2] WM warm-restore SKIPPED (default-off …)`. Opt-in `DREAMER_WM_BEST_RESTORE_AT_P2=1`.
 - Codebase also includes follow-ups 1–14 (never GPU-validated). If observer is not P26-class, isolate those next — do not stack more critic knobs.
 - Keep min-of-2 + freeze `return_scale` so a GAIN-READY freeze is the first *valid* actor test of those knobs.
 - Env-free, compile default-on (match P26/P28), tmux `mbrl2_p29`, `output/test_sim/run_p29_norestp2`.
 - **Judge by:** SKIPPED restore (not `loaded wm_best.pt`); P1→P2 gain-probe MV in [0.8, 1.3]; val MV ss/@H ~×1.0 ±0.1, DV not ×1.56; P2 r@H stays ~0.5 (not 0.09). If still GAIN_NOT_READY: `actor_experiment_valid=False`, do not read econ as an actor result. If observer P26-class: `return_scale` stays near warmup, `critic_rew_to_tgt_var` >0.015, econ vs baseline **and** vs P27 BC −59.
+- **LIVE (2026-08-26 ~P1 iter 10, GPU still running): CONFOUNDED.** Env-free dropped `DREAMER_RSSM_LATENT_TYPE=deterministic` (P26/P28 env, never a default). P29 is **categorical**: `kl_loss=0.30` pinned, `joint_embed_loss≡0`, recon **0.49** (P26/P28 recon **<0.02** by iter 10). Gain-match spiked 1.21 at iter 6 then recovered; recon did not. `z_dim=32` / `zrank/1024` is the same width as deterministic — do not use it. P29 cannot verdict skip-restore. **Code fix (this session, no relaunch):** `rssm_latent_type` default **categorical → deterministic**. Next GPU job after P29 ends is the real skip-restore A/B (plus follow-ups 1–14). Train-start banner now prints `latent=`.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
-Already unitless / derived: isolation TBPTT `max(8, round(K/3.5))`; `gain_match_len` / isolation len = H; isolation sample window `max(seq_len, K+1)` (test_sim seq_len ≥ H unchanged); P1/P2 main WM sample `max(seq_len, K+1)` (overshoot/gain-match; P3 stays seq_len); gain-match open-loop `K` not truncated to `T-1`; `skip_storm_last_ok_recon_ratio=5` (recon/recon); `p1_gate_wm_ema_min=1.5` (fidelity mix); inject EVERY = f(buffer lap) (test_sim 20/10); inject N = f(n_mv, n_dv) (test_sim 5/2/2/3); isolation settle = 24 **per input** (test_sim 24+24 / cap 48 settle-only; distillation 96+24 / cap 120). Isolation_buf holds only those settle episodes (not MIMO PRBS). Isolation settle is a whole-episode hold at a stratified level (`action_std=0`); DV step is MV-action-isomorphic (`isolated_level × span/2`). Opt-in: `gain_match_huber_beta<=0` → median |tgt| (P28 still uses β=1). Gain-ready band `[0.80, 1.30]` and wm-fidelity mix weights are unitless TrainConfig (were os.environ).
+Already unitless / derived: isolation TBPTT `max(8, round(K/3.5))`; `gain_match_len` / isolation len = H; isolation sample window `max(seq_len, K+1)` (test_sim seq_len ≥ H unchanged); P1/P2 main WM sample `max(seq_len, K+1)` (overshoot/gain-match; P3 stays seq_len); gain-match open-loop `K` not truncated to `T-1`; `skip_storm_last_ok_recon_ratio=5` (recon/recon); `p1_gate_wm_ema_min=1.5` (fidelity mix); inject EVERY = f(buffer lap) (test_sim 20/10); inject N = f(n_mv, n_dv) (test_sim 5/2/2/3); isolation settle = 24 **per input** (test_sim 24+24 / cap 48 settle-only; distillation 96+24 / cap 120). Isolation_buf holds only those settle episodes (not MIMO PRBS). Isolation settle is a whole-episode hold at a stratified level (`action_std=0`); DV step is MV-action-isomorphic (`isolated_level × span/2`). Opt-in: `gain_match_huber_beta<=0` → median |tgt| (P28 still uses β=1). Gain-ready band `[0.80, 1.30]` and wm-fidelity mix weights are unitless TrainConfig (were os.environ). `rssm_latent_type` default **deterministic** (P26 proven; P29 env-free drop of the leftover env-var).
 
 Still not sim-adaptive:
 - `wm_fidelity_{warmup,patience}_iters` and `wm_probe_every_iters` stay in *iters* (one WM update ≈ one iter).
-- `rssm_latent_type` default still `categorical` (do not flip without a dedicated observer run)
 - `dv_feedforward=True` still appends measured DV to **head** feat (decoder half is off). `dv_as_input` is the symmetric path; do not re-add decoder FF.
 - `dv_prbs_seed_episodes=24` / `expert_seed_episodes=24` / `constant_action_seed_episodes=40` are flat episode counts (each DV-PRBS episode already sweeps every DV; episode length already scales with τ). `phase3_onpolicy_buffer_eps=16` is an on-policy episode count (same).
-- Isolation/ss-match trajectory MSE is still absolute (same family as abs Huber). Variance-normalized isolation is the next observer A/B **if** P28 DV ss stays ~×0.87 after follow-up 10 isomorphic |Δu| + follow-up 13 full-K gain-match + follow-up 14 mean-c0 — do not revive relative Huber.
+- Isolation/ss-match trajectory MSE is still absolute (same family as abs Huber). Variance-normalized isolation is the next observer A/B **if** P28 DV ss stays ~×0.87 after follow-up 10 isomorphic |Δu| + follow-up 13 full-K gain-match + follow-up 14 mean-c0 — do not revive relative Huber. Wait for a **deterministic** skip-restore run before that A/B.
 
 ### Graveyard (P24–P28 observer / actor levers)
 
@@ -1301,6 +1301,7 @@ Still not sim-adaptive:
 | P1 skip-storm restore last-ok (not wm_best) | P28 follow-up 3 | KEPT | YES — wm_best can discard late-P1 |
 | Skip P1→P2 wm_best reload after skip-storm | P28 follow-up 4 | KEPT | YES — next-iter restore undid last-ok |
 | P1→P2 wm_best restore on healthy P1 (default ON) | P28 GPU | REVERTED default OFF | YES — restored iter 60, val MV ×0.52; P26 skipped via min_gap |
+| `rssm_latent_type` default `categorical` (env-free) | P29 live | REVERTED default `deterministic` | YES — P26/P28 env never promoted; P29 recon stuck 0.49, kl_loss=0.3, joint_embed≡0 |
 | P1 inject EVERY = f(buffer lap) | P28 follow-up 5 | KEPT | YES — 20/10 were test_sim iters, not f(τ) |
 | P1 inject N = f(n_mv, n_dv) | P28 follow-up 6 | KEPT | YES — 5/2/2/3 were 1-MV+1-DV counts |
 | `_cfg_from_env` uses `ENV_OVERRIDES` | P28 follow-up 6 | KEPT | YES — train.py CLI silently dropped 130+ knobs |

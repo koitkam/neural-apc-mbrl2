@@ -81,13 +81,13 @@ class RSSMConfig:
     embed_dim: int = 256
     hidden_dim: int = 256
     unimix: float = 0.01            # paper 1% uniform mixture
-    # Latent type (2026-08-12).  ``'categorical'`` = paper DreamerV3 (default).
-    # ``'deterministic'`` = a continuous tanh latent with NO variational KL
-    # (prior/posterior consistency via joint-embedding) — no quantization, so
-    # the continuous CV/DV gain is not attenuated (bias-free observer).
-    # ``latent_noise`` > 0 adds reparameterization noise to the deterministic
-    # sample (information-bottleneck regularizer; anti-overfit, no quantization).
-    latent_type: str = 'categorical'
+    # Latent type (2026-08-12).  ``'deterministic'`` (default, P26/P29 RCA) = a
+    # continuous tanh latent with NO variational KL (prior/posterior consistency
+    # via joint-embedding) — no quantization, so the continuous CV/DV gain is
+    # not attenuated (bias-free observer).  ``'categorical'`` = paper DreamerV3
+    # (opt-in).  ``latent_noise`` > 0 adds reparameterization noise to the
+    # deterministic sample (information-bottleneck regularizer; no quantization).
+    latent_type: str = 'deterministic'
     latent_noise: float = 0.0
     # DV-as-input (Option B, 2026-06-07).  When ``dv_dim > 0`` the measured
     # disturbance-variable channels (at ``dv_indices`` within the obs vector)
@@ -435,7 +435,7 @@ class RSSMDynamics(nn.Module):
                             hidden_dim=self.hidden_dim, num_layers=1)
         self.gru = nn.GRUCell(trans_in, self.deter_dim)
         # Prior p(z'|h') and posterior q(z'|h', embed).
-        _lt = str(getattr(cfg, 'latent_type', 'categorical'))
+        _lt = str(getattr(cfg, 'latent_type', 'deterministic'))
         _ln = float(getattr(cfg, 'latent_noise', 0.0) or 0.0)
         self.prior_net = _CategoricalLatent(
             self.deter_dim, self.n_categoricals, self.n_classes,

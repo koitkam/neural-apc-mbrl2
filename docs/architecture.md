@@ -129,7 +129,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > reload when `skip_storm_p1_recovered`. Healthy P1 still restores.
 > The restore knobs are TrainConfig + `ENV_OVERRIDES` (defaults
 > unchanged).
-> **2026-08-26 — P28 GPU VERDICT / P29.** `run_p28_absgain_qens` (@ a7941be,
+> **2026-08-26 — P28 GPU VERDICT / P29 / env-free latent drop.** `run_p28_absgain_qens` (@ a7941be,
 > before follow-ups 1–14) restored gain-blind `wm_best` iter 60 on a
 > *healthy* P1 (0 skip-storms). Val MV ss/@H ×0.52/×0.48 vs P26 ×0.97/×0.88.
 > Follow-up 4 (skip restore only after skip-storm) would not have stopped
@@ -137,6 +137,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > end-of-P1 `g`. Opt in with `DREAMER_WM_BEST_RESTORE_AT_P2=1`. Freeze
 > `return_scale` did pin 2.29 (KEEP) but the P28 actor experiment is
 > **invalid** (GAIN_NOT_READY).
+> **P29 live (confounded):** env-free launch dropped
+> `DREAMER_RSSM_LATENT_TYPE=deterministic` (P26/P28 env, never a
+> TrainConfig default). P29 is **categorical** (`kl_loss` pinned at
+> free_bits, `joint_embed_loss≡0`, recon ~0.49 at P1 iter 10 vs P26
+> <0.02). Not a skip-restore A/B. **Default is now `deterministic`.**
+> `z_dim=32` / `zrank/1024` does **not** distinguish the two (same
+> stoch_flat width). Read `kl_loss` vs `joint_embed_loss` or the
+> train-start `latent=` banner.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
