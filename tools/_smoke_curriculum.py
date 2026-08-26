@@ -164,6 +164,11 @@ def _check(wm_type):
     assert g_grad == 0.0, 'Stage2: g is FROZEN -> must get NO gradient'
     assert dob_grad > 0.0, 'Stage2: the DOB observer must get recon gradient'
     assert float(losses['dob_reg']) > 0.0, 'Stage2: dob_reg must be active'
+    # P28 follow-up 11: overshoot/held/gain-match train g; skip when frozen.
+    assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0, \
+        'Stage2: overshoot is a g-only aux and must skip'
+    assert float(losses.get('gain_match_loss', 0.0)) == 0.0, \
+        'Stage2: gain-match is a g-only aux and must skip'
     print(f'[smoke] OK  Stage2: recon trains the DOB (|dob_grad|={dob_grad:.4f}) '
           f'and NOT g (|g_grad|={g_grad:.1f}) — observer identifiable on the '
           f'fixed plant [{wm_type}]')

@@ -3039,7 +3039,13 @@ def _isolation_sample_seq_len(cfg: 'TrainConfig') -> int:
 
 
 def _dynamics_g_trainable(model: 'DreamerV4') -> bool:
-    """True iff the plant model ``g`` (not DOB A,K) still takes gradients."""
+    """True iff the plant model ``g`` (not DOB A,K) still takes gradients.
+
+    Gate for g-only aux (isolation extra unroll, overshoot, held-rollout,
+    full-BPTT gain-match).  DOB-curriculum P2 freezes encoder/decoder/GRU/
+    cont-gain; those K-step prior rolls cannot update frozen params and
+    are ~73% of the WM step (P28 follow-up 11).
+    """
     dyn = getattr(model, 'dynamics', None)
     if dyn is None:
         return False
@@ -5379,11 +5385,19 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # OVERSHOOT EVERY step now (the compiled ``img_rollout`` keeps it cheap).
     # The HELD-rollout (drift/stationarity, less gain-critical) stays
     # every-other for the residual speedup.
+    # P28 follow-up 11: skip when g is frozen (DOB curriculum P2).  Same
+    # reason as isolation extra unroll (follow-up 10): these K-step prior
+    # rolls train encoder/decoder/GRU/cont-gain, which ``set_world_model_
+    # trainable(g=False)`` has frozen.  Full-BPTT gain-match is the same
+    # family (and more expensive: baseline + one roll per input).  P2
+    # still pays for recon + DOB ground/reg (A,K).  Cadence counter
+    # still ticks so a later unfreeze keeps every-other held.
+    _g_live = _dynamics_g_trainable(model)
     _wm_aux_n = int(getattr(model, '_wm_aux_step', 0)) + 1
     model._wm_aux_step = _wm_aux_n
     _run_held = (_wm_aux_n % 2 == 0)
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
-    if overshoot_coef > 0.0:
+    if overshoot_coef > 0.0 and _g_live:
         overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
             model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
     else:
@@ -5393,7 +5407,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
 
     # ----- (b2, P89) multi-step held-action rollout stationarity (RSSM) -----
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
-    if _run_held and held_coef > 0.0:
+    if _run_held and held_coef > 0.0 and _g_live:
         held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
             model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
     else:
@@ -5406,8 +5420,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # the subdominant DV gain the categorical attenuates (the continuous gain
     # channel gives the WM the un-quantized CAPACITY this loss grabs onto).
     gm_coef = float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0)
-    gain_match_loss, gain_match_diag = _wm_gain_match_loss(
-        model, feats, obs_cur, act, cfg)
+    if gm_coef > 0.0 and _g_live:
+        gain_match_loss, gain_match_diag = _wm_gain_match_loss(
+            model, feats, obs_cur, act, cfg)
+    else:
+        gain_match_loss = torch.zeros((), device=feats.device)
+        gain_match_diag = {}
     wm_total = wm_total + gm_coef * gain_match_loss
 
     losses: Dict[str, torch.Tensor] = {
@@ -9720,8 +9738,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # roll ``sample=False`` so the gradient lands in the cont-gain
                 # channel.  Skip when g is frozen (DOB curriculum P2) — the
                 # extra unroll cannot update frozen params (dead hot-path
-                # forward).  Window length is max(seq_len, K+1) so a slow
-                # plant's settle horizon still fits (test_sim unchanged).
+                # forward).  Follow-up 11 skips the in-graph g-only aux
+                # (overshoot / held / gain-match) for the same reason.
+                # Window length is max(seq_len, K+1) so a slow plant's
+                # settle horizon still fits (test_sim unchanged).
                 if (isolation_buf is not None and isolation_buf.filled > 0
                         and current_phase in (1, 2)
                         and _dynamics_g_trainable(model)

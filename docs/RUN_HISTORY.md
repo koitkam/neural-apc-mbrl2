@@ -1252,6 +1252,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Code follow-up 8 (no GPU this session):** isolation_buf still ingested ordinary MIMO PRBS + all-DV PRBS. Follow-up 7 sized cap `max(baseline+dv_prbs+8, settle)` to keep test_sim at 48, but auto-tune baseline ~26 grew the cap to 58 so wrap left ~10 confounded all-DV episodes in front of the 48 settle — `wm_ss_match` trained on a MIMO mixture. Cap is settle-only (test_sim still 48; distillation still 120). Long-hold settle now also zeros process/measurement noise (`clean_steady_seeds`, same P89 gate as const-action / step-settle) so DC-gain ID is not errors-in-variables.
 - **Code follow-up 9 (no GPU this session):** follow-up 8 still PRBS-stepped inside each settle episode (`seg_max = min(max(seg, 2K), T/4)` → ~11 holds of 110 steps on test_sim T=1220) and passed `action_std=baseline_seed_std` on the isolated MV. Random `seq_len=64` windows from `isolation_buf` straddled those steps (~half), so `wm_ss_match`'s `settle_var` gate down-weighted the DC-gain term; `_st_levels` was wired to `hold_level` of *other* MVs (no-op on test_sim). Isolation settle is now a **whole-episode constant hold** at the stratified `isolated_level` (`action_std=0`, others at 0). DV settle is one step at t=0 to `isolated_level × (span/2)`, MV held at 0. Ordinary MIMO PRBS / all-DV PRBS still cover transients in the main replay buffer.
 - **Code follow-up 10 (no GPU this session):** follow-up 9 still multiplied the DV isolation step by `dv_prbs_op_frac` (`delta = isolated_level × 0.8 × span/2`). Isolation levels are already in MV-action units (`±constant_action_seed_op_band`), so DV |Δu| was 0.8× the matching MV step → smaller |ΔCV| → absolute isolation/ss-match MSE under-trained DV (same family as abs-Huber on unequal |tgt|, P26 DV ss ×0.87). Isolation DV step is now **MV-action-isomorphic** (`±1 ↔ ±half-span`); ordinary all-DV PRBS still uses `dv_prbs_op_frac`. Also: isolation sample windows are `max(seq_len, K+1)` so a slow plant with H > seq_len still reaches SS (test_sim seq_len ≥ H unchanged); isolation extra unroll is skipped when `g` is frozen (DOB curriculum P2).
+- **Code follow-up 11 (no GPU this session):** follow-up 10 skipped only the isolation extra unroll. P2 `world_model_loss` still ran overshoot + held-rollout (~73% of the WM step) and full-BPTT gain-match (baseline + one K-step FD roll per input) after `g` was frozen. Those losses cannot update encoder/decoder/GRU/cont-gain; P2 is DOB A,K on recon + ground/reg. Skip the g-only aux when `_dynamics_g_trainable` is false (cadence counter still ticks). P1 unchanged.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
@@ -1261,6 +1262,8 @@ Still not sim-adaptive:
 - `wm_fidelity_{warmup,patience}_iters` and `wm_probe_every_iters` stay in *iters* (one WM update ≈ one iter).
 - `rssm_latent_type` default still `categorical` (do not flip without a dedicated observer run)
 - `dv_feedforward=True` still appends measured DV to **head** feat (decoder half is off). `dv_as_input` is the symmetric path; do not re-add decoder FF.
+- `dv_prbs_seed_episodes=24` / `expert_seed_episodes=24` / `constant_action_seed_episodes=40` are flat episode counts (each DV-PRBS episode already sweeps every DV; episode length already scales with τ). `phase3_onpolicy_buffer_eps=16` is an on-policy episode count (same).
+- Isolation/ss-match trajectory MSE is still absolute (same family as abs Huber). Variance-normalized isolation is the next observer A/B **if** P28 DV ss stays ~×0.87 after follow-up 10 isomorphic |Δu| — do not revive relative Huber.
 
 ### Graveyard (P24–P28 observer / actor levers)
 
@@ -1289,6 +1292,7 @@ Still not sim-adaptive:
 | Isolation DV step MV-action-isomorphic (`× span/2`, no extra `dv_prbs_op_frac`) | P28 follow-up 10 | KEPT | YES — extra op_frac shrank \|ΔDV\| vs \|ΔMV\| so abs isolation/ss-match under-trained DV |
 | Isolation sample window `max(seq_len, K+1)` | P28 follow-up 10 | KEPT | YES — seq_len < H truncated the SS window on slow plants |
 | Isolation extra unroll skipped when g frozen | P28 follow-up 10 | KEPT | YES — DOB-curriculum P2 cannot update frozen g (dead hot-path) |
+| Skip overshoot / held-rollout / gain-match when g frozen | P28 follow-up 11 | KEPT | YES — same dead hot-path inside `world_model_loss`; ~73% of WM step + full-BPTT FD rolls |
 
 
 

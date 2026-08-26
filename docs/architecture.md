@@ -178,6 +178,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > `max(seq_len, K+1)` so a slow plant with H > seq_len still reaches SS
 > (test_sim seq_len ≥ H unchanged). Isolation extra unroll is skipped
 > when `g` is frozen (DOB curriculum P2 — dead hot-path forward).
+> **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
+> the *extra* isolation unroll. `world_model_loss` still ran overshoot,
+> held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM
+> step plus one K-step FD roll per input). Those losses train `g`
+> (encoder/decoder/GRU/cont-gain), which curriculum P2 has frozen;
+> P2 only needs recon + DOB ground/reg. Skip the g-only aux when
+> `_dynamics_g_trainable` is false. P1 unchanged. test_sim recipe
+> unchanged.
 
 ---
 

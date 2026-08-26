@@ -400,14 +400,41 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  isolation settle whole-episode hold (isolated_level, '
           'action_std=0, DV MV-action-isomorphic, sample len ≥ K+1)')
 
-    # Frozen-g skip: isolation extra unroll is dead when DOB curriculum
-    # freezes the plant model (P2).  Restore g=True so later smokes stay live.
+    # Frozen-g skip: isolation extra unroll (follow-up 10) AND the in-graph
+    # g-only aux (overshoot / held-rollout / full-BPTT gain-match,
+    # follow-up 11) are dead when DOB curriculum freezes the plant model
+    # (P2).  Isolation is a separate extra unroll; the aux trio is ~73% of
+    # each WM step.  Restore g=True so later smokes stay live.
     assert _dynamics_g_trainable(model)
+    _gate_over = float(cfg.wm_overshoot_gate_recon)
+    _gate_held = float(cfg.wm_held_rollout_gate_recon)
+    cfg.wm_overshoot_gate_recon = 0.0
+    cfg.wm_held_rollout_gate_recon = 0.0
+    cfg.wm_overshoot_coef = 0.3
+    cfg.wm_overshoot_len = min(8, T - 1)
+    cfg.wm_held_rollout_coef = 0.5
+    cfg.wm_held_rollout_len = 8
+    cfg.gain_match_coef = 1.0
+    cfg.gain_match_len = 4
+    cfg.gain_match_mv_target = ((0.5,) * max(1, action_dim),)
+    losses_g, _, _ = world_model_loss(model, batch, cfg)
+    if wm_type == 'rssm':
+        assert float(losses_g['wm_overshoot_loss']) > 0.0, losses_g['wm_overshoot_loss']
     model.set_world_model_trainable(g=False, dob=True, reward=True)
     assert not _dynamics_g_trainable(model)
+    losses_fz, _, _ = world_model_loss(model, batch, cfg)
+    assert float(losses_fz['wm_overshoot_loss']) == 0.0, losses_fz['wm_overshoot_loss']
+    assert float(losses_fz['wm_held_rollout_loss']) == 0.0, losses_fz['wm_held_rollout_loss']
+    assert float(losses_fz['gain_match_loss']) == 0.0, losses_fz['gain_match_loss']
+    assert 'gain_match_n' not in losses_fz
     model.set_world_model_trainable(g=True, dob=False, reward=True)
     assert _dynamics_g_trainable(model)
+    cfg.wm_overshoot_gate_recon = _gate_over
+    cfg.wm_held_rollout_gate_recon = _gate_held
+    cfg.gain_match_coef = 0.0
+    cfg.gain_match_mv_target = ()
     print('[smoke] OK  isolation skip when g frozen (_dynamics_g_trainable)')
+    print('[smoke] OK  g-only aux (overshoot/held/gain-match) skip when g frozen')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
