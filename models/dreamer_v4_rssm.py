@@ -810,13 +810,21 @@ class RSSMDynamics(nn.Module):
     def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,
                     actions: torch.Tensor,
                     dvs: Optional[torch.Tensor] = None,
-                    sample: bool = True) -> torch.Tensor:
-        """Prior-only (imagined) rollout of K steps from ``(h0, z0)`` under a
-        per-step action (and optional per-step DV) sequence.
+                    sample: bool = True,
+                    c0: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Prior-only (imagined) rollout of K steps from ``(h0, z0[, c0])``.
 
         ``h0`` (Bm, deter_dim), ``z0`` (Bm, n_categoricals, n_classes),
-        ``actions`` (Bm, K, A), ``dvs`` (Bm, K, dv_dim) | None.  Returns the
-        stacked per-step feature ``(Bm, K, F)`` (``feat`` = [h, z_flat, (dv)]).
+        ``actions`` (Bm, K, A), ``dvs`` (Bm, K, dv_dim) | None,
+        ``c0`` (Bm, cont_dim) | None = posterior continuous latent at the
+        start (gain + optional cont-dist).  ``c0=None`` with ``cont_dim>0``
+        zero-fills — same as ``img_step`` when ``prev.c is None``.  Returns
+        stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
+
+        P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
+        the open-loop gain supervisor trained a ``c=0`` GRU path while
+        isolation / gain-match / the actor / transfer-matrix start from
+        posterior ``c`` (p20 family: supervisor ≠ metric path).
 
         Compiled the SAME way as ``rollout_observed`` (see ``maybe_compile``):
         capturing the whole K-step ``img_step`` loop as ONE graph removes the
@@ -827,11 +835,15 @@ class RSSMDynamics(nn.Module):
         """
         Bm = h0.shape[0]
         K = actions.shape[1]
+        c = None
+        if self.cont_dim > 0:
+            c = (c0 if c0 is not None else torch.zeros(
+                Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
         state = RSSMState(
             h=h0,
             z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
                                  device=h0.device, dtype=h0.dtype),
-            z=z0)
+            z=z0, c=c)
         feats = []
         for k in range(K):
             dv_k = dvs[:, k] if dvs is not None else None

@@ -4,7 +4,9 @@ continuous gain channel (the routing that bypasses the categorical bottleneck).
 import torch
 
 from training.train import (TrainConfig, build_model,
-                            _wm_input_isolation_loss, _wm_gain_match_loss)
+                            _wm_input_isolation_loss, _wm_gain_match_loss,
+                            _wm_latent_overshoot_loss,
+                            _wm_held_rollout_stationarity_loss)
 
 
 def main():
@@ -159,6 +161,61 @@ def main():
     os.environ.pop('DREAMER_GAIN_MATCH_HUBER_BETA', None)
     print(f'[gain-match-beta] OK: resolved beta used despite env=0 '
           f'(loss={float(gm_auto):.5f})')
+
+    # ---- P28 follow-up 12: img_rollout / overshoot / held must start from
+    # posterior c.  Dropping c zero-fills the GRU input, so the open-loop
+    # gain supervisor trained a different path than isolation / gain-match
+    # / the actor (p20 family).  Changing ONLY the c slice of feat must
+    # move overshoot + held; img_rollout(c0=0) stays back-compat with omit.
+    rssm = model.dynamics
+    assert rssm.cont_dim > 0
+    torch.manual_seed(0)
+    Bm, Kc = 2, 4
+    h0 = torch.zeros(Bm, rssm.deter_dim)
+    z0 = torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes)
+    z0[..., 0] = 1.0
+    a_seq = torch.zeros(Bm, Kc, cfg.action_dim)
+    c_hi = torch.ones(Bm, rssm.cont_dim)
+    c_lo = torch.zeros(Bm, rssm.cont_dim)
+    f_hi = rssm.img_rollout(h0, z0, a_seq, sample=False, c0=c_hi)
+    f_lo = rssm.img_rollout(h0, z0, a_seq, sample=False, c0=c_lo)
+    f_none = rssm.img_rollout(h0, z0, a_seq, sample=False)
+    assert f_hi.shape == f_lo.shape == f_none.shape
+    assert not torch.allclose(f_hi, f_lo), \
+        'img_rollout must use c0 (posterior gain) on the first GRU step'
+    assert torch.allclose(f_lo, f_none, atol=1e-5, rtol=1e-5), \
+        'c0=0 must match omitted c0 (back-compat zero-fill)'
+    print('[img-rollout-c0] OK: c0 changes the prior roll; omit≡zeros')
+
+    cfg.wm_overshoot_coef = 0.3
+    cfg.wm_overshoot_len = 6
+    cfg.wm_overshoot_gate_recon = 0.0
+    cfg.wm_overshoot_max_starts = 4
+    cfg.wm_held_rollout_coef = 0.5
+    cfg.wm_held_rollout_len = 8
+    cfg.wm_held_rollout_gate_recon = 0.0
+    cfg.wm_held_rollout_max_starts = 4
+    feats_c = feats.detach().clone()
+    feats_shift = feats_c.clone()
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    feats_shift[..., _ze:_ze + rssm.cont_dim] = (
+        feats_shift[..., _ze:_ze + rssm.cont_dim] + 1.0)
+    torch.manual_seed(1)
+    ov_a, _ = _wm_latent_overshoot_loss(model, feats_c, obs, act, cfg)
+    torch.manual_seed(1)
+    ov_b, _ = _wm_latent_overshoot_loss(model, feats_shift, obs, act, cfg)
+    assert torch.isfinite(ov_a).all() and torch.isfinite(ov_b).all()
+    assert abs(float(ov_a) - float(ov_b)) > 1e-8, \
+        'overshoot must read posterior c (loss unchanged when only c shifted)'
+    # Held-rollout is GAIN-NEUTRAL (late−early drift of h). A constant c
+    # offset that persists can cancel in that difference — do not require
+    # the loss to move. Still require a finite term; img_rollout(c0) above
+    # already proves the start-c path.
+    torch.manual_seed(2)
+    hd_a, _ = _wm_held_rollout_stationarity_loss(model, feats_c, obs, act, cfg)
+    assert torch.isfinite(hd_a).all() and float(hd_a) >= 0.0
+    print(f'[overshoot-c0] OK: overshoot {float(ov_a):.5f}→{float(ov_b):.5f} '
+          f'(c-slice shift); held finite {float(hd_a):.5f} (gain-neutral)')
 
 
 if __name__ == '__main__':

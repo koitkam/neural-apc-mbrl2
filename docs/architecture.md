@@ -186,6 +186,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > P2 only needs recon + DOB ground/reg. Skip the g-only aux when
 > `_dynamics_g_trainable` is false. P1 unchanged. test_sim recipe
 > unchanged.
+> **P28 follow-up 12 (no GPU this session):** overshoot + held-rollout
+> call compiled `img_rollout(h, z, a, dv)` and constructed
+> `RSSMState` **without posterior `c`**. `img_step` zero-fills
+> `prev.c`, so the first GRU step (and therefore the whole open-loop
+> gain supervisor — ~73% of the P1 WM step) trained a **c=0 path**
+> while isolation / full-BPTT gain-match / the actor / transfer-matrix
+> start from posterior `c` (p20 family: supervisor ≠ metric path).
+> `img_rollout` now takes `c0`; overshoot/held slice it from feat
+> like isolation. test_sim recipe unchanged. `c0=None` still
+> zero-fills (back-compat).
 
 ---
 

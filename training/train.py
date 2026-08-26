@@ -4667,6 +4667,12 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
+    # Posterior continuous gain (feat = [h, z, (c), (dv), (d)]).  Must start
+    # the prior roll from this c — img_rollout used to omit it (c=0 GRU
+    # input) so overshoot trained a different path than isolation /
+    # gain-match / the actor (P28 follow-up 12 / p20 family).
+    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
+          if int(getattr(rssm, 'cont_dim', 0) or 0) > 0 else None)
     # Per-step REAL action + DV sequences for k=1..K (gathered ONCE).
     k_off = torch.arange(1, K + 1, device=device)                 # (K,)
     idx = starts.view(S, 1) + k_off.view(1, K)                    # (S, K) time idx
@@ -4676,7 +4682,8 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # COMPILED prior rollout (whole K-step img_step loop = ONE graph) + ONE
     # batched decode (the per-step decode was the launch-bound killer, exactly
     # what rollout_observed hoists out).
-    roll_feats = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True)  # (Bm,K,F)
+    roll_feats = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True,
+                                  c0=c0)                          # (Bm,K,F)
     preds = rssm.decode(roll_feats).reshape(B, S, K, -1)          # (B, S, K, D)
     total = zero
     # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
@@ -4772,6 +4779,8 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
+    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
+          if int(getattr(rssm, 'cont_dim', 0) or 0) > 0 else None)
     a_hold = act[:, starts].reshape(Bm, -1).detach()              # HELD action a_t
     # DV-as-input: hold the measured DV CONSTANT at its start value across the
     # rollout too — so this probes true held-(action+DV) stationarity and the
@@ -4785,7 +4794,7 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     dv_hold_seq = (dv_hold.unsqueeze(1).expand(Bm, K, dv_hold.shape[-1])
                    if dv_hold is not None else None)
     roll_feats = rssm.img_rollout(h, z, a_hold_seq, dvs=dv_hold_seq,
-                                  sample=True)                    # (Bm, K, F)
+                                  sample=True, c0=c0)             # (Bm, K, F)
     Hroll = roll_feats[..., :rssm.deter_dim]                      # (Bm, K, deter)
     h_scale = Hroll.detach().std().clamp_min(1e-3)
     early = Hroll[:, s:s + win].mean(dim=1)                      # (B*S, deter)
