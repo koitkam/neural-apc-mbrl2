@@ -20,7 +20,8 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _critic_anchor_lambda,
                             _critic_anchor_coef, _force_p1_cap_at,
-                            _resolve_aux_tbptt_steps,
+                            _resolve_aux_tbptt_steps, _buffer_lap_iters,
+                            _resolve_inject_cadence,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
                             _should_warm_restore_wm_best)
@@ -212,6 +213,48 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         wm_best_iter=20, total_iters=80, min_gap=10, wm_best_exists=True)
     print('[smoke] OK  skip-storm last-ok restore prefers late-P1 observer')
     print('[smoke] OK  skip-storm blocks P1→P2 wm_best overwrite')
+
+    # P28 follow-up 5: P1 re-inject EVERY is f(buffer lap).  test_sim
+    # (ep_len=1220, 400k cap, 5 eps/iter) stays 20/10.
+    _inj = TrainConfig()
+    assert int(_inj.const_action_inject_every) == 20
+    assert int(_inj.dv_prbs_inject_every) == 10
+    assert int(_inj.wm_probe_every_iters) == 10
+    assert float(_inj.gain_ready_lo) == 0.80
+    assert bool(_inj.p1_gain_gate) is True
+    _inj.episode_length = 1220
+    _inj.buffer_capacity_steps = 400_000
+    _inj.ep_per_iter = 5
+    assert abs(_buffer_lap_iters(_inj) - 65.57377) < 0.01
+    _got = _resolve_inject_cadence(_inj)
+    assert _got['const_action_inject_every'] == 20, _got
+    assert _got['step_test_inject_every'] == 20, _got
+    assert _got['dv_prbs_inject_every'] == 10, _got
+    assert _got['expert_inject_every'] == 20, _got
+    _slow = TrainConfig()
+    _slow.episode_length = 4000
+    _slow.buffer_capacity_steps = 400_000
+    _slow.ep_per_iter = 5
+    _sg = _resolve_inject_cadence(_slow)
+    assert _sg['const_action_inject_every'] == 6, _sg   # 20-iter lap × 0.30
+    assert _sg['dv_prbs_inject_every'] == 5, _sg        # floor 5
+    _fast = TrainConfig()
+    _fast.episode_length = 500
+    _fast.buffer_capacity_steps = 400_000
+    _fast.ep_per_iter = 5
+    _fg = _resolve_inject_cadence(_fast)
+    assert _fg['const_action_inject_every'] == 48, _fg  # 160-iter lap × 0.30
+    assert _fg['dv_prbs_inject_every'] == 10, _fg       # capped at warmup/4
+    _off = TrainConfig()
+    _off.episode_length = 1220
+    _off.const_action_inject_every = 0
+    assert _resolve_inject_cadence(_off)['const_action_inject_every'] == 0
+    _ex = TrainConfig()
+    _ex.episode_length = 4000
+    _ex.const_action_inject_every = 20
+    _ex._explicit_fields = {'const_action_inject_every'}
+    assert _resolve_inject_cadence(_ex)['const_action_inject_every'] == 20
+    print('[smoke] OK  inject cadence sim-adaptive (test_sim 20/10; 0=off)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and

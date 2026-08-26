@@ -258,6 +258,23 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # coverage for the WM before random/imagination data dominates).
     # Default 24 in TrainConfig.
     'DREAMER_CONST_ACTION_SEEDS': ('constant_action_seed_episodes', int),
+    # P1 re-inject cadence (P28 follow-up 5): EVERY auto-scales from
+    # buffer lap unless explicit; 0 disables.  N and IN_P2/P3 stay as set.
+    'DREAMER_CONST_ACTION_INJECT_EVERY':  ('const_action_inject_every',      int),
+    'DREAMER_CONST_ACTION_INJECT_N':      ('const_action_inject_n',          int),
+    'DREAMER_CONST_ACTION_INJECT_IN_P2':  ('const_action_inject_in_p2',      _as_bool),
+    'DREAMER_CONST_ACTION_INJECT_IN_P3':  ('const_action_inject_in_p3',      _as_bool),
+    'DREAMER_STEP_TEST_INJECT_EVERY':     ('step_test_inject_every',         int),
+    'DREAMER_STEP_TEST_INJECT_N':         ('step_test_inject_n',             int),
+    'DREAMER_STEP_TEST_INJECT_IN_P2':     ('step_test_inject_in_p2',         _as_bool),
+    'DREAMER_STEP_TEST_INJECT_IN_P3':     ('step_test_inject_in_p3',         _as_bool),
+    'DREAMER_DV_PRBS_INJECT_EVERY':       ('dv_prbs_inject_every',           int),
+    'DREAMER_DV_PRBS_INJECT_N':           ('dv_prbs_inject_n',               int),
+    'DREAMER_DV_PRBS_INJECT_IN_P2':       ('dv_prbs_inject_in_p2',           _as_bool),
+    'DREAMER_DV_PRBS_INJECT_IN_P3':       ('dv_prbs_inject_in_p3',           _as_bool),
+    'DREAMER_EXPERT_INJECT_EVERY':        ('expert_inject_every',            int),
+    'DREAMER_EXPERT_INJECT_N':            ('expert_inject_n',                int),
+    'DREAMER_EXPERT_INJECT_IN_P3':        ('expert_inject_in_p3',            _as_bool),
     # 2026-05-22 (P41): MTP head sequence length.  Paper default 8.
     # Bumped to 32 in TrainConfig on 2026-05-21 (p31 RCA) but P40
     # falsified that rationale (0% steady-state WM convergence at
@@ -292,10 +309,28 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_P1_GATE_WM_EMA_MIN':  ('p1_gate_wm_ema_min',         float),
     'DREAMER_P1_GATE_PLATEAU_FRAC': ('p1_gate_plateau_frac',      float),
     'DREAMER_P1_GATE_PLATEAU_PROBES': ('p1_gate_plateau_probes',  int),
-        'DREAMER_P1_GATE_MAX_EXTENSION': ('p1_gate_max_extension',    float),  # default 1.0
+    'DREAMER_P1_GATE_MAX_EXTENSION': ('p1_gate_max_extension',    float),  # default 1.0
+    'DREAMER_P1_GAIN_GATE':        ('p1_gain_gate',               _as_bool),
+    'DREAMER_GAIN_READY_LO':       ('gain_ready_lo',              float),
+    'DREAMER_GAIN_READY_HI':       ('gain_ready_hi',              float),
+    'DREAMER_GAIN_READY_LEVELS':   ('gain_ready_levels',          int),
+    'DREAMER_GAIN_READY_NOISE_MAX': ('gain_ready_noise_max',      float),
+    'DREAMER_GAIN_READY_FLIP_MAX': ('gain_ready_flip_max',        int),
+    'DREAMER_WM_BEST_GAIN_GATE':   ('wm_best_gain_gate',          _as_bool),
+    'DREAMER_WM_FIDELITY_EMA_ALPHA': ('wm_fidelity_ema_alpha',    float),
+    'DREAMER_WM_FIDELITY_WARMUP_ITERS': ('wm_fidelity_warmup_iters', int),
+    'DREAMER_WM_FIDELITY_PATIENCE_ITERS': ('wm_fidelity_patience_iters', int),
+    'DREAMER_WM_FIDELITY_CONV_PROBE': ('wm_fidelity_conv_probe',  _as_bool),
+    'DREAMER_WM_FIDELITY_CONV_WEIGHT': ('wm_fidelity_conv_weight', float),
+    'DREAMER_WM_FIDELITY_RECON_WEIGHT': ('wm_fidelity_recon_weight', float),
+    'DREAMER_WM_FIDELITY_GAIN_WEIGHT': ('wm_fidelity_gain_weight', float),
+    'DREAMER_WM_FIDELITY_GAIN_GATE_RECON': ('wm_fidelity_gain_gate_recon', float),
+    'DREAMER_WM_PROBE_EVERY_ITERS': ('wm_probe_every_iters',      int),
+    'DREAMER_HORIZON_R_FLOOR':     ('horizon_r_floor',            float),
+    'DREAMER_WM_CONVERGE_EPS_STD': ('wm_converge_eps_std',        float),
     'DREAMER_P2_GATE_REWARD_MTP_MAX': ('p2_gate_reward_mtp_max',  float),
     'DREAMER_P2_GATE_RECENT_ITERS': ('p2_gate_recent_iters',      int),
-        'DREAMER_P2_GATE_MAX_EXTENSION': ('p2_gate_max_extension',    float),  # default 0.5
+    'DREAMER_P2_GATE_MAX_EXTENSION': ('p2_gate_max_extension',    float),  # default 0.5
     # 2026-05-27 (P57 RCA): minimum fraction of total_steps reserved
     # for P3 (actor-critic) regardless of P1/P2 extensions.  Default
     # 0.20 in TrainConfig.  Set to 0.0 to disable (legacy behaviour).

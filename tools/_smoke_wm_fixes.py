@@ -160,6 +160,11 @@ def _test_defaults_and_env():
         'DREAMER_EXPERT_BC_P3_FLOOR': ('0.0', 'expert_bc_p3_floor', 0.0),
         'DREAMER_WM_BEST_RESTORE_AT_P2': ('0', 'wm_best_restore_at_p2', False),
         'DREAMER_WM_BEST_RESTORE_MIN_GAP': ('7', 'wm_best_restore_min_gap', 7),
+        'DREAMER_CONST_ACTION_INJECT_EVERY': ('7', 'const_action_inject_every', 7),
+        'DREAMER_DV_PRBS_INJECT_EVERY': ('5', 'dv_prbs_inject_every', 5),
+        'DREAMER_GAIN_READY_LO': ('0.75', 'gain_ready_lo', 0.75),
+        'DREAMER_P1_GAIN_GATE': ('0', 'p1_gain_gate', False),
+        'DREAMER_WM_PROBE_EVERY_ITERS': ('8', 'wm_probe_every_iters', 8),
     }
     for k, (val, _f, _e) in env_map.items():
         os.environ[k] = val

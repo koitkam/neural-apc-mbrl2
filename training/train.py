@@ -1180,6 +1180,29 @@ class TrainConfig:
     # (≈0.79–0.84) vs the well-excited MV; a larger sweep raises Var(DV) further
     # (less errors-in-variables dilution) + covers more nonlinear operating points.
     dv_prbs_op_frac: float = 0.8
+    # ---- P1 re-inject cadence (sim-adaptive; P28 follow-up 5) ----
+    # Dataclass 20/20/10/20 are the test_sim sentinels (ep_len≈1220,
+    # 400k-step buffer, 5 eps/iter → ~66-iter FIFO lap).  ``_resolve_
+    # inject_cadence`` replaces them with ``round(frac × lap)`` so a
+    # longer-τ plant (fewer episodes in the same step-cap) injects more
+    # often and a faster plant less often.  Episode length is already
+    # ``k·(τ+θ)``, so this is f(buffer turnover / τ) with no engineering
+    # units.  ``0`` disables.  Explicit ``DREAMER_*_INJECT_EVERY`` wins.
+    const_action_inject_every: int = 20
+    const_action_inject_n: int = 5
+    const_action_inject_in_p2: bool = False
+    const_action_inject_in_p3: bool = False
+    step_test_inject_every: int = 20
+    step_test_inject_n: int = 2
+    step_test_inject_in_p2: bool = False
+    step_test_inject_in_p3: bool = False
+    dv_prbs_inject_every: int = 10
+    dv_prbs_inject_n: int = 2
+    dv_prbs_inject_in_p2: bool = False
+    dv_prbs_inject_in_p3: bool = False
+    expert_inject_every: int = 20
+    expert_inject_n: int = 3
+    expert_inject_in_p3: bool = True
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -1715,6 +1738,32 @@ class TrainConfig:
     p1_gate_plateau_frac: float = 0.05
     p1_gate_plateau_probes: int = 3
     p1_gate_max_extension: float = 1.0
+    # P1→P2 observer GAIN-readiness probe (p20).  Unitless DC-gain band
+    # and noise/sign-flip limits — already sim-agnostic; promoted so they
+    # appear in run_plan.json instead of silent os.environ.  ``p1_gain_gate``
+    # off skips the probe (fidelity-only freeze — not for actor experiments).
+    p1_gain_gate: bool = True
+    gain_ready_lo: float = 0.80
+    gain_ready_hi: float = 1.30
+    gain_ready_levels: int = 5
+    gain_ready_noise_max: float = 3.0
+    gain_ready_flip_max: int = 1
+    wm_best_gain_gate: bool = True
+    # WM-fidelity probe / wm_best score (unitless mix).  Cadence and
+    # patience stay in *iters* (one WM update ≈ one iter); inject EVERY
+    # is the one that had to become f(buffer lap).  Promoted from
+    # os.environ so A/B lands in run_plan.json.
+    wm_fidelity_ema_alpha: float = 0.5
+    wm_fidelity_warmup_iters: int = 40
+    wm_fidelity_patience_iters: int = 40
+    wm_fidelity_conv_probe: bool = True
+    wm_fidelity_conv_weight: float = 1.0
+    wm_fidelity_recon_weight: float = 3.0
+    wm_fidelity_gain_weight: float = 3.0
+    wm_fidelity_gain_gate_recon: float = 0.15
+    wm_probe_every_iters: int = 10
+    horizon_r_floor: float = 0.40
+    wm_converge_eps_std: float = 0.05
 
     # P2 gate: same idea, on ``reward_mtp_loss``.  In this codebase the
     # critic head only trains in P3 — P2 is WM + reward-MTP head only
@@ -2800,6 +2849,89 @@ def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
     auto = max(8, int(round(float(max(1, k)) / 3.5)))
     cfg.aux_tbptt_steps = int(auto)
     return int(auto)
+
+
+def _buffer_lap_iters(cfg: 'TrainConfig') -> float:
+    """Iters to FIFO-lap the replay buffer (episode-major ring).
+
+    ``capacity_steps / (episode_length × ep_per_iter)``.  Episode length
+    is already ``k·(τ+θ)`` (``derive_episode_length``), so this is
+    f(buffer turnover / τ) with no engineering units.  test_sim:
+    400k / (1220 × 5) ≈ 65.6 iters (the "~65 iters worth" in the P39
+    eviction RCA).
+    """
+    cap = max(1, int(getattr(cfg, 'buffer_capacity_steps', 400_000)
+                     or 400_000))
+    ep_len = max(1, int(getattr(cfg, 'episode_length', 1) or 1))
+    epi = max(1, int(getattr(cfg, 'ep_per_iter', 5) or 5))
+    return float(cap) / float(ep_len * epi)
+
+
+def _resolve_one_inject_every(
+        cfg: 'TrainConfig', field: str, sentinel: int, auto: int) -> int:
+    """Keep 0=off, explicit/non-sentinel, else the buffer-lap auto value."""
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    cur = int(getattr(cfg, field, sentinel) or 0)
+    if cur <= 0:
+        setattr(cfg, field, 0)
+        return 0
+    if field in explicit or cur != int(sentinel):
+        return cur
+    auto_i = max(5, int(auto))
+    setattr(cfg, field, int(auto_i))
+    return int(auto_i)
+
+
+def _resolve_inject_cadence(
+        cfg: 'TrainConfig', *, log: bool = False) -> Dict[str, int]:
+    """Scale P1 re-inject EVERY from buffer-lap; keep test_sim at 20/10.
+
+    Const / step-test / expert: 0.30 of a lap → 20 of ~66 on test_sim
+    (~3 injects per FIFO lap, the P39 dilution fix).  DV-PRBS: 0.15 of
+    a lap → 10 of ~66, also capped at ``wm_fidelity_warmup_iters/4`` so
+    ≥4 injects land before a typical early ``wm_best`` (p122: cadence
+    20→10 so injects fire inside the restored window instead of after
+    it and getting rolled back).
+
+    Dataclass 20/20/10/20 are the test_sim sentinels (like
+    ``aux_tbptt_steps=16``).  Explicit ``DREAMER_*_INJECT_EVERY`` wins.
+    ``0`` disables (not auto — 0 has always meant off).
+    """
+    lap = _buffer_lap_iters(cfg)
+    warmup = max(1, int(getattr(cfg, 'wm_fidelity_warmup_iters', 40) or 40))
+    const_auto = int(round(lap * 0.30))
+    dv_auto = min(int(round(lap * 0.15)), max(5, warmup // 4))
+    out = {
+        'lap_iters': int(round(lap)),
+        'const_action_inject_every': _resolve_one_inject_every(
+            cfg, 'const_action_inject_every', 20, const_auto),
+        'step_test_inject_every': _resolve_one_inject_every(
+            cfg, 'step_test_inject_every', 20, const_auto),
+        'dv_prbs_inject_every': _resolve_one_inject_every(
+            cfg, 'dv_prbs_inject_every', 10, dv_auto),
+        'expert_inject_every': _resolve_one_inject_every(
+            cfg, 'expert_inject_every', 20, const_auto),
+    }
+    if log:
+        print(
+            f'[inject-cadence] buffer lap={lap:.1f} iters '
+            f'(cap={int(cfg.buffer_capacity_steps)} / '
+            f'ep_len={int(cfg.episode_length)} / '
+            f'ep_per_iter={int(cfg.ep_per_iter)}); '
+            f'const/step/expert every={out["const_action_inject_every"]}/'
+            f'{out["step_test_inject_every"]}/{out["expert_inject_every"]} '
+            f'dv-prbs every={out["dv_prbs_inject_every"]} '
+            f'(test_sim sentinels 20/20/10/20; 0=off)',
+            flush=True)
+    return out
+
+
+def _cfg_on(cfg: 'TrainConfig', name: str, default: bool = True) -> bool:
+    """Bool cfg field; strings like ``'0'``/``'off'`` count as False."""
+    v = getattr(cfg, name, default)
+    if isinstance(v, str):
+        return str(v).strip().lower() not in ('0', 'off', 'false', 'no', '')
+    return bool(v)
 
 
 # ---------------------------------------------------------------------------
@@ -5659,7 +5791,7 @@ def _probe_wm_held_convergence(model, env, device, cfg: 'TrainConfig'):
         return None
     if got < L + H + 2:
         return None
-    eps_std = float(os.environ.get('DREAMER_WM_CONVERGE_EPS_STD', '0.05'))
+    eps_std = float(getattr(cfg, 'wm_converge_eps_std', 0.05) or 0.05)
     conv_flags: List[float] = []
     drifts: List[float] = []
     for i in range(n_starts):
@@ -5708,7 +5840,7 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     except Exception as e:
         print(f'[wm-fidelity-probe] import failed: {e!r}', flush=True)
         return None
-    r_floor = float(os.environ.get('DREAMER_HORIZON_R_FLOOR', '0.40'))
+    r_floor = float(getattr(cfg, 'horizon_r_floor', 0.40) or 0.40)
     r_floor = float(np.clip(r_floor, 0.0, 0.95))
     try:
         wm = _wm_kstep_rollout(model, env, device,
@@ -5785,8 +5917,7 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     # P89: held-action convergence companion (anti-drift) so the wm_best score
     # is not blind to imagination drift (the r-terms above are scale-invariant).
     # Gated (DREAMER_WM_FIDELITY_CONV_PROBE), RSSM-only, never fatal.
-    if os.environ.get('DREAMER_WM_FIDELITY_CONV_PROBE',
-                       '1').lower() not in ('0', 'off', 'false', 'no'):
+    if _cfg_on(cfg, 'wm_fidelity_conv_probe', True):
         try:
             _conv = _probe_wm_held_convergence(model, env, device, cfg)
         except Exception as e:
@@ -5834,9 +5965,9 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     except Exception as e:
         print(f'[gain-ready-probe] import failed: {e!r}', flush=True)
         return None
-    band_lo = float(os.environ.get('DREAMER_GAIN_READY_LO', '0.80'))
-    band_hi = float(os.environ.get('DREAMER_GAIN_READY_HI', '1.30'))
-    n_levels = int(os.environ.get('DREAMER_GAIN_READY_LEVELS', '5'))
+    band_lo = float(getattr(cfg, 'gain_ready_lo', 0.80))
+    band_hi = float(getattr(cfg, 'gain_ready_hi', 1.30))
+    n_levels = int(getattr(cfg, 'gain_ready_levels', 5) or 5)
     _dprob = getattr(env, '_disturbance_prob_override', None)
     obs_std = None
     try:
@@ -5896,8 +6027,8 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     if not ss_ratios:
         return None
     srs = [r for _, r in ss_ratios]
-    noise_max = float(os.environ.get('DREAMER_GAIN_READY_NOISE_MAX', '3.0'))
-    flip_max = int(os.environ.get('DREAMER_GAIN_READY_FLIP_MAX', '1'))
+    noise_max = float(getattr(cfg, 'gain_ready_noise_max', 3.0))
+    flip_max = int(getattr(cfg, 'gain_ready_flip_max', 1) or 1)
     worst_noise = float(max(noises)) if noises else 0.0
     # READY = UNBIASED (every MV+DV DC-gain ratio in band) AND NOT-NOISY (the
     # deterministic open-loop gain is consistent across operating points: its
@@ -7675,20 +7806,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_score_ema: float = -1e18
     wm_score_ema_best: float = -1e18
     wm_score_ema_best_iter: int = -1
-    wm_score_ema_alpha = float(
-        os.environ.get('DREAMER_WM_FIDELITY_EMA_ALPHA', '0.5'))
+    wm_score_ema_alpha = float(getattr(cfg, 'wm_fidelity_ema_alpha', 0.5) or 0.5)
     # P2-relative ES: reset the "best" tracker on P1→P2 entry so the
     # P2 critic head gets a fair patience window from its own best,
     # not from an unreachable P1 best (P47 RCA: iter 50 in P2 was 30
     # iters past wm_best_iter=20 in P1 → instant trip on P2 entry).
     wm_es_p2_baseline_iter: int = -1
     wm_fidelity_warmup_iters = int(
-        os.environ.get('DREAMER_WM_FIDELITY_WARMUP_ITERS', '40'))
+        getattr(cfg, 'wm_fidelity_warmup_iters', 40) or 40)
     # P47 RCA: 20 → 40 iters (4 probes) so the EMA can stabilise across
     # the natural ±0.12 noise band.  Combined with EMA smoothing,
     # genuine multi-probe degradation still trips within ~50 iters.
     wm_fidelity_patience_iters = int(
-        os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '40'))
+        getattr(cfg, 'wm_fidelity_patience_iters', 40) or 40)
     # ----- Phase-transition quality gates (P52 RCA, 2026-05-26) -----
     # ``phase{1,2}_env_steps`` become *lower bounds*; quality gates can
     # extend each phase up to ``(1+max_extension)`` × budget.  Gate
@@ -7742,12 +7872,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # steady-state behaviour even while its short-horizon next-state
     # loss continues to improve.  Periodically inject fresh const-action
     # episodes during P1 to keep the steady-state regime represented in
-    # the buffer.  Sim-agnostic: counts are env-tunable, action levels
-    # stratified within ``constant_action_seed_op_band``.
-    const_inject_every = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_EVERY', '20'))
-    const_inject_n = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_N', '5'))
+    # the buffer.  Cadence is f(buffer lap): see ``_resolve_inject_cadence``.
+    _resolve_inject_cadence(cfg, log=True)
+    const_inject_every = int(getattr(cfg, 'const_action_inject_every', 20) or 0)
+    const_inject_n = int(getattr(cfg, 'const_action_inject_n', 5) or 0)
     # P49 RCA (2026-05-25): WM steady-state probe still shows 0%
     # convergence under zero/constant action even after P39's periodic
     # P1 injection — because the const-action episodes are evicted
@@ -7760,10 +7888,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # steady-state convergence (still 0% in P50).  Defaults reverted
     # to OFF (P1-only injection).  Opt-in for experimentation via
     # DREAMER_CONST_ACTION_INJECT_IN_{P2,P3}=1.  See P50 RCA.
-    const_inject_in_p2 = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P2', '0'))
-    const_inject_in_p3 = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P3', '0'))
+    const_inject_in_p2 = bool(getattr(cfg, 'const_action_inject_in_p2', False))
+    const_inject_in_p3 = bool(getattr(cfg, 'const_action_inject_in_p3', False))
     # ----- Periodic STEP-TEST (DV-exciting) re-injection (2026-06-13) -----
     # The const-inject above replenishes only the MV exciters (const +
     # step-settle); the DV-exciting STEP-TEST episodes are seed-only.  Once the
@@ -7774,14 +7900,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # step-test episodes on the same cadence so the DV gain stays supervised
     # right up to the WM freeze.  Default ON in P1 (matches const-inject), P2/P3
     # opt-in (P50 cascade caution), NO-OP when the sim has no DV channel.
-    step_test_inject_every = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_EVERY', '20'))
-    step_test_inject_n = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_N', '2'))
-    step_test_inject_in_p2 = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P2', '0'))
-    step_test_inject_in_p3 = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P3', '0'))
+    step_test_inject_every = int(getattr(cfg, 'step_test_inject_every', 20) or 0)
+    step_test_inject_n = int(getattr(cfg, 'step_test_inject_n', 2) or 0)
+    step_test_inject_in_p2 = bool(getattr(cfg, 'step_test_inject_in_p2', False))
+    step_test_inject_in_p3 = bool(getattr(cfg, 'step_test_inject_in_p3', False))
     # DV-PRBS re-injection (2026-06-14): keep the full-range DV sweep fresh
     # in the ring buffer through Stage 1 so the DV→CV gain stays supervised
     # right up to the WM freeze (the seed-time dv-prbs episodes are FIFO-
@@ -7791,14 +7913,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # P1→P2 wm_best warm-restore keeps an early (~iter 30) checkpoint, so the
     # re-injects must land BEFORE it — every-10 fires at iter 10/20/30 (all
     # inside the kept window) instead of 20/40/60 (40/60 rolled back).
-    dv_prbs_inject_every = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_EVERY', '10'))
-    dv_prbs_inject_n = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_N', '2'))
-    dv_prbs_inject_in_p2 = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_IN_P2', '0'))
-    dv_prbs_inject_in_p3 = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_IN_P3', '0'))
+    # Auto-scale still caps at warmup/4 so other plants keep that property.
+    dv_prbs_inject_every = int(getattr(cfg, 'dv_prbs_inject_every', 10) or 0)
+    dv_prbs_inject_n = int(getattr(cfg, 'dv_prbs_inject_n', 2) or 0)
+    dv_prbs_inject_in_p2 = bool(getattr(cfg, 'dv_prbs_inject_in_p2', False))
+    dv_prbs_inject_in_p3 = bool(getattr(cfg, 'dv_prbs_inject_in_p3', False))
     # ----- Periodic EXPERT re-injection (P81 RCA, 2026-06-03) -----
     # Same eviction failure mode as the const-action seeds above, but for
     # the objective-aligned expert demonstrations: the expert episodes are
@@ -7814,16 +7933,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # P2 injection does not threaten Var(r)/Var(target_v).  P83 keeps a
     # decaying masked-BC anchor alive THROUGH P3, so the expert episodes
     # must also survive in the buffer during P3 — hence injection in P3 is
-    # now ON by default.  Volume is kept low (3 eps every 20 iters) and the
+    # now ON by default.  Volume is kept low (3 eps every ~0.3 lap) and the
     # episodes ride the constraint edge with healthy reward variance, so the
     # P50 const-inject cascade risk (flat steady-state collapsing Var(r))
     # does not apply.  Disable via DREAMER_EXPERT_INJECT_IN_P3=0 for ablation.
-    expert_inject_every = int(
-        os.environ.get('DREAMER_EXPERT_INJECT_EVERY', '20'))
-    expert_inject_n = int(
-        os.environ.get('DREAMER_EXPERT_INJECT_N', '3'))
-    expert_inject_in_p3 = int(
-        os.environ.get('DREAMER_EXPERT_INJECT_IN_P3', '1'))
+    expert_inject_every = int(getattr(cfg, 'expert_inject_every', 20) or 0)
+    expert_inject_n = int(getattr(cfg, 'expert_inject_n', 3) or 0)
+    expert_inject_in_p3 = bool(getattr(cfg, 'expert_inject_in_p3', True))
     # ----- wm_best.pt warm-restore at P1→P2 (P39, 2026-05-22) -----
     # When the WM's fidelity peak is reached well before P1 ends and the
     # subsequent iters drift to a lower-quality basin (P38: peak iter 50,
@@ -8528,8 +8644,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _gain_ok = True
             _gain_probe = None
             if (_ema_ok and _plateau_ok
-                    and os.environ.get('DREAMER_P1_GAIN_GATE', '1').lower()
-                        not in ('0', 'off', 'false', 'no')):
+                    and _cfg_on(cfg, 'p1_gain_gate', True)):
                 _gain_probe = _probe_observer_gain_ready(model, env, device, cfg)
                 if _gain_probe is not None:
                     _gain_ok = bool(_gain_probe.get('gain_ready', True))
@@ -8738,9 +8853,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # the AUTHORITATIVE transfer-matrix gain: keep whichever
                         # of {wm_best, current} is more gain-ready.
                         # DREAMER_WM_BEST_GAIN_GATE=0 disables.
-                        _gain_gate = os.environ.get(
-                            'DREAMER_WM_BEST_GAIN_GATE', '1').lower() \
-                            not in ('0', 'off', 'false', 'no')
+                        _gain_gate = _cfg_on(cfg, 'wm_best_gain_gate', True)
 
                         def _gain_badness(_pr):
                             if not _pr:
@@ -9772,9 +9885,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # than waiting for the phase transition.  Default every
             # 10 log-iters; disable via DREAMER_WM_PROBE_EVERY_ITERS=0.
             try:
-                _probe_every = int(os.environ.get(
-                    'DREAMER_WM_PROBE_EVERY_ITERS', '10') or 0)
-            except ValueError:
+                _probe_every = int(getattr(
+                    cfg, 'wm_probe_every_iters', 10) or 0)
+            except (TypeError, ValueError):
                 _probe_every = 0
             if (_probe_every > 0
                     and current_phase in (1, 2)
@@ -9819,8 +9932,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # degenerate flat-but-"converged" WM earns no credit.
                         # Weight via DREAMER_WM_FIDELITY_CONV_WEIGHT (0=off).
                         _conv_frac = _pbe.get('wm_converge_frac')
-                        _conv_w = float(os.environ.get(
-                            'DREAMER_WM_FIDELITY_CONV_WEIGHT', '1.0'))
+                        _conv_w = float(getattr(
+                            cfg, 'wm_fidelity_conv_weight', 1.0) or 0.0)
                         if (_conv_w > 0.0 and _conv_frac is not None
                                 and int(_pbe.get('best_h', 0)) > 0):
                             _score = _score + _conv_w * float(_conv_frac)
@@ -9836,8 +9949,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # recon ⇒ better gain, the control-relevant property).
                         # Weight via DREAMER_WM_FIDELITY_RECON_WEIGHT (0=off,
                         # legacy).  Uses the most recent training recon_loss.
-                        _recon_w = float(os.environ.get(
-                            'DREAMER_WM_FIDELITY_RECON_WEIGHT', '3.0'))
+                        _recon_w = float(getattr(
+                            cfg, 'wm_fidelity_recon_weight', 3.0) or 0.0)
                         if _recon_w > 0.0:
                             try:
                                 _rl = wm_losses.get('recon_loss')
@@ -9858,8 +9971,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # high-variance early checkpoint cannot win on spurious
                         # CV variance (mirrors the overshoot/held recon gates).
                         # Weight via DREAMER_WM_FIDELITY_GAIN_WEIGHT (0=off).
-                        _gain_w = float(os.environ.get(
-                            'DREAMER_WM_FIDELITY_GAIN_WEIGHT', '3.0'))
+                        _gain_w = float(getattr(
+                            cfg, 'wm_fidelity_gain_weight', 3.0) or 0.0)
                         _gain_fid = _pbe.get('wm_gain_fidelity')
                         if _gain_w > 0.0 and _gain_fid is not None:
                             try:
@@ -9867,8 +9980,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 _rlv = float(_rl.detach().item()
                                               if torch.is_tensor(_rl)
                                               else _rl)
-                                _gate_thr = float(os.environ.get(
-                                    'DREAMER_WM_FIDELITY_GAIN_GATE_RECON', '0.15'))
+                                _gate_thr = float(getattr(
+                                    cfg, 'wm_fidelity_gain_gate_recon', 0.15)
+                                    or 0.15)
                                 _gate = (min(1.0, _gate_thr / max(_rlv, 1e-6))
                                           if np.isfinite(_rlv) else 0.0)
                                 _score = _score + _gain_w * float(_gain_fid) * _gate
@@ -10591,6 +10705,49 @@ def _cfg_from_env() -> TrainConfig:
         ('DREAMER_P1_GATE_PLATEAU_FRAC', 'p1_gate_plateau_frac', float),
         ('DREAMER_P1_GATE_PLATEAU_PROBES', 'p1_gate_plateau_probes', int),
         ('DREAMER_P1_GATE_MAX_EXTENSION', 'p1_gate_max_extension', float),
+        ('DREAMER_P1_GAIN_GATE', 'p1_gain_gate',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_GAIN_READY_LO', 'gain_ready_lo', float),
+        ('DREAMER_GAIN_READY_HI', 'gain_ready_hi', float),
+        ('DREAMER_GAIN_READY_LEVELS', 'gain_ready_levels', int),
+        ('DREAMER_GAIN_READY_NOISE_MAX', 'gain_ready_noise_max', float),
+        ('DREAMER_GAIN_READY_FLIP_MAX', 'gain_ready_flip_max', int),
+        ('DREAMER_WM_BEST_GAIN_GATE', 'wm_best_gain_gate',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_WM_FIDELITY_EMA_ALPHA', 'wm_fidelity_ema_alpha', float),
+        ('DREAMER_WM_FIDELITY_WARMUP_ITERS', 'wm_fidelity_warmup_iters', int),
+        ('DREAMER_WM_FIDELITY_PATIENCE_ITERS', 'wm_fidelity_patience_iters', int),
+        ('DREAMER_WM_FIDELITY_CONV_PROBE', 'wm_fidelity_conv_probe',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_WM_FIDELITY_CONV_WEIGHT', 'wm_fidelity_conv_weight', float),
+        ('DREAMER_WM_FIDELITY_RECON_WEIGHT', 'wm_fidelity_recon_weight', float),
+        ('DREAMER_WM_FIDELITY_GAIN_WEIGHT', 'wm_fidelity_gain_weight', float),
+        ('DREAMER_WM_FIDELITY_GAIN_GATE_RECON', 'wm_fidelity_gain_gate_recon', float),
+        ('DREAMER_WM_PROBE_EVERY_ITERS', 'wm_probe_every_iters', int),
+        ('DREAMER_HORIZON_R_FLOOR', 'horizon_r_floor', float),
+        ('DREAMER_WM_CONVERGE_EPS_STD', 'wm_converge_eps_std', float),
+        ('DREAMER_CONST_ACTION_INJECT_EVERY', 'const_action_inject_every', int),
+        ('DREAMER_CONST_ACTION_INJECT_N', 'const_action_inject_n', int),
+        ('DREAMER_CONST_ACTION_INJECT_IN_P2', 'const_action_inject_in_p2',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_CONST_ACTION_INJECT_IN_P3', 'const_action_inject_in_p3',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_STEP_TEST_INJECT_EVERY', 'step_test_inject_every', int),
+        ('DREAMER_STEP_TEST_INJECT_N', 'step_test_inject_n', int),
+        ('DREAMER_STEP_TEST_INJECT_IN_P2', 'step_test_inject_in_p2',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_STEP_TEST_INJECT_IN_P3', 'step_test_inject_in_p3',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_DV_PRBS_INJECT_EVERY', 'dv_prbs_inject_every', int),
+        ('DREAMER_DV_PRBS_INJECT_N', 'dv_prbs_inject_n', int),
+        ('DREAMER_DV_PRBS_INJECT_IN_P2', 'dv_prbs_inject_in_p2',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_DV_PRBS_INJECT_IN_P3', 'dv_prbs_inject_in_p3',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
+        ('DREAMER_EXPERT_INJECT_EVERY', 'expert_inject_every', int),
+        ('DREAMER_EXPERT_INJECT_N', 'expert_inject_n', int),
+        ('DREAMER_EXPERT_INJECT_IN_P3', 'expert_inject_in_p3',
+            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
         ('DREAMER_P2_GATE_REWARD_MTP_MAX', 'p2_gate_reward_mtp_max', float),
         ('DREAMER_P2_GATE_RECENT_ITERS', 'p2_gate_recent_iters', int),
         ('DREAMER_P2_GATE_MAX_EXTENSION', 'p2_gate_max_extension', float),
