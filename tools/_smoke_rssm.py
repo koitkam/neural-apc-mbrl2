@@ -20,7 +20,9 @@ from training.train import (TrainConfig, build_model, world_model_loss,
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _critic_anchor_lambda,
                             _critic_anchor_coef, _force_p1_cap_at,
-                            _resolve_aux_tbptt_steps)
+                            _resolve_aux_tbptt_steps,
+                            _recon_still_healthy, _skip_storm_restore_ckpt,
+                            _actor_experiment_valid)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -161,6 +163,36 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _tb_ex._explicit_fields = {'aux_tbptt_steps'}
     assert _resolve_aux_tbptt_steps(_tb_ex) == 16
     print('[smoke] OK  aux_tbptt_steps sim-adaptive (16-of-55; explicit wins)')
+
+    # P28 follow-up 3: skip-storm restores last healthy P1 step, not wm_best.
+    import tempfile
+    from pathlib import Path as _P
+    with tempfile.TemporaryDirectory() as _td:
+        _tmp = _P(_td)
+        _last = _tmp / 'wm_last_ok.pt'
+        _best = _tmp / 'wm_best.pt'
+        _last.write_bytes(b'ok')
+        _best.write_bytes(b'best')
+        _p, _src = _skip_storm_restore_ckpt(_last, _best)
+        assert _src == 'wm_last_ok' and _p == _last, (_src, _p)
+        _last.unlink()
+        _p, _src = _skip_storm_restore_ckpt(_last, _best)
+        assert _src == 'wm_best' and _p == _best, (_src, _p)
+        _best.unlink()
+        _p, _src = _skip_storm_restore_ckpt(_last, _best)
+        assert _src == 'none' and _p is None, (_src, _p)
+    assert _recon_still_healthy(0.004, None)
+    assert _recon_still_healthy(0.004, 0.0039, 5.0)
+    assert not _recon_still_healthy(0.50, 0.0039, 5.0)
+    assert not _recon_still_healthy(float('nan'), 0.01)
+    assert _actor_experiment_valid(skip_storm_source='wm_last_ok',
+                                   gain_not_ready_capped=False)
+    assert not _actor_experiment_valid(skip_storm_source='wm_best',
+                                       gain_not_ready_capped=False)
+    assert not _actor_experiment_valid(skip_storm_source=None,
+                                       gain_not_ready_capped=True)
+    assert float(TrainConfig().skip_storm_last_ok_recon_ratio) == 5.0
+    print('[smoke] OK  skip-storm last-ok restore prefers late-P1 observer')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and

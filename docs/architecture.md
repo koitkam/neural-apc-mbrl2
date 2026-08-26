@@ -109,6 +109,17 @@ env-gated off · **[planned]** = designed, not yet built.
 > changes. Isolation TBPTT stride is sim-adaptive (`max(8, round(K/3.5))`,
 > 16-of-55 on test_sim); Huber β is not re-read from env on the hot path
 > (that undid `<=0` auto-median).
+> **P28 follow-up 3:** skip-storm recovery used to restore fidelity-peak
+> `wm_best.pt` (gain-blind EMA of correlation + std-ratio). P27's last
+> healthy observer was iter 49; an early lucky `wm_best` would have
+> discarded that late-P1 excitation. Recovery now keeps an in-memory
+> last-ok snapshot on every skip-free P1 iter whose recon is within
+> `skip_storm_last_ok_recon_ratio` (default 5×, unitless) of the best
+> recon, and restores that first (writes `wm_last_ok.pt` only if a
+> storm fires). Fallback is still `wm_best`. Summary
+> records `actor_experiment_valid=False` when the freeze is
+> `GAIN_NOT_READY` or skip-storm fell back to `wm_best` — P3 still
+> runs, but econ must not be attributed to actor knobs.
 
 ---
 
@@ -467,7 +478,7 @@ the freezes, WM frozen by S3). Both backbones.
 | TSSM (transformer, duck-compatible) | `models/transformer_ssm.py` |
 | Heads (reward/value/policy/disturbance), param groups | `models/dreamer_v4.py` (`parameters_world/_actor/_critic`) |
 | WM loss (recon/KL/overshoot/held-rollout, disturbance) | `training/train.py` (`world_model_loss`, `_disturbance_head_loss`) |
-| Imagination + λ-returns + MC grounding + actor/critic | `training/train.py` (`_imagination_step_rssm`, `imagination_step`) |
+| Real-sim λ-returns + MC grounding + actor/critic | `training/train.py` (`_realsim_actor_critic_step`) |
 | Hidden load + Gd disturbance | `utils/hidden_disturbance.py` (`HiddenDisturbance`) |
 | Neural Kalman filter / DOB (`d_t` state) | `models/dreamer_v4_rssm.py` + `models/transformer_ssm.py` (`dob_enabled`, `obs_step`/`img_step`/`apply_dob`); recon in `training/train.py:_rssm_world_model_loss` |
 | Staged curriculum (per-stage freeze + DOB suppression) | `models/dreamer_v4.py` (`set_world_model_trainable`, `set_dob_active`); stage latch in `training/train.py` (`curriculum_enabled`, per-iter stage hook) |

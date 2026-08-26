@@ -333,6 +333,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # P27 RCA / P28: restore wm_best and continue to P2 on a P1 skip-storm
     # instead of aborting the run (default ON).
     'DREAMER_SKIP_STORM_RECOVER_P1':      ('skip_storm_recover_p1',          _as_bool),
+    'DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO': (
+        'skip_storm_last_ok_recon_ratio', float),
     # Cascade RCA (2026-05-29): the two corrected anti-cascade fixes.
     # A' — potential-based reward shaping (dense, policy-invariant, same
     # γ; training-only, validation scores on unshaped raw_reward).

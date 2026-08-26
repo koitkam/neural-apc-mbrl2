@@ -1245,6 +1245,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Judge by:** P1 completes (or recovers); MV ss/@H ~×1.0 ±0.1 (P26-class); P3 actually runs; `return_scale` not pinned at 49.5; `critic_rew_to_tgt_var` stays >0.015; no entropy-collapse; econ beats baseline AND the P27 BC score (−59); MV not railed/chattery.
 - **Code follow-up (no GPU this session):** skip-storm recovery now closes `p1_gate_max_ext_steps` (`_force_p1_cap_at`) so a recovered P1 cannot re-open the quality-gate extension and re-explode gain-match. `gain_match_huber_beta` / `aux_tbptt_steps` / `wm_grad_skip_norm` promoted to TrainConfig + `ENV_OVERRIDES` (defaults unchanged). `gain_match_huber_beta<=0` auto-sets median |tgt| (opt-in sim-adaptive; not the P28 default).
 - **Code follow-up 2 (no GPU this session):** (1) Curriculum freeze/DOB now re-applies on the **same iter** as `current_phase` changes — the loop-start latch left `g` trainable for the first P2 train step (full-BPTT gain-match on skip-storm-restored weights; also leaked one extra gain-match step on every healthy P1→P2). (2) Isolation TBPTT stride is sim-adaptive: dataclass 16 (test_sim K≈55) becomes `max(8, round(K/3.5))` unless `DREAMER_AUX_TBPTT_STEPS` is explicit. (3) Gain-match Huber β is not re-read from env on the hot path (env `0` = auto-median would overwrite the resolved β and pass β=0 into `smooth_l1`).
+- **Code follow-up 3 (no GPU this session):** skip-storm recovery restored fidelity-peak `wm_best` (gain-blind / noise-led). P27's last healthy observer was iter 49 — restoring an early lucky spike would discard late-P1 excitation. Keep an in-memory last-ok snapshot on skip-free P1 iters whose recon is within 5× the best (unitless); restore that first, `wm_best` only as fallback (`wm_last_ok.pt` written only if a storm fires). Summary `actor_experiment_valid=False` when the freeze is `GAIN_NOT_READY` or skip-storm fell back to `wm_best`.
 
 ### Graveyard (P24–P28 observer / actor levers)
 
@@ -1262,6 +1263,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P1 skip-storm restore `wm_best` + AdamW reset | P28 | KEPT | PARTIAL — recovery without closing ext cap would re-enter exploding P1 |
 | P1 skip-storm close `p1_gate_max_ext_steps` | P28 follow-up | KEPT | YES — zeroed ext re-opened P1 gate |
 | Curriculum freeze on same iter as phase change | P28 follow-up 2 | KEPT | YES — first P2 step still trained `g` |
+| P1 skip-storm restore last-ok (not wm_best) | P28 follow-up 3 | KEPT | YES — wm_best can discard late-P1 |
 
 
 
