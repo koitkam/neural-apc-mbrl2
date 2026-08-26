@@ -32,6 +32,7 @@ from training.train import (
                             _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
+                            _should_skip_invalid_p3,
                             _should_warm_restore_wm_best,
                             _auto_if_unset, _write_resolved_run_plan)
 
@@ -202,6 +203,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
                                        gain_not_ready_capped=False)
     assert not _actor_experiment_valid(skip_storm_source=None,
                                        gain_not_ready_capped=True)
+    assert bool(TrainConfig().skip_invalid_p3) is True
+    assert _should_skip_invalid_p3(actor_valid=False, skip_enabled=True)
+    assert not _should_skip_invalid_p3(actor_valid=True, skip_enabled=True)
+    assert not _should_skip_invalid_p3(actor_valid=False, skip_enabled=False)
+    print('[smoke] OK  skip_invalid_p3 default-on (GAIN_NOT_READY skips P3)')
     assert float(TrainConfig().skip_storm_last_ok_recon_ratio) == 5.0
     assert bool(TrainConfig().wm_best_restore_at_p2) is False
     assert bool(TrainConfig().wm_best_restore_at_p3) is False

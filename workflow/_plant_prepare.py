@@ -387,6 +387,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_BEST_RESTORE_AT_P2':      ('wm_best_restore_at_p2',       _as_bool),
     'DREAMER_WM_BEST_RESTORE_AT_P3':      ('wm_best_restore_at_p3',       _as_bool),
     'DREAMER_WM_BEST_RESTORE_MIN_GAP':    ('wm_best_restore_min_gap',     int),
+    # P29 bookkeeping: skip P3 when the freeze is GAIN_NOT_READY / wm_best
+    # skip-storm fallback (default ON). Observer validation still runs.
+    'DREAMER_SKIP_INVALID_P3':            ('skip_invalid_p3',             _as_bool),
     # Cascade RCA (2026-05-29): the two corrected anti-cascade fixes.
     # A' — potential-based reward shaping (dense, policy-invariant, same
     # γ; training-only, validation scores on unshaped raw_reward).

@@ -1721,6 +1721,12 @@ class TrainConfig:
     # Skip the boundary reload when ``total_iters - wm_best_iter`` is below
     # this (wm_best ≈ current).  ``DREAMER_WM_BEST_RESTORE_MIN_GAP``.
     wm_best_restore_min_gap: int = 10
+    # Hard constraint: do not train the actor on a GAIN_NOT_READY freeze
+    # (or skip-storm ``wm_best`` fallback) and call it an actor experiment.
+    # Default ON skips P3; P2 still trains DOB/reward on the frozen
+    # observer and validation still runs.  ``DREAMER_SKIP_INVALID_P3=0``
+    # keeps the old warn-and-train-anyway path.
+    skip_invalid_p3: bool = True
     # P1 mid-check: at the P1→P2 transition, require ``sf_loss`` to have
     # dropped at least ``min_drop_frac`` from its initial value.  If not,
     # WM never learned dynamics; flag the trial so the BO score reflects
@@ -2844,6 +2850,17 @@ def _actor_experiment_valid(*,
     return True
 
 
+def _should_skip_invalid_p3(*, actor_valid: bool, skip_enabled: bool) -> bool:
+    """Default-on: do not spend GPU on an invalid actor (P28/P29).
+
+    P29 CAPPED P1 as ``not_plateaued`` after an earlier ``gain_not_ready``
+    (DC 3.05@MV) and still entered hours of P3.  When the freeze is not
+    gain-ready, skip P3; observer validation still runs on ``final.pt``.
+    Opt out with ``DREAMER_SKIP_INVALID_P3=0``.
+    """
+    return (not bool(actor_valid)) and bool(skip_enabled)
+
+
 def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
     """Isolation / ss-match TBPTT stride from the rollout length K.
 
@@ -3082,6 +3099,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
+        f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -8370,6 +8388,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
           f"z_dim={cfg.z_dim} lookback={cfg.lookback} "
           f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
           f"compile={_resolve_compile_mode(cfg) or 'eager'} "
+          f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
           f"phases={p1}/{p2}/{p3}",
           flush=True)
 
@@ -9363,12 +9382,38 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                       f'{p1 + p1_ext_steps} (cap {p1 + p1_gate_max_ext_steps})',
                       flush=True)
             else:
+                # Cap: freeze is imminent.  Always run the gain probe here —
+                # the per-check probe is gated on ema∧plateau, so a later
+                # ``not_plateaued`` cap used to hide an earlier
+                # ``gain_not_ready`` (P29: iter 75 DC 3.05@MV, cap printed
+                # only not_plateaued, ``actor_experiment_valid`` stayed True).
+                if (_gain_probe is None
+                        and _cfg_on(cfg, 'p1_gain_gate', True)):
+                    _gain_probe = _probe_observer_gain_ready(
+                        model, env, device, cfg)
+                    if _gain_probe is not None:
+                        _gain_ok = bool(_gain_probe.get('gain_ready', True))
+                        print(f"[gate p1->p2] cap-time gain-probe "
+                              f"ready={_gain_ok} "
+                              f"DCgain_ratio[{_gain_probe['r_min']:.2f},"
+                              f"{_gain_probe['r_max']:.2f}] "
+                              f"worst={_gain_probe['worst_ratio']:.2f}"
+                              f"@{_gain_probe['worst_input']} "
+                              f"band={_gain_probe['band']} | noise: "
+                              f"spread_x{_gain_probe['noise_worst']:.1f} "
+                              f"signflips={_gain_probe['sign_flips']} "
+                              f"({_gain_probe['n_checks']} inputs)",
+                              flush=True)
                 phase_gate_decisions.append({
                     'gate': 'p1->p2', 'iter': int(total_iters),
                     'env_steps': int(total_env_steps),
                     'pass': False, 'capped': True,
                     'wm_ema_best': float(wm_score_ema_best)
                         if wm_score_ema_best > -1e17 else None,
+                    'gain_worst_ratio': (float(_gain_probe['worst_ratio'])
+                                          if _gain_probe else None),
+                    'gain_ready': (bool(_gain_probe.get('gain_ready'))
+                                   if _gain_probe else None),
                 })
                 _cap_why = []
                 if not _ema_ok:
@@ -9453,11 +9498,26 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     skip_storm_source=skip_storm_restore_source,
                     gain_not_ready_capped=bool(p1_gain_not_ready_capped))
                 if not _aev:
+                    _skip_p3 = _should_skip_invalid_p3(
+                        actor_valid=_aev,
+                        skip_enabled=bool(getattr(
+                            cfg, 'skip_invalid_p3', True)))
                     print('[actor] P3 is NOT an actor experiment: observer '
                           'freeze is GAIN_NOT_READY and/or skip-storm fell '
                           'back to fidelity-peak wm_best. Judge observer '
                           'only; do not attribute econ to actor knobs.',
                           flush=True)
+                    if _skip_p3:
+                        early_stop_reason = 'p3_skipped_invalid_observer'
+                        mid_check_flags.append('p3_skipped_invalid_observer')
+                        print('[p3-skip] skipping actor training; P2-end '
+                              'observer freeze stands. Validation still '
+                              'runs on final.pt (expert-BC policy). '
+                              'DREAMER_SKIP_INVALID_P3=0 to train anyway.',
+                              flush=True)
+                        print(f'[early-stop] tripped: {early_stop_reason}',
+                              flush=True)
+                        break
             # mbrl2 real-sim: enable domain randomisation at P3 entry so the
             # actor trains on a RANDOMISED true plant (robustness), while the
             # observer was identified CLEAN in P1/P2 (DR off).  No-op if the
@@ -10524,16 +10584,26 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # categorical KL vs deterministic joint-embed was only in jsonl
             # while the banner printed RSSM ``sf≡0`` + deleted ``img_ret``).
             _rssm = str(getattr(cfg, 'world_model_type', 'rssm')) == 'rssm'
+
+            def _lf(key, nd=4):
+                v = row.get(key, 0.0)
+                try:
+                    x = float(v)
+                    return (f'{x:.{nd}f}' if np.isfinite(x)
+                            else f'{0.0:.{nd}f}')
+                except (TypeError, ValueError):
+                    return f'{0.0:.{nd}f}'
+
             _obs = (
-                f"recon {row.get('recon_loss', 0.0):.4f} "
-                + (f"kl {row.get('kl_loss', 0.0):.3f} "
-                   f"jemb {row.get('joint_embed_loss', 0.0):.4f} "
+                f"recon {_lf('recon_loss')} "
+                + (f"kl {_lf('kl_loss', 3)} "
+                   f"jemb {_lf('joint_embed_loss')} "
                    if _rssm else
-                   f"sf {row.get('sf_loss', 0.0):.4f} ")
-                + f"gmatch {row.get('gain_match_loss', 0.0):.4f} "
-                + f"iso {row.get('wm_input_isolation_loss', 0.0):.4f} "
-                + f"ss {row.get('wm_ss_match_loss', 0.0):.4f} "
-                + (f"dobg {row.get('dob_ground', 0.0):.4f} "
+                   f"sf {_lf('sf_loss')} ")
+                + f"gmatch {_lf('gain_match_loss')} "
+                + f"iso {_lf('wm_input_isolation_loss')} "
+                + f"ss {_lf('wm_ss_match_loss')} "
+                + (f"dobg {_lf('dob_ground')} "
                    if current_phase >= 2 or joint_mode else '')
             )
             _enc = (
@@ -11297,6 +11367,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'actor_experiment_valid': _actor_experiment_valid(
             skip_storm_source=skip_storm_restore_source,
             gain_not_ready_capped=bool(p1_gain_not_ready_capped)),
+        'skip_invalid_p3': bool(getattr(cfg, 'skip_invalid_p3', True)),
     }
 
 

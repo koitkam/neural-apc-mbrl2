@@ -118,8 +118,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > recon, and restores that first (writes `wm_last_ok.pt` only if a
 > storm fires). Fallback is still `wm_best`. Summary
 > records `actor_experiment_valid=False` when the freeze is
-> `GAIN_NOT_READY` or skip-storm fell back to `wm_best` — P3 still
-> runs, but econ must not be attributed to actor knobs.
+> `GAIN_NOT_READY` or skip-storm fell back to `wm_best`. Default
+> `skip_invalid_p3=True` then **skips P3** (`[p3-skip]`,
+> `early_stop_reason=p3_skipped_invalid_observer`); observer
+> validation still runs on `final.pt`. P29 hid GAIN_NOT_READY
+> behind a later `not_plateaued` cap (no freeze-time probe) so P3
+> still started — the cap path now always re-probes gain.
+> Opt out `DREAMER_SKIP_INVALID_P3=0`.
 > **P28 follow-up 4:** last-ok restore was still undone on the next
 > iter. Default `DREAMER_WM_BEST_RESTORE_AT_P2=1` reloads the
 > fidelity-peak `wm_best.pt` at the P1→P2 boundary (healthy-P1 win,
@@ -159,17 +164,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > Train-start / `[resolved-cfg]` print `compile=`. Compile-on caps
 > inductor worker threads to `min(4, ncpu/4)` so the CPU sim is not
 > starved (P29: 20 workers on 20 cores, collect 22.6 s vs P28 17.6 s).
-> P29 P1 iter 92 (still running): recon 0.323 (wrap spike 0.65 @49, min 0.162 @46),
-> isolation live ~0.002 (follow-ups 1–14 ARE in this GPU job, still confounded with
-> categorical+compile). kl 0.30–0.81 (not joint-embed). Overshoot stuck ~0.10
-> (P28 0.22→0.05). z_alive 1024→97. Gates: iter 75 `gain_not_ready` DC[0.58,3.05]
-> worst=3.05@MV; iter 85 `not_plateaued` wm_ema_best=1.889. Live banner on **this**
-> job still prints `sf≡0`/`img_ret`; HEAD prints `kl`/`jemb`/`gmatch`/`iso`/`ss`.
-> `wm_ss_match_loss` was never a jsonl key (folded into iso) — HEAD now splits it
-> + `wm_ss_match_wmean` (settle_var). Host-adaptive OpenBLAS thread cap (numpy
-> scipy-openblas64 MAX_THREADS=64). Next GPU job after P29 EXIT:
-> env-free `cursor/p28` (deterministic + eager; no leftover
-> compile/latent/DOB/act-hist env-vars — do not pass `DREAMER_COMPILE=0`).
+> P29 (GPU still running, **P3 started @iter 151**, confounded): recon 0.26–0.32,
+> isolation live in P1 (~0.002; follow-ups 1–14 ARE in this job). kl 0.30–0.81,
+> joint_embed≡0, overshoot stuck ~0.10, z_alive ~94. P1 CAPPED `not_plateaued`
+> after iter-75 `gain_not_ready` DC 3.05@MV — cap-time probe was skipped so
+> `actor_experiment_valid` would stay True and `[actor] NOT an actor experiment`
+> never printed. Skip-restore **did** fire (`WM warm-restore SKIPPED`). P2
+> `dob_ground≈0.008` (n_dist live). P3 on this job is INVALID (do not read econ).
+> HEAD: cap-time gain probe + `skip_invalid_p3` default-on. Next GPU job after
+> EXIT: env-free deterministic + eager (no leftover compile/latent/DOB/act-hist).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

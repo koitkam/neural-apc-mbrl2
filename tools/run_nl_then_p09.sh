@@ -13,12 +13,9 @@ source /home/koitkam/neural-APC-mbrl2-env/bin/activate
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
-export DREAMER_ACT_HIST_REQUIRED=1
-export DREAMER_DOB_ENABLED=1
-# Eager mode: the reboot wiped the /tmp Inductor cache, and a fresh torch.compile
-# of the unrolled img_rollout (horizon 55/56) stalls ~20 min single-threaded.
-# Eager gives IDENTICAL results, just slower per-iter — reliable for these tests.
-export DREAMER_COMPILE=0
+# Env-free contract (P29 leftover class): do NOT pass DREAMER_DOB_ENABLED,
+# DREAMER_ACT_HIST_REQUIRED, DREAMER_COMPILE=0, or DREAMER_RSSM_LATENT_TYPE.
+# dob_enabled / deterministic / eager are TrainConfig defaults.
 
 STATUS=output/orchestrator_status.log
 log(){ echo "[orchestrator] $(date '+%F %T') $*" | tee -a "$STATUS"; }
