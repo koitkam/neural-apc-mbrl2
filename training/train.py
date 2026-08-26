@@ -2899,8 +2899,9 @@ def _resolve_compile_mode(cfg: 'TrainConfig') -> str:
     compiled while P26/P28 (observer win) passed ``DREAMER_COMPILE=0`` and
     stayed eager — the same silent-drop class as ``rssm_latent_type``.
     Opt in with ``DREAMER_COMPILE=1`` / ``DREAMER_COMPILE_MODE=default``.
-    Precedence: explicit ``compile_mode`` (incl. ``DREAMER_COMPILE_MODE``)
-    over ``DREAMER_COMPILE`` over eager.
+    Precedence: explicit ``compile_mode`` (incl. whitelist
+    ``DREAMER_COMPILE_MODE`` / ``DREAMER_COMPILE``) over a direct
+    ``DREAMER_COMPILE_MODE`` env read over ``DREAMER_COMPILE`` over eager.
     """
     off = {'', '0', 'off', 'false', 'none', 'no'}
     on = {'1', 'true', 'yes'}
@@ -2911,12 +2912,79 @@ def _resolve_compile_mode(cfg: 'TrainConfig') -> str:
         return 'default' if cm in on else cm
     if cm not in off:
         return 'default' if cm in on else cm
+    # Direct env read so tests / CLI that skip apply_dreamer_env_overrides
+    # still opt in.  MODE before COMPILE (explicit mode wins).
+    env_mode = os.environ.get('DREAMER_COMPILE_MODE', '').strip().lower()
+    if env_mode and env_mode not in off:
+        return 'default' if env_mode in on else env_mode
     env_cm = os.environ.get('DREAMER_COMPILE', '').strip().lower()
     if env_cm in off:
         return ''
     if env_cm in on:
         return 'default'
     return env_cm
+
+
+def _host_cpu_count() -> int:
+    """CPUs actually available to this process (cgroup / affinity aware)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+        if n > 0:
+            return int(n)
+    except Exception:
+        pass
+    return int(os.cpu_count() or 4)
+
+
+def _configure_runtime_threads(device: torch.device) -> int:
+    """Cap PyTorch intra-op threads so the plant sim keeps CPU.
+
+    GPU training is kernel-bound; the default intra-op = all cores
+    starves the CPU simulator.  P29 compiled with 20 inductor workers
+    on a 20-core host: collect 22.6 s vs P28 eager 17.6 s.  Adaptive
+    to this host's affinity (cgroup / ``sched_getaffinity``).
+    """
+    ncpu = _host_cpu_count()
+    if device.type == 'cuda':
+        nth = max(1, min(8, ncpu // 4 or 1))
+    else:
+        nth = max(1, ncpu)
+    try:
+        torch.set_num_threads(nth)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(max(1, min(4, nth)))
+    except Exception:
+        pass
+    return nth
+
+
+def _batch_np_to_device(batch_np: Dict, device: torch.device
+                       ) -> Dict[str, torch.Tensor]:
+    """Host→device for a numpy replay sample. Pin + non_blocking on CUDA."""
+    out: Dict[str, torch.Tensor] = {}
+    cuda = device.type == 'cuda'
+    for k, v in batch_np.items():
+        t = torch.from_numpy(v)
+        if cuda:
+            t = t.pin_memory().to(device, non_blocking=True)
+        else:
+            t = t.to(device)
+        out[k] = t
+    return out
+
+
+def _clone_module_state(model: torch.nn.Module, device: torch.device
+                        ) -> Dict[str, torch.Tensor]:
+    """In-process skip-storm snapshot. GPU clone (no H2D sync); CPU if OOM."""
+    try:
+        return {k: v.detach().clone() for k, v in model.state_dict().items()}
+    except RuntimeError as exc:
+        if device.type != 'cuda' or 'out of memory' not in str(exc).lower():
+            raise
+        torch.cuda.empty_cache()
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
 def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
@@ -7582,6 +7650,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             torch.set_float32_matmul_precision('high')
         except Exception:
             pass
+    _nth = _configure_runtime_threads(device)
+    print(f'[runtime] cpu_threads={_nth} host_cpus={_host_cpu_count()} '
+          f'device={device.type}', flush=True)
 
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim
@@ -9839,14 +9910,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _sample_T = (int(cfg.seq_len) if current_phase == 3
                          else _wm_train_seq_len(cfg))
             batch_np = _src_buf.sample(cfg.batch_size, _sample_T, rng)
-            batch: Dict[str, torch.Tensor] = {}
-            for k, v in batch_np.items():
-                t = torch.from_numpy(v)
-                if device.type == 'cuda':
-                    t = t.pin_memory().to(device, non_blocking=True)
-                else:
-                    t = t.to(device)
-                batch[k] = t
+            batch = _batch_np_to_device(batch_np, device)
             t_sample_acc += time.time() - _t
 
             if current_phase in (1, 2):
@@ -9957,8 +10021,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                   or 0.0) > 0.0):
                     _iso_np = isolation_buf.sample(
                         cfg.batch_size, _isolation_sample_seq_len(cfg), rng)
-                    _iso_obs = torch.from_numpy(_iso_np['obs']).to(device)
-                    _iso_act = torch.from_numpy(_iso_np['act']).to(device)
+                    _iso = _batch_np_to_device(
+                        {'obs': _iso_np['obs'], 'act': _iso_np['act']}, device)
+                    _iso_obs, _iso_act = _iso['obs'], _iso['act']
                     with torch.amp.autocast(device_type=device.type,
                                               dtype=torch.bfloat16,
                                               enabled=(device.type == 'cuda')):
@@ -10128,19 +10193,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 if (onpol_buf is not None and onpol_buf.filled > 0
                         and buf.filled > 0):
                     _cb_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
-                    _critic_batch = {}
-                    for _k, _v in _cb_np.items():
-                        # NB: do NOT reuse ``_t`` here — it is the AC-step
-                        # wall-clock timer (``_t = time.time()`` above), consumed
-                        # by ``t_ac_acc += time.time() - _t`` below.  Clobbering
-                        # it with a tensor made ``t_ac_s`` a Tensor -> the p04
-                        # json.dumps crash (2026-07-10).
-                        _ct = torch.from_numpy(_v)
-                        if device.type == 'cuda':
-                            _ct = _ct.pin_memory().to(device, non_blocking=True)
-                        else:
-                            _ct = _ct.to(device)
-                        _critic_batch[_k] = _ct
+                    # NB: do NOT reuse ``_t`` here — it is the AC-step
+                    # wall-clock timer (``_t = time.time()`` above).
+                    _critic_batch = _batch_np_to_device(_cb_np, device)
                 # P83 FIX (p19 RCA): P3 expert-BC anchor weight — decay
                 # expert_bc_scale·(1→floor) across P3 so the actor starts pinned to
                 # the good BC-seeded policy and is progressively released to let
@@ -10236,14 +10291,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _ok_ratio = float(getattr(
                 cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
             if _recon_still_healthy(_rlv, p1_recon_best, _ok_ratio):
-                # CPU clone — skip-storm restore is in-process, so disk
-                # every iter is wasted hot-path I/O.  Written to
+                # In-process snapshot — skip-storm restore never needs
+                # disk on the happy path.  GPU clone (no H2D sync every
+                # P1 iter); CPU if VRAM is tight.  Written to
                 # wm_last_ok.pt only if a storm actually fires.
                 try:
-                    p1_last_ok_sd = {
-                        k: v.detach().cpu().clone()
-                        for k, v in model.state_dict().items()
-                    }
+                    p1_last_ok_sd = _clone_module_state(model, device)
                     p1_last_ok_ckpt_path = out_dir / 'wm_last_ok.pt'
                     p1_last_ok_iter = int(total_iters)
                     if p1_recon_best is None or _rlv < p1_recon_best:
@@ -11175,7 +11228,6 @@ _CLI_ONLY_ENV = (
     ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
     ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
     ('DREAMER_ATTN_IMPL', 'attn_impl', str),
-    ('DREAMER_COMPILE_MODE', 'compile_mode', str),
     ('AGENT_TOTAL_STEPS', 'total_steps', int),
     ('SIM_EPISODE_LENGTH', 'episode_length', int),
     ('SIM_SAMPLE_RATE', 'sample_rate', int),

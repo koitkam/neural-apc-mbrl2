@@ -191,6 +191,17 @@ def _as_opt_float(s: str):
     return float(s)
 
 
+def _as_compile_mode(s: str) -> str:
+    """Map ``DREAMER_COMPILE`` / ``DREAMER_COMPILE_MODE`` onto TrainConfig
+    ``compile_mode``.  ``''`` = eager.  ``1``/true → ``default``."""
+    v = str(s).strip().lower()
+    if v in ('', '0', 'off', 'false', 'none', 'no'):
+        return ''
+    if v in ('1', 'true', 'yes', 'on'):
+        return 'default'
+    return v
+
+
 ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAE_LAMBDA':         ('gae_lambda',                 float),
     'DREAMER_PHASE1_FRAC':        ('phase1_frac',                float),
@@ -405,8 +416,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
     'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),
     # ---- World-model backbone (P68, 2026-05-30) ----
-    # ``rssm`` (default) vs ``sf_transformer``; RSSM categorical-latent
-    # sizes and KL-balance knobs.  See TrainConfig for paper rationale.
+    # ``rssm`` (default) vs ``sf_transformer``; RSSM latent sizes and
+    # KL-balance knobs.  See TrainConfig for paper rationale.
     'DREAMER_WORLD_MODEL_TYPE':           ('world_model_type',               str),
     'DREAMER_RSSM_DETER_DIM':             ('rssm_deter_dim',                 int),
     'DREAMER_RSSM_N_CATEGORICALS':        ('rssm_n_categoricals',            int),
@@ -421,6 +432,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RSSM_LATENT_TYPE':           ('rssm_latent_type',               str),
     'DREAMER_RSSM_LATENT_NOISE':          ('rssm_latent_noise',              float),
     'DREAMER_RSSM_JOINT_EMBED_COEF':      ('rssm_joint_embed_coef',          float),
+    # torch.compile (P29 leftover): env-free is eager.  COMPILE before
+    # COMPILE_MODE so an explicit mode wins if both are set.  ``1`` →
+    # ``default``.  Also read in ``_resolve_compile_mode`` so tests that
+    # skip ``apply_dreamer_env_overrides`` still work.
+    'DREAMER_COMPILE':                    ('compile_mode',                   _as_compile_mode),
+    'DREAMER_COMPILE_MODE':               ('compile_mode',                   _as_compile_mode),
     # TSSM (transformer-SSM) backbone dims (world_model_type='tssm').
     'DREAMER_TSSM_D_MODEL':               ('tssm_d_model',                   int),
     'DREAMER_TSSM_N_LAYERS':              ('tssm_n_layers',                  int),

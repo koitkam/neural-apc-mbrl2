@@ -1465,6 +1465,25 @@ class DreamerV4(nn.Module):
         if getattr(self, '_compiled', False):
             return
         try:
+            # Don't let inductor fork ncpu workers — that starves the
+            # plant sim (P29: 20 compile workers on 20 cores).  Leave
+            # cores for training + the CPU simulator.  User override
+            # via TORCHINDUCTOR_COMPILE_THREADS still wins.
+            try:
+                try:
+                    _ncpu = len(os.sched_getaffinity(0)) or (os.cpu_count() or 4)
+                except Exception:
+                    _ncpu = os.cpu_count() or 4
+                _nth = max(1, min(4, int(_ncpu) // 4 or 1))
+                os.environ.setdefault('TORCHINDUCTOR_COMPILE_THREADS', str(_nth))
+                try:
+                    import torch._inductor.config as _ind_cfg
+                    if getattr(_ind_cfg, 'compile_threads', None) is not None:
+                        _ind_cfg.compile_threads = _nth
+                except Exception:
+                    pass
+            except Exception:
+                pass
             # P3 imagination calls dynamics with context lengths T=seq_len..
             # seq_len+H (≈43 distinct shapes). The default recompile_limit=8
             # would bail to eager after 8 shapes despite dynamic=True. Bump

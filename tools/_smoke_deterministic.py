@@ -22,7 +22,8 @@ import torch
 
 from models.dreamer_v4_rssm import _CategoricalLatent, rssm_joint_embed_loss
 from training.train import (TrainConfig, build_model, world_model_loss,
-                            _realsim_actor_critic_step, _resolve_compile_mode)
+                            _realsim_actor_critic_step, _resolve_compile_mode,
+                            _batch_np_to_device, _host_cpu_count)
 
 
 def _small_cfg(obs_dim=6, action_dim=2, wm_type='rssm', latent_type='categorical'):
@@ -95,7 +96,8 @@ def _check_backbone(wm_type):
         for k, v in losses.items():
             if torch.is_tensor(v) and v.is_floating_point():
                 assert torch.isfinite(v).all(), f'NON-FINITE {k}'
-        je = float(losses['joint_embed_loss']); kl = float(losses['kl_loss'])
+        je = float(losses['joint_embed_loss'].detach())
+        kl = float(losses['kl_loss'].detach())
         if latent_type == 'deterministic':
             assert kl == 0.0, f'{wm_type}/det: kl should be 0 (no variational KL)'
             assert je > 0.0, f'{wm_type}/det: joint_embed should be >0'
@@ -132,6 +134,9 @@ def _check_compile_default_eager():
         os.environ['DREAMER_COMPILE'] = 'reduce-overhead'
         assert _resolve_compile_mode(cfg) == 'reduce-overhead'
         os.environ.pop('DREAMER_COMPILE', None)
+        os.environ['DREAMER_COMPILE_MODE'] = 'reduce-overhead'
+        assert _resolve_compile_mode(TrainConfig()) == 'reduce-overhead'
+        os.environ.pop('DREAMER_COMPILE_MODE', None)
         off = TrainConfig()
         off.compile_mode = 'off'
         off._explicit_fields = {'compile_mode'}
@@ -139,7 +144,17 @@ def _check_compile_default_eager():
         assert _resolve_compile_mode(off) == '', (
             'explicit compile_mode=off must beat DREAMER_COMPILE=1'
         )
-        print('[smoke] OK  compile default eager; DREAMER_COMPILE=1 opt-in')
+        os.environ['DREAMER_COMPILE'] = '1'
+        from workflow._plant_prepare import (
+            apply_dreamer_env_overrides, _as_compile_mode)
+        assert _as_compile_mode('1') == 'default'
+        assert _as_compile_mode('0') == ''
+        cfg2 = TrainConfig()
+        apply_dreamer_env_overrides(cfg2)
+        assert cfg2.compile_mode == 'default', cfg2.compile_mode
+        assert 'compile_mode' in getattr(cfg2, '_explicit_fields', set())
+        print('[smoke] OK  compile default eager; DREAMER_COMPILE=1 opt-in '
+              '(whitelist + MODE)')
     finally:
         if saved is None:
             os.environ.pop('DREAMER_COMPILE', None)
@@ -160,6 +175,12 @@ def main():
     assert int(c.n_critics) == 2
     assert c.return_scale_freeze_after_warmup is True
     _check_compile_default_eager()
+    import numpy as np
+    y = _batch_np_to_device(
+        {'obs': np.zeros((2, 4, 3), dtype='float32')}, torch.device('cpu'))
+    assert y['obs'].shape == (2, 4, 3)
+    assert _host_cpu_count() >= 1
+    print('[smoke] OK  _batch_np_to_device CPU + host_cpu_count')
     _check_head()
     for wm in ('rssm', 'tssm'):
         _check_backbone(wm)

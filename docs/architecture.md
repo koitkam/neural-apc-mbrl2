@@ -154,7 +154,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > documented off, but `build_model` treated empty as default-on unless
 > `DREAMER_COMPILE=0`. Env-free P29 compiled; P26/P28 (no compile
 > banner) were eager. Default is now **eager**; opt in
-> `DREAMER_COMPILE=1`. Train-start / `[resolved-cfg]` print `compile=`.
+> `DREAMER_COMPILE=1` or `DREAMER_COMPILE_MODE=default` (both now in
+> `ENV_OVERRIDES` — `single_run` used to silently drop `DREAMER_COMPILE_MODE`).
+> Train-start / `[resolved-cfg]` print `compile=`. Compile-on caps
+> inductor worker threads to `min(4, ncpu/4)` so the CPU sim is not
+> starved (P29: 20 workers on 20 cores, collect 22.6 s vs P28 17.6 s).
 > Next GPU job after P29 EXIT: env-free `cursor/p28` (deterministic +
 > eager; no leftover compile/latent env-vars).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
