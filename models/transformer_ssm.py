@@ -124,7 +124,8 @@ import torch.nn.functional as F
 
 # Reuse the proven RSSM building blocks so the categorical latent + KL are
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
-from models.dreamer_v4_rssm import _CategoricalLatent, _ContinuousLatent
+from models.dreamer_v4_rssm import (
+    _CategoricalLatent, _ContinuousLatent, dob_kalman_scan)
 
 
 @dataclass
@@ -746,12 +747,7 @@ class TransformerSSMDynamics(nn.Module):
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
                 coef = (1.0 - K) * A                                  # (n_cv,)
-                d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
-                ds_l = []
-                for t in range(T):
-                    d_prev = coef * d_prev + u[:, t]
-                    ds_l.append(d_prev)
-                ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+                ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
                 ds = torch.zeros(B, T, self.n_cv, device=device,

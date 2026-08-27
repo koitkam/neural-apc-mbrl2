@@ -3539,6 +3539,36 @@ class TrajectoryBuffer:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _collect_random_episode(env: APCEnv, cfg: TrainConfig
+                            ) -> Dict[str, np.ndarray]:
+    """P1/P2 random collect: numpy-only (no RSSM / policy / torch).
+
+    ``collect_episode(..., random_action=True)`` never reads the posterior
+    (WM teacher-forces from replay).  Keep this path off the GPU so the
+    A10 P1 loop and CPU smokes do not pay ``episode_length`` kernel
+    launches or an unused SF ``a_history`` concat.  Same buffers as
+    ``collect_episode``.
+    """
+    obs_window = env.reset(exploration=True)
+    T, D = cfg.episode_length, env.obs_dim
+    obs_buf = np.zeros((T, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window[-1]
+        a_np = env.rng.uniform(-1.0, 1.0,
+                                size=(env.action_dim,)).astype('float32')
+        next_window, reward, done, _ = env.step(a_np)
+        act_buf[t] = a_np
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
 def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                     cfg: TrainConfig, *, random_action: bool = False,
                     deterministic: bool = False) -> Dict[str, np.ndarray]:
@@ -3551,8 +3581,13 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
          (slight context noise) and d=d_min; read the agent-register
          hidden state at the latest time slot.
       3. Sample (or argmax) the action from the policy head.
+
+    P1/P2 ``random_action=True`` is numpy-only (see
+    ``_collect_random_episode``).
     """
-    obs_window = env.reset(exploration=random_action)
+    if random_action:
+        return _collect_random_episode(env, cfg)
+    obs_window = env.reset(exploration=False)
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     # Phase 2 (2026-05-24): replay storage is per-step ``(T, D)`` only;
     # the L-length sliding window persists in ``obs_window`` for the
@@ -3587,26 +3622,17 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # single device→host ``.cpu()`` of the chosen action is unavoidable
     # because the simulator runs on CPU/numpy.
     #
-    # P1/P2 ``random_action=True`` never consults the policy: every step is
-    # uniform in [-1, 1], this function has no mixed-mode path, and the
-    # recurrent state is discarded at episode end (WM teacher-forces from
-    # replay).  Advancing obs_step anyway was ``ep_per_iter × episode_length``
-    # bs=1 GPU launches per iter (~17 s of P31 t_collect on test_sim) for
-    # a state nobody reads.  Skip it; P3 on-policy still streams the
-    # posterior.  Host-adaptive: same skip on CPU smokes (no 1220× obs_step).
-    _stream_rssm = _is_rssm and not random_action
+    # P1/P2 ``random_action=True`` is handled above (numpy-only).  P3
+    # on-policy still streams the posterior.
     with torch.inference_mode():
         _rssm_state = (model.dynamics.initial_state(1, device)
-                       if _stream_rssm else None)
+                       if _is_rssm else None)
         _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
-                        if _stream_rssm else None)
+                        if _is_rssm else None)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
-            if random_action:
-                a_np = env.rng.uniform(-1.0, 1.0,
-                                        size=(env.action_dim,)).astype('float32')
-            elif _is_rssm:
+            if _is_rssm:
                 with torch.amp.autocast(device_type=device.type,
                                          dtype=torch.bfloat16,
                                          enabled=(device.type == 'cuda')):
@@ -6680,6 +6706,25 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     return result
 
 
+def _format_gain_probe_line(probe: dict) -> str:
+    """Compact P1-gate line: min/max + per-input DC ratios + unbiased/noise."""
+    pairs = probe.get('ss_pairs') or []
+    pair_s = ' '.join(f'{n}={r:.2f}' for n, r in pairs)
+    extra = (f" unbiased={bool(probe.get('unbiased'))}"
+             f" not_noisy={bool(probe.get('not_noisy'))}")
+    if pair_s:
+        extra += f' pairs[{pair_s}]'
+    return (
+        f"ready={probe.get('gain_ready')} "
+        f"DCgain_ratio[{probe['r_min']:.2f},{probe['r_max']:.2f}] "
+        f"worst={probe['worst_ratio']:.2f}@{probe['worst_input']} "
+        f"band={probe['band']} | noise: "
+        f"spread_x{probe['noise_worst']:.1f} "
+        f"signflips={probe['sign_flips']} "
+        f"({probe['n_checks']} inputs){extra}"
+    )
+
+
 def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     """Controlled multi-level step-response GAIN-readiness probe (p20, 2026-08-19).
 
@@ -6797,6 +6842,7 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
         'noise_worst': worst_noise, 'sign_flips': int(flips),
         'n_checks': int(len(srs)), 'band': [band_lo, band_hi],
         'noise_max': noise_max,
+        'ss_pairs': [(str(n), float(r)) for n, r in ss_ratios],
     }
 
 
@@ -9426,15 +9472,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 _gain_probe = _probe_observer_gain_ready(model, env, device, cfg)
                 if _gain_probe is not None:
                     _gain_ok = bool(_gain_probe.get('gain_ready', True))
-                    print(f"[gate p1->p2] gain-probe ready={_gain_ok} "
-                          f"DCgain_ratio[{_gain_probe['r_min']:.2f},"
-                          f"{_gain_probe['r_max']:.2f}] "
-                          f"worst={_gain_probe['worst_ratio']:.2f}"
-                          f"@{_gain_probe['worst_input']} "
-                          f"band={_gain_probe['band']} | noise: "
-                          f"spread_x{_gain_probe['noise_worst']:.1f} "
-                          f"signflips={_gain_probe['sign_flips']} "
-                          f"({_gain_probe['n_checks']} inputs)", flush=True)
+                    print(f"[gate p1->p2] gain-probe "
+                          f"{_format_gain_probe_line(_gain_probe)}",
+                          flush=True)
             if _ema_ok and _plateau_ok and _gain_ok:
                 phase_gate_decisions.append({
                     'gate': 'p1->p2', 'iter': int(total_iters),
@@ -9497,15 +9537,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     if _gain_probe is not None:
                         _gain_ok = bool(_gain_probe.get('gain_ready', True))
                         print(f"[gate p1->p2] cap-time gain-probe "
-                              f"ready={_gain_ok} "
-                              f"DCgain_ratio[{_gain_probe['r_min']:.2f},"
-                              f"{_gain_probe['r_max']:.2f}] "
-                              f"worst={_gain_probe['worst_ratio']:.2f}"
-                              f"@{_gain_probe['worst_input']} "
-                              f"band={_gain_probe['band']} | noise: "
-                              f"spread_x{_gain_probe['noise_worst']:.1f} "
-                              f"signflips={_gain_probe['sign_flips']} "
-                              f"({_gain_probe['n_checks']} inputs)",
+                              f"{_format_gain_probe_line(_gain_probe)}",
                               flush=True)
                 phase_gate_decisions.append({
                     'gate': 'p1->p2', 'iter': int(total_iters),

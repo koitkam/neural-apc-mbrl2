@@ -478,8 +478,8 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  isolation skip when g frozen (_dynamics_g_trainable)')
     print('[smoke] OK  g-only aux (overshoot/held/gain-match) skip when g frozen')
 
-    # P1/P2 random collect must not advance the RSSM (state is discarded;
-    # WM teacher-forces from replay).  P3 on-policy still streams obs_step.
+    # P1/P2 random collect is numpy-only (no RSSM).  P3 on-policy still
+    # streams obs_step.
     if wm_type == 'rssm':
         class _DummyCollectEnv:
             def __init__(self):

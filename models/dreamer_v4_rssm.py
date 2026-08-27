@@ -67,6 +67,38 @@ import torch.nn.functional as F
 from torch.distributions import OneHotCategorical
 
 
+def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
+    """Vectorized ``d_t = coef * d_{t-1} + u_t`` with ``d_{-1}=0``.
+
+    ``u`` is ``(B, T, n_cv)``, ``coef`` is ``(n_cv,)``.  Same recurrence as
+    the old Python T-loop; that loop was T sequential GPU launches per WM
+    step in P2 (``dob_active``).  Closed form
+    ``d_t = sum_{s<=t} coef^{t-s} u_s`` via a lower-triangular mix.
+    Host-adaptive: if the T×T mix would exceed ~16 MiB, fall back to the
+    sequential recurrence (huge ``seq_len`` / many CVs).  Differentiable
+    in ``u`` and ``coef`` (P2 trains Kalman A,K through this).
+    """
+    B, T, C = u.shape
+    if T == 0:
+        return u
+    nbytes = T * T * C * int(u.element_size())
+    coef_f = coef.to(dtype=u.dtype)
+    if T == 1 or nbytes > 16 * 1024 * 1024:
+        d_prev = torch.zeros(B, C, device=u.device, dtype=u.dtype)
+        out = u.new_empty(B, T, C)
+        for t in range(T):
+            d_prev = coef_f * d_prev + u[:, t]
+            out[:, t] = d_prev
+        return out
+    t_idx = torch.arange(T, device=u.device)
+    lags = t_idx.view(T, 1) - t_idx.view(1, T)
+    mask = lags >= 0
+    lags_f = lags.clamp_min(0).to(dtype=u.dtype)
+    pows = coef_f.view(1, 1, C).pow(lags_f.unsqueeze(-1))
+    pows = pows.masked_fill(~mask.unsqueeze(-1), 0)
+    return torch.einsum('tsc,bsc->btc', pows, u)
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -778,12 +810,7 @@ class RSSMDynamics(nn.Module):
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
                 coef = (1.0 - K) * A                                  # (n_cv,)
-                d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
-                ds_l = []
-                for t in range(T):
-                    d_prev = coef * d_prev + u[:, t]
-                    ds_l.append(d_prev)
-                ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+                ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
                 ds = torch.zeros(B, T, self.n_cv, device=device,

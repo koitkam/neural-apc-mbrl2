@@ -13,7 +13,7 @@ Verifies, WITHOUT a real env, for BOTH backbones (rssm + tssm):
 
 Run (CPU):
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_dob.py
+  /home/koitkam/neural-APC-mbrl2-env/bin/python tools/_smoke_dob.py
 """
 import sys
 from pathlib import Path
@@ -202,6 +202,29 @@ def _check_scope2(wm_type):
               f"held={float(losses.get('wm_held_rollout_loss', 0)):.3f}) [{wm_type}]")
 
 
+def _check_kalman_scan():
+    """Closed-form scan == sequential recurrence (incl. grad through coef)."""
+    print('\n=== dob_kalman_scan identity ===')
+    from models.dreamer_v4_rssm import dob_kalman_scan
+    torch.manual_seed(0)
+    B, T, C = 4, 33, 3
+    u = torch.randn(B, T, C, requires_grad=True)
+    coef = torch.tensor([0.93, 0.10, 0.0], requires_grad=True)
+    got = dob_kalman_scan(u, coef)
+    d_prev = torch.zeros(B, C)
+    ref_l = []
+    for t in range(T):
+        d_prev = coef * d_prev + u[:, t]
+        ref_l.append(d_prev)
+    ref = torch.stack(ref_l, dim=1)
+    err = float((got.detach() - ref.detach()).abs().max())
+    assert err < 1e-5, f'scan vs loop max|Δ|={err}'
+    got.sum().backward()
+    assert u.grad is not None and coef.grad is not None
+    assert torch.isfinite(u.grad).all() and torch.isfinite(coef.grad).all()
+    print(f'[smoke] OK  dob_kalman_scan ≡ loop (max|Δ|={err:.2e}) + grad')
+
+
 def _check_compile_equiv(wm_type):
     """Compile-efficiency refactor (2026-06-12): the vectorized DOB
     ``rollout_observed`` (d-free recurrence + ONE batched prior decode + scalar
@@ -272,6 +295,7 @@ def _check_grounding():
 
 
 if __name__ == '__main__':
+    _check_kalman_scan()
     for wm in ('rssm', 'tssm'):
         _check(wm)
         _check_scope2(wm)
