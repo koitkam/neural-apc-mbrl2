@@ -910,15 +910,11 @@ class TrainConfig:
     # signal a mixed PRBS+settle isolation batch drowns.  0 = off (unweighted).
     wm_ss_match_settle_var: float = 0.0
     wm_isolation_settle_episodes: int = 0   # long-hold settle eps PER isolated input (auto 24)
-    # Inverse-variance reweight of isolation / ss-match — **opt-in, default
-    # OFF** (P36 RCA).  Abs MSE (P33) completes P1 (gmatch 1.21→0.002 by
-    # iter 9, no skip-storm, val DV ×0.66).  Inv-var is relative-gain
-    # reweight: ``w∝1/|G|²`` upweights DV ~33× (same class as P27 relative
-    # Huber).  P34 AM/HM exploded; P35 per-seq |CV|² quiet-hold starved
-    # (scale_ratio ~22000); P36 per-input |G|² fired (ratio 20–33,
-    # tgt_scale=1) but iso 0.125 vs P33 1.69, gmatch stuck 1.21, storm
-    # 2/2 @iter 7, val DV ×0.004.  ``DREAMER_WM_ISOLATION_VAR_NORM=1`` = A/B.
-    wm_isolation_var_norm: bool = False
+    # Isolation / ss-match is ABSOLUTE MSE (P33).  Inverse-variance reweight
+    # (``wm_isolation_var_norm``) skip-stormed P1 three formulas (P34 AM/HM
+    # explode, P35 quiet-hold, P36 33× DV) — same class as P27 relative
+    # Huber.  The A/B path was removed, not kept as opt-in.  Do not re-add
+    # ``wm_isolation_var_norm`` / ``DREAMER_WM_ISOLATION_VAR_NORM``.
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -3255,7 +3251,6 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
-        f"iso_varnorm={bool(getattr(cfg, 'wm_isolation_var_norm', False))} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -5620,130 +5615,6 @@ def _rssm_tbptt_img_rollout(
     return torch.cat(chunks, dim=1)
 
 
-def _gain_match_input_tgt_sq(cfg: TrainConfig, n_mv: int, n_dv: int,
-                             device: torch.device, dtype: torch.dtype
-                             ) -> Optional[torch.Tensor]:
-    """Per-input identified |G|² in WM-norm (n_mv + n_dv,), or None."""
-    mv = list(getattr(cfg, 'gain_match_mv_target', ()) or ())
-    dv = list(getattr(cfg, 'gain_match_dv_target', ()) or ())
-    n_in = int(n_mv) + int(n_dv)
-    if n_in <= 0:
-        return None
-    _key = (int(n_mv), int(n_dv),
-            tuple(tuple(float(x) for x in r) for r in mv),
-            tuple(tuple(float(x) for x in r) for r in dv),
-            str(device), str(dtype))
-    _cached = getattr(cfg, '_iso_tgt_sq_cache', None)
-    if _cached is not None and _cached[0] == _key:
-        return _cached[1]
-    rows: List[float] = []
-    ok = False
-
-    def _row_sq(row) -> float:
-        vals = [float(x) * float(x) for x in (row or ())]
-        return (sum(vals) / len(vals)) if vals else 0.0
-
-    for i in range(int(n_mv)):
-        sq = _row_sq(mv[i] if i < len(mv) else ())
-        if sq > 1e-8:
-            ok = True
-        rows.append(max(sq, 1e-4))
-    for i in range(int(n_dv)):
-        sq = _row_sq(dv[i] if i < len(dv) else ())
-        if sq > 1e-8:
-            ok = True
-        rows.append(max(sq, 1e-4))
-    out = (torch.tensor(rows, device=device, dtype=dtype) if ok else None)
-    cfg._iso_tgt_sq_cache = (_key, out)  # type: ignore[attr-defined]
-    return out
-
-
-def _isolation_per_input_scale(
-        act: torch.Tensor,
-        dv: Optional[torch.Tensor],
-        cv_real: torch.Tensor,
-        cfg: TrainConfig) -> Tuple[torch.Tensor, float]:
-    """Per-sequence isolation scale = per-INPUT |ΔCV|², not per-hold |CV|².
-
-    Isolation settle holds one input at a stratified level (linspace
-    includes ~0).  Per-sequence ``cv_real.pow(2)`` on a near-zero hold
-    hits the 1e-4 floor; mean-1 then parks almost all weight on quiet
-    sequences (P35: scale_ratio ~22000, iso 0.0008 vs P33 abs 1.69).
-    SysID wants equal weight per **isolated input** (MV vs DV |G|),
-    not per operating point.
-
-    Detect the held input by mean |u| over the K-window.  Prefer
-    identified gain-match |tgt|² (dynamics-ID, sim-adaptive).  Fallback
-    for no-ID / nonlinear plants: scatter-mean of ``cv_real²`` per
-    detected input, floored at 5% of the loudest input so an unlucky
-    all-quiet batch of one channel cannot recreate the 22000× upweight.
-    Returns ``(scale_b, src)`` with ``src=1`` if tgt LUT, else ``0``.
-    """
-    n_mv = int(act.shape[-1])
-    n_dv = int(dv.shape[-1]) if dv is not None else 0
-    a_mag = act.detach().abs().mean(dim=1)
-    if dv is not None and n_dv > 0:
-        mag = torch.cat([a_mag, dv.detach().abs().mean(dim=1)], dim=-1)
-    else:
-        mag = a_mag
-    n_in = int(mag.shape[-1])
-    inp_idx = mag.argmax(dim=-1)
-    tgt_sq = _gain_match_input_tgt_sq(cfg, n_mv, n_dv, act.device, act.dtype)
-    if tgt_sq is not None and int(tgt_sq.numel()) == n_in:
-        return tgt_sq[inp_idx], 1.0
-    cv2 = cv_real.detach().pow(2).mean(dim=(1, 2))
-    if n_in <= 1:
-        return cv2.new_full(cv2.shape, float(cv2.mean().clamp_min(1e-4))), 0.0
-    idx = inp_idx.long()
-    sum_cv = cv2.new_zeros(n_in)
-    cnt = cv2.new_zeros(n_in)
-    sum_cv.scatter_add_(0, idx, cv2)
-    cnt.scatter_add_(0, idx, torch.ones_like(cv2))
-    mean_cv = sum_cv / cnt.clamp_min(1.0)
-    loud = mean_cv.max().clamp_min(1e-4)
-    floor = (loud * 0.05).clamp_min(1e-4)
-    mean_cv = torch.where(
-        cnt > 0, mean_cv.clamp_min(floor), torch.ones_like(mean_cv))
-    return mean_cv[idx], 0.0
-
-
-def _invvar_weights(scale: torch.Tensor,
-                    floor_frac: float = 0.05,
-                    abs_floor: float = 1e-4) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Mean-1 inverse-variance weights.  ``scale`` is detached.
-
-    ``abs_floor`` is (normalized CV)² — unitless.  Median floor is a
-    belt; per-input scale (``_isolation_per_input_scale``) is the
-    actual quiet-hold defence.
-    """
-    scale = scale.detach().float()
-    med = scale.median().clamp_min(float(abs_floor))
-    floor = (med * float(floor_frac)).clamp_min(float(abs_floor))
-    scale = scale.clamp_min(floor)
-    w = (1.0 / scale)
-    w = w / w.mean().clamp_min(1e-8)
-    return w, scale
-
-
-def _invvar_reweight(err: torch.Tensor, scale: torch.Tensor,
-                     floor_frac: float = 0.05,
-                     abs_floor: float = 1e-4) -> torch.Tensor:
-    """Equalize relative-gain gradient; keep abs units at init.
-
-    ``mean(w * err)`` with ``w ∝ 1/scale``, ``mean(w)=1``.  Constant
-    scale ⇒ identical to ``mean(err)`` (P33 iter-1 iso ~1.7).  Mixed
-    MV/DV isolation batches upweight the subdominant |G|.
-
-    P34 FAIL: ``mean(err/scale)*mean(scale)`` has mean(w)=AM/HM(scale)
-    which explodes when an untrained WM has similar *abs* err on quiet
-    and loud sequences (iso 7088, skip 99, ES).  Mean-1 weights stay
-    O(mean(err)) at init.  Pass **per-input** scale (P35 RCA), not
-    per-sequence |CV|².
-    """
-    w, _ = _invvar_weights(scale, floor_frac=floor_frac, abs_floor=abs_floor)
-    return (err.float() * w).mean()
-
-
 def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
                              act: torch.Tensor, cfg: TrainConfig
                              ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -5770,11 +5641,9 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     ``0`` for other backbones / when off.
 
     Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match.
-    Default is abs mean (P33 / P36 RCA).  Opt-in inverse-variance
-    (``wm_isolation_var_norm``) equalizes per-input relative error
-    (identified |G|²) but skip-stormed P1 at 20–33× DV upweight.
-    ``extras`` splits the folded DC-gain term (``wm_ss_match_loss``) plus
-    var-norm diagnostics when the A/B is on.
+    Default is abs mean (P33 / P36 RCA).  Inverse-variance reweight was
+    removed (P34–P36 skip-storm; same class as P27 relative Huber).
+    ``extras`` splits the folded DC-gain term (``wm_ss_match_loss``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     empty: Dict[str, torch.Tensor] = {}
@@ -5842,21 +5711,8 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     cv_pred = rssm.decode(roll_feats).index_select(
         -1, cv_idx)                                               # (Bm, K, n_cv)
     err_b = (cv_pred - cv_real).pow(2).mean(dim=(1, 2))            # (Bm,)
-    var_norm = bool(getattr(cfg, 'wm_isolation_var_norm', False))
     extras: Dict[str, torch.Tensor] = {}
-    iso_w: Optional[torch.Tensor] = None
-    if var_norm:
-        scale_b, src = _isolation_per_input_scale(
-            a_all, dv_all, cv_real, cfg)
-        iso_w, scale_u = _invvar_weights(scale_b)
-        w_e = iso_w.to(dtype=err_b.dtype)
-        traj = coef * (err_b * w_e).mean()
-        extras['wm_isolation_var_wmax'] = iso_w.max().detach()
-        extras['wm_isolation_var_scale_ratio'] = (
-            scale_u.max() / scale_u.min().clamp_min(1e-8)).detach()
-        extras['wm_isolation_var_tgt_scale'] = err_b.new_tensor(float(src))
-    else:
-        traj = coef * err_b.mean()
+    traj = coef * err_b.mean()
     extras['wm_isolation_traj_loss'] = traj.detach()
     out = traj
     if ss_coef > 0.0 and ss_k0 < K:
@@ -5870,17 +5726,7 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
             # dilute the per-input steady-state match (undiluted, symmetric).
             w_settle = torch.exp(-real_win.var(dim=1) / ss_var)
             extras['wm_ss_match_wmean'] = w_settle.mean().detach()
-        if var_norm:
-            if w_settle is not None:
-                ss_per = (ss_err * w_settle).sum(dim=-1) / w_settle.sum(
-                    dim=-1).clamp_min(1e-6)
-            else:
-                ss_per = ss_err.mean(dim=-1)
-            # Same per-input weights as the trajectory term (SysID: equalize
-            # MV vs DV |G|, not settled |CV| of this window).
-            assert iso_w is not None
-            ss = (ss_per.float() * iso_w).mean()
-        elif w_settle is not None:
+        if w_settle is not None:
             ss = (ss_err * w_settle).sum() / w_settle.sum().clamp_min(1e-6)
         else:
             ss = ss_err.mean()

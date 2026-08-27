@@ -601,9 +601,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_SS_MATCH_COEF':           ('wm_ss_match_coef',               float),
     'DREAMER_WM_SS_MATCH_SETTLE_VAR':     ('wm_ss_match_settle_var',         float),
     'DREAMER_WM_ISOLATION_SETTLE_EPISODES': ('wm_isolation_settle_episodes', int),
-    # P36 RCA: default OFF (abs isolation).  =1 is A/B only — inv-var
-    # skip-stormed P1 (relative-gain reweight, same class as P27 Huber).
-    'DREAMER_WM_ISOLATION_VAR_NORM':      ('wm_isolation_var_norm',          _as_bool),
     # Per isolated input (auto 24).  Seed loop emits n × n_mv + n × n_dv.
     # p10 RCA: treat the DV like a clean input — low-pass the noisy measured DV
     # into the WM (errors-in-variables gain fix) + make it input-only (no recon).

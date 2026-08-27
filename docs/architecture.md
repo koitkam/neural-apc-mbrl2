@@ -211,9 +211,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > per-input `|G|²` fired (`tgt_scale=1`, scale_ratio 20–33) but inv-var
 > **DISCARDED**: iso 0.125 vs P33 1.69, gmatch stuck 1.21, storm 2/2
 > @iter 7, val MV ×0.91 DV ×0.004 det_r 0.076. `[p3-skip]`. Same class
-> as P27 relative Huber (33× DV isolation grad). Default is **abs
-> isolation** (`wm_isolation_var_norm=False`). `DREAMER_WM_ISOLATION_VAR_NORM=1`
-> is A/B only. Do not try another isolation reweight.
+> as P27 relative Huber (33× DV isolation grad). Abs isolation is the
+> only path (inv-var A/B **REMOVED**, same as relative Huber). Do not
+> try another isolation reweight. P37 GPU (`run_p37_isoabs`): P1 iso
+> 1.33 / gmatch falling / skip 0 (P33 class). Do not launch a second
+> GPU job.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
@@ -267,8 +269,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > by ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation inv-var
 > (`wm_isolation_var_norm`) tried to equalize that and **failed three
 > formulas** (P34 explode, P35 quiet-hold, P36 33× DV skip-storm).
-> Env-free default is **abs MSE** (P33). Opt-in `DREAMER_WM_ISOLATION_VAR_NORM=1`
-> only. Next DV lever is not another isolation reweight. Not relative Huber.
+> Abs MSE is the only path (A/B **REMOVED**). Next DV lever is not
+> another isolation reweight: if DV stays ~×0.66 after P37, equalize
+> isolation **|ΔCV| via excitation amplitude** (`Δu_i ∝ 1/|G_i|`,
+> clipped to bounds). Not relative Huber.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

@@ -6,8 +6,7 @@ import torch
 from training.train import (TrainConfig, build_model,
                             _wm_input_isolation_loss, _wm_gain_match_loss,
                             _wm_latent_overshoot_loss,
-                            _wm_held_rollout_stationarity_loss,
-                            _invvar_reweight, _isolation_per_input_scale)
+                            _wm_held_rollout_stationarity_loss)
 
 
 def _iso(model, obs, act, cfg):
@@ -85,110 +84,6 @@ def main():
     # open-loop prior/decoder/cont-gain path is what's supervised).
     print('[iso] OK: finite, off-when-disabled, grad reaches the cont-gain '
           'channel (bypasses the categorical bottleneck)')
-
-    # Inverse-variance reweight: identity on constant scale; equal relative
-    # error ≡ abs mean; subdominant-only error is upweighted (P33 DV).
-    err_c = torch.tensor([0.4, 0.2, 0.6])
-    sc_c = torch.ones(3) * 2.0
-    got_c = _invvar_reweight(err_c, sc_c)
-    assert abs(float(got_c) - float(err_c.mean())) < 1e-6, float(got_c)
-    err_eq = torch.tensor([0.04, 0.01])   # e²=0.01 times scale [4, 1]
-    sc_eq = torch.tensor([4.0, 1.0])
-    got_eq = _invvar_reweight(err_eq, sc_eq)
-    # mean(w)=1, w∝1/s → equal relative error ⇒ equal w·err (not abs mean)
-    inv = 1.0 / sc_eq
-    w_eq = inv / inv.mean()
-    assert abs(float(got_eq) - float((err_eq * w_eq).mean())) < 1e-6, float(got_eq)
-    assert abs(float((w_eq * err_eq)[0] - (w_eq * err_eq)[1])) < 1e-6
-    err_dv = torch.tensor([0.0, 1.0])
-    sc_dv = torch.tensor([4.0, 1.0])
-    got_dv = _invvar_reweight(err_dv, sc_dv)
-    assert float(got_dv) > float(err_dv.mean()) + 0.2, (
-        f'expected DV-only error upweighted vs abs {float(err_dv.mean())}, '
-        f'got {float(got_dv)}')
-    # P34: untrained equal abs err + 1000:1 scale must NOT explode
-    err_init = torch.ones(2)
-    sc_init = torch.tensor([1.0, 1e-3])
-    got_init = _invvar_reweight(err_init, sc_init)
-    assert float(got_init) < 5.0, f'init AM/HM explode: {float(got_init)}'
-    assert abs(float(got_init) - 1.0) < 0.5, float(got_init)
-    print(f'[iso-varnorm] OK: identity={float(got_c):.4f} '
-          f'eq-rel={float(got_eq):.4f} dv-boost {float(err_dv.mean()):.3f}'
-          f'→{float(got_dv):.3f} init={float(got_init):.3f}')
-
-    # P35 RCA: scale is per isolated INPUT, not per-sequence |CV|².
-    # Quiet vs loud holds of the same MV share |tgt_mv|²; DV gets |tgt_dv|².
-    cfg.gain_match_mv_target = ((-2.82,),)
-    cfg.gain_match_dv_target = ((0.49,),)
-    act_s = torch.zeros(4, 8, 1)
-    dv_s = torch.zeros(4, 8, 1)
-    cv_s = torch.zeros(4, 8, 1)
-    act_s[0, :, 0] = 1.0
-    act_s[1, :, 0] = 0.01
-    cv_s[0] = 2.82
-    cv_s[1] = 0.01
-    dv_s[2, :, 0] = 1.0
-    dv_s[3, :, 0] = 0.01
-    cv_s[2] = 0.49
-    cv_s[3] = 0.01
-    sc_tgt, src_tgt = _isolation_per_input_scale(act_s, dv_s, cv_s, cfg)
-    assert src_tgt == 1.0, src_tgt
-    assert torch.allclose(sc_tgt[0], sc_tgt[1]), sc_tgt
-    assert torch.allclose(sc_tgt[2], sc_tgt[3]), sc_tgt
-    ratio_tgt = float(sc_tgt[0] / sc_tgt[2])
-    expect = (2.82 / 0.49) ** 2
-    assert abs(ratio_tgt - expect) / expect < 0.02, (ratio_tgt, expect)
-    cfg.gain_match_mv_target = ()
-    cfg.gain_match_dv_target = ()
-    sc_fb, src_fb = _isolation_per_input_scale(act_s, dv_s, cv_s, cfg)
-    assert src_fb == 0.0, src_fb
-    assert torch.allclose(sc_fb[0], sc_fb[1]), sc_fb
-    assert torch.allclose(sc_fb[2], sc_fb[3]), sc_fb
-    # Fallback averages |CV|² per input: quiet MV does not get 1e-4.
-    assert float(sc_fb[1]) > 0.5, float(sc_fb[1])
-    cfg.gain_match_mv_target = ((-2.82,),)
-    cfg.gain_match_dv_target = ((0.49,),)
-    print(f'[iso-per-input] OK: tgt-ratio={ratio_tgt:.2f} (expect {expect:.2f}) '
-          f'fallback quiet-MV scale={float(sc_fb[1]):.3f}')
-
-    cfg.wm_isolation_var_norm = False
-    loss_abs, extras_abs = _wm_input_isolation_loss(model, obs, act, cfg)
-    cfg.wm_isolation_var_norm = True
-    loss_vn, extras_vn = _wm_input_isolation_loss(model, obs, act, cfg)
-    assert torch.isfinite(loss_abs).all() and torch.isfinite(loss_vn).all()
-    assert 'wm_isolation_var_wmax' in extras_vn
-    assert 'wm_isolation_var_scale_ratio' in extras_vn
-    assert 'wm_isolation_var_wmax' not in extras_abs
-    wmax = float(extras_vn['wm_isolation_var_wmax'])
-    assert wmax >= 1.0 - 1e-5, wmax
-    assert 'wm_isolation_var_tgt_scale' in extras_vn
-    assert float(extras_vn['wm_isolation_var_scale_ratio']) < 100.0, extras_vn
-    # Crafted quiet-MV + loud-MV + DV: per-input |tgt|² ratio ~33, not 22000.
-    obs_q = torch.zeros(4, cfg.seq_len, cfg.obs_dim)
-    act_q = torch.zeros(4, cfg.seq_len, cfg.action_dim)
-    act_q[0] = 1.0
-    act_q[1] = 0.02
-    obs_q[0, :, 0] = 2.82
-    obs_q[1, :, 0] = 0.02
-    obs_q[2, :, 3] = 1.0
-    obs_q[3, :, 3] = 0.02
-    obs_q[2, :, 0] = 0.49
-    obs_q[3, :, 0] = 0.02
-    _, extras_q = _wm_input_isolation_loss(model, obs_q, act_q, cfg)
-    ratio_q = float(extras_q['wm_isolation_var_scale_ratio'])
-    assert float(extras_q['wm_isolation_var_tgt_scale']) == 1.0
-    assert 10.0 < ratio_q < 50.0, ratio_q
-    print(f'[iso-varnorm] quiet+loud extras scale_ratio={ratio_q:.2f} '
-          f'(P35 per-seq was ~22000)')
-    model.zero_grad(set_to_none=True)
-    loss_vn.backward()
-    cont_grad_vn = sum(float(p.grad.abs().sum())
-                       for n, p in model.dynamics.named_parameters()
-                       if p.grad is not None and 'cont' in n)
-    assert cont_grad_vn > 0.0, 'var-norm isolation did NOT reach cont-gain!'
-    print(f'[iso-varnorm] OK: abs={float(loss_abs):.5f} vn={float(loss_vn):.5f} '
-          f'wmax={wmax:.3f} cont_grad={cont_grad_vn:.4e}')
-    cfg.wm_isolation_var_norm = False
 
     # ---- steady-state (DC-gain) match term (2026-08-03) ----
     base = float(_iso(model, obs, act, cfg))  # ss off

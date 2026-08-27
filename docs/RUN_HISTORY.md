@@ -99,7 +99,9 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P32 | 2026-08-27 | last-ok at detonated freeze; continue-after-storm | storm 1/2 @53 KEEP; val MV ×1.09 DV ×0.68 det_r 0.11; `[p3-skip]` | ❌ CAPPED 0.71@DV — extension closed; keep-ext = P33 |
 | P33 | 2026-08-27 | keep P1 extension on skip-storm continue | val MV ×1.08 DV ×0.66 det_r 0.40; `[p3-skip]` | ❌ keep-ext KEEP as mechanism; FALSIFIED as DV lever |
 | P34 | 2026-08-27 | AM/HM inv-var isolation | iso 7088 skip 99 ES iter 1 | ❌ formula REVERTED |
-| P35 | 2026-08-27 | mean-1 per-seq inv-var isolation | storm 2/2 @16 CAPPED GAIN_NOT_READY 0.01@DV; gmatch stuck 1.21; iso ~0.0008 | ⏳ P2 on frozen last-ok; per-seq scale SUPERSEDED (per-input \|G\|² on HEAD) |
+| P35 | 2026-08-27 | mean-1 per-seq inv-var isolation | storm 2/2 @16 CAPPED GAIN_NOT_READY 0.01@DV; val DV ×0.013 | ❌ per-seq SUPERSEDED |
+| P36 | 2026-08-27 | per-input \|G\|² inv-var isolation | storm 2/2 @7 CAPPED 0.00@DV; val DV ×0.004 | ❌ inv-var DISCARDED then **REMOVED** |
+| P37 | 2026-08-27 | abs isolation (P33 recipe) | LIVE P1: iso 1.33, gmatch 1.20→0.0008 by iter 17, skip 0 | ⏳ GPU; no second job |
 
 ## Run details
 
@@ -1383,11 +1385,11 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Actor INVALID.** `[p3-skip]` KEEP. `critic_r=NaN`. econ **−29 vs baseline −120** is expert-BC (beats_baseline is **not** an actor win; CV viol 11.9, MV viol 4.0, pulse/chatter near a limit). Do not stack critic knobs. Do not revive relative Huber. Do not lower skip threshold. Do not train P3 on GAIN_NOT_READY.
 - **ROOT:** inverse-variance isolation is a **relative-gain reweight**. `w∝1/|G|²` with ratio 33 = 33× DV isolation gradient — same class as P27 relative Huber (skip-storm). Isolation teacher 13× weaker than P33 abs (iso 0.125 vs 1.69) so gain-match never pins G, then a huge-grad step detonates P1 at iter 4/7. Per-input scale fixed P35's quiet-hold (ratio 33 not 22000) but did **not** restore P33 P1 health. **REVERT default `wm_isolation_var_norm=False`** (abs, P33). Do not try another isolation reweight formula.
 
-### p37 (`run_p37_isoabs`, branch `cursor/p28`) — FIX: abs isolation (revert var-norm)
-- **One attributed GPU change vs P36:** `wm_isolation_var_norm=False` TrainConfig default (P33 abs MSE). Per-input `|G|²` helpers stay behind `DREAMER_WM_ISOLATION_VAR_NORM=1` (A/B only). Gain-match stays abs Huber. Env-free. Do **not** pass leftover compile/latent/DOB/var-norm env-vars.
-- **Step 4 resolved-cfg vs P36:** `iso_varnorm=True` → **`False`**. All other knobs identical (det+eager `storm_cap=2` skip_invalid_p3 n_critics=2 rs_freeze).
-- **Judge by:** `[resolved-cfg] iso_varnorm=False`. Iter-1 iso **P33 class (~1.7)** not 0.125; gmatch falling from 1.21 (**P33 hit 0.002 by iter 9**); no storm 2/2 in the first ~16 iters. If GAIN-READY: first valid actor (rscale freeze, rtgt>0.015, econ vs baseline **and** vs P33 BC −21). If still GAIN_NOT_READY: `[p3-skip]`. Val MV ss/@H ~×1.0 ±0.1 (P26 ×0.97/×0.88; P33 ×1.08), DV not ×0.004 (P33 floor ×0.66). **Next DV lever is not another isolation reweight** (P34–P36 falsified).
-- Watch `[resolved-cfg] latent=deterministic compile=eager iso_varnorm=False storm_cap=2`.
+### p37 GPU LIVE (`run_p37_isoabs`, tmux `mbrl2_p37`, HEAD `4d349fb`) — abs isolation confirmation
+- **Launch KEEP:** env-free det+eager `storm_cap=2`. `[resolved-cfg] iso_varnorm=False` gain_match=1 isolation=1 ss_match=3. Gain-match tgt MV −2.81 DV 0.487. device=cuda bs=128. No leftover `DREAMER_*`.
+- **P1 through iter 21 (P33 class, not P34–P36):** iter-1 iso **1.33** (P33 1.69; P36 0.125). gmatch **1.20 → 0.054 by iter 3 → 0.0008 by iter 17** (P33 hit 0.002 by iter 9; P36 stuck 1.21). skip **0**. Iter 19 wrap-class blip recon 0.267 / gmatch 1.07 recovered iter 21 recon 0.031 skip 0 (do **not** lower skip threshold). jsonl key is `wm_input_isolation_loss` (not `wm_isolation_loss`).
+- **Do not launch a second GPU job.** If GAIN-READY: first valid actor. If still GAIN_NOT_READY: `[p3-skip]`. Next DV lever is **not** isolation reweight — if DV stays ~×0.66, equalize isolation **|ΔCV| SNR via excitation amplitude** `Δu_i ∝ 1/|G_i|` (clipped to bounds), not loss weights.
+- **HEAD (not in this pid):** isolation inv-var A/B **REMOVED** (field + `DREAMER_WM_ISOLATION_VAR_NORM` + helpers), same class as relative Huber. Abs MSE is the only path.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
@@ -1397,14 +1399,15 @@ Still not sim-adaptive:
 - `wm_fidelity_{warmup,patience}_iters` and `wm_probe_every_iters` stay in *iters* (one WM update ≈ one iter — plant-independent). KEEP.
 - `dv_feedforward=True` still appends measured DV to **head** feat (decoder half is off). `dv_as_input` is the symmetric path; do not re-add decoder FF.
 - `dv_prbs_seed_episodes=24` / `expert_seed_episodes=24` / `constant_action_seed_episodes=40` are flat episode counts (each DV-PRBS episode already sweeps every DV; episode length already scales with τ). Isolation settle is already per-input. `phase3_onpolicy_buffer_eps=16` is an on-policy episode count (same). MIMO coverage of const-action OP combinations is the remaining seed-count question — do not change test_sim sentinels without a MIMO run.
-- Isolation/ss-match default is **abs MSE** (`wm_isolation_var_norm=False`, P33 / P36 RCA). Inv-var (`mean(w·err)` mean(w)=1, per-input `|G|²`) is **opt-in** `DREAMER_WM_ISOLATION_VAR_NORM=1` only. P36 EXIT: scale_ratio 20–33 (LUT fired) but iso 0.125 vs P33 1.69, gmatch stuck 1.21, storm 2/2 @iter 7, val DV ×0.004 — relative-gain reweight, same class as P27 Huber. P35 per-seq `|CV|²` SUPERSEDED. P34 AM/HM REVERTED. Do **not** revive relative Huber. Do **not** try another isolation reweight until a non-reweight DV lever is specified.
+- Isolation/ss-match is **abs MSE only**. Inv-var A/B **REMOVED** (P34–P36 + P37-live cleanup; same as relative Huber). Do **not** re-add `wm_isolation_var_norm`. Next DV lever if P37 still GAIN_NOT_READY: isolation **excitation** `|ΔCV|` matching, not a loss reweight.
 - `wm_overshoot_max_starts=24` / `gain_match_max_starts=6` are **per-sequence** caps. With gpu-calib `B=128`, total `Bm=B·S` is ~8× paper `B=16`. Do **not** retune until the observer is GAIN-READY (would stack a second observer change). Host-adaptive thread caps already scale with `sched_getaffinity`.
 - Gain-probe log prints **per-input** `ss_pairs` + `unbiased`/`not_noisy` (HEAD). P31 live gates only had min/max+worst. P32 GPU job has the per-input log.
 - P1→P2 **detonated-freeze last-ok restore** (P32 GPU job, P31 RCA): if freeze-iter recon > `skip_storm_last_ok_recon_ratio` × last-ok best, restore `wm_last_ok`, reset AdamW, re-probe gain. Unitless (recon/recon). P31 GPU froze exploded g (val DV ×0.11).
-- P1/P2 random collect is **numpy-only** (no `torch.inference_mode` / SF `a_history`). P3 on-policy still streams. P2 DOB Kalman scan is a closed-form mix (same recurrence; host-adaptive T×T cap `clamp(GPU_mem/1500, 4MiB, 64MiB)` — A10 24GB still **16 MiB**). Stage-1 skips `apply_dob` clone + ground/reg. CV-std tensor cached. P1 skips unused `agent_finetune_loss` when `reward_scale_loss_p1=0`. Last-ok snapshot `copy_` reuse. Isolation inv-var scale is per-input `|G|²` (P36, **opt-in only**). Env-free abs isolation (P37).
-- `run_plan.json → config` is now rewritten after gain-match resolve (`[resolved-cfg]` includes `iso_varnorm=`). Pre-rewrite dump is dataclass defaults (P29 plan still shows `rssm_latent_type=categorical` / `gain_match_coef=0` even though training auto-enabled grounding).
+- P1/P2 random collect is **numpy-only** (no `torch.inference_mode` / SF `a_history`). P3 on-policy still streams. P2 DOB Kalman scan is a closed-form mix (same recurrence; host-adaptive T×T cap `clamp(GPU_mem/1500, 4MiB, 64MiB)` — A10 24GB still **16 MiB**). Stage-1 skips `apply_dob` clone + ground/reg. CV-std tensor cached. P1 skips unused `agent_finetune_loss` when `reward_scale_loss_p1=0`. Last-ok snapshot `copy_` reuse. Isolation is abs MSE (inv-var helpers deleted).
+- `run_plan.json → config` is rewritten after gain-match resolve. `[resolved-cfg]` no longer prints `iso_varnorm=` (knob removed). Pre-rewrite dump is dataclass defaults (P29 plan still shows `rssm_latent_type=categorical` / `gain_match_coef=0` even though training auto-enabled grounding).
 - Validation `wm_gain_pass` is still **MV-only**. HEAD logs `wm_dv_gain_*` + `wm_dv_ss_ratio_worst` (P29 HEALTHY MV rel_err 0.10 hid DV ×0.56; P31 HEALTHY MV rel_err 0.35 hid DV ×0.11; P35 HEALTHY MV rel_err 0.064 hid DV ×0.013). Does not change `wm_gain_pass`.
-- P36 EXIT (`run_p36_isoinpscale`): storm 2/2 CAPPED GAIN_NOT_READY 0.00@DV. Val MV ×0.91/@H ×0.95, DV ×0.004, det_r 0.076, `[p3-skip]`. Per-input `|G|²` fired (ratio 33) but inv-var DISCARDED. P37 GPU: abs isolation, env-free. Do not pass leftover compile/latent/DOB/var-norm env-vars.
+- P36 EXIT (`run_p36_isoinpscale`): storm 2/2 CAPPED GAIN_NOT_READY 0.00@DV. Val MV ×0.91/@H ×0.95, DV ×0.004, det_r 0.076, `[p3-skip]`. Per-input `|G|²` fired (ratio 33) but inv-var DISCARDED then **REMOVED**. P37 GPU: abs isolation, env-free. Do not pass leftover compile/latent/DOB env-vars. Do not launch a second GPU job.
+
 ### Graveyard (P24–P28 observer / actor levers)
 
 | Lever | Tried | Status | Root-cause? |
@@ -1438,7 +1441,7 @@ Still not sim-adaptive:
 | Isolation extra unroll skipped when g frozen | P28 follow-up 10 | KEPT | YES — DOB-curriculum P2 cannot update frozen g (dead hot-path) |
 | Extra P1 via keep-ext to pin DV DC-gain | P33 P1→P2 (full 175924 ext, no storm) | FALSIFIED as DV lever (keep-ext KEEP as mechanism) | YES — iter 85 and 97 both 0.68@DV; P32 val ×0.675 was not extension-starve |
 | Abs isolation/ss-match MSE on mixed MV/DV | P33 EXIT | KEPT as default (P36 REVERT); FALSIFIED as DV pin | YES — |tgt| MV 2.82 vs DV 0.49; val DV ×0.66 after full ext. Inv-var (P34–P36) skip-stormed worse. |
-| Isolation inv-var (AM/HM, per-seq, per-input `|G|²`) | P34–P36 | DISCARDED as default (`wm_isolation_var_norm=False`) | YES — relative-gain reweight; P36 LUT fired (ratio 33) then storm 2/2 @iter 7, val DV ×0.004 |
+| Isolation inv-var (AM/HM, per-seq, per-input `|G|²`) | P34–P36 | DISCARDED then **REMOVED** (P37-live; like relative Huber) | YES — relative-gain reweight; P36 LUT fired (ratio 33) then storm 2/2 @iter 7, val DV ×0.004 |
 | `mean(err/scale)*mean(scale)` isolation | P34 iter 1 | REVERTED (mean-1 `w·err`) | YES — AM/HM exploded iso 7088 skip 99 ES |
 | Per-sequence `|CV|²` inv-var (quiet holds) | P35 EXIT | SUPERSEDED (per-input `|G|²`) | YES — scale_ratio ~22000, iso 0.0008, gmatch stuck 1.21, storm 2/2 cap 0.01@DV; val DV ×0.013 |
 | P1 `agent_finetune_loss` when `reward_scale_loss_p1=0` | P33 GPU-occupied | SUPERSEDED (skip except log-last inner step) | YES — paper default 0; 100 unused MTP forwards/iter; jsonl `bc` still from last step |
