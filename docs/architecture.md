@@ -273,9 +273,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > `wm_isolation_dcv_match` scales isolation **excitation**
 > `Δu_i ∝ 1/|G_i|` (clipped to ±1) so |ΔCV| matches at the linspace
 > edge. Equal-|G| plants keep the op-band linspace. Not relative Huber.
-> P37 GPU still runs unscaled abs (launch `4d349fb`). Next env-free
-> launch after P37 GAIN_NOT_READY is this recipe; if P37 is GAIN-READY
-> opt out `DREAMER_WM_ISOLATION_DCV_MATCH=0` for the actor experiment.
+> Pre-iso resolve is **only** for those scales; gain-match Huber
+> targets always re-resolve after isolation+expert (P37 obs-norm freeze
+> point — skipping would confound P38). P37 GPU still runs unscaled abs
+> (launch `4d349fb`). Next env-free launch after P37 GAIN_NOT_READY is
+> this recipe; if P37 is GAIN-READY opt out
+> `DREAMER_WM_ISOLATION_DCV_MATCH=0` for the actor experiment.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

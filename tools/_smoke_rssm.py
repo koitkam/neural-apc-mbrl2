@@ -717,6 +717,12 @@ def _test_isolation_dcv_scales() -> None:
     assert abs(dv_sc[0] - 1.0 / 0.6) < 1e-6
     assert _scale_isolation_level(0.6, dv_sc[0]) == 1.0
     assert abs(_scale_isolation_level(0.6, mv_sc[0]) - 0.6 * mv_sc[0]) < 1e-9
+    from pathlib import Path as _P
+    import training.train as _tr
+    _src = _P(_tr.__file__).read_text()
+    assert "log_label='pre-iso targets'" in _src
+    assert 'keeping pre-iso targets' in _src
+    assert 'Isolation settle already tried this (for |ΔCV| excitation scales); skip a second print' not in _src
     cfg.gain_match_mv_target = ((1.0,),)
     cfg.gain_match_dv_target = ((1.0,),)
     assert _isolation_dcv_scales(cfg, 1, 1, 0.6) == ([1.0], [1.0])

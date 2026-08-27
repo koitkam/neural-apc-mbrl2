@@ -3600,17 +3600,20 @@ def _gain_match_targets_ready(cfg: 'TrainConfig') -> bool:
 
 
 def _maybe_resolve_gain_match_targets(env: 'APCEnv', cfg: 'TrainConfig') -> bool:
-    """Resolve WM-norm |G| before isolation-settle (obs-norm already running).
+    """Resolve WM-norm |G| before isolation-settle (for dcv_match scales only).
 
     Isolation settle is late in seed fill (after PRBS / const / step-test /
     DV-PRBS) so Welford obs-norm is already on the operational buffer.
-    Failure leaves scales at 1; the post-seed resolve still runs.
+    This must NOT skip the post-seed re-resolve: isolation + expert still
+    update cv_std (P37 freeze point). Failure leaves scales at 1.
     """
     if _gain_match_targets_ready(cfg):
         return True
     try:
-        _resolve_gain_match_targets(env, cfg)
-    except Exception:
+        _resolve_gain_match_targets(env, cfg, log_label='pre-iso targets')
+    except Exception as exc:
+        print(f'[gain-match] pre-iso FAILED ({exc!r}); '
+              f'isolation dcv scales stay 1', flush=True)
         return False
     return _gain_match_targets_ready(cfg)
 
@@ -5841,7 +5844,8 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     return out, extras
 
 
-def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
+def _resolve_gain_match_targets(
+        env: 'APCEnv', cfg: TrainConfig, *, log_label: str = 'targets') -> None:
     """C(1): convert the identified steady-state gains (engineering units) into
     the WM's NORMALIZED units and store them on ``cfg`` for the gain-match loss.
 
@@ -5941,7 +5945,7 @@ def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
     if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
         cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
     _resolve_aux_tbptt_steps(cfg)
-    print(f'[gain-match] targets (WM-norm) mv={cfg.gain_match_mv_target} '
+    print(f'[gain-match] {log_label} (WM-norm) mv={cfg.gain_match_mv_target} '
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
           f'len={cfg.gain_match_len} huber_beta={cfg.gain_match_huber_beta} '
           f'aux_tbptt={cfg.aux_tbptt_steps}',
@@ -9488,7 +9492,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # reweight).
     n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
     if isolation_buf is not None and n_settle > 0:
-        _maybe_resolve_gain_match_targets(env, cfg)
+        # Pre-iso resolve is only for dcv scales. Actor A/B with
+        # ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` skips it so gain-match
+        # freezes exactly where P37 did (after isolation+expert).
+        if _cfg_on(cfg, 'wm_isolation_dcv_match', True):
+            _maybe_resolve_gain_match_targets(env, cfg)
         _mv_sc, _dv_sc = _isolation_dcv_scales(cfg, n_mv, n_dv, const_op_band)
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
                                  dtype='float32')
@@ -9635,18 +9643,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     # p08 RCA: resolve the gain-match targets from the identified gains now that
     # obs-norm is fitted (seed buffer collected above) → re-anchor the WM
-    # steady-state gains that isolation-only let shrink.  Isolation settle
-    # already tried this (for |ΔCV| excitation scales); skip a second print
-    # when it succeeded.  Graceful no-op if the identification data is missing
+    # steady-state gains that isolation-only let shrink.  ALWAYS re-resolve
+    # here even if dcv_match already resolved pre-iso: isolation-settle +
+    # expert still update Welford cv_std, and P37 froze |G| at this point.
+    # Skipping would confound the P38 excitation A/B with a different Huber
+    # target.  Graceful no-op if the identification data is missing
     # (isolation loss still supervises the gain).
-    if not _gain_match_targets_ready(cfg):
-        try:
-            _resolve_gain_match_targets(env, cfg)
-        except Exception as _gm_exc:
+    try:
+        _resolve_gain_match_targets(env, cfg)
+    except Exception as _gm_exc:
+        if not _gain_match_targets_ready(cfg):
             cfg.gain_match_coef = 0.0
             print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
                   f'falling back to isolation-only WM gain supervision.',
                   flush=True)
+        else:
+            print(f'[gain-match] post-seed re-resolve FAILED ({_gm_exc!r}); '
+                  f'keeping pre-iso targets', flush=True)
     _resolve_aux_tbptt_steps(cfg)
     _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:
