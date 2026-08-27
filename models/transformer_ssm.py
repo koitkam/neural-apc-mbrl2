@@ -485,7 +485,8 @@ class TransformerSSMDynamics(nn.Module):
 
     def apply_dob(self, decoded: torch.Tensor,
                   d: Optional[torch.Tensor]) -> torch.Tensor:
-        if not self.dob_enabled or d is None:
+        if (not self.dob_enabled or d is None
+                or not bool(getattr(self, 'dob_active', True))):
             return decoded
         out = decoded.clone()
         out.index_add_(-1, self.cv_index_t, d.to(out.dtype))

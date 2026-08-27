@@ -1676,16 +1676,11 @@ class DreamerV4(nn.Module):
         2026-06-09).  Included for both backbones; omitted when the head is
         disabled (``disturbance_head_dim == 0`` ⇒ ``self.disturbance is None``).
         """
-        if getattr(self, 'world_model_type', 'sf_transformer') == 'rssm':
-            params = (list(self.dynamics.parameters())
-                      + list(self.reward.parameters()))
-        else:
-            # SF-transformer has a tokenizer; RSSM/TSSM integrate the encoder/
-            # decoder into ``dynamics`` (tokenizer is None) — guard it so both
-            # the 'rssm' and 'tssm' backbones work.
-            params = list(self.dynamics.parameters()) + list(self.reward.parameters())
-            if getattr(self, 'tokenizer', None) is not None:
-                params = list(self.tokenizer.parameters()) + params
+        # RSSM/TSSM fold encoder/decoder into ``dynamics`` (tokenizer is None).
+        # SF-transformer has a separate tokenizer — include it when present.
+        params = list(self.dynamics.parameters()) + list(self.reward.parameters())
+        if getattr(self, 'tokenizer', None) is not None:
+            params = list(self.tokenizer.parameters()) + params
         if getattr(self, 'disturbance', None) is not None:
             params = params + list(self.disturbance.parameters())
         return params

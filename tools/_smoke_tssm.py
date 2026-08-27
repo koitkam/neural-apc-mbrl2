@@ -178,6 +178,9 @@ def test_end_to_end_dreamer_tssm():
     cfg.mtp_length = 4
     cfg.disturbance_head_dim = 1          # unmeasured-disturbance estimator
     cfg.compile_mode = 'off'
+    cfg.wm_overshoot_len = 4
+    cfg.wm_held_rollout_len = 8
+    cfg.wm_held_rollout_win = 2
     model = build_model(cfg)
     assert model.world_model_type == 'tssm'
     assert type(model.dynamics).__name__ == 'TransformerSSMDynamics'
@@ -194,15 +197,16 @@ def test_end_to_end_dreamer_tssm():
     losses, _, _ = world_model_loss(model, batch, cfg)
     assert torch.isfinite(losses['wm_total']).all()
     assert 'disturbance_loss' in losses, "disturbance loss missing for TSSM"
-    # overshoot/held-rollout no-op for TSSM (documented compat decision)
-    assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0
+    # RSSM-interface: overshoot runs; held is every-other so the first WM
+    # step stays 0 (same cadence as RSSM).
+    assert float(losses.get('wm_overshoot_loss', 0.0)) > 0.0
     assert float(losses.get('wm_held_rollout_loss', 0.0)) == 0.0
     losses['wm_total'].backward()
     diag = _realsim_actor_critic_step(model, batch, cfg)
     assert torch.isfinite(diag['critic_loss']).all()
     assert torch.isfinite(diag['actor_loss']).all()
-    print("[smoke] OK end-to-end DreamerV4(tssm): WM loss + imagination run, "
-          "disturbance head built, overshoot/held no-op (compat)")
+    print("[smoke] OK end-to-end DreamerV4(tssm): WM loss + real-sim actor, "
+          "disturbance head built, overshoot live (held every-other skip)")
 
 
 def test_diagnostics_probes_route_tssm():

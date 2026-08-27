@@ -205,10 +205,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P33 LIVE (2026-08-27 03:55, tmux `mbrl2_p33`, `run_p33_keepext`):**
 > keep `p1_gate_max_ext_steps` on storm-1 continue. Storm 2 still
 > `_force_p1_cap_at`. Env-free det+eager CONFIRMED (`[resolved-cfg]`
-> `storm_cap=2 compile=eager`). Through P1 iter **56** skip **0** (wrap
-> blip 46–48 recovered; not a P32 skip-storm). GPU occupied — no second
-> job. Isolation / P3 frozen-observer `rollout_observed(...,
-> store_aux=False)` skips unused logit stacks (feats identical).
+> `storm_cap=2 compile=eager`). Through P1 iter **77** recon **0.0041**
+> skip **0**. **Iter 75 gate EXTENDED** (`not_plateaued`, +75396 to
+> 829356; P32 CAPPED here). GPU occupied — no second job. Isolation /
+> P3 frozen-observer `rollout_observed(..., store_aux=False)` skips
+> unused logit stacks. Stage-1 skips `apply_dob` clone + ground/reg
+> (`d_t≡0`); isolation / overshoot / held use the RSSM-interface
+> (TSSM too).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

@@ -753,6 +753,41 @@ def _test_dv_gain_gate(tmp_path: str) -> None:
     print('[smoke] OK  DV gain gate fields (MV-only wm_gain_pass unchanged)')
 
 
+def _test_stage1_dob_ground_skip() -> None:
+    """Stage-1 ``d_t≡0``: skip apply_dob clone and ground/reg (no grad)."""
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
+    cfg.mtp_length = 4
+    cfg.dob_enabled = True
+    cfg.dob_ground_coef = 2.0
+    cfg.cv_obs_indices = (0,)
+    cfg.compile_mode = 'off'
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    cfg.gain_match_coef = 0.0
+    cfg.wm_input_isolation_coef = 0.0
+    model = build_model(cfg)
+    model.set_dob_active(False)
+    B, T = 2, cfg.seq_len
+    batch = {
+        'obs': torch.randn(B, T, cfg.obs_dim),
+        'act': torch.rand(B, T, cfg.action_dim) * 2 - 1,
+        'rew': torch.randn(B, T),
+        'cont': torch.ones(B, T),
+        'expert': torch.zeros(B, T),
+        'dist': torch.randn(B, T, 1) * 5,
+    }
+    losses, _, _ = world_model_loss(model, batch, cfg)
+    assert float(losses['dob_ground']) == 0.0, float(losses['dob_ground'])
+    recon = torch.randn(B, T, cfg.obs_dim)
+    d0 = torch.zeros(B, T, model.dynamics.n_cv)
+    out = model.dynamics.apply_dob(recon, d0)
+    assert out is recon, 'Stage-1 apply_dob must be identity'
+    print('[smoke] OK  Stage-1 dob_ground skipped; apply_dob identity')
+
+
 if __name__ == '__main__':
     import os
     import sys
@@ -766,6 +801,7 @@ if __name__ == '__main__':
     only = sys.argv[1] if len(sys.argv) > 1 else None
     _test_cfg_from_env_whitelist()
     _test_store_aux_feats_identity()
+    _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
     _test_auto_if_unset_honours_explicit()
     import tempfile

@@ -3123,6 +3123,32 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device
     return out
 
 
+def _is_rssm_interface(model) -> bool:
+    """RSSM and TSSM share ``rollout_observed`` / ``img_rollout`` / ``decode``."""
+    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+
+
+def _cv_obs_std_tensor(cfg: 'TrainConfig', ds: torch.Tensor
+                       ) -> Optional[torch.Tensor]:
+    """Cached device tensor of running CV obs-norm std (DOB-ground units).
+
+    Rebuilding ``torch.tensor(list(cvs))`` every WM step was a host→device
+    sync on the P2 inner loop (same class as the gain-match tgt cache).
+    """
+    cvs = getattr(cfg, '_cv_obs_std', None)
+    if cvs is None or len(cvs) != int(ds.shape[-1]):
+        return None
+    key = (tuple(float(x) for x in cvs), str(ds.device), str(ds.dtype),
+           int(ds.shape[-1]))
+    cached = getattr(cfg, '_cv_obs_std_t', None)
+    if cached is None or cached[0] != key:
+        t = torch.tensor(list(cvs), device=ds.device,
+                         dtype=ds.dtype).clamp_min(1e-6)
+        cfg._cv_obs_std_t = (key, t)  # type: ignore[attr-defined]
+        return t
+    return cached[1]
+
+
 def _clone_module_state(model: torch.nn.Module, device: torch.device
                         ) -> Dict[str, torch.Tensor]:
     """In-process skip-storm snapshot. GPU clone (no H2D sync); CPU if OOM."""
@@ -3631,7 +3657,7 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
 
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+    _is_rssm = _is_rssm_interface(model)
     # SF lookback context (unused on RSSM/TSSM — GRU/token state carries it).
     a_history = None
     d_min = tau_ctx_val = None
@@ -5035,8 +5061,9 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     what makes a long imagination horizon H legitimately usable instead of
     leaning on the WM's weakest capability.
 
-    RSSM-only; returns ``(0, 0.0)`` for the SF-transformer backbone (its
-    shortcut-forcing loss is the native multi-step-prediction mechanism).
+    RSSM-interface (rssm + tssm); returns ``(0, 0.0)`` for the SF-transformer
+    backbone (its shortcut-forcing loss is the native multi-step-prediction
+    mechanism).
     Cost ~ O(B · n_starts · K) GRU steps; ``n_starts`` capped via a stride by
     ``wm_overshoot_max_starts`` so the term is bounded.  ``sample=True`` so the
     straight-through categorical grad trains the PRIOR (sample=False would give
@@ -5048,7 +5075,7 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     zero = torch.zeros((), device=device, dtype=obs.dtype)
     if coef <= 0.0 or K < 1:
         return zero, 0.0
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+    if not _is_rssm_interface(model):
         return zero, 0.0
     rssm = model.dynamics
     B, T = obs.shape[:2]
@@ -5150,8 +5177,8 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     categorical sampling noise, (b) is GAIN-NEUTRAL — it constrains only the
     tail DISPLACEMENT, never the response magnitude, and leaves the transient
     ``[0, s)`` free so the overshoot/recon terms still set the gain — and (c) is
-    scale-robust (normalised by the rollout's own ``h`` std).  RSSM-only;
-    returns ``(0, 0.0)`` for the SF backbone.  Cost ~ O(B·max_starts·K) GRU
+    scale-robust (normalised by the rollout's own ``h`` std).  RSSM-interface
+    (rssm + tssm); returns ``(0, 0.0)`` for the SF backbone.  Cost ~ O(B·max_starts·K) GRU
     steps, bounded by ``wm_held_rollout_max_starts``.  ``sample=True`` so the
     straight-through categorical grad trains the PRIOR (the drift source).
     """
@@ -5161,7 +5188,7 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     zero = torch.zeros((), device=device, dtype=obs.dtype)
     if coef <= 0.0 or K < 4:
         return zero, 0.0
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+    if not _is_rssm_interface(model):
         return zero, 0.0
     rssm = model.dynamics
     B, T = obs.shape[:2]
@@ -5297,7 +5324,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     if float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0:
         return zero, diag
     _wmt = getattr(model, 'world_model_type', 'sf_transformer')
-    if _wmt not in ('rssm', 'tssm'):
+    if not _is_rssm_interface(model):
         return zero, diag
     rssm = model.dynamics
     if int(getattr(rssm, 'cont_gain_dim', 0) or 0) <= 0 or rssm.n_cv <= 0:
@@ -5552,8 +5579,8 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     bottleneck that attenuates SUBDOMINANT inputs (the same routing C(1)
     gain-match uses).  The K-step prior is ``img_rollout`` with TBPTT applied
     between chunks (``h``-only ``keep_c``, never inside the SS window) — same
-    cuts as the old Python ``img_step`` loop.  RSSM-only; ``0`` for other
-    backbones / when off.
+    cuts as the old Python ``img_step`` loop.  RSSM-interface (rssm + tssm);
+    ``0`` for other backbones / when off.
 
     Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match
     (unchanged training objective).  ``extras`` splits the folded DC-gain
@@ -5565,7 +5592,7 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     coef = float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0)
     if coef <= 0.0:
         return zero, empty
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+    if not _is_rssm_interface(model):
         return zero, empty
     rssm = model.dynamics
     if rssm.n_cv <= 0:
@@ -5783,8 +5810,11 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # channels so the recon target the decoder/dynamics ``g`` must fit becomes
     # ``obs - d_t`` — i.e. g learns the CLEAN input->CV response and d_t absorbs
     # the unmeasured load (de-confounds the omitted-variable gain attenuation).
+    # Stage-1 (``dob_active=False``) forces ``d_t≡0`` — skip the clone+add and
+    # the ground/reg terms (constant MSE of zeros vs load; no gradient).
     dob_on = bool(getattr(rssm, 'dob_enabled', False)) and ds is not None
-    if dob_on:
+    dob_live = dob_on and bool(getattr(rssm, 'dob_active', True))
+    if dob_live:
         recon = rssm.apply_dob(recon, ds)
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
     latent_type = str(getattr(cfg, 'rssm_latent_type', 'deterministic')).lower()
@@ -5870,7 +5900,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # CV movement with g (the inputs) whenever it can, using d_t only for the
     # slow unmeasured load.  ``dob_reg_coef=0`` disables the prior.
     dob_reg = torch.zeros((), device=feats.device)
-    if dob_on:
+    if dob_live:
         dob_reg = ds.float().pow(2).mean()
         wm_total = wm_total + float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0) * dob_reg
 
@@ -5886,7 +5916,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # divide by the running CV obs-norm std (threaded on cfg as _cv_obs_std).
     dob_ground = torch.zeros((), device=feats.device)
     dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
-    if dob_on and dgc > 0.0:
+    if dob_live and dgc > 0.0:
         if dist_target is None:
             if not getattr(cfg, '_dob_ground_missing_warned', False):
                 print('[dob-ground] WARNING: dob_ground_coef>0 but batch has '
@@ -5908,10 +5938,8 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 elif dtgt.shape[-1] > ds.shape[-1]:
                     dtgt = dtgt[..., :ds.shape[-1]]
             if dtgt.shape == ds.shape:
-                cvs = getattr(cfg, '_cv_obs_std', None)
-                if cvs is not None and len(cvs) == int(ds.shape[-1]):
-                    cv_std_t = torch.tensor(list(cvs), device=ds.device,
-                                            dtype=ds.dtype).clamp_min(1e-6)
+                cv_std_t = _cv_obs_std_tensor(cfg, ds)
+                if cv_std_t is not None:
                     dtgt = dtgt / cv_std_t
                 dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
                 wm_total = wm_total + dgc * dob_ground
@@ -6027,7 +6055,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dist_match_loss': dist_match_loss.detach(),
         'dob_reg': dob_reg.detach(),
         'dob_ground': dob_ground.detach(),
-        'dob_d_absmean': (ds.abs().mean().detach() if dob_on
+        'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
     }
     losses.update(kl_diag)
@@ -6074,7 +6102,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # ===== RSSM world-model branch =====
     # neural-apc-mbrl: 'tssm' (transformer-SSM) shares the RSSM-interface path
     # (feat=[h,z_flat], rollout_observed/img_step/decode) so it routes here too.
-    if getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm'):
+    if _is_rssm_interface(model):
         return _rssm_world_model_loss(model, obs_cur, act, cfg,
                                       dist_target=batch.get('dist'))
 
@@ -6597,7 +6625,7 @@ def _probe_wm_held_convergence(model, env, device, cfg: 'TrainConfig'):
     no-op there anyway).  Never fatal — any failure returns ``None`` and the
     score falls back to correlation-only.
     """
-    if getattr(model, 'world_model_type', 'sf_transformer') not in ('rssm', 'tssm'):
+    if not _is_rssm_interface(model):
         return None
     H = int(getattr(cfg, 'horizon', 15))
     if H < 8:
@@ -6817,8 +6845,7 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     the REAL plant's OWN spread, so a genuinely curved plant is allowed while
     excess WM variance is flagged).  Returns a diag dict or ``None`` (never fatal).
     """
-    _wmt = getattr(model, 'world_model_type', 'sf_transformer')
-    if _wmt not in ('rssm', 'tssm'):
+    if not _is_rssm_interface(model):
         return None
     try:
         from evaluation.wm_transfer_matrix import (
@@ -9920,8 +9947,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     for _p in model.dynamics.parameters():
                         _p.requires_grad_(False)
                         _nfz += 1
-                    if (getattr(model, 'world_model_type', 'sf_transformer')
-                            != 'rssm'
+                    if (not _is_rssm_interface(model)
                             and getattr(model, 'tokenizer', None) is not None):
                         for _p in model.tokenizer.parameters():
                             _p.requires_grad_(False)
@@ -10276,7 +10302,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             for _p in model.dynamics.parameters():
                 _p.requires_grad_(False)
                 _nfz += 1
-            if (getattr(model, 'world_model_type', 'sf_transformer') != 'rssm'
+            if (not _is_rssm_interface(model)
                     and getattr(model, 'tokenizer', None) is not None):
                 for _p in model.tokenizer.parameters():
                     _p.requires_grad_(False)
@@ -10296,6 +10322,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         ac_losses: Dict[str, torch.Tensor] = {}
         iter_wm_skips = 0
         iter_wm_applied = 0
+
+        # P19 DOB-ground units: running CV obs-norm std.  Once per logged
+        # iter (Welford barely moves in 100 WM steps) and only while the
+        # Kalman observer is live.  Stage-1 ``d_t≡0`` skips ground/reg.
+        if (current_phase in (1, 2)
+                and float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) > 0.0
+                and bool(getattr(getattr(model, 'dynamics', None),
+                                 'dob_active', False))):
+            try:
+                _ovar = np.asarray(env.get_obs_norm_stats().get('var'),
+                                   dtype='float64')
+                cfg._cv_obs_std = [  # type: ignore[attr-defined]
+                    float(np.sqrt(max(_ovar[int(i)], 1e-8)))
+                    for i in env.cv_indices]
+            except Exception:
+                pass
 
         for _ in range(cfg.train_steps_per_iter
                           if current_phase != 3
@@ -10321,18 +10363,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if current_phase in (1, 2):
                 # World-model losses (always live in P1 + P2).
                 _t = time.time()
-                # P19: thread the running CV obs-norm std so the DOB grounding
-                # loss converts the engineering disturbance target into the
-                # normalized-CV units d_t lives in (no-op unless dob_ground_coef>0).
-                if float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) > 0.0:
-                    try:
-                        _ovar = np.asarray(env.get_obs_norm_stats().get('var'),
-                                           dtype='float64')
-                        cfg._cv_obs_std = [  # type: ignore[attr-defined]
-                            float(np.sqrt(max(_ovar[int(i)], 1e-8)))
-                            for i in env.cv_indices]
-                    except Exception:
-                        pass
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
@@ -10853,7 +10883,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # Observer discriminators on the live line (P29 leftover class:
             # categorical KL vs deterministic joint-embed was only in jsonl
             # while the banner printed RSSM ``sf≡0`` + deleted ``img_ret``).
-            _rssm = str(getattr(cfg, 'world_model_type', 'rssm')) == 'rssm'
+            _rssm = str(getattr(cfg, 'world_model_type', 'rssm')) in ('rssm', 'tssm')
 
             def _lf(key, nd=4):
                 v = row.get(key, 0.0)

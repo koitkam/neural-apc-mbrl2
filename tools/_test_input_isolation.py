@@ -424,6 +424,49 @@ def main():
     assert float(d_tail.abs().max()) == 0.0, 'P1 d-tail must be identically 0'
     print('[dob-stage1] OK: dob_active=False → d_t≡0 (no prior-core decode)')
 
+    recon = torch.randn_like(obs)
+    d0 = torch.zeros(obs.shape[0], obs.shape[1], model.dynamics.n_cv)
+    out = model.dynamics.apply_dob(recon, d0)
+    assert out is recon, 'Stage-1 apply_dob must skip clone+index_add'
+    model.dynamics.dob_active = True
+    out_live = model.dynamics.apply_dob(recon, d0)
+    assert out_live is not recon
+    model.dynamics.dob_active = False
+    print('[dob-stage1] OK: apply_dob identity while dob_active=False')
+
+    # TSSM shares img_rollout — isolation must not no-op on backbone name.
+    cfg_t = TrainConfig()
+    cfg_t.obs_dim = 6
+    cfg_t.action_dim = 1
+    cfg_t.lookback = 8
+    cfg_t.world_model_type = 'tssm'
+    cfg_t.tssm_d_model, cfg_t.tssm_n_layers, cfg_t.tssm_n_heads = 32, 2, 4
+    cfg_t.tssm_max_seq_len = 64
+    cfg_t.rssm_n_categoricals = 4
+    cfg_t.rssm_n_classes = 4
+    cfg_t.rssm_embed_dim = 16
+    cfg_t.head_hidden = 32
+    cfg_t.head_n_layers = 2
+    cfg_t.mtp_length = 4
+    cfg_t.horizon = 6
+    cfg_t.seq_len = 16
+    cfg_t.dv_dim = 1
+    cfg_t.dv_indices = (3,)
+    cfg_t.cv_obs_indices = (0,)
+    cfg_t.dob_enabled = True
+    cfg_t.cont_latent_enabled = True
+    cfg_t.cont_gain_dim = 2
+    cfg_t.cont_dist_dim = 0
+    cfg_t.wm_input_isolation_coef = 0.5
+    cfg_t.wm_input_isolation_len = 6
+    cfg_t.compile_mode = 'off'
+    model_t = build_model(cfg_t)
+    obs_t = torch.randn(2, cfg_t.seq_len, cfg_t.obs_dim)
+    act_t = torch.rand(2, cfg_t.seq_len, cfg_t.action_dim) * 2 - 1
+    loss_t = _iso(model_t, obs_t, act_t, cfg_t)
+    assert torch.isfinite(loss_t).all() and float(loss_t) > 0.0, float(loss_t)
+    print(f'[iso-tssm] OK: isolation finite on TSSM ({float(loss_t):.5f})')
+
 
 if __name__ == '__main__':
     main()

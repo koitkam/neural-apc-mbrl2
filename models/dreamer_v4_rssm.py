@@ -606,8 +606,11 @@ class RSSMDynamics(nn.Module):
     def apply_dob(self, decoded: torch.Tensor,
                   d: Optional[torch.Tensor]) -> torch.Tensor:
         """Add the DOB disturbance state ``d`` (..., n_cv) into the CV channels
-        of a decoded obs tensor (..., obs_dim).  Identity when DOB is off."""
-        if not self.dob_enabled or d is None:
+        of a decoded obs tensor (..., obs_dim).  Identity when DOB is off
+        or Stage-1-suppressed (``dob_active=False`` → ``d_t≡0``, skip the
+        clone+index_add)."""
+        if (not self.dob_enabled or d is None
+                or not bool(getattr(self, 'dob_active', True))):
             return decoded
         out = decoded.clone()
         out.index_add_(-1, self.cv_index_t, d.to(out.dtype))
