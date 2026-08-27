@@ -910,17 +910,17 @@ class TrainConfig:
     # signal a mixed PRBS+settle isolation batch drowns.  0 = off (unweighted).
     wm_ss_match_settle_var: float = 0.0
     wm_isolation_settle_episodes: int = 0   # long-hold settle eps PER isolated input (auto 24)
-    # Inverse-variance reweight of isolation / ss-match (P33 RCA).  Abs
-    # trajectory MSE drowns the subdominant input: test_sim gain-match
+    # Inverse-variance reweight of isolation / ss-match (P33 RCA, P34 FAIL).
+    # Abs trajectory MSE drowns the subdominant input: test_sim gain-match
     # targets |MV|≈2.82 vs |DV|≈0.49 (~5.8×) so |ΔCV|² weights MV ~33×
     # more.  Extra P1 (keep-ext) left live DV at 0.68 — same as P32 val
-    # ×0.675.  Per-sequence ``mean(err/scale)*mean(scale)`` equalizes
-    # relative-gain gradient (SysID: equal weight per isolated input)
-    # while matching abs MSE when scale is constant, so isolation_coef /
-    # ss_match_coef stay in (normalized CV)² units.  NOT relative Huber
-    # (P27: per-element (g-tgt)/|tgt| on full-BPTT gain-match).  This
-    # path is isolation TBPTT only.  ``DREAMER_WM_ISOLATION_VAR_NORM=0``
-    # reverts to abs mean.
+    # ×0.675.  Per-sequence ``mean(w·err)`` with ``w∝1/scale``,
+    # ``mean(w)=1`` equalizes relative-gain gradient (SysID: equal weight
+    # per isolated input) and matches abs MSE when scale is constant or
+    # when abs err is uncorrelated with scale (untrained init).
+    # P34 ``mean(err/scale)*mean(scale)`` exploded (iso 7088, skip 99) —
+    # AM/HM(scale) ≫ 1 on quiet holds.  NOT relative Huber (P27).
+    # Isolation TBPTT only.  ``DREAMER_WM_ISOLATION_VAR_NORM=0`` = abs.
     wm_isolation_var_norm: bool = True
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
@@ -5624,21 +5624,28 @@ def _rssm_tbptt_img_rollout(
 
 
 def _invvar_reweight(err: torch.Tensor, scale: torch.Tensor,
-                     floor_frac: float = 0.05) -> torch.Tensor:
-    """Equalize per-sequence relative error without changing abs units.
+                     floor_frac: float = 0.05,
+                     abs_floor: float = 1e-4) -> torch.Tensor:
+    """Equalize per-sequence relative-gain gradient; keep abs units at init.
 
-    ``mean(err/scale) * mean(scale)`` is identical to ``mean(err)`` when
-    ``scale`` is constant (test_sim 1-input batch, or equal |ΔCV|).  When
-    isolated MV/DV sequences share a batch, subdominant |ΔCV| is no
-    longer drowned (P33: abs isolation left DV ×0.68).  ``scale`` is
-    detached.  Sequences below ``floor_frac * median(scale)`` are clamped
-    so a near-zero hold cannot 1/0; floor fraction is unitless.
+    ``mean(w * err)`` with ``w ∝ 1/scale``, ``mean(w)=1``.  Constant
+    scale ⇒ identical to ``mean(err)`` (P33 iter-1 iso ~1.7).  Mixed
+    MV/DV isolation batches upweight the subdominant |ΔCV|.
+
+    P34 FAIL: ``mean(err/scale)*mean(scale)`` has mean(w)=AM/HM(scale)
+    which explodes when an untrained WM has similar *abs* err on quiet
+    (near-zero hold) and loud sequences (iso 7088, skip 99, ES).  Mean-1
+    weights stay O(mean(err)) at init.  ``scale`` is detached.
+    ``abs_floor`` is (normalized CV)² — unitless, not engineering units.
     """
     scale = scale.detach().float()
     err = err.float()
-    med = scale.median().clamp_min(1e-8)
-    scale = scale.clamp_min(float(floor_frac) * med)
-    return (err / scale).mean() * scale.mean()
+    med = scale.median().clamp_min(float(abs_floor))
+    floor = (med * float(floor_frac)).clamp_min(float(abs_floor))
+    scale = scale.clamp_min(floor)
+    w = (1.0 / scale)
+    w = w / w.mean().clamp_min(1e-8)
+    return (err * w).mean()
 
 
 def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
@@ -5742,8 +5749,9 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     if var_norm:
         scale_b = cv_real.pow(2).mean(dim=(1, 2))
         traj = coef * _invvar_reweight(err_b, scale_b)
-        _sc = scale_b.detach().clamp_min(1e-8)
-        extras['wm_isolation_var_wmax'] = (_sc.mean() / _sc).max()
+        _sc = scale_b.detach().float().clamp_min(1e-4)
+        _inv = 1.0 / _sc
+        extras['wm_isolation_var_wmax'] = (_inv / _inv.mean().clamp_min(1e-8)).max()
         extras['wm_isolation_var_scale_ratio'] = _sc.max() / _sc.min()
     else:
         traj = coef * (cv_pred - cv_real).pow(2).mean()

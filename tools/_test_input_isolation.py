@@ -95,16 +95,26 @@ def main():
     err_eq = torch.tensor([0.04, 0.01])   # e²=0.01 times scale [4, 1]
     sc_eq = torch.tensor([4.0, 1.0])
     got_eq = _invvar_reweight(err_eq, sc_eq)
-    assert abs(float(got_eq) - float(err_eq.mean())) < 1e-6, float(got_eq)
+    # mean(w)=1, w∝1/s → equal relative error ⇒ equal w·err (not abs mean)
+    inv = 1.0 / sc_eq
+    w_eq = inv / inv.mean()
+    assert abs(float(got_eq) - float((err_eq * w_eq).mean())) < 1e-6, float(got_eq)
+    assert abs(float((w_eq * err_eq)[0] - (w_eq * err_eq)[1])) < 1e-6
     err_dv = torch.tensor([0.0, 1.0])
     sc_dv = torch.tensor([4.0, 1.0])
     got_dv = _invvar_reweight(err_dv, sc_dv)
     assert float(got_dv) > float(err_dv.mean()) + 0.2, (
         f'expected DV-only error upweighted vs abs {float(err_dv.mean())}, '
         f'got {float(got_dv)}')
+    # P34: untrained equal abs err + 1000:1 scale must NOT explode
+    err_init = torch.ones(2)
+    sc_init = torch.tensor([1.0, 1e-3])
+    got_init = _invvar_reweight(err_init, sc_init)
+    assert float(got_init) < 5.0, f'init AM/HM explode: {float(got_init)}'
+    assert abs(float(got_init) - 1.0) < 0.5, float(got_init)
     print(f'[iso-varnorm] OK: identity={float(got_c):.4f} '
           f'eq-rel={float(got_eq):.4f} dv-boost {float(err_dv.mean()):.3f}'
-          f'→{float(got_dv):.3f}')
+          f'→{float(got_dv):.3f} init={float(got_init):.3f}')
 
     cfg.wm_isolation_var_norm = False
     loss_abs, extras_abs = _wm_input_isolation_loss(model, obs, act, cfg)

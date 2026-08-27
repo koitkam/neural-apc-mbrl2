@@ -209,7 +209,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > as mechanism, **FALSIFIED as DV lever**. Abs isolation drowns DV
 > (|tgt| MV 2.82 vs DV 0.49). **P34** (`run_p34_isovarnorm`): isolation
 > / ss-match inverse-variance reweight (`wm_isolation_var_norm=True`;
-> `mean(err/scale)*mean(scale)`). Gain-match stays abs Huber. Env-free.
+> P34 `mean(err/scale)*mean(scale)` exploded iso 7088 skip 99 —
+> **P35** uses `mean(w·err)` with mean(w)=1). Gain-match stays abs Huber.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
@@ -259,10 +260,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > `max(seq_len, K+1)` so a slow plant with H > seq_len still reaches SS
 > (test_sim seq_len ≥ H unchanged). Isolation extra unroll is skipped
 > when `g` is frozen (DOB curriculum P2 — dead hot-path forward).
-> **P34:** even with isomorphic |Δu|, WM-norm |ΔCV| still differs by
-> ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation/ss-match
-> default inverse-variance reweight (`wm_isolation_var_norm`) so a
-> mixed MV/DV isolation batch does not drown DV. Not relative Huber.
+> **P34/P35:** even with isomorphic |Δu|, WM-norm |ΔCV| still differs
+> by ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation/ss-match
+> default inverse-variance reweight (`wm_isolation_var_norm`):
+> `mean(w·err)` with mean(w)=1. P34 AM/HM form exploded. Not relative Huber.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

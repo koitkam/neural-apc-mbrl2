@@ -377,9 +377,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _err_dv = torch.tensor([0.0, 1.0])
     _got_dv = _invvar_reweight(_err_dv, torch.tensor([4.0, 1.0]))
     assert float(_got_dv) > float(_err_dv.mean()) + 0.2
+    _got_init = _invvar_reweight(torch.ones(2), torch.tensor([1.0, 1e-3]))
+    assert float(_got_init) < 5.0, float(_got_init)
     assert TrainConfig().wm_isolation_var_norm is True
     print('[smoke] OK  isolation inv-var reweight (identity + DV boost; '
-          'default ON)')
+          'init-stable; default ON)')
 
     # P28 follow-up 8: long-hold isolation settle zeros sim noise (P89 gate).
     class _DummyIsoEnv:
