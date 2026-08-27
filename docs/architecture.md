@@ -202,16 +202,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > skip-storm 1/2 @iter 53 KEEP. P1→P2 CAPPED GAIN_NOT_READY 0.71@DV
 > (healthy recon 0.0026; continue closed extension). Val MV ss/@H
 > ×1.088/×1.098, DV ×0.675/×0.754, det_r 0.109. `[p3-skip]` KEEP.
-> **P33 LIVE (2026-08-27 03:55, tmux `mbrl2_p33`, `run_p33_keepext`):**
-> keep `p1_gate_max_ext_steps` on storm-1 continue. Storm 2 still
-> `_force_p1_cap_at`. Env-free det+eager CONFIRMED. **No skip-storm.**
-> Iter 75 **EXTENDED** (`not_plateaued`). Iter 85 **EXTENDED**
-> (`gain_not_ready` 0.68@DV). Iter 97 **CAPPED** after using the
-> 175924 ext cap — still 0.68@DV (MV 1.11 in band). Keep-ext path
-> is live; extra P1 did **not** pin DV. P2 recon ~0.004, `dobg` live,
-> `g` frozen. `[p3-skip]` expected. GPU occupied — no second job.
-> HEAD (not in pid 4146603): skip unused P1 MTP when
-> `reward_scale_loss_p1=0`; last-ok snapshot `copy_`.
+> **P33 EXIT (2026-08-27 08:15, `run_p33_keepext`, 151 iters):**
+> keep-ext **used** (iter 75/85 EXTEND, iter 97 CAPPED after 175924).
+> No skip-storm. Val MV ss/@H ×1.083/×1.093, DV ×0.660/×0.770,
+> det_r 0.398 (amplitude still dead). `[p3-skip]` KEEP. Keep-ext KEEP
+> as mechanism, **FALSIFIED as DV lever**. Abs isolation drowns DV
+> (|tgt| MV 2.82 vs DV 0.49). **P34** (`run_p34_isovarnorm`): isolation
+> / ss-match inverse-variance reweight (`wm_isolation_var_norm=True`;
+> `mean(err/scale)*mean(scale)`). Gain-match stays abs Huber. Env-free.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
@@ -261,6 +259,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > `max(seq_len, K+1)` so a slow plant with H > seq_len still reaches SS
 > (test_sim seq_len ≥ H unchanged). Isolation extra unroll is skipped
 > when `g` is frozen (DOB curriculum P2 — dead hot-path forward).
+> **P34:** even with isomorphic |Δu|, WM-norm |ΔCV| still differs by
+> ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation/ss-match
+> default inverse-variance reweight (`wm_isolation_var_norm`) so a
+> mixed MV/DV isolation batch does not drown DV. Not relative Huber.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

@@ -6,7 +6,8 @@ import torch
 from training.train import (TrainConfig, build_model,
                             _wm_input_isolation_loss, _wm_gain_match_loss,
                             _wm_latent_overshoot_loss,
-                            _wm_held_rollout_stationarity_loss)
+                            _wm_held_rollout_stationarity_loss,
+                            _invvar_reweight)
 
 
 def _iso(model, obs, act, cfg):
@@ -84,6 +85,46 @@ def main():
     # open-loop prior/decoder/cont-gain path is what's supervised).
     print('[iso] OK: finite, off-when-disabled, grad reaches the cont-gain '
           'channel (bypasses the categorical bottleneck)')
+
+    # Inverse-variance reweight: identity on constant scale; equal relative
+    # error ≡ abs mean; subdominant-only error is upweighted (P33 DV).
+    err_c = torch.tensor([0.4, 0.2, 0.6])
+    sc_c = torch.ones(3) * 2.0
+    got_c = _invvar_reweight(err_c, sc_c)
+    assert abs(float(got_c) - float(err_c.mean())) < 1e-6, float(got_c)
+    err_eq = torch.tensor([0.04, 0.01])   # e²=0.01 times scale [4, 1]
+    sc_eq = torch.tensor([4.0, 1.0])
+    got_eq = _invvar_reweight(err_eq, sc_eq)
+    assert abs(float(got_eq) - float(err_eq.mean())) < 1e-6, float(got_eq)
+    err_dv = torch.tensor([0.0, 1.0])
+    sc_dv = torch.tensor([4.0, 1.0])
+    got_dv = _invvar_reweight(err_dv, sc_dv)
+    assert float(got_dv) > float(err_dv.mean()) + 0.2, (
+        f'expected DV-only error upweighted vs abs {float(err_dv.mean())}, '
+        f'got {float(got_dv)}')
+    print(f'[iso-varnorm] OK: identity={float(got_c):.4f} '
+          f'eq-rel={float(got_eq):.4f} dv-boost {float(err_dv.mean()):.3f}'
+          f'→{float(got_dv):.3f}')
+
+    cfg.wm_isolation_var_norm = False
+    loss_abs, extras_abs = _wm_input_isolation_loss(model, obs, act, cfg)
+    cfg.wm_isolation_var_norm = True
+    loss_vn, extras_vn = _wm_input_isolation_loss(model, obs, act, cfg)
+    assert torch.isfinite(loss_abs).all() and torch.isfinite(loss_vn).all()
+    assert 'wm_isolation_var_wmax' in extras_vn
+    assert 'wm_isolation_var_scale_ratio' in extras_vn
+    assert 'wm_isolation_var_wmax' not in extras_abs
+    wmax = float(extras_vn['wm_isolation_var_wmax'])
+    assert wmax >= 1.0 - 1e-5, wmax
+    model.zero_grad(set_to_none=True)
+    loss_vn.backward()
+    cont_grad_vn = sum(float(p.grad.abs().sum())
+                       for n, p in model.dynamics.named_parameters()
+                       if p.grad is not None and 'cont' in n)
+    assert cont_grad_vn > 0.0, 'var-norm isolation did NOT reach cont-gain!'
+    print(f'[iso-varnorm] OK: abs={float(loss_abs):.5f} vn={float(loss_vn):.5f} '
+          f'wmax={wmax:.3f} cont_grad={cont_grad_vn:.4e}')
+    cfg.wm_isolation_var_norm = True
 
     # ---- steady-state (DC-gain) match term (2026-08-03) ----
     base = float(_iso(model, obs, act, cfg))  # ss off

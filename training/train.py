@@ -910,6 +910,18 @@ class TrainConfig:
     # signal a mixed PRBS+settle isolation batch drowns.  0 = off (unweighted).
     wm_ss_match_settle_var: float = 0.0
     wm_isolation_settle_episodes: int = 0   # long-hold settle eps PER isolated input (auto 24)
+    # Inverse-variance reweight of isolation / ss-match (P33 RCA).  Abs
+    # trajectory MSE drowns the subdominant input: test_sim gain-match
+    # targets |MV|≈2.82 vs |DV|≈0.49 (~5.8×) so |ΔCV|² weights MV ~33×
+    # more.  Extra P1 (keep-ext) left live DV at 0.68 — same as P32 val
+    # ×0.675.  Per-sequence ``mean(err/scale)*mean(scale)`` equalizes
+    # relative-gain gradient (SysID: equal weight per isolated input)
+    # while matching abs MSE when scale is constant, so isolation_coef /
+    # ss_match_coef stay in (normalized CV)² units.  NOT relative Huber
+    # (P27: per-element (g-tgt)/|tgt| on full-BPTT gain-match).  This
+    # path is isolation TBPTT only.  ``DREAMER_WM_ISOLATION_VAR_NORM=0``
+    # reverts to abs mean.
+    wm_isolation_var_norm: bool = True
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -3246,6 +3258,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
+        f"iso_varnorm={bool(getattr(cfg, 'wm_isolation_var_norm', True))} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -5610,6 +5623,24 @@ def _rssm_tbptt_img_rollout(
     return torch.cat(chunks, dim=1)
 
 
+def _invvar_reweight(err: torch.Tensor, scale: torch.Tensor,
+                     floor_frac: float = 0.05) -> torch.Tensor:
+    """Equalize per-sequence relative error without changing abs units.
+
+    ``mean(err/scale) * mean(scale)`` is identical to ``mean(err)`` when
+    ``scale`` is constant (test_sim 1-input batch, or equal |ΔCV|).  When
+    isolated MV/DV sequences share a batch, subdominant |ΔCV| is no
+    longer drowned (P33: abs isolation left DV ×0.68).  ``scale`` is
+    detached.  Sequences below ``floor_frac * median(scale)`` are clamped
+    so a near-zero hold cannot 1/0; floor fraction is unitless.
+    """
+    scale = scale.detach().float()
+    err = err.float()
+    med = scale.median().clamp_min(1e-8)
+    scale = scale.clamp_min(float(floor_frac) * med)
+    return (err / scale).mean() * scale.mean()
+
+
 def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
                              act: torch.Tensor, cfg: TrainConfig
                              ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -5635,10 +5666,10 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     cuts as the old Python ``img_step`` loop.  RSSM-interface (rssm + tssm);
     ``0`` for other backbones / when off.
 
-    Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match
-    (unchanged training objective).  ``extras`` splits the folded DC-gain
-    term that P28/P29 jsonl never logged (``wm_ss_match_loss`` was always
-    missing; settle_var starvation was invisible).
+    Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match.
+    Default inverse-variance reweight (``wm_isolation_var_norm``) equalizes
+    per-sequence relative error; abs mean when off.  ``extras`` splits the
+    folded DC-gain term (``wm_ss_match_loss``) plus var-norm diagnostics.
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     empty: Dict[str, torch.Tensor] = {}
@@ -5705,22 +5736,40 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     # TBPTT still detaches ``h`` between chunks (feats keep their graphs).
     cv_pred = rssm.decode(roll_feats).index_select(
         -1, cv_idx)                                               # (Bm, K, n_cv)
-    traj = coef * (cv_pred - cv_real).pow(2).mean()
-    extras: Dict[str, torch.Tensor] = {
-        'wm_isolation_traj_loss': traj.detach(),
-    }
+    err_b = (cv_pred - cv_real).pow(2).mean(dim=(1, 2))            # (Bm,)
+    var_norm = bool(getattr(cfg, 'wm_isolation_var_norm', True))
+    extras: Dict[str, torch.Tensor] = {}
+    if var_norm:
+        scale_b = cv_real.pow(2).mean(dim=(1, 2))
+        traj = coef * _invvar_reweight(err_b, scale_b)
+        _sc = scale_b.detach().clamp_min(1e-8)
+        extras['wm_isolation_var_wmax'] = (_sc.mean() / _sc).max()
+        extras['wm_isolation_var_scale_ratio'] = _sc.max() / _sc.min()
+    else:
+        traj = coef * (cv_pred - cv_real).pow(2).mean()
+    extras['wm_isolation_traj_loss'] = traj.detach()
     out = traj
     if ss_coef > 0.0 and ss_k0 < K:
         pred_ss = cv_pred[:, ss_k0:].mean(dim=1)                  # (Bm, n_cv)
         real_win = cv_real[:, ss_k0:]                             # (Bm, W, n_cv)
         ss_err = (pred_ss - real_win.mean(dim=1)).pow(2)         # (Bm, n_cv)
+        w_settle = None
         if ss_var > 0.0:
             # Option 1: only SETTLED sequences carry a DC-gain signal — weight by
             # exp(-Var(real CV window)/ss_var) so transient (PRBS) episodes don't
             # dilute the per-input steady-state match (undiluted, symmetric).
-            w = torch.exp(-real_win.var(dim=1) / ss_var)
-            ss = (ss_err * w).sum() / w.sum().clamp_min(1e-6)
-            extras['wm_ss_match_wmean'] = w.mean().detach()
+            w_settle = torch.exp(-real_win.var(dim=1) / ss_var)
+            extras['wm_ss_match_wmean'] = w_settle.mean().detach()
+        if var_norm:
+            if w_settle is not None:
+                ss_per = (ss_err * w_settle).sum(dim=-1) / w_settle.sum(
+                    dim=-1).clamp_min(1e-6)
+            else:
+                ss_per = ss_err.mean(dim=-1)
+            ss = _invvar_reweight(
+                ss_per, real_win.mean(dim=1).pow(2).mean(dim=-1))
+        elif w_settle is not None:
+            ss = (ss_err * w_settle).sum() / w_settle.sum().clamp_min(1e-6)
         else:
             ss = ss_err.mean()
         ss_term = coef * ss_coef * ss
