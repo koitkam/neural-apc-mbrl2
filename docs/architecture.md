@@ -11,13 +11,12 @@ expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 Status legend: **[current]** = implemented & default · **[opt-in]** = implemented,
 env-gated off · **[planned]** = designed, not yet built.
 
-> **2026-06-11:** the neural-Kalman-filter / DOB disturbance observer (§3) is now
-> **implemented** in both backbones (`models/dreamer_v4_rssm.py`,
-> `models/transformer_ssm.py`), env-gated **off** by default
-> (`DREAMER_DOB_ENABLED=1` to turn on). It was validated by Exp A (p113): with
-> the hidden disturbance OFF the WM gain recovered 0.36→0.18 and the autoencoder
-> real→posterior 0.77→0.94, confirming the unmeasured load was an omitted
-> variable attenuating the gain — exactly what the DOB de-confounds.
+> **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
+> observer (§3) is implemented in both backbones and is **default ON**
+> (`TrainConfig.dob_enabled=True`; opt out `DREAMER_DOB_ENABLED=0`). Exp A
+> (p113) showed the unmeasured load was an omitted variable attenuating the
+> gain (hidden disturbance OFF recovered WM gain 0.36→0.18 and autoencoder
+> real→posterior 0.77→0.94) — exactly what the DOB de-confounds.
 
 > **2026-06-22 [SUPERSEDED 2026-08-18 — see below]:** the **continuous
 > gain+disturbance latent (§3b, C3)** supersedes the DOB as the default direction
@@ -570,11 +569,12 @@ on the randomised true plant for sim-to-real robustness.
 
 ---
 
-## 4. [opt-in] Staged clean→disturbance curriculum
+## 4. [current] Staged clean→disturbance curriculum
 
-Shipped 2026-06-12 (`DREAMER_CURRICULUM_ENABLED=1`, default off; **requires
-`DREAMER_DOB_ENABLED=1` + phased mode** — it hard-disables with a warning
-otherwise). It is the textbook system-identification recipe applied to the DOB:
+Shipped 2026-06-12; **default ON** (`TrainConfig.curriculum_enabled=True`,
+phased + DOB). Opt out `DREAMER_CURRICULUM_ENABLED=0`. Joint mode or
+`dob_enabled=False` hard-disables with a warning. It is the textbook
+system-identification recipe applied to the DOB:
 **identify the plant `g` on clean data → identify the observer `(A,K)` on the
 fixed plant → train the controller.** This removes the gain↔disturbance
 identifiability confound that co-training `g` and `d_t` on disturbed closed-loop

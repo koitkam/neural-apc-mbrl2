@@ -17,7 +17,7 @@ Verifies, for BOTH backbones where applicable, WITHOUT a real env:
 
 Run (CPU, do not disturb a live GPU run):
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_wm_fixes.py
+    /home/koitkam/neural-APC-mbrl2-env/bin/python tools/_smoke_wm_fixes.py
 """
 import os
 import numpy as np
@@ -190,7 +190,52 @@ def _test_defaults_and_env():
     print(f'[smoke] OK  all {len(ENV_OVERRIDES)} ENV_OVERRIDES map to TrainConfig')
 
 
+def _test_buffer_sample_identity():
+    print('\n=== TrajectoryBuffer.sample fancy-index identity ===')
+    T, D, A, N, n_dist = 32, 6, 2, 11, 1
+    buf = TrajectoryBuffer(N, T, D, A, n_dist=n_dist)
+    for i in range(N):
+        obs = np.full((T, D), float(i), dtype='float32')
+        obs[:, 0] = np.arange(T, dtype='float32')
+        act = np.full((T, A), float(i) + 0.5, dtype='float32')
+        rew = np.arange(T, dtype='float32') + i
+        cont = np.ones(T, dtype='float32')
+        expert = (np.arange(T) == i).astype('float32')
+        dist = np.full((T, n_dist), float(i) + 0.25, dtype='float32')
+        buf.add_episode(obs, act, rew, cont, expert=expert, dist=dist)
+    B, S = 8, 12
+    rng_a = np.random.default_rng(7)
+    rng_b = np.random.default_rng(7)
+    got = buf.sample(B, S, rng_a)
+    ep_idx = rng_b.integers(0, buf.filled, size=B)
+    max_start = buf.T - S
+    starts = (np.zeros(B, dtype=np.int64) if max_start <= 0
+              else rng_b.integers(0, max_start + 1, size=B))
+    want_obs = np.zeros((B, S, D), dtype='float32')
+    want_act = np.zeros((B, S, A), dtype='float32')
+    want_rew = np.zeros((B, S), dtype='float32')
+    want_cont = np.zeros((B, S), dtype='float32')
+    want_exp = np.zeros((B, S), dtype='float32')
+    want_dist = np.zeros((B, S, n_dist), dtype='float32')
+    for b in range(B):
+        s = starts[b]
+        want_obs[b] = buf.obs[ep_idx[b], s:s + S]
+        want_act[b] = buf.act[ep_idx[b], s:s + S]
+        want_rew[b] = buf.rew[ep_idx[b], s:s + S]
+        want_cont[b] = buf.cont[ep_idx[b], s:s + S]
+        want_exp[b] = buf.expert[ep_idx[b], s:s + S]
+        want_dist[b] = buf.dist[ep_idx[b], s:s + S]
+    assert np.array_equal(got['obs'], want_obs)
+    assert np.array_equal(got['act'], want_act)
+    assert np.array_equal(got['rew'], want_rew)
+    assert np.array_equal(got['cont'], want_cont)
+    assert np.array_equal(got['expert'], want_exp)
+    assert np.array_equal(got['dist'], want_dist)
+    print('[smoke] OK  buffer sample matches per-row slice copy')
+
+
 if __name__ == '__main__':
+    _test_buffer_sample_identity()
     _test_weighted_recon()
     for wm in ('rssm', 'sf_transformer'):
         _test_recon_integration(wm)

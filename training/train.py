@@ -783,15 +783,12 @@ class TrainConfig:
     # against the NOMINAL plant (eval disables DR), forcing the categorical
     # latent to model a gain DISTRIBUTION ⇒ a systematically ATTENUATED
     # identified gain (the cross-run ~0.85 'ceiling').  When True the curriculum
-    # turns DR OFF for the seed collection + P1 (clean WM id) + P2 (DOB id).  As
-    # of Stage A (p135) DR STAYS OFF for P3 too — the actor's loop-gain
-    # robustness now comes from IMAGINATION-time gain randomization
-    # (actor_imag_gain_random_frac) rather than REAL-data DR, which created a
-    # train/imagination mismatch (p134 actor regression: the real loop gain
-    # varied ±frac but the actor imagined on the nominal frozen WM).  Textbook
-    # system-ID: identify the plant clean, then design a robust controller
-    # (robustness injected in imagination).  Sim-agnostic (toggles the existing
-    # randomizer).  ``DREAMER_CURRICULUM_WM_ID_DR_OFF``.
+    # turns DR OFF for the seed collection + P1 (clean WM id) + P2 (DOB id).
+    # mbrl2 real-sim: DR turns ON at P2→P3 (``set_domain_randomization(True)``)
+    # so the actor sees loop-gain robustness on the true simulator, not a
+    # deleted imagination gain-rand.  Textbook system-ID: identify the plant
+    # clean, then train a robust controller.  Sim-agnostic (toggles the
+    # existing randomizer).  ``DREAMER_CURRICULUM_WM_ID_DR_OFF``.
     curriculum_wm_id_dr_off: bool = True
 
 
@@ -3555,28 +3552,19 @@ class TrajectoryBuffer:
             starts = np.zeros(batch_size, dtype=np.int64)
         else:
             starts = rng.integers(0, max_start + 1, size=batch_size)
-        out_obs = np.zeros((batch_size, seq_len, self.obs_dim),
-                           dtype='float32')
-        out_act = np.zeros((batch_size, seq_len, self.action_dim),
-                           dtype='float32')
-        out_rew = np.zeros((batch_size, seq_len), dtype='float32')
-        out_cont = np.zeros((batch_size, seq_len), dtype='float32')
-        out_expert = np.zeros((batch_size, seq_len), dtype='float32')
-        out_dist = (np.zeros((batch_size, seq_len, self.n_dist), dtype='float32')
-                    if self.dist is not None else None)
-        for b in range(batch_size):
-            s = starts[b]
-            out_obs[b] = self.obs[ep_idx[b], s:s + seq_len]
-            out_act[b] = self.act[ep_idx[b], s:s + seq_len]
-            out_rew[b] = self.rew[ep_idx[b], s:s + seq_len]
-            out_cont[b] = self.cont[ep_idx[b], s:s + seq_len]
-            out_expert[b] = self.expert[ep_idx[b], s:s + seq_len]
-            if out_dist is not None:
-                out_dist[b] = self.dist[ep_idx[b], s:s + seq_len]
-        out = {'obs': out_obs, 'act': out_act, 'rew': out_rew,
-               'cont': out_cont, 'expert': out_expert}
-        if out_dist is not None:
-            out['dist'] = out_dist
+        # Fancy-index the (episode, time) windows.  Same slices as the
+        # old Python ``for b`` copy; host-adaptive (no extra threads).
+        t_idx = starts[:, None] + np.arange(int(seq_len), dtype=np.int64)
+        ep = ep_idx[:, None]
+        out = {
+            'obs': self.obs[ep, t_idx],
+            'act': self.act[ep, t_idx],
+            'rew': self.rew[ep, t_idx],
+            'cont': self.cont[ep, t_idx],
+            'expert': self.expert[ep, t_idx],
+        }
+        if self.dist is not None:
+            out['dist'] = self.dist[ep, t_idx]
         return out
 
 
@@ -9050,13 +9038,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _fz = model.set_world_model_trainable(
                         g=False, dob=False, reward=True)
                     _wm_frozen_now = True
-                    _igf = float(getattr(cfg,
-                            'actor_imag_gain_random_frac', 0.0) or 0.0)
                     _desc = (f'actor/critic on FROZEN cont-WM (disturbance '
                              f'{env._disturbance_prob_override:.2f}; real-plant '
-                             f'DR OFF; imagination loop-gain rand '
-                             f'±{_igf:.3f}; DOB-free disturbance via cont '
-                             f'channel)')
+                             f'DR OFF; DOB-free disturbance via cont channel)')
                 print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
                       f"steps{total_env_steps}: {_desc} "
                       f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']}]",
