@@ -1705,7 +1705,9 @@ class TrainConfig:
     skip_storm_recover_p1: bool = True
     # Unitless recon-health band for ``wm_last_ok`` (sim-agnostic).  P27
     # exploded 0.004 → 0.50 (~125×); 5× still accepts mild recon jitter
-    # and rejects a skip-storm detonation.  ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
+    # and rejects a skip-storm detonation.  P31 also uses this ratio at
+    # the P1→P2 freeze so a single huge-grad step that never trips
+    # skip-storm cannot freeze exploded g.  ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
     skip_storm_last_ok_recon_ratio: float = 5.0
     # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first then cap.
     # ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
@@ -2813,6 +2815,40 @@ def _recon_still_healthy(recon: float, recon_best: Optional[float],
     return r <= float(ratio) * b
 
 
+def _should_restore_last_ok_at_p1_freeze(
+        *,
+        recon: float,
+        recon_best: Optional[float],
+        ratio: float,
+        has_last_ok: bool,
+) -> bool:
+    """True if P1→P2 would freeze detonated weights and last-ok exists.
+
+    P31: skip-storm needs ``> early_stop_grad_skip_max`` skips in the
+    window (default 5/100). A single huge-grad step (iter 95 recon
+    0.0035→0.71, ``wm_grad_norm`` 66, skip 2→3) did not trip it. The
+    quality-gate CAPPED then froze exploded ``g`` into P2 (cap-time DV
+    ×0.08 vs healthy late-P1). Same last-ok snapshot as skip-storm, at
+    the freeze boundary. Scale-invariant (recon/recon).
+    """
+    if not has_last_ok:
+        return False
+    return not _recon_still_healthy(recon, recon_best, ratio)
+
+
+def _wm_recon_scalar(wm_losses: Optional[dict]) -> float:
+    """Current-iter recon as float; NaN if missing (treat as detonated)."""
+    if not wm_losses:
+        return float('nan')
+    try:
+        v = wm_losses.get('recon_loss')
+        if v is None:
+            return float('nan')
+        return float(v.detach().item() if torch.is_tensor(v) else v)
+    except Exception:
+        return float('nan')
+
+
 def _skip_storm_restore_ckpt(
         last_ok: Optional[Path],
         wm_best: Optional[Path],
@@ -2842,15 +2878,17 @@ def _should_warm_restore_wm_best(
         total_iters: int,
         min_gap: int,
         wm_best_exists: bool,
+        last_ok_on_model: bool = False,
 ) -> bool:
     """Whether to reload ``wm_best.pt`` at a phase boundary.
 
     Default OFF (P28 GPU RCA: gain-blind fidelity peak).  After a P1
     skip-storm last-ok restore the next iter IS the P1→P2 transition —
     reloading ``wm_best`` would overwrite last-ok even if this flag is
-    opted back on.
+    opted back on.  P31 detonated-freeze last-ok is the same: do not
+    overwrite with the gain-blind peak.
     """
-    if skip_storm_recovered:
+    if skip_storm_recovered or last_ok_on_model:
         return False
     if not restore_enabled or not wm_best_exists:
         return False
@@ -8594,6 +8632,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_last_ok_iter: int = -1
     p1_recon_best: Optional[float] = None
     p1_gain_not_ready_capped: bool = False
+    p1_detonated_freeze_restored: bool = False
     p1_initial_sf: Optional[float] = None
     p2_final_reward_mtp: Optional[float] = None
     mid_check_flags: List[str] = []
@@ -9677,6 +9716,69 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     if torch.is_tensor(_sf_val) else _sf_val)
                     print(f"[p1→p2] sf_loss {p1_initial_sf:.4f} → "
                           f"{last_sf:.4f}", flush=True)
+                # P31: quality-gate CAPPED (and any P1→P2) must not freeze
+                # detonated full-BPTT weights. Skip-storm needs >5 skips
+                # in 100 iters; a single huge-grad step still explodes
+                # recon. Restore last-ok, reset AdamW, re-probe gain so
+                # actor_experiment_valid reflects the frozen observer.
+                _fr_ratio = float(getattr(
+                    cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
+                _fr_rlv = _wm_recon_scalar(wm_losses)
+                if _should_restore_last_ok_at_p1_freeze(
+                        recon=_fr_rlv,
+                        recon_best=p1_recon_best,
+                        ratio=_fr_ratio,
+                        has_last_ok=p1_last_ok_sd is not None):
+                    try:
+                        assert p1_last_ok_sd is not None
+                        model.load_state_dict({
+                            k: v.to(device)
+                            for k, v in p1_last_ok_sd.items()
+                        })
+                        opt_world = torch.optim.AdamW(
+                            model.parameters_world(),
+                            lr=eff_lr_world, eps=1e-8,
+                            weight_decay=0.0)
+                        p1_detonated_freeze_restored = True
+                        try:
+                            torch.save({
+                                'model': p1_last_ok_sd,
+                                'cfg': asdict(cfg),
+                                'obs_norm': env.get_obs_norm_stats(),
+                                'iter': int(p1_last_ok_iter),
+                            }, out_dir / 'wm_last_ok.pt')
+                        except Exception:
+                            pass
+                        try:
+                            _gp = _probe_observer_gain_ready(
+                                model, env, device, cfg)
+                            if _gp is not None:
+                                print(f'[p1→p2] detonated-freeze gain-probe '
+                                      f'{_format_gain_probe_line(_gp)}',
+                                      flush=True)
+                                p1_gain_not_ready_capped = not bool(
+                                    _gp.get('gain_ready', True))
+                        except Exception as _e_gp:
+                            print('[p1→p2] detonated-freeze gain-probe '
+                                  f'failed: {_e_gp!r} — keeping cap-time '
+                                  'GAIN_NOT_READY flag', flush=True)
+                        _best_s = (f'{p1_recon_best:.4f}'
+                                   if p1_recon_best is not None else 'n/a')
+                        mid_check_flags.append(
+                            f'p1_detonated_freeze_restored: wm_last_ok iter '
+                            f'{p1_last_ok_iter} (recon {_fr_rlv:.4f} vs best '
+                            f'{_best_s})')
+                        print(
+                            f'[p1→p2] detonated freeze restored wm_last_ok '
+                            f'(iter {p1_last_ok_iter}); reset opt_world; '
+                            f'recon {_fr_rlv:.4f} > {_fr_ratio:g}× last-ok '
+                            f'best {_best_s}. Skip-storm needs >5 skips; a '
+                            f'single huge-grad step must not freeze exploded g.',
+                            flush=True)
+                    except Exception as _e_fr:
+                        print(f'[p1→p2] detonated-freeze last-ok restore '
+                              f'failed: {_e_fr!r} — freezing current weights',
+                              flush=True)
                 # P39: warm-restore WM to its fidelity peak before P2.
                 # Skip after skip-storm last-ok: this transition is the
                 # very next iter, and wm_best is the gain-blind peak.
@@ -9687,13 +9789,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                           f'restored {skip_storm_restore_source} (iter '
                           f'{skip_storm_restore_iter}); wm_best is gain-blind '
                           'and must not overwrite last-ok', flush=True)
+                elif p1_detonated_freeze_restored:
+                    print('[p1→p2] WM warm-restore SKIPPED: detonated freeze '
+                          f'already restored wm_last_ok (iter '
+                          f'{p1_last_ok_iter}); wm_best is gain-blind and '
+                          'must not overwrite last-ok', flush=True)
                 elif _should_warm_restore_wm_best(
                         restore_enabled=wm_best_restore_at_p2,
                         skip_storm_recovered=bool(skip_storm_p1_recovered),
                         wm_best_iter=int(wm_best_iter),
                         total_iters=int(total_iters),
                         min_gap=int(wm_best_restore_min_gap),
-                        wm_best_exists=_wb_exists):
+                        wm_best_exists=_wb_exists,
+                        last_ok_on_model=bool(p1_detonated_freeze_restored)):
                     _wb_iter0 = int(wm_best_iter)
                     try:
                         # p21 RCA: the fidelity-score wm_best can freeze a
@@ -9817,7 +9925,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         min_gap=int(wm_best_restore_min_gap),
                         wm_best_exists=bool(
                             wm_best_ckpt_path is not None
-                            and wm_best_ckpt_path.exists())):
+                            and wm_best_ckpt_path.exists()),
+                        last_ok_on_model=bool(p1_detonated_freeze_restored)):
                     try:
                         _blob = torch.load(wm_best_ckpt_path,
                                             map_location=device,
@@ -11548,6 +11657,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'p1_last_ok_iter': (int(p1_last_ok_iter)
                             if p1_last_ok_iter >= 0 else None),
         'p1_gain_not_ready_capped': bool(p1_gain_not_ready_capped),
+        'p1_detonated_freeze_restored': bool(p1_detonated_freeze_restored),
         'actor_experiment_valid': _actor_experiment_valid(
             skip_storm_source=skip_storm_restore_source,
             gain_not_ready_capped=bool(p1_gain_not_ready_capped)),

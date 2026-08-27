@@ -190,15 +190,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > extension still closed); second storm still caps. Storm-time
 > GAIN_NOT_READY does not stick if P1 continues. Fidelity ES suppressed
 > while `_dynamics_g_trainable` is false.
-> **P31 LIVE (2026-08-26 21:47):** P1 iter 78 / 773k of extended 829k. Survived
-> P30's iter-18–25 window without a skip-storm. Healthy stretch
-> recon 0.003–0.005; `wm_best` iter 50 `best_h=55/55`. Iter 58–59
-> wrap blip recovered (iter 70 `best_h=55/55`). **Iter 75 gate
-> `gain_not_ready` DC [0.63, 1.48] worst=1.48@MV spread_x5.1 —
-> extending P1** (correct; P26 ~90 iters). Iter 78 recon 0.0049.
-> Skip still 2. GPU occupied; no second job. HEAD (not this process
-> `4ffe11f`): batched gain-match FD, numpy-only P1/P2 random collect,
-> vectorized DOB Kalman scan, relative Huber A/B **removed**.
+> **P31 LIVE (2026-08-26 22:55):** Survived P30 skip-storm window. Healthy
+> P1 to iter 94 (recon 0.003–0.005, `wm_best` iter 90). Iter 75
+> `gain_not_ready` 1.48@MV extended P1 (correct). **Iter 95 detonated**
+> (recon 0.71, gnorm 66, skip 2→3 — not a skip-storm). Iter 97 CAPPED
+> froze exploded `g` (DC 0.08@DV) into P2. P2 recon ~0.45, `dobg` live.
+> HEAD (not process `4ffe11f`): P1→P2 restores last-ok when freeze recon
+> is detonated vs last-ok best (same 5× ratio); re-probes gain. Also
+> batched gain-match FD, numpy P1/P2 collect, vectorized DOB Kalman,
+> relative Huber **removed**. GPU occupied; no second job.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

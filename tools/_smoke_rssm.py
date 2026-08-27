@@ -39,6 +39,8 @@ from training.train import (
                             _actor_experiment_valid,
                             _should_skip_invalid_p3,
                             _should_warm_restore_wm_best,
+                            _should_restore_last_ok_at_p1_freeze,
+                            _wm_recon_scalar,
                             _auto_if_unset, _write_resolved_run_plan,
                             _resolve_compile_mode)
 
@@ -243,8 +245,26 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _should_warm_restore_wm_best(
         restore_enabled=False, skip_storm_recovered=False,
         wm_best_iter=20, total_iters=80, min_gap=10, wm_best_exists=True)
+    assert not _should_warm_restore_wm_best(
+        restore_enabled=True, skip_storm_recovered=False,
+        wm_best_iter=20, total_iters=80, min_gap=10, wm_best_exists=True,
+        last_ok_on_model=True)
     print('[smoke] OK  skip-storm last-ok restore prefers late-P1 observer')
     print('[smoke] OK  skip-storm blocks P1→P2 wm_best overwrite')
+    # P31: quality-gate CAPPED while recon is detonated must restore last-ok
+    # (skip-storm needs >5 skips; a single huge-grad step does not trip it).
+    assert _should_restore_last_ok_at_p1_freeze(
+        recon=0.5669, recon_best=0.0033, ratio=5.0, has_last_ok=True)
+    assert _should_restore_last_ok_at_p1_freeze(
+        recon=0.71, recon_best=0.0035, ratio=5.0, has_last_ok=True)
+    assert not _should_restore_last_ok_at_p1_freeze(
+        recon=0.004, recon_best=0.0035, ratio=5.0, has_last_ok=True)
+    assert not _should_restore_last_ok_at_p1_freeze(
+        recon=0.71, recon_best=0.0035, ratio=5.0, has_last_ok=False)
+    _nan_r = _wm_recon_scalar(None)
+    assert _nan_r != _nan_r
+    assert abs(_wm_recon_scalar({'recon_loss': 0.0035}) - 0.0035) < 1e-12
+    print('[smoke] OK  P1 detonated-freeze last-ok restore (P31 RCA)')
 
     # P28 follow-up 5: P1 re-inject EVERY is f(buffer lap).  test_sim
     # (ep_len=1220, 400k cap, 5 eps/iter) stays 20/10.
