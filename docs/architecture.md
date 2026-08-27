@@ -276,9 +276,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > Pre-iso resolve is **only** for those scales; gain-match Huber
 > targets always re-resolve after isolation+expert (P37 obs-norm freeze
 > point — skipping would confound P38). P37 GPU still runs unscaled abs
-> (launch `4d349fb`). Next env-free launch after P37 GAIN_NOT_READY is
-> this recipe; if P37 is GAIN-READY opt out
-> `DREAMER_WM_ISOLATION_DCV_MATCH=0` for the actor experiment.
+> (launch `4d349fb`). Iter 75 EXTEND **0.68@DV** (MV 0.99) = P33 pin.
+> Next env-free launch after P37 GAIN_NOT_READY is this recipe; resolved
+> Δu scales land in `run_plan.isolation_dcv_scales`. If P37 is GAIN-READY
+> opt out `DREAMER_WM_ISOLATION_DCV_MATCH=0` for the actor experiment.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

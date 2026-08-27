@@ -3239,10 +3239,12 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     plan_path = out / 'run_plan.json'
     if not plan_path.exists():
         return
+    _dcv = _isolation_dcv_scale_payload(cfg)
     try:
         with open(plan_path) as f:
             plan = json.load(f)
         plan['config'] = asdict(cfg)
+        plan['isolation_dcv_scales'] = _dcv
         with open(plan_path, 'w') as f:
             json.dump(plan, f, indent=2, default=str)
     except Exception as exc:  # noqa: BLE001
@@ -3258,7 +3260,9 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
-        f"iso_dcv={bool(getattr(cfg, 'wm_isolation_dcv_match', True))} "
+        f"iso_dcv={_dcv['on']} "
+        f"mv={['%.3g' % x for x in _dcv['mv']]} "
+        f"dv={['%.3g' % x for x in _dcv['dv']]} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -3591,6 +3595,24 @@ def _isolation_dcv_scales(
         return out
 
     return _sc(mv_g), _sc(dv_g)
+
+
+def _stash_isolation_dcv_scales(
+        cfg: 'TrainConfig', mv_sc: List[float], dv_sc: List[float]) -> None:
+    """Persist resolved Δu scales for run_plan / [resolved-cfg] audit."""
+    cfg._isolation_dcv_mv_scale = tuple(float(x) for x in mv_sc)  # type: ignore[attr-defined]
+    cfg._isolation_dcv_dv_scale = tuple(float(x) for x in dv_sc)  # type: ignore[attr-defined]
+
+
+def _isolation_dcv_scale_payload(cfg: 'TrainConfig') -> Dict[str, object]:
+    """Audit dict: on/off + per-input isolation |Δu| multipliers (not knobs)."""
+    return {
+        'on': bool(getattr(cfg, 'wm_isolation_dcv_match', True)),
+        'mv': [float(x) for x in (
+            getattr(cfg, '_isolation_dcv_mv_scale', ()) or ())],
+        'dv': [float(x) for x in (
+            getattr(cfg, '_isolation_dcv_dv_scale', ()) or ())],
+    }
 
 
 def _gain_match_targets_ready(cfg: 'TrainConfig') -> bool:
@@ -4225,10 +4247,10 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     The curriculum disturbance schedule is **suppressed** for these
     episodes (``env._schedule = []``) so the WM sees a clean settled
     response — a CV/DV step partway through would defeat the purpose.
-    Domain randomization, OU process noise, and measurement noise remain
-    active (DR fires in ``sim.reset()`` upstream of the schedule build,
-    so it is untouched; OU/measurement live in the ``SimNoiseWrapper``
-    and are independent of ``_schedule``).  This is sim-agnostic:
+    Hidden OU is also cleared.  Default ``clean_steady_seeds`` then
+    disables process OU + measurement noise (P89); opt out
+    ``DREAMER_CLEAN_STEADY_SEEDS=0``.  Domain randomization is gated
+    off in P1/P2 independently of this collect path.  Sim-agnostic:
     ``APCEnv._schedule`` is the single hook used by every simulator.
 
     ``action_level`` is in the env's normalized action space and is
@@ -4236,13 +4258,9 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
-    # Clear curriculum disturbance schedule so this seed is a clean
-    # held-action steady-state probe.  DR + OU + measurement noise stay
-    # active EXCEPT the hidden (truly-unmeasured) OU disturbance, which
-    # would corrupt the steady-state target the WM is meant to learn
-    # from this episode (P43, 2026-05-23 audit finding: const_action
-    # was firing hidden OU in 12.5 % of episodes, contaminating the SS
-    # signal).  Sim-agnostic: ``_hidden_disturbance`` lives on APCEnv.
+    # Clear curriculum DV schedule + hidden OU (P43: const_action used
+    # to fire hidden OU in 12.5% of episodes).  P89 then zeros process
+    # OU + measurement when ``clean_steady_seeds`` (default).
     env._schedule = []
     env._hidden_disturbance = None
     # P89 Fix A: make this held-action steady-state seed fully NOISE-FREE
@@ -4380,8 +4398,9 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
         plant changes despite the action being held.
 
     Curriculum disturbance schedule is suppressed (``env._schedule = []``)
-    so the step's effect is unambiguous; DR + OU + measurement noise
-    remain active.  Sim-agnostic via ``APCEnv._schedule``.
+    so the step's effect is unambiguous. Hidden OU is cleared. Default
+    ``clean_steady_seeds`` disables process/measurement noise (P89).
+    Sim-agnostic via ``APCEnv._schedule``.
 
     Both ``action_start`` and ``action_end`` are clipped to ``[-1, 1]``.
     Returns the same dict shape as ``collect_episode``.
@@ -9498,6 +9517,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         if _cfg_on(cfg, 'wm_isolation_dcv_match', True):
             _maybe_resolve_gain_match_targets(env, cfg)
         _mv_sc, _dv_sc = _isolation_dcv_scales(cfg, n_mv, n_dv, const_op_band)
+        _stash_isolation_dcv_scales(cfg, _mv_sc, _dv_sc)
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
                                  dtype='float32')
         _st_jit = env.rng.uniform(-0.05, 0.05,

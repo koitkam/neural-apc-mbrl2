@@ -34,6 +34,8 @@ from training.train import (
                             _isolation_buf_capacity, _isolation_sample_seq_len,
                             _wm_train_seq_len, wm_train_seq_len_for_plant,
                             _dv_isolation_delta, _isolation_dcv_scales,
+                            _stash_isolation_dcv_scales,
+                            _isolation_dcv_scale_payload,
                             _scale_isolation_level, _gain_col_rms,
                             _dynamics_g_trainable,
                             _maybe_clean_steady_seed,
@@ -730,6 +732,11 @@ def _test_isolation_dcv_scales() -> None:
     cfg.gain_match_mv_target = ((-2.8,),)
     cfg.gain_match_dv_target = ((0.49,),)
     assert _isolation_dcv_scales(cfg, 1, 1, 0.6) == ([1.0], [1.0])
+    _stash_isolation_dcv_scales(cfg, [0.289], [1.67])
+    pay = _isolation_dcv_scale_payload(cfg)
+    assert pay['on'] is False and pay['mv'] == [0.289] and pay['dv'] == [1.67]
+    assert 'isolation_dcv_scales' in _src
+    assert '_stash_isolation_dcv_scales' in _src
     assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
     assert _gain_col_rms(((-2.8, 0.0),))[0] > 1.0
     class _DvSim:
@@ -792,6 +799,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     cfg.rssm_latent_type = 'deterministic'
     cfg.gain_match_coef = 1.0
     cfg.dob_ground_coef = 2.0
+    _stash_isolation_dcv_scales(cfg, [0.289], [1.67])
     plan_path = Path(tmp_path) / 'run_plan.json'
     plan_path.write_text(json.dumps({'config': {'rssm_latent_type': 'categorical',
                                                 'gain_match_coef': 0.0}}))
@@ -800,6 +808,9 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
     assert float(plan['config']['dob_ground_coef']) == 2.0
+    dcv = plan['isolation_dcv_scales']
+    assert dcv['on'] is True
+    assert dcv['mv'] == [0.289] and dcv['dv'] == [1.67]
     print('[smoke] OK  _write_resolved_run_plan rewrites run_plan.json config')
 
 

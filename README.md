@@ -383,6 +383,8 @@ Default `wm_isolation_dcv_match=True` then scales each input's
 (`DREAMER_WM_ISOLATION_DCV_MATCH=0` to keep isomorphic |Δu|). Pre-iso
 resolve feeds those scales only; post-seed always re-resolves so Huber
 targets see isolation+expert obs-norm (P37 freeze point).
+Resolved Δu scales are written to `run_plan.isolation_dcv_scales`
+(`[resolved-cfg] iso_dcv= mv= dv=`).
 Warm-restore no-ops when `wm_best.pt` is essentially the current state.
 
 #### Reward-MTP / WM-coupling diagnostics (P39)
