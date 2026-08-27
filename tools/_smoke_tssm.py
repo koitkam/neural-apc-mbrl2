@@ -1,24 +1,22 @@
 """CPU smoke + correctness test for the transformer-SSM (TSSM) backbone.
 
-neural-apc-mbrl, 2026-06-06.  GPU-FREE — runs on a tiny model on CPU, so it does
-not touch any live GPU training run.  The TSSM is NOT yet wired into build_model
-dispatch; this exercises the backbone directly.
+GPU-FREE — tiny model on CPU; safe alongside a live GPU training run.
 
 Verifies:
   1. Interface shapes match RSSMDynamics (embed / rollout_observed / img_step /
-     obs_step / decode / feat_dim), and the state duck-types RSSMState
-     (.h, .z_logits, .z, .feat, .stoch_flat).
+     img_rollout / obs_step / decode / feat_dim), and the state duck-types
+     RSSMState (.h, .z_logits, .z, .feat, .stoch_flat).
   2. KL-ability: post_logits / prior_logits have shape (B, T, K, C) and are finite.
   3. Straight-through gradient REACHES the transformer + prior_net (the overshoot
      and held-rollout losses rely on sample=True grad flowing to the prior).
   4. Determinism: sample=False img_step is deterministic.
-  5. CORRECTNESS GATE (the future KV-cache must match this): stepwise img_step
-     over a fixed (z, action) sequence == a single full-sequence causal-
-     transformer forward over the same tokens (h_stepwise ≈ h_full).
+  5. CORRECTNESS GATE: stepwise img_step over a fixed (z, action) sequence == a
+     single full-sequence causal-transformer forward over the same tokens.
+  6. ``img_rollout`` ≡ sequential ``img_step`` (gain-match batched FD path).
 
 Run:
-  PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_tssm.py
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \\
+  ~/neural-APC-mbrl2-env/bin/python tools/_smoke_tssm.py
 """
 import torch
 
@@ -91,6 +89,31 @@ def test_determinism_mode():
         h2 = m.img_step(s0, a, sample=False).h
     assert torch.allclose(h1, h2, atol=1e-6), "sample=False img_step not deterministic"
     print("[smoke] OK sample=False img_step deterministic")
+
+
+def test_img_rollout_equals_img_step():
+    """Gain-match batched FD: img_rollout ≡ sequential img_step (fresh cache)."""
+    cfg, m = _mk()
+    B, K = 3, 5
+    torch.manual_seed(0)
+    h0 = torch.randn(B, cfg.deter_dim)
+    z0 = torch.zeros(B, cfg.n_categoricals, cfg.n_classes)
+    z0[..., 0] = 1.0
+    acts = torch.rand(B, K, cfg.action_dim) * 2 - 1
+    with torch.no_grad():
+        roll = m.img_rollout(h0, z0, acts, sample=False)
+        state = TSSMState(
+            h=h0.clone(),
+            z_logits=torch.zeros(B, cfg.n_categoricals, cfg.n_classes),
+            z=z0.clone(), kv_cache=None, pos=0)
+        seq = []
+        for k in range(K):
+            state = m.img_step(state, acts[:, k], sample=False)
+            seq.append(state.feat)
+        seq = torch.stack(seq, dim=1)
+    max_err = float((roll - seq).abs().max())
+    assert max_err < 1e-6, f"img_rollout != img_step (max_err={max_err})"
+    print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e})")
 
 
 def test_stepwise_equals_full_sequence():
@@ -198,6 +221,7 @@ if __name__ == '__main__':
     test_interface_shapes()
     test_st_grad_reaches_prior_and_transformer()
     test_determinism_mode()
+    test_img_rollout_equals_img_step()
     test_stepwise_equals_full_sequence()
     test_end_to_end_dreamer_tssm()
     test_diagnostics_probes_route_tssm()

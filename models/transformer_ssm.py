@@ -40,8 +40,8 @@ WHY a transformer core (vs the current SF/flow transformer):
   contains the right per-domain dynamics).
 
 INTERFACE CONTRACT (must match models.dreamer_v4_rssm.RSSMDynamics exactly so the
-existing dispatch in train.py / world_model_loss / _imagination_step_rssm / the
-overshoot + held-rollout losses / the WM probes all work unchanged):
+existing dispatch in train.py / world_model_loss / _realsim_actor_critic_step /
+the overshoot + held-rollout losses / the WM probes all work unchanged):
   attributes : deter_dim, n_categoricals, n_classes, obs_dim, prior_net,
                post_net, pre_gru-equivalent, encoder, decoder
   state      : object with .h (..., deter_dim), .z_logits (..., K, C),
@@ -82,7 +82,7 @@ WIRING PLAN (when implemented):
      'tssm': self.dynamics = TransformerSSMDynamics(tssm_cfg)`` alongside the
      RSSM branch; ensure parameters_world() includes it (it already globs
      self.dynamics.parameters()).
-  2. training/train.py world_model_loss / imagination_step dispatch: the RSSM
+  2. training/train.py world_model_loss / real-sim actor-critic dispatch: the RSSM
      branch checks ``world_model_type == 'rssm'``; widen to
      ``in ('rssm', 'tssm')`` since the interface is identical (feat=[h,z_flat],
      rollout_observed/img_step/decode).  Verify _wm_latent_overshoot_loss and
@@ -616,6 +616,37 @@ class TransformerSSMDynamics(nn.Module):
         return TSSMState(h=h, z_logits=z_logits, z=z,
                          kv_cache=new_cache, pos=pos + 1, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
+
+    def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,
+                    actions: torch.Tensor,
+                    dvs: Optional[torch.Tensor] = None,
+                    sample: bool = True,
+                    c0: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Prior-only rollout of K steps from ``(h0, z0[, c0])``.
+
+        Same contract as ``RSSMDynamics.img_rollout`` so gain-match can
+        stack baseline+per-input on the batch dim (one KV-cache loop,
+        MIMO-width no longer sequential).  Fresh cache (``kv_cache=None``,
+        ``pos=0``) matches the sequential TSSM ``_roll`` fallback.
+        ``c0=None`` with ``cont_dim>0`` zero-fills like ``img_step``.
+        """
+        Bm = h0.shape[0]
+        K = actions.shape[1]
+        c = None
+        if self.cont_dim > 0:
+            c = (c0 if c0 is not None else torch.zeros(
+                Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
+        state = TSSMState(
+            h=h0,
+            z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
+                                 device=h0.device, dtype=h0.dtype),
+            z=z0, c=c, kv_cache=None, pos=0)
+        feats = []
+        for k in range(K):
+            dv_k = dvs[:, k] if dvs is not None else None
+            state = self.img_step(state, actions[:, k], dv=dv_k, sample=sample)
+            feats.append(state.feat)
+        return torch.stack(feats, dim=1)
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,

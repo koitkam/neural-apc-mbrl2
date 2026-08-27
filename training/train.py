@@ -1699,8 +1699,11 @@ class TrainConfig:
     # still healthy).  Falls back to ``wm_best`` if no last-ok snapshot
     # exists.  Then reset ``opt_world``.  P30 capped P1 on the *first*
     # storm and froze an under-trained observer (iter 18 of ~90).  Default
-    # ``skip_storm_p1_cap_after=2`` continues original P1 on the first
-    # recovery (extension still closed) and caps on the second.  P2/P3
+    # ``skip_storm_p1_cap_after=2`` continues original P1 **and** the
+    # quality-gate extension on the first recovery; storm 2 still
+    # ``_force_p1_cap_at`` (closes extension → P2).  P32 closed extension
+    # on storm 1 and CAPPED GAIN_NOT_READY(worst=0.71@DV) with healthy
+    # recon — P26/P31 needed that extension past ~iter 75.  P2/P3
     # skip-storms still abort.  Set 0 to keep the P27 abort behaviour.
     skip_storm_recover_p1: bool = True
     # Unitless recon-health band for ``wm_last_ok`` (sim-agnostic).  P27
@@ -1709,8 +1712,8 @@ class TrainConfig:
     # the P1→P2 freeze so a single huge-grad step that never trips
     # skip-storm cannot freeze exploded g.  ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
     skip_storm_last_ok_recon_ratio: float = 5.0
-    # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first then cap.
-    # ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
+    # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first
+    # (keep extension) then cap.  ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
     skip_storm_p1_cap_after: int = 2
     # P28 GPU RCA: fidelity-peak ``wm_best`` is gain-blind.  Restoring it
     # at P1→P2 on a *healthy* P1 discarded 37 late-P1 iters (val MV ×0.52
@@ -2767,22 +2770,27 @@ def _skip_storm_should_continue_p1(storm_n: int, cap_after: int) -> bool:
     """True if this 1-indexed P1 skip-storm should keep the original P1 budget.
 
     ``cap_after=1`` is the P30 policy (cap on first storm). Default 2
-    continues the first recovery and caps the second so a repeated
-    explosion still exits to Stage 2.
+    continues the first recovery (P1 budget **and** extension) and
+    caps the second so a repeated explosion still exits to Stage 2.
     """
     return int(storm_n) < max(1, int(cap_after))
 
 
-def _skip_storm_continue_p1(p1: int, p1_ext_steps: int = 0) -> Tuple[int, int, int]:
-    """Keep original P1; close quality-gate extension only.
+def _skip_storm_continue_p1(
+        p1: int, p1_ext_steps: int = 0,
+        p1_gate_max_ext_steps: int = 0) -> Tuple[int, int, int]:
+    """Keep original P1 budget AND quality-gate extension.
 
     P30 restored last-ok then ``_force_p1_cap_at`` set ``p1`` to the
     storm iter (~18), throwing away the remaining original budget
-    (P26 needed ~90).  Extension stays closed so the P1 quality gate
-    cannot re-open exploding full-BPTT.
+    (P26 needed ~90).  P32 continued original P1 after storm 1 but
+    closed extension (``p1_gate_max_ext_steps=0``), so the first
+    P1→P2 gate CAPPED GAIN_NOT_READY(worst=0.71@DV) with healthy
+    recon — P26/P31 needed that extension past ~iter 75.  Storm 2
+    still ``_force_p1_cap_at`` (close extension so a cap-now cannot
+    re-open the next-iter gate — P28).
     """
-    del p1_ext_steps
-    return int(p1), 0, 0
+    return int(p1), int(p1_ext_steps), int(p1_gate_max_ext_steps)
 
 
 def _wm_fidelity_es_suppressed_frozen_g(g_trainable: bool) -> bool:
@@ -4669,8 +4677,6 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     the same dict shape as ``collect_episode``.
     """
     from utils.training_disturbance import _channel_catalog
-    T = int(cfg.episode_length)
-    D = env.obs_dim
     obs_window = env.reset(exploration=True)
     env._schedule = []
     env._hidden_disturbance = None
@@ -4685,42 +4691,17 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     u_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
     cur_u = float(np.clip(mv_level, -u_band, u_band))
     cur_u = float(np.clip(cur_u, -1.0, 1.0))
-    act_buf = np.full((T, env.action_dim), cur_u, dtype='float32')
+    held = np.full((env.action_dim,), cur_u, dtype='float32')
 
-    if not has_dv:
-        # No DV channels → just run the held-MV episode (still useful as a
-        # steady-state MV anchor; matches collect_constant semantics).
-        obs_buf = np.zeros((T, D), dtype='float32')
-        rew_buf = np.zeros(T, dtype='float32')
-        cont_buf = np.ones(T, dtype='float32')
-        for t in range(T):
-            obs_buf[t] = obs_window[-1]
-            obs_window, reward, done, _ = env.step(act_buf[t])
-            rew_buf[t] = reward
-            cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
-            if done:
-                break
-        return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
-
-    # Full-range, multi-timescale, stratified DV-PRBS schedule (shared
-    # builder; byte-identical excitation statistics to the R1a Stage-1
-    # on-policy DV excitation in ``APCEnv.reset``).
-    env._schedule = _build_dv_prbs_schedule(
-        env, cfg, long_hold=long_hold, isolate_dv_idx=isolate_dv_idx,
-        isolated_level=isolated_level)
-
-    # ----- Run the episode (MV held, DV swept by the schedule) ----------
-    obs_buf = np.zeros((T, D), dtype='float32')
-    rew_buf = np.zeros(T, dtype='float32')
-    cont_buf = np.ones(T, dtype='float32')
-    for t in range(T):
-        obs_buf[t] = obs_window[-1]
-        obs_window, reward, done, _ = env.step(act_buf[t])
-        rew_buf[t] = reward
-        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
-        if done:
-            break
-    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+    if has_dv:
+        # Full-range, multi-timescale, stratified DV-PRBS (shared builder;
+        # byte-identical to the R1a Stage-1 on-policy DV excitation).
+        env._schedule = _build_dv_prbs_schedule(
+            env, cfg, long_hold=long_hold, isolate_dv_idx=isolate_dv_idx,
+            isolated_level=isolated_level)
+    # MV held; DV either absent (steady-state MV anchor) or swept by
+    # the schedule.  Same constant-action stepper as isolation settle.
+    return _collect_held_action_episode(env, cfg, obs_window, held)
 
 
 # ---------------------------------------------------------------------------
@@ -5315,13 +5296,13 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     the main-buffer ``seq_len`` was the same DC-gain miss isolation
     follow-up 10 already plugged for ``isolation_buf``.
 
-    Eager (P31 default): RSSM stacks the baseline + one step per MV/DV
-    into a single ``img_rollout`` (batch ``Bm·(1+n_mv+n_dv)``) so the
-    K-step GRU loop runs once.  Sequential ``img_step`` paid
-    ``1+n_mv+n_dv`` Python K-loops — linear in plant width, the remaining
-    full-BPTT cost after isolation decode was batched.  Same last-step
-    ``ΔCV/Δu`` Huber (P26 DC-gain).  TSSM stays sequential (no
-    ``img_rollout``; scaffold).
+    Eager (P31 default): any backbone with ``img_rollout`` stacks the
+    baseline + one step per MV/DV into a single roll (batch
+    ``Bm·(1+n_mv+n_dv)``) so the K-step prior loop runs once.  Sequential
+    ``img_step`` paid ``1+n_mv+n_dv`` Python K-loops — linear in plant
+    width.  Same last-step ``ΔCV/Δu`` Huber (P26 DC-gain).  TSSM now
+    has ``img_rollout`` (fresh KV-cache per start, same as the old
+    sequential ``_roll``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
@@ -5417,7 +5398,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # gradient that pins transfer-matrix gain (forward loss still
     # looks tiny; val MV stayed ×0.74).  Explosion defence for this
     # path is Huber + ``wm_grad_skip_norm`` (P24/P25), not a detach.
-    _use_batched = (_wmt == 'rssm' and hasattr(rssm, 'img_rollout'))
+    _use_batched = hasattr(rssm, 'img_rollout')
     if _use_batched:
         a_list = [a_base]
         dv_list = ([dv0] if dv0 is not None else None)
@@ -11228,7 +11209,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 skip_storm_p1_n, _cap_after)
                             if _continue_p1:
                                 p1, p1_ext_steps, p1_gate_max_ext_steps = (
-                                    _skip_storm_continue_p1(p1, p1_ext_steps))
+                                    _skip_storm_continue_p1(
+                                        p1, p1_ext_steps,
+                                        p1_gate_max_ext_steps))
                             else:
                                 p1, p1_ext_steps, p1_gate_max_ext_steps = (
                                     _force_p1_cap_at(total_env_steps))
@@ -11260,14 +11243,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     f'{_restored} ({_src} iter '
                                     f'{skip_storm_restore_iter}); continuing '
                                     f'P1 (storm {skip_storm_p1_n}/'
-                                    f'{_cap_after}, extension closed)')
+                                    f'{_cap_after}, extension kept '
+                                    f'{p1_gate_max_ext_steps} steps)')
                                 print(
                                     f'[skip-storm] P1 recovered: restored '
                                     f'{_restored} ({_src} iter '
                                     f'{skip_storm_restore_iter}); reset '
                                     f'opt_world; continuing P1 '
                                     f'(storm {skip_storm_p1_n}/{_cap_after}, '
-                                    f'extension closed at {p1} steps). '
+                                    f'original P1 {p1} steps, extension '
+                                    f'kept {p1_gate_max_ext_steps} steps). '
                                     f'({window_skips} skips in last '
                                     f'{window_iters} iters)',
                                     flush=True)

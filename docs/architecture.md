@@ -187,8 +187,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > then killed DOB after ~40 iters (g frozen; first P2 probe cannot
 > improve). Val MV mean ×1.88 (median ~×1.06 + OP outlier); DV ×0.77;
 > det_r 0.05. Actor never ran (`skip_invalid_p3`). **P31:** first
-> skip-storm **continues original P1** (`skip_storm_p1_cap_after=2`,
-> extension still closed); second storm still caps. Storm-time
+> skip-storm **continues original P1** (`skip_storm_p1_cap_after=2`);
+> storm 1 keeps the quality-gate extension (P32 CAPPED 0.71@DV when
+> it was closed); storm 2 still `_force_p1_cap_at`. Storm-time
 > GAIN_NOT_READY does not stick if P1 continues. Fidelity ES suppressed
 > while `_dynamics_g_trainable` is false.
 > **P31 EXIT (2026-08-26 23:23, 151 iters):** storm_cap=2 KEEP (healthy
@@ -198,12 +199,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > last-ok when freeze recon is detonated vs last-ok best (same 5×
 > ratio); re-probes gain. Also batched gain-match FD, numpy P1/P2
 > collect, vectorized DOB Kalman, relative Huber **removed**.
-> **P32 LIVE (2026-08-27 01:02, tmux `mbrl2_p32`, `run_p32_detfreeze`, pid 4139864):**
-> env-free det+eager CONFIRMED. P1 iter 28 recon 0.0041, `kl=0`, `jemb` 0.019,
-> skip 0, `wm_best` iter 20 `best_h=55/55` gain_fid=0.747. GPU ~19.5 GB
-> reserved. gnorm blips (iter 14/28 ~21–23) recovered — not a skip-storm.
-> Do not launch a second job. HEAD isolation TBPTT is chunked `img_rollout`
-> (same P25 `h`-only `keep_c` cuts; not in this GPU process).
+> **P32 LIVE (2026-08-27 03:06, tmux `mbrl2_p32`, `run_p32_detfreeze`, pid 4139864):**
+> env-free det+eager. Skip-storm 1/2 @iter 53 restored last-ok (KEEP).
+> P1→P2 @iter 75 **CAPPED GAIN_NOT_READY 0.71@DV** with healthy recon 0.0026
+> because continue closed extension. P2 iter 106 recon 0.0036 `dobg` live.
+> Expect `[p3-skip]`. GPU occupied — no second job. HEAD: keep extension
+> on storm 1; TSSM `img_rollout`.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

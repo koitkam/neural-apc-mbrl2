@@ -156,10 +156,13 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _p1, _ext, _cap = _force_p1_cap_at(12345)
     assert (_p1, _ext, _cap) == (12345, 0, 0), (_p1, _ext, _cap)
     print('[smoke] OK  P1 skip-storm cap closes extension budget')
-    # P31: first storm keeps original P1; second caps. Extension closed
-    # on continue so the quality gate cannot re-open exploding BPTT.
-    _p1c, _extc, _capc = _skip_storm_continue_p1(753960, 12000)
-    assert (_p1c, _extc, _capc) == (753960, 0, 0), (_p1c, _extc, _capc)
+    # P32: first storm keeps original P1 AND the quality-gate
+    # extension (P26/P31 needed it past ~iter 75). Storm 2 still
+    # ``_force_p1_cap_at`` (closes extension so a cap-now cannot
+    # re-open the next-iter gate — P28).
+    _p1c, _extc, _capc = _skip_storm_continue_p1(753960, 12000, 175924)
+    assert (_p1c, _extc, _capc) == (753960, 12000, 175924), (
+        _p1c, _extc, _capc)
     assert int(TrainConfig().skip_storm_p1_cap_after) == 2
     assert _skip_storm_should_continue_p1(1, 2) is True
     assert _skip_storm_should_continue_p1(2, 2) is False
