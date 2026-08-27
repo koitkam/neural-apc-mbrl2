@@ -861,10 +861,11 @@ class RSSMDynamics(nn.Module):
         capturing the whole K-step ``img_step`` loop as ONE graph removes the
         per-step Python / kernel-launch overhead that otherwise makes the
         multi-step WM aux losses (latent-overshoot + held-rollout +
-        gain-match FD) launch-bound.  Eager default still wins by stacking
-        independent rolls on the batch dim (gain-match: baseline + one
-        step per MV/DV).  Batched analogue of the Python loops those
-        losses used to run inline.
+        gain-match FD + isolation TBPTT chunks) launch-bound.  Eager default
+        still wins by stacking independent rolls on the batch dim
+        (gain-match: baseline + one step per MV/DV).  Isolation TBPTT is
+        applied *between* ``img_rollout`` chunks in train.py (``h``-only
+        ``keep_c``) so compile-on always sees a TBPTT-free graph.
         """
         Bm = h0.shape[0]
         K = actions.shape[1]

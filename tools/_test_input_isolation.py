@@ -127,6 +127,52 @@ def main():
     print(f'[tbptt] OK: isolation TBPTT(keep_c) still trains cont-gain '
           f'({cont_grad_tb:.4e})')
 
+    # Chunked img_rollout TBPTT ≡ sequential img_step + detach(keep_c)
+    # (same cuts; compile-on fuses each chunk).
+    from models.dreamer_v4_rssm import RSSMState
+    from training.train import _rssm_tbptt_img_rollout
+    _rssm = model.dynamics
+    with torch.no_grad():
+        feats_iso, *_ = _rssm.rollout_observed(obs, act, sample=False)
+    feats_iso = feats_iso.detach()
+    K_iso = 6
+    B_iso, T_iso = obs.shape[:2]
+    n_valid = T_iso - K_iso
+    starts = torch.arange(0, n_valid, max(1, n_valid // 6), device=obs.device)
+    S = int(starts.numel())
+    f0 = feats_iso[:, starts]
+    Bm = B_iso * S
+    h0 = f0[..., :_rssm.deter_dim].reshape(Bm, -1)
+    _ze = _rssm.deter_dim + _rssm.stoch_flat_dim
+    z0 = f0[..., _rssm.deter_dim:_ze].reshape(
+        Bm, _rssm.n_categoricals, _rssm.n_classes)
+    c0 = f0[..., _ze:_ze + _rssm.cont_dim].reshape(Bm, -1)
+    k_off = torch.arange(1, K_iso + 1, device=obs.device)
+    idx = starts.view(S, 1) + k_off.view(1, K_iso)
+    a_all = act[:, idx].reshape(Bm, K_iso, -1)
+    dv_all = obs[:, idx].index_select(-1, _rssm.dv_index_t).reshape(Bm, K_iso, -1)
+    ss_k0 = K_iso - max(1, int(round(0.34 * K_iso)))
+    tbptt = 2
+    feat_chunk = _rssm_tbptt_img_rollout(
+        _rssm, h0.clone(), z0.clone(), a_all, dv_all, c0.clone(),
+        sample=False, tbptt_steps=tbptt, ss_k0=ss_k0)
+    st = RSSMState(
+        h=h0.clone(),
+        z_logits=torch.zeros(Bm, _rssm.n_categoricals, _rssm.n_classes,
+                             device=obs.device, dtype=f0.dtype),
+        z=z0.clone(), c=c0.clone())
+    seq_feats = []
+    for k in range(K_iso):
+        st = _rssm.img_step(st, a_all[:, k], dv=dv_all[:, k], sample=False)
+        seq_feats.append(st.feat)
+        if (k < K_iso - 1 and (k + 1) % tbptt == 0 and k < ss_k0 - 1):
+            st = st.detach(keep_c=True)
+    feat_seq = torch.stack(seq_feats, dim=1)
+    delta = float((feat_chunk - feat_seq).abs().max())
+    assert delta < 1e-5, f'isolation img_rollout TBPTT Δ={delta:.2e}'
+    print(f'[iso-img-rollout] OK: chunked img_rollout ≡ sequential '
+          f'img_step+keep_c (max|Δ|={delta:.2e})')
+
     # ---- P25 RCA: gain-match is FULL BPTT (no detach) so the K-step
     # asymptote still reaches the continuous gain channel.
     cfg.gain_match_coef = 1.0

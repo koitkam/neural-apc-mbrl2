@@ -57,7 +57,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > DOB for the same CV innovation (the gain↔disturbance identifiability confound)
 > and never recovered (p137–p141 held-out r ≤ 0). The cont latent now keeps ONLY
 > the **gain** block (the C(1) gain-match de-confounder); the neural-Kalman
-> **DOB `d_t` owns the unmeasured load** (`DREAMER_DOB_ENABLED=1` auto-selects the
+> **DOB `d_t` owns the unmeasured load** (`TrainConfig.dob_enabled=True` auto-selects the
 > GAIN-ONLY cont latent). **(2) Option 1 — symmetric per-input steady-state
 > DC-gain ID (p18).** A first-class, input-symmetric `wm_ss_match` DC-gain
 > objective (settledness-gated via `wm_ss_match_settle_var`, MV & DV identical)
@@ -80,7 +80,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > that sets transfer-matrix gain (P25 freeze MV ×0.74 / @H ×0.60). Gain-match
 > now runs **full BPTT** (explosion defence = Huber + `wm_grad_skip_norm`);
 > isolation may still TBPTT **`h` only** (`keep_c=True`) and **never inside the
-> SS-match settle window**. **(2) DOB grounding was dead code** whenever the
+> SS-match settle window** (applied *between* `img_rollout` chunks so
+> compile-on fuses each chunk; eager `img_step` count unchanged). **(2) DOB grounding was dead code** whenever the
 > DOB replaced the read-out head: `disturbance_head_dim` is forced to 0, the
 > replay buffer stored `n_dist=0`, `batch['dist']` was missing, and
 > `dob_ground` was identically 0 for every P2 iter of P19 *and* P25. Buffer
@@ -197,6 +198,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > last-ok when freeze recon is detonated vs last-ok best (same 5×
 > ratio); re-probes gain. Also batched gain-match FD, numpy P1/P2
 > collect, vectorized DOB Kalman, relative Huber **removed**.
+> **P32 LIVE (2026-08-27 01:02, tmux `mbrl2_p32`, `run_p32_detfreeze`, pid 4139864):**
+> env-free det+eager CONFIRMED. P1 iter 28 recon 0.0041, `kl=0`, `jemb` 0.019,
+> skip 0, `wm_best` iter 20 `best_h=55/55` gain_fid=0.747. GPU ~19.5 GB
+> reserved. gnorm blips (iter 14/28 ~21–23) recovered — not a skip-storm.
+> Do not launch a second job. HEAD isolation TBPTT is chunked `img_rollout`
+> (same P25 `h`-only `keep_c` cuts; not in this GPU process).
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
@@ -393,9 +400,10 @@ critic is training-only). With the DOB enabled,
 
 ---
 
-## 3. [opt-in] Neural Kalman filter / disturbance observer (DOB)
+## 3. [current] Neural Kalman filter / disturbance observer (DOB)
 
-Implemented 2026-06-11 (`DREAMER_DOB_ENABLED=1`, default off). The unmeasured load is an **omitted variable**: the WM cannot attribute that CV
+Implemented 2026-06-11; **default ON** (`TrainConfig.dob_enabled=True`, p142).
+Opt out `DREAMER_DOB_ENABLED=0`. The unmeasured load is an **omitted variable**: the WM cannot attribute that CV
 movement to any input it sees, so it under-fits the input→CV gain
 (MV ratio ≈ 0.64, DV ratio ≈ 0.73 in p112) — which makes the actor over-actuate
 and oscillate, and makes a read-out disturbance head unrecoverable. The fix is a
@@ -467,7 +475,7 @@ decay/correct, CV-only add, grad-isolated into `opt_world`).
 > **GAIN-ONLY (2026-08-18):** the continuous **gain** block below is current; the
 > continuous **disturbance** block it originally shipped with was reverted at p142
 > (it competed with the DOB for the same CV innovation and never recovered). With
-> `DREAMER_DOB_ENABLED=1` the cont latent auto-resolves to **gain-only**
+> `TrainConfig.dob_enabled=True` the cont latent auto-resolves to **gain-only**
 > (`cont_dist_dim=0`, `dist_match` off) and the neural-Kalman **DOB `d_t` owns the
 > unmeasured load** (§3). See the 2026-08-18 changelog note above.
 

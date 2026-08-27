@@ -5471,6 +5471,53 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     return loss, diag
 
 
+def _rssm_tbptt_img_rollout(
+        rssm, h0: torch.Tensor, z0: torch.Tensor,
+        a_all: torch.Tensor, dv_all: Optional[torch.Tensor],
+        c0: Optional[torch.Tensor], *, sample: bool = False,
+        tbptt_steps: int = 0, ss_k0: Optional[int] = None,
+        ) -> torch.Tensor:
+    """K-step prior roll with isolation TBPTT (``h`` only, ``keep_c``).
+
+    Cut rule matches the old Python ``img_step`` loop (P25 RCA): after step
+    index ``k`` (0-based), detach when ``tbptt_steps>0`` and ``k < K-1`` and
+    ``(k+1) % tbptt_steps == 0`` and (if ``ss_k0`` is set) ``k < ss_k0-1``.
+    Never cuts inside the SS-match window.  Each chunk is one ``img_rollout``
+    so compile-on fuses the GRU loop; eager ``img_step`` count is unchanged.
+    """
+    K = int(a_all.shape[1])
+    if int(tbptt_steps) <= 0 or K < 2:
+        return rssm.img_rollout(h0, z0, a_all, dvs=dv_all,
+                                sample=sample, c0=c0)
+    chunks = []
+    h, z, c = h0, z0, c0
+    k0 = 0
+    _tbptt = int(tbptt_steps)
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    while k0 < K:
+        k_cut = None
+        for k in range(k0, K):
+            if (k < K - 1 and (k + 1) % _tbptt == 0
+                    and (ss_k0 is None or k < int(ss_k0) - 1)):
+                k_cut = k
+                break
+        k1 = (k_cut + 1) if k_cut is not None else K
+        dv_ch = (dv_all[:, k0:k1] if dv_all is not None else None)
+        roll = rssm.img_rollout(h, z, a_all[:, k0:k1], dvs=dv_ch,
+                                sample=sample, c0=c)
+        chunks.append(roll)
+        if k1 >= K:
+            break
+        last = roll[:, -1]
+        h = last[..., :rssm.deter_dim].detach()
+        z = last[..., rssm.deter_dim:_ze].reshape(
+            last.shape[0], rssm.n_categoricals, rssm.n_classes).detach()
+        c = (last[..., _ze:_ze + rssm.cont_dim]
+             if rssm.cont_dim > 0 else None)
+        k0 = k1
+    return torch.cat(chunks, dim=1)
+
+
 def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
                              act: torch.Tensor, cfg: TrainConfig
                              ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -5491,7 +5538,10 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     ``sample=False`` freezes the categorical at its argmax so the gradient flows
     into the CONTINUOUS gain channel + decoder + GRU, bypassing the categorical
     bottleneck that attenuates SUBDOMINANT inputs (the same routing C(1)
-    gain-match uses).  RSSM-only; ``0`` for other backbones / when off.
+    gain-match uses).  The K-step prior is ``img_rollout`` with TBPTT applied
+    between chunks (``h``-only ``keep_c``, never inside the SS window) — same
+    cuts as the old Python ``img_step`` loop.  RSSM-only; ``0`` for other
+    backbones / when off.
 
     Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match
     (unchanged training objective).  ``extras`` splits the folded DC-gain
@@ -5508,7 +5558,6 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     rssm = model.dynamics
     if rssm.n_cv <= 0:
         return zero, empty
-    from models.dreamer_v4_rssm import RSSMState
     B, T = obs.shape[:2]
     K = int(getattr(cfg, 'wm_input_isolation_len', 0) or 0)
     K = min(K, T - 1) if K > 0 else (T - 1)
@@ -5542,11 +5591,6 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
               if getattr(rssm, 'dv_dim', 0) > 0 else None)
     cv_real = obs[:, idx].index_select(-1, cv_idx).reshape(Bm, K, -1).detach()
-    st = RSSMState(
-        h=h0.clone(),
-        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                             device=obs.device, dtype=f0.dtype),
-        z=z0.clone(), c=(c0.clone() if c0 is not None else None))
     # Self-supervised STEADY-STATE (DC-gain) match: accumulate the terminal
     # settled window so we can match MEAN(pred) vs MEAN(real) — timing-insensitive
     # → pins the DC gain the transient-dominated per-step MSE under-shoots.
@@ -5554,24 +5598,19 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     w_frac = float(getattr(cfg, 'wm_ss_match_window_frac', 0.34) or 0.34)
     ss_var = float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0)
     ss_k0 = K - max(1, int(round(min(max(w_frac, 0.05), 0.9) * K)))
-    feat_steps = []
     _tbptt = int(getattr(cfg, 'aux_tbptt_steps', 16) or 0)
-    for k in range(K):
-        dvk = dv_all[:, k] if dv_all is not None else None
-        st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
-        feat_steps.append(st.feat)
-        # Truncated BPTT (p24 RCA / p25 RCA): bound the GRU path so a
-        # marginally-stable recurrence can't explode, but NEVER cut the
-        # continuous gain channel ``c`` and NEVER cut inside the
-        # settled SS-match window (that window IS the DC-gain supervisor).
-        if (_tbptt > 0 and k < K - 1 and (k + 1) % _tbptt == 0
-                and (ss_coef <= 0.0 or k < ss_k0 - 1)
-                and hasattr(st, 'detach')):
-            st = st.detach(keep_c=True)
+    # Truncated BPTT (p24/p25 RCA): bound GRU ``h``, NEVER cut ``c``, NEVER
+    # cut inside the settled SS-match window.  Chunked ``img_rollout`` (same
+    # cuts) so compile-on fuses each chunk; eager img_step count unchanged.
+    roll_feats = _rssm_tbptt_img_rollout(
+        rssm, h0.clone(), z0.clone(), a_all, dv_all,
+        (c0.clone() if c0 is not None else None),
+        sample=False, tbptt_steps=_tbptt,
+        ss_k0=(ss_k0 if ss_coef > 0.0 else None))
     # One decode of (Bm, K, F).  Pointwise MLP ⇒ same as K per-step
     # decodes; mean_{Bm,K,CV} MSE ≡ mean_k mean_{Bm,CV} of the old loop.
     # TBPTT still detaches ``h`` between chunks (feats keep their graphs).
-    cv_pred = rssm.decode(torch.stack(feat_steps, dim=1)).index_select(
+    cv_pred = rssm.decode(roll_feats).index_select(
         -1, cv_idx)                                               # (Bm, K, n_cv)
     traj = coef * (cv_pred - cv_real).pow(2).mean()
     extras: Dict[str, torch.Tensor] = {
@@ -5904,8 +5943,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # OPEN-LOOP GAIN supervisor — gating it to every-other step slipped the MV
     # gain (5.7%→12.3% rel-err) and let the DV compound open-loop, so run
     # OVERSHOOT EVERY step now (``img_rollout`` is one K-loop; compile-on
-    # fuses it, eager still avoids per-start Python).  The HELD-rollout
-    # (drift/stationarity, less gain-critical) stays every-other.
+    # fuses it, eager still avoids per-start Python).  Isolation TBPTT is
+    # the same ``img_rollout`` in chunks (``h``-only ``keep_c``).  The
+    # HELD-rollout (drift/stationarity, less gain-critical) stays every-other.
     # Gain-match (full-BPTT FD) batches baseline+per-input into the same
     # ``img_rollout`` so MIMO width does not multiply sequential K-loops.
     # P28 follow-up 11: skip when g is frozen (DOB curriculum P2).  Same
