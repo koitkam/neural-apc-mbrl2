@@ -391,6 +391,39 @@ def main():
     print(f'[gain-match-batched] OK: batched={float(gm_batched):.6f} '
           f'seq={float(gm_seq):.6f}')
 
+    # TD-λ helper ≡ the three reverse loops it replaced (incl. MC λ=1).
+    from training.train import _lambda_returns
+    torch.manual_seed(1)
+    rew_t = torch.randn(4, 8)
+    v_t = torch.randn(4, 8)
+    gamma, lam, cap = 0.99, 0.90, 50.0
+    v_c = v_t.clamp(-cap, cap)
+    ref = torch.zeros_like(v_c)
+    ref[:, -1] = v_c[:, -1]
+    for t in reversed(range(7)):
+        boot = (1.0 - lam) * v_c[:, t + 1] + lam * ref[:, t + 1]
+        ref[:, t] = rew_t[:, t] + gamma * boot
+    ref = ref.detach().clamp(-cap, cap)
+    got = _lambda_returns(rew_t, v_t, gamma, lam, cap)
+    assert torch.allclose(got, ref, atol=1e-6), 'λ-return helper mismatch'
+    mc_ref = torch.zeros_like(v_c)
+    mc_ref[:, -1] = v_c[:, -1]
+    for t in reversed(range(7)):
+        mc_ref[:, t] = rew_t[:, t] + gamma * mc_ref[:, t + 1]
+    mc_ref = mc_ref.detach().clamp(-cap, cap)
+    mc_got = _lambda_returns(rew_t, v_t, gamma, 1.0, cap)
+    assert torch.allclose(mc_got, mc_ref, atol=1e-6), 'MC λ=1 helper mismatch'
+    print('[lambda-returns] OK: helper ≡ reverse loops (λ and MC)')
+
+    # Stage-1 (dob_active=False) still returns a zero d-tail without
+    # collecting unused prior-core (P1 skip).
+    model.dynamics.dob_active = False
+    with torch.no_grad():
+        feats_s1, *_rest = model.dynamics.rollout_observed(obs, act, sample=False)
+    d_tail = feats_s1[..., -model.dynamics.n_cv:]
+    assert float(d_tail.abs().max()) == 0.0, 'P1 d-tail must be identically 0'
+    print('[dob-stage1] OK: dob_active=False → d_t≡0 (no prior-core decode)')
+
 
 if __name__ == '__main__':
     main()

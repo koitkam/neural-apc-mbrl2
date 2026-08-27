@@ -41,7 +41,7 @@ import torch.nn.functional as F
 
 from models.dreamer_v4 import (  # noqa: F401
     DreamerV4, DreamerV4Config,
-    shortcut_forcing_loss, pmpo_loss, reinforce_actor_loss,
+    shortcut_forcing_loss,
 )
 from utils.sim_factory import create_sim, resolve_sim_metadata
 from utils.objective_runtime import compute_objective_components
@@ -3635,15 +3635,18 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
 
-    a_history = np.zeros((L, env.action_dim), dtype='float32')
-    d_min = 1.0 / cfg.k_max
-    # Past τ must land in the trained grid.  sample_tau_d emits
-    # τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max, so the maximum trained
-    # τ value is (k_max-1)/k_max.  Using cfg.tau_ctx=0.1 (τ=0.9) with
-    # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
-    tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
-
     _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+    # SF lookback context (unused on RSSM/TSSM — GRU/token state carries it).
+    a_history = None
+    d_min = tau_ctx_val = None
+    if not _is_rssm:
+        a_history = np.zeros((L, env.action_dim), dtype='float32')
+        d_min = 1.0 / cfg.k_max
+        # Past τ must land in the trained grid.  sample_tau_d emits
+        # τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max, so the maximum trained
+        # τ value is (k_max-1)/k_max.  Using cfg.tau_ctx=0.1 (τ=0.9) with
+        # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
+        tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
     # RSSM streaming inference: carry a running recurrent state across the
     # episode.  Each step advances the posterior with (prev_action, obs)
     # and the posterior feature drives the policy — the GRU holds the
@@ -3715,7 +3718,9 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
             act_buf[t] = a_np
             rew_buf[t] = reward
             cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
-            a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
+            if a_history is not None:
+                a_history = np.concatenate(
+                    [a_history[1:], a_np[None, :]], axis=0)
             obs_window = next_window
             if done:
                 break
@@ -4749,6 +4754,31 @@ def _adaptive_return_cap(cfg: TrainConfig) -> Optional[float]:
         gl = max(0.0, min(0.999999, gamma * lam))
         denom = 1.0 - gl
     return k * B / denom
+
+
+def _lambda_returns(rew: torch.Tensor, v: torch.Tensor,
+                    gamma: float, lam: float,
+                    ret_cap: Optional[float] = None) -> torch.Tensor:
+    """Truncated TD-λ returns. Last step is V (no ``r_T``).
+
+    ``lam=1`` is pure Monte-Carlo (``r_t + γ r_{t+1}`` … ``V_T``).  Same
+    recurrence as the three Python reverse loops this replaced — T is
+    seq_len (≪ GRU unroll), so the loop is not the hot path; the helper
+    keeps the actor/critic/MC sites identical.
+    """
+    if ret_cap is not None:
+        v = v.clamp(-float(ret_cap), float(ret_cap))
+    returns = torch.zeros_like(v)
+    returns[:, -1] = v[:, -1]
+    g = float(gamma)
+    l = float(lam)
+    for t in reversed(range(int(v.shape[1]) - 1)):
+        boot = (1.0 - l) * v[:, t + 1] + l * returns[:, t + 1]
+        returns[:, t] = rew[:, t] + g * boot
+    out = returns.detach()
+    if ret_cap is not None:
+        out = out.clamp(-float(ret_cap), float(ret_cap))
+    return out
 
 
 def _critic_anchor_lambda(cfg: TrainConfig) -> float:
@@ -6378,16 +6408,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     gamma = float(cfg.gamma)
     lam = float(cfg.gae_lambda)
     _ret_cap = _adaptive_return_cap(cfg)
-    if _ret_cap is not None:
-        v_slow = v_slow.clamp(-_ret_cap, _ret_cap)
-    returns = torch.zeros_like(v_slow)
-    returns[:, -1] = v_slow[:, -1]
-    for t in reversed(range(T - 1)):
-        bootstrap = (1.0 - lam) * v_slow[:, t + 1] + lam * returns[:, t + 1]
-        returns[:, t] = rew[:, t] + gamma * bootstrap
-    target_returns = returns.detach()
-    if _ret_cap is not None:
-        target_returns = target_returns.clamp(-_ret_cap, _ret_cap)
+    target_returns = _lambda_returns(rew, v_slow, gamma, lam, _ret_cap)
 
     # ----- CRITIC loss (twohot CE): ON-POLICY (advantage accuracy) + replay -----
     # p06 RCA (2026-07-10): the p05 buffer-split trained the critic ONLY on the
@@ -6406,22 +6427,16 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # cannot inflate the λ-return / return_scale.
     _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
 
-    def _critic_ce(feat, vslow, rew_b, Tb, lam_ret):
+    def _critic_ce(feat, vslow, rew_b, lam_ret):
         """Ensemble twohot-CE to the λ-return + optional PURE-MC (λ=1)."""
         loss = model.critic_ensemble_ce(feat, lam_ret)
         if _mc_coef > 0.0:
-            rmc = torch.zeros_like(vslow)
-            rmc[:, -1] = vslow[:, -1]
-            for _tt in reversed(range(Tb - 1)):
-                rmc[:, _tt] = rew_b[:, _tt] + gamma * rmc[:, _tt + 1]
-            rmc = rmc.detach()
-            if _ret_cap is not None:
-                rmc = rmc.clamp(-_ret_cap, _ret_cap)
+            rmc = _lambda_returns(rew_b, vslow, gamma, 1.0, _ret_cap)
             loss = loss + _mc_coef * model.critic_ensemble_ce(feat, rmc)
         return loss
 
     # (a) ON-POLICY term — the distribution the advantage is evaluated on.
-    critic_loss = _critic_ce(feat_flat, v_slow, rew, T, target_returns)
+    critic_loss = _critic_ce(feat_flat, v_slow, rew, target_returns)
 
     # P83 expert-BC anchor accumulator (wired below on the seed-buffer batch,
     # which retains expert-flagged steps via the every-20-iter P3 expert inject).
@@ -6438,18 +6453,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         rew_c = critic_batch['rew'].float()
         with torch.no_grad():
             v_slow_c = model.critic_min_v(feat_c, target=True).reshape(Bc, Tc)
-            if _ret_cap is not None:
-                v_slow_c = v_slow_c.clamp(-_ret_cap, _ret_cap)
-        ret_c = torch.zeros_like(v_slow_c)
-        ret_c[:, -1] = v_slow_c[:, -1]
-        for _tc in reversed(range(Tc - 1)):
-            _bc = (1.0 - lam) * v_slow_c[:, _tc + 1] + lam * ret_c[:, _tc + 1]
-            ret_c[:, _tc] = rew_c[:, _tc] + gamma * _bc
-        ret_c = ret_c.detach()
-        if _ret_cap is not None:
-            ret_c = ret_c.clamp(-_ret_cap, _ret_cap)
+        ret_c = _lambda_returns(rew_c, v_slow_c, gamma, lam, _ret_cap)
         critic_loss = critic_loss + _critic_ce(
-            feat_c, v_slow_c, rew_c, Tc, ret_c)
+            feat_c, v_slow_c, rew_c, ret_c)
         # P83 FIX (p19 RCA, 2026-08-19): re-wire the P3 expert-BC anchor — it was
         # DEAD CODE (expert_bc_p3_loss defined + unit-tested but NEVER called),
         # so the P3 actor had NO anchor and diverged off the good BC-seeded

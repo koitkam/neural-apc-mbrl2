@@ -582,7 +582,8 @@ freeze is `DreamerV4.set_world_model_trainable(g, dob, reward)` (toggles
 
 The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 **no head-dim change at a stage boundary**. In Stage 1 the estimate is *suppressed*
-(`d_t ≡ 0`), not removed.
+(`d_t ≡ 0`), not removed — `rollout_observed` skips the prior-core harvest that
+P2's batched DOB decode consumes (`dob_active=False`).
 
 | | **Stage 1 = P1** (plant id) | **Stage 2 = P2** (observer id) | **Stage 3 = P3** (controller) |
 |---|---|---|---|

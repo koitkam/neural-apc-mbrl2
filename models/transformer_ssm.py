@@ -694,7 +694,7 @@ class TransformerSSMDynamics(nn.Module):
         # ONE batched decode gives ν, pass 2 re-rolls feeding ν[:, t].  Single
         # pass when off (DOB path unchanged).
         two_pass = bool(getattr(self, '_cont_post_uses_innov', False))
-        _need_prior_core = self.dob_enabled or two_pass
+        _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         for t in range(T):
@@ -731,7 +731,7 @@ class TransformerSSMDynamics(nn.Module):
                 prior_l.append(prior.z_logits)
                 c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                 c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-                if self.dob_enabled:
+                if self.dob_enabled and self.dob_active:
                     prior_core_l.append(prior.feat[..., :dec_in])
         post_core = torch.stack(feats_l, dim=1)          # (B, T, dec_in) = [h,z,(dv)]
         post_logits = torch.stack(post_l, dim=1)
