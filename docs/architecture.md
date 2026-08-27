@@ -260,10 +260,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > `max(seq_len, K+1)` so a slow plant with H > seq_len still reaches SS
 > (test_sim seq_len ≥ H unchanged). Isolation extra unroll is skipped
 > when `g` is frozen (DOB curriculum P2 — dead hot-path forward).
-> **P34/P35:** even with isomorphic |Δu|, WM-norm |ΔCV| still differs
+> **P34/P35/P36:** even with isomorphic |Δu|, WM-norm |ΔCV| still differs
 > by ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation/ss-match
 > default inverse-variance reweight (`wm_isolation_var_norm`):
-> `mean(w·err)` with mean(w)=1. P34 AM/HM form exploded. Not relative Huber.
+> `mean(w·err)` with mean(w)=1 and **per-input** scale (identified
+> `|tgt|²`; no-ID fallback = scatter-mean CV² of that input). P34 AM/HM
+> form exploded. P35 per-sequence `|CV|²` starved quiet-hold sequences
+> (scale_ratio ~22000, iso 0.0008, gmatch stuck 1.21, storm 2/2 cap).
+> Not relative Huber.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

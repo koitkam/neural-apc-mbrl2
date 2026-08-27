@@ -97,7 +97,9 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P30 | 2026-08-26 | env-free det+eager; cap P1 on first skip-storm | froze iter 18; val MV mean ×1.88; P3 skipped | ❌ cap-on-first REVERTED |
 | P31 | 2026-08-26 | `storm_cap=2`; no skip-storm | healthy P1 to 94; CAPPED exploded g; DV ×0.11 | ❌ freeze last-ok (P32); storm_cap KEEP |
 | P32 | 2026-08-27 | last-ok at detonated freeze; continue-after-storm | storm 1/2 @53 KEEP; val MV ×1.09 DV ×0.68 det_r 0.11; `[p3-skip]` | ❌ CAPPED 0.71@DV — extension closed; keep-ext = P33 |
-| P33 | 2026-08-27 | keep P1 extension on skip-storm continue | — | 🔬 LIVE `run_p33_keepext` |
+| P33 | 2026-08-27 | keep P1 extension on skip-storm continue | val MV ×1.08 DV ×0.66 det_r 0.40; `[p3-skip]` | ❌ keep-ext KEEP as mechanism; FALSIFIED as DV lever |
+| P34 | 2026-08-27 | AM/HM inv-var isolation | iso 7088 skip 99 ES iter 1 | ❌ formula REVERTED |
+| P35 | 2026-08-27 | mean-1 per-seq inv-var isolation | storm 2/2 @16 CAPPED GAIN_NOT_READY 0.01@DV; gmatch stuck 1.21; iso ~0.0008 | ⏳ P2 on frozen last-ok; per-seq scale SUPERSEDED (per-input \|G\|² on HEAD) |
 
 ## Run details
 
@@ -1360,10 +1362,12 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **ROOT:** untrained WM has similar *abs* err on quiet (near-zero hold) and loud sequences. ``mean(err/s)*mean(s)`` has mean(w)=AM/HM(scale) ≫ 1 → isolation loss 4000×. Not relative Huber. Not GPU occupancy.
 - **Fix (P35):** ``mean(w·err)`` with ``w∝1/scale``, ``mean(w)=1`` + abs floor 1e-4 (norm CV)². Identity on constant scale; O(mean(err)) at init; still equalizes relative-gain gradient when err∝scale.
 
-### p35 (`run_p35_isowmean1`, branch `cursor/p28`) — FIX: mean-1 inverse-variance isolation
-- **One attributed GPU change vs P33 abs isolation (P34 form discarded):** same `wm_isolation_var_norm=True` default, weights mean-normalized. Gain-match stays abs Huber. Env-free.
-- **Step 4 vs P33:** `iso_varnorm=True` on `[resolved-cfg]`. vs P34: helper formula only. Watch P1 iter 1 iso **~1–3 not 7000**, skip **0**, jsonl `wm_isolation_var_wmax` O(1–10) not 1000. Then live/val DV into `[0.8,1.3]`.
-- **Judge by:** iter-1 iso in P26/P33 class; no skip-storm on step 1. Then DV ss/@H into band without MV leaving it. If GAIN-READY: first valid actor. If skip-storm at init: revert `DREAMER_WM_ISOLATION_VAR_NORM=0`. Do not revive relative Huber.
+### p35 (`run_p35_isowmean1`, branch `cursor/p28`) — LIVE P2: mean-1 per-seq inv-var starved DC-gain
+- **One attributed GPU change vs P33 abs isolation (P34 form discarded):** same `wm_isolation_var_norm=True` default, weights mean-normalized. Gain-match stays abs Huber. Env-free. Launch `fcfe750`.
+- **Liveness (2026-08-27 ~09:57):** still RUNNING P2. GPU ~17.7 GB. **No second GPU job.** Storm **1/2 @iter 9** (gnorm 8.8e13, skip 70, restored last-ok iter 3). Storm **2/2 @iter 16** (gnorm 1.8e12, skip 155, restored last-ok iter 15) **capped P1** at 344040 steps. `[gate p1->p2] CAPPED GAIN_NOT_READY worst=0.01@DV` MV 0.78 (neither in `[0.8,1.3]`). Detonated-freeze restored last-ok iter 15 (recon 0.341 > 5× 0.0199). P2 recon ~0.08, `dobg` 0.07–0.11 live, g frozen. Expect `[p3-skip]`. Actor INVALID.
+- **Observer path vs P33 (P1 only ~16 iters).** Iter 1 iso **0.0008** skip 0 (P34 iso 7088 — mean-1 did not explode). Then iso stayed ~0.0006 vs P33 iter-1 **1.69**. `wm_isolation_var_scale_ratio` **~22000** throughout (wmax ~2.5). Gain-match **stuck at 1.21** (P33 dropped to 0.002 by iter 9). Cap-time DV ×0.01, MV ×0.78.
+- **ROOT (SysID):** per-sequence `cv_real.pow(2)` hits the 1e-4 floor on near-zero stratified isolation holds. Mean-1 then parks almost all weight on quiet sequences → loud MV/DV DC-gain teacher starved → full-BPTT gain-match never pins G → skip-storm. `scale_ratio` 22000 is quiet-vs-loud, not MV-vs-DV (~33 from \|tgt\| 2.82 vs 0.49). Median floor in `_invvar_reweight` is useless when the median IS the quiet floor.
+- **HEAD (not in this pid):** isolation scale is **per isolated input** (identified \|tgt\|², else scatter-mean CV² of that input). Same mean-1 `w·err`. JSONL `wm_isolation_var_tgt_scale` + `scale_ratio` should be ~33 not 22000. CPU smoke identity. Next GPU after P35 EXIT: env-free P36. Do not revive relative Huber. Do not lower skip threshold. Do not stack critic knobs. Do not train P3 on this freeze.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
@@ -1373,14 +1377,14 @@ Still not sim-adaptive:
 - `wm_fidelity_{warmup,patience}_iters` and `wm_probe_every_iters` stay in *iters* (one WM update ≈ one iter — plant-independent). KEEP.
 - `dv_feedforward=True` still appends measured DV to **head** feat (decoder half is off). `dv_as_input` is the symmetric path; do not re-add decoder FF.
 - `dv_prbs_seed_episodes=24` / `expert_seed_episodes=24` / `constant_action_seed_episodes=40` are flat episode counts (each DV-PRBS episode already sweeps every DV; episode length already scales with τ). Isolation settle is already per-input. `phase3_onpolicy_buffer_eps=16` is an on-policy episode count (same). MIMO coverage of const-action OP combinations is the remaining seed-count question — do not change test_sim sentinels without a MIMO run.
-- Isolation/ss-match default is inverse-variance reweight (`wm_isolation_var_norm=True`): `mean(w·err)` with `w∝1/scale`, `mean(w)=1`, abs floor 1e-4 (norm CV)². P34 `mean(err/scale)*mean(scale)` **REVERTED** (iso 7088 skip 99). Abs mean when `DREAMER_WM_ISOLATION_VAR_NORM=0`. Do **not** revive relative Huber.
-- `wm_overshoot_max_starts=24` / `gain_match_max_starts=6` are **per-sequence** caps. With gpu-calib `B=128`, total `Bm=B·S` is ~8× paper `B=16`. Do **not** retune during P35 (would stack a second observer change). Host-adaptive thread caps already scale with `sched_getaffinity`.
+- Isolation/ss-match default is inverse-variance reweight (`wm_isolation_var_norm=True`): `mean(w·err)` with `w∝1/scale`, `mean(w)=1`. **Scale is per isolated input** (identified `|tgt|²` from dynamics-ID; no-ID fallback = scatter-mean CV² of that input). P35 per-sequence `|CV|²` **SUPERSEDED** (scale_ratio ~22000, iso 0.0008, gmatch stuck 1.21, storm 2/2 cap GAIN_NOT_READY 0.01@DV). P34 `mean(err/scale)*mean(scale)` **REVERTED**. Abs mean when `DREAMER_WM_ISOLATION_VAR_NORM=0`. Do **not** revive relative Huber.
+- `wm_overshoot_max_starts=24` / `gain_match_max_starts=6` are **per-sequence** caps. With gpu-calib `B=128`, total `Bm=B·S` is ~8× paper `B=16`. Do **not** retune until the observer is GAIN-READY (would stack a second observer change). Host-adaptive thread caps already scale with `sched_getaffinity`.
 - Gain-probe log prints **per-input** `ss_pairs` + `unbiased`/`not_noisy` (HEAD). P31 live gates only had min/max+worst. P32 GPU job has the per-input log.
 - P1→P2 **detonated-freeze last-ok restore** (P32 GPU job, P31 RCA): if freeze-iter recon > `skip_storm_last_ok_recon_ratio` × last-ok best, restore `wm_last_ok`, reset AdamW, re-probe gain. Unitless (recon/recon). P31 GPU froze exploded g (val DV ×0.11).
-- P1/P2 random collect is **numpy-only** (no `torch.inference_mode` / SF `a_history`). P3 on-policy still streams. P2 DOB Kalman scan is a closed-form mix (same recurrence; host-adaptive T×T cap `clamp(GPU_mem/1500, 4MiB, 64MiB)` — A10 24GB still **16 MiB**). Stage-1 skips `apply_dob` clone + ground/reg. CV-std tensor cached. P1 skips unused `agent_finetune_loss` when `reward_scale_loss_p1=0`. Last-ok snapshot `copy_` reuse. Isolation inv-var is mean-1 `w·err` (P35; P34 AM/HM REVERTED).
+- P1/P2 random collect is **numpy-only** (no `torch.inference_mode` / SF `a_history`). P3 on-policy still streams. P2 DOB Kalman scan is a closed-form mix (same recurrence; host-adaptive T×T cap `clamp(GPU_mem/1500, 4MiB, 64MiB)` — A10 24GB still **16 MiB**). Stage-1 skips `apply_dob` clone + ground/reg. CV-std tensor cached. P1 skips unused `agent_finetune_loss` when `reward_scale_loss_p1=0`. Last-ok snapshot `copy_` reuse. Isolation inv-var scale is per-input `|G|²` (HEAD, not P35 pid).
 - `run_plan.json → config` is now rewritten after gain-match resolve (`[resolved-cfg]` includes `iso_varnorm=`). Pre-rewrite dump is dataclass defaults (P29 plan still shows `rssm_latent_type=categorical` / `gain_match_coef=0` even though training auto-enabled grounding).
 - Validation `wm_gain_pass` is still **MV-only**. HEAD logs `wm_dv_gain_*` + `wm_dv_ss_ratio_worst` (P29 HEALTHY MV rel_err 0.10 hid DV ×0.56; P31 HEALTHY MV rel_err 0.35 hid DV ×0.11). Does not change `wm_gain_pass`.
-- P33 EXIT (`run_p33_keepext`): keep-ext KEEP as mechanism, FALSIFIED as DV lever (val MV ×1.08 DV ×0.66 det_r 0.40 `[p3-skip]`). P34 AM/HM inv-var ES iter 1. Next GPU: P35 mean-1 inv-var. Do not pass leftover compile/latent/DOB env-vars.
+- P35 LIVE P2 (`run_p35_isowmean1`): storm 2/2 capped GAIN_NOT_READY 0.01@DV. Per-seq `|CV|²` SUPERSEDED on HEAD. Next GPU after EXIT: P36 per-input scale, env-free. Do not pass leftover compile/latent/DOB env-vars.
 ### Graveyard (P24–P28 observer / actor levers)
 
 | Lever | Tried | Status | Root-cause? |
@@ -1415,6 +1419,7 @@ Still not sim-adaptive:
 | Extra P1 via keep-ext to pin DV DC-gain | P33 P1→P2 (full 175924 ext, no storm) | FALSIFIED as DV lever (keep-ext KEEP as mechanism) | YES — iter 85 and 97 both 0.68@DV; P32 val ×0.675 was not extension-starve |
 | Abs isolation/ss-match MSE on mixed MV/DV | P33 EXIT | SUPERSEDED (`wm_isolation_var_norm=True`) | YES — |tgt| MV 2.82 vs DV 0.49; val DV ×0.66 after full ext |
 | `mean(err/scale)*mean(scale)` isolation | P34 iter 1 | REVERTED (mean-1 `w·err`) | YES — AM/HM exploded iso 7088 skip 99 ES |
+| Per-sequence `|CV|²` inv-var (quiet holds) | P35 live | SUPERSEDED (per-input `|G|²`) | YES — scale_ratio ~22000, iso 0.0008, gmatch stuck 1.21, storm 2/2 cap 0.01@DV |
 | P1 `agent_finetune_loss` when `reward_scale_loss_p1=0` | P33 GPU-occupied | SUPERSEDED (skip except log-last inner step) | YES — paper default 0; 100 unused MTP forwards/iter; jsonl `bc` still from last step |
 | Fresh last-ok `state_dict` clone every P1 iter | P33 GPU-occupied | SUPERSEDED (`copy_` reuse) | YES — same weights; first alloc then in-place |
 | Sequential `TrajectoryBuffer.sample` Python copy | P33 GPU-occupied | SUPERSEDED (fancy-index) | YES — B=128 windows were a host `for b` copy; same slices; CPU smoke identity |

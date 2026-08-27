@@ -34,7 +34,7 @@ from training.train import (
                             _isolation_buf_capacity, _isolation_sample_seq_len,
                             _wm_train_seq_len, wm_train_seq_len_for_plant,
                             _dv_isolation_delta, _dynamics_g_trainable,
-                            _invvar_reweight,
+                            _invvar_reweight, _isolation_per_input_scale,
                             _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
@@ -380,8 +380,25 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _got_init = _invvar_reweight(torch.ones(2), torch.tensor([1.0, 1e-3]))
     assert float(_got_init) < 5.0, float(_got_init)
     assert TrainConfig().wm_isolation_var_norm is True
+    _cfg_iso = TrainConfig()
+    _cfg_iso.gain_match_mv_target = ((-2.82,),)
+    _cfg_iso.gain_match_dv_target = ((0.49,),)
+    _act_s = torch.zeros(4, 8, 1)
+    _dv_s = torch.zeros(4, 8, 1)
+    _cv_s = torch.zeros(4, 8, 1)
+    _act_s[0, :, 0] = 1.0
+    _act_s[1, :, 0] = 0.01
+    _cv_s[0] = 2.82
+    _cv_s[1] = 0.01
+    _dv_s[2, :, 0] = 1.0
+    _dv_s[3, :, 0] = 0.01
+    _cv_s[2] = 0.49
+    _cv_s[3] = 0.01
+    _sc, _src = _isolation_per_input_scale(_act_s, _dv_s, _cv_s, _cfg_iso)
+    assert _src == 1.0 and torch.allclose(_sc[0], _sc[1])
+    assert abs(float(_sc[0] / _sc[2]) - (2.82 / 0.49) ** 2) < 0.5
     print('[smoke] OK  isolation inv-var reweight (identity + DV boost; '
-          'init-stable; default ON)')
+          'init-stable; per-input |G|²; default ON)')
 
     # P28 follow-up 8: long-hold isolation settle zeros sim noise (P89 gate).
     class _DummyIsoEnv:
