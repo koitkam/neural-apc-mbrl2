@@ -602,6 +602,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_SS_MATCH_SETTLE_VAR':     ('wm_ss_match_settle_var',         float),
     'DREAMER_WM_ISOLATION_SETTLE_EPISODES': ('wm_isolation_settle_episodes', int),
     # Per isolated input (auto 24).  Seed loop emits n × n_mv + n × n_dv.
+    # Equalize isolation |ΔCV| via Δu ∝ 1/|G| (default ON; P33 drowning).
+    'DREAMER_WM_ISOLATION_DCV_MATCH':     ('wm_isolation_dcv_match',     _as_bool),
     # p10 RCA: treat the DV like a clean input — low-pass the noisy measured DV
     # into the WM (errors-in-variables gain fix) + make it input-only (no recon).
     'DREAMER_DV_LOWPASS_TAU':             ('dv_lowpass_tau',                 float),

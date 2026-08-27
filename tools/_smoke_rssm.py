@@ -33,7 +33,9 @@ from training.train import (
                             _isolation_settle_counts,
                             _isolation_buf_capacity, _isolation_sample_seq_len,
                             _wm_train_seq_len, wm_train_seq_len_for_plant,
-                            _dv_isolation_delta, _dynamics_g_trainable,
+                            _dv_isolation_delta, _isolation_dcv_scales,
+                            _scale_isolation_level, _gain_col_rms,
+                            _dynamics_g_trainable,
                             _maybe_clean_steady_seed,
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
@@ -653,6 +655,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_ES_GRADSKIP_MAX': '11',
         'DREAMER_N_CRITICS': '3',
         'DREAMER_STEP_TEST_INJECT_N': '7',
+        'DREAMER_WM_ISOLATION_DCV_MATCH': '0',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -663,6 +666,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.early_stop_grad_skip_max) == 11
         assert int(cfg.n_critics) == 3
         assert int(cfg.step_test_inject_n) == 7
+        assert cfg.wm_isolation_dcv_match is False
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -701,6 +705,47 @@ def _test_store_aux_feats_identity() -> None:
           f'kalman mix budget={bud}')
 
 
+def _test_isolation_dcv_scales() -> None:
+    """|ΔCV| excitation: Δu ∝ 1/|G| clipped to ±1 (not a loss reweight)."""
+    import numpy as _np
+    cfg = TrainConfig()
+    cfg.wm_isolation_dcv_match = True
+    cfg.gain_match_mv_target = ((-2.80807126652211,),)
+    cfg.gain_match_dv_target = ((0.48662864649935383,),)
+    mv_sc, dv_sc = _isolation_dcv_scales(cfg, 1, 1, 0.6)
+    assert abs(mv_sc[0] - 0.48662864649935383 / (2.80807126652211 * 0.6)) < 1e-6
+    assert abs(dv_sc[0] - 1.0 / 0.6) < 1e-6
+    assert _scale_isolation_level(0.6, dv_sc[0]) == 1.0
+    assert abs(_scale_isolation_level(0.6, mv_sc[0]) - 0.6 * mv_sc[0]) < 1e-9
+    cfg.gain_match_mv_target = ((1.0,),)
+    cfg.gain_match_dv_target = ((1.0,),)
+    assert _isolation_dcv_scales(cfg, 1, 1, 0.6) == ([1.0], [1.0])
+    cfg.wm_isolation_dcv_match = False
+    cfg.gain_match_mv_target = ((-2.8,),)
+    cfg.gain_match_dv_target = ((0.49,),)
+    assert _isolation_dcv_scales(cfg, 1, 1, 0.6) == ([1.0], [1.0])
+    assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
+    assert _gain_col_rms(((-2.8, 0.0),))[0] > 1.0
+    class _DvSim:
+        cv_indices = [0]
+        dv_indices = [1]
+        dv_normalization_ranges = [[0.0, 10.0]]
+        state_variables = ['cv', 'dv']
+    class _DvEnv:
+        def __init__(self):
+            self.sim = _DvSim()
+            self.rng = _np.random.default_rng(0)
+    iso_cfg = TrainConfig()
+    iso_cfg.episode_length = 40
+    iso_cfg.dv_prbs_op_frac = 0.8
+    scaled = _scale_isolation_level(0.5, 1.0 / 0.6)
+    sched = _build_dv_prbs_schedule(
+        _DvEnv(), iso_cfg, long_hold=True, isolate_dv_idx=0,
+        isolated_level=scaled)
+    assert abs(float(sched[0]['delta']) - _dv_isolation_delta(scaled, 10.0)) < 1e-9
+    print('[smoke] OK  isolation |ΔCV| dcv_match scales (test_sim 2.81 vs 0.49)')
+
+
 def _test_envfree_observer_recipe() -> None:
     """Env-free TrainConfig must already be the P26 observer / P28 actor stack."""
     c = TrainConfig()
@@ -714,6 +759,8 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
     assert not hasattr(c, 'wm_isolation_var_norm')
+    assert c.wm_isolation_dcv_match is True
+    assert 'DREAMER_WM_ISOLATION_DCV_MATCH' in ENV_OVERRIDES
     assert c.cont_gain_deterministic_roll is True
     assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
     print('[smoke] OK  env-free TrainConfig = P26 observer / P28 actor recipe')
@@ -827,6 +874,7 @@ if __name__ == '__main__':
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
     _test_auto_if_unset_honours_explicit()
+    _test_isolation_dcv_scales()
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         _test_write_resolved_run_plan(td)

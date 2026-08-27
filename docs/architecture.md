@@ -269,10 +269,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > by ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation inv-var
 > (`wm_isolation_var_norm`) tried to equalize that and **failed three
 > formulas** (P34 explode, P35 quiet-hold, P36 33× DV skip-storm).
-> Abs MSE is the only path (A/B **REMOVED**). Next DV lever is not
-> another isolation reweight: if DV stays ~×0.66 after P37, equalize
-> isolation **|ΔCV| via excitation amplitude** (`Δu_i ∝ 1/|G_i|`,
-> clipped to bounds). Not relative Huber.
+> Abs MSE is the only path (A/B **REMOVED**). Default
+> `wm_isolation_dcv_match` scales isolation **excitation**
+> `Δu_i ∝ 1/|G_i|` (clipped to ±1) so |ΔCV| matches at the linspace
+> edge. Equal-|G| plants keep the op-band linspace. Not relative Huber.
+> P37 GPU still runs unscaled abs (launch `4d349fb`). Next env-free
+> launch after P37 GAIN_NOT_READY is this recipe; if P37 is GAIN-READY
+> opt out `DREAMER_WM_ISOLATION_DCV_MATCH=0` for the actor experiment.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

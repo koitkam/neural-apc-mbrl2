@@ -377,6 +377,10 @@ test_sim 24+24 / isolation-buf cap 48 settle-only; distillation 4 MV + 1 DV →
 long-hold settle is noise-free when `clean_steady_seeds` (default ON).
 Isolation DV settle uses MV-action units (`isolated_level × span/2`);
 sample windows are `max(seq_len, K+1)` so ss-match can reach SS.
+Default `wm_isolation_dcv_match=True` then scales each input's
+`isolated_level` by `1/|G_i|` (WM-norm gain-match targets, clipped to
+±1) so abs isolation/ss-match sees matched |ΔCV| — not a loss reweight
+(`DREAMER_WM_ISOLATION_DCV_MATCH=0` to keep isomorphic |Δu|).
 Warm-restore no-ops when `wm_best.pt` is essentially the current state.
 
 #### Reward-MTP / WM-coupling diagnostics (P39)

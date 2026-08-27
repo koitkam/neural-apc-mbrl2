@@ -915,6 +915,13 @@ class TrainConfig:
     # explode, P35 quiet-hold, P36 33× DV) — same class as P27 relative
     # Huber.  The A/B path was removed, not kept as opt-in.  Do not re-add
     # ``wm_isolation_var_norm`` / ``DREAMER_WM_ISOLATION_VAR_NORM``.
+    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA, P37-live prep):
+    # ``Δu_i ∝ 1/|G_i|`` from gain-match WM-norm targets, clipped to ±1.
+    # Abs MSE on isomorphic |Δu| drowns the weak-|G| input (|tgt| MV 2.82 vs
+    # DV 0.49 → P32/P33 val DV ×0.66–0.68).  This is DATA amplitude, not a
+    # loss reweight.  Equal-|G| plants keep the op-band linspace.  Opt out
+    # ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` (e.g. P37 GAIN-READY actor A/B).
+    wm_isolation_dcv_match: bool = True
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -3251,6 +3258,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
+        f"iso_dcv={bool(getattr(cfg, 'wm_isolation_dcv_match', True))} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -3504,10 +3512,107 @@ def _dv_isolation_delta(isolated_level: Optional[float], span: float) -> float:
     extra op_frac shrank |ΔDV| vs |ΔMV| → smaller |ΔCV| → absolute
     isolation/ss-match MSE under-trained DV (same family as abs-Huber
     on unequal |tgt|).  Ordinary DV-PRBS still uses ``dv_prbs_op_frac``.
+    ``wm_isolation_dcv_match`` scales ``isolated_level`` at the caller
+    (``Δu ∝ 1/|G|``); this helper stays isomorphic.
     """
     frac = 0.0 if isolated_level is None else float(
         np.clip(isolated_level, -1.0, 1.0))
     return float(frac * 0.5 * abs(float(span)))
+
+
+def _gain_col_rms(rows) -> List[float]:
+    """Per-input RMS |G| across CVs from ``gain_match_*_target`` tuples."""
+    out: List[float] = []
+    for row in (rows or ()):
+        if row is None:
+            out.append(0.0)
+            continue
+        if np.ndim(row) == 0:
+            xs = [abs(float(row))]
+        else:
+            xs = [abs(float(x)) for x in row]
+        xs = [x for x in xs if np.isfinite(x)]
+        if not xs:
+            out.append(0.0)
+        else:
+            out.append(float(np.sqrt(np.mean(np.square(xs)))))
+    return out
+
+
+def _scale_isolation_level(level: float, scale: float) -> float:
+    """Clip ``level * scale`` to the normalized-action cube."""
+    return float(np.clip(float(level) * float(scale), -1.0, 1.0))
+
+
+def _isolation_dcv_scales(
+        cfg: 'TrainConfig', n_mv: int, n_dv: int, op_band: float,
+) -> Tuple[List[float], List[float]]:
+    """Per-input multipliers so isolation |G_i|·|u_i| match at the linspace edge.
+
+    Abs isolation/ss-match MSE drowns the weak-|G| input when |Δu| is
+    MV-action-isomorphic (P33 |tgt| 2.82 vs 0.49 → val DV ×0.66).  Inv-var
+    reweight DISCARDED (P34–P36).  Scale ``Δu_i ∝ 1/|G_i|`` from WM-norm
+    gain-match targets and clip to ±1 (weak input may use the op-band
+    headroom; strong input shrinks).  Equal-|G| (max/min < 1.05) or a
+    single input keeps the unscaled op-band linspace.  Off
+    (``wm_isolation_dcv_match=False``) or missing targets → all 1s.
+    """
+    n_mv = max(0, int(n_mv or 0))
+    n_dv = max(0, int(n_dv or 0))
+    ones_mv = [1.0] * n_mv
+    ones_dv = [1.0] * n_dv
+    if not _cfg_on(cfg, 'wm_isolation_dcv_match', True):
+        return ones_mv, ones_dv
+    mv_g = _gain_col_rms(getattr(cfg, 'gain_match_mv_target', ()) or ())
+    dv_g = _gain_col_rms(getattr(cfg, 'gain_match_dv_target', ()) or ())
+    while len(mv_g) < n_mv:
+        mv_g.append(0.0)
+    while len(dv_g) < n_dv:
+        dv_g.append(0.0)
+    mv_g = mv_g[:n_mv]
+    dv_g = dv_g[:n_dv]
+    g_all = [g for g in mv_g + dv_g if g > 1e-6]
+    if len(g_all) < 2:
+        return ones_mv, ones_dv
+    g_min = float(min(g_all))
+    g_max = float(max(g_all))
+    if g_max / max(g_min, 1e-12) < 1.05:
+        return ones_mv, ones_dv
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
+    smax = 1.0 / a0
+
+    def _sc(gs: List[float]) -> List[float]:
+        out: List[float] = []
+        for g in gs:
+            if g <= 1e-6:
+                out.append(1.0)
+            else:
+                out.append(float(np.clip(g_min / (g * a0), 1e-3, smax)))
+        return out
+
+    return _sc(mv_g), _sc(dv_g)
+
+
+def _gain_match_targets_ready(cfg: 'TrainConfig') -> bool:
+    mv = getattr(cfg, 'gain_match_mv_target', None) or ()
+    dv = getattr(cfg, 'gain_match_dv_target', None) or ()
+    return bool(mv) or bool(dv)
+
+
+def _maybe_resolve_gain_match_targets(env: 'APCEnv', cfg: 'TrainConfig') -> bool:
+    """Resolve WM-norm |G| before isolation-settle (obs-norm already running).
+
+    Isolation settle is late in seed fill (after PRBS / const / step-test /
+    DV-PRBS) so Welford obs-norm is already on the operational buffer.
+    Failure leaves scales at 1; the post-seed resolve still runs.
+    """
+    if _gain_match_targets_ready(cfg):
+        return True
+    try:
+        _resolve_gain_match_targets(env, cfg)
+    except Exception:
+        return False
+    return _gain_match_targets_ready(cfg)
 
 
 def _maybe_clean_steady_seed(env: 'APCEnv', cfg: 'TrainConfig') -> None:
@@ -9377,9 +9482,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # isolated MV, and wired ``_st_levels`` to *other* MVs (no-op on
     # test_sim).  These are the ONLY episodes written to ``isolation_buf``
     # (follow-up 8): ordinary MIMO PRBS / all-DV PRBS stay in the main
-    # replay buffer.
+    # replay buffer.  ``wm_isolation_dcv_match`` then scales each
+    # input's ``isolated_level`` by ``1/|G_i|`` (clipped to ±1) so abs
+    # isolation/ss-match sees matched |ΔCV| (P33 drowning; not a loss
+    # reweight).
     n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
     if isolation_buf is not None and n_settle > 0:
+        _maybe_resolve_gain_match_targets(env, cfg)
+        _mv_sc, _dv_sc = _isolation_dcv_scales(cfg, n_mv, n_dv, const_op_band)
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
                                  dtype='float32')
         _st_jit = env.rng.uniform(-0.05, 0.05,
@@ -9391,31 +9501,38 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # test_sim 1+1 stays 24+24.  Hold every other MV/DV so ss-match
         # is not a MIMO-confounded mixture.
         for _mv_i in range(max(0, n_mv)):
+            _sc = _mv_sc[_mv_i] if _mv_i < len(_mv_sc) else 1.0
             for _lvl in _st_levels:
                 ep = collect_prbs_episode(
                     env, cfg, action_std=0.0,
                     op_band=prbs_op_band, long_hold=True,
                     isolate_dim=int(_mv_i), hold_level=0.0,
-                    isolated_level=float(_lvl))
+                    isolated_level=_scale_isolation_level(float(_lvl), _sc))
                 isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
                                           ep['cont'])
                 total_env_steps += cfg.episode_length
                 _n_mv_settle += 1
         if n_dv > 0:
             for _dv_j in range(n_dv):
+                _sc = _dv_sc[_dv_j] if _dv_j < len(_dv_sc) else 1.0
                 for _lvl in _st_levels:
                     ep = collect_dv_prbs_episode(
                         env, cfg, mv_level=0.0, long_hold=True,
                         isolate_dv_idx=int(_dv_j),
-                        isolated_level=float(_lvl))
+                        isolated_level=_scale_isolation_level(
+                            float(_lvl), _sc))
                     isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
                                               ep['cont'])
                     total_env_steps += cfg.episode_length
                     _n_dv_settle += 1
+        _sc_txt = (
+            f"dcv_match MV={['%.3g' % s for s in _mv_sc]} "
+            f"DV={['%.3g' % s for s in _dv_sc]}"
+            if _cfg_on(cfg, 'wm_isolation_dcv_match', True) else 'dcv_match=off')
         print(f"[seed] isolated-settle MV={_n_mv_settle} DV={_n_dv_settle} "
               f"(per_input={n_settle}, n_mv={n_mv}, n_dv={n_dv}; "
               f"whole-ep hold @ stratified level, action_std=0 → "
-              f"wm_ss_match)", flush=True)
+              f"wm_ss_match; {_sc_txt})", flush=True)
 
     # ---------- APC expert seed episodes (P81 design, 2026-06-03) ----------
     # Build the steady-state expert (static gain-schedule or NN surrogate),
@@ -9518,14 +9635,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     # p08 RCA: resolve the gain-match targets from the identified gains now that
     # obs-norm is fitted (seed buffer collected above) → re-anchor the WM
-    # steady-state gains that isolation-only let shrink.  Graceful no-op if the
-    # identification data is missing (isolation loss still supervises the gain).
-    try:
-        _resolve_gain_match_targets(env, cfg)
-    except Exception as _gm_exc:
-        cfg.gain_match_coef = 0.0
-        print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
-              f'falling back to isolation-only WM gain supervision.', flush=True)
+    # steady-state gains that isolation-only let shrink.  Isolation settle
+    # already tried this (for |ΔCV| excitation scales); skip a second print
+    # when it succeeded.  Graceful no-op if the identification data is missing
+    # (isolation loss still supervises the gain).
+    if not _gain_match_targets_ready(cfg):
+        try:
+            _resolve_gain_match_targets(env, cfg)
+        except Exception as _gm_exc:
+            cfg.gain_match_coef = 0.0
+            print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
+                  f'falling back to isolation-only WM gain supervision.',
+                  flush=True)
     _resolve_aux_tbptt_steps(cfg)
     _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:
