@@ -42,7 +42,9 @@ from training.train import (
                             _should_restore_last_ok_at_p1_freeze,
                             _wm_recon_scalar,
                             _auto_if_unset, _write_resolved_run_plan,
-                            _resolve_compile_mode)
+                            _resolve_compile_mode,
+                            _clone_module_state, _refresh_module_state,
+                            _p1_need_agent_finetune)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -170,6 +172,25 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _wm_fidelity_es_suppressed_frozen_g(False) is True
     assert _wm_fidelity_es_suppressed_frozen_g(True) is False
     print('[smoke] OK  P1 skip-storm continue first / cap second; frozen-g ES')
+    assert _p1_need_agent_finetune(0.0, False, 0, 100) is False
+    assert _p1_need_agent_finetune(0.0, True, 98, 100) is False
+    assert _p1_need_agent_finetune(0.0, True, 99, 100) is True
+    assert _p1_need_agent_finetune(1.0, False, 0, 100) is True
+    print('[smoke] OK  P1 MTP skip when reward_scale_loss_p1=0 (log last only)')
+
+    class _Snap(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.arange(4.0))
+
+    _m = _Snap()
+    _d0 = _clone_module_state(_m, torch.device('cpu'))
+    _m.w.data.add_(1.0)
+    _d1 = _refresh_module_state(_d0, _m, torch.device('cpu'))
+    assert _d1 is _d0
+    assert torch.equal(_d1['w'], _m.w.detach())
+    assert _d1['w'].data_ptr() != _m.w.data_ptr()
+    print('[smoke] OK  last-ok snapshot refresh copy_ (same storage, not aliased)')
     _tc = TrainConfig()
     assert float(_tc.gain_match_huber_beta) == 1.0
     assert int(_tc.aux_tbptt_steps) == 16

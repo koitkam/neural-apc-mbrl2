@@ -204,14 +204,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > ×1.088/×1.098, DV ×0.675/×0.754, det_r 0.109. `[p3-skip]` KEEP.
 > **P33 LIVE (2026-08-27 03:55, tmux `mbrl2_p33`, `run_p33_keepext`):**
 > keep `p1_gate_max_ext_steps` on storm-1 continue. Storm 2 still
-> `_force_p1_cap_at`. Env-free det+eager CONFIRMED (`[resolved-cfg]`
-> `storm_cap=2 compile=eager`). Through P1 iter **77** recon **0.0041**
-> skip **0**. **Iter 75 gate EXTENDED** (`not_plateaued`, +75396 to
-> 829356; P32 CAPPED here). GPU occupied — no second job. Isolation /
-> P3 frozen-observer `rollout_observed(..., store_aux=False)` skips
-> unused logit stacks. Stage-1 skips `apply_dob` clone + ground/reg
-> (`d_t≡0`); isolation / overshoot / held use the RSSM-interface
-> (TSSM too).
+> `_force_p1_cap_at`. Env-free det+eager CONFIRMED. **No skip-storm.**
+> Iter 75 **EXTENDED** (`not_plateaued`). Iter 85 **EXTENDED**
+> (`gain_not_ready` 0.68@DV). Iter 97 **CAPPED** after using the
+> 175924 ext cap — still 0.68@DV (MV 1.11 in band). Keep-ext path
+> is live; extra P1 did **not** pin DV. P2 recon ~0.004, `dobg` live,
+> `g` frozen. `[p3-skip]` expected. GPU occupied — no second job.
+> HEAD (not in pid 4146603): skip unused P1 MTP when
+> `reward_scale_loss_p1=0`; last-ok snapshot `copy_`.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets

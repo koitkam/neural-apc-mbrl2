@@ -3161,6 +3161,59 @@ def _clone_module_state(model: torch.nn.Module, device: torch.device
         return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
+def _refresh_module_state(
+        dst: Optional[Dict[str, torch.Tensor]],
+        model: torch.nn.Module, device: torch.device
+        ) -> Dict[str, torch.Tensor]:
+    """Reuse last-ok tensor storage (``copy_``) instead of a fresh 45 MB clone.
+
+    Same weights as ``_clone_module_state``.  First call (``dst is None``)
+    allocates; later P1 iters overwrite in place.  If a previous snapshot
+    spilled to CPU, keep copying on CPU.  Host-adaptive: no extra threads.
+    """
+    if dst is None:
+        return _clone_module_state(model, device)
+    sd = model.state_dict()
+    sample = next(iter(dst.values()), None)
+    spill_cpu = (sample is not None and sample.device.type == 'cpu'
+                 and device.type == 'cuda')
+    try:
+        for k, v in sd.items():
+            src = v.detach()
+            if spill_cpu:
+                src = src.cpu()
+            old = dst.get(k)
+            if (old is not None and old.shape == src.shape
+                    and old.dtype == src.dtype
+                    and old.device == src.device):
+                old.copy_(src)
+            else:
+                dst[k] = src.clone()
+        for k in list(dst.keys()):
+            if k not in sd:
+                del dst[k]
+        return dst
+    except RuntimeError as exc:
+        if device.type != 'cuda' or 'out of memory' not in str(exc).lower():
+            raise
+        torch.cuda.empty_cache()
+        return {k: v.detach().cpu().clone() for k, v in sd.items()}
+
+
+def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
+                            step_i: int, n_inner: int) -> bool:
+    """P1 MTP is in ``total_loss`` only when ``reward_scale_loss_p1>0``.
+
+    Paper default 0: the P1 ``agent_finetune_loss`` forward was discarded
+    (``total_loss = wm_total``) yet still ran 100× per iter.  Skip it
+    except the last inner step of a logged iter so jsonl ``bc`` /
+    ``reward_mtp`` still come from that step.  Objective unchanged.
+    """
+    if float(rmtp_weight or 0.0) != 0.0:
+        return True
+    return bool(will_log) and int(step_i) + 1 == int(n_inner)
+
+
 def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     """Rewrite ``run_plan.json → config`` after train.py auto-enables.
 
@@ -10339,9 +10392,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             except Exception:
                 pass
 
-        for _ in range(cfg.train_steps_per_iter
-                          if current_phase != 3
-                          else max(1, int(cfg.phase3_train_steps_per_iter))):
+        n_inner = (int(cfg.train_steps_per_iter) if current_phase != 3
+                   else max(1, int(cfg.phase3_train_steps_per_iter)))
+        _log_every = max(1, int(getattr(cfg, 'log_every', 1) or 1))
+        _will_log = ((int(total_iters) + 1) % _log_every == 0)
+        p1_rmtp_weight = (0.0 if diag_disable_reward_mtp_in_p1
+                          else float(cfg.reward_scale_loss_p1))
+        for _i in range(n_inner):
             _t = time.time()
             # mbrl2 real-sim: P3 actor-critic REINFORCE is ON-POLICY — sample the
             # dedicated on-policy buffer (recent current-policy episodes only), NOT
@@ -10376,22 +10433,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     if (wm_trunk_stopgrad_in_p2 and current_phase == 2
                             and isinstance(agent_hid, torch.Tensor)):
                         agent_hid = agent_hid.detach()
-                    # P1 + P2 both train the reward MTP head (paper
-                    # Algorithm 1: tokenizer + dynamics + reward + value
-                    # are co-trained throughout WM pretraining).
-                    # Previously P1 used only ``recon + sf``, leaving
-                    # the reward head untrained until P2 (~10 iters of
-                    # reward gradient at our default budget).
-                    # validate-iter80 RCA (2026-05-06): reward head
-                    # Pearson r = 0.16 with pred_std=2.8 vs real_std=80
-                    # — under-trained.  Adding reward MTP to P1 gives
-                    # ~3× more reward-head gradient updates over the
-                    # full schedule.  BC loss is *not* added in P1
-                    # because random-action episodes carry no expert
-                    # signal; cloning them collapses the actor prior
-                    # to uniform (preserves the existing P2-only BC
-                    # rationale documented at TrainConfig.bc_scale).
-                    if current_phase == 1:
+                    # P1 reward-MTP is opt-in (``reward_scale_loss_p1``,
+                    # paper default 0 — head trains in P2+).  BC is
+                    # never in the P1 loss (random-action clone would
+                    # collapse the prior).  Skip the unused MTP forward
+                    # except the last inner step of a logged iter.
+                    if (current_phase == 1
+                            and _p1_need_agent_finetune(
+                                p1_rmtp_weight, _will_log, _i, n_inner)):
                         # P39 diag C: optional stop-gradient on agent_hid
                         # before reward-MTP head, to isolate whether
                         # reward-MTP gradients distort the encoder/dynamics
@@ -10402,8 +10451,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 and not diag_disable_reward_mtp_in_p1
                                 and isinstance(agent_hid, torch.Tensor)):
                             _hid_for_agent = agent_hid.detach()
-                        ag_losses = agent_finetune_loss(model, batch,
-                                                          _hid_for_agent, cfg)
+                        if p1_rmtp_weight == 0.0:
+                            with torch.no_grad():
+                                ag_losses = agent_finetune_loss(
+                                    model, batch, _hid_for_agent, cfg)
+                        else:
+                            ag_losses = agent_finetune_loss(
+                                model, batch, _hid_for_agent, cfg)
                 # Phase 2: also update reward + policy via MTP (eq. 9).
                 if current_phase == 2:
                     with torch.amp.autocast(device_type=device.type,
@@ -10425,8 +10479,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # honoured as a hard override to force-zero the P1
                     # weight regardless of cfg, for backward-compat with
                     # ad-hoc ablation runs.
-                    p1_rmtp_weight = (0.0 if diag_disable_reward_mtp_in_p1
-                                       else float(cfg.reward_scale_loss_p1))
                     if p1_rmtp_weight == 0.0:
                         total_loss = wm_losses['wm_total']
                     else:
@@ -10729,11 +10781,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
             if _recon_still_healthy(_rlv, p1_recon_best, _ok_ratio):
                 # In-process snapshot — skip-storm restore never needs
-                # disk on the happy path.  GPU clone (no H2D sync every
-                # P1 iter); CPU if VRAM is tight.  Written to
-                # wm_last_ok.pt only if a storm actually fires.
+                # disk on the happy path.  Reuses last-ok storage
+                # (``copy_``) after the first alloc; CPU if VRAM is
+                # tight.  Written to wm_last_ok.pt only if a storm fires.
                 try:
-                    p1_last_ok_sd = _clone_module_state(model, device)
+                    p1_last_ok_sd = _refresh_module_state(
+                        p1_last_ok_sd, model, device)
                     p1_last_ok_ckpt_path = out_dir / 'wm_last_ok.pt'
                     p1_last_ok_iter = int(total_iters)
                     if p1_recon_best is None or _rlv < p1_recon_best:
