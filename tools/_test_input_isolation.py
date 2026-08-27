@@ -188,7 +188,7 @@ def main():
     assert cont_grad_vn > 0.0, 'var-norm isolation did NOT reach cont-gain!'
     print(f'[iso-varnorm] OK: abs={float(loss_abs):.5f} vn={float(loss_vn):.5f} '
           f'wmax={wmax:.3f} cont_grad={cont_grad_vn:.4e}')
-    cfg.wm_isolation_var_norm = True
+    cfg.wm_isolation_var_norm = False
 
     # ---- steady-state (DC-gain) match term (2026-08-03) ----
     base = float(_iso(model, obs, act, cfg))  # ss off

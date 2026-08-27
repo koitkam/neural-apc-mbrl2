@@ -207,10 +207,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > No skip-storm. Val MV ss/@H ×1.083/×1.093, DV ×0.660/×0.770,
 > det_r 0.398 (amplitude still dead). `[p3-skip]` KEEP. Keep-ext KEEP
 > as mechanism, **FALSIFIED as DV lever**. Abs isolation drowns DV
-> (|tgt| MV 2.82 vs DV 0.49). **P34** (`run_p34_isovarnorm`): isolation
-> / ss-match inverse-variance reweight (`wm_isolation_var_norm=True`;
-> P34 `mean(err/scale)*mean(scale)` exploded iso 7088 skip 99 —
-> **P35** uses `mean(w·err)` with mean(w)=1). Gain-match stays abs Huber.
+> **P36 EXIT (2026-08-27 11:44, `run_p36_isoinpscale`, 61 iters):**
+> per-input `|G|²` fired (`tgt_scale=1`, scale_ratio 20–33) but inv-var
+> **DISCARDED**: iso 0.125 vs P33 1.69, gmatch stuck 1.21, storm 2/2
+> @iter 7, val MV ×0.91 DV ×0.004 det_r 0.076. `[p3-skip]`. Same class
+> as P27 relative Huber (33× DV isolation grad). Default is **abs
+> isolation** (`wm_isolation_var_norm=False`). `DREAMER_WM_ISOLATION_VAR_NORM=1`
+> is A/B only. Do not try another isolation reweight.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
@@ -261,13 +264,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > (test_sim seq_len ≥ H unchanged). Isolation extra unroll is skipped
 > when `g` is frozen (DOB curriculum P2 — dead hot-path forward).
 > **P34/P35/P36:** even with isomorphic |Δu|, WM-norm |ΔCV| still differs
-> by ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation/ss-match
-> default inverse-variance reweight (`wm_isolation_var_norm`):
-> `mean(w·err)` with mean(w)=1 and **per-input** scale (identified
-> `|tgt|²`; no-ID fallback = scatter-mean CV² of that input). P34 AM/HM
-> form exploded. P35 EXIT per-sequence `|CV|²` starved quiet-hold
-> sequences (scale_ratio ~22000, iso 0.0008, gmatch stuck 1.21, storm
-> 2/2 cap, val DV ×0.013). P36 uses per-input `|G|²`. Not relative Huber.
+> by ~|G| (test_sim gain-match |tgt| 2.82 vs 0.49). Isolation inv-var
+> (`wm_isolation_var_norm`) tried to equalize that and **failed three
+> formulas** (P34 explode, P35 quiet-hold, P36 33× DV skip-storm).
+> Env-free default is **abs MSE** (P33). Opt-in `DREAMER_WM_ISOLATION_VAR_NORM=1`
+> only. Next DV lever is not another isolation reweight. Not relative Huber.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

@@ -379,7 +379,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert float(_got_dv) > float(_err_dv.mean()) + 0.2
     _got_init = _invvar_reweight(torch.ones(2), torch.tensor([1.0, 1e-3]))
     assert float(_got_init) < 5.0, float(_got_init)
-    assert TrainConfig().wm_isolation_var_norm is True
+    assert TrainConfig().wm_isolation_var_norm is False
     _cfg_iso = TrainConfig()
     _cfg_iso.gain_match_mv_target = ((-2.82,),)
     _cfg_iso.gain_match_dv_target = ((0.49,),)
@@ -398,7 +398,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _src == 1.0 and torch.allclose(_sc[0], _sc[1])
     assert abs(float(_sc[0] / _sc[2]) - (2.82 / 0.49) ** 2) < 0.5
     print('[smoke] OK  isolation inv-var reweight (identity + DV boost; '
-          'init-stable; per-input |G|²; default ON)')
+          'init-stable; per-input |G|²; default OFF / P36 RCA)')
 
     # P28 follow-up 8: long-hold isolation settle zeros sim noise (P89 gate).
     class _DummyIsoEnv:
@@ -743,7 +743,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' in ENV_OVERRIDES
     assert c.cont_gain_deterministic_roll is True
-    assert c.wm_isolation_var_norm is True
+    assert c.wm_isolation_var_norm is False
     assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
     print('[smoke] OK  env-free TrainConfig = P26 observer / P28 actor recipe')
 

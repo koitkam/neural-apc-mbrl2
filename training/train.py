@@ -910,19 +910,15 @@ class TrainConfig:
     # signal a mixed PRBS+settle isolation batch drowns.  0 = off (unweighted).
     wm_ss_match_settle_var: float = 0.0
     wm_isolation_settle_episodes: int = 0   # long-hold settle eps PER isolated input (auto 24)
-    # Inverse-variance reweight of isolation / ss-match (P33 RCA).
-    # Abs trajectory MSE drowns the subdominant input: test_sim gain-match
-    # targets |MV|≈2.82 vs |DV|≈0.49 (~5.8×) so |ΔCV|² weights MV ~33×
-    # more.  Extra P1 (keep-ext) left live DV at 0.68 — same as P32 val
-    # ×0.675.  ``mean(w·err)`` with ``w∝1/scale``, ``mean(w)=1``.
-    # Scale is **per isolated input** (identified |tgt|², else batch
-    # mean CV² of that input) — NOT per-sequence |CV|².
-    # P35 EXIT: per-sequence scale hit the 1e-4 floor on near-zero
-    # stratified holds → scale_ratio ~22000, iso ~0.0008 vs P33 ~1.69,
-    # gain-match stuck at 1.21, storm 2/2 cap, val DV ×0.013.
-    # P34 ``mean(err/scale)*mean(scale)`` exploded (iso 7088, skip 99).
-    # NOT relative Huber (P27).  ``DREAMER_WM_ISOLATION_VAR_NORM=0`` = abs.
-    wm_isolation_var_norm: bool = True
+    # Inverse-variance reweight of isolation / ss-match — **opt-in, default
+    # OFF** (P36 RCA).  Abs MSE (P33) completes P1 (gmatch 1.21→0.002 by
+    # iter 9, no skip-storm, val DV ×0.66).  Inv-var is relative-gain
+    # reweight: ``w∝1/|G|²`` upweights DV ~33× (same class as P27 relative
+    # Huber).  P34 AM/HM exploded; P35 per-seq |CV|² quiet-hold starved
+    # (scale_ratio ~22000); P36 per-input |G|² fired (ratio 20–33,
+    # tgt_scale=1) but iso 0.125 vs P33 1.69, gmatch stuck 1.21, storm
+    # 2/2 @iter 7, val DV ×0.004.  ``DREAMER_WM_ISOLATION_VAR_NORM=1`` = A/B.
+    wm_isolation_var_norm: bool = False
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -3259,7 +3255,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
-        f"iso_varnorm={bool(getattr(cfg, 'wm_isolation_var_norm', True))} "
+        f"iso_varnorm={bool(getattr(cfg, 'wm_isolation_var_norm', False))} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -5774,11 +5770,11 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     ``0`` for other backbones / when off.
 
     Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match.
-    Default inverse-variance reweight (``wm_isolation_var_norm``) equalizes
-    **per-input** relative error (identified |G|²); abs mean when off.
+    Default is abs mean (P33 / P36 RCA).  Opt-in inverse-variance
+    (``wm_isolation_var_norm``) equalizes per-input relative error
+    (identified |G|²) but skip-stormed P1 at 20–33× DV upweight.
     ``extras`` splits the folded DC-gain term (``wm_ss_match_loss``) plus
-    var-norm diagnostics (``wm_isolation_var_tgt_scale`` = 1 when the
-    gain-match LUT is used).
+    var-norm diagnostics when the A/B is on.
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     empty: Dict[str, torch.Tensor] = {}
@@ -5846,7 +5842,7 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     cv_pred = rssm.decode(roll_feats).index_select(
         -1, cv_idx)                                               # (Bm, K, n_cv)
     err_b = (cv_pred - cv_real).pow(2).mean(dim=(1, 2))            # (Bm,)
-    var_norm = bool(getattr(cfg, 'wm_isolation_var_norm', True))
+    var_norm = bool(getattr(cfg, 'wm_isolation_var_norm', False))
     extras: Dict[str, torch.Tensor] = {}
     iso_w: Optional[torch.Tensor] = None
     if var_norm:
