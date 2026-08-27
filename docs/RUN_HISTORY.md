@@ -97,7 +97,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P30 | 2026-08-26 | env-free det+eager; cap P1 on first skip-storm | froze iter 18; val MV mean ×1.88; P3 skipped | ❌ cap-on-first REVERTED |
 | P31 | 2026-08-26 | `storm_cap=2`; no skip-storm | healthy P1 to 94; CAPPED exploded g; DV ×0.11 | ❌ freeze last-ok (P32); storm_cap KEEP |
 | P32 | 2026-08-27 | last-ok at detonated freeze; continue-after-storm | storm 1/2 @53 KEEP; val MV ×1.09 DV ×0.68 det_r 0.11; `[p3-skip]` | ❌ CAPPED 0.71@DV — extension closed; keep-ext = P33 |
-| P33 | 2026-08-27 | keep P1 extension on skip-storm continue | — | 🔬 launch `run_p33_keepext` |
+| P33 | 2026-08-27 | keep P1 extension on skip-storm continue | — | 🔬 LIVE `run_p33_keepext` |
 
 ## Run details
 
@@ -1338,6 +1338,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **One attributed GPU change vs P32 process `a138e1f`:** `_skip_storm_continue_p1` keeps `p1_gate_max_ext_steps` (already HEAD). Storm 2 still `_force_p1_cap_at`. Env-free. Same job also picks up isolation TBPTT chunked `img_rollout`, Stage-1 prior-core skip, TSSM `img_rollout`, DV-PRBS DRY (objective-unchanged; not in P32).
 - **Step 4 resolved-cfg vs P32:** TrainConfig knobs **identical** (env-free det+eager `storm_cap=2`). Diff is the continue code-path, not a `DREAMER_*` override. Watch `[skip-storm] … extension kept` (not `extension closed`); `[gate-budget]` p1_ext_cap must still be usable at the first P1→P2 gate.
 - **Judge by:** if storm 1/2 fires: log `extension kept <p1_ext_cap> steps`. If GAIN_NOT_READY at original P1 budget (~iter 75): **EXTEND** not `CAPPED … (cap 0 steps reached)`. Val MV ss/@H ~×1.0 ±0.1 (P26 ×0.97/×0.88; P32 ×1.09), DV not ×0.67. If GAIN-READY: first valid actor test of min-of-2 + freeze `return_scale` (rscale near warmup, `rtgt>0.015`, econ vs baseline **and** vs P32 BC −23 / P27 BC −59). If still GAIN_NOT_READY: `[p3-skip]`. Watch `[resolved-cfg] latent=deterministic compile=eager storm_cap=2`.
+- **LIVE (2026-08-27 03:55, tmux `mbrl2_p33`, GPU ~18.8 GB, pid 4146603):** env-free det+eager CONFIRMED. `[resolved-cfg] latent=deterministic restore_p2=False gain_match=1 dob_ground=2 isolation=1 ss_match=3 n_critics=2 rs_freeze=True skip_invalid_p3=True storm_cap=2 compile=eager`. Train-start `device=cuda bs=128`. `[gate-budget]` p1_ext_cap **175924**. Stage 1 @iter0. **No second GPU job.**
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 

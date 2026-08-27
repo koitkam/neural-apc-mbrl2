@@ -203,8 +203,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > skip-storm 1/2 @iter 53 KEEP. P1→P2 CAPPED GAIN_NOT_READY 0.71@DV
 > (healthy recon 0.0026; continue closed extension). Val MV ss/@H
 > ×1.088/×1.098, DV ×0.675/×0.754, det_r 0.109. `[p3-skip]` KEEP.
-> **P33** (`run_p33_keepext`): keep `p1_gate_max_ext_steps` on storm-1
-> continue (HEAD `8205f4b`). Storm 2 still `_force_p1_cap_at`. Env-free.
+> **P33 LIVE (2026-08-27 03:55, tmux `mbrl2_p33`, `run_p33_keepext`):**
+> keep `p1_gate_max_ext_steps` on storm-1 continue. Storm 2 still
+> `_force_p1_cap_at`. Env-free det+eager CONFIRMED (`[resolved-cfg]`
+> `storm_cap=2 compile=eager`). GPU occupied — no second job.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
