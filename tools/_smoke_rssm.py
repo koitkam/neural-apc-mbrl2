@@ -27,7 +27,8 @@ from training.train import (
                             _wm_fidelity_es_suppressed_frozen_g,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
-                            collect_prbs_episode, _build_dv_prbs_schedule,
+                            collect_episode, collect_prbs_episode,
+                            _build_dv_prbs_schedule,
                             _isolated_hold_action, _hold_other_action_dims,
                             _isolation_settle_counts,
                             _isolation_buf_capacity, _isolation_sample_seq_len,
@@ -476,6 +477,46 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     cfg.gain_match_mv_target = ()
     print('[smoke] OK  isolation skip when g frozen (_dynamics_g_trainable)')
     print('[smoke] OK  g-only aux (overshoot/held/gain-match) skip when g frozen')
+
+    # P1/P2 random collect must not advance the RSSM (state is discarded;
+    # WM teacher-forces from replay).  P3 on-policy still streams obs_step.
+    if wm_type == 'rssm':
+        class _DummyCollectEnv:
+            def __init__(self):
+                self.action_dim = action_dim
+                self.obs_dim = obs_dim
+                self.rng = __import__('numpy').random.default_rng(0)
+            def reset(self, exploration=True):
+                return __import__('numpy').zeros((1, self.obs_dim),
+                                                 dtype='float32')
+            def step(self, a):
+                return (__import__('numpy').zeros((1, self.obs_dim),
+                                                  dtype='float32'),
+                        0.0, False, {})
+        _n_obs = {'n': 0}
+        _orig_obs = model.dynamics.obs_step
+
+        def _count_obs(*a, **k):
+            _n_obs['n'] += 1
+            return _orig_obs(*a, **k)
+
+        model.dynamics.obs_step = _count_obs
+        _ccfg = TrainConfig()
+        _ccfg.episode_length = 8
+        _ccfg.lookback = 4
+        _ccfg.k_max = 4
+        _ccfg.tau_ctx = 0.1
+        _ccfg.world_model_type = 'rssm'
+        try:
+            collect_episode(_DummyCollectEnv(), model, torch.device('cpu'),
+                            _ccfg, random_action=True)
+            assert _n_obs['n'] == 0, _n_obs['n']
+            collect_episode(_DummyCollectEnv(), model, torch.device('cpu'),
+                            _ccfg, random_action=False)
+            assert _n_obs['n'] == 8, _n_obs['n']
+        finally:
+            model.dynamics.obs_step = _orig_obs
+        print('[smoke] OK  random collect skips RSSM obs_step; on-policy streams')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and

@@ -3589,34 +3589,26 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # host→device every step — that removes one transfer per step.  The
     # single device→host ``.cpu()`` of the chosen action is unavoidable
     # because the simulator runs on CPU/numpy.
+    #
+    # P1/P2 ``random_action=True`` never consults the policy: every step is
+    # uniform in [-1, 1], this function has no mixed-mode path, and the
+    # recurrent state is discarded at episode end (WM teacher-forces from
+    # replay).  Advancing obs_step anyway was ``ep_per_iter × episode_length``
+    # bs=1 GPU launches per iter (~17 s of P31 t_collect on test_sim) for
+    # a state nobody reads.  Skip it; P3 on-policy still streams the
+    # posterior.  Host-adaptive: same skip on CPU smokes (no 1220× obs_step).
+    _stream_rssm = _is_rssm and not random_action
     with torch.inference_mode():
         _rssm_state = (model.dynamics.initial_state(1, device)
-                       if _is_rssm else None)
+                       if _stream_rssm else None)
         _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
-                        if _is_rssm else None)
+                        if _stream_rssm else None)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
             if random_action:
                 a_np = env.rng.uniform(-1.0, 1.0,
                                         size=(env.action_dim,)).astype('float32')
-                if _is_rssm:
-                    # Advance the posterior even on random actions so the
-                    # recurrent state stays consistent if a later step is
-                    # policy-driven (mixed-mode collection).
-                    with torch.amp.autocast(device_type=device.type,
-                                             dtype=torch.bfloat16,
-                                             enabled=(device.type == 'cuda')):
-                        _o = torch.from_numpy(
-                            obs_window[-1]).to(device).unsqueeze(0)
-                        _emb = model.dynamics.embed(_o)
-                        _post, _ = model.dynamics.obs_step(
-                            _rssm_state, _rssm_prev_a, _emb, sample=True)
-                    _rssm_state = _post
-                    # Random action originates on host; the (1, A) host→device
-                    # copy is negligible and necessary (no device tensor yet).
-                    _rssm_prev_a = torch.from_numpy(
-                        a_np).to(device).unsqueeze(0)
             elif _is_rssm:
                 with torch.amp.autocast(device_type=device.type,
                                          dtype=torch.bfloat16,
@@ -3630,8 +3622,8 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                     # OPTIMAL STATE ESTIMATE — so acting on a SAMPLED belief here is
                     # a train/inference mismatch that injects latent-sampling noise
                     # into the MV (part of the p01 chatter, esp. at deterministic
-                    # eval).  Random-exploration collection above keeps sample=True
-                    # (diverse latents for WM training).
+                    # eval).  P1/P2 random collect (above) does not stream the
+                    # posterior at all — replay teacher-force is the WM path.
                     _post, _ = model.dynamics.obs_step(
                         _rssm_state, _rssm_prev_a, _emb, sample=False)
                     action_t, _, _ = model.policy(_post.feat,
