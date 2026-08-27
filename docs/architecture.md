@@ -275,11 +275,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > edge. Equal-|G| plants keep the op-band linspace. Not relative Huber.
 > Pre-iso resolve is **only** for those scales; gain-match Huber
 > targets always re-resolve after isolation+expert (P37 obs-norm freeze
-> point — skipping would confound P38). P37 GPU still runs unscaled abs
-> (launch `4d349fb`). Iter 75 EXTEND **0.68@DV** (MV 0.99) = P33 pin.
-> Next env-free launch after P37 GAIN_NOT_READY is this recipe; resolved
-> Δu scales land in `run_plan.isolation_dcv_scales`. If P37 is GAIN-READY
-> opt out `DREAMER_WM_ISOLATION_DCV_MATCH=0` for the actor experiment.
+> point — skipping would confound P38). P37 GPU (`run_p37_isoabs`,
+> launch `4d349fb`) ran unscaled abs. Iter 75 EXTEND **0.68@DV**, iter 85
+> **0.72@DV**, then extra-P1 silent detonation (iter 88 gnorm 62.4, skip 0).
+> P1→P2 detonated-freeze restored last-ok iter 87: MV **×1.00** DV **×0.71**.
+> Abs isolation CONFIRMED as the DV pin. Next env-free launch after EXIT is
+> this recipe (`run_p38_isodcv`); resolved Δu scales land in
+> `run_plan.isolation_dcv_scales`. Actor only if a later freeze is
+> GAIN-READY (`DREAMER_WM_ISOLATION_DCV_MATCH=0`). Do not launch P38
+> while P37 is live.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

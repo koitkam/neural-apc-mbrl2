@@ -737,6 +737,8 @@ def _test_isolation_dcv_scales() -> None:
     assert pay['on'] is False and pay['mv'] == [0.289] and pay['dv'] == [1.67]
     assert 'isolation_dcv_scales' in _src
     assert '_stash_isolation_dcv_scales' in _src
+    assert "'p1_last_ok_iter'" in _src
+    assert "row['wm_isolation_loss'] = row['wm_input_isolation_loss']" in _src
     assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
     assert _gain_col_rms(((-2.8, 0.0),))[0] > 1.0
     class _DvSim:

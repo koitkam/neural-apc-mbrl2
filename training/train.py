@@ -915,12 +915,13 @@ class TrainConfig:
     # explode, P35 quiet-hold, P36 33× DV) — same class as P27 relative
     # Huber.  The A/B path was removed, not kept as opt-in.  Do not re-add
     # ``wm_isolation_var_norm`` / ``DREAMER_WM_ISOLATION_VAR_NORM``.
-    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA, P37-live prep):
+    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA, P38 next):
     # ``Δu_i ∝ 1/|G_i|`` from gain-match WM-norm targets, clipped to ±1.
     # Abs MSE on isomorphic |Δu| drowns the weak-|G| input (|tgt| MV 2.82 vs
-    # DV 0.49 → P32/P33 val DV ×0.66–0.68).  This is DATA amplitude, not a
-    # loss reweight.  Equal-|G| plants keep the op-band linspace.  Opt out
-    # ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` (e.g. P37 GAIN-READY actor A/B).
+    # DV 0.49 → P32/P33/P37 freeze DV ×0.66–0.71).  This is DATA amplitude,
+    # not a loss reweight.  Equal-|G| plants keep the op-band linspace.
+    # Opt out ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` for an actor A/B on a
+    # GAIN-READY freeze (P37 was not: last-ok 0.71@DV).
     wm_isolation_dcv_match: bool = True
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
@@ -1719,7 +1720,11 @@ class TrainConfig:
     # exploded 0.004 → 0.50 (~125×); 5× still accepts mild recon jitter
     # and rejects a skip-storm detonation.  P31 also uses this ratio at
     # the P1→P2 freeze so a single huge-grad step that never trips
-    # skip-storm cannot freeze exploded g.  ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
+    # skip-storm cannot freeze exploded g.  P37 GPU-confirmed: extra-P1
+    # iter 88 gnorm 62.4 applied (skip 0; threshold 1e4), recon 0.003→0.85
+    # through cap, then restored last-ok iter 87 (0.71@DV).  Do not lower
+    # the skip threshold — wrap blips (P37 iter 19 gnorm ~9.5) recover.
+    # ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
     skip_storm_last_ok_recon_ratio: float = 5.0
     # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first
     # (keep extension) then cap.  ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
@@ -11016,9 +11021,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 'wm_frozen': bool(_wm_frozen_now),
                 'expert_det_return': last_expert_det_return,
                 'agent_minus_expert_return': last_agent_minus_expert,
+                'p1_last_ok_iter': (int(p1_last_ok_iter)
+                                    if int(p1_last_ok_iter) >= 0 else None),
             }
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
+            # Live key is ``wm_input_isolation_loss`` (ss-match split out).
+            # Alias so diagnosis scripts that still look for the pre-split
+            # name do not read None while the banner prints ``iso``.
+            if ('wm_isolation_loss' not in row
+                    and 'wm_input_isolation_loss' in row):
+                row['wm_isolation_loss'] = row['wm_input_isolation_loss']
             # P39 diag A: emit last computed per-head grad norms (if any).
             # Values may be float (grad norms) or str (error messages); pass
             # strings through unchanged so jsonl serialisation works.
