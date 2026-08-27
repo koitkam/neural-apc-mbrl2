@@ -701,7 +701,7 @@ class TransformerSSMDynamics(nn.Module):
         return post, prior
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
-                         sample: bool = True
+                         sample: bool = True, store_aux: bool = True
                          ) -> Tuple[torch.Tensor, torch.Tensor,
                                     torch.Tensor, TSSMState]:
         """Teacher-forced posterior rollout over (B, T, *).  ``act[:, t]`` drives
@@ -709,7 +709,9 @@ class TransformerSSMDynamics(nn.Module):
         in RSSMDynamics).  Returns (feats, post_logits, prior_logits,
         last_state, ds, cont) with shapes (B, T, F), (B, T, K, C), (B, T, K, C),
         the last state, ds (B, T, n_cv) = per-step DOB estimate (None=off), and
-        cont = continuous-latent stats (always None on the TSSM scaffold)."""
+        cont = continuous-latent stats (always None on the TSSM scaffold).
+        ``store_aux=False`` skips logit/cont stacks (same feats; isolation
+        encode)."""
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                         # (B, T, embed_dim)
@@ -737,11 +739,12 @@ class TransformerSSMDynamics(nn.Module):
                                         dv=dv_t, sample=sample, obs=None)
             state = post
             feats_l.append(post.feat[..., :dec_in])      # decoder feat [h,z,(c),(dv)]
-            post_l.append(post.z_logits)
-            prior_l.append(prior.z_logits)
-            if self.cont_dim > 0:
-                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+            if store_aux:
+                post_l.append(post.z_logits)
+                prior_l.append(prior.z_logits)
+                if self.cont_dim > 0:
+                    c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                    c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
             if _need_prior_core:
                 prior_core_l.append(prior.feat[..., :dec_in])
         if two_pass:
@@ -758,15 +761,16 @@ class TransformerSSMDynamics(nn.Module):
                                             cont_innov=nu_seq[:, t])
                 state = post
                 feats_l.append(post.feat[..., :dec_in])
-                post_l.append(post.z_logits)
-                prior_l.append(prior.z_logits)
-                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if store_aux:
+                    post_l.append(post.z_logits)
+                    prior_l.append(prior.z_logits)
+                    c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                    c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
                     prior_core_l.append(prior.feat[..., :dec_in])
         post_core = torch.stack(feats_l, dim=1)          # (B, T, dec_in) = [h,z,(dv)]
-        post_logits = torch.stack(post_l, dim=1)
-        prior_logits = torch.stack(prior_l, dim=1)
+        post_logits = (torch.stack(post_l, dim=1) if store_aux else None)
+        prior_logits = (torch.stack(prior_l, dim=1) if store_aux else None)
         ds = None
         if self.dob_enabled:
             if self.dob_active:
@@ -794,7 +798,7 @@ class TransformerSSMDynamics(nn.Module):
         # gain+disturbance latent), matching RSSMDynamics.rollout_observed so the
         # shared _rssm_world_model_loss unpacks both backbones.  None when off.
         cont = None
-        if self.cont_dim > 0:
+        if self.cont_dim > 0 and store_aux:
             cont = {
                 'post_mean': torch.stack(c_qm_l, dim=1),
                 'post_std': torch.stack(c_qs_l, dim=1),

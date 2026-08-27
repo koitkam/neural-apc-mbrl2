@@ -67,6 +67,35 @@ import torch.nn.functional as F
 from torch.distributions import OneHotCategorical
 
 
+_DOB_SCAN_MIX_BUDGET_BYTES: Optional[int] = None
+
+
+def _dob_scan_mix_budget_bytes() -> int:
+    """Cap the T×T Kalman mix by device RAM (identity on a 24 GB A10).
+
+    Closed-form mix is ``T×T×C``; ~16 MiB on this A10 (24 GiB / 1500).
+    Smaller GPUs drop the cap so a huge ``seq_len`` cannot OOM; larger
+    hosts may mix a longer window before falling back to the sequential
+    recurrence.  Floor 4 MiB / ceiling 64 MiB.  CPU smokes keep 16 MiB.
+    Cached after the first call (one device per process).
+    """
+    global _DOB_SCAN_MIX_BUDGET_BYTES
+    if _DOB_SCAN_MIX_BUDGET_BYTES is not None:
+        return _DOB_SCAN_MIX_BUDGET_BYTES
+    try:
+        if torch.cuda.is_available():
+            idx = torch.cuda.current_device()
+            total = int(torch.cuda.get_device_properties(idx).total_memory)
+            _DOB_SCAN_MIX_BUDGET_BYTES = int(
+                min(64 * 1024 * 1024,
+                    max(4 * 1024 * 1024, total // 1500)))
+            return _DOB_SCAN_MIX_BUDGET_BYTES
+    except Exception:
+        pass
+    _DOB_SCAN_MIX_BUDGET_BYTES = 16 * 1024 * 1024
+    return _DOB_SCAN_MIX_BUDGET_BYTES
+
+
 def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
     """Vectorized ``d_t = coef * d_{t-1} + u_t`` with ``d_{-1}=0``.
 
@@ -74,16 +103,17 @@ def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
     the old Python T-loop; that loop was T sequential GPU launches per WM
     step in P2 (``dob_active``).  Closed form
     ``d_t = sum_{s<=t} coef^{t-s} u_s`` via a lower-triangular mix.
-    Host-adaptive: if the T×T mix would exceed ~16 MiB, fall back to the
-    sequential recurrence (huge ``seq_len`` / many CVs).  Differentiable
-    in ``u`` and ``coef`` (P2 trains Kalman A,K through this).
+    Host-adaptive: if the T×T mix would exceed the device budget (≈16 MiB
+    on a 24 GB A10), fall back to the sequential recurrence (huge
+    ``seq_len`` / many CVs).  Differentiable in ``u`` and ``coef`` (P2
+    trains Kalman A,K through this).
     """
     B, T, C = u.shape
     if T == 0:
         return u
     nbytes = T * T * C * int(u.element_size())
     coef_f = coef.to(dtype=u.dtype)
-    if T == 1 or nbytes > 16 * 1024 * 1024:
+    if T == 1 or nbytes > _dob_scan_mix_budget_bytes():
         d_prev = torch.zeros(B, C, device=u.device, dtype=u.dtype)
         out = u.new_empty(B, T, C)
         for t in range(T):
@@ -709,7 +739,7 @@ class RSSMDynamics(nn.Module):
 
     # ----- sequence rollout ---------------------------------------------
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
-                         sample: bool = True
+                         sample: bool = True, store_aux: bool = True
                          ) -> Tuple[torch.Tensor, torch.Tensor,
                                     torch.Tensor, RSSMState]:
         """Teacher-forced posterior rollout over a (B, T, *) batch.
@@ -723,6 +753,11 @@ class RSSMDynamics(nn.Module):
         shapes ``(B, T, F)``, ``(B, T, K, C)``, ``(B, T, K, C)``, the final
         ``RSSMState`` (for imagination warm-start), and ``ds`` ``(B, T, n_cv)``
         = the per-step DOB disturbance estimate (``None`` when DOB is off).
+
+        ``store_aux=False`` skips stacking logits / cont-KL stats (same
+        ``feats``).  Isolation's no-grad encode discards those tensors;
+        keeping them alive for T steps was a dead alloc on the P1 hot path
+        (100 WM steps/iter).  Default ``True`` is the training path.
         """
         B, T = obs.shape[:2]
         device = obs.device
@@ -769,11 +804,12 @@ class RSSMDynamics(nn.Module):
                                         dv=dv_t, sample=sample, obs=None)
             state = post
             feats_l.append(post.feat[..., :dec_in])    # decoder feat [h,z,(c),(dv)]
-            post_l.append(post.z_logits)
-            prior_l.append(prior.z_logits)
-            if self.cont_dim > 0:
-                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+            if store_aux:
+                post_l.append(post.z_logits)
+                prior_l.append(prior.z_logits)
+                if self.cont_dim > 0:
+                    c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                    c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
             if _need_prior_core:
                 prior_core_l.append(prior.feat[..., :dec_in])
         if two_pass:
@@ -792,15 +828,16 @@ class RSSMDynamics(nn.Module):
                                             cont_innov=nu_seq[:, t])
                 state = post
                 feats_l.append(post.feat[..., :dec_in])
-                post_l.append(post.z_logits)
-                prior_l.append(prior.z_logits)
-                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if store_aux:
+                    post_l.append(post.z_logits)
+                    prior_l.append(prior.z_logits)
+                    c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                    c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
                     prior_core_l.append(prior.feat[..., :dec_in])
         post_core = torch.stack(feats_l, dim=1)        # (B, T, dec_in)=[h,z,(c),(dv)]
-        post_logits = torch.stack(post_l, dim=1)
-        prior_logits = torch.stack(prior_l, dim=1)
+        post_logits = (torch.stack(post_l, dim=1) if store_aux else None)
+        prior_logits = (torch.stack(prior_l, dim=1) if store_aux else None)
         ds = None
         if self.dob_enabled:
             if self.dob_active:
@@ -827,7 +864,7 @@ class RSSMDynamics(nn.Module):
         # Continuous-latent KL stats + posterior sample (for the cont KL +
         # gain-matching aux loss + disturbance readout).  ``None`` when off.
         cont = None
-        if self.cont_dim > 0:
+        if self.cont_dim > 0 and store_aux:
             cont = {
                 'post_mean': torch.stack(c_qm_l, dim=1),   # (B,T,cont_dim)
                 'post_std': torch.stack(c_qs_l, dim=1),

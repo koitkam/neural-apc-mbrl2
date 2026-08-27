@@ -5375,8 +5375,21 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         if not tgts:
             return zero
         g_wm = (cv_step_stack - cv_base) / step
-        tgt = torch.tensor([list(t) for t in tgts],
-                           device=g_wm.device, dtype=g_wm.dtype)
+        # Cache the (n_in, n_cv) target — same every WM step; rebuilding
+        # it from Python lists was a host→device sync on the 100-step P1
+        # inner loop.  Identity values.  Key includes the tgt numbers so a
+        # mid-run target rewrite cannot reuse a stale tensor of the same
+        # shape.
+        _tgt_key = (tuple(tuple(float(x) for x in t) for t in tgts),
+                    str(g_wm.device), str(g_wm.dtype),
+                    int(g_wm.shape[0]), int(g_wm.shape[-1]))
+        _cached = getattr(cfg, '_gain_match_tgt_cache', None)
+        if _cached is None or _cached[0] != _tgt_key:
+            tgt = torch.tensor([list(t) for t in tgts],
+                               device=g_wm.device, dtype=g_wm.dtype)
+            cfg._gain_match_tgt_cache = (_tgt_key, tgt)  # type: ignore[attr-defined]
+        else:
+            tgt = _cached[1]
         tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
                          g_wm.shape[-1]).expand_as(g_wm)
         return F.smooth_l1_loss(g_wm, tgt_b, beta=_hb)
@@ -5569,7 +5582,8 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     # so the gradient trains the prior/decoder/cont-gain roll, not the encoder.
     # Gain-match does NOT detach (P26 full-BPTT through the encoder).
     with torch.no_grad():
-        feats, *_ = rssm.rollout_observed(obs, act, sample=False)
+        feats, *_ = rssm.rollout_observed(
+            obs, act, sample=False, store_aux=False)
     feats = feats.detach()
     max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
     stride = max(1, n_valid // max_starts)
@@ -6364,8 +6378,8 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # deterministic + reproducible so the critic value and the actor log-prob
     # are evaluated on the SAME belief the control acts on.
     with torch.no_grad():
-        feats, _pl, _prl, _last, _ds, _cont = rssm.rollout_observed(
-            obs, act, sample=False)                      # (B, T, F)
+        feats, *_ = rssm.rollout_observed(
+            obs, act, sample=False, store_aux=False)     # (B, T, F)
     feats = feats.detach()
     feat_flat = feats.reshape(B * T, -1)
 
@@ -6415,8 +6429,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # (b) DIVERSE replay term — anti-starvation diversity (skipped if no split).
     if critic_batch is not None:
         with torch.no_grad():
-            _fc, _cpl, _cprl, _clast, _cds, _ccont = rssm.rollout_observed(
-                critic_batch['obs'], critic_batch['act'], sample=False)
+            _fc, *_ = rssm.rollout_observed(
+                critic_batch['obs'], critic_batch['act'],
+                sample=False, store_aux=False)
         Bc, Tc = critic_batch['obs'].shape[:2]
         feat_c = _fc.detach().reshape(Bc * Tc, -1)
         rew_c = critic_batch['rew'].float()

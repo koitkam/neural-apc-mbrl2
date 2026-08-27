@@ -116,6 +116,23 @@ def test_img_rollout_equals_img_step():
     print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e})")
 
 
+def test_store_aux_feats_identity():
+    """Isolation encode may drop logit stacks; feats must match the full pass."""
+    cfg, m = _mk()
+    B, T = 2, 6
+    obs = torch.randn(B, T, cfg.obs_dim)
+    act = torch.rand(B, T, cfg.action_dim) * 2 - 1
+    with torch.no_grad():
+        f_full, post, prior, *_ = m.rollout_observed(obs, act, sample=False)
+        f_iso, post2, prior2, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False)
+    assert post is not None and prior is not None
+    assert post2 is None and prior2 is None
+    err = float((f_full - f_iso).abs().max())
+    assert err < 1e-6, f"store_aux=False feats drifted (max_err={err})"
+    print(f"[smoke] OK store_aux=False feats identity (max_err={err:.2e})")
+
+
 def test_stepwise_equals_full_sequence():
     """CORRECTNESS GATE for the future KV-cache: stepwise img_step over a fixed
     (z, action) sequence must equal a single full-sequence causal forward over
@@ -222,6 +239,7 @@ if __name__ == '__main__':
     test_st_grad_reaches_prior_and_transformer()
     test_determinism_mode()
     test_img_rollout_equals_img_step()
+    test_store_aux_feats_identity()
     test_stepwise_equals_full_sequence()
     test_end_to_end_dreamer_tssm()
     test_diagnostics_probes_route_tssm()

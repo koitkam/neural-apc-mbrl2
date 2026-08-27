@@ -80,7 +80,8 @@ class DeterministicController(nn.Module):
             # rollout_observed → (feats, ...)).  Fixes the ONNX export for the
             # RSSM/TSSM production backbones (the wrapper was SF-only).
             feats = self.dynamics.rollout_observed(
-                obs_window, prev_actions, sample=False)[0]    # (B, L, F)
+                obs_window, prev_actions, sample=False,
+                store_aux=False)[0]                           # (B, L, F)
             agent_hid = feats[:, -1]                           # (B, F)
         # Deterministic action — works for both PolicyHead (argmax bin)
         # and ContinuousPolicyHead (tanh(mu)).

@@ -654,6 +654,32 @@ def _test_cfg_from_env_whitelist() -> None:
                 os.environ[k] = old
 
 
+def _test_store_aux_feats_identity() -> None:
+    """Isolation encode may drop logit stacks; feats must match the full pass."""
+    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics, _dob_scan_mix_budget_bytes
+    torch.manual_seed(0)
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     cont_gain_dim=2, dob_enabled=True, cv_indices=(0,))
+    m = RSSMDynamics(cfg).eval()
+    B, T = 2, 8
+    obs = torch.randn(B, T, 6)
+    act = torch.rand(B, T, 2) * 2 - 1
+    with torch.no_grad():
+        f_full, post, prior, *_ = m.rollout_observed(obs, act, sample=False)
+        f_iso, post2, prior2, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False)
+    assert post is not None and prior is not None
+    assert post2 is None and prior2 is None
+    err = float((f_full - f_iso).abs().max())
+    assert err < 1e-6, f'store_aux=False feats drifted (max_err={err})'
+    bud = _dob_scan_mix_budget_bytes()
+    assert 4 * 1024 * 1024 <= bud <= 64 * 1024 * 1024
+    print(f'[smoke] OK  store_aux=False feats identity (max_err={err:.2e}); '
+          f'kalman mix budget={bud}')
+
+
 def _test_envfree_observer_recipe() -> None:
     """Env-free TrainConfig must already be the P26 observer / P28 actor stack."""
     c = TrainConfig()
@@ -739,6 +765,7 @@ if __name__ == '__main__':
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None
     _test_cfg_from_env_whitelist()
+    _test_store_aux_feats_identity()
     _test_envfree_observer_recipe()
     _test_auto_if_unset_honours_explicit()
     import tempfile
