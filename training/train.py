@@ -917,9 +917,9 @@ class TrainConfig:
     # ×0.675.  ``mean(w·err)`` with ``w∝1/scale``, ``mean(w)=1``.
     # Scale is **per isolated input** (identified |tgt|², else batch
     # mean CV² of that input) — NOT per-sequence |CV|².
-    # P35 live: per-sequence scale hit the 1e-4 floor on near-zero
+    # P35 EXIT: per-sequence scale hit the 1e-4 floor on near-zero
     # stratified holds → scale_ratio ~22000, iso ~0.0008 vs P33 ~1.69,
-    # gain-match stuck at 1.21, skip-storm @iter 9 (gnorm 8e13).
+    # gain-match stuck at 1.21, storm 2/2 cap, val DV ×0.013.
     # P34 ``mean(err/scale)*mean(scale)`` exploded (iso 7088, skip 99).
     # NOT relative Huber (P27).  ``DREAMER_WM_ISOLATION_VAR_NORM=0`` = abs.
     wm_isolation_var_norm: bool = True

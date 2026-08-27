@@ -265,9 +265,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > default inverse-variance reweight (`wm_isolation_var_norm`):
 > `mean(w·err)` with mean(w)=1 and **per-input** scale (identified
 > `|tgt|²`; no-ID fallback = scatter-mean CV² of that input). P34 AM/HM
-> form exploded. P35 per-sequence `|CV|²` starved quiet-hold sequences
-> (scale_ratio ~22000, iso 0.0008, gmatch stuck 1.21, storm 2/2 cap).
-> Not relative Huber.
+> form exploded. P35 EXIT per-sequence `|CV|²` starved quiet-hold
+> sequences (scale_ratio ~22000, iso 0.0008, gmatch stuck 1.21, storm
+> 2/2 cap, val DV ×0.013). P36 uses per-input `|G|²`. Not relative Huber.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM
