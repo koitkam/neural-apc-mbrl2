@@ -146,25 +146,6 @@ def main():
     print(f'[gain-match] OK: full-BPTT asymptote trains cont-gain '
           f'({cont_grad_gm:.4e})')
 
-    # ---- P27 DISCARDED relative Huber (keep opt-in path finite) ----
-    # Relative (err = (g-tgt)/|tgt|) exploded full-BPTT (skip-storm @P1
-    # iter 50).  Default stays absolute; this only checks the A/B path.
-    cfg.gain_match_relative = 0.0
-    model.zero_grad(set_to_none=True)
-    gm_abs, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
-    cfg.gain_match_relative = 1.0
-    model.zero_grad(set_to_none=True)
-    gm_rel, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
-    assert torch.isfinite(gm_rel).all() and float(gm_rel) > 0.0, float(gm_rel)
-    gm_rel.backward()
-    cont_grad_rel = sum(float(p.grad.abs().sum())
-                        for n, p in model.dynamics.named_parameters()
-                        if p.grad is not None and 'cont' in n)
-    assert cont_grad_rel > 0.0, 'relative gain-match did NOT reach cont-gain!'
-    print(f'[gain-match-rel] OK: abs={float(gm_abs):.5f} rel={float(gm_rel):.5f} '
-          f'cont-grad={cont_grad_rel:.4e}')
-    cfg.gain_match_relative = 0.0
-
     # P28 follow-up 13: open-loop FD K is not min(K, T-1).  A short
     # window (T=16) with K=20 used to return 0 (n_valid=T-K<1).
     cfg.gain_match_len = 20
@@ -184,7 +165,6 @@ def main():
     # (auto-median sentinel) on every loss call.
     import os
     os.environ['DREAMER_GAIN_MATCH_HUBER_BETA'] = '0'
-    cfg.gain_match_relative = 0.0
     cfg.gain_match_huber_beta = 0.52
     model.zero_grad(set_to_none=True)
     gm_auto, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
@@ -305,7 +285,6 @@ def main():
     torch.manual_seed(5)
     cfg.gain_match_len = 6
     cfg.gain_match_step = 1.0
-    cfg.gain_match_relative = 0.0
     cfg.gain_match_huber_beta = 1.0
     cfg.gain_match_mv_target = ((0.4,),)
     cfg.gain_match_dv_target = ((-0.2,),)

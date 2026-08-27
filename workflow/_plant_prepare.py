@@ -591,8 +591,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_LEN':             ('gain_match_len',                 int),
     'DREAMER_GAIN_MATCH_MAX_STARTS':      ('gain_match_max_starts',          int),
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
-    # P27 RCA / P28: relative Huber is OFF by default (exploded P1).  1 = opt-in.
-    'DREAMER_GAIN_MATCH_RELATIVE':        ('gain_match_relative',            float),
     'DREAMER_GAIN_MATCH_HUBER_BETA':      ('gain_match_huber_beta',          float),
     'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):

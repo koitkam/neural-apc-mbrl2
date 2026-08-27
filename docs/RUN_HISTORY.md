@@ -1238,7 +1238,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **ROOT:** `gain_match_relative=1` (only observer delta vs P26). Actor knobs (`n_critics=2`, `return_scale_freeze_after_warmup`) never ran.
 
 ### p28 (`run_p28_absgain_qens`, branch `cursor`) — FIX: restore P26 observer; keep untested actor knobs; recover P1 skip-storms
-- Revert `gain_match_relative` default **1→0** (absolute Huber, P26 observer). Relative stays opt-in via `DREAMER_GAIN_MATCH_RELATIVE`.
+- Revert `gain_match_relative` default **1→0** (absolute Huber, P26 observer). The opt-in A/B path was later **removed** (P31 GPU-occupied) so future runs cannot re-enable it via env.
 - Keep TD3 min-of-2 twohot critics + freeze `return_scale` after critic warmup (first real P3 test of the P26 cascade fix).
 - P1 skip-storm: restore `wm_best.pt`, reset `opt_world` AdamW (drop 1e12 moments), cap P1 so the next iter is Stage 2. P2/P3 skip-storms still abort. `DREAMER_SKIP_STORM_RECOVER_P1=0` to disable.
 - Same env stack as P26/P27 so the observer delta is only the relative-Huber revert. Run ALONE from `neural-APC-mbrl2-cursor`.
@@ -1299,7 +1299,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 ### p31 (`run_p31_stormcont`, branch `cursor/p28`) — FIX: continue P1 after first skip-storm; suppress frozen-g fidelity ES
 - **One attributed GPU change vs P30:** `skip_storm_p1_cap_after=2` (TrainConfig default). First P1 skip-storm restores last-ok, resets AdamW, **keeps original P1 budget** with extension closed; second storm still `_force_p1_cap_at` → P2. Storm-time GAIN_NOT_READY does **not** stick if P1 continues. Same commit, not the A/B: suppress `wm_fidelity_degradation` while `_dynamics_g_trainable` is false (one-line log). Env-free. Batched isolation/overshoot (`0a61872`) now in the GPU job.
 - **Judge by:** `[skip-storm] … continuing P1 (storm 1/2, extension closed)` not instant P2; recon returns to last-ok; P1 proceeds toward ~90 iters; skip-restore SKIPPED; if GAIN-READY then first valid actor test of min-of-2 + freeze `return_scale`. Val MV ss/@H ~×1.0 ±0.1 (P26 ×0.97/×0.88). If second storm caps GAIN_NOT_READY: `[p3-skip]`. `[wm-fidelity-ES] suppressed: dynamics g frozen` in P2; DOB should train full P2, det_r not 0.05 after 40 iters.
-- **LIVE (2026-08-26 19:55, tmux `mbrl2_p31`, GPU ~19.6 GB, process `4ffe11f`):** env-free confirmed. P1 iter **39** / ~501k of 754k. `kl=0` `jemb=0.031` recon **0.0048** (P26/P28 class). Survived P30's iter-18–25 window **without** a skip-storm (iter 19 recon 0.021, skip still 2 from the iter-11 dv-prbs blip; window needs >5). gmatch 0.002 iso 0.003 alive 1022. t_wm ~150 s eager, t_collect ~17.7 s. `wm_best` still iter 10 (restore OFF). Fidelity `best_h=0/55` gain_fid 0.65 @iter 30 (gain-blind; WATCH-only). Remaining P1 ~41 iters ≈ 1.9 h. **No second GPU job.** HEAD (not in this process): batched gain-match FD + skip RSSM `obs_step` on P1/P2 random collect (~17 s of dead bs=1 launches per iter).
+- **LIVE (2026-08-26 20:54, tmux `mbrl2_p31`, GPU ~19.6 GB, process `4ffe11f`):** env-free confirmed. P1 iter **60** / ~647k of 754k. `kl=0`. Survived P30's iter-18–25 window **without** a skip-storm (iter 19 recon 0.021; skip still 2 from the iter-11 dv-prbs blip). Healthy stretch iter 40–57: recon **0.003–0.005**, `wm_best` **iter 50** `best_h=55/55` raw 5.678 (gain_fid **is** in the EMA score, weight 3, recon-gated — not WATCH-only; restore OFF so the freeze is still end-of-P1). Iter 58–59 buffer-wrap blip (recon 0.119→**0.381**, alive 1024→895) recovered iter 60 recon 0.074 alive 977; probe `best_h=0/55` (will not overwrite iter-50 `wm_best`). Skip still 2 — **not** a skip-storm. Remaining P1 ~18 iters ≈ 50 min, then P2. t_wm ~150 s, t_collect ~17.7 s. **No second GPU job.** HEAD (not in this process): batched gain-match FD + skip RSSM `obs_step` on P1/P2 random collect; relative Huber A/B path **removed**.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
@@ -1322,7 +1322,7 @@ Still not sim-adaptive:
 | Isolation TBPTT stride `max(8, round(K/3.5))` | P28 follow-up 2 | KEPT | YES — 16 was absolute steps, not f(K/τ) |
 | Huge-grad skip (`wm_grad_skip_norm=1e4`) | P24 | KEPT | YES — garbage clipped step |
 | Huber gain-match (abs, β=1) | P23/P26 | KEPT | YES — MSE overshoot |
-| Relative Huber (`gain_match_relative=1`) | P27 | REVERTED | YES — DV ~5× grad, skip-storm abort |
+| Relative Huber (`gain_match_relative=1`) | P27 | REVERTED then **REMOVED** (P31 GPU-occupied) | YES — DV ~5× grad, skip-storm abort; A/B path deleted |
 | Live `_replay_n_dist` for DOB ground | P25/P26 | KEPT | YES — grounding was dead |
 | Full-BPTT gain-match | P26 | KEPT | YES — recovered MV ×0.97 |
 | min-of-2 critics + freeze `return_scale` | P27/P28 | KEPT (untested in P3) | PARTIAL — P27 never reached P3 |
@@ -1360,6 +1360,7 @@ Still not sim-adaptive:
 | Isolation K-step per-decode + overshoot Python MSE loop (eager) | P30-live GPU-occupied | KEPT (batched decode / vectorized MSE, same mean) | YES — extra hot-path forwards; compile leftover was full-model not this |
 | Sequential gain-match `_roll` (1+n_mv+n_dv Python K-loops) | P31-live GPU-occupied | SUPERSEDED (batched `img_rollout`, same last-step Huber) | YES — eager default; MIMO width multiplied full-BPTT wall time |
 | P1/P2 random collect streams RSSM `obs_step` every sim step | P31-live GPU-occupied | SUPERSEDED (skip; P3 on-policy still streams) | YES — `ep_per_iter × episode_length` bs=1 launches; state discarded; WM teacher-forces from replay |
+| Relative Huber opt-in (`DREAMER_GAIN_MATCH_RELATIVE`) | P27/P28 leftover | REMOVED | YES — proven inferior; field + whitelist invited re-enable |
 | `tools/_smoke_*.py` leftover `DREAMER_COMPILE=0` + mbrl-env path | P30-live GPU-occupied | KEPT (stripped; eager is default) | YES — same leftover-env class as P29 launch |
 | Cap P1 on first skip-storm (`_force_p1_cap_at` immediately) | P30 | REVERTED default `skip_storm_p1_cap_after=2` | YES — restored last-ok then froze iter 18 of ~90; val MV mean ×1.88 (median ~×1.06 + OP outlier) |
 | `wm_fidelity_degradation` while curriculum `g` is frozen | P30 | KEPT (suppress in P2) | YES — first P2 probe 5.644 + patience 40 killed DOB; g cannot improve a gain-blind score |

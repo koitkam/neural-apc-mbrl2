@@ -859,13 +859,10 @@ class TrainConfig:
     gain_match_len: int = 0            # K step-response rollout steps (= horizon)
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
-    # P27 RCA / P28: relative Huber is OFF by default.  P27's scale-free
-    # residual (divide by |target|) boosted the subdominant DV gradient ~5×
-    # vs MV and exploded full-BPTT gain-match at P1 iter 50 (wm_grad 6e12,
-    # 42 skips, recon 0.004→0.50) — P2/P3 never ran.  Absolute Huber is the
-    # P26 observer that reached MV ss/@H ×0.97/×0.88.  1.0 = relative
-    # (P27, opt-in via DREAMER_GAIN_MATCH_RELATIVE); 0.0 = absolute.
-    gain_match_relative: float = 0.0
+    # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
+    # (``(g-tgt)/|tgt|``) gave the subdominant DV ~5× the MV gradient and
+    # exploded full-BPTT at P1 iter 50 — the A/B path was removed, not
+    # kept as opt-in.  Do not re-add ``gain_match_relative``.
     # Huber β for the gain-match residual (WM-norm gain units).  1.0 matches
     # the P24–P28 env default.  ``<=0`` = auto at resolve-time: median |tgt|
     # (sim-adaptive; next attributed observer A/B, not the P28 default).
@@ -5302,30 +5299,24 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # large transient gain swing (p23 coef 2.0: ×1.09→×2.42→×-5.61) produces an
     # exploding gradient that overshoots and DIVERGES.  smooth_l1 caps the
     # gradient at ±1 beyond ``beta`` → damps the oscillation to a stable pin.
-    # P27 RCA / P28: RELATIVE Huber is opt-in.  Dividing by |target| gave the
-    # subdominant DV ~5× the MV gradient and exploded full-BPTT at P1 iter 50.
-    # Default 0 = absolute Huber (P26 observer, MV ×0.97).  Unitless.
-    # Trust TrainConfig (ENV_OVERRIDES + resolve-time auto).  Do NOT re-read
-    # ``DREAMER_GAIN_MATCH_HUBER_BETA`` here: env ``<=0`` (median |tgt|) would
-    # overwrite the resolved β and pass β=0 into smooth_l1.
+    # Absolute Huber (P26).  P27 relative ``(g-tgt)/|tgt|`` is DELETED — it
+    # exploded full-BPTT.  Trust TrainConfig (ENV_OVERRIDES + resolve-time
+    # auto).  Do NOT re-read ``DREAMER_GAIN_MATCH_HUBER_BETA`` here: env
+    # ``<=0`` (median |tgt|) would overwrite the resolved β and pass β=0
+    # into smooth_l1.
     _hb = max(1e-6, float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 1.0))
-    _rel = float(getattr(cfg, 'gain_match_relative', 0.0) or 0.0)
 
-    def _gm_huber(g_wm, tgt_row):
-        tgt = torch.tensor(list(tgt_row), device=obs.device, dtype=g_wm.dtype)
-        tgt_b = tgt.expand_as(g_wm)
-        if _rel > 0.0:
-            scale = tgt.abs().clamp_min(1e-3)
-            err = (g_wm - tgt_b) / scale
-            return F.smooth_l1_loss(err, torch.zeros_like(err), beta=_hb)
+    def _huber_from_cv(cv_base, cv_step_stack, tgts):
+        # ``cv_step_stack`` (n_in, Bm, n_cv).  One mean Huber ≡ mean of
+        # per-input means (equal Bm×n_cv).  P27 relative scale is gone.
+        if not tgts:
+            return zero
+        g_wm = (cv_step_stack - cv_base) / step
+        tgt = torch.tensor([list(t) for t in tgts],
+                           device=g_wm.device, dtype=g_wm.dtype)
+        tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
+                         g_wm.shape[-1]).expand_as(g_wm)
         return F.smooth_l1_loss(g_wm, tgt_b, beta=_hb)
-
-    def _huber_from_cv(cv_base, cv_steps, tgts):
-        total = zero
-        for i, tgt_row in enumerate(tgts):
-            g_wm = (cv_steps[i] - cv_base) / step
-            total = total + _gm_huber(g_wm, tgt_row)
-        return total
 
     # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
     # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
@@ -5374,10 +5365,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         cv_last = rssm.decode(roll_feats[:, -1]).index_select(-1, cv_idx)
         cv_last = cv_last.view(n_rolls, Bm, -1)
         cv_base = cv_last[0]
-        n_mv = len(mv_tgts)
-        total = _huber_from_cv(cv_base, cv_last[1:1 + n_mv], mv_tgts)
-        total = total + _huber_from_cv(
-            cv_base, cv_last[1 + n_mv:], dv_tgts)
+        total = _huber_from_cv(
+            cv_base, cv_last[1:], list(mv_tgts) + list(dv_tgts))
     else:
         if _wmt == 'tssm':
             from models.transformer_ssm import TSSMState as _State
@@ -5401,20 +5390,19 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
             return rssm.decode(st.feat).index_select(-1, cv_idx)
 
         cv_base = _roll(a_base, dv0)
-        cv_mv = []
+        cv_steps = []
         for j in range(len(mv_tgts)):
             a_step = a_base.clone()
             a_step[:, j] = a_step[:, j] + step
-            cv_mv.append(_roll(a_step, dv0))
-        cv_dv = []
+            cv_steps.append(_roll(a_step, dv0))
         if dv0 is not None:
             for j in range(len(dv_tgts)):
                 dv_step = dv0.clone()
                 dv_step[:, j] = dv_step[:, j] + step
-                cv_dv.append(_roll(a_base, dv_step))
-        total = _huber_from_cv(cv_base, cv_mv, mv_tgts)
-        total = total + _huber_from_cv(cv_base, cv_dv, dv_tgts)
-    loss = total / float(nterm)
+                cv_steps.append(_roll(a_base, dv_step))
+        total = _huber_from_cv(cv_base, torch.stack(cv_steps, dim=0),
+                              list(mv_tgts) + list(dv_tgts))
+    loss = total
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     return loss, diag
 

@@ -168,8 +168,8 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _tc = TrainConfig()
     assert float(_tc.gain_match_huber_beta) == 1.0
     assert int(_tc.aux_tbptt_steps) == 16
-    assert float(_tc.gain_match_relative) == 0.0
-    print('[smoke] OK  gain-match defaults (abs Huber, beta=1, TBPTT=16)')
+    assert not hasattr(_tc, 'gain_match_relative')
+    print('[smoke] OK  gain-match defaults (abs Huber only, beta=1, TBPTT=16)')
 
     # Isolation TBPTT is sim-adaptive: 16 of K≈55 (test_sim) scales as K/3.5.
     _tb = TrainConfig()
@@ -639,7 +639,9 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.n_critics) == 2
     assert c.return_scale_freeze_after_warmup is True
     assert c.dob_enabled is True
-    assert float(c.gain_match_relative) == 0.0
+    assert not hasattr(c, 'gain_match_relative')
+    from workflow._plant_prepare import ENV_OVERRIDES
+    assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert c.cont_gain_deterministic_roll is True
     assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
     print('[smoke] OK  env-free TrainConfig = P26 observer / P28 actor recipe')
