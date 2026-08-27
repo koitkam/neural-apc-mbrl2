@@ -126,14 +126,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > still started — the cap path now always re-probes gain.
 > Opt out `DREAMER_SKIP_INVALID_P3=0`.
 > **P28 follow-up 4:** last-ok restore was still undone on the next
-> iter. Default `DREAMER_WM_BEST_RESTORE_AT_P2=1` reloads the
+> iter. At the time, default `DREAMER_WM_BEST_RESTORE_AT_P2=1` reloaded the
 > fidelity-peak `wm_best.pt` at the P1→P2 boundary (healthy-P1 win,
-> p124). After a skip-storm the next iter *is* that boundary, so
+> p124). **P28 GPU reverted that default to False** (see below). After a skip-storm the next iter *is* that boundary, so
 > last-ok was overwritten by the same gain-blind spike follow-up 3
 > exists to avoid. Recovery now skips the P1→P2 (and P2→P3) wm_best
-> reload when `skip_storm_p1_recovered`. Healthy P1 still restores.
-> The restore knobs are TrainConfig + `ENV_OVERRIDES` (defaults
-> unchanged).
+> reload when `skip_storm_p1_recovered`. Healthy P1 still restores
+> only if that knob is opted back on.
 > **2026-08-26 — P28 GPU VERDICT / P29 / env-free latent drop.** `run_p28_absgain_qens` (@ a7941be,
 > before follow-ups 1–14) restored gain-blind `wm_best` iter 60 on a
 > *healthy* P1 (0 skip-storms). Val MV ss/@H ×0.52/×0.48 vs P26 ×0.97/×0.88.
@@ -271,8 +270,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > formulas** (P34 explode, P35 quiet-hold, P36 33× DV skip-storm).
 > Abs MSE is the only path (A/B **REMOVED**). Default
 > `wm_isolation_dcv_match` scales isolation **excitation**
-> `Δu_i ∝ 1/|G_i|` (clipped to ±1) so |ΔCV| matches at the linspace
-> edge. Equal-|G| plants keep the op-band linspace. Not relative Huber.
+> `Δu_i ∝ 1/|G_i|` then clips `level*scale` to ±1 so |ΔCV| matches at
+> the linspace edge. Logged `scale` is a **multiplier** on
+> `isolated_level ∈ [−op_band,+op_band]`; applied edge |Δu| is
+> `min(1, op_band·scale)` (`run_plan.isolation_dcv_scales.edge_du_*`).
+> P38 LIVE (`run_p38_isodcv`): MV scale 0.317 → edge |Δu| **0.19**
+> (P37 was 0.60); DV scale 1.67 → edge |Δu| **1.0**. Matching at
+> `g_min` shrinks the strong-|G| isolation teacher. Equal-|G| plants
+> keep the op-band linspace. Not relative Huber.
 > Pre-iso resolve is **only** for those scales; gain-match Huber
 > targets always re-resolve after isolation+expert (P37 obs-norm freeze
 > point — skipping would confound P38). P37 EXIT (`run_p37_isoabs`,
@@ -280,8 +285,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > then 0.72@DV; extra-P1 silent detonation iter 88; last-ok iter 87.
 > Val MV ss/@H **×0.981 / ×1.005**, DV **×0.690 / ×0.783**, det_r
 > **0.370**, `[p3-skip]`. Abs isolation completes P1 and pins MV;
-> **FALSIFIED as DV pin**. Next env-free is this recipe
-> (`run_p38_isodcv`); resolved Δu scales land in
+> **FALSIFIED as DV pin**. P38 LIVE is this recipe
+> (`run_p38_isodcv`); resolved multipliers **and** `edge_du_*` land in
 > `run_plan.isolation_dcv_scales`. Actor only on a GAIN-READY freeze.
 > Opt out `DREAMER_WM_ISOLATION_DCV_MATCH=0`.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only

@@ -35,7 +35,7 @@ from training.train import (
                             _wm_train_seq_len, wm_train_seq_len_for_plant,
                             _dv_isolation_delta, _isolation_dcv_scales,
                             _stash_isolation_dcv_scales,
-                            _isolation_dcv_scale_payload,
+                            _isolation_dcv_scale_payload, _isolation_edge_du,
                             _scale_isolation_level, _gain_col_rms,
                             _dynamics_g_trainable,
                             _maybe_clean_steady_seed,
@@ -719,6 +719,8 @@ def _test_isolation_dcv_scales() -> None:
     assert abs(dv_sc[0] - 1.0 / 0.6) < 1e-6
     assert _scale_isolation_level(0.6, dv_sc[0]) == 1.0
     assert abs(_scale_isolation_level(0.6, mv_sc[0]) - 0.6 * mv_sc[0]) < 1e-9
+    assert abs(_isolation_edge_du(dv_sc[0], 0.6) - 1.0) < 1e-9
+    assert abs(_isolation_edge_du(mv_sc[0], 0.6) - 0.6 * mv_sc[0]) < 1e-9
     from pathlib import Path as _P
     import training.train as _tr
     _src = _P(_tr.__file__).read_text()
@@ -732,11 +734,15 @@ def _test_isolation_dcv_scales() -> None:
     cfg.gain_match_mv_target = ((-2.8,),)
     cfg.gain_match_dv_target = ((0.49,),)
     assert _isolation_dcv_scales(cfg, 1, 1, 0.6) == ([1.0], [1.0])
-    _stash_isolation_dcv_scales(cfg, [0.289], [1.67])
+    _stash_isolation_dcv_scales(cfg, [0.289], [1.67], 0.6)
     pay = _isolation_dcv_scale_payload(cfg)
     assert pay['on'] is False and pay['mv'] == [0.289] and pay['dv'] == [1.67]
+    assert pay['op_band'] == 0.6
+    assert abs(pay['edge_du_mv'][0] - 0.6 * 0.289) < 1e-9
+    assert abs(pay['edge_du_dv'][0] - 1.0) < 1e-9
     assert 'isolation_dcv_scales' in _src
     assert '_stash_isolation_dcv_scales' in _src
+    assert '_isolation_edge_du' in _src
     assert "'p1_last_ok_iter'" in _src
     assert "row['wm_isolation_loss'] = row['wm_input_isolation_loss']" in _src
     assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
@@ -801,7 +807,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     cfg.rssm_latent_type = 'deterministic'
     cfg.gain_match_coef = 1.0
     cfg.dob_ground_coef = 2.0
-    _stash_isolation_dcv_scales(cfg, [0.289], [1.67])
+    _stash_isolation_dcv_scales(cfg, [0.289], [1.67], 0.6)
     plan_path = Path(tmp_path) / 'run_plan.json'
     plan_path.write_text(json.dumps({'config': {'rssm_latent_type': 'categorical',
                                                 'gain_match_coef': 0.0}}))
@@ -813,6 +819,8 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     dcv = plan['isolation_dcv_scales']
     assert dcv['on'] is True
     assert dcv['mv'] == [0.289] and dcv['dv'] == [1.67]
+    assert abs(dcv['edge_du_mv'][0] - 0.6 * 0.289) < 1e-9
+    assert abs(dcv['edge_du_dv'][0] - 1.0) < 1e-9
     print('[smoke] OK  _write_resolved_run_plan rewrites run_plan.json config')
 
 

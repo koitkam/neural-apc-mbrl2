@@ -915,11 +915,16 @@ class TrainConfig:
     # explode, P35 quiet-hold, P36 33× DV) — same class as P27 relative
     # Huber.  The A/B path was removed, not kept as opt-in.  Do not re-add
     # ``wm_isolation_var_norm`` / ``DREAMER_WM_ISOLATION_VAR_NORM``.
-    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA, P38 next):
-    # ``Δu_i ∝ 1/|G_i|`` from gain-match WM-norm targets, clipped to ±1.
-    # Abs MSE on isomorphic |Δu| drowns the weak-|G| input (|tgt| MV 2.82 vs
-    # DV 0.49 → P32/P33/P37 freeze DV ×0.66–0.71).  This is DATA amplitude,
-    # not a loss reweight.  Equal-|G| plants keep the op-band linspace.
+    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA, P38 LIVE):
+    # ``Δu_i ∝ 1/|G_i|`` from gain-match WM-norm targets, then
+    # ``level*scale`` clipped to ±1.  Linspace is ``±op_band`` so the
+    # *applied* edge |Δu| is ``min(1, op_band·scale)`` — a logged DV
+    # scale 1.67 with op_band=0.6 is edge |Δu|=1.0, not 1.67 (P38).
+    # Matching at ``g_min`` shrinks the strong-|G| teacher (test_sim
+    # MV edge |Δu| 0.19 vs P37 0.60).  Abs MSE on isomorphic |Δu|
+    # drowns the weak-|G| input (|tgt| MV 2.82 vs DV 0.49 → P32/P33/P37
+    # freeze DV ×0.66–0.71).  This is DATA amplitude, not a loss
+    # reweight.  Equal-|G| plants keep the op-band linspace.
     # Opt out ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` for an actor A/B on a
     # GAIN-READY freeze (P37 was not: last-ok 0.71@DV).
     wm_isolation_dcv_match: bool = True
@@ -3268,6 +3273,8 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"iso_dcv={_dcv['on']} "
         f"mv={['%.3g' % x for x in _dcv['mv']]} "
         f"dv={['%.3g' % x for x in _dcv['dv']]} "
+        f"edge_du_mv={['%.3g' % x for x in (_dcv.get('edge_du_mv') or ())]} "
+        f"edge_du_dv={['%.3g' % x for x in (_dcv.get('edge_du_dv') or ())]} "
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -3553,6 +3560,16 @@ def _scale_isolation_level(level: float, scale: float) -> float:
     return float(np.clip(float(level) * float(scale), -1.0, 1.0))
 
 
+def _isolation_edge_du(scale: float, op_band: float) -> float:
+    """Applied |Δu| at the isolation linspace edge (after cube clip).
+
+    Scales in ``run_plan`` are multipliers on ``isolated_level ∈
+    [−op_band, +op_band]``.  ``scale>1`` does **not** mean |Δu|>1.
+    """
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
+    return float(np.clip(a0 * abs(float(scale)), 0.0, 1.0))
+
+
 def _isolation_dcv_scales(
         cfg: 'TrainConfig', n_mv: int, n_dv: int, op_band: float,
 ) -> Tuple[List[float], List[float]]:
@@ -3561,10 +3578,13 @@ def _isolation_dcv_scales(
     Abs isolation/ss-match MSE drowns the weak-|G| input when |Δu| is
     MV-action-isomorphic (P33 |tgt| 2.82 vs 0.49 → val DV ×0.66).  Inv-var
     reweight DISCARDED (P34–P36).  Scale ``Δu_i ∝ 1/|G_i|`` from WM-norm
-    gain-match targets and clip to ±1 (weak input may use the op-band
-    headroom; strong input shrinks).  Equal-|G| (max/min < 1.05) or a
-    single input keeps the unscaled op-band linspace.  Off
-    (``wm_isolation_dcv_match=False``) or missing targets → all 1s.
+    gain-match targets; ``level*scale`` is clipped to ±1 (weak input
+    may use cube headroom; strong input shrinks).  Audit
+    ``edge_du_* = min(1, op_band·scale)`` — that is the applied |Δu|
+    at the linspace edge, not the raw multiplier.  Equal-|G|
+    (max/min < 1.05) or a single input keeps the unscaled op-band
+    linspace.  Off (``wm_isolation_dcv_match=False``) or missing
+    targets → all 1s.
     """
     n_mv = max(0, int(n_mv or 0))
     n_dv = max(0, int(n_dv or 0))
@@ -3603,21 +3623,32 @@ def _isolation_dcv_scales(
 
 
 def _stash_isolation_dcv_scales(
-        cfg: 'TrainConfig', mv_sc: List[float], dv_sc: List[float]) -> None:
-    """Persist resolved Δu scales for run_plan / [resolved-cfg] audit."""
+        cfg: 'TrainConfig', mv_sc: List[float], dv_sc: List[float],
+        op_band: float = 0.6) -> None:
+    """Persist resolved Δu scales + applied edge |Δu| for run_plan audit."""
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
     cfg._isolation_dcv_mv_scale = tuple(float(x) for x in mv_sc)  # type: ignore[attr-defined]
     cfg._isolation_dcv_dv_scale = tuple(float(x) for x in dv_sc)  # type: ignore[attr-defined]
+    cfg._isolation_dcv_op_band = a0  # type: ignore[attr-defined]
 
 
 def _isolation_dcv_scale_payload(cfg: 'TrainConfig') -> Dict[str, object]:
-    """Audit dict: on/off + per-input isolation |Δu| multipliers (not knobs)."""
-    return {
+    """Audit dict: multipliers AND applied edge |Δu| (after cube clip)."""
+    mv = [float(x) for x in (
+        getattr(cfg, '_isolation_dcv_mv_scale', ()) or ())]
+    dv = [float(x) for x in (
+        getattr(cfg, '_isolation_dcv_dv_scale', ()) or ())]
+    op = float(getattr(cfg, '_isolation_dcv_op_band', 0.0) or 0.0)
+    out: Dict[str, object] = {
         'on': bool(getattr(cfg, 'wm_isolation_dcv_match', True)),
-        'mv': [float(x) for x in (
-            getattr(cfg, '_isolation_dcv_mv_scale', ()) or ())],
-        'dv': [float(x) for x in (
-            getattr(cfg, '_isolation_dcv_dv_scale', ()) or ())],
+        'mv': mv,
+        'dv': dv,
     }
+    if op > 0.0:
+        out['op_band'] = op
+        out['edge_du_mv'] = [_isolation_edge_du(s, op) for s in mv]
+        out['edge_du_dv'] = [_isolation_edge_du(s, op) for s in dv]
+    return out
 
 
 def _gain_match_targets_ready(cfg: 'TrainConfig') -> bool:
@@ -9522,7 +9553,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         if _cfg_on(cfg, 'wm_isolation_dcv_match', True):
             _maybe_resolve_gain_match_targets(env, cfg)
         _mv_sc, _dv_sc = _isolation_dcv_scales(cfg, n_mv, n_dv, const_op_band)
-        _stash_isolation_dcv_scales(cfg, _mv_sc, _dv_sc)
+        _stash_isolation_dcv_scales(cfg, _mv_sc, _dv_sc, const_op_band)
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
                                  dtype='float32')
         _st_jit = env.rng.uniform(-0.05, 0.05,
@@ -9560,7 +9591,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _n_dv_settle += 1
         _sc_txt = (
             f"dcv_match MV={['%.3g' % s for s in _mv_sc]} "
-            f"DV={['%.3g' % s for s in _dv_sc]}"
+            f"DV={['%.3g' % s for s in _dv_sc]} "
+            f"edge_du MV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _mv_sc]} "
+            f"DV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _dv_sc]}"
             if _cfg_on(cfg, 'wm_isolation_dcv_match', True) else 'dcv_match=off')
         print(f"[seed] isolated-settle MV={_n_mv_settle} DV={_n_dv_settle} "
               f"(per_input={n_settle}, n_mv={n_mv}, n_dv={n_dv}; "
