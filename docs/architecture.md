@@ -190,15 +190,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > extension still closed); second storm still caps. Storm-time
 > GAIN_NOT_READY does not stick if P1 continues. Fidelity ES suppressed
 > while `_dynamics_g_trainable` is false.
-> **P31 LIVE (2026-08-26 22:55):** Survived P30 skip-storm window. Healthy
-> P1 to iter 94 (recon 0.003–0.005, `wm_best` iter 90). Iter 75
-> `gain_not_ready` 1.48@MV extended P1 (correct). **Iter 95 detonated**
-> (recon 0.71, gnorm 66, skip 2→3 — not a skip-storm). Iter 97 CAPPED
-> froze exploded `g` (DC 0.08@DV) into P2. P2 recon ~0.45, `dobg` live.
-> HEAD (not process `4ffe11f`): P1→P2 restores last-ok when freeze recon
-> is detonated vs last-ok best (same 5× ratio); re-probes gain. Also
-> batched gain-match FD, numpy P1/P2 collect, vectorized DOB Kalman,
-> relative Huber **removed**. GPU occupied; no second job.
+> **P31 EXIT (2026-08-26 23:23, 151 iters):** storm_cap=2 KEEP (healthy
+> P1 to iter 94; no skip-storm). Iter 95 detonated (recon 0.71, gnorm 66,
+> skip 2→3). CAPPED froze exploded g — val MV ×1.35, DV ×0.11, det_r
+> 0.11. `[p3-skip]` KEEP. **P32** (`run_p32_detfreeze`): P1→P2 restores
+> last-ok when freeze recon is detonated vs last-ok best (same 5×
+> ratio); re-probes gain. Also batched gain-match FD, numpy P1/P2
+> collect, vectorized DOB Kalman, relative Huber **removed**.
 > **P28 follow-up 6 (no GPU this session):** inject **N** was a raw
 > episode count (const 5 / step-test 2 / DV-PRBS 2 / expert 3). That is
 > one 1-MV+1-DV shot. `_resolve_inject_cadence` now also sets
