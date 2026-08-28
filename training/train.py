@@ -10629,16 +10629,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # very next iter, and wm_best is the gain-blind peak.
                 _wb_exists = bool(wm_best_ckpt_path is not None
                                   and wm_best_ckpt_path.exists())
-                if skip_storm_p1_recovered:
-                    print('[p1→p2] WM warm-restore SKIPPED: skip-storm already '
-                          f'restored {skip_storm_restore_source} (iter '
-                          f'{skip_storm_restore_iter}); wm_best is gain-blind '
-                          'and must not overwrite last-ok', flush=True)
-                elif p1_detonated_freeze_restored:
+                if p1_detonated_freeze_restored:
                     print('[p1→p2] WM warm-restore SKIPPED: detonated freeze '
                           f'already restored wm_last_ok (iter '
                           f'{p1_last_ok_iter}); wm_best is gain-blind and '
                           'must not overwrite last-ok', flush=True)
+                elif skip_storm_p1_recovered:
+                    print('[p1→p2] WM warm-restore SKIPPED: skip-storm already '
+                          f'restored {skip_storm_restore_source} (iter '
+                          f'{skip_storm_restore_iter}); wm_best is gain-blind '
+                          'and must not overwrite last-ok', flush=True)
                 elif _should_warm_restore_wm_best(
                         restore_enabled=wm_best_restore_at_p2,
                         skip_storm_recovered=bool(skip_storm_p1_recovered),
