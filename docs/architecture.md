@@ -270,14 +270,19 @@ env-gated off · **[planned]** = designed, not yet built.
 > formulas** (P34 explode, P35 quiet-hold, P36 33× DV skip-storm).
 > Abs MSE is the only path (A/B **REMOVED**). Default
 > `wm_isolation_dcv_match` scales isolation **excitation**
-> `Δu_i ∝ 1/|G_i|` then clips `level*scale` to ±1 so |ΔCV| matches at
-> the linspace edge. Logged `scale` is a **multiplier** on
+> `Δu_i ∝ 1/|G_i|` then clips `level*scale` to ±1. Scale is
+> **floored at 1.0** so the strong-|G| teacher stays at op-band.
+> Logged `scale` is a **multiplier** on
 > `isolated_level ∈ [−op_band,+op_band]`; applied edge |Δu| is
 > `min(1, op_band·scale)` (`run_plan.isolation_dcv_scales.edge_du_*`).
-> P38 LIVE (`run_p38_isodcv`): MV scale 0.317 → edge |Δu| **0.19**
-> (P37 was 0.60); DV scale 1.67 → edge |Δu| **1.0**. Matching at
-> `g_min` shrinks the strong-|G| isolation teacher. Equal-|G| plants
-> keep the op-band linspace. Not relative Huber.
+> P38 (`run_p38_isodcv`, **no floor**): MV scale 0.317 → edge |Δu| **0.19**
+> (P37 0.60); DV scale 1.67 → edge |Δu| **1.0**. Match-at-`g_min` starved
+> MV isolation SNR. Storm **1/2 @iter 45** (last-ok 13) then **2/2 @iter 48**
+> CAPPED GAIN_NOT_READY **0.01@DV** (MV 1.12); gmatch stuck **1.30**;
+> detonated-freeze restored last-ok iter **47** (still untrained g). P2
+> running on that freeze (`[p3-skip]`). HEAD floor keeps MV edge |Δu|=0.60
+> and still boosts DV to the cube. Equal-|G| plants keep the op-band
+> linspace. Not relative Huber.
 > Pre-iso resolve is **only** for those scales; gain-match Huber
 > targets always re-resolve after isolation+expert (P37 obs-norm freeze
 > point — skipping would confound P38). P37 EXIT (`run_p37_isoabs`,
@@ -285,10 +290,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > then 0.72@DV; extra-P1 silent detonation iter 88; last-ok iter 87.
 > Val MV ss/@H **×0.981 / ×1.005**, DV **×0.690 / ×0.783**, det_r
 > **0.370**, `[p3-skip]`. Abs isolation completes P1 and pins MV;
-> **FALSIFIED as DV pin**. P38 LIVE is this recipe
-> (`run_p38_isodcv`); resolved multipliers **and** `edge_du_*` land in
-> `run_plan.isolation_dcv_scales`. Actor only on a GAIN-READY freeze.
-> Opt out `DREAMER_WM_ISOLATION_DCV_MATCH=0`.
+> **FALSIFIED as DV pin**. P38 (`run_p38_isodcv`) **CAPPED** match-at-`g_min`
+> (no floor): storm 2/2, freeze 0.01@DV, gmatch stuck 1.30. HEAD floor
+> `min_scale=1.0` (MV stays P37 op-band; DV still cube). Actor only on a
+> GAIN-READY freeze. Opt out `DREAMER_WM_ISOLATION_DCV_MATCH=0`.
 > **P28 follow-up 11 (no GPU this session):** follow-up 10 skipped only
 > the *extra* isolation unroll. `world_model_loss` still ran overshoot,
 > held-rollout, and full-BPTT gain-match every P2 iter (~73% of the WM

@@ -379,13 +379,16 @@ Isolation DV settle uses MV-action units (`isolated_level × span/2`);
 sample windows are `max(seq_len, K+1)` so ss-match can reach SS.
 Default `wm_isolation_dcv_match=True` then scales each input's
 `isolated_level` by `1/|G_i|` (WM-norm gain-match targets, clipped to
-±1) so abs isolation/ss-match sees matched |ΔCV| — not a loss reweight
+±1, **scale floored at 1.0**) so abs isolation/ss-match can boost the
+weak-|G| input up to the cube without shrinking the strong-|G| teacher
+below op-band (P38 match-at-`g_min` starved MV: edge |Δu| 0.19 vs P37
+0.60 → storm 2/2 CAPPED 0.01@DV). Not a loss reweight
 (`DREAMER_WM_ISOLATION_DCV_MATCH=0` to keep isomorphic |Δu|). Pre-iso
 resolve feeds those scales only; post-seed always re-resolves so Huber
 targets see isolation+expert obs-norm (P37 freeze point).
-Resolved Δu **multipliers** and applied **edge |Δu|** (`min(1, op_band·scale)`)
-are written to `run_plan.isolation_dcv_scales`
-(`[resolved-cfg] iso_dcv= mv= dv= edge_du_mv= edge_du_dv=`).
+Resolved Δu **multipliers**, `min_scale`, and applied **edge |Δu|**
+(`min(1, op_band·scale)`) are written to `run_plan.isolation_dcv_scales`
+(`[resolved-cfg] iso_dcv= min_scale= mv= dv= edge_du_mv= edge_du_dv=`).
 Warm-restore no-ops when `wm_best.pt` is essentially the current state.
 
 #### Reward-MTP / WM-coupling diagnostics (P39)

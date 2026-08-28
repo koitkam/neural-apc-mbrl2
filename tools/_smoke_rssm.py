@@ -708,19 +708,20 @@ def _test_store_aux_feats_identity() -> None:
 
 
 def _test_isolation_dcv_scales() -> None:
-    """|ΔCV| excitation: Δu ∝ 1/|G| clipped to ±1 (not a loss reweight)."""
+    """|ΔCV| excitation: Δu ∝ 1/|G| floored at op-band (not a loss reweight)."""
     import numpy as _np
     cfg = TrainConfig()
     cfg.wm_isolation_dcv_match = True
     cfg.gain_match_mv_target = ((-2.80807126652211,),)
     cfg.gain_match_dv_target = ((0.48662864649935383,),)
     mv_sc, dv_sc = _isolation_dcv_scales(cfg, 1, 1, 0.6)
-    assert abs(mv_sc[0] - 0.48662864649935383 / (2.80807126652211 * 0.6)) < 1e-6
-    assert abs(dv_sc[0] - 1.0 / 0.6) < 1e-6
+    # P38 match-at-g_min was 0.289; floor 1.0 keeps MV at op-band.
+    assert abs(mv_sc[0] - 1.0) < 1e-6, mv_sc
+    assert abs(dv_sc[0] - 1.0 / 0.6) < 1e-6, dv_sc
     assert _scale_isolation_level(0.6, dv_sc[0]) == 1.0
-    assert abs(_scale_isolation_level(0.6, mv_sc[0]) - 0.6 * mv_sc[0]) < 1e-9
+    assert abs(_scale_isolation_level(0.6, mv_sc[0]) - 0.6) < 1e-9
     assert abs(_isolation_edge_du(dv_sc[0], 0.6) - 1.0) < 1e-9
-    assert abs(_isolation_edge_du(mv_sc[0], 0.6) - 0.6 * mv_sc[0]) < 1e-9
+    assert abs(_isolation_edge_du(mv_sc[0], 0.6) - 0.6) < 1e-9
     from pathlib import Path as _P
     import training.train as _tr
     _src = _P(_tr.__file__).read_text()
@@ -737,6 +738,7 @@ def _test_isolation_dcv_scales() -> None:
     _stash_isolation_dcv_scales(cfg, [0.289], [1.67], 0.6)
     pay = _isolation_dcv_scale_payload(cfg)
     assert pay['on'] is False and pay['mv'] == [0.289] and pay['dv'] == [1.67]
+    assert pay['min_scale'] == 1.0
     assert pay['op_band'] == 0.6
     assert abs(pay['edge_du_mv'][0] - 0.6 * 0.289) < 1e-9
     assert abs(pay['edge_du_dv'][0] - 1.0) < 1e-9
@@ -745,6 +747,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_isolation_edge_du' in _src
     assert "'p1_last_ok_iter'" in _src
     assert "row['wm_isolation_loss'] = row['wm_input_isolation_loss']" in _src
+    assert 'np.clip(g_min / (g * a0), 1.0, smax)' in _src
     assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
     assert _gain_col_rms(((-2.8, 0.0),))[0] > 1.0
     class _DvSim:
@@ -764,7 +767,7 @@ def _test_isolation_dcv_scales() -> None:
         _DvEnv(), iso_cfg, long_hold=True, isolate_dv_idx=0,
         isolated_level=scaled)
     assert abs(float(sched[0]['delta']) - _dv_isolation_delta(scaled, 10.0)) < 1e-9
-    print('[smoke] OK  isolation |ΔCV| dcv_match scales (test_sim 2.81 vs 0.49)')
+    print('[smoke] OK  isolation |ΔCV| dcv_match scales (floor 1.0; DV cube)')
 
 
 def _test_envfree_observer_recipe() -> None:
@@ -818,6 +821,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert float(plan['config']['dob_ground_coef']) == 2.0
     dcv = plan['isolation_dcv_scales']
     assert dcv['on'] is True
+    assert dcv['min_scale'] == 1.0
     assert dcv['mv'] == [0.289] and dcv['dv'] == [1.67]
     assert abs(dcv['edge_du_mv'][0] - 0.6 * 0.289) < 1e-9
     assert abs(dcv['edge_du_dv'][0] - 1.0) < 1e-9

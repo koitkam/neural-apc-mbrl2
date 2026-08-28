@@ -915,18 +915,21 @@ class TrainConfig:
     # explode, P35 quiet-hold, P36 33× DV) — same class as P27 relative
     # Huber.  The A/B path was removed, not kept as opt-in.  Do not re-add
     # ``wm_isolation_var_norm`` / ``DREAMER_WM_ISOLATION_VAR_NORM``.
-    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA, P38 LIVE):
+    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA):
     # ``Δu_i ∝ 1/|G_i|`` from gain-match WM-norm targets, then
     # ``level*scale`` clipped to ±1.  Linspace is ``±op_band`` so the
-    # *applied* edge |Δu| is ``min(1, op_band·scale)`` — a logged DV
-    # scale 1.67 with op_band=0.6 is edge |Δu|=1.0, not 1.67 (P38).
-    # Matching at ``g_min`` shrinks the strong-|G| teacher (test_sim
-    # MV edge |Δu| 0.19 vs P37 0.60).  Abs MSE on isomorphic |Δu|
-    # drowns the weak-|G| input (|tgt| MV 2.82 vs DV 0.49 → P32/P33/P37
-    # freeze DV ×0.66–0.71).  This is DATA amplitude, not a loss
-    # reweight.  Equal-|G| plants keep the op-band linspace.
-    # Opt out ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` for an actor A/B on a
-    # GAIN-READY freeze (P37 was not: last-ok 0.71@DV).
+    # *applied* edge |Δu| is ``min(1, op_band·scale)``.  Scale is
+    # **floored at 1.0** (P38 RCA): never shrink the strong-|G|
+    # teacher below op-band.  P38 match-at-``g_min`` (no floor) gave
+    # test_sim MV edge |Δu| 0.19 vs P37 0.60 → gmatch stuck 1.30,
+    # storm 2/2, CAPPED GAIN_NOT_READY 0.01@DV.  Floor keeps MV at
+    # P37 SNR and still boosts the weak input up to the cube
+    # (test_sim DV edge |Δu| 1.0 vs P37 0.60).  Abs MSE on
+    # isomorphic |Δu| drowns the weak-|G| input (|tgt| MV 2.82 vs
+    # DV 0.49 → P32/P33/P37 freeze DV ×0.66–0.71).  This is DATA
+    # amplitude, not a loss reweight.  Equal-|G| plants keep the
+    # op-band linspace.  Opt out ``DREAMER_WM_ISOLATION_DCV_MATCH=0``
+    # for isomorphic |Δu| (P37 P1 form).
     wm_isolation_dcv_match: bool = True
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
@@ -3271,6 +3274,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
         f"iso_dcv={_dcv['on']} "
+        f"min_scale={_dcv.get('min_scale', 1.0)} "
         f"mv={['%.3g' % x for x in _dcv['mv']]} "
         f"dv={['%.3g' % x for x in _dcv['dv']]} "
         f"edge_du_mv={['%.3g' % x for x in (_dcv.get('edge_du_mv') or ())]} "
@@ -3578,13 +3582,15 @@ def _isolation_dcv_scales(
     Abs isolation/ss-match MSE drowns the weak-|G| input when |Δu| is
     MV-action-isomorphic (P33 |tgt| 2.82 vs 0.49 → val DV ×0.66).  Inv-var
     reweight DISCARDED (P34–P36).  Scale ``Δu_i ∝ 1/|G_i|`` from WM-norm
-    gain-match targets; ``level*scale`` is clipped to ±1 (weak input
-    may use cube headroom; strong input shrinks).  Audit
-    ``edge_du_* = min(1, op_band·scale)`` — that is the applied |Δu|
-    at the linspace edge, not the raw multiplier.  Equal-|G|
-    (max/min < 1.05) or a single input keeps the unscaled op-band
-    linspace.  Off (``wm_isolation_dcv_match=False``) or missing
-    targets → all 1s.
+    gain-match targets; ``level*scale`` is clipped to ±1.  Scale is
+    **floored at 1.0** so the strong-|G| teacher stays at op-band (P38
+    match-at-``g_min`` starved MV: edge |Δu| 0.19 vs P37 0.60 → storm
+    2/2 CAPPED 0.01@DV).  Weak input may use cube headroom
+    (``smax = 1/op_band``).  Audit ``edge_du_* = min(1, op_band·scale)``
+    — that is the applied |Δu| at the linspace edge, not the raw
+    multiplier.  Equal-|G| (max/min < 1.05) or a single input keeps
+    the unscaled op-band linspace.  Off (``wm_isolation_dcv_match=False``)
+    or missing targets → all 1s.
     """
     n_mv = max(0, int(n_mv or 0))
     n_dv = max(0, int(n_dv or 0))
@@ -3616,7 +3622,8 @@ def _isolation_dcv_scales(
             if g <= 1e-6:
                 out.append(1.0)
             else:
-                out.append(float(np.clip(g_min / (g * a0), 1e-3, smax)))
+                # Floor 1.0 = never shrink below op-band (P38 RCA).
+                out.append(float(np.clip(g_min / (g * a0), 1.0, smax)))
         return out
 
     return _sc(mv_g), _sc(dv_g)
@@ -3641,6 +3648,7 @@ def _isolation_dcv_scale_payload(cfg: 'TrainConfig') -> Dict[str, object]:
     op = float(getattr(cfg, '_isolation_dcv_op_band', 0.0) or 0.0)
     out: Dict[str, object] = {
         'on': bool(getattr(cfg, 'wm_isolation_dcv_match', True)),
+        'min_scale': 1.0,
         'mv': mv,
         'dv': dv,
     }
@@ -9542,9 +9550,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # test_sim).  These are the ONLY episodes written to ``isolation_buf``
     # (follow-up 8): ordinary MIMO PRBS / all-DV PRBS stay in the main
     # replay buffer.  ``wm_isolation_dcv_match`` then scales each
-    # input's ``isolated_level`` by ``1/|G_i|`` (clipped to ±1) so abs
-    # isolation/ss-match sees matched |ΔCV| (P33 drowning; not a loss
-    # reweight).
+    # input's ``isolated_level`` by ``1/|G_i|`` (clipped to ±1, scale
+    # floored at 1.0 so strong-|G| stays at op-band — P38 RCA) so abs
+    # isolation/ss-match sees a louder weak-input |ΔCV| (P33 drowning;
+    # not a loss reweight).
     n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
     if isolation_buf is not None and n_settle > 0:
         # Pre-iso resolve is only for dcv scales. Actor A/B with
@@ -9590,7 +9599,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     total_env_steps += cfg.episode_length
                     _n_dv_settle += 1
         _sc_txt = (
-            f"dcv_match MV={['%.3g' % s for s in _mv_sc]} "
+            f"dcv_match min_scale=1 MV={['%.3g' % s for s in _mv_sc]} "
             f"DV={['%.3g' % s for s in _dv_sc]} "
             f"edge_du MV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _mv_sc]} "
             f"DV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _dv_sc]}"
