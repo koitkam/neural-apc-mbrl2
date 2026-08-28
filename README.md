@@ -381,8 +381,8 @@ Default `wm_isolation_dcv_match=True` then scales each input's
 `isolated_level` by `1/|G_i|` (WM-norm gain-match targets, clipped to
 ±1, **scale floored at 1.0**) so abs isolation/ss-match can boost the
 weak-|G| input up to the cube without shrinking the strong-|G| teacher
-below op-band (P38 match-at-`g_min` starved MV: edge |Δu| 0.19 vs P37
-0.60 → storm 2/2 CAPPED 0.01@DV). Not a loss reweight
+below op-band (P38 EXIT match-at-`g_min` starved MV: edge |Δu| 0.19 vs
+P37 0.60 → storm 2/2, val MV ×1.25 DV ×0.007). Not a loss reweight
 (`DREAMER_WM_ISOLATION_DCV_MATCH=0` to keep isomorphic |Δu|). Pre-iso
 resolve feeds those scales only; post-seed always re-resolves so Huber
 targets see isolation+expert obs-norm (P37 freeze point).
