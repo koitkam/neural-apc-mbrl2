@@ -305,9 +305,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > DV pin** (not P26 ×0.87). P26 `run_plan` isolation=0 was the pre-rewrite
 > dump (jsonl iso 1.44). Gain-match is the DC supervisor. Opt in
 > `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when off.
-> **P41:** P1 gate floor is the **recent** EMA max
-> (`_p1_fidelity_local_plateau`), not return to all-time `wm_score_ema_best`.
-> Original-budget gain-probe can run (P40 skipped it then extra-P1 detonated).
+> **P41 first gate GPU-confirmed** (`run_p41_recentfloor`, `acb8a7b`,
+> iter 82): recent-floor **KEEP as mechanism**. Gain-probe **ran**
+> (P40 `not_plateaued` / no probe on ema_best 6.541). FAIL
+> **GAIN_NOT_READY 0.76@DV** (MV 1.01) → EXTEND extra-P1. Did not
+> freeze at original budget. Original-budget DV already P40-cap class
+> (0.76 vs P40 CAPPED 0.75). `p1_gate_wm_ema_min=1.5` recent max.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
