@@ -286,6 +286,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`; P1 iter 22 gmatch
 > **0.0008** skip 0 (P37-class, not P38 stuck 1.30). Equal-|G| plants keep the op-band
 > linspace.
+> **P39 GPU-occupied (no second job):** const-action / step-settle
+> seed used one linspace level on **every** MV (OP-space diagonal).
+> Isolation settle already covers per-input holds. Joint SS on MIMO
+> now uses independent per-MV permutations of the same linspace
+> (`_per_mv_hold_rows`); `n_mv<=1` returns None so test_sim keeps the
+> scalar path (same RNG, same episodes). Episode **count** stays 40.
+> Not a loss reweight; not a test_sim recipe change.
 > Not relative Huber.
 > Pre-iso resolve is **only** for those scales; gain-match Huber
 > targets always re-resolve after isolation+expert (P37 obs-norm freeze

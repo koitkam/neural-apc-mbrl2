@@ -50,7 +50,9 @@ from training.train import (
                             _clone_module_state, _refresh_module_state,
                             _p1_need_agent_finetune,
                             _isolation_seq_is_mv, _snr_build_report,
-                            _snr_moving_average)
+                            _snr_moving_average,
+                            _as_hold_action, _per_mv_hold_rows,
+                            _sample_step_settle_params)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -774,6 +776,38 @@ def _test_isolation_dcv_scales() -> None:
     print('[smoke] OK  isolation |ΔCV| dcv_match scales (floor 1.0; DV cube)')
 
 
+def _test_mimo_hold_rows() -> None:
+    """test_sim n_mv=1 stays scalar; MIMO gets independent per-MV holds."""
+    import numpy as _np
+    rng = _np.random.default_rng(0)
+    levels = _np.linspace(-0.6, 0.6, 8, dtype='float32')
+    assert _per_mv_hold_rows(levels, 1, 1, rng) is None
+    assert _per_mv_hold_rows(levels, 0, 1, rng) is None
+    r1 = _np.random.default_rng(7)
+    r2 = _np.random.default_rng(7)
+    assert _per_mv_hold_rows(levels, 1, 1, r1) is None
+    assert float(r1.random()) == float(r2.random())
+    rows = _per_mv_hold_rows(levels, 4, 4, rng)
+    assert rows is not None and rows.shape == (8, 4)
+    for j in range(4):
+        assert _np.allclose(_np.sort(rows[:, j]), _np.sort(levels))
+    # Not the all-MVs-equal diagonal.
+    assert not _np.allclose(rows[:, 0], rows[:, 1])
+    a = _as_hold_action(0.5, 3)
+    assert a.shape == (3,) and _np.allclose(a, 0.5)
+    b = _as_hold_action(_np.array([0.1, -0.2, 0.3], dtype='float32'), 3)
+    assert _np.allclose(b, [0.1, -0.2, 0.3])
+    cfg = TrainConfig()
+    cfg.episode_length = 20
+    u1, sw = _sample_step_settle_params(_np.random.default_rng(1), cfg, 0.2)
+    assert isinstance(u1, float) and 1 <= sw <= 19
+    u1v, swv = _sample_step_settle_params(
+        _np.random.default_rng(1), cfg,
+        _np.array([0.2, -0.1], dtype='float32'))
+    assert getattr(u1v, 'shape', ()) == (2,) and 1 <= swv <= 19
+    print('[smoke] OK  MIMO const-action hold rows (n_mv=1 identity)')
+
+
 def _test_isolation_seq_is_mv() -> None:
     B, T, A = 4, 8, 1
     act = torch.zeros(B, T, A)
@@ -946,6 +980,7 @@ if __name__ == '__main__':
     _test_envfree_observer_recipe()
     _test_auto_if_unset_honours_explicit()
     _test_isolation_dcv_scales()
+    _test_mimo_hold_rows()
     _test_isolation_seq_is_mv()
     _test_snr_measured_scope()
     import tempfile

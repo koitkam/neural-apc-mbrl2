@@ -269,7 +269,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_DISTURBANCE_DETREND_SETTLE_MULT': ('disturbance_detrend_settle_mult', float),
     # 2026-05-22: number of constant-action seed episodes (steady-state
     # coverage for the WM before random/imagination data dominates).
-    # Default 24 in TrainConfig.
+    # Default 40 in TrainConfig (P42 SS coverage).  Count is the
+    # test_sim sentinel; MIMO covers OP combinations via per-MV
+    # permutations, not extra episodes.
     'DREAMER_CONST_ACTION_SEEDS': ('constant_action_seed_episodes', int),
     # P1 re-inject cadence (P28 follow-up 5/6): EVERY auto-scales from
     # buffer lap; N auto-scales from n_mv/n_dv.  Explicit env wins; 0 disables.

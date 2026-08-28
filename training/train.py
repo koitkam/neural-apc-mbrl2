@@ -1097,7 +1097,10 @@ class TrainConfig:
     # diagnostic: real plant converges 75–88%, WM 0% under constant
     # action).  10 full-length constant-action episodes give the WM
     # explicit steady-state coverage at a stratified spread of operating
-    # points.  Set to 0 to disable.
+    # points.  Set to 0 to disable.  Scalar level broadcasts to every
+    # MV (test_sim n_mv=1).  MIMO uses independent per-MV permutations
+    # of the same linspace (``_per_mv_hold_rows``) so joint SS is not
+    # only the all-MVs-equal diagonal; episode count stays this sentinel.
     constant_action_seed_episodes: int = 40
     # Operating-band fraction for the constant-action seed.  Narrower
     # than ``prbs_seed_op_band`` (0.95) on purpose: at the very edges of
@@ -3482,6 +3485,55 @@ def _hold_other_action_dims(
     return out
 
 
+def _as_hold_action(level: float | np.ndarray, action_dim: int) -> np.ndarray:
+    """Normalized hold vector.  Scalar broadcasts (test_sim n_mv=1)."""
+    a = max(1, int(action_dim or 1))
+    x = np.asarray(level, dtype='float32').reshape(-1)
+    if x.size <= 1:
+        v = float(x.item()) if x.size == 1 else float(level)
+        return np.full((a,), float(np.clip(v, -1.0, 1.0)), dtype='float32')
+    out = np.zeros((a,), dtype='float32')
+    n = min(int(x.size), a)
+    out[:n] = np.clip(x[:n], -1.0, 1.0)
+    return out
+
+
+def _per_mv_hold_rows(
+        levels: np.ndarray, n_mv: int, action_dim: int,
+        rng: np.random.Generator) -> Optional[np.ndarray]:
+    """Independent per-MV stratified holds, or None to keep scalar ``levels[i]``.
+
+    Const-action / step-settle used to copy one linspace level onto **every**
+    MV (the OP-space diagonal).  Isolation settle already covers per-input
+    holds.  Joint SS coverage on MIMO needs combinations, not all-MVs-equal.
+    ``n_mv<=1`` returns None so test_sim keeps the existing scalar path
+    (same RNG, same episodes).  MIMO: each column is a permutation of the
+    already-jittered 1-D linspace — same marginals, Latin-hypercube-ish
+    joints.  Episode **count** is unchanged (still the test_sim sentinel).
+    """
+    lv = np.asarray(levels, dtype='float32').reshape(-1)
+    n_eps = int(lv.size)
+    n_mv_i = max(0, int(n_mv or 0))
+    a = max(1, int(action_dim or n_mv_i or 1))
+    if n_mv_i <= 1 or a <= 1 or n_eps <= 0:
+        return None
+    rows = np.empty((n_eps, a), dtype='float32')
+    n_fill = min(n_mv_i, a)
+    for j in range(n_fill):
+        rows[:, j] = lv[rng.permutation(n_eps)]
+    if a > n_fill:
+        rows[:, n_fill:] = 0.0
+    return rows
+
+
+def _env_n_mv(env: 'APCEnv') -> int:
+    sim = getattr(env, 'sim', None)
+    n = int(len(getattr(sim, 'mv_indices', []) or []) or 0)
+    if n > 0:
+        return n
+    return max(1, int(getattr(env, 'action_dim', 1) or 1))
+
+
 def _isolation_settle_counts(
         n_mv: int, n_dv: int, n_per: int) -> Tuple[int, int]:
     """Isolated-settle episode counts. ``n_per`` is per input (test_sim 24)."""
@@ -4424,7 +4476,7 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
-                                      action_level: float,
+                                      action_level: float | np.ndarray,
                                       ) -> Dict[str, np.ndarray]:
     """Collect one episode driven by a single, perfectly constant action.
 
@@ -4447,7 +4499,9 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     ``APCEnv._schedule`` is the single hook used by every simulator.
 
     ``action_level`` is in the env's normalized action space and is
-    clipped to ``[-1, 1]``.  Returns the same dict shape as
+    clipped to ``[-1, 1]``.  A scalar broadcasts to every MV (test_sim
+    n_mv=1).  A vector sets each MV independently (MIMO OP hypercube;
+    see ``_per_mv_hold_rows``).  Returns the same dict shape as
     ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
@@ -4468,9 +4522,7 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
-    a_const = np.full((env.action_dim,),
-                       float(np.clip(action_level, -1.0, 1.0)),
-                       dtype='float32')
+    a_const = _as_hold_action(action_level, env.action_dim)
     for t in range(T):
         obs_buf[t] = obs_window[-1]
         next_window, reward, done, _ = env.step(a_const)
@@ -4567,8 +4619,8 @@ def collect_expert_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
-                                  action_start: float,
-                                  action_end: float,
+                                  action_start: float | np.ndarray,
+                                  action_end: float | np.ndarray,
                                   switch_step: int,
                                   ) -> Dict[str, np.ndarray]:
     """Collect a step-and-settle episode for WM seeding (P42 design).
@@ -4596,6 +4648,7 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     Sim-agnostic via ``APCEnv._schedule``.
 
     Both ``action_start`` and ``action_end`` are clipped to ``[-1, 1]``.
+    Scalars broadcast to every MV; vectors set each MV independently.
     Returns the same dict shape as ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
@@ -4612,12 +4665,8 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
-    a_start = np.full((env.action_dim,),
-                       float(np.clip(action_start, -1.0, 1.0)),
-                       dtype='float32')
-    a_end = np.full((env.action_dim,),
-                     float(np.clip(action_end, -1.0, 1.0)),
-                     dtype='float32')
+    a_start = _as_hold_action(action_start, env.action_dim)
+    a_end = _as_hold_action(action_end, env.action_dim)
     sw = int(np.clip(switch_step, 1, T - 1))
     for t in range(T):
         a_t = a_start if t < sw else a_end
@@ -4633,7 +4682,8 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
-                                  u0: float) -> Tuple[float, int]:
+                                  u0: float | np.ndarray
+                                  ) -> Tuple[float | np.ndarray, int]:
     """Sample ``(u1, switch_step)`` for a step-and-settle episode.
 
     ``u1`` is ``u0 + Δ`` with ``|Δ| ∈ [step_seed_delta_min, max]`` and
@@ -4641,6 +4691,10 @@ def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
     shrink the step below ``step_seed_delta_min``, the sign is
     reversed before re-clipping (keeps the step magnitude meaningful
     even when ``u0`` is near the operating-band edge).
+
+    A vector ``u0`` (MIMO independent holds) gets an independent Δ per
+    MV and one shared ``switch_step``.  Scalar ``u0`` is the test_sim
+    path and keeps the original RNG order.
 
     ``switch_step`` is uniformly sampled from
     ``int(prefix_frac * episode_length)`` with
@@ -4650,11 +4704,24 @@ def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
     d_max = float(cfg.step_seed_delta_max)
     if d_max < d_min:
         d_min, d_max = d_max, d_min
-    mag = float(rng.uniform(d_min, d_max))
-    sign = 1.0 if rng.uniform() < 0.5 else -1.0
-    u1 = float(np.clip(u0 + sign * mag, -1.0, 1.0))
-    if abs(u1 - u0) < d_min:
-        u1 = float(np.clip(u0 - sign * mag, -1.0, 1.0))
+
+    def _one_u1(u0f: float) -> float:
+        mag = float(rng.uniform(d_min, d_max))
+        sign = 1.0 if rng.uniform() < 0.5 else -1.0
+        u1 = float(np.clip(u0f + sign * mag, -1.0, 1.0))
+        if abs(u1 - u0f) < d_min:
+            u1 = float(np.clip(u0f - sign * mag, -1.0, 1.0))
+        return u1
+
+    u0_arr = np.asarray(u0, dtype='float32').reshape(-1)
+    if isinstance(u0, np.ndarray) and u0_arr.size > 1:
+        u1 = np.asarray([_one_u1(float(u)) for u in u0_arr], dtype='float32')
+    else:
+        if isinstance(u0, np.ndarray):
+            u0f = float(u0_arr.item()) if u0_arr.size == 1 else 0.0
+        else:
+            u0f = float(u0)
+        u1 = _one_u1(u0f)
     pf_min = float(cfg.step_seed_prefix_frac_min)
     pf_max = float(cfg.step_seed_prefix_frac_max)
     if pf_max < pf_min:
@@ -4666,21 +4733,22 @@ def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
 
 
 def _seed_one_const_or_step(env: APCEnv, cfg: TrainConfig, *,
-                              level: float, do_step: bool,
+                              level: float | np.ndarray, do_step: bool,
                               ) -> Dict[str, np.ndarray]:
     """Dispatch one constant-action OR step-and-settle seed episode.
 
     Used by the initial seed loop and the P1 periodic injection block
     so the const-vs-step allocation is identical in both code paths.
+    ``level`` is a scalar (test_sim) or a per-MV vector (MIMO).
     """
     if do_step:
-        u1, sw = _sample_step_settle_params(env.rng, cfg, float(level))
+        u1, sw = _sample_step_settle_params(env.rng, cfg, level)
         return collect_step_settle_episode(env, cfg,
-                                             action_start=float(level),
+                                             action_start=level,
                                              action_end=u1,
                                              switch_step=sw)
     return collect_constant_action_episode(env, cfg,
-                                             action_level=float(level))
+                                             action_level=level)
 
 
 def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
@@ -9618,9 +9686,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             do_step_mask[step_idx] = True
         n_step_emitted = 0
         n_const_emitted = 0
+        n_mv_hold = _env_n_mv(env)
+        hold_rows = _per_mv_hold_rows(
+            levels, n_mv_hold, int(env.action_dim), env.rng)
         for i, lvl in enumerate(levels):
+            level_i = (hold_rows[i] if hold_rows is not None
+                       else float(lvl))
             ep = _seed_one_const_or_step(env, cfg,
-                                          level=float(lvl),
+                                          level=level_i,
                                           do_step=bool(do_step_mask[i]))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
             total_env_steps += cfg.episode_length
@@ -9630,7 +9703,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 n_const_emitted += 1
         print(f"[seed] const-action={n_const_emitted} "
               f"step-settle={n_step_emitted} "
-              f"(step_fraction={step_frac:.2f}, op_band={const_op_band:.2f})",
+              f"(step_fraction={step_frac:.2f}, op_band={const_op_band:.2f}"
+              f"{'' if hold_rows is None else f', mimo_hold n_mv={n_mv_hold}'})",
               flush=True)
 
     # APC step-test seed episodes (P51 design, 2026-05-25).  Held-MV
@@ -10486,9 +10560,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     0, const_inject_n - 1, _n_step, dtype=int)] = True
             _n_c = 0
             _n_s = 0
+            _n_mv_hold = _env_n_mv(env)
+            _hold_rows = _per_mv_hold_rows(
+                _levels, _n_mv_hold, int(env.action_dim), env.rng)
             for _i, _lvl in enumerate(_levels):
+                _level = (_hold_rows[_i] if _hold_rows is not None
+                          else float(_lvl))
                 _ep = _seed_one_const_or_step(
-                    env, cfg, level=float(_lvl),
+                    env, cfg, level=_level,
                     do_step=bool(_do_step_mask[_i]))
                 buf.add_episode(_ep['obs'], _ep['act'],
                                  _ep['rew'], _ep['cont'])
