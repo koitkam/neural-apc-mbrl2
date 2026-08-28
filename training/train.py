@@ -938,7 +938,8 @@ class TrainConfig:
     # 1/op_band, |ΔCV| cannot equalize without shrinking the strong
     # teacher or exceeding the cube — floor 1.0 leaves residual
     # |ΔCV| imbalance (test_sim ~5.8 > 1.67).  P39 CAPPED 0.70@DV.
-    # ``DREAMER_WM_ISOLATION_DCV_MIN_SCALE``.
+    # Audit ``run_plan.isolation_dcv_scales.equalize_possible`` /
+    # ``g_ratio`` / ``smax``.  ``DREAMER_WM_ISOLATION_DCV_MIN_SCALE``.
     wm_isolation_dcv_min_scale: float = 1.0
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
@@ -3321,6 +3322,13 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         print(f'[resolved-cfg] WARN could not rewrite run_plan.json: {exc!r}',
               flush=True)
         return
+    _span = ''
+    if _dcv.get('g_ratio') is not None:
+        _span = (
+            f"g_ratio={float(_dcv['g_ratio']):.3g} "
+            f"smax={_dcv.get('smax')} "
+            f"equalize={_dcv.get('equalize_possible')} "
+        )
     print(
         '[resolved-cfg] '
         f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
@@ -3336,6 +3344,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dv={['%.3g' % x for x in _dcv['dv']]} "
         f"edge_du_mv={['%.3g' % x for x in (_dcv.get('edge_du_mv') or ())]} "
         f"edge_du_dv={['%.3g' % x for x in (_dcv.get('edge_du_dv') or ())]} "
+        f"{_span}"
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -3691,6 +3700,46 @@ def _isolation_edge_du(scale: float, op_band: float) -> float:
     return float(np.clip(a0 * abs(float(scale)), 0.0, 1.0))
 
 
+def _isolation_dcv_floor(cfg: 'TrainConfig') -> float:
+    raw_floor = getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)
+    try:
+        return max(0.0, float(raw_floor))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _record_isolation_dcv_span(
+        cfg: 'TrainConfig', op_band: float,
+        mv_g: Optional[List[float]] = None,
+        dv_g: Optional[List[float]] = None,
+) -> None:
+    """Stash unitless |G| span for run_plan audit (does not change scales)."""
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
+    smax = 1.0 / a0
+    cfg._isolation_dcv_smax = smax  # type: ignore[attr-defined]
+    cfg._isolation_dcv_g_ratio = None  # type: ignore[attr-defined]
+    cfg._isolation_dcv_equalize_possible = None  # type: ignore[attr-defined]
+    if not _cfg_on(cfg, 'wm_isolation_dcv_match', True):
+        return
+    if mv_g is None or dv_g is None:
+        return
+    g_all = [g for g in list(mv_g) + list(dv_g) if g > 1e-6]
+    if len(g_all) < 2:
+        return
+    g_min = float(min(g_all))
+    g_max = float(max(g_all))
+    ratio = g_max / max(g_min, 1e-12)
+    cfg._isolation_dcv_g_ratio = float(ratio)  # type: ignore[attr-defined]
+    if ratio < 1.05:
+        cfg._isolation_dcv_equalize_possible = True  # type: ignore[attr-defined]
+        return
+    floor = _isolation_dcv_floor(cfg)
+    # Floor 0 can equalize by shrinking the strong teacher (P38 FALSIFIED).
+    # Floor 1.0 can equalize only when ratio ≤ smax (cube headroom).
+    cfg._isolation_dcv_equalize_possible = bool(  # type: ignore[attr-defined]
+        floor <= 0.0 or ratio <= smax * 1.001)
+
+
 def _isolation_dcv_scales(
         cfg: 'TrainConfig', n_mv: int, n_dv: int, op_band: float,
 ) -> Tuple[List[float], List[float]]:
@@ -3707,17 +3756,16 @@ def _isolation_dcv_scales(
     ``|G_max|/|G_min| > 1/op_band``, |ΔCV| cannot equalize without
     shrinking the strong teacher or exceeding the cube — the floor
     leaves residual |ΔCV| imbalance (test_sim ~5.8 > 1.67; P39 CAPPED
-    0.70@DV).  Audit ``edge_du_* = min(1, op_band·scale)``.  Equal-|G|
+    0.70@DV).  Audit ``edge_du_* = min(1, op_band·scale)`` and
+    ``equalize_possible`` / ``g_ratio`` / ``smax``.  Equal-|G|
     (max/min < 1.05) or a single input keeps the unscaled op-band
     linspace.  Off (``wm_isolation_dcv_match=False``) or missing
-    targets → all 1s.
+    targets → all 1s.  Scale values are unchanged by the span audit.
     """
     n_mv = max(0, int(n_mv or 0))
     n_dv = max(0, int(n_dv or 0))
     ones_mv = [1.0] * n_mv
     ones_dv = [1.0] * n_dv
-    if not _cfg_on(cfg, 'wm_isolation_dcv_match', True):
-        return ones_mv, ones_dv
     mv_g = _gain_col_rms(getattr(cfg, 'gain_match_mv_target', ()) or ())
     dv_g = _gain_col_rms(getattr(cfg, 'gain_match_dv_target', ()) or ())
     while len(mv_g) < n_mv:
@@ -3726,6 +3774,9 @@ def _isolation_dcv_scales(
         dv_g.append(0.0)
     mv_g = mv_g[:n_mv]
     dv_g = dv_g[:n_dv]
+    _record_isolation_dcv_span(cfg, op_band, mv_g, dv_g)
+    if not _cfg_on(cfg, 'wm_isolation_dcv_match', True):
+        return ones_mv, ones_dv
     g_all = [g for g in mv_g + dv_g if g > 1e-6]
     if len(g_all) < 2:
         return ones_mv, ones_dv
@@ -3735,11 +3786,7 @@ def _isolation_dcv_scales(
         return ones_mv, ones_dv
     a0 = float(np.clip(float(op_band), 1e-3, 1.0))
     smax = 1.0 / a0
-    raw_floor = getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)
-    try:
-        floor = max(0.0, float(raw_floor))
-    except (TypeError, ValueError):
-        floor = 1.0
+    floor = _isolation_dcv_floor(cfg)
 
     def _sc(gs: List[float]) -> List[float]:
         out: List[float] = []
@@ -3772,11 +3819,7 @@ def _isolation_dcv_scale_payload(cfg: 'TrainConfig') -> Dict[str, object]:
     dv = [float(x) for x in (
         getattr(cfg, '_isolation_dcv_dv_scale', ()) or ())]
     op = float(getattr(cfg, '_isolation_dcv_op_band', 0.0) or 0.0)
-    raw_floor = getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)
-    try:
-        min_scale = max(0.0, float(raw_floor))
-    except (TypeError, ValueError):
-        min_scale = 1.0
+    min_scale = _isolation_dcv_floor(cfg)
     out: Dict[str, object] = {
         'on': bool(getattr(cfg, 'wm_isolation_dcv_match', True)),
         'min_scale': min_scale,
@@ -3787,6 +3830,15 @@ def _isolation_dcv_scale_payload(cfg: 'TrainConfig') -> Dict[str, object]:
         out['op_band'] = op
         out['edge_du_mv'] = [_isolation_edge_du(s, op) for s in mv]
         out['edge_du_dv'] = [_isolation_edge_du(s, op) for s in dv]
+    g_ratio = getattr(cfg, '_isolation_dcv_g_ratio', None)
+    if g_ratio is not None:
+        out['g_ratio'] = float(g_ratio)
+    smax = getattr(cfg, '_isolation_dcv_smax', None)
+    if smax is not None:
+        out['smax'] = float(smax)
+    eq = getattr(cfg, '_isolation_dcv_equalize_possible', None)
+    if eq is not None:
+        out['equalize_possible'] = bool(eq)
     return out
 
 
@@ -9474,15 +9526,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # ×0.97).  Opt in with DREAMER_WM_BEST_RESTORE_AT_P2=1.
     wm_best_restore_min_gap = int(
         getattr(cfg, 'wm_best_restore_min_gap', 10) or 10)
-    # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
-    # All four are cheap and gated by env vars.  A + D are standing
-    # observability (default ON, run at probe cadence → <2% overhead).
-    # B + C are controlled-experiment switches (default OFF) used to
-    # causally isolate whether reward-MTP gradients distort the latent.
+    # ----- Diagnostics for reward-MTP/WM coupling RCA (May-2026 P39) -----
+    # Extra autograd.grad(retain_graph=True) + tokenizer encode.  Default
+    # OFF (probes belong in gitignored scratch/; env-free must not pay
+    # a second backward every 10 iters).  Opt in via env (read here, not
+    # ENV_OVERRIDES).  B + C stay default OFF.
     diag_perhead_grads_every = int(
-        os.environ.get('DREAMER_DIAG_PERHEAD_GRADS_EVERY', '10') or 0)
+        os.environ.get('DREAMER_DIAG_PERHEAD_GRADS_EVERY', '0') or 0)
     diag_latent_stability_every = int(
-        os.environ.get('DREAMER_DIAG_LATENT_STABILITY_EVERY', '10') or 0)
+        os.environ.get('DREAMER_DIAG_LATENT_STABILITY_EVERY', '0') or 0)
     diag_disable_reward_mtp_in_p1 = bool(int(
         os.environ.get('DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1', '0') or 0))
     diag_reward_mtp_stop_grad_in_p1 = bool(int(
@@ -9869,6 +9921,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             f"edge_du MV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _mv_sc]} "
             f"DV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _dv_sc]}"
             if _cfg_on(cfg, 'wm_isolation_dcv_match', True) else 'dcv_match=off')
+        _gr = getattr(cfg, '_isolation_dcv_g_ratio', None)
+        _eq = getattr(cfg, '_isolation_dcv_equalize_possible', None)
+        _sx = getattr(cfg, '_isolation_dcv_smax', None)
+        if _gr is not None:
+            _sc_txt += (
+                f" g_ratio={float(_gr):.3g} smax={float(_sx or 0.0):.3g} "
+                f"equalize={_eq}")
         print(f"[seed] isolated-settle MV={_n_mv_settle} DV={_n_dv_settle} "
               f"(per_input={n_settle}, n_mv={n_mv}, n_dv={n_dv}; "
               f"whole-ep hold @ stratified level, action_std=0 → "

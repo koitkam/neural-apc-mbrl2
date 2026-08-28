@@ -276,7 +276,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > Logged `scale` is a **multiplier** on
 > `isolated_level ∈ [−op_band,+op_band]`; applied edge |Δu| is
 > `min(1, op_band·scale)` (`run_plan.isolation_dcv_scales.edge_du_*`).
-> P38 EXIT (`run_p38_isodcv`, **no floor**, 102 iters): MV scale 0.317 →
+> Span audit (no scale change): `g_ratio`, `smax=1/op_band`,
+> `equalize_possible` (False on test_sim with floor 1.0: ratio ~5.8 >
+> 1.67). P38 EXIT (`run_p38_isodcv`, **no floor**, 102 iters): MV scale 0.317 →
 > edge |Δu| **0.19** (P37 0.60); DV scale 1.67 → edge |Δu| **1.0**.
 > Match-at-`g_min` starved MV isolation SNR. Storm **1/2 @iter 45**
 > (last-ok 13) then **2/2 @iter 48** CAPPED GAIN_NOT_READY **0.01@DV**
@@ -287,13 +289,18 @@ env-gated off · **[planned]** = designed, not yet built.
 > `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`. Storm **1/2 @iter 53**
 > recovered, extension kept. Iter 75/85 EXTEND 0.71 then 0.69@DV.
 > Extra-P1 **did not detonate**. Iter 97 CAPPED **0.70@DV** (MV 1.00),
-> P2 recon 0.003 `dobg>0`. Cube-boost **FALSIFIED as DV pin**.
+> P2 recon 0.003 `dobg>0` (iter ~117 still P2). Cube-boost **FALSIFIED as DV pin**.
 > **Structural:** `|G_max|/|G_min| > 1/op_band` cannot equalize |ΔCV|
 > without shrinking the strong teacher (P38) or exceeding the cube.
 > Floor is `wm_isolation_dcv_min_scale=1.0`. Do not launch a second GPU
 > job. Expect `[p3-skip]`.
-> **P39 GPU-occupied (no second job):** const-action / step-settle
-> seed used one linspace level on **every** MV (OP-space diagonal).
+> **P39 GPU-occupied (no second job):** May-2026 per-head
+> `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
+> ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
+> default is now **0** (opt in `DREAMER_DIAG_*_EVERY=10`). Isolation
+> span audit does not change scales.
+> Const-action / step-settle seed used one linspace level on **every** MV
+> (OP-space diagonal).
 > Isolation settle already covers per-input holds. Joint SS on MIMO
 > now uses independent per-MV permutations of the same linspace
 > (`_per_mv_hold_rows`); `n_mv<=1` returns None so test_sim keeps the
