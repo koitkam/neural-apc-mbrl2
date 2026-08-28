@@ -206,6 +206,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > No skip-storm. Val MV ss/@H ×1.083/×1.093, DV ×0.660/×0.770,
 > det_r 0.398 (amplitude still dead). `[p3-skip]` KEEP. Keep-ext KEEP
 > as mechanism, **FALSIFIED as DV lever**. Abs isolation drowns DV
+> (|tgt| 2.82 vs 0.49). Extra P1 cannot pin DV.
 > **P36 EXIT (2026-08-27 11:44, `run_p36_isoinpscale`, 61 iters):**
 > per-input `|G|²` fired (`tgt_scale=1`, scale_ratio 20–33) but inv-var
 > **DISCARDED**: iso 0.125 vs P33 1.69, gmatch stuck 1.21, storm 2/2
@@ -283,15 +284,22 @@ env-gated off · **[planned]** = designed, not yet built.
 > DV **×0.007 / ×0.007**, det_r **0.428** amp-dead, `[p3-skip]`.
 > **FALSIFIED**. HEAD/P39 floor keeps MV edge |Δu|=0.60 and still
 > boosts DV to the cube. P39 LIVE (`run_p39_isodcvfloor`, pid 4170377):
-> `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`; P1 iter 22 gmatch
-> **0.0008** skip 0 (P37-class, not P38 stuck 1.30). Equal-|G| plants keep the op-band
-> linspace.
+> `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`. Storm **1/2 @iter 53**
+> recovered last-ok 51, **extension kept**. Iter 75 **EXTENDED**
+> GAIN_NOT_READY **0.71@DV** (MV 1.04 in band) — P37-class first gate
+> (P37 0.68@DV), not P38 dead DV. Cube-boost has not moved the
+> first-gate DV pin. Do not launch a second GPU job.
 > **P39 GPU-occupied (no second job):** const-action / step-settle
 > seed used one linspace level on **every** MV (OP-space diagonal).
 > Isolation settle already covers per-input holds. Joint SS on MIMO
 > now uses independent per-MV permutations of the same linspace
 > (`_per_mv_hold_rows`); `n_mv<=1` returns None so test_sim keeps the
 > scalar path (same RNG, same episodes). Episode **count** stays 40.
+> **Step-test** had the same diagonal: scalar `cur_u` filled every MV
+> and each MV *event* stepped all MVs together (confounded MIMO
+> ∂CV/∂u_i). Held baseline now uses `_per_mv_hold_rows`; each MV
+> event steps **one** channel (`primary_mv_pos` round-robin).
+> `n_mv<=1` identity (no extra RNG). Faithful auditor matches.
 > Not a loss reweight; not a test_sim recipe change.
 > Not relative Huber.
 > Pre-iso resolve is **only** for those scales; gain-match Huber

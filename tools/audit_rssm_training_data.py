@@ -129,6 +129,7 @@ from training.train import (  # noqa: E402
     TrainConfig, APCEnv, auto_tune_seed_buffer,
     collect_baseline_episode, collect_episode, collect_prbs_episode,
     _seed_one_const_or_step, collect_step_test_episode,
+    _per_mv_hold_rows, _env_n_mv,
 )
 
 _valid = {f.name for f in _dc_fields(TrainConfig)}
@@ -347,8 +348,12 @@ if n_const > 0:
     do_step = np.zeros(n_const, dtype=bool)
     if n_step > 0:
         do_step[np.linspace(0, n_const - 1, n_step, dtype=int)] = True
+    n_mv_hold = _env_n_mv(env)
+    hold_rows = _per_mv_hold_rows(
+        levels, n_mv_hold, int(env.action_dim), env.rng)
     for i, lvl in enumerate(levels):
-        ep = _seed_one_const_or_step(env, cfg, level=float(lvl),
+        level_i = (hold_rows[i] if hold_rows is not None else float(lvl))
+        ep = _seed_one_const_or_step(env, cfg, level=level_i,
                                      do_step=bool(do_step[i]))
         if do_step[i]:
             _harvest('step_settle', ep)
@@ -370,10 +375,17 @@ if n_st > 0:
     st_levels = np.linspace(-const_band, const_band, n_st, dtype='float32')
     st_jit = env.rng.uniform(-0.05, 0.05, size=st_levels.shape).astype('float32')
     st_levels = np.clip(st_levels + st_jit * const_band, -1.0, 1.0)
+    st_hold_rows = _per_mv_hold_rows(
+        st_levels, n_mv, int(env.action_dim), env.rng)
     for ep_idx, lvl in enumerate(st_levels):
         primary = (ep_idx % n_dv) if n_dv > 0 else -1
-        ep = collect_step_test_episode(env, cfg, initial_level=float(lvl),
-                                       primary_dv_pos=int(primary))
+        primary_mv = (ep_idx % n_mv) if n_mv > 1 else -1
+        level_i = (st_hold_rows[ep_idx] if st_hold_rows is not None
+                   else float(lvl))
+        ep = collect_step_test_episode(
+            env, cfg, initial_level=level_i,
+            primary_dv_pos=int(primary),
+            primary_mv_pos=int(primary_mv))
         _harvest('step_test', ep)
 print(f'[audit] step_test={n_st}', flush=True)
 

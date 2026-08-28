@@ -1179,7 +1179,8 @@ class TrainConfig:
     # every DV gets balanced isolated-step coverage).  The remainder
     # are picked uniformly at random across all DV channels — covers
     # cross-DV cases.  0.7 = strong stratification while still seeing
-    # the off-primary DVs.
+    # the off-primary DVs.  Analogous MV events use ``primary_mv_pos``
+    # (one MV per event; test_sim n_mv=1 identity).
     step_test_primary_dv_bias: float = 0.7
     # ---- DV-PRBS seed episodes (2026-06-14, p121 DV-gain RCA) ----
     # The DV analogue of the MV's ``collect_prbs_episode``: hold the MV and
@@ -3498,6 +3499,17 @@ def _as_hold_action(level: float | np.ndarray, action_dim: int) -> np.ndarray:
     return out
 
 
+def _step_test_mv_index(n_action: int, primary_mv_pos: int = -1) -> int:
+    """Which MV to step in a step-test event.  ``n_action<=1`` → 0 (test_sim)."""
+    n = max(1, int(n_action or 1))
+    if n <= 1:
+        return 0
+    j = int(primary_mv_pos)
+    if 0 <= j < n:
+        return j
+    return 0
+
+
 def _per_mv_hold_rows(
         levels: np.ndarray, n_mv: int, action_dim: int,
         rng: np.random.Generator) -> Optional[np.ndarray]:
@@ -4752,8 +4764,9 @@ def _seed_one_const_or_step(env: APCEnv, cfg: TrainConfig, *,
 
 
 def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
-                                initial_level: float,
+                                initial_level: float | np.ndarray,
                                 primary_dv_pos: int = -1,
+                                primary_mv_pos: int = -1,
                                 ) -> Dict[str, np.ndarray]:
     """APC-style step-test seed episode (P51 design, 2026-05-25).
 
@@ -4800,7 +4813,12 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
         each event's response is unambiguous (P43 SS-fidelity logic).
 
     ``initial_level`` is in normalized action space; clipped to [-1, 1].
-    Returns the same dict shape as ``collect_episode``.
+    A scalar broadcasts to every MV (test_sim n_mv=1, same RNG).  A
+    vector sets each MV independently (MIMO held baseline; see
+    ``_per_mv_hold_rows``).  Each MV *event* steps **one** MV
+    (``primary_mv_pos`` round-robin, else dim 0) so MIMO gains stay
+    isolated — broadcasting the same Δ onto every MV was the OP-space
+    diagonal.  Returns the same dict shape as ``collect_episode``.
     """
     from utils.training_disturbance import (_load_identifier_context,
                                               _channel_catalog)
@@ -4878,7 +4896,7 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
     u_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
 
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
-    cur_u = float(np.clip(initial_level, -1.0, 1.0))
+    cur_u = _as_hold_action(initial_level, env.action_dim)
     last_t = 0
     dv_schedule: List[Dict] = []
     mv_event_count = 0
@@ -4888,15 +4906,18 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
         if start > last_t:
             act_buf[last_t:start, :] = cur_u
         if kind == 'mv':
-            # Step the action: pick magnitude and a sign that keeps u in
-            # the operating band when possible.
+            # Step ONE MV (test_sim: the only dim).  Same mag/sign RNG
+            # as the scalar path; MIMO round-robin via primary_mv_pos
+            # does not consume extra RNG.
             mag = float(rng.uniform(u_min, u_max))
             sign = +1.0 if rng.random() < 0.5 else -1.0
-            cand = cur_u + sign * mag
+            j = _step_test_mv_index(cur_u.size, primary_mv_pos)
+            u = float(cur_u[j])
+            cand = u + sign * mag
             if abs(cand) > u_band:
                 sign = -sign   # flip toward the centre
-                cand = cur_u + sign * mag
-            cur_u = float(np.clip(cand, -1.0, 1.0))
+                cand = u + sign * mag
+            cur_u[j] = float(np.clip(cand, -1.0, 1.0))
             mv_event_count += 1
         else:
             # DV step: pick a channel and a magnitude in the channel's
@@ -9728,13 +9749,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         st_jit = env.rng.uniform(-0.05, 0.05,
                                    size=st_levels.shape).astype('float32')
         st_levels = np.clip(st_levels + st_jit * const_op_band, -1.0, 1.0)
+        st_hold_rows = _per_mv_hold_rows(
+            st_levels, n_mv, int(env.action_dim), env.rng)
         for ep_idx, lvl in enumerate(st_levels):
             # Round-robin primary DV so each DV channel gets balanced
             # coverage across the seed batch.  -1 disables when n_dv=0.
             primary = (ep_idx % n_dv) if n_dv > 0 else -1
-            ep = collect_step_test_episode(env, cfg,
-                                             initial_level=float(lvl),
-                                             primary_dv_pos=int(primary))
+            primary_mv = (ep_idx % n_mv) if n_mv > 1 else -1
+            level_i = (st_hold_rows[ep_idx] if st_hold_rows is not None
+                       else float(lvl))
+            ep = collect_step_test_episode(
+                env, cfg, initial_level=level_i,
+                primary_dv_pos=int(primary),
+                primary_mv_pos=int(primary_mv))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] step-test={n_step_test_seed} "
@@ -9742,7 +9769,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"floor={n_step_test_floor}, "
               f"dv_share={cfg.step_test_dv_share:.2f}, "
               f"overlap_frac={cfg.step_test_overlap_frac:.2f}, "
-              f"primary_dv_bias={cfg.step_test_primary_dv_bias:.2f})",
+              f"primary_dv_bias={cfg.step_test_primary_dv_bias:.2f}"
+              f"{'' if st_hold_rows is None else f', mimo_hold n_mv={n_mv}'})",
               flush=True)
 
     # ---------- DV-PRBS seed episodes (2026-06-14, p121 DV-gain RCA) ----------
@@ -10606,11 +10634,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _st_jit = env.rng.uniform(-0.05, 0.05,
                                        size=_st_levels.shape).astype('float32')
             _st_levels = np.clip(_st_levels + _st_jit * _st_op, -1.0, 1.0)
+            _n_mv_inj = _env_n_mv(env)
+            _st_hold = _per_mv_hold_rows(
+                _st_levels, _n_mv_inj, int(env.action_dim), env.rng)
             for _si, _slvl in enumerate(_st_levels):
                 _primary = _si % _n_dv_inj
+                _primary_mv = (_si % _n_mv_inj) if _n_mv_inj > 1 else -1
+                _level = (_st_hold[_si] if _st_hold is not None
+                          else float(_slvl))
                 _stp = collect_step_test_episode(
-                    env, cfg, initial_level=float(_slvl),
-                    primary_dv_pos=int(_primary))
+                    env, cfg, initial_level=_level,
+                    primary_dv_pos=int(_primary),
+                    primary_mv_pos=int(_primary_mv))
                 buf.add_episode(_stp['obs'], _stp['act'], _stp['rew'],
                                  _stp['cont'])
                 total_env_steps += cfg.episode_length

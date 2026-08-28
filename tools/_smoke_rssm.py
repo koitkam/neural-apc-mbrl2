@@ -52,7 +52,7 @@ from training.train import (
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
-                            _sample_step_settle_params)
+                            _step_test_mv_index, _sample_step_settle_params)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -805,6 +805,14 @@ def _test_mimo_hold_rows() -> None:
         _np.random.default_rng(1), cfg,
         _np.array([0.2, -0.1], dtype='float32'))
     assert getattr(u1v, 'shape', ()) == (2,) and 1 <= swv <= 19
+    assert _step_test_mv_index(1, 3) == 0
+    assert _step_test_mv_index(4, 2) == 2
+    assert _step_test_mv_index(4, -1) == 0
+    # MIMO step-test: vector hold + one-MV step; other MVs stay put.
+    cur = _as_hold_action(_np.array([0.1, -0.2, 0.3], dtype='float32'), 3)
+    j = _step_test_mv_index(cur.size, 1)
+    cur[j] = 0.5
+    assert _np.allclose(cur, [0.1, 0.5, 0.3])
     print('[smoke] OK  MIMO const-action hold rows (n_mv=1 identity)')
 
 
