@@ -305,21 +305,22 @@ env-gated off · **[planned]** = designed, not yet built.
 > DV pin** (not P26 ×0.87). P26 `run_plan` isolation=0 was the pre-rewrite
 > dump (jsonl iso 1.44). Gain-match is the DC supervisor. Opt in
 > `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when off.
-> **P41 CAPPED GPU-confirmed** (`run_p41_recentfloor`, `acb8a7b`,
-> iter 104): recent-floor **KEEP as mechanism** (gain-probe at 82, 94,
-> and cap-time). Gates FAIL **0.76@DV**; CAPPED **0.74@DV** (MV 1.02)
-> — extra P1 FALSIFIED as DV lever (slightly worse). Freeze recon
-> 0.0028; last_ok 104 (overwrite 56→64 then extra-P1); warm-restore
-> SKIPPED. P2 dobg live, g frozen. Expect `[p3-skip]`.
+> **P41 EXIT** (`run_p41_recentfloor`, `acb8a7b`, 158 iters): recent-floor
+> **KEEP as mechanism** (gain-probe at 82, 94, and cap-time). CAPPED
+> **GAIN_NOT_READY 0.74@DV** (MV 1.02; extra P1 0.76→0.74 FALSIFIED as
+> DV lever). Val MV ss/@H **×0.986 / ×0.973**, DV **×0.700 / ×0.775**,
+> det_r **0.079** / R² 0.006 (pred_std 0.196 vs true 1.93; P40 det_r
+> **0.490**). `[p3-skip]`. Actor INVALID. Isolation-off KEEP as env-free
+> default. Freeze last_ok **104** (overwrite 56→64 then extra-P1);
+> detonated-freeze missed 56. **FALSIFIED as DV pin.**
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
-> **HEAD (not in P41 pid):** last-ok locks after a silent recon spike
-> (`skip_storm_last_ok_lock_ratio=20`, unitless). P40 extra-P1 overwrote
-> 83→104; **P41 live already overwrote 56→64 in original P1** (iter 57
-> recon 0.089 / skip 0, recovered 0.0098 < 5×). Lock is recon-only (a
-> spike iter with skip 1 still locks). Skip-storm restore unlocks. Do
-> not stack onto live P41.
+> **P42 GPU:** last-ok locks after a silent recon spike
+> (`skip_storm_last_ok_lock_ratio=20`, unitless; recon-only). P40 extra-P1
+> overwrote 83→104; **P41 original-P1 overwrote 56→64** (iter 57 recon
+> 0.089 / skip 0, recovered 0.0098 < 5×) then 104. Skip-storm restore
+> unlocks. Wrap ~5–10× must not lock. One attributed vs P41 launch.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
