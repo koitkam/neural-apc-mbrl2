@@ -5675,12 +5675,12 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     a_all = act[:, idx].reshape(Bm, K, -1)                        # (Bm, K, A)
     dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
               if getattr(rssm, 'dv_dim', 0) > 0 else None)         # (Bm,K,dv)|None
-    # COMPILED prior rollout (whole K-step img_step loop = ONE graph) + ONE
-    # batched decode (the per-step decode was the launch-bound killer, exactly
-    # what rollout_observed hoists out).
-    roll_feats = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True,
-                                  c0=c0)                          # (Bm,K,F)
-    preds = rssm.decode(roll_feats).reshape(B, S, K, -1)          # (B, S, K, D)
+    # Decoder is a pointwise MLP, so per-step ``decode(feat_k)`` ≡ batched
+    # ``decode(stack(feat))``.  ``out='obs'`` skips the unused (Bm, K, F)
+    # stack (P40 GPU-occupied: A10 peak ~16.6 GB; F-stack is ~2 GB at
+    # B=128 / starts=24 / K=55).  GRU recurrence is identical.
+    preds = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True,
+                             c0=c0, out='obs').reshape(B, S, K, -1)  # (B,S,K,D)
     tgt = obs[:, idx].detach()                                    # (B, S, K, D)
     # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
     # contraction (decomp 1step→openloop ×0.876; probe: sampled open-loop gain
@@ -5792,9 +5792,10 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     a_hold_seq = a_hold.unsqueeze(1).expand(Bm, K, a_hold.shape[-1])   # (Bm,K,A)
     dv_hold_seq = (dv_hold.unsqueeze(1).expand(Bm, K, dv_hold.shape[-1])
                    if dv_hold is not None else None)
-    roll_feats = rssm.img_rollout(h, z, a_hold_seq, dvs=dv_hold_seq,
-                                  sample=True, c0=c0)             # (Bm, K, F)
-    Hroll = roll_feats[..., :rssm.deter_dim]                      # (Bm, K, deter)
+    # Drift uses ``h`` windows only.  ``out='h'`` skips the unused F-stack
+    # (same GRU; held loss never reads z/c/decode).
+    Hroll = rssm.img_rollout(h, z, a_hold_seq, dvs=dv_hold_seq,
+                             sample=True, c0=c0, out='h')          # (Bm, K, deter)
     h_scale = Hroll.detach().std().clamp_min(1e-3)
     early = Hroll[:, s:s + win].mean(dim=1)                      # (B*S, deter)
     late = Hroll[:, K - win:].mean(dim=1)                        # (B*S, deter)
@@ -11401,12 +11402,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             }
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
-            # Live key is ``wm_input_isolation_loss`` (ss-match split out).
-            # Alias so diagnosis scripts that still look for the pre-split
-            # name do not read None while the banner prints ``iso``.
-            if ('wm_isolation_loss' not in row
-                    and 'wm_input_isolation_loss' in row):
-                row['wm_isolation_loss'] = row['wm_input_isolation_loss']
+            # Diagnosis scripts look for ``wm_gain_match_loss`` / isolation
+            # keys.  Isolation off (P40 env-free) used to omit the keys so
+            # parsers read None while the banner printed ``iso 0``.  Emit 0.
+            if 'gain_match_loss' in row:
+                row.setdefault('wm_gain_match_loss', row['gain_match_loss'])
+            row.setdefault('wm_input_isolation_loss', 0.0)
+            row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
+            row.setdefault('wm_ss_match_loss', 0.0)
             # P39 diag A: emit last computed per-head grad norms (if any).
             # Values may be float (grad norms) or str (error messages); pass
             # strings through unchanged so jsonl serialisation works.

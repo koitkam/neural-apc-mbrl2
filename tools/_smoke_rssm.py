@@ -713,7 +713,11 @@ def _test_store_aux_feats_identity() -> None:
 
 
 def _test_img_rollout_last_only() -> None:
-    """Gain-match last-step Huber: last_only ≡ stack[:, -1]; GRU still gets grad."""
+    """Gain-match last-step Huber: last_only ≡ stack[:, -1]; GRU still gets grad.
+
+    ``out='h'`` / ``out='obs'`` are identity vs slicing/decoding the feat
+    stack (overshoot/held skip the unused F-stack).
+    """
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
     torch.manual_seed(0)
     cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
@@ -731,13 +735,27 @@ def _test_img_rollout_last_only() -> None:
     assert last.shape == roll[:, -1].shape, (last.shape, roll[:, -1].shape)
     err = float((last - roll[:, -1]).detach().abs().max())
     assert err < 1e-6, f'last_only != stack[:, -1] (max_err={err})'
+    h_roll = m.img_rollout(h0, z0, acts, sample=False, out='h')
+    h_err = float((h_roll - roll[..., :cfg.deter_dim]).detach().abs().max())
+    assert h_err < 1e-6, f"out='h' != feat[..., :deter] (max_err={h_err})"
+    obs_roll = m.img_rollout(h0, z0, acts, sample=False, out='obs')
+    obs_err = float((obs_roll - m.decode(roll)).detach().abs().max())
+    assert obs_err < 1e-5, f"out='obs' != decode(feat) (max_err={obs_err})"
+    last_h = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='h')
+    last_h_err = float((last_h - h_roll[:, -1]).detach().abs().max())
+    assert last_h_err < 1e-6, f"last_only out='h' != stack[:, -1] (max_err={last_h_err})"
+    last_obs = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='obs')
+    last_obs_err = float((last_obs - obs_roll[:, -1]).detach().abs().max())
+    assert last_obs_err < 1e-5, f"last_only out='obs' != stack[:, -1] (max_err={last_obs_err})"
     m.zero_grad(set_to_none=True)
     last.sum().backward()
     gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
                 if p.grad is not None)
     assert gru_g > 0.0, 'last_only decode/feat lost GRU gradient'
     print(f'[smoke] OK  img_rollout last_only ≡ stack[:, -1] '
-          f'(max_err={err:.2e}); gru |g|={gru_g:.3f}')
+          f'(max_err={err:.2e}); out=h/obs identity '
+          f'(h={h_err:.2e} obs={obs_err:.2e} last_h={last_h_err:.2e} '
+          f'last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}')
 
 
 def _test_isolation_dcv_scales() -> None:
@@ -794,7 +812,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_isolation_edge_du' in _src
     assert '_record_isolation_dcv_span' in _src
     assert "'p1_last_ok_iter'" in _src
-    assert "row['wm_isolation_loss'] = row['wm_input_isolation_loss']" in _src
+    assert "row.setdefault('wm_isolation_loss'" in _src
+    assert "out='obs'" in _src
+    assert "out='h'" in _src
+    assert 'last_only=True' in _src
     assert 'np.clip(g_min / (g * a0), floor, smax)' in _src
     assert 'wm_isolation_dcv_min_scale' in _src
     assert 'clamp_min(1.0)).detach()' in _src

@@ -882,7 +882,8 @@ class RSSMDynamics(nn.Module):
                     dvs: Optional[torch.Tensor] = None,
                     sample: bool = True,
                     c0: Optional[torch.Tensor] = None,
-                    last_only: bool = False) -> torch.Tensor:
+                    last_only: bool = False,
+                    out: str = 'feat') -> torch.Tensor:
         """Prior-only (imagined) rollout of K steps from ``(h0, z0[, c0])``.
 
         ``h0`` (Bm, deter_dim), ``z0`` (Bm, n_categoricals, n_classes),
@@ -894,9 +895,17 @@ class RSSMDynamics(nn.Module):
         ``E[f(c_sampled)]`` on the first GRU step).  ``c0=None`` with
         ``cont_dim>0`` zero-fills — same as ``img_step`` when ``prev.c is None``.
         Returns stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
-        ``last_only=True`` returns only the K-step feat ``(Bm, F)`` — same
-        recurrence / last-step value as ``stack[:, -1]``, without keeping
-        the unused K-stack (gain-match FD Huber is last-step only).
+        ``last_only=True`` returns only the K-step value ``(Bm, *)`` — same
+        recurrence / last-step as ``stack[:, -1]``, without keeping the
+        unused K-stack (gain-match FD Huber is last-step feat).
+        ``out`` selects what is stacked (GRU recurrence is identical):
+          * ``'feat'`` (default) — full ``state.feat``
+          * ``'h'`` — ``state.h`` only (held-rollout drift; no F-stack)
+          * ``'obs'`` — ``decode(feat)`` per step.  Pointwise MLP ⇒
+            ``stack(decode(feat_k))`` ≡ ``decode(stack(feat))`` (overshoot
+            does not need the unused F-stack).
+        ``last_only`` materializes ``out`` once after the K-loop (no
+        intermediate decode / feat copies).
 
         P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
         the open-loop gain supervisor trained a ``c=0`` GRU path while
@@ -920,21 +929,35 @@ class RSSMDynamics(nn.Module):
         if self.cont_dim > 0:
             c = (c0 if c0 is not None else torch.zeros(
                 Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
+        if out not in ('feat', 'h', 'obs'):
+            raise ValueError(f'img_rollout out={out!r}')
         state = RSSMState(
             h=h0,
             z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
                                  device=h0.device, dtype=h0.dtype),
             z=z0, c=c)
-        feats = []
+        feats = None if last_only else []
         img_step = self.img_step
+        out_h = out == 'h'
+        out_obs = out == 'obs'
         for k in range(K):
             dv_k = dvs[:, k] if dvs is not None else None
             state = img_step(state, actions[:, k], dv=dv_k, sample=sample)
-            if not last_only:
+            if last_only:
+                continue
+            if out_h:
+                feats.append(state.h)
+            elif out_obs:
+                feats.append(self.decode(state.feat))
+            else:
                 feats.append(state.feat)
         if last_only:
-            return state.feat                                 # (Bm, F)
-        return torch.stack(feats, dim=1)                      # (Bm, K, F)
+            if out_h:
+                return state.h
+            if out_obs:
+                return self.decode(state.feat)
+            return state.feat                                 # (Bm, *)
+        return torch.stack(feats, dim=1)                      # (Bm, K, *)
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the

@@ -301,17 +301,22 @@ env-gated off · **[planned]** = designed, not yet built.
 > Gain-match is the DC supervisor. Opt in
 > `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when
 > off. **P40 LIVE** (`mbrl2_p40`, `run_p40_gmatchonly`, `73a5116`,
-> pid 4176670): `[resolved-cfg] isolation=0 ss_match=0 iso_dcv=off
-> gain_match=1`. Iter 24 recon 0.0034 gmatch 0.0002 skip 0;
-> t_wm ~99 s (P39 ~128 s; isolation unroll skipped). Probe iter 10
-> `gain_fid=0.903`. Wrap gnorm blips (~22) recover. GPU ~17 GB.
-> Do not launch a second GPU job.
+> pid 4176670): `[resolved-cfg] isolation=0 ss_match=0 iso_dcv=True`
+> (inert; HEAD prints `iso_dcv=off`). Iter 66 after **storm 1/2 @65**
+> restored last-ok 63: recon **0.0041**, gmatch **0.0002**, skip
+> banner 7 = cumulative inner skips (window cleared on restore).
+> Isolation-off did **not** eliminate storms. Iter-60 r@H55 **+0.219**
+> vs P39 **+0.521** (WATCH; do not stack overshoot CV-mask until EXIT).
+> t_wm ~99 s. GPU ~17 GB. Do not launch a second GPU job.
 > **P40 GPU-occupied (HEAD):** gain-match `img_rollout(..., last_only=True)`
 > — last-step Huber does not keep the unused `(Bm, K, F)` stack
-> (test_sim ~Bm·55·F per inner step; GRU chain unchanged). Sequential
+> (test_sim ~Bm·55·F per inner step; GRU chain unchanged). Overshoot
+> `out='obs'` / held `out='h'` skip the same F-stack (~2 GB at
+> B=128/starts=24/K=55; pointwise decode ≡ batched). Sequential
 > `img_step` gain-match fallback **REMOVED** (RSSM+TSSM both expose
-> `img_rollout`). `[resolved-cfg]` prints `iso_dcv=off` when the
-> teacher is off. Not a recipe change; live pid still `73a5116`.
+> `img_rollout`). jsonl isolation/ss keys emit 0 when teacher off.
+> `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off. Not a
+> recipe change; live pid still `73a5116`.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free

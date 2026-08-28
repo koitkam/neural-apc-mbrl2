@@ -624,7 +624,8 @@ class TransformerSSMDynamics(nn.Module):
                     dvs: Optional[torch.Tensor] = None,
                     sample: bool = True,
                     c0: Optional[torch.Tensor] = None,
-                    last_only: bool = False) -> torch.Tensor:
+                    last_only: bool = False,
+                    out: str = 'feat') -> torch.Tensor:
         """Prior-only rollout of K steps from ``(h0, z0[, c0])``.
 
         Same contract as ``RSSMDynamics.img_rollout`` so gain-match can
@@ -632,7 +633,9 @@ class TransformerSSMDynamics(nn.Module):
         MIMO-width no longer sequential).  Fresh cache (``kv_cache=None``,
         ``pos=0``) matches sequential ``img_step``.  ``c0=None`` with
         ``cont_dim>0`` zero-fills like ``img_step``.  ``last_only=True``
-        returns ``(Bm, F)`` ≡ ``stack[:, -1]`` (gain-match last-step Huber).
+        returns ``(Bm, *)`` ≡ ``stack[:, -1]`` (gain-match last-step Huber).
+        ``out``: ``'feat'`` (default) / ``'h'`` / ``'obs'`` — see RSSM.
+        ``last_only`` materializes ``out`` once after the K-loop.
         """
         Bm = h0.shape[0]
         K = actions.shape[1]
@@ -640,19 +643,33 @@ class TransformerSSMDynamics(nn.Module):
         if self.cont_dim > 0:
             c = (c0 if c0 is not None else torch.zeros(
                 Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
+        if out not in ('feat', 'h', 'obs'):
+            raise ValueError(f'img_rollout out={out!r}')
         state = TSSMState(
             h=h0,
             z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
                                  device=h0.device, dtype=h0.dtype),
             z=z0, c=c, kv_cache=None, pos=0)
-        feats = []
+        feats = None if last_only else []
         img_step = self.img_step
+        out_h = out == 'h'
+        out_obs = out == 'obs'
         for k in range(K):
             dv_k = dvs[:, k] if dvs is not None else None
             state = img_step(state, actions[:, k], dv=dv_k, sample=sample)
-            if not last_only:
+            if last_only:
+                continue
+            if out_h:
+                feats.append(state.h)
+            elif out_obs:
+                feats.append(self.decode(state.feat))
+            else:
                 feats.append(state.feat)
         if last_only:
+            if out_h:
+                return state.h
+            if out_obs:
+                return self.decode(state.feat)
             return state.feat
         return torch.stack(feats, dim=1)
 

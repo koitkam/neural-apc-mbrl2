@@ -116,8 +116,22 @@ def test_img_rollout_equals_img_step():
     last = m.img_rollout(h0, z0, acts, sample=False, last_only=True)
     last_err = float((last - roll[:, -1]).detach().abs().max())
     assert last_err < 1e-6, f"last_only != stack[:, -1] (max_err={last_err})"
+    h_roll = m.img_rollout(h0, z0, acts, sample=False, out='h')
+    h_err = float((h_roll - roll[..., :cfg.deter_dim]).detach().abs().max())
+    assert h_err < 1e-6, f"out='h' != feat[..., :deter] (max_err={h_err})"
+    obs_roll = m.img_rollout(h0, z0, acts, sample=False, out='obs')
+    obs_err = float((obs_roll - m.decode(roll)).detach().abs().max())
+    assert obs_err < 1e-5, f"out='obs' != decode(feat) (max_err={obs_err})"
+    last_h = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='h')
+    last_h_err = float((last_h - h_roll[:, -1]).detach().abs().max())
+    assert last_h_err < 1e-6, f"last_only out='h' != stack[:, -1] (max_err={last_h_err})"
+    last_obs = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='obs')
+    last_obs_err = float((last_obs - obs_roll[:, -1]).detach().abs().max())
+    assert last_obs_err < 1e-5, f"last_only out='obs' != stack[:, -1] (max_err={last_obs_err})"
     print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e}); "
-          f"last_only ≡ stack[:, -1] (max_err={last_err:.2e})")
+          f"last_only ≡ stack[:, -1] (max_err={last_err:.2e}); "
+          f"out=h/obs identity (h={h_err:.2e} obs={obs_err:.2e} "
+          f"last_h={last_h_err:.2e} last_obs={last_obs_err:.2e})")
 
 
 def test_store_aux_feats_identity():
