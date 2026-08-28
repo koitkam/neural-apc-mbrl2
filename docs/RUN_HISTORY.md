@@ -1475,6 +1475,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Not:** Huber/isolation reweight, extra-P1, leftover `DREAMER_*`, P3 on GAIN_NOT_READY. `DREAMER_GAIN_MATCH_SETTLE_LEN=-1` recovers P43 FD-from-posterior.
 - **Step 4 resolved-cfg vs P43:** identical banner except `gmatch_settle=` **H** (P43 pid had no settle field / identity). `latent=deterministic restore_p2=False gain_match=1 dob_ground=2 isolation=0 ss_match=0 iso_dcv=off n_critics=2 rs_freeze=True skip_invalid_p3=True storm_cap=2 lock=20 huber_per_in=True compile=eager`.
 - **Watch:** `[resolved-cfg] gmatch_settle=55` and `[gain-match] settle=55`. P1 gmatch falling (not P38 stuck 1.30). Storm 2/2 early or P25 DC death (MV under, Huber tiny) → REVERT `-1`. Iter 82 DV toward `[0.8,1.3]` not 0.75. Val DV toward P26 ×0.87 not P43 ×0.74. Expect `[p3-skip]` unless GAIN-READY.
+- **Liveness:** **P1.** GPU ~17.1 GB / 23 GB. tmux `mbrl2_p44`, pid **11360**, launch `fc18ebf`. `device=cuda` bs=128. `[resolved-cfg] gmatch_settle=55` `huber_per_in=True isolation=0 lock=20`. `[gain-match] settle=55`. P1 iter **1** recon **0.0654** gmatch **0.0010** iso 0 skip **0**. **Do not launch a second GPU job.**
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
