@@ -2327,6 +2327,67 @@ class APCEnv:
             self._update_obs_norm(raw)
         return self._normalize_obs(raw)
 
+    def obs_channel_meta(self) -> List[Dict[str, object]]:
+        """Names + kinds for the concatenated obs vector (state + aug + derived).
+
+        SNR / recon diagnostics used to log ``obs[i]`` and treat constant
+        setpoint/bound channels as −120 dB 'noise' (P39: obs[8]/obs[9]).
+        """
+        sv = [str(x) for x in (self.meta.get('state_variables') or [])]
+        mv_idx = {int(x) for x in (self.meta.get('mv_indices') or [])
+                  if x is not None}
+        cv_idx = {int(x) for x in self.cv_indices}
+        dv_idx = {int(x) for x in self.dv_indices}
+        out: List[Dict[str, object]] = []
+        for i in range(int(self.state_dim)):
+            name = sv[i] if i < len(sv) else f'state[{i}]'
+            if i in cv_idx:
+                role = 'cv'
+            elif i in dv_idx:
+                role = 'dv'
+            elif i in mv_idx:
+                role = 'mv'
+            else:
+                role = 'state'
+            out.append({'name': name, 'kind': 'state', 'role': role})
+        n_mv = int(getattr(self.setpoint_mgr, 'n_mv', 0) or 0)
+        n_cv = int(getattr(self.setpoint_mgr, 'n_cv', 0) or 0)
+        for i in range(n_mv):
+            out.append({'name': f'MV{i}_lo', 'kind': 'aug_bounds',
+                        'role': 'mv_bound'})
+            out.append({'name': f'MV{i}_hi', 'kind': 'aug_bounds',
+                        'role': 'mv_bound'})
+        for i in range(n_cv):
+            out.append({'name': f'CV{i}_lo', 'kind': 'aug_bounds',
+                        'role': 'cv_bound'})
+            out.append({'name': f'CV{i}_hi', 'kind': 'aug_bounds',
+                        'role': 'cv_bound'})
+            out.append({'name': f'CV{i}_tgt', 'kind': 'aug_bounds',
+                        'role': 'cv_tgt'})
+            out.append({'name': f'CV{i}_tgt_on', 'kind': 'aug_bounds',
+                        'role': 'cv_tgt'})
+        if self._derived_features is not None:
+            for i in range(int(self._derived_features.n_cv)):
+                out.append({'name': f'CV{i}_int_err', 'kind': 'derived',
+                            'role': 'derived'})
+                out.append({'name': f'CV{i}_dcv', 'kind': 'derived',
+                            'role': 'derived'})
+                out.append({'name': f'CV{i}_var', 'kind': 'derived',
+                            'role': 'derived'})
+        if self._integral_enabled:
+            for i in range(len(self.cv_indices)):
+                out.append({'name': f'CV{i}_integral', 'kind': 'integral',
+                            'role': 'integral'})
+        while len(out) < int(self.obs_dim):
+            j = len(out)
+            out.append({'name': f'obs[{j}]', 'kind': 'unknown',
+                        'role': 'unknown'})
+        return out[:int(self.obs_dim)]
+
+    @property
+    def obs_channel_names(self) -> List[str]:
+        return [str(p['name']) for p in self.obs_channel_meta()]
+
     def _resolve_plant_timing(self) -> "tuple[float, float]":
         """Resolve ``(tau_dominant, dead_time)`` in plant time units.
 
@@ -3696,6 +3757,94 @@ def _cfg_on(cfg: 'TrainConfig', name: str, default: bool = True) -> bool:
     if isinstance(v, str):
         return str(v).strip().lower() not in ('0', 'off', 'false', 'no', '')
     return bool(v)
+
+
+def _isolation_seq_is_mv(act: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """(B,) bool: isolated-MV hold (action energy) vs isolated-DV (action≈0).
+
+    Isolation settle writes whole-episode MV holds (``action_std=0``) or
+    DV steps with MV held at 0.  Used only to split detached isolation
+    traj extras — does not change the loss.
+    """
+    return act.detach().pow(2).mean(dim=(1, 2)) > float(eps)
+
+
+def _snr_moving_average(arr: np.ndarray, window: int
+                        ) -> Tuple[np.ndarray, np.ndarray]:
+    """Valid moving-average trend + residual. ``arr`` is (T, C)."""
+    w = int(window)
+    t, _c = arr.shape
+    cs = np.concatenate(
+        [np.zeros((1, arr.shape[1]), dtype=arr.dtype),
+         np.cumsum(arr, axis=0)], axis=0)
+    trend = (cs[w:] - cs[:-w]) / float(w)
+    aligned = arr[w - 1:, :]
+    return trend, aligned - trend
+
+
+def _snr_build_report(
+        arr: np.ndarray, window: int, tau_dom: float, sample_rate: int,
+        channel_meta: List[Dict[str, object]],
+        measured_idx: List[int],
+) -> Dict[str, object]:
+    """Per-channel SNR. Summary/WARN use measured CV+DV, not constant aug."""
+    trend, detail = _snr_moving_average(arr, int(window))
+    signal_var = np.var(trend, axis=0)
+    noise_var = np.var(detail, axis=0)
+    snr_per_ch = signal_var / np.maximum(noise_var, 1e-12)
+    snr_db = 10.0 * np.log10(np.maximum(snr_per_ch, 1e-12))
+    n_ch = int(arr.shape[1])
+    per_channel: List[Dict[str, object]] = []
+    for i in range(n_ch):
+        meta = channel_meta[i] if i < len(channel_meta) else {}
+        sig = float(np.sqrt(signal_var[i]))
+        noi = float(np.sqrt(noise_var[i]))
+        constant = bool(sig < 1e-12 and noi < 1e-12)
+        per_channel.append({
+            'index': int(i),
+            'name': str(meta.get('name') or f'obs[{i}]'),
+            'kind': str(meta.get('kind') or 'unknown'),
+            'role': str(meta.get('role') or 'unknown'),
+            'signal_std': sig,
+            'noise_std': noi,
+            'snr': float(snr_per_ch[i]),
+            'snr_db': float(snr_db[i]),
+            'constant': constant,
+        })
+    meas_set = {int(x) for x in measured_idx}
+    meas = [p for p in per_channel
+            if int(p['index']) in meas_set and not bool(p['constant'])]
+    scope = 'measured_cv_dv'
+    if not meas:
+        meas = [p for p in per_channel
+                if p.get('kind') == 'state' and not bool(p['constant'])]
+        scope = 'state_nonconstant'
+    if not meas:
+        meas = [p for p in per_channel if not bool(p['constant'])]
+        scope = 'nonconstant'
+    if meas:
+        vals = np.asarray([float(p['snr_db']) for p in meas], dtype='float64')
+        snr_min = float(vals.min())
+        snr_med = float(np.median(vals))
+        snr_max = float(vals.max())
+    else:
+        snr_min = float(snr_db.min())
+        snr_med = float(np.median(snr_db))
+        snr_max = float(snr_db.max())
+        scope = 'all'
+    const_ch = [p for p in per_channel if bool(p['constant'])]
+    return {
+        'window_steps': int(window),
+        'tau_dom': float(tau_dom),
+        'sample_rate': int(sample_rate),
+        'summary_scope': scope,
+        'per_channel': per_channel,
+        'snr_db_min': snr_min,
+        'snr_db_median': snr_med,
+        'snr_db_max': snr_max,
+        'constant_n': int(len(const_ch)),
+        'constant_names': [str(p['name']) for p in const_ch],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -5814,7 +5963,9 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match.
     Default is abs mean (P33 / P36 RCA).  Inverse-variance reweight was
     removed (P34–P36 skip-storm; same class as P27 relative Huber).
-    ``extras`` splits the folded DC-gain term (``wm_ss_match_loss``).
+    ``extras`` splits the folded DC-gain term (``wm_ss_match_loss``) and
+    detached MV vs DV traj (``wm_isolation_mv_traj`` / ``_dv_traj``;
+    action-energy mask, no extra forward).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     empty: Dict[str, torch.Tensor] = {}
@@ -5885,6 +6036,18 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     extras: Dict[str, torch.Tensor] = {}
     traj = coef * err_b.mean()
     extras['wm_isolation_traj_loss'] = traj.detach()
+    # Detached MV vs DV split (no extra forward).  Isolation settle is
+    # mixed 50/50 on test_sim; P39 cube-boosts DV |Δu| so DV traj should
+    # be louder than P37.  Action energy >0 ⇒ isolated-MV hold.
+    is_mv_bm = (_isolation_seq_is_mv(act).unsqueeze(1).expand(B, S)
+                .reshape(Bm))
+    extras['wm_isolation_mv_frac'] = is_mv_bm.float().mean().detach()
+    if bool(is_mv_bm.any()):
+        extras['wm_isolation_mv_traj'] = (
+            coef * err_b[is_mv_bm].mean()).detach()
+    if bool((~is_mv_bm).any()):
+        extras['wm_isolation_dv_traj'] = (
+            coef * err_b[~is_mv_bm].mean()).detach()
     out = traj
     if ss_coef > 0.0 and ss_k0 < K:
         pred_ss = cv_pred[:, ss_k0:].mean(dim=1)                  # (Bm, n_cv)
@@ -8655,56 +8818,49 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             elif arr.ndim != 2:
                 raise ValueError(f'unexpected obs_trace ndim={arr.ndim}')
             sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
-            tau_dom = float(os.environ.get(
-                'SIM_IDENTIFIED_TAU_DOMINANT', '50') or 50)
-            window = max(3, int(round(tau_dom / sr)))
+            # Plant τ from the identifier (not a leftover SIM_* env).
+            try:
+                tau_dom, _ = env._resolve_plant_timing()
+            except Exception:
+                tau_dom = 0.0
+            if tau_dom <= 0:
+                tau_dom = float(os.environ.get(
+                    'SIM_IDENTIFIED_TAU_DOMINANT', '50') or 50)
+            window = max(3, int(round(float(tau_dom) / sr)))
             if arr.shape[0] > window + 2:
-                trend = np.array([
-                    np.convolve(arr[:, c],
-                                  np.ones(window) / window, mode='valid')
-                    for c in range(arr.shape[1])
-                ]).T  # (T-window+1, obs_dim)
-                # Align lengths so detail is per-step (signal_var vs
-                # high-freq residual).
-                aligned = arr[window - 1:, :]
-                detail = aligned - trend
-                signal_var = np.var(trend, axis=0)
-                noise_var = np.var(detail, axis=0)
-                snr_per_ch = signal_var / np.maximum(noise_var, 1e-12)
-                snr_db = 10.0 * np.log10(np.maximum(snr_per_ch, 1e-12))
-                # Channel names if available; otherwise just indices.
-                ch_names = list(getattr(env, 'obs_channel_names', []) or [])
-                snr_report = {
-                    'window_steps': int(window),
-                    'tau_dom': float(tau_dom),
-                    'sample_rate': int(sr),
-                    'per_channel': [
-                        {
-                            'index': int(i),
-                            'name': (ch_names[i] if i < len(ch_names)
-                                       else f'obs[{i}]'),
-                            'signal_std': float(np.sqrt(signal_var[i])),
-                            'noise_std': float(np.sqrt(noise_var[i])),
-                            'snr': float(snr_per_ch[i]),
-                            'snr_db': float(snr_db[i]),
-                        }
-                        for i in range(arr.shape[1])
-                    ],
-                    'snr_db_min': float(snr_db.min()),
-                    'snr_db_median': float(np.median(snr_db)),
-                    'snr_db_max': float(snr_db.max()),
-                }
+                # Summary/WARN = measured CV+DV only.  Constant setpoint /
+                # bound channels used to show −120 dB and pollute min/median.
+                meta = []
+                try:
+                    meta = list(env.obs_channel_meta())
+                except Exception:
+                    meta = []
+                measured = [int(x) for x in (
+                    list(getattr(env, 'cv_indices', []) or [])
+                    + list(getattr(env, 'dv_indices', []) or []))]
+                snr_report = _snr_build_report(
+                    arr, window, float(tau_dom), int(sr), meta, measured)
+                meas_set = set(measured)
                 low_ch = [
                     p for p in snr_report['per_channel']
-                    if p['snr_db'] < 10.0
+                    if int(p['index']) in meas_set
+                    and not bool(p.get('constant'))
+                    and float(p['snr_db']) < 10.0
                 ]
                 summary = (f"SNR median={snr_report['snr_db_median']:+.1f}dB"
                            f" min={snr_report['snr_db_min']:+.1f}dB"
                            f" max={snr_report['snr_db_max']:+.1f}dB"
-                           f" window={window}step")
+                           f" window={window}step"
+                           f" scope={snr_report.get('summary_scope')}")
+                n_const = int(snr_report.get('constant_n') or 0)
+                if n_const:
+                    cnames = ','.join(
+                        str(n) for n in (
+                            snr_report.get('constant_names') or [])[:3])
+                    summary += f"  const={n_const} ({cnames})"
                 if low_ch:
-                    names = ','.join(p['name'] for p in low_ch[:3])
-                    summary += (f"  WARN: {len(low_ch)} ch <10dB "
+                    names = ','.join(str(p['name']) for p in low_ch[:3])
+                    summary += (f"  WARN: {len(low_ch)} measured ch <10dB "
                                   f"({names})")
                 print(f"[snr] {summary}", flush=True)
                 out_dir_pre = Path(cfg.out_dir or '.')

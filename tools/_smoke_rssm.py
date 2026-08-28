@@ -48,7 +48,9 @@ from training.train import (
                             _auto_if_unset, _write_resolved_run_plan,
                             _resolve_compile_mode,
                             _clone_module_state, _refresh_module_state,
-                            _p1_need_agent_finetune)
+                            _p1_need_agent_finetune,
+                            _isolation_seq_is_mv, _snr_build_report,
+                            _snr_moving_average)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -748,6 +750,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "'p1_last_ok_iter'" in _src
     assert "row['wm_isolation_loss'] = row['wm_input_isolation_loss']" in _src
     assert 'np.clip(g_min / (g * a0), 1.0, smax)' in _src
+    assert 'wm_isolation_mv_traj' in _src
+    assert 'summary_scope' in _src
     assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
     assert _gain_col_rms(((-2.8, 0.0),))[0] > 1.0
     class _DvSim:
@@ -768,6 +772,42 @@ def _test_isolation_dcv_scales() -> None:
         isolated_level=scaled)
     assert abs(float(sched[0]['delta']) - _dv_isolation_delta(scaled, 10.0)) < 1e-9
     print('[smoke] OK  isolation |ΔCV| dcv_match scales (floor 1.0; DV cube)')
+
+
+def _test_isolation_seq_is_mv() -> None:
+    B, T, A = 4, 8, 1
+    act = torch.zeros(B, T, A)
+    act[:2] = 0.6
+    m = _isolation_seq_is_mv(act)
+    assert bool(m[0]) and bool(m[1]) and (not bool(m[2])) and (not bool(m[3]))
+    print('[smoke] OK  isolation seq MV mask (action energy)')
+
+
+def _test_snr_measured_scope() -> None:
+    import numpy as _np
+    T, C = 80, 4
+    rng = _np.random.default_rng(0)
+    arr = _np.zeros((T, C), dtype='float64')
+    arr[:, 0] = _np.linspace(0.0, 1.0, T) + 0.01 * rng.normal(size=T)
+    arr[:, 1] = 0.05 * rng.normal(size=T)
+    meta = [
+        {'name': 'CV', 'kind': 'state', 'role': 'cv'},
+        {'name': 'DV', 'kind': 'state', 'role': 'dv'},
+        {'name': 'CV0_tgt', 'kind': 'aug_bounds', 'role': 'cv_tgt'},
+        {'name': 'CV0_tgt_on', 'kind': 'aug_bounds', 'role': 'cv_tgt'},
+    ]
+    # cumsum MA ≡ per-channel np.convolve valid
+    trend, detail = _snr_moving_average(arr, 8)
+    conv = _np.convolve(arr[:, 0], _np.ones(8) / 8.0, mode='valid')
+    assert _np.allclose(trend[:, 0], conv)
+    assert detail.shape == trend.shape
+    r = _snr_build_report(arr, 8, 50.0, 4, meta, [0, 1])
+    assert r['summary_scope'] == 'measured_cv_dv'
+    assert r['per_channel'][2]['constant'] is True
+    assert r['per_channel'][3]['constant'] is True
+    assert r['snr_db_min'] > -50.0, r['snr_db_min']
+    assert r['constant_n'] == 2
+    print('[smoke] OK  SNR summary excludes constant aug channels')
 
 
 def _test_envfree_observer_recipe() -> None:
@@ -906,6 +946,8 @@ if __name__ == '__main__':
     _test_envfree_observer_recipe()
     _test_auto_if_unset_honours_explicit()
     _test_isolation_dcv_scales()
+    _test_isolation_seq_is_mv()
+    _test_snr_measured_scope()
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         _test_write_resolved_run_plan(td)

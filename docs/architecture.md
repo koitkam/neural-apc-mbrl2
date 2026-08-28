@@ -283,8 +283,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > DV **×0.007 / ×0.007**, det_r **0.428** amp-dead, `[p3-skip]`.
 > **FALSIFIED**. HEAD/P39 floor keeps MV edge |Δu|=0.60 and still
 > boosts DV to the cube. P39 LIVE (`run_p39_isodcvfloor`, pid 4170377):
-> `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`; P1 iter 1 iso 1.20
-> ss 0.90 skip 0 (P38 iso/ss ~0.14). Equal-|G| plants keep the op-band
+> `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`; P1 iter 22 gmatch
+> **0.0008** skip 0 (P37-class, not P38 stuck 1.30). Equal-|G| plants keep the op-band
 > linspace.
 > Not relative Huber.
 > Pre-iso resolve is **only** for those scales; gain-match Huber
