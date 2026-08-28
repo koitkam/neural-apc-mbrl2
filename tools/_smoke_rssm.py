@@ -45,6 +45,7 @@ from training.train import (
                             _should_skip_invalid_p3,
                             _should_warm_restore_wm_best,
                             _should_restore_last_ok_at_p1_freeze,
+                            _should_lock_last_ok,
                             _wm_recon_scalar,
                             _auto_if_unset, _isolation_teacher_on,
                             _promote_isolation_aux, _write_resolved_run_plan,
@@ -299,6 +300,30 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _nan_r != _nan_r
     assert abs(_wm_recon_scalar({'recon_loss': 0.0035}) - 0.0035) < 1e-12
     print('[smoke] OK  P1 detonated-freeze last-ok restore (P31 RCA)')
+
+    # P40: silent extra-P1 spike then recovered recon overwrote last-ok.
+    assert float(TrainConfig().skip_storm_last_ok_lock_ratio) == 20.0
+    assert _should_lock_last_ok(
+        recon=0.4816, recon_best=0.0015, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=False)
+    # Wrap ~6.7× must not lock (post-wrap snapshots may resume).
+    assert not _should_lock_last_ok(
+        recon=0.02, recon_best=0.003, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=False)
+    assert _should_lock_last_ok(
+        recon=0.0068, recon_best=0.0015, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=True)
+    assert not _should_lock_last_ok(
+        recon=0.4657, recon_best=0.0021, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=True, already_locked=True)
+    # Freeze recon healthy — restore because locked (P40 CAPPED 0.0045).
+    assert _should_restore_last_ok_at_p1_freeze(
+        recon=0.0045, recon_best=0.0015, ratio=5.0,
+        has_last_ok=True, last_ok_locked=True)
+    assert not _should_restore_last_ok_at_p1_freeze(
+        recon=0.0045, recon_best=0.0015, ratio=5.0,
+        has_last_ok=True, last_ok_locked=False)
+    print('[smoke] OK  last-ok lock after silent recon spike (P40 RCA)')
 
     # P28 follow-up 5: P1 re-inject EVERY is f(buffer lap).  test_sim
     # (ep_len=1220, 400k cap, 5 eps/iter) stays 20/10.
@@ -660,6 +685,7 @@ def _test_cfg_from_env_whitelist() -> None:
     keys = {
         'DREAMER_AUX_TBPTT_STEPS': '9',
         'DREAMER_SKIP_STORM_RECOVER_P1': '0',
+        'DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO': '40',
         'DREAMER_ES_GRADSKIP_MAX': '11',
         'DREAMER_N_CRITICS': '3',
         'DREAMER_STEP_TEST_INJECT_N': '7',
@@ -671,6 +697,7 @@ def _test_cfg_from_env_whitelist() -> None:
         cfg = _cfg_from_env()
         assert int(cfg.aux_tbptt_steps) == 9, cfg.aux_tbptt_steps
         assert cfg.skip_storm_recover_p1 is False
+        assert abs(float(cfg.skip_storm_last_ok_lock_ratio) - 40.0) < 1e-12
         assert int(cfg.early_stop_grad_skip_max) == 11
         assert int(cfg.n_critics) == 3
         assert int(cfg.step_test_inject_n) == 7
@@ -813,6 +840,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_isolation_edge_du' in _src
     assert '_record_isolation_dcv_span' in _src
     assert "'p1_last_ok_iter'" in _src
+    assert "'p1_last_ok_locked'" in _src
+    assert '_should_lock_last_ok' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "out='obs'" in _src
     assert "out='h'" in _src
@@ -949,6 +978,7 @@ def _test_envfree_observer_recipe() -> None:
     assert float(c.wm_isolation_dcv_min_scale) == 1.0
     assert 'DREAMER_WM_ISOLATION_DCV_MATCH' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_DCV_MIN_SCALE' in ENV_OVERRIDES
+    assert 'DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO' in ENV_OVERRIDES
     assert not hasattr(c, 'rssm_imag_latent_mode')
     assert 'DREAMER_RSSM_IMAG_LATENT_MODE' not in ENV_OVERRIDES
     assert c.cont_gain_deterministic_roll is True

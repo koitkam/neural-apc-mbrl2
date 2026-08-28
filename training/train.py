@@ -1738,6 +1738,14 @@ class TrainConfig:
     # the skip threshold — wrap blips (P37 iter 19 gnorm ~9.5) recover.
     # ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
     skip_storm_last_ok_recon_ratio: float = 5.0
+    # P40: extra-P1 silent detonation (recon 0.48, skip 0) then recovered
+    # below the 5× snapshot band and *overwrote* last-ok 83→104. Cap
+    # recon was healthy so detonated-freeze did not restore 83.
+    # Lock last-ok when recon exceeds this × best (default 20 = 4× the
+    # snapshot band). Wrap jitter stays below it; skip-storm restore
+    # unlocks so post-storm healthy P1 can snapshot again.
+    # ``DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO``.
+    skip_storm_last_ok_lock_ratio: float = 20.0
     # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first
     # (keep extension) then cap.  ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
     skip_storm_p1_cap_after: int = 2
@@ -2956,12 +2964,42 @@ def _recon_still_healthy(recon: float, recon_best: Optional[float],
     return r <= float(ratio) * b
 
 
+def _should_lock_last_ok(
+        *,
+        recon: float,
+        recon_best: Optional[float],
+        lock_ratio: float,
+        has_last_ok: bool,
+        skip_storm_restored: bool,
+        already_locked: bool,
+) -> bool:
+    """Lock last-ok after a silent recon spike so recovery cannot overwrite it.
+
+    P40: extra-P1 iter 84 recon 0.48 / skip 0 (skip-storm silent). Recovery
+    iter 98 recon 0.0068 < 5× best overwrote last-ok 83→104. Iter 104
+    CAPPED with healthy recon so detonated-freeze did **not** restore 83.
+
+    Skip-storm restore **unlocks** (post-restore healthy P1 should resume
+    snapshots — P40 storm 1/2 @65 then last-ok 66+). Wrap jitter at
+    ~5–10× best must **not** lock (lock_ratio default 20). Unitless
+    recon/recon.
+    """
+    if skip_storm_restored:
+        return False
+    if already_locked:
+        return True
+    if not has_last_ok:
+        return False
+    return not _recon_still_healthy(recon, recon_best, lock_ratio)
+
+
 def _should_restore_last_ok_at_p1_freeze(
         *,
         recon: float,
         recon_best: Optional[float],
         ratio: float,
         has_last_ok: bool,
+        last_ok_locked: bool = False,
 ) -> bool:
     """True if P1→P2 would freeze detonated weights and last-ok exists.
 
@@ -2971,9 +3009,16 @@ def _should_restore_last_ok_at_p1_freeze(
     quality-gate CAPPED then froze exploded ``g`` into P2 (cap-time DV
     ×0.08 vs healthy late-P1). Same last-ok snapshot as skip-storm, at
     the freeze boundary. Scale-invariant (recon/recon).
+
+    P40: a locked last-ok means extra-P1 detonated then *recovered*.
+    Freeze-iter recon can look healthy — still restore the pre-spike
+    snapshot (recovered extra-P1 is a different basin; extra P1 is
+    FALSIFIED as a DV lever).
     """
     if not has_last_ok:
         return False
+    if last_ok_locked:
+        return True
     return not _recon_still_healthy(recon, recon_best, ratio)
 
 
@@ -9269,6 +9314,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_last_ok_ckpt_path: Optional[Path] = None
     p1_last_ok_sd: Optional[Dict[str, torch.Tensor]] = None
     p1_last_ok_iter: int = -1
+    p1_last_ok_locked: bool = False
     p1_recon_best: Optional[float] = None
     p1_gain_not_ready_capped: bool = False
     p1_detonated_freeze_restored: bool = False
@@ -10408,7 +10454,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         recon=_fr_rlv,
                         recon_best=p1_recon_best,
                         ratio=_fr_ratio,
-                        has_last_ok=p1_last_ok_sd is not None):
+                        has_last_ok=p1_last_ok_sd is not None,
+                        last_ok_locked=bool(p1_last_ok_locked)):
                     try:
                         assert p1_last_ok_sd is not None
                         model.load_state_dict({
@@ -10444,15 +10491,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                   'GAIN_NOT_READY flag', flush=True)
                         _best_s = (f'{p1_recon_best:.4f}'
                                    if p1_recon_best is not None else 'n/a')
+                        _lock_why = (
+                            'locked last-ok after silent recon spike '
+                            '(P40: recovered extra-P1 must not freeze)'
+                            if p1_last_ok_locked
+                            else (f'recon {_fr_rlv:.4f} > {_fr_ratio:g}× '
+                                  f'last-ok best {_best_s}'))
                         mid_check_flags.append(
                             f'p1_detonated_freeze_restored: wm_last_ok iter '
-                            f'{p1_last_ok_iter} (recon {_fr_rlv:.4f} vs best '
-                            f'{_best_s})')
+                            f'{p1_last_ok_iter} ({_lock_why})')
                         print(
                             f'[p1→p2] detonated freeze restored wm_last_ok '
                             f'(iter {p1_last_ok_iter}); reset opt_world; '
-                            f'recon {_fr_rlv:.4f} > {_fr_ratio:g}× last-ok '
-                            f'best {_best_s}. Skip-storm needs >5 skips; a '
+                            f'{_lock_why}. Skip-storm needs >5 skips; a '
                             f'single huge-grad step must not freeze exploded g.',
                             flush=True)
                     except Exception as _e_fr:
@@ -11352,7 +11403,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # P1 last-healthy snapshot for skip-storm recovery.  Updated only
         # on skip-free iters whose recon has not detonated vs the best
         # seen — that is the late-P1 observer, not the fidelity-peak
-        # wm_best (which can be an early lucky spike).
+        # wm_best (which can be an early lucky spike).  A silent recon
+        # spike (P40 extra-P1 0.48, skip 0) locks the snapshot so a
+        # later recovered recon cannot overwrite it; skip-storm restore
+        # unlocks.
         if (current_phase == 1
                 and bool(getattr(cfg, 'skip_storm_recover_p1', True))
                 and iter_wm_applied > 0
@@ -11365,7 +11419,26 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 _rlv = float('nan')
             _ok_ratio = float(getattr(
                 cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
-            if _recon_still_healthy(_rlv, p1_recon_best, _ok_ratio):
+            _lock_ratio = float(getattr(
+                cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0)
+            _was_locked = bool(p1_last_ok_locked)
+            p1_last_ok_locked = _should_lock_last_ok(
+                recon=_rlv,
+                recon_best=p1_recon_best,
+                lock_ratio=_lock_ratio,
+                has_last_ok=p1_last_ok_sd is not None,
+                skip_storm_restored=False,
+                already_locked=_was_locked)
+            if p1_last_ok_locked and not _was_locked:
+                _best_s = (f'{p1_recon_best:.4f}'
+                           if p1_recon_best is not None else 'n/a')
+                print(f'[wm-last-ok] locked iter {p1_last_ok_iter} '
+                      f'(recon {_rlv:.4f} > {_lock_ratio:g}× best {_best_s}); '
+                      f'P1→P2 freeze restores this snapshot even if recon '
+                      f'recovers',
+                      flush=True)
+            if (not p1_last_ok_locked
+                    and _recon_still_healthy(_rlv, p1_recon_best, _ok_ratio)):
                 # In-process snapshot — skip-storm restore never needs
                 # disk on the happy path.  Reuses last-ok storage
                 # (``copy_``) after the first alloc; CPU if VRAM is
@@ -11443,6 +11516,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 'agent_minus_expert_return': last_agent_minus_expert,
                 'p1_last_ok_iter': (int(p1_last_ok_iter)
                                     if int(p1_last_ok_iter) >= 0 else None),
+                'p1_last_ok_locked': bool(p1_last_ok_locked),
                 'wm_score_ema': (float(wm_score_ema)
                                   if wm_score_ema > -1e17 else None),
                 'wm_score_ema_best': (float(wm_score_ema_best)
@@ -11902,6 +11976,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     _force_p1_cap_at(total_env_steps))
                             grad_skip_history.clear()
                             skip_storm_p1_recovered = True
+                            if p1_last_ok_locked:
+                                print('[wm-last-ok] unlocked after skip-storm '
+                                      'restore', flush=True)
+                            p1_last_ok_locked = False
                             skip_storm_restore_source = _src
                             skip_storm_restore_iter = (
                                 int(p1_last_ok_iter)
@@ -12372,6 +12450,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'skip_storm_restore_iter': skip_storm_restore_iter,
         'p1_last_ok_iter': (int(p1_last_ok_iter)
                             if p1_last_ok_iter >= 0 else None),
+        'p1_last_ok_locked': bool(p1_last_ok_locked),
         'p1_gain_not_ready_capped': bool(p1_gain_not_ready_capped),
         'p1_detonated_freeze_restored': bool(p1_detonated_freeze_restored),
         'actor_experiment_valid': _actor_experiment_valid(
