@@ -987,15 +987,14 @@ class TrainConfig:
     dv_as_input: bool = True
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
-    # DV→decoder+heads FEEDFORWARD (2026-06-19, p129 RCA).  Route the measured
-    # DV directly into the WM decoder AND the reward/value/policy heads (in
-    # addition to the transition), so the CV reconstruction ``g(h, z, dv)`` has
-    # a DIRECT ∂CV/∂dv path that SKIPS the categorical bottleneck where the
-    # DV→CV gain was dying (p129 DV posterior-prior decomp: real→post ×0.77,
-    # post→1step ×1.00 — the loss is the autoencoder, not data/excitation), and
-    # the actor finally SEES the disturbance in imagination (fixes the passive
-    # actor).  Sim-adaptive: no-op when the plant has no measured DV (dv_dim=0).
-    # Backbone-agnostic (RSSM + TSSM).  Opt out with DREAMER_DV_FEEDFORWARD=0.
+    # DV in the head-facing feat (2026-06-19, p129; decoder half OFF p146).
+    # Measured DV is concatenated onto reward/value/policy ``feat`` so the
+    # actor sees the load.  Decoder feedforward is a *separate* knob
+    # (``dv_decoder_feedforward``, default False): a memoryless dv_t→CV_t
+    # path that skipped GRU dead-time and biased DV DC-gain low.  Do not
+    # special-case DV in the decoder; ``dv_as_input`` + gain-match is the
+    # symmetric MV/DV path.  No-op when the plant has no measured DV
+    # (dv_dim=0).  Opt out with DREAMER_DV_FEEDFORWARD=0.
     dv_feedforward: bool = True
     # DV→DECODER half of the feedforward (2026-08-06, p146 RCA).  Keep the DV in
     # the head feat (actor sees the load) but REMOVE the memoryless dv_t→CV_t
@@ -3496,6 +3495,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
         f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
+        f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )

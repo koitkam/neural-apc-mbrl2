@@ -321,6 +321,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > overwrote 83→104; **P41 original-P1 overwrote 56→64** (iter 57 recon
 > 0.089 / skip 0, recovered 0.0098 < 5×) then 104. Skip-storm restore
 > unlocks. Wrap ~5–10× must not lock. One attributed vs P41 launch.
+> LIVE P1 iter 41: **past P41 storm window with no skip-storm**
+> (recon 0.0021@40 skip 0); lock still idle. `[resolved-cfg]` now
+> prints `lock=` (HEAD; not in the live pid).
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free

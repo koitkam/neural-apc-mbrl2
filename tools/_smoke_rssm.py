@@ -855,6 +855,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "'p1_last_ok_iter'" in _src
     assert "'p1_last_ok_locked'" in _src
     assert '_should_lock_last_ok' in _src
+    assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert '_wm_recon_scalar(wm_losses)' in _src
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
@@ -1065,6 +1066,8 @@ def _test_promote_isolation_aux() -> None:
 
 
 def _test_write_resolved_run_plan(tmp_path: str) -> None:
+    import contextlib
+    import io
     import json
     from pathlib import Path
     cfg = TrainConfig()
@@ -1076,7 +1079,12 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     plan_path = Path(tmp_path) / 'run_plan.json'
     plan_path.write_text(json.dumps({'config': {'rssm_latent_type': 'categorical',
                                                 'gain_match_coef': 0.0}}))
-    _write_resolved_run_plan(cfg)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _write_resolved_run_plan(cfg)
+    banner = buf.getvalue()
+    assert 'lock=20' in banner, banner
+    assert 'iso_dcv=off' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
