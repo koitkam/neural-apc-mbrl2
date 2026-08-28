@@ -511,63 +511,11 @@ class TrainConfig:
     # to 8.0.  Set ``advantage_clip=0.0`` to disable (legacy unclamped).
     advantage_clip: float = 8.0
 
-    # ---- C : replay-grounded critic anchor (P66-RCA, 2026-05-29) ----
-    # The cascade's root cause is that the P3 critic regresses purely on
-    # IMAGINED λ-returns from a frozen, non-convergent WM: targets become
-    # ~95% self-bootstrap (critic_target_v_r→0.95, reward <1% of target var),
-    # so the critic drifts into a self-consistent growing-negative fixed point
-    # of its own making.  This anchor adds a critic loss term on REAL replayed
-    # transitions — a TD-λ target built from the buffer's REAL rewards and the
-    # slow target-value bootstrap on the REAL latents — so the critic is pinned
-    # to genuine reward variance and cannot float free.  ``coef`` weights the
-    # anchor vs the imagined critic loss.  Set ``critic_replay_anchor_coef=0.0``
-    # to disable (legacy pure-imagination critic).
-    # Default 0.0 = p117 recipe: grounding is done by the MC term below, not
-    # this anchor (promoted 2026-06-14; was 0.5).
-    critic_replay_anchor_coef: float = 0.0
-
-    # ---- B : long-horizon critic-anchor grounding (P85, 2026-06-04) ----
-    # The replay anchor above computes its TD-λ target over the FULL real
-    # context (``Treal = seq_len`` steps), which spans MANY plant time
-    # constants — but it reuses the myopic imagination ``gae_lambda`` (0.90)
-    # in its backward recursion, giving it an effective credit horizon of
-    # only ~1/(1-γλ) ≈ 10 steps.  A constraint-riding limit cycle whose
-    # period (~40 steps) EXCEEDS that horizon is therefore invisible to the
-    # critic target even though the real buffer data contains several full
-    # cycles: the delayed overshoot a too-aggressive action causes is
-    # down-weighted to ~1 % and never co-occurs with its cause in the
-    # value target.  ``critic_anchor_lambda`` decouples the ANCHOR's λ from
-    # the imagination λ so the anchor can use a near-Monte-Carlo
-    # return-to-go (λ→1) over the real sequence — injecting the FULL
-    # realised multi-cycle cost into the critic target, GROUNDED IN REAL
-    # DATA (not a long WM rollout).  The actor still trains purely on H-step
-    # imagination; only the critic's real-grounding horizon changes, so the
-    # value bootstrap V(s_H) the actor reads becomes calibrated to the
-    # long-horizon cost.  ``None`` (default) ⇒ fall back to ``gae_lambda``
-    # (exact legacy behaviour).  Set ~0.97–1.0 to engage.  Does NOT touch
-    # the cascade-sensitive imagination λ.
-    critic_anchor_lambda: Optional[float] = None
-    # Raise the anchor's pull when its long-horizon target must overcome the
-    # myopic imagined critic loss that keeps dragging V back to a ~10-step
-    # estimate.  ``None`` ⇒ use ``critic_replay_anchor_coef`` unchanged.
-    critic_anchor_coef_long: Optional[float] = None
-    # ---- #1 (P88, 2026-06-05): critic real-grounding rebalance ----
-    # Weight on the IMAGINED critic CE.  The cascade through-line is that the
-    # critic regresses almost entirely on its own imagined bootstrap
-    # (critic_target_v_r->0.97, critic_rew_to_tgt_var->0.001 = reward <0.1% of
-    # target variance) -> a self-referential pessimistic fixed point that
-    # freezes the actor.  Down-weighting the imagined CE (<1.0) lets the
-    # REAL-return replay anchor (``critic_replay_anchor_coef`` /
-    # ``critic_anchor_coef_long`` with ``critic_anchor_lambda``->1.0 = near-MC
-    # return-to-go over the real buffer) DOMINATE the critic target, so the
-    # value is grounded in realised economics instead of model fiction.  Pairs
-    # with #2 (latent overshooting): once the WM is accurate at long H the
-    # critic trained on REAL states also values IMAGINED states correctly
-    # (value-equivalence).  ``1.0`` = legacy (imagined-primary).
-    # Inert in mbrl2: imagination critic CE is deleted
-    # (``_realsim_actor_critic_step``).  Not in ENV_OVERRIDES — a
-    # ``DREAMER_CRITIC_IMAG_LOSS_COEF`` override would be a false A/B.
-    critic_imag_loss_coef: float = 0.3
+    # Imagination-era critic knobs REMOVED (never read by
+    # ``_realsim_actor_critic_step``): ``critic_imag_loss_coef``,
+    # ``critic_replay_anchor_coef``, ``critic_anchor_lambda``,
+    # ``critic_anchor_coef_long``.  Real-sim grounding is the on-policy
+    # λ-return + diverse replay ``critic_batch`` + MC term below.
 
     # mbrl2 real-sim (p04, 2026-07-09): Monte-Carlo GROUNDING weight for the
     # real-sim actor-critic critic.  The critic target is the λ-return CE plus
@@ -586,14 +534,6 @@ class TrainConfig:
     # keeps correctly penalising the oscillation's violations → the actor LEARNS
     # smooth control from the objective (no move penalty needed).
     critic_mc_grounding_coef: float = 2.0
-
-    # When True, cap the MC return with a single discounted tail bootstrap
-    # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
-    # (default) the return is PURE MC (truncated at the segment end).  At
-    # ``seq_len`` = 128 / γ = 0.97 the truncation bias γ^128 ≈ 0.02 is
-    # negligible, so pure MC is the cleaner, fully-grounded default.  Env
-    # ``DREAMER_CRITIC_MC_TAIL_BOOTSTRAP``.
-    critic_mc_tail_bootstrap: bool = False
 
     # ---- MV / limit consistency (P86, 2026-06-05) ----
     # (1) Action→MV mapping basis.  The normalised actor action is mapped to an
@@ -5486,34 +5426,6 @@ def _lambda_returns(rew: torch.Tensor, v: torch.Tensor,
     return out
 
 
-def _critic_anchor_lambda(cfg: TrainConfig) -> float:
-    """Option (B): the λ used by the REPLAY critic anchor's TD-λ recursion.
-
-    Defaults to the imagination ``gae_lambda`` (exact legacy behaviour) when
-    ``critic_anchor_lambda`` is unset.  Setting it ~0.97–1.0 turns the anchor
-    into a near-Monte-Carlo return-to-go over the real context so the critic
-    target sees the FULL long-horizon (multi-cycle) cost contained in the real
-    buffer data.  Decoupled from the cascade-sensitive imagination λ.
-    Clamped to [0, 1].
-    """
-    v = getattr(cfg, 'critic_anchor_lambda', None)
-    if v is None:
-        return float(getattr(cfg, 'gae_lambda', 0.95))
-    return float(max(0.0, min(1.0, float(v))))
-
-
-def _critic_anchor_coef(cfg: TrainConfig) -> float:
-    """Option (B): the anchor weight, optionally raised above the base
-    ``critic_replay_anchor_coef`` so the long-horizon real target can overcome
-    the myopic imagined critic loss.  ``critic_anchor_coef_long=None`` ⇒ use
-    the base coef unchanged (legacy)."""
-    base = float(getattr(cfg, 'critic_replay_anchor_coef', 0.0) or 0.0)
-    long = getattr(cfg, 'critic_anchor_coef_long', None)
-    if long is None:
-        return base
-    return float(max(0.0, float(long)))
-
-
 def _steady_held_mask(obs: torch.Tensor, act: torch.Tensor,
                        cfg: TrainConfig) -> Optional[torch.Tensor]:
     """Option (b): adaptive SETTLED + HELD step mask, backbone-independent.
@@ -6019,6 +5931,31 @@ def _smooth_l1_gain_match(
     return torch.where(abs_e < b, quadratic, linear).mean()
 
 
+def _gain_match_fd_held(
+        a_base: torch.Tensor, dv0: Optional[torch.Tensor],
+        n_mv: int, n_dv: int, step: float
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Baseline + one unit step per MV then per DV (broadcast, no clone-loop).
+
+    ``a_held`` is ``(1+n_mv+n_dv, Bm, A)``; ``dv_held`` is the same layout
+    or ``None`` when the plant has no DV.  Identity with stacking
+    ``[a_base, a_base+e_j, …]`` / ``[dv0, dv0, …, dv0+e_k]``.
+    """
+    n_rolls = 1 + int(n_mv) + int(n_dv)
+    da = a_base.new_zeros(n_rolls, a_base.shape[-1])
+    if n_mv:
+        _i = torch.arange(n_mv, device=a_base.device)
+        da[_i + 1, _i] = step
+    a_held = a_base.unsqueeze(0) + da.unsqueeze(1)
+    if dv0 is None:
+        return a_held, None
+    dd = dv0.new_zeros(n_rolls, dv0.shape[-1])
+    if n_dv:
+        _j = torch.arange(n_dv, device=dv0.device)
+        dd[_j + 1 + n_mv, _j] = step
+    return a_held, dv0.unsqueeze(0) + dd.unsqueeze(1)
+
+
 def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                         obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig,
                         c_mean: Optional[torch.Tensor] = None,
@@ -6162,21 +6099,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # path is Huber + ``wm_grad_skip_norm`` (P24/P25), not a detach.
     # RSSM-interface always has ``img_rollout``; sequential ``img_step``
     # K-loops (linear in n_mv+n_dv) were dead after P32 TSSM wiring.
-    a_list = [a_base]
-    dv_list = ([dv0] if dv0 is not None else None)
-    for j in range(len(mv_tgts)):
-        a_j = a_base.clone()
-        a_j[:, j] = a_j[:, j] + step
-        a_list.append(a_j)
-        if dv_list is not None:
-            dv_list.append(dv0)
-    if dv0 is not None:
-        for j in range(len(dv_tgts)):
-            a_list.append(a_base)
-            dv_j = dv0.clone()
-            dv_j[:, j] = dv_j[:, j] + step
-            dv_list.append(dv_j)
-    n_rolls = len(a_list)
+    n_mv_t = len(mv_tgts)
+    n_dv_t = len(dv_tgts)
+    a_held, dv_held = _gain_match_fd_held(
+        a_base, dv0, n_mv_t, n_dv_t, step)
+    n_rolls = int(a_held.shape[0])
 
     def _repeat_starts(t):
         return (t.unsqueeze(0).expand(n_rolls, *t.shape)
@@ -6185,14 +6112,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     h_b = _repeat_starts(h0)
     z_b = _repeat_starts(z0)
     c_b = _repeat_starts(c0) if c0 is not None else None
-    a_held = torch.stack(a_list, dim=0)
     a_seq = (a_held.unsqueeze(2)
              .expand(n_rolls, Bm, K, a_held.shape[-1])
              .reshape(n_rolls * Bm, K, a_held.shape[-1])
              .contiguous())
     dv_seq = None
-    if dv_list is not None:
-        dv_held = torch.stack(dv_list, dim=0)
+    if dv_held is not None:
         dv_seq = (dv_held.unsqueeze(2)
                   .expand(n_rolls, Bm, K, dv_held.shape[-1])
                   .reshape(n_rolls * Bm, K, dv_held.shape[-1])
@@ -6207,7 +6132,6 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     cv_last = cv_last.view(n_rolls, Bm, -1)
     cv_base = cv_last[0]
     cv_steps = cv_last[1:]
-    n_mv_t = len(mv_tgts)
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts))
     loss = total

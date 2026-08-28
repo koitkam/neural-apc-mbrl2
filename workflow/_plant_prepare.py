@@ -182,15 +182,6 @@ def _as_bool(s: str) -> bool:
     return str(s).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')
 
 
-def _as_opt_float(s: str):
-    """Parse an env-var string into Optional[float].  Empty / ``none`` /
-    ``null`` -> None (use the TrainConfig default); otherwise float."""
-    v = str(s).strip().lower()
-    if v in ('', 'none', 'null', 'na', 'default'):
-        return None
-    return float(s)
-
-
 def _as_compile_mode(s: str) -> str:
     """Map ``DREAMER_COMPILE`` / ``DREAMER_COMPILE_MODE`` onto TrainConfig
     ``compile_mode``.  ``''`` = eager.  ``1``/true → ``default``."""
@@ -411,17 +402,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # suppressed near a constraint.  Policy-invariant.  0.0 disables Φ_econ.
     'DREAMER_SHAPING_ECON_COEF':          ('shaping_econ_coef',              float),
     'DREAMER_SHAPING_ECON_MARGIN_FRAC':   ('shaping_econ_margin_frac',       float),
-    'DREAMER_CRITIC_REPLAY_ANCHOR_COEF':  ('critic_replay_anchor_coef',      float),
-    # (B) P85 (2026-06-04): long-horizon critic-anchor grounding.  The
-    # replay anchor's own λ (decoupled from the cascade-sensitive
-    # imagination ``gae_lambda``) — ~0.97–1.0 turns it into a near-MC
-    # return-to-go over the real context so a constraint-riding limit cycle
-    # whose period exceeds the myopic ~10-step credit horizon becomes
-    # visible in the critic target.  ``_LONG`` optionally raises the anchor
-    # weight so the long target overcomes the myopic imagined critic loss.
-    # Both None (unset) ⇒ exact legacy behaviour.  Sim-agnostic.
-    'DREAMER_CRITIC_ANCHOR_LAMBDA':       ('critic_anchor_lambda',           _as_opt_float),
-    'DREAMER_CRITIC_ANCHOR_COEF_LONG':    ('critic_anchor_coef_long',        _as_opt_float),
+    # Imagination-era critic_replay_anchor / critic_anchor_* / imag CE
+    # REMOVED (never read by ``_realsim_actor_critic_step``).  Real-sim
+    # grounding is ``DREAMER_CRITIC_MC_GROUNDING_COEF`` (default 2.0).
+    'DREAMER_CRITIC_MC_GROUNDING_COEF':   ('critic_mc_grounding_coef',       float),
     'DREAMER_MV_HARD_CLAMP':              ('mv_hard_clamp',                  _as_bool),
     'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
     'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),

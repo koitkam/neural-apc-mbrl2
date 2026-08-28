@@ -339,8 +339,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > still observability). One attributed vs P41 launch.
 > **P43 GPU-occupied (no second job):** printed observer verdict is
 > `wm_observer_gain_*` (MV AND DV); lineage `wm_gain_pass` stays MV-only.
-> `DREAMER_CRITIC_IMAG_LOSS_COEF` dropped from `ENV_OVERRIDES` (inert in
-> real-sim). P3 `|corr(adv,a_i)|` is batched. P1→P2 prints recon drop
+> Imagination-era critic knobs **REMOVED** (`critic_imag_loss_coef`,
+> `critic_replay_anchor_*`, `critic_anchor_*`, `critic_mc_tail_bootstrap`
+> — never read by `_realsim_actor_critic_step`). `DREAMER_CRITIC_MC_GROUNDING_COEF`
+> is in `ENV_OVERRIDES` (default 2.0). Gain-match FD held stack is broadcast
+> (identity vs clone-loop). P3 `|corr(adv,a_i)|` is batched. P1→P2 prints recon drop
 > (RSSM `sf_loss≡0`). **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free

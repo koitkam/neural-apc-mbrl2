@@ -20,8 +20,7 @@ from training.train import (
     TrainConfig, build_model, world_model_loss,
                             agent_finetune_loss, _realsim_actor_critic_step,
                             expert_bc_p3_loss, _adaptive_return_cap,
-                            _steady_held_mask, _critic_anchor_lambda,
-                            _critic_anchor_coef, _force_p1_cap_at,
+                            _steady_held_mask, _force_p1_cap_at,
                             _skip_storm_continue_p1,
                             _skip_storm_should_continue_p1,
                             _wm_fidelity_es_suppressed_frozen_g,
@@ -53,7 +52,8 @@ from training.train import (
                             _resolve_compile_mode,
                             _clone_module_state, _refresh_module_state,
                             _p1_need_agent_finetune,
-                            _smooth_l1_gain_match, _adv_action_corr,
+                            _smooth_l1_gain_match, _gain_match_fd_held,
+                            _adv_action_corr,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
@@ -130,23 +130,6 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     if _m is not None:
         assert torch.isfinite(_m).all() and _m.shape == (B, T - 1), _m.shape
 
-    # (B) long-horizon critic-anchor grounding: λ default falls back to
-    # gae_lambda; engaged value is clamped to [0,1]; coef resolver honours
-    # the optional override.  Exercise both default + engaged.
-    assert _critic_anchor_lambda(cfg) == float(cfg.gae_lambda), \
-        'anchor λ default must equal gae_lambda'
-    assert _critic_anchor_coef(cfg) == float(cfg.critic_replay_anchor_coef), \
-        'anchor coef default must equal base coef'
-    cfg.critic_anchor_lambda = 0.97
-    cfg.critic_anchor_coef_long = 1.0
-    assert abs(_critic_anchor_lambda(cfg) - 0.97) < 1e-9, 'anchor λ engage'
-    assert abs(_critic_anchor_coef(cfg) - 1.0) < 1e-9, 'anchor coef engage'
-    cfg.critic_anchor_lambda = 1.5   # out-of-range -> clamped to 1.0
-    assert _critic_anchor_lambda(cfg) == 1.0, 'anchor λ clamp to 1.0'
-    cfg.critic_anchor_lambda = None
-    cfg.critic_anchor_coef_long = None
-    print('[smoke] OK  critic-anchor λ/coef resolvers (default + engaged + clamp)')
-
     # ---- P2 agent finetune (BC + reward MTP) ----
     _, _, agent_hid2 = world_model_loss(model, batch, cfg)
     af = agent_finetune_loss(model, batch, agent_hid2, cfg)
@@ -154,7 +137,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     af['agent_total'].backward()
     print('[smoke] OK  agent_total.backward()')
 
-    # ---- P3 imagination ----
+    # ---- P3 real-sim actor-critic ----
     assert int(getattr(model, 'n_critics', 1)) == int(getattr(cfg, 'n_critics', 1))
     assert len(model.values) == model.n_critics
     diag = _realsim_actor_critic_step(model, batch, cfg)
@@ -642,18 +625,6 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  _realsim_actor_critic_step critic_batch split + '
           'MC-grounding backward()')
 
-    # (B) imagination with the long-horizon anchor ENGAGED — exercise the
-    # ``lam_anchor`` recursion + raised coef and confirm the critic loss is
-    # finite and backprops through the engaged path.
-    cfg.critic_anchor_lambda = 0.97
-    cfg.critic_anchor_coef_long = 1.0
-    diagB = _realsim_actor_critic_step(model, batch, cfg)
-    _finite('_realsim_actor_critic_step[anchorB]', diagB)
-    diagB['critic_loss'].backward()
-    print('[smoke] OK  _realsim_actor_critic_step critic_loss.backward() with anchor B engaged')
-    cfg.critic_anchor_lambda = None
-    cfg.critic_anchor_coef_long = None
-
     # ---- P3 expert-BC anchor (P83) + adaptive scaling (P84) ----
     # Exercise the new train-loop P3 branch outside the full loop: build a
     # masked expert batch, call expert_bc_p3_loss, and replay the exact
@@ -1026,6 +997,16 @@ def _test_envfree_observer_recipe() -> None:
     assert not hasattr(c, 'rssm_imag_latent_mode')
     assert 'DREAMER_RSSM_IMAG_LATENT_MODE' not in ENV_OVERRIDES
     assert 'DREAMER_CRITIC_IMAG_LOSS_COEF' not in ENV_OVERRIDES
+    assert 'DREAMER_CRITIC_REPLAY_ANCHOR_COEF' not in ENV_OVERRIDES
+    assert 'DREAMER_CRITIC_ANCHOR_LAMBDA' not in ENV_OVERRIDES
+    assert 'DREAMER_CRITIC_ANCHOR_COEF_LONG' not in ENV_OVERRIDES
+    assert 'DREAMER_CRITIC_MC_GROUNDING_COEF' in ENV_OVERRIDES
+    assert not hasattr(c, 'critic_imag_loss_coef')
+    assert not hasattr(c, 'critic_replay_anchor_coef')
+    assert not hasattr(c, 'critic_anchor_lambda')
+    assert not hasattr(c, 'critic_anchor_coef_long')
+    assert not hasattr(c, 'critic_mc_tail_bootstrap')
+    assert float(c.critic_mc_grounding_coef) == 2.0
     assert c.cont_gain_deterministic_roll is True
     assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
     assert float(c.wm_input_isolation_coef) == 0.0
@@ -1054,6 +1035,36 @@ def _test_gain_match_per_input_huber() -> None:
     ref = F.smooth_l1_loss(a, b, beta=1.0)
     assert torch.allclose(got, ref)
     print('[smoke] OK  per-input Huber β=|tgt| (L1 sat ±1/N, not 1/|tgt|)')
+
+
+def _test_gain_match_fd_held() -> None:
+    """Broadcast FD held actions ≡ clone-loop stack (MIMO + SISO)."""
+    torch.manual_seed(0)
+    Bm, n_mv, n_dv, step = 4, 2, 1, 1.0
+    a_base = torch.randn(Bm, n_mv)
+    dv0 = torch.randn(Bm, n_dv)
+    got_a, got_dv = _gain_match_fd_held(a_base, dv0, n_mv, n_dv, step)
+    a_list = [a_base]
+    dv_list = [dv0]
+    for j in range(n_mv):
+        a_j = a_base.clone()
+        a_j[:, j] = a_j[:, j] + step
+        a_list.append(a_j)
+        dv_list.append(dv0)
+    for j in range(n_dv):
+        a_list.append(a_base)
+        dv_j = dv0.clone()
+        dv_j[:, j] = dv_j[:, j] + step
+        dv_list.append(dv_j)
+    ref_a = torch.stack(a_list, dim=0)
+    ref_dv = torch.stack(dv_list, dim=0)
+    assert torch.allclose(got_a, ref_a), (got_a - ref_a).abs().max()
+    assert torch.allclose(got_dv, ref_dv), (got_dv - ref_dv).abs().max()
+    a1, dv1 = _gain_match_fd_held(a_base[:, :1], None, 1, 0, step)
+    assert dv1 is None and a1.shape == (2, Bm, 1)
+    assert torch.allclose(a1[0], a_base[:, :1])
+    assert torch.allclose(a1[1, :, 0], a_base[:, 0] + step)
+    print('[smoke] OK  gain-match FD held stack (broadcast ≡ clone-loop)')
 
 
 def _test_adv_action_corr_vectorized() -> None:
@@ -1263,6 +1274,7 @@ if __name__ == '__main__':
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
     _test_gain_match_per_input_huber()
+    _test_gain_match_fd_held()
     _test_adv_action_corr_vectorized()
     _test_p1_fidelity_local_plateau()
     _test_auto_if_unset_honours_explicit()

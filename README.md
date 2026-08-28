@@ -432,7 +432,7 @@ default-OFF (paper-faithful) and apply to both entry points (single run + BO):
 | `DREAMER_WM_OVERSHOOT_MAX_STARTS` | Cap on strided start positions per batch (default 24) — bounds the added GRU cost. |
 | `DREAMER_WM_OVERSHOOT_GATE_RECON` | Soft recon-fidelity gate (default 0.1): scales the term by `min(1, gate/recon_loss)` so it ramps in only as 1-step reconstruction converges (no early-P1 destabilisation). |
 
-mbrl2 real-sim: imagination critic CE is deleted (`_realsim_actor_critic_step`). `DREAMER_CRITIC_IMAG_LOSS_COEF` is **not** in `ENV_OVERRIDES` (false A/B). Real-sim critic grounding is `DREAMER_CRITIC_MC_GROUNDING_COEF`.
+mbrl2 real-sim: imagination critic CE / replay-anchor knobs are **removed** (`_realsim_actor_critic_step` never read them). Real-sim critic grounding is `DREAMER_CRITIC_MC_GROUNDING_COEF` (default 2.0, now in `ENV_OVERRIDES`).
 
 ## Single training run (no BO)
 
@@ -524,7 +524,7 @@ this table in sync whenever a default changes.
 | `bound_training_reward_ref` (`ref`) | `50.0` | econ-derived adaptive clip used to normalize raw reward before bounding | — | P77 |
 | `return_scale_abs_cap` | `500.0` | absolute hard cap on the percentile return_scale EMA (`0` disables); prevents the return-normalization runaway that froze the actor | `DREAMER_RETURN_SCALE_ABS_CAP` | Cursor stabilizer #2 (P79) |
 | `advantage_clip` | `8.0` | clamp normalized advantage to `±clip` before the actor loss | `DREAMER_ADVANTAGE_CLIP` | Cursor stabilizer #3 (P74) |
-| `critic_replay_anchor_coef` | `0.5` | anchors the critic on replayed real returns to resist the pessimistic self-consistent fixed point | — | anti-cascade |
+| `critic_mc_grounding_coef` | `2.0` | real-sim critic CE on a pure MC return-to-go (λ=1) in addition to the on-policy λ-return; pins V to realised economics | `DREAMER_CRITIC_MC_GROUNDING_COEF` | p04/p07 (imagination critic CE / replay-anchor knobs removed) |
 
 ## Disabled / dormant knobs (intentionally off)
 
