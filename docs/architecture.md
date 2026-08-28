@@ -312,9 +312,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
 > **HEAD (not in P41 pid):** last-ok locks after a silent recon spike
-> (`skip_storm_last_ok_lock_ratio=20`, unitless). P40 recovery overwrote
-> last-ok 83→104 then froze healthy recovered extra-P1. Skip-storm restore
-> unlocks. Do not stack onto live P41.
+> (`skip_storm_last_ok_lock_ratio=20`, unitless). P40 extra-P1 overwrote
+> 83→104; **P41 live already overwrote 56→64 in original P1** (iter 57
+> recon 0.089 / skip 0, recovered 0.0098 < 5×). Lock is recon-only (a
+> spike iter with skip 1 still locks). Skip-storm restore unlocks. Do
+> not stack onto live P41.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free

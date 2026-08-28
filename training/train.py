@@ -2983,6 +2983,11 @@ def _should_lock_last_ok(
     snapshots — P40 storm 1/2 @65 then last-ok 66+). Wrap jitter at
     ~5–10× best must **not** lock (lock_ratio default 20). Unitless
     recon/recon.
+
+    P41 live (original P1, not extra-P1): iter 57 recon 0.0887 / skip 0
+    / gnorm 1.99 (42× best 0.0021) then recovered 0.0098 < 5× overwrote
+    last-ok 56→64. Iter 58 of that spike had skip 1 — lock must not
+    require a skip-free iter or a 0.48-class extra-P1 only.
     """
     if skip_storm_restored:
         return False
@@ -2990,7 +2995,13 @@ def _should_lock_last_ok(
         return True
     if not has_last_ok:
         return False
-    return not _recon_still_healthy(recon, recon_best, lock_ratio)
+    try:
+        r = float(recon)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(r):
+        return False
+    return not _recon_still_healthy(r, recon_best, lock_ratio)
 
 
 def _should_restore_last_ok_at_p1_freeze(
@@ -11404,19 +11415,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # on skip-free iters whose recon has not detonated vs the best
         # seen — that is the late-P1 observer, not the fidelity-peak
         # wm_best (which can be an early lucky spike).  A silent recon
-        # spike (P40 extra-P1 0.48, skip 0) locks the snapshot so a
-        # later recovered recon cannot overwrite it; skip-storm restore
-        # unlocks.
+        # spike (P40 extra-P1 0.48; P41 original-P1 0.089) locks the
+        # snapshot so a later recovered recon cannot overwrite it.
+        # Lock is recon-only (not skip-free): P41 iter 58 skip 1 sat on
+        # the same spike.  Skip-storm restore unlocks.
         if (current_phase == 1
-                and bool(getattr(cfg, 'skip_storm_recover_p1', True))
-                and iter_wm_applied > 0
-                and iter_wm_skips == 0):
-            try:
-                _rl = wm_losses.get('recon_loss')
-                _rlv = float(_rl.detach().item()
-                             if torch.is_tensor(_rl) else _rl)
-            except Exception:
-                _rlv = float('nan')
+                and bool(getattr(cfg, 'skip_storm_recover_p1', True))):
+            _rlv = _wm_recon_scalar(wm_losses)
             _ok_ratio = float(getattr(
                 cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
             _lock_ratio = float(getattr(
@@ -11438,6 +11443,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                       f'recovers',
                       flush=True)
             if (not p1_last_ok_locked
+                    and iter_wm_applied > 0
+                    and iter_wm_skips == 0
                     and _recon_still_healthy(_rlv, p1_recon_best, _ok_ratio)):
                 # In-process snapshot — skip-storm restore never needs
                 # disk on the happy path.  Reuses last-ok storage

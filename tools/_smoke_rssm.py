@@ -316,6 +316,19 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _should_lock_last_ok(
         recon=0.4657, recon_best=0.0021, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=True, already_locked=True)
+    # P41 live (original P1): silent spike 0.0887 vs best 0.0021 (42×)
+    # locks; recovered 0.0098 is <5× (overwrite hole) and <20× (must
+    # not *start* a lock). Missing recon must not lock.
+    assert _should_lock_last_ok(
+        recon=0.0887, recon_best=0.0021, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=False)
+    assert _recon_still_healthy(0.0098, 0.0021, 5.0)
+    assert not _should_lock_last_ok(
+        recon=0.0098, recon_best=0.0021, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=False)
+    assert not _should_lock_last_ok(
+        recon=float('nan'), recon_best=0.0021, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=False)
     # Freeze recon healthy — restore because locked (P40 CAPPED 0.0045).
     assert _should_restore_last_ok_at_p1_freeze(
         recon=0.0045, recon_best=0.0015, ratio=5.0,
@@ -842,6 +855,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "'p1_last_ok_iter'" in _src
     assert "'p1_last_ok_locked'" in _src
     assert '_should_lock_last_ok' in _src
+    assert '_wm_recon_scalar(wm_losses)' in _src
+    assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "out='obs'" in _src
     assert "out='h'" in _src
