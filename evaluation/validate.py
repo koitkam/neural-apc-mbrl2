@@ -2258,8 +2258,9 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
+            from evaluation.wm_transfer_matrix import wm_tf_roll_len
             _tf_h = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
-            _pp_h = _tf_h if _tf_h > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            _pp_h = wm_tf_roll_len(cfg, _tf_h)
             pp_res = compute_posterior_prior_decomp(
                 model, pp_env, cfg, device, horizon=_pp_h, settle=_pp_h)
             with open(out_dir / 'wm_posterior_prior_decomp.json', 'w') as f:
@@ -2300,8 +2301,9 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
+            from evaluation.wm_transfer_matrix import wm_tf_roll_len
             _tf_h2 = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
-            _dpp_h = _tf_h2 if _tf_h2 > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            _dpp_h = wm_tf_roll_len(cfg, _tf_h2)
             dvpp_res = compute_dv_posterior_prior_decomp(
                 model, dpp_env, cfg, device, horizon=_dpp_h, settle=_dpp_h)
             with open(out_dir / 'wm_dv_posterior_prior_decomp.json', 'w') as f:

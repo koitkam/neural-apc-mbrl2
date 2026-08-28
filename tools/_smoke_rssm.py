@@ -1138,8 +1138,14 @@ def _test_gain_match_held_settle() -> None:
     c_set = TrainConfig()
     c_set.gain_match_settle_len = 12
     assert _auto_gain_match_settle_len(c_set) == 12
-    # TM probe default is 4×horizon (test_sim 220), not P44's S=H.
-    assert max(80, 4 * 55) == 220
+    from evaluation.wm_transfer_matrix import wm_tf_horizon, wm_tf_roll_len
+    assert wm_tf_horizon(55) == 220
+    assert wm_tf_horizon(15) == 80
+    assert wm_tf_horizon(30) == 120
+    _cfg_h = TrainConfig()
+    _cfg_h.horizon = 55
+    assert wm_tf_roll_len(_cfg_h, 0) == 220
+    assert wm_tf_roll_len(_cfg_h, 100) == 100
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 

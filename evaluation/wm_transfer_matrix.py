@@ -48,6 +48,26 @@ from tools.wm_steady_state_diagnostic import (
 )
 
 
+def wm_tf_horizon(control_horizon: int) -> int:
+    """Default TM / gain-ready open-loop window: ``max(80, 4·H)``.
+
+    Slow WM prior τ~2× plant; 1.5H under-settled and under-read DC-gain.
+    Floor 80 covers fast plants (H=15 → 80, not 60).  Callers pass
+    ``horizon>0`` (CLI ``DREAMER_WM_TF_HORIZON``) to override.  P44
+    gain-match settle is *control* H, not this window — do not silently
+    retarget the teacher here.
+    """
+    h = max(1, int(control_horizon or 1))
+    return max(80, int(4 * h))
+
+
+def wm_tf_roll_len(cfg, horizon: int = 0) -> int:
+    """Resolved TM roll length: explicit ``horizon`` or ``wm_tf_horizon``."""
+    if int(horizon or 0) > 0:
+        return int(horizon)
+    return wm_tf_horizon(int(getattr(cfg, 'horizon', 30) or 30))
+
+
 def _settle_capture(env, base_action: np.ndarray, settle_steps: int,
                     L: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Settle the env at ``base_action`` and capture the lookback window.
@@ -224,13 +244,9 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
     cv_idx = list(env.cv_indices)
     n_mv = int(env.action_dim)
     obs_dim = int(env.obs_dim)
-    # 4x the control horizon (was 1.5x).  The WM open-loop PRIOR settles ~2x
-    # slower than the real plant (effective tau ~2x), so 1.5x*H under-settled
-    # the WM step response and UNDER-READ its steady-state gain (the WM curve
-    # was still rising at the old cutoff).  4x*H lets the slow prior asymptote
-    # so the reported gain reflects the true steady state.  Override:
-    # DREAMER_WM_TF_HORIZON / _SETTLE.
-    H = int(horizon) if horizon > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+    # ``wm_tf_horizon``: 4×H so the slow WM prior reaches SS (was 1.5×).
+    # Callers pass ``horizon=`` from CLI ``DREAMER_WM_TF_HORIZON``.
+    H = wm_tf_roll_len(cfg, horizon)
     S = int(settle_steps) if settle_steps > 0 else H
     L = min(int(getattr(cfg, 'lookback', 64)), S)
     if obs_std is None:
@@ -333,11 +349,9 @@ def compute_transfer_matrix(model, env, cfg, device, *,
     cv_idx = list(env.cv_indices)
     n_mv = int(env.action_dim)
     obs_dim = int(env.obs_dim)
-    # 4x the control horizon (was 1.5x) so the slow WM open-loop prior reaches
-    # steady state before the gain is read (WM effective tau ~2x the real
-    # plant; 1.5x*H under-settled -> under-read gain).  Override:
-    # DREAMER_WM_TF_HORIZON / _SETTLE.
-    H = int(horizon) if horizon > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+    # ``wm_tf_horizon``: 4×H so the slow WM prior reaches SS (was 1.5×).
+    # Callers pass ``horizon=`` from CLI ``DREAMER_WM_TF_HORIZON``.
+    H = wm_tf_roll_len(cfg, horizon)
     S = int(settle_steps) if settle_steps > 0 else H
     L = min(int(getattr(cfg, 'lookback', 64)), S)
     k_max = int(getattr(cfg, 'k_max', 4))

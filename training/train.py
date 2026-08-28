@@ -797,8 +797,8 @@ class TrainConfig:
     # Held prior-roll BEFORE the FD (P44).  Dataclass 0 = auto
     # ``horizon`` (one *control* settling response).  ``<0`` = off
     # (P43 identity: FD from the replay posterior).  The transfer-matrix
-    # probe's default window is ``H_tf = max(80, 4·horizon)`` and its
-    # settle is ``S = H_tf`` (test_sim 220, not 55) — matching that 4H
+    # probe's default window is ``wm_tf_horizon(H) = max(80, 4·H)`` and
+    # settle ``S = H_tf`` (test_sim 220, not 55) — matching that 4H
     # settle is a *second* attributed change after P44's S=H test.
     # P43 Huber ~1e-4 from PRBS posteriors while the rest-then-step
     # probe stays ~0.75@DV.  P43 DV @H ×0.849 vs ss ×0.740 is a real
@@ -6429,8 +6429,8 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
 def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
     """Promote dataclass 0 to ``horizon`` (control H).  ``<0`` stays off.
 
-    P44 tests S=H.  The TM probe defaults to ``H_tf = max(80, 4·H)``
-    and settle ``S = H_tf`` (test_sim 220).  Matching that 4H settle is
+    P44 tests S=H.  The TM probe defaults to ``wm_tf_horizon(H)``
+    (test_sim 220) and settle ``S = H_tf``.  Matching that 4H settle is
     a later A/B (``DREAMER_GAIN_MATCH_SETTLE_LEN``), not this auto.
     Do not use ``or 0`` — that would treat ``DREAMER_GAIN_MATCH_SETTLE_LEN=-1``
     as auto.  Mutates ``cfg.gain_match_settle_len`` only when it was 0.

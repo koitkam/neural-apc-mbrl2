@@ -340,11 +340,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > `[resolved-cfg]` prints `huber_per_in=`. Env-free. Do not revive
 > relative Huber. **P44** (`gain_match_settle_len` auto=control H):
 > held prior-roll at the start's a/dv before FD.  This is **not** the
-> TM protocol (TM settles the real env for `H_tf=4H` then encodes
-> that lookback).  P43 DV @H ×0.849 vs ss ×0.740 — do not cite `@H≈ss`
+> TM protocol (TM settles the real env for `wm_tf_horizon(H)=max(80,4H)`
+> then encodes that lookback).  CPU probe on P43 freeze: P44 teacher
+> (PRBS+S=H) still FD DV×0.969 — Huber~0 does not pin the rest-step
+> gate.  P43 DV @H ×0.849 vs ss ×0.740 — do not cite `@H≈ss`
 > for DV.  `DREAMER_GAIN_MATCH_SETTLE_LEN=-1` recovers P43.
 > jsonl `wm_gain_match_mv_ratio` / `wm_gain_match_dv_ratio` =
-> mean `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss).
+> mean `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss; not in P44 pid).
 > Head persist-on-lock writes the snapshot when the lock fires. jsonl
 > `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`.
 > Gain-probe line prints ss **and** `@H`. Printed observer verdict is
@@ -620,7 +622,7 @@ fixes BOTH:
   the decoder. Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
   finite-difference step-response asymptote (optionally hold a/dv
   `gain_match_settle_len` steps — auto = control horizon; TM probe settle
-  is 4×horizon — then roll the prior K=`gain_match_len` steps, held baseline vs
+  is `wm_tf_horizon` = max(80, 4×horizon) — then roll the prior K=`gain_match_len` steps, held baseline vs
   +`gain_match_step` per MV/DV input, ΔCV/step) matched to
   the identified steady-state gain in WM-normalized units
   (`gain_match_mv_target`/`gain_match_dv_target`, resolved by
