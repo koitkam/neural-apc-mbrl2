@@ -726,6 +726,11 @@ def _test_isolation_dcv_scales() -> None:
     assert abs(_scale_isolation_level(0.6, mv_sc[0]) - 0.6) < 1e-9
     assert abs(_isolation_edge_du(dv_sc[0], 0.6) - 1.0) < 1e-9
     assert abs(_isolation_edge_du(mv_sc[0], 0.6) - 0.6) < 1e-9
+    cfg.wm_isolation_dcv_min_scale = 0.0
+    mv0, dv0 = _isolation_dcv_scales(cfg, 1, 1, 0.6)
+    assert abs(mv0[0] - 0.289) < 0.01, mv0
+    assert abs(dv0[0] - 1.0 / 0.6) < 1e-6, dv0
+    cfg.wm_isolation_dcv_min_scale = 1.0
     from pathlib import Path as _P
     import training.train as _tr
     _src = _P(_tr.__file__).read_text()
@@ -751,7 +756,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_isolation_edge_du' in _src
     assert "'p1_last_ok_iter'" in _src
     assert "row['wm_isolation_loss'] = row['wm_input_isolation_loss']" in _src
-    assert 'np.clip(g_min / (g * a0), 1.0, smax)' in _src
+    assert 'np.clip(g_min / (g * a0), floor, smax)' in _src
+    assert 'wm_isolation_dcv_min_scale' in _src
+    assert 'clamp_min(1.0)).detach()' in _src
+    assert 'bool(is_mv_bm.any())' not in _src
     assert 'wm_isolation_mv_traj' in _src
     assert 'summary_scope' in _src
     assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
@@ -822,6 +830,13 @@ def _test_isolation_seq_is_mv() -> None:
     act[:2] = 0.6
     m = _isolation_seq_is_mv(act)
     assert bool(m[0]) and bool(m[1]) and (not bool(m[2])) and (not bool(m[3]))
+    err = torch.tensor([1.0, 3.0, 5.0, 7.0])
+    mv_w = m.to(dtype=err.dtype)
+    dv_w = 1.0 - mv_w
+    mv_m = (err * mv_w).sum() / mv_w.sum().clamp_min(1.0)
+    dv_m = (err * dv_w).sum() / dv_w.sum().clamp_min(1.0)
+    assert abs(float(mv_m) - 2.0) < 1e-6
+    assert abs(float(dv_m) - 6.0) < 1e-6
     print('[smoke] OK  isolation seq MV mask (action energy)')
 
 
@@ -866,7 +881,11 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
     assert not hasattr(c, 'wm_isolation_var_norm')
     assert c.wm_isolation_dcv_match is True
+    assert float(c.wm_isolation_dcv_min_scale) == 1.0
     assert 'DREAMER_WM_ISOLATION_DCV_MATCH' in ENV_OVERRIDES
+    assert 'DREAMER_WM_ISOLATION_DCV_MIN_SCALE' in ENV_OVERRIDES
+    assert not hasattr(c, 'rssm_imag_latent_mode')
+    assert 'DREAMER_RSSM_IMAG_LATENT_MODE' not in ENV_OVERRIDES
     assert c.cont_gain_deterministic_roll is True
     assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
     print('[smoke] OK  env-free TrainConfig = P26 observer / P28 actor recipe')

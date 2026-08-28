@@ -283,12 +283,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > (MV 1.12); gmatch stuck **1.30**; val MV ss/@H **×1.253 / ×1.293**,
 > DV **×0.007 / ×0.007**, det_r **0.428** amp-dead, `[p3-skip]`.
 > **FALSIFIED**. HEAD/P39 floor keeps MV edge |Δu|=0.60 and still
-> boosts DV to the cube. P39 LIVE (`run_p39_isodcvfloor`, pid 4170377):
+> boosts DV to the cube. P39 CAPPED (`run_p39_isodcvfloor`, pid 4170377):
 > `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`. Storm **1/2 @iter 53**
-> recovered last-ok 51, **extension kept**. Iter 75 **EXTENDED**
-> GAIN_NOT_READY **0.71@DV** (MV 1.04 in band) — P37-class first gate
-> (P37 0.68@DV), not P38 dead DV. Cube-boost has not moved the
-> first-gate DV pin. Do not launch a second GPU job.
+> recovered, extension kept. Iter 75/85 EXTEND 0.71 then 0.69@DV.
+> Extra-P1 **did not detonate**. Iter 97 CAPPED **0.70@DV** (MV 1.00),
+> P2 recon 0.003 `dobg>0`. Cube-boost **FALSIFIED as DV pin**.
+> **Structural:** `|G_max|/|G_min| > 1/op_band` cannot equalize |ΔCV|
+> without shrinking the strong teacher (P38) or exceeding the cube.
+> Floor is `wm_isolation_dcv_min_scale=1.0`. Do not launch a second GPU
+> job. Expect `[p3-skip]`.
 > **P39 GPU-occupied (no second job):** const-action / step-settle
 > seed used one linspace level on **every** MV (OP-space diagonal).
 > Isolation settle already covers per-input holds. Joint SS on MIMO

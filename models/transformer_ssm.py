@@ -100,8 +100,9 @@ OPEN DESIGN DECISIONS (resolve before implementing):
   - KL free-bits: reuse rssm_kl_loss verbatim (post vs prior logits) — no change.
   - Positional encoding over the lookback: absolute vs rotary; rotary preferred
     for length generalization (imagination H may exceed training seq_len).
-  - Imagination determinism: RSSM uses sample=False (mode) under
-    DREAMER_RSSM_IMAG_LATENT_MODE; keep the same flag semantics.
+  - Observer / aux rolls pass ``sample=`` explicitly (isolation/gain-match
+    ``False``).  ``DREAMER_RSSM_IMAG_LATENT_MODE`` was a deleted-imagination
+    leftover and is no longer a TrainConfig field.
   - Numerical-equivalence test (MUST pass): img_step rolled K steps under the
     SAME actions as a teacher-forced rollout must match within tol (proves the
     KV-cache path == the full-attention path).

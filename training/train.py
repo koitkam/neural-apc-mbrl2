@@ -931,6 +931,15 @@ class TrainConfig:
     # op-band linspace.  Opt out ``DREAMER_WM_ISOLATION_DCV_MATCH=0``
     # for isomorphic |Δu| (P37 P1 form).
     wm_isolation_dcv_match: bool = True
+    # Unitless isolation-scale floor (P38 RCA).  1.0 = never shrink the
+    # strong-|G| teacher below op-band.  0 = P38 match-at-``g_min``
+    # (FALSIFIED: MV edge |Δu| 0.19, storm 2/2, val DV ×0.007).
+    # Cube still clips applied |Δu| to 1.  When |G_max|/|G_min| >
+    # 1/op_band, |ΔCV| cannot equalize without shrinking the strong
+    # teacher or exceeding the cube — floor 1.0 leaves residual
+    # |ΔCV| imbalance (test_sim ~5.8 > 1.67).  P39 CAPPED 0.70@DV.
+    # ``DREAMER_WM_ISOLATION_DCV_MIN_SCALE``.
+    wm_isolation_dcv_min_scale: float = 1.0
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -1015,23 +1024,6 @@ class TrainConfig:
     tssm_n_layers: int = 4
     tssm_n_heads: int = 8
     tssm_max_seq_len: int = 256
-    # P70 (2026-05-30) imagination steady-state fixes.  The trained RSSM
-    # prior map CONTRACTS to a fixed point under a held action (offline
-    # probe: deterministic-mode tail_std ~0.01), but per-step categorical
-    # RE-sampling in imagination re-injects ~0.84 nats/group of latent
-    # noise every step → the reward head (≈quadratic CV penalty) sees a
-    # curvature·Var positive penalty bias on EVERY imagined step → too-
-    # negative imagined returns → critic pessimism → return_scale runaway
-    # → bootstrap cascade (flat MV).  Opt-in mitigation:
-    #   ``rssm_imag_latent_mode``: roll the imagined PRIOR with the
-    #       categorical MODE (argmax, sample=False) instead of a sample —
-    #       removes the per-step jitter so the reward head sees the
-    #       settled mean latent.  Actor exploration still comes from the
-    #       policy's own action sampling (TD-MPC2-style deterministic
-    #       latent + stochastic action).  Default True = p117 recipe: removes the
-    #       per-step imagined-latent jitter that biases imagined returns negative
-    #       and feeds the cascade (promoted 2026-06-14; paper-faithful = False).
-    rssm_imag_latent_mode: bool = True
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -3708,14 +3700,17 @@ def _isolation_dcv_scales(
     MV-action-isomorphic (P33 |tgt| 2.82 vs 0.49 → val DV ×0.66).  Inv-var
     reweight DISCARDED (P34–P36).  Scale ``Δu_i ∝ 1/|G_i|`` from WM-norm
     gain-match targets; ``level*scale`` is clipped to ±1.  Scale is
-    **floored at 1.0** so the strong-|G| teacher stays at op-band (P38
-    match-at-``g_min`` starved MV: edge |Δu| 0.19 vs P37 0.60 → storm
-    2/2 CAPPED 0.01@DV).  Weak input may use cube headroom
-    (``smax = 1/op_band``).  Audit ``edge_du_* = min(1, op_band·scale)``
-    — that is the applied |Δu| at the linspace edge, not the raw
-    multiplier.  Equal-|G| (max/min < 1.05) or a single input keeps
-    the unscaled op-band linspace.  Off (``wm_isolation_dcv_match=False``)
-    or missing targets → all 1s.
+    floored at ``wm_isolation_dcv_min_scale`` (default 1.0) so the
+    strong-|G| teacher stays at op-band (P38 match-at-``g_min`` starved
+    MV: edge |Δu| 0.19 vs P37 0.60 → storm 2/2 CAPPED 0.01@DV).  Weak
+    input may use cube headroom (``smax = 1/op_band``).  When
+    ``|G_max|/|G_min| > 1/op_band``, |ΔCV| cannot equalize without
+    shrinking the strong teacher or exceeding the cube — the floor
+    leaves residual |ΔCV| imbalance (test_sim ~5.8 > 1.67; P39 CAPPED
+    0.70@DV).  Audit ``edge_du_* = min(1, op_band·scale)``.  Equal-|G|
+    (max/min < 1.05) or a single input keeps the unscaled op-band
+    linspace.  Off (``wm_isolation_dcv_match=False``) or missing
+    targets → all 1s.
     """
     n_mv = max(0, int(n_mv or 0))
     n_dv = max(0, int(n_dv or 0))
@@ -3740,6 +3735,11 @@ def _isolation_dcv_scales(
         return ones_mv, ones_dv
     a0 = float(np.clip(float(op_band), 1e-3, 1.0))
     smax = 1.0 / a0
+    raw_floor = getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)
+    try:
+        floor = max(0.0, float(raw_floor))
+    except (TypeError, ValueError):
+        floor = 1.0
 
     def _sc(gs: List[float]) -> List[float]:
         out: List[float] = []
@@ -3748,7 +3748,8 @@ def _isolation_dcv_scales(
                 out.append(1.0)
             else:
                 # Floor 1.0 = never shrink below op-band (P38 RCA).
-                out.append(float(np.clip(g_min / (g * a0), 1.0, smax)))
+                # 0 = match-at-g_min (P38 FALSIFIED).
+                out.append(float(np.clip(g_min / (g * a0), floor, smax)))
         return out
 
     return _sc(mv_g), _sc(dv_g)
@@ -3771,9 +3772,14 @@ def _isolation_dcv_scale_payload(cfg: 'TrainConfig') -> Dict[str, object]:
     dv = [float(x) for x in (
         getattr(cfg, '_isolation_dcv_dv_scale', ()) or ())]
     op = float(getattr(cfg, '_isolation_dcv_op_band', 0.0) or 0.0)
+    raw_floor = getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)
+    try:
+        min_scale = max(0.0, float(raw_floor))
+    except (TypeError, ValueError):
+        min_scale = 1.0
     out: Dict[str, object] = {
         'on': bool(getattr(cfg, 'wm_isolation_dcv_match', True)),
-        'min_scale': 1.0,
+        'min_scale': min_scale,
         'mv': mv,
         'dv': dv,
     }
@@ -6125,18 +6131,18 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     extras: Dict[str, torch.Tensor] = {}
     traj = coef * err_b.mean()
     extras['wm_isolation_traj_loss'] = traj.detach()
-    # Detached MV vs DV split (no extra forward).  Isolation settle is
-    # mixed 50/50 on test_sim; P39 cube-boosts DV |Δu| so DV traj should
-    # be louder than P37.  Action energy >0 ⇒ isolated-MV hold.
+    # Detached MV vs DV split (no extra forward, no CUDA .any() sync).
+    # Isolation settle is mixed 50/50 on test_sim.  Action energy >0 ⇒
+    # isolated-MV hold.  Empty group → 0 (clamp_min on a zero count).
     is_mv_bm = (_isolation_seq_is_mv(act).unsqueeze(1).expand(B, S)
                 .reshape(Bm))
-    extras['wm_isolation_mv_frac'] = is_mv_bm.float().mean().detach()
-    if bool(is_mv_bm.any()):
-        extras['wm_isolation_mv_traj'] = (
-            coef * err_b[is_mv_bm].mean()).detach()
-    if bool((~is_mv_bm).any()):
-        extras['wm_isolation_dv_traj'] = (
-            coef * err_b[~is_mv_bm].mean()).detach()
+    mv_w = is_mv_bm.to(dtype=err_b.dtype)
+    dv_w = 1.0 - mv_w
+    extras['wm_isolation_mv_frac'] = mv_w.mean().detach()
+    extras['wm_isolation_mv_traj'] = (
+        coef * (err_b * mv_w).sum() / mv_w.sum().clamp_min(1.0)).detach()
+    extras['wm_isolation_dv_traj'] = (
+        coef * (err_b * dv_w).sum() / dv_w.sum().clamp_min(1.0)).detach()
     out = traj
     if ss_coef > 0.0 and ss_k0 < K:
         pred_ss = cv_pred[:, ss_k0:].mean(dim=1)                  # (Bm, n_cv)
@@ -9857,7 +9863,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     total_env_steps += cfg.episode_length
                     _n_dv_settle += 1
         _sc_txt = (
-            f"dcv_match min_scale=1 MV={['%.3g' % s for s in _mv_sc]} "
+            f"dcv_match min_scale={float(getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)):g} "
+            f"MV={['%.3g' % s for s in _mv_sc]} "
             f"DV={['%.3g' % s for s in _dv_sc]} "
             f"edge_du MV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _mv_sc]} "
             f"DV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _dv_sc]}"

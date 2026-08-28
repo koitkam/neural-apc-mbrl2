@@ -450,10 +450,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_TSSM_N_LAYERS':              ('tssm_n_layers',                  int),
     'DREAMER_TSSM_N_HEADS':               ('tssm_n_heads',                   int),
     'DREAMER_TSSM_MAX_SEQ_LEN':           ('tssm_max_seq_len',               int),
-    # P70 (2026-05-30): RSSM imagination steady-state fix (opt-in).
-    # latent-mode = roll imagined prior with categorical MODE (kills the
-    # per-step jitter that biases the reward head).  Sim-agnostic.
-    'DREAMER_RSSM_IMAG_LATENT_MODE':      ('rssm_imag_latent_mode',          _as_bool),
     # P73 (2026-05-31): bounded training reward (cascade root-cause fix).
     # symlog-squash per-step training reward into [-B,B] so imagined returns
     # stay bounded and return_scale cannot run away.  Sim-agnostic.
@@ -607,6 +603,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Equalize isolation |ΔCV| via Δu ∝ 1/|G| with scale floor 1.0
     # (default ON; P33 drowning, P38 match-at-g_min starved MV).
     'DREAMER_WM_ISOLATION_DCV_MATCH':     ('wm_isolation_dcv_match',     _as_bool),
+    # Unitless floor on dcv isolation scale (default 1.0 = never shrink
+    # strong-|G| below op-band).  0 = P38 match-at-g_min (FALSIFIED).
+    'DREAMER_WM_ISOLATION_DCV_MIN_SCALE': ('wm_isolation_dcv_min_scale', float),
     # p10 RCA: treat the DV like a clean input — low-pass the noisy measured DV
     # into the WM (errors-in-variables gain fix) + make it input-only (no recon).
     'DREAMER_DV_LOWPASS_TAU':             ('dv_lowpass_tau',                 float),
