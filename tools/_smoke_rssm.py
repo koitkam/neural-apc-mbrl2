@@ -25,6 +25,7 @@ from training.train import (
                             _skip_storm_continue_p1,
                             _skip_storm_should_continue_p1,
                             _wm_fidelity_es_suppressed_frozen_g,
+                            _p1_fidelity_local_plateau,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
                             collect_episode, collect_prbs_episode,
@@ -816,6 +817,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "out='obs'" in _src
     assert "out='h'" in _src
     assert 'last_only=True' in _src
+    assert "last_only=True, out='obs'" in _src
+    assert '_p1_fidelity_local_plateau' in _src
     assert 'np.clip(g_min / (g * a0), floor, smax)' in _src
     assert 'wm_isolation_dcv_min_scale' in _src
     assert 'clamp_min(1.0)).detach()' in _src
@@ -957,6 +960,30 @@ def _test_envfree_observer_recipe() -> None:
     print('[smoke] OK  env-free TrainConfig = gain-match observer / P28 actor')
 
 
+def _test_p1_fidelity_local_plateau() -> None:
+    """P40: warmup spike must not block the recent-floor gate."""
+    # Too few probes.
+    ok, flat, rmax, band = _p1_fidelity_local_plateau(
+        [(10, 6.541)], n_probes=3, plateau_frac=0.05, ema_min=1.5)
+    assert ok is False and flat is False
+
+    # P40-like: all-time 6.541 at iter 10; late-P1 recovered ~5.2.
+    hist = [(10, 6.541), (20, 6.06), (30, 5.50), (40, 5.20),
+            (50, 4.80), (60, 4.40), (70, 5.00), (80, 5.20)]
+    ok, _flat, rmax, _band = _p1_fidelity_local_plateau(
+        hist, n_probes=3, plateau_frac=0.05, ema_min=1.5)
+    assert ok is True, (ok, rmax)
+    assert rmax == 5.20
+    # Gate uses recent_ok, so original-budget P1 would run the GAIN probe
+    # instead of EXTEND-for-not_plateaued.
+
+    low = [(10, 1.2), (20, 1.1), (30, 1.0)]
+    ok2, _, r2, _ = _p1_fidelity_local_plateau(
+        low, n_probes=3, plateau_frac=0.05, ema_min=1.5)
+    assert ok2 is False and r2 == 1.2
+    print('[smoke] OK  P1 fidelity gate is recent-floor (not warmup spike)')
+
+
 def _test_auto_if_unset_honours_explicit() -> None:
     cfg = TrainConfig()
     assert _auto_if_unset(cfg, 'dob_ground_coef', 2.0) is True
@@ -1095,6 +1122,7 @@ if __name__ == '__main__':
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
+    _test_p1_fidelity_local_plateau()
     _test_auto_if_unset_honours_explicit()
     _test_promote_isolation_aux()
     _test_isolation_dcv_scales()

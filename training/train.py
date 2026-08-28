@@ -1777,11 +1777,16 @@ class TrainConfig:
     # gates that can extend each phase up to ``max_extension`` × budget.
     #
     # P1 gate: at the P1 env-step budget, only transition to P2 if
-    #   (a) ``wm_score_ema >= p1_gate_wm_ema_min``  AND
-    #   (b) ``wm_score_ema`` has been within ±``plateau_frac`` of
-    #       ``wm_score_ema_best`` for ≥ ``plateau_probes`` probes
-    #       (i.e. it's plateaued at a healthy level, not just stalled
-    #       at a low one).
+    #   (a) the *recent* fidelity EMA (last ``plateau_probes``) is
+    #       ``>= p1_gate_wm_ema_min``  AND
+    #   (b) the observer GAIN probe is in ``[gain_ready_lo, gain_ready_hi]``.
+    # Do **not** require recent EMA to return to the all-time
+    # ``wm_score_ema_best``.  That peak is a warmup spike (P40 iter-10
+    # 6.541, gain_fid=0.903 with recon already 0.005 so the recon-gate
+    # is fully open). Late-P1 never matches it → ``not_plateaued``
+    # EXTEND → extra-P1 detonation (P37 iter 88; P40 iter 84, gnorm 2.5,
+    # skip-storm silent). Extra P1 is FALSIFIED as a DV lever. Floor +
+    # gain probe are the quality gate; local-flat is logged not required.
     # Else extend P1 by 10 % of budget and re-check at next probe, up
     # to a hard cap of ``(1+max_extension)`` × ``phase1_env_steps``.
     # Set ``p1_gate_wm_ema_min=0.0`` to disable.
@@ -2883,6 +2888,47 @@ def _skip_storm_continue_p1(
 def _wm_fidelity_es_suppressed_frozen_g(g_trainable: bool) -> bool:
     """P2 curriculum freezes ``g``; a gain-blind probe cannot improve."""
     return not bool(g_trainable)
+
+
+def _p1_fidelity_local_plateau(
+        history: List[Tuple[int, float]],
+        *,
+        n_probes: int,
+        plateau_frac: float,
+        ema_min: float,
+) -> Tuple[bool, bool, float, float]:
+    """Recent-floor + local-flat diagnostics for the P1→P2 fidelity gate.
+
+    Returns ``(recent_ok, local_flat, recent_max, band)``.
+
+    * ``recent_ok`` — last ``n_probes`` EMAs exist and their max is
+      ``>= ema_min``.  **This** is the P1 floor (HEAD): a warmup all-time
+      best does not count.
+    * ``local_flat`` — those EMAs sit within ``band`` of *their* max.
+      Band is ``max(plateau_frac × recent_max, 2 × σ(last 2K))`` (P57
+      noise-adaptive).  Logged only — extra P1 must not wait for a
+      return to ``wm_score_ema_best`` (P40 RCA).
+
+    P40: ``wm_ema_best=6.541`` at iter 10. Iter-82 gate printed
+    ``not_plateaued`` and extended; iter 84 recon 0.48 / last_ok 83 /
+    gnorm 2.51 / skip still 7. Isolation-off did not cause that —
+    extra P1 after a healthy original budget did.
+    """
+    n = max(1, int(n_probes))
+    if len(history) < n:
+        return False, False, float('-inf'), 0.0
+    recent = history[-n:]
+    scores = [float(e) for _, e in recent]
+    recent_max = max(scores)
+    recent_ok = bool(math.isfinite(recent_max) and recent_max >= float(ema_min))
+    noise_window = history[-max(n * 2, 4):]
+    noise_vals = [float(e) for _, e in noise_window]
+    noise_std = (float(np.std(noise_vals)) if len(noise_vals) >= 2 else 0.0)
+    band = max(1e-6, float(plateau_frac) * max(recent_max, 0.0),
+               2.0 * noise_std)
+    local_flat = bool(
+        recent_ok and all(abs(s - recent_max) <= band for s in scores))
+    return recent_ok, local_flat, float(recent_max), float(band)
 
 
 def _recon_still_healthy(recon: float, recon_best: Optional[float],
@@ -5886,9 +5932,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     + one step per MV/DV into a single roll (batch
     ``Bm·(1+n_mv+n_dv)``) so the K-step prior loop runs once.  Huber is
     last-step ``ΔCV/Δu`` (P26 DC-gain), so the roll uses
-    ``last_only=True`` (same last feat as ``stack[:, -1]``; no unused
-    K-stack).  Sequential ``img_step`` fallback REMOVED (both
-    RSSM-interface backbones expose ``img_rollout``).
+    ``last_only=True, out='obs'`` (same last decode as
+    ``decode(stack[:, -1])``; no unused K-stack or last-feat).
+    Sequential ``img_step`` fallback REMOVED (both RSSM-interface
+    backbones expose ``img_rollout``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
@@ -6033,11 +6080,13 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                   .expand(n_rolls, Bm, K, dv_held.shape[-1])
                   .reshape(n_rolls * Bm, K, dv_held.shape[-1])
                   .contiguous())
-    # Last-step Huber only: skip the unused (Bm, K, F) stack.  Recurrence
-    # is identical; autograd still flows through the GRU chain.
-    last_feat = rssm.img_rollout(
-        h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b, last_only=True)
-    cv_last = rssm.decode(last_feat).index_select(-1, cv_idx)
+    # Last-step Huber only: skip the unused (Bm, K, F) stack.
+    # ``out='obs'`` decodes once after the K-loop (same as
+    # ``decode(last feat)``; no extra last-feat tensor).
+    last_obs = rssm.img_rollout(
+        h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
+        last_only=True, out='obs')
+    cv_last = last_obs.index_select(-1, cv_idx)
     cv_last = cv_last.view(n_rolls, Bm, -1)
     cv_base = cv_last[0]
     total = _huber_from_cv(
@@ -10109,32 +10158,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _candidate_phase = _phase_for(total_env_steps)
         if (current_phase == 1 and _candidate_phase == 2
                 and p1_gate_wm_ema_min_v > 0.0):
-            # Healthy?  EMA above floor AND plateaued (≥ K probes
-            # within ±plateau_frac of EMA-best).
-            _ema_ok = (wm_score_ema_best > -1e17
-                       and wm_score_ema_best >= p1_gate_wm_ema_min_v)
-            _plateau_ok = False
-            if _ema_ok and len(p1_score_ema_history) >= p1_gate_plateau_probes_v:
-                # 2026-05-27 (P57 RCA): adaptive plateau band.  The
-                # static ``plateau_frac × ema_best`` band (default 5 %)
-                # is too tight for plants where the WM-fidelity probe
-                # has high per-probe variance (P57: σ(probe)≈0.4 →
-                # σ(EMA)≈0.3 → 5 % of ema_best=2.7 = 0.135 ≪ noise).
-                # The gate then never sees "plateaued" even after the
-                # EMA has flattened in the noisy sense.  Widen the
-                # band to ``max(plateau_frac × ema_best, k × σ(recent EMAs))``
-                # — sim-agnostic, derived from the actual EMA noise
-                # observed in the last ``2 × plateau_probes`` probes.
-                recent = p1_score_ema_history[-p1_gate_plateau_probes_v:]
-                _noise_window = p1_score_ema_history[
-                    -max(p1_gate_plateau_probes_v * 2, 4):]
-                _noise_std = (float(np.std([e for _, e in _noise_window]))
-                              if len(_noise_window) >= 2 else 0.0)
-                _band_static = p1_gate_plateau_frac_v * wm_score_ema_best
-                _band_noise = 2.0 * _noise_std
-                _band = max(1e-6, _band_static, _band_noise)
-                _plateau_ok = all(
-                    abs(e - wm_score_ema_best) <= _band for _, e in recent)
+            # Healthy?  Recent EMA above floor.  Do not require return
+            # to all-time ``wm_score_ema_best`` (P40 warmup spike →
+            # unbounded extra P1).  Local-flat is logged, not gated.
+            _recent_ok, _local_flat, _recent_max, _plat_band = (
+                _p1_fidelity_local_plateau(
+                    p1_score_ema_history,
+                    n_probes=p1_gate_plateau_probes_v,
+                    plateau_frac=p1_gate_plateau_frac_v,
+                    ema_min=p1_gate_wm_ema_min_v))
+            _ema_ok = bool(_recent_ok)
+            _plateau_ok = bool(_recent_ok)
             # p20 gain-readiness gate: don't freeze g until the observer's
             # controlled step-response GAIN matches the real plant across the
             # operating band (the correlation/EMA fidelity above is gain-blind —
@@ -10157,14 +10191,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'pass': True, 'ext_steps': int(p1_ext_steps),
                     'wm_ema_best': float(wm_score_ema_best),
                     'wm_ema_best_iter': int(wm_score_ema_best_iter),
+                    'wm_ema_recent_max': float(_recent_max)
+                        if math.isfinite(_recent_max) else None,
+                    'local_flat': bool(_local_flat),
                     'gain_worst_ratio': (float(_gain_probe['worst_ratio'])
                                           if _gain_probe else None),
                 })
                 print(f'[gate p1->p2] PASS at iter {total_iters}: '
-                      f'wm_ema_best={wm_score_ema_best:.3f} '
-                      f'(iter {wm_score_ema_best_iter}, '
-                      f'min={p1_gate_wm_ema_min_v:.2f}), '
-                      f'plateaued over last {p1_gate_plateau_probes_v} probes; '
+                      f'recent_max={_recent_max:.3f} '
+                      f'(global_best={wm_score_ema_best:.3f}@iter'
+                      f'{wm_score_ema_best_iter}, '
+                      f'min={p1_gate_wm_ema_min_v:.2f}, '
+                      f'local_flat={int(_local_flat)}, '
+                      f'band={_plat_band:.3f}); '
                       f'p1_extension={p1_ext_steps}/{p1_gate_max_ext_steps} steps',
                       flush=True)
             elif p1_ext_steps + p1_gate_check_step <= p1_gate_max_ext_steps:
@@ -10181,12 +10220,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         if wm_score_ema > -1e17 else None,
                     'wm_ema_best': float(wm_score_ema_best)
                         if wm_score_ema_best > -1e17 else None,
+                    'wm_ema_recent_max': float(_recent_max)
+                        if math.isfinite(_recent_max) else None,
+                    'local_flat': bool(_local_flat),
                 })
                 if reason == 'ema_below_floor':
-                    _why = (f'wm_ema_best={wm_score_ema_best:.3f} < '
-                            f'{p1_gate_wm_ema_min_v:.2f}')
+                    _why = (f'recent_max={_recent_max:.3f} < '
+                            f'{p1_gate_wm_ema_min_v:.2f} '
+                            f'(global_best={wm_score_ema_best:.3f}@iter'
+                            f'{wm_score_ema_best_iter})')
                 elif reason == 'not_plateaued':
-                    _why = (f'wm_ema_best={wm_score_ema_best:.3f} '
+                    _why = (f'recent_max={_recent_max:.3f} '
                             f'not plateaued')
                 elif _gain_probe is not None:
                     _why = (f'gain_not_ready worst='
@@ -11399,6 +11443,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 'agent_minus_expert_return': last_agent_minus_expert,
                 'p1_last_ok_iter': (int(p1_last_ok_iter)
                                     if int(p1_last_ok_iter) >= 0 else None),
+                'wm_score_ema': (float(wm_score_ema)
+                                  if wm_score_ema > -1e17 else None),
+                'wm_score_ema_best': (float(wm_score_ema_best)
+                                       if wm_score_ema_best > -1e17 else None),
+                'wm_score_ema_best_iter': (int(wm_score_ema_best_iter)
+                                           if int(wm_score_ema_best_iter) >= 0
+                                           else None),
             }
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)

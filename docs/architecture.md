@@ -302,21 +302,23 @@ env-gated off · **[planned]** = designed, not yet built.
 > `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when
 > off. **P40 LIVE** (`mbrl2_p40`, `run_p40_gmatchonly`, `73a5116`,
 > pid 4176670): `[resolved-cfg] isolation=0 ss_match=0 iso_dcv=True`
-> (inert; HEAD prints `iso_dcv=off`). Iter 66 after **storm 1/2 @65**
-> restored last-ok 63: recon **0.0041** then iter 70 **0.0021**, skip
-> banner 7 = cumulative inner skips (window cleared on restore).
-> Isolation-off did **not** eliminate storms. Iter-60 r@H55 **+0.219**
-> vs P39 **+0.521** (WATCH; do not stack overshoot CV-mask until EXIT).
-> t_wm ~99 s. GPU ~17 GB. Do not launch a second GPU job.
-> **P40 GPU-occupied (HEAD):** gain-match `img_rollout(..., last_only=True)`
-> — last-step Huber does not keep the unused `(Bm, K, F)` stack
-> (test_sim ~Bm·55·F per inner step; GRU chain unchanged). Overshoot
-> `out='obs'` / held `out='h'` skip the same F-stack (~2 GB at
-> B=128/starts=24/K=55; pointwise decode ≡ batched). Sequential
-> `img_step` gain-match fallback **REMOVED** (RSSM+TSSM both expose
-> `img_rollout`). jsonl isolation/ss keys emit 0 when teacher off.
-> `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off. Not a
-> recipe change; live pid still `73a5116`.
+> (inert; HEAD prints `iso_dcv=off`). Storm **1/2 @iter 65**.
+> Isolation-off did **not** eliminate storms. Iter-80 r@H55 **+0.495**
+> `gain_fid=0.932` then **iter 82 `not_plateaued wm_ema_best=6.541`**
+> (iter-10 warmup spike; gain probe skipped). Extra-P1 **silent
+> detonation iter 84** (recon 0.48, gnorm 2.51, skip-storm silent,
+> last_ok 83). Recovering iter 91 recon 0.013. t_wm ~99 s. GPU ~17 GB.
+> Do not launch a second GPU job.
+> **P40 GPU-occupied (HEAD):** P1→P2 fidelity floor is the **recent**
+> EMA max (`_p1_fidelity_local_plateau`), not return to all-time
+> `wm_score_ema_best`. Extra P1 waiting on a warmup spike is how
+> P40 detonated after a healthy original budget. Gain-match
+> `img_rollout(..., last_only=True, out='obs')`. jsonl emits
+> `wm_score_ema` / `_best` / `_best_iter`. Overshoot `out='obs'` /
+> held `out='h'` skip the unused F-stack. Sequential `img_step`
+> gain-match fallback **REMOVED**. jsonl isolation/ss keys emit 0
+> when teacher off. `[resolved-cfg]` prints `iso_dcv=off` when the
+> teacher is off. Live pid still `73a5116`.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
