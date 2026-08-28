@@ -105,7 +105,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P38 | 2026-08-27 | dcv_match match-at-g_min (no floor) | val MV ×1.25 DV ×0.007 det_r 0.43; storm 2/2 @48; `[p3-skip]` | ❌ FALSIFIED |
 | P39 | 2026-08-27 | dcv_match scale floor 1.0 | val MV ×0.954/×0.954 DV ×0.679/×0.785 det_r 0.326; CAPPED 0.70@DV; `[p3-skip]` | ❌ KEEP as P1 form; FALSIFIED as DV pin |
 | P40 | 2026-08-28 | isolation auto-enable OFF (gain-match-only) | val MV ×0.995/×0.964 DV ×0.723/×0.743 det_r 0.490; CAPPED 0.75@DV; `[p3-skip]` | ❌ KEEP as env-free default; FALSIFIED as DV pin |
-| P41 | 2026-08-28 | P1 gate recent-floor (not warmup ema_best) | launching | ⏳ GPU |
+| P41 | 2026-08-28 | P1 gate recent-floor (not warmup ema_best) | LIVE P1 iter 2; iso=0 skip=0 | ⏳ GPU |
 
 ## Run details
 
@@ -1428,6 +1428,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 ### p41 (`run_p41_recentfloor`, branch `cursor/p28`) — FIX: P1 gate recent-floor (not warmup `wm_ema_best`)
 - **One attributed GPU change vs P40 process `73a5116`:** P1→P2 fidelity floor is the **recent** EMA max (`_p1_fidelity_local_plateau`), not return to all-time `wm_score_ema_best`. Gain-probe can run at the original P1 budget (~iter 82). Isolation-off stays (env-free KEEP; FALSIFIED as DV pin).
 - **Not:** isolation reweight, last_ok-overwrite change, leftover `DREAMER_*`, P3 on GAIN_NOT_READY. `last_only` / jsonl zeros already HEAD from P40-live (claimed objective-unchanged; in this pid).
+- **Liveness (05:09 CDT):** LIVE P1. tmux `mbrl2_p41`, pid **4185725**, launch `acb8a7b`. GPU ~15.4 GB (climbing). `CUDA_VISIBLE_DEVICES=0`. **No leftover `DREAMER_*`.** `[resolved-cfg] isolation=0 ss_match=0 iso_dcv=off` gain_match=1 dob_ground=2 restore_p2=False skip_invalid_p3=True storm_cap=2 compile=eager. No `[seed] isolated-settle`. No `[isolation-buf]`. Isolated-settle skipped (`wm_isolation_settle_episodes=0`). Iter **1** recon 0.0755 gmatch 0.0020 **iso 0 ss 0 skip 0**. Iter **2** recon 0.0256 gmatch 0.0025 skip 0. Do **not** launch a second GPU job.
 - **Judge by:** first gate prints **gain-probe** (not `not_plateaued` on 6.541). If PASS ~iter 82: freeze pre-blip; if GAIN-READY, first valid actor test of min-of-2 + freeze `return_scale`. If GAIN_NOT_READY EXTEND: extra-P1 may still fire. Val MV ~×1.0 ±0.1; DV vs P40 ×0.72 / P26 ×0.87. If still GAIN_NOT_READY: `[p3-skip]`.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
