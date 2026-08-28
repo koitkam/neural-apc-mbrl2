@@ -316,14 +316,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
-> **P42 GPU:** last-ok locks after a silent recon spike
-> (`skip_storm_last_ok_lock_ratio=20`, unitless; recon-only). P40 extra-P1
-> overwrote 83→104; **P41 original-P1 overwrote 56→64** (iter 57 recon
-> 0.089 / skip 0, recovered 0.0098 < 5×) then 104. Skip-storm restore
-> unlocks. Wrap ~5–10× must not lock. One attributed vs P41 launch.
-> LIVE P1 iter 41: **past P41 storm window with no skip-storm**
-> (recon 0.0021@40 skip 0); lock still idle. `[resolved-cfg]` now
-> prints `lock=` (HEAD; not in the live pid).
+> **P42 GPU-confirmed** (`run_p42_lastoklock`, pid 4192010): last-ok
+> **locks** after a silent recon spike (`skip_storm_last_ok_lock_ratio=20`,
+> recon-only). Spike iter **67** recon **0.3066** (170× best 0.0018, skip
+> 1) locked snapshot iter **66**. last_ok held through 77. P40 extra-P1
+> overwrote 83→104; P41 original-P1 overwrote 56→64. Skip-storm restore
+> unlocks (untested this run). Wrap ~5–10× must not lock (untested;
+> jump was 170×). One attributed vs P41 launch.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
