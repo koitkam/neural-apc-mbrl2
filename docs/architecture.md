@@ -296,29 +296,21 @@ env-gated off · **[planned]** = designed, not yet built.
 > isolation is on. **Structural:** `|G_max|/|G_min| > 1/op_band` cannot
 > equalize |ΔCV| without shrinking the strong teacher (P38) or exceeding
 > the cube. Floor is `wm_isolation_dcv_min_scale=1.0`.
-> **P40:** P08 auto-enable isolation=1 / ss_match=3 is **off** env-free.
-> P26 `run_plan` isolation=0 was the pre-rewrite dump (jsonl iso 1.44).
-> Gain-match is the DC supervisor. Opt in
-> `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when
-> off. **P40 LIVE** (`mbrl2_p40`, `run_p40_gmatchonly`, `73a5116`,
-> pid 4176670): `[resolved-cfg] isolation=0 ss_match=0 iso_dcv=True`
-> (inert; HEAD prints `iso_dcv=off`). Storm **1/2 @iter 65**.
-> Isolation-off did **not** eliminate storms. Iter-80 r@H55 **+0.495**
-> `gain_fid=0.932` then **iter 82 `not_plateaued wm_ema_best=6.541`**
-> (iter-10 warmup spike; gain probe skipped). Extra-P1 **silent
-> detonation iter 84** (recon 0.48, gnorm 2.51, skip-storm silent,
-> last_ok 83). Recovering iter 91 recon 0.013. t_wm ~99 s. GPU ~17 GB.
-> Do not launch a second GPU job.
-> **P40 GPU-occupied (HEAD):** P1→P2 fidelity floor is the **recent**
-> EMA max (`_p1_fidelity_local_plateau`), not return to all-time
-> `wm_score_ema_best`. Extra P1 waiting on a warmup spike is how
-> P40 detonated after a healthy original budget. Gain-match
-> `img_rollout(..., last_only=True, out='obs')`. jsonl emits
-> `wm_score_ema` / `_best` / `_best_iter`. Overshoot `out='obs'` /
-> held `out='h'` skip the unused F-stack. Sequential `img_step`
-> gain-match fallback **REMOVED**. jsonl isolation/ss keys emit 0
-> when teacher off. `[resolved-cfg]` prints `iso_dcv=off` when the
-> teacher is off. Live pid still `73a5116`.
+> **P40 EXIT** (`run_p40_gmatchonly`, `73a5116`, 158 iters): isolation/ss-match
+> **off** env-free. Storm 1/2 @65. Iter 82 EXTEND `not_plateaued` 6.541
+> (gain-probe skipped). Extra-P1 @84; last_ok overwrote 83→104.
+> Iter 104 CAPPED **0.75@DV** (MV 1.01). Val MV ss/@H **×0.995 / ×0.964**,
+> DV **×0.723 / ×0.743**, det_r **0.490** (pred_std 0.246 vs true 1.93)
+> `[p3-skip]`. Isolation-off **KEEP** as env-free default; **FALSIFIED as
+> DV pin** (not P26 ×0.87). P26 `run_plan` isolation=0 was the pre-rewrite
+> dump (jsonl iso 1.44). Gain-match is the DC supervisor. Opt in
+> `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when off.
+> **P41:** P1 gate floor is the **recent** EMA max
+> (`_p1_fidelity_local_plateau`), not return to all-time `wm_score_ema_best`.
+> Original-budget gain-probe can run (P40 skipped it then extra-P1 detonated).
+> Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
+> `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
+> `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
