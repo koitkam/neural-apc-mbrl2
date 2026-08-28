@@ -329,19 +329,22 @@ env-gated off · **[planned]** = designed, not yet built.
 > the P41 det_r-collapse fix** (freeze-66 stayed P41-class; P40 also froze
 > last_ok 104 with det_r 0.490). Extra-P1 recon stayed ≥14× so <5×
 > overwrite-prevention untested. Abs Huber gain-match |tgt| 2.62 vs 0.51
-> was the remaining DV drowning. **P43** (`gain_match_huber_per_input=True`):
-> per-element Huber β = `|tgt_ij|`. L1 saturation is still ±1 — **not**
-> relative Huber (P27 residual `(g-tgt)/|tgt|`). `[resolved-cfg]` prints
-> `huber_per_in=`. Env-free. Do not revive relative Huber.
-> HEAD persist-on-lock writes the snapshot when the lock fires (not in
-> this pid). jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
-> `wm_gain_match_dv_loss`. P43 per-input β changes the Huber (split is
-> still observability). One attributed vs P41 launch.
-> **P43 GPU-occupied (no second job):** first gate iter 82 **0.75@DV / 1.04@MV**
-> (P40/P41-class); gmatch already ~1e-4 so per-input Huber is not the DV lever.
-> Gain-probe line now prints ss **and** `@H` (was computed, dropped). Printed
-> observer verdict is `wm_observer_gain_*` (MV AND DV); lineage `wm_gain_pass`
-> stays MV-only.
+> was the remaining DV drowning. **P43 EXIT** (`run_p43_gmatchperbeta`,
+> launch `51b0f45`, 158 iters, `[p3-skip]`):
+> `gain_match_huber_per_input=True` per-element Huber β = `|tgt_ij|`.
+> L1 saturation is still ±1 — **not** relative Huber. KEEP as P1 form;
+> **FALSIFIED as DV pin**. Gates 82/94/104 all 0.75@DV. Freeze last_ok
+> **94**. Val MV ss/@H **×0.985 / ×0.993**, DV **×0.740 / ×0.849**,
+> det_r **−0.215** (amp dead pred_std 0.137 vs true 1.93). Actor INVALID.
+> Teacher IC (PRBS posterior FD, Huber ~0) ≠ TM rest-then-step.
+> `[resolved-cfg]` prints `huber_per_in=`. Env-free. Do not revive
+> relative Huber. **P44** (`gain_match_settle_len` auto=H): held settle
+> before FD so the teacher matches the rest-then-step probe.
+> `DREAMER_GAIN_MATCH_SETTLE_LEN=-1` recovers P43.
+> Head persist-on-lock writes the snapshot when the lock fires. jsonl
+> `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`.
+> Gain-probe line prints ss **and** `@H`. Printed observer verdict is
+> `wm_observer_gain_*` (MV AND DV); lineage `wm_gain_pass` stays MV-only.
 > Imagination-era critic knobs **REMOVED** (`critic_imag_loss_coef`,
 > `critic_replay_anchor_*`, `critic_anchor_*`, `critic_mc_tail_bootstrap`
 > — never read by `_realsim_actor_critic_step`). `DREAMER_CRITIC_MC_GROUNDING_COEF`
