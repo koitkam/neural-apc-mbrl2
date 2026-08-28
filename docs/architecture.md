@@ -175,7 +175,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > `[resolved-cfg]` same + `gain_match=1 isolation=1 ss_match=3 n_critics=2
 > rs_freeze=True restore_p2=False`. No leftover `[env-override]`, no
 > `torch.compile` banner. Validation now logs `wm_dv_gain_*` so MV-only
-> `wm_gain_pass` cannot hide a biased DV. **P30 P1 iter 17 (2026-08-26 16:55):**
+> `wm_gain_pass` cannot hide a biased DV. HEAD also emits
+> `wm_observer_gain_pass` / `wm_observer_gain_healthy` (MV AND DV) so
+> the printed observer verdict is not MV-only. **P30 P1 iter 17 (2026-08-26 16:55):**
 > recon 0.0098, `kl=0`, `jemb=0.036`, alive 1024, skip 0 — tracking P26/P28
 > (not P29 leftover). GPU occupied; no second job. HEAD eager-path opt
 > (batched isolation decode + vectorized overshoot MSE) is for the *next*
@@ -335,7 +337,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > this pid). jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
 > `wm_gain_match_dv_loss`. P43 per-input β changes the Huber (split is
 > still observability). One attributed vs P41 launch.
-> **P39 GPU-occupied (no second job):** May-2026 per-head
+> **P43 GPU-occupied (no second job):** printed observer verdict is
+> `wm_observer_gain_*` (MV AND DV); lineage `wm_gain_pass` stays MV-only.
+> `DREAMER_CRITIC_IMAG_LOSS_COEF` dropped from `ENV_OVERRIDES` (inert in
+> real-sim). P3 `|corr(adv,a_i)|` is batched. P1→P2 prints recon drop
+> (RSSM `sf_loss≡0`). **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
 > default is now **0** (opt in `DREAMER_DIAG_*_EVERY=10`). Isolation

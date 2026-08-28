@@ -53,7 +53,7 @@ from training.train import (
                             _resolve_compile_mode,
                             _clone_module_state, _refresh_module_state,
                             _p1_need_agent_finetune,
-                            _smooth_l1_gain_match,
+                            _smooth_l1_gain_match, _adv_action_corr,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
@@ -878,6 +878,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_should_lock_last_ok' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
+    assert '_adv_action_corr' in _src
+    assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
     assert '_wm_recon_scalar(wm_losses)' in _src
     assert 'Lock is recon-only (not skip-free)' in _src
@@ -1023,6 +1025,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO' in ENV_OVERRIDES
     assert not hasattr(c, 'rssm_imag_latent_mode')
     assert 'DREAMER_RSSM_IMAG_LATENT_MODE' not in ENV_OVERRIDES
+    assert 'DREAMER_CRITIC_IMAG_LOSS_COEF' not in ENV_OVERRIDES
     assert c.cont_gain_deterministic_roll is True
     assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
     assert float(c.wm_input_isolation_coef) == 0.0
@@ -1051,6 +1054,26 @@ def _test_gain_match_per_input_huber() -> None:
     ref = F.smooth_l1_loss(a, b, beta=1.0)
     assert torch.allclose(got, ref)
     print('[smoke] OK  per-input Huber β=|tgt| (L1 sat ±1/N, not 1/|tgt|)')
+
+
+def _test_adv_action_corr_vectorized() -> None:
+    """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
+    torch.manual_seed(0)
+    adv = torch.randn(8, 16)
+    act = torch.randn(8 * 16, 3)
+    got = _adv_action_corr(adv, act)
+    adv_c = (adv.float() - adv.float().mean()).reshape(-1)
+    refs = []
+    for i in range(act.shape[-1]):
+        a = act[:, i].float()
+        a_c = a - a.mean()
+        den = (adv_c.norm() * a_c.norm()).clamp_min(1e-8)
+        refs.append(((adv_c * a_c).sum() / den).abs())
+    ref = torch.stack(refs).mean()
+    assert torch.allclose(got, ref, atol=1e-6), (got, ref)
+    z = _adv_action_corr(adv, act[:, :0])
+    assert float(z) == 0.0
+    print('[smoke] OK  vectorized adv-action corr (P3 diag identity)')
 
 
 def _test_p1_fidelity_local_plateau() -> None:
@@ -1150,7 +1173,10 @@ def _test_dv_gain_gate(tmp_path: str) -> None:
     """MV-only wm_gain_pass must not hide a biased DV (P29 ×0.56)."""
     import json
     from pathlib import Path
-    from evaluation.validate import _dv_gain_gate_from_json, _ss_gain_rel_errs
+    from evaluation.validate import (
+        _dv_gain_gate_from_json, _ss_gain_rel_errs, _merge_observer_gain_gate,
+        _gain_status,
+    )
     p = Path(tmp_path) / 'wm_dv_transfer_matrix.json'
     p.write_text(json.dumps({
         'pairs': {
@@ -1169,7 +1195,20 @@ def _test_dv_gain_gate(tmp_path: str) -> None:
     assert abs(g['wm_dv_ss_ratio_worst'] - 0.5616) < 1e-6
     rel = _ss_gain_rel_errs({'a': {'real_ss_gain': 0.32, 'ss_gain_abs_err': 0.031}})
     assert abs(rel[0] - 0.031 / 0.32) < 1e-9
-    print('[smoke] OK  DV gain gate fields (MV-only wm_gain_pass unchanged)')
+    mv = {
+        'wm_gain_pass': True,
+        'wm_gain_healthy': True,
+    }
+    merged = _merge_observer_gain_gate(dict(mv), g)
+    assert merged['wm_gain_pass'] is True
+    assert merged['wm_observer_gain_pass'] is True
+    assert merged['wm_observer_gain_healthy'] is False
+    assert _gain_status(True, True) == 'HEALTHY'
+    assert _gain_status(False, True) == 'PASS'
+    assert _gain_status(False, False) == 'FAIL'
+    no_dv = _merge_observer_gain_gate(dict(mv), None)
+    assert no_dv['wm_observer_gain_healthy'] is True
+    print('[smoke] OK  DV gain gate + observer-wide AND (MV-only wm_gain_pass kept)')
 
 
 def _test_stage1_dob_ground_skip() -> None:
@@ -1224,6 +1263,7 @@ if __name__ == '__main__':
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
     _test_gain_match_per_input_huber()
+    _test_adv_action_corr_vectorized()
     _test_p1_fidelity_local_plateau()
     _test_auto_if_unset_honours_explicit()
     _test_promote_isolation_aux()

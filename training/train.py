@@ -563,10 +563,10 @@ class TrainConfig:
     # value is grounded in realised economics instead of model fiction.  Pairs
     # with #2 (latent overshooting): once the WM is accurate at long H the
     # critic trained on REAL states also values IMAGINED states correctly
-    # (value-equivalence).  ``1.0`` = legacy (imagined-primary).  Env
-    # ``DREAMER_CRITIC_IMAG_LOSS_COEF``.
-    # Default 0.3 = p117 recipe: let the MC grounding term dominate the critic
-    # target so it can't self-inflate (promoted 2026-06-14; was 1.0).
+    # (value-equivalence).  ``1.0`` = legacy (imagined-primary).
+    # Inert in mbrl2: imagination critic CE is deleted
+    # (``_realsim_actor_critic_step``).  Not in ENV_OVERRIDES — a
+    # ``DREAMER_CRITIC_IMAG_LOSS_COEF`` override would be a false A/B.
     critic_imag_loss_coef: float = 0.3
 
     # mbrl2 real-sim (p04, 2026-07-09): Monte-Carlo GROUNDING weight for the
@@ -7101,6 +7101,22 @@ def expert_bc_p3_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     return bc_loss, em.sum()
 
 
+def _adv_action_corr(adv_raw: torch.Tensor, act_flat: torch.Tensor
+                     ) -> torch.Tensor:
+    """Mean |corr(advantage, action_i)| over action channels.
+
+    Vectorized identity of the old per-channel Python loop (P3 diag only;
+    imagination actor is deleted).  Empty action dim → 0.
+    """
+    a = act_flat.float()
+    if a.shape[-1] == 0:
+        return torch.zeros((), device=adv_raw.device, dtype=torch.float32)
+    adv_c = (adv_raw.float() - adv_raw.float().mean()).reshape(-1, 1)
+    a_c = a - a.mean(dim=0, keepdim=True)
+    den = (adv_c.norm() * a_c.norm(dim=0)).clamp_min(1e-8)
+    return ((adv_c * a_c).sum(dim=0) / den).abs().mean()
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 — Imagination training (PMPO + TD-λ)
 # ---------------------------------------------------------------------------
@@ -7248,15 +7264,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     with torch.no_grad():
         rew_var = rew.var().clamp_min(1e-8)
         tgt_var = target_returns.float().var().clamp_min(1e-8)
-        _adv_c = (adv_raw.float() - adv_raw.float().mean()).reshape(-1)
-        _corr = []
-        for _ai in range(act_flat.shape[-1]):
-            _a = act_flat[:, _ai].float()
-            _a_c = _a - _a.mean()
-            _den = (_adv_c.norm() * _a_c.norm()).clamp_min(1e-8)
-            _corr.append(((_adv_c * _a_c).sum() / _den).abs())
-        adv_action_corr = (torch.stack(_corr).mean()
-                           if _corr else torch.zeros((), device=device))
+        adv_action_corr = _adv_action_corr(adv_raw, act_flat)
     return {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
@@ -9412,6 +9420,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_gain_not_ready_capped: bool = False
     p1_detonated_freeze_restored: bool = False
     p1_initial_sf: Optional[float] = None
+    p1_initial_recon: Optional[float] = None
     p2_final_reward_mtp: Optional[float] = None
     mid_check_flags: List[str] = []
     # ----- WM fidelity tracking (2026-05-22, P37 RCA) -----
@@ -10529,6 +10538,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # P1-extension + horizon-clip mechanism was removed
                 # 2026-05-20; the 1M-step default budget gives P1
                 # enough time at the paper-default H=15.
+                if p1_initial_recon is not None:
+                    last_recon = _wm_recon_scalar(wm_losses)
+                    print(f"[p1→p2] recon {p1_initial_recon:.4f} → "
+                          f"{last_recon:.4f}", flush=True)
                 if p1_initial_sf is not None and 'sf_loss' in wm_losses:
                     _sf_val = wm_losses.get('sf_loss', p1_initial_sf)
                     last_sf = float(_sf_val.detach().item()
@@ -12003,6 +12016,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 if (current_phase == 1 and p1_initial_sf is None
                         and 'sf_loss' in row and row['sf_loss'] > 1e-6):
                     p1_initial_sf = float(row['sf_loss'])
+                # RSSM/TSSM emit sf_loss≡0 (shortcut-forcing is N/A).
+                # Capture recon so P1→P2 still prints a WM-learning delta.
+                if (current_phase == 1 and p1_initial_recon is None
+                        and row.get('recon_loss') is not None
+                        and float(row['recon_loss']) > 1e-8):
+                    p1_initial_recon = float(row['recon_loss'])
 
                 # --- Hard fails ---
                 # Grad-skip storm.

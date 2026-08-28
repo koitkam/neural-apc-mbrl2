@@ -98,6 +98,35 @@ def _ss_gain_rel_errs(pairs: Dict) -> List[float]:
     return rel_errs
 
 
+def _merge_observer_gain_gate(gate: Dict, dv_gate: Optional[Dict]) -> Dict:
+    """Keep MV-only ``wm_gain_*`` for lineage; AND DV into observer-wide keys.
+
+    P29 printed ``wm_gain_healthy=True`` at MV rel_err=0.10 while DV ss
+    was ×0.56. ``wm_gain_pass`` stays MV-only. ``wm_observer_gain_*`` is
+    the control-relevant observer verdict (MV and DV both in band).
+    No-DV plants copy the MV flags.
+    """
+    mv_pass = bool(gate.get('wm_gain_pass'))
+    mv_healthy = bool(gate.get('wm_gain_healthy'))
+    if dv_gate:
+        gate['wm_observer_gain_pass'] = (
+            mv_pass and bool(dv_gate.get('wm_dv_gain_pass')))
+        gate['wm_observer_gain_healthy'] = (
+            mv_healthy and bool(dv_gate.get('wm_dv_gain_healthy')))
+    else:
+        gate['wm_observer_gain_pass'] = mv_pass
+        gate['wm_observer_gain_healthy'] = mv_healthy
+    return gate
+
+
+def _gain_status(healthy: bool, passed: bool) -> str:
+    if healthy:
+        return 'HEALTHY'
+    if passed:
+        return 'PASS'
+    return 'FAIL'
+
+
 def _dv_gain_gate_from_json(path: Path) -> Optional[Dict]:
     """MV-only ``wm_gain_*`` hid P29 DV ss ×0.56 behind HEALTHY MV rel_err.
 
@@ -2177,27 +2206,33 @@ def run_validation(*,
                         out_dir / 'wm_dv_transfer_matrix.json')
                     if dv_gate:
                         gate.update(dv_gate)
+                    _merge_observer_gain_gate(gate, dv_gate)
                     if isinstance(locals().get('fidelity_gates'), dict):
                         fidelity_gates.update(gate)
                     else:
                         fidelity_gates = gate
-                    status = ('HEALTHY' if gate['wm_gain_healthy']
-                              else ('PASS' if gate['wm_gain_pass'] else 'FAIL'))
-                    print(f'[val] WM gain fidelity: rel_err={gain_rel_err:.2f} '
-                          f'({status}; correlation gates can pass while this '
-                          f'fails — gain is the control-relevant metric)',
+                    mv_status = _gain_status(
+                        gate['wm_gain_healthy'], gate['wm_gain_pass'])
+                    print(f'[val] WM MV gain fidelity: rel_err={gain_rel_err:.2f} '
+                          f'({mv_status}; lineage wm_gain_pass is MV-only)',
                           flush=True)
                     if dv_gate:
-                        dv_status = (
-                            'HEALTHY' if dv_gate['wm_dv_gain_healthy']
-                            else ('PASS' if dv_gate['wm_dv_gain_pass']
-                                  else 'FAIL'))
+                        dv_status = _gain_status(
+                            dv_gate['wm_dv_gain_healthy'],
+                            dv_gate['wm_dv_gain_pass'])
                         print(f'[val] WM DV gain fidelity: rel_err='
                               f'{dv_gate["wm_dv_gain_rel_err"]:.2f} '
                               f'ss_ratio_worst='
                               f'{dv_gate.get("wm_dv_ss_ratio_worst", float("nan")):.2f} '
-                              f'({dv_status}; not counted in wm_gain_pass)',
+                              f'({dv_status})',
                               flush=True)
+                    obs_status = _gain_status(
+                        gate['wm_observer_gain_healthy'],
+                        gate['wm_observer_gain_pass'])
+                    print(f'[val] WM observer gain: {obs_status} '
+                          f'(MV+DV; correlation gates can pass while this '
+                          f'fails — gain is the control-relevant metric)',
+                          flush=True)
             except Exception as _ge:
                 print(f'[val] WM gain-gate skipped: {_ge!r}', flush=True)
         except Exception as e:

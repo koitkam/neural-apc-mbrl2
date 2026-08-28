@@ -431,7 +431,8 @@ default-OFF (paper-faithful) and apply to both entry points (single run + BO):
 | `DREAMER_WM_OVERSHOOT_LEN` | Open-loop horizon K to supervise (default 15; set to the imagination horizon for long-H runs). |
 | `DREAMER_WM_OVERSHOOT_MAX_STARTS` | Cap on strided start positions per batch (default 24) — bounds the added GRU cost. |
 | `DREAMER_WM_OVERSHOOT_GATE_RECON` | Soft recon-fidelity gate (default 0.1): scales the term by `min(1, gate/recon_loss)` so it ramps in only as 1-step reconstruction converges (no early-P1 destabilisation). |
-| `DREAMER_CRITIC_IMAG_LOSS_COEF` | **(#1) Critic real-grounding rebalance.** Weight on the *imagined* critic CE (default 1.0 = legacy). `<1.0` lets the real-return replay anchor (`critic_replay_anchor_coef`, `critic_anchor_lambda`) dominate the value target, breaking the bootstrap self-dominance (`critic_rew_to_tgt_var → ~0.001`) that freezes the actor. Both backbones. |
+
+mbrl2 real-sim: imagination critic CE is deleted (`_realsim_actor_critic_step`). `DREAMER_CRITIC_IMAG_LOSS_COEF` is **not** in `ENV_OVERRIDES` (false A/B). Real-sim critic grounding is `DREAMER_CRITIC_MC_GROUNDING_COEF`.
 
 ## Single training run (no BO)
 
