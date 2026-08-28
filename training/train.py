@@ -794,11 +794,15 @@ class TrainConfig:
     # continuous gain channel is on AND the identified gains are available.
     gain_match_coef: float = 0.0
     gain_match_len: int = 0            # K step-response rollout steps (= horizon)
-    # Held prior-roll BEFORE the FD (P44).  Dataclass 0 = auto ``horizon``
-    # at resolve (same as the transfer-matrix settle ``S=H``).  ``<0`` =
-    # off (P43 identity: FD from the replay posterior).  P43 Huber ~1e-4
-    # from PRBS posteriors while the rest-then-step probe stays ~0.75@DV
-    # at both @H and 4×H — teacher IC ≠ TM IC, not a loss reweight.
+    # Held prior-roll BEFORE the FD (P44).  Dataclass 0 = auto
+    # ``horizon`` (one *control* settling response).  ``<0`` = off
+    # (P43 identity: FD from the replay posterior).  The transfer-matrix
+    # probe's default window is ``H_tf = max(80, 4·horizon)`` and its
+    # settle is ``S = H_tf`` (test_sim 220, not 55) — matching that 4H
+    # settle is a *second* attributed change after P44's S=H test.
+    # P43 Huber ~1e-4 from PRBS posteriors while the rest-then-step
+    # probe stays ~0.75@DV.  P43 DV @H ×0.849 vs ss ×0.740 is a real
+    # 4H-asymptote gap (MV @H≈ss); do not cite "@H≈ss" for DV.
     # Gradful (P25: detaching the gain-match roll kills DC).  Extra cost
     # is one ``Bm×S`` roll vs the FD's ``(1+n_mv+n_dv)·Bm×K``.
     # ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
@@ -5941,6 +5945,26 @@ def _smooth_l1_gain_match(
     return torch.where(abs_e < b, quadratic, linear).mean()
 
 
+def _gain_match_pred_over_tgt(
+        g_wm: torch.Tensor, tgts) -> torch.Tensor:
+    """Mean ``G_pred / G_tgt`` over finite targets (no extra FD).
+
+    P43 Huber ~1e-4 while TM DV stayed ×0.74 — jsonl Huber is 0 at a
+    matching IC, so it cannot show a rest-step miss.  Sign-aware (test_sim
+    MV tgt is negative).  Empty / all-tiny tgts → 0.
+    """
+    if not tgts:
+        return g_wm.new_zeros(())
+    tgt = torch.as_tensor([list(t) for t in tgts],
+                         device=g_wm.device, dtype=g_wm.dtype)
+    tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
+                      g_wm.shape[-1]).expand_as(g_wm)
+    ok = tgt_b.abs() >= 1e-6
+    den = torch.where(ok, tgt_b, torch.ones_like(tgt_b))
+    n = ok.to(g_wm.dtype).sum().clamp_min(1.0)
+    return torch.where(ok, g_wm / den, torch.zeros_like(g_wm)).sum() / n
+
+
 def _gain_match_fd_held(
         a_base: torch.Tensor, dv0: Optional[torch.Tensor],
         n_mv: int, n_dv: int, step: float
@@ -5986,9 +6010,12 @@ def _gain_match_held_settle(
         rssm, h0: torch.Tensor, z0: torch.Tensor,
         c0: Optional[torch.Tensor], a_base: torch.Tensor,
         dv0: Optional[torch.Tensor], settle: int):
-    """Gradful held prior-roll of ``settle`` steps (TM rest-then-step IC).
+    """Gradful held prior-roll of ``settle`` steps at the start's a/dv.
 
-    P25: do not detach — TBPTT on the gain-match path kills DC-gain.
+    P44: damps GRU transients so the FD starts from a held OP, not a
+    mid-PRBS posterior.  This is *not* the TM protocol (TM settles the
+    *real* env for ``H_tf=4H`` then encodes that lookback).  P25: do not
+    detach — TBPTT on the gain-match path kills DC-gain.
     ``settle < 2`` is a no-op (P43 identity).
     """
     if int(settle) < 2:
@@ -6014,7 +6041,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     """C(1): finite-difference step-response asymptote gain-matching (RSSM).
 
     From a strided set of posterior start states, optionally hold a/dv for
-    ``gain_match_settle_len`` steps (TM rest-then-step IC; auto = horizon),
+    ``gain_match_settle_len`` steps (P44: auto = control horizon; TM
+    probe settle is 4×horizon — see TrainConfig),
     then roll the PRIOR forward ``K`` steps under (a) a HELD baseline
     action/DV and (b) a unit STEP in each input channel.  The DIFFERENCE of
     the decoded CV at step ``K`` cancels the common transient and isolates
@@ -6092,10 +6120,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
     dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
            if getattr(rssm, 'dv_dim', 0) > 0 else None)
-    # P44: settle at the start's held a/dv BEFORE the FD so the teacher
-    # measures G at a rest-like prior (transfer-matrix protocol) instead
-    # of a PRBS posterior.  P43 Huber ~0 from replay starts while the
-    # rest-step probe stayed 0.75@DV.  Gradful (P25).
+    # P44: settle at the start's held a/dv BEFORE the FD so the *student*
+    # FD (matched to identified G, not a teacher FD) starts from a held
+    # OP instead of a PRBS posterior.  P43 Huber ~0 from replay starts
+    # while the rest-step probe stayed 0.75@DV.  Gradful (P25).
     h0, z0, c0 = _gain_match_held_settle(
         rssm, h0, z0, c0, a_base, dv0,
         int(getattr(cfg, 'gain_match_settle_len', 0)))
@@ -6199,13 +6227,20 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
     # (L1 sat ±1) is the loss change; the MV/DV split still shows
     # per-channel Huber (abs mean used to drown |tgt| 2.62 vs 0.51).
+    # ``*_ratio`` = mean G_pred/G_tgt so Huber~0 cannot hide a 0.75@DV
+    # rest-step miss the way P43 jsonl did.
     with torch.no_grad():
+        g_all = (cv_steps - cv_base) / step
         if n_mv_t:
             diag['gain_match_mv_loss'] = _huber_from_cv(
                 cv_base, cv_steps[:n_mv_t], mv_tgts)
+            diag['gain_match_mv_ratio'] = _gain_match_pred_over_tgt(
+                g_all[:n_mv_t], mv_tgts)
         if dv_tgts:
             diag['gain_match_dv_loss'] = _huber_from_cv(
                 cv_base, cv_steps[n_mv_t:], dv_tgts)
+            diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
+                g_all[n_mv_t:], dv_tgts)
     return loss, diag
 
 
@@ -6392,8 +6427,11 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
 
 
 def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
-    """Promote dataclass 0 to ``horizon`` (TM settle ``S=H``).  ``<0`` stays off.
+    """Promote dataclass 0 to ``horizon`` (control H).  ``<0`` stays off.
 
+    P44 tests S=H.  The TM probe defaults to ``H_tf = max(80, 4·H)``
+    and settle ``S = H_tf`` (test_sim 220).  Matching that 4H settle is
+    a later A/B (``DREAMER_GAIN_MATCH_SETTLE_LEN``), not this auto.
     Do not use ``or 0`` — that would treat ``DREAMER_GAIN_MATCH_SETTLE_LEN=-1``
     as auto.  Mutates ``cfg.gain_match_settle_len`` only when it was 0.
     """
@@ -11656,6 +11694,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                            float(row.get('gain_match_mv_loss') or 0.0))
             row.setdefault('wm_gain_match_dv_loss',
                            float(row.get('gain_match_dv_loss') or 0.0))
+            if 'gain_match_mv_ratio' in row:
+                row.setdefault('wm_gain_match_mv_ratio',
+                            row['gain_match_mv_ratio'])
+            if 'gain_match_dv_ratio' in row:
+                row.setdefault('wm_gain_match_dv_ratio',
+                            row['gain_match_dv_ratio'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)

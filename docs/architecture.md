@@ -338,9 +338,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > det_r **−0.215** (amp dead pred_std 0.137 vs true 1.93). Actor INVALID.
 > Teacher IC (PRBS posterior FD, Huber ~0) ≠ TM rest-then-step.
 > `[resolved-cfg]` prints `huber_per_in=`. Env-free. Do not revive
-> relative Huber. **P44** (`gain_match_settle_len` auto=H): held settle
-> before FD so the teacher matches the rest-then-step probe.
-> `DREAMER_GAIN_MATCH_SETTLE_LEN=-1` recovers P43.
+> relative Huber. **P44** (`gain_match_settle_len` auto=control H):
+> held prior-roll at the start's a/dv before FD.  This is **not** the
+> TM protocol (TM settles the real env for `H_tf=4H` then encodes
+> that lookback).  P43 DV @H ×0.849 vs ss ×0.740 — do not cite `@H≈ss`
+> for DV.  `DREAMER_GAIN_MATCH_SETTLE_LEN=-1` recovers P43.
+> jsonl `wm_gain_match_mv_ratio` / `wm_gain_match_dv_ratio` =
+> mean `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss).
 > Head persist-on-lock writes the snapshot when the lock fires. jsonl
 > `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`.
 > Gain-probe line prints ss **and** `@H`. Printed observer verdict is
@@ -615,8 +619,8 @@ fixes BOTH:
   lookback, feeds the GRU (so `h` carries the per-episode gain forward) **and**
   the decoder. Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
   finite-difference step-response asymptote (optionally hold a/dv
-  `gain_match_settle_len` steps — auto = horizon, same as the transfer-matrix
-  settle — then roll the prior K=`gain_match_len` steps, held baseline vs
+  `gain_match_settle_len` steps — auto = control horizon; TM probe settle
+  is 4×horizon — then roll the prior K=`gain_match_len` steps, held baseline vs
   +`gain_match_step` per MV/DV input, ΔCV/step) matched to
   the identified steady-state gain in WM-normalized units
   (`gain_match_mv_target`/`gain_match_dv_target`, resolved by
@@ -625,8 +629,9 @@ fixes BOTH:
   `g_mv_norm = g_eng·mv_action_scale/obs_std[cv]`). Huber is **absolute**
   on `G=ΔCV/Δu` (P26). Default **per-input β = |tgt_ij|** (P43): L1 sat
   ±1, not P27 relative Huber. Default **held settle before FD** (P44):
-  teacher IC matches the rest-then-step probe; `DREAMER_GAIN_MATCH_SETTLE_LEN=-1`
-  recovers P43 FD-from-posterior. `sample=False` freezes the
+  prior-hold at start a/dv for control H; `DREAMER_GAIN_MATCH_SETTLE_LEN=-1`
+  recovers P43 FD-from-posterior. jsonl `*_ratio` = mean G_pred/G_tgt.
+  `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.
 - **DISTURBANCE block** (`cont_dist_dim = n_cv`): an **inherent amortized Kalman**.

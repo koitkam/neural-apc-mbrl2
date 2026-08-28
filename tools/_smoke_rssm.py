@@ -55,6 +55,7 @@ from training.train import (
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
+                            _gain_match_pred_over_tgt,
                             _wm_gain_match_loss,
                             _adv_action_corr, _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
@@ -852,6 +853,9 @@ def _test_isolation_dcv_scales() -> None:
     assert "wrote {p1_last_ok_ckpt_path.name}" in _src
     assert 'gain_match_mv_loss' in _src
     assert 'gain_match_dv_loss' in _src
+    assert 'gain_match_mv_ratio' in _src
+    assert 'gain_match_dv_ratio' in _src
+    assert '_gain_match_pred_over_tgt' in _src
     assert '_should_lock_last_ok' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
@@ -1049,6 +1053,17 @@ def _test_gain_match_per_input_huber() -> None:
     print('[smoke] OK  per-input Huber β=|tgt| (L1 sat ±1/N, not 1/|tgt|)')
 
 
+def _test_gain_match_pred_over_tgt() -> None:
+    """jsonl G_pred/G_tgt: 1.0 on match, 0.75 on P43-class DV miss, sign-safe."""
+    mv = torch.tensor([[[-2.624]]])   # (n_in, Bm, n_cv)
+    dv = torch.tensor([[[0.51 * 0.75]]])
+    assert abs(float(_gain_match_pred_over_tgt(mv, ((-2.624,),))) - 1.0) < 1e-6
+    assert abs(float(_gain_match_pred_over_tgt(dv, ((0.51,),))) - 0.75) < 1e-6
+    z = _gain_match_pred_over_tgt(mv, ())
+    assert float(z) == 0.0
+    print('[smoke] OK  gain-match pred/tgt ratio (P43 Huber-blind miss)')
+
+
 def _test_gain_match_fd_held() -> None:
     """Broadcast FD held actions ≡ clone-loop stack (MIMO + SISO)."""
     torch.manual_seed(0)
@@ -1123,6 +1138,8 @@ def _test_gain_match_held_settle() -> None:
     c_set = TrainConfig()
     c_set.gain_match_settle_len = 12
     assert _auto_gain_match_settle_len(c_set) == 12
+    # TM probe default is 4×horizon (test_sim 220), not P44's S=H.
+    assert max(80, 4 * 55) == 220
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 
@@ -1353,6 +1370,7 @@ if __name__ == '__main__':
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
     _test_gain_match_per_input_huber()
+    _test_gain_match_pred_over_tgt()
     _test_gain_match_fd_held()
     _test_gain_match_held_settle()
     _test_adv_action_corr_vectorized()

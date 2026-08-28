@@ -245,9 +245,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # transition input (held constant in imagination = MPC feedforward) instead
     # of predicting them.  Default ON; DREAMER_DV_AS_INPUT=0 reverts to paper.
     'DREAMER_DV_AS_INPUT':                ('dv_as_input',                _as_bool),
-    # DV→decoder+heads feedforward (2026-06-19, p129): route the measured DV
-    # around the categorical bottleneck (where the DV→CV gain dies) directly
-    # into the decoder + heads.  Default ON; =0 reverts to transition-only DV.
+    # DV in the *head* feat (actor sees the load).  Decoder half is a
+    # separate knob (``DREAMER_DV_DECODER_FEEDFORWARD``, default off —
+    # p146 memoryless dv_t→CV_t skipped GRU dead-time and biased DV
+    # DC-gain).  ``DREAMER_DV_FEEDFORWARD=0`` = transition-only DV.
     'DREAMER_DV_FEEDFORWARD':             ('dv_feedforward',             _as_bool),
     'DREAMER_DV_DECODER_FEEDFORWARD':     ('dv_decoder_feedforward',     _as_bool),
     # De-contaminate the disturbance head from the MEASURED dv (2026-06-19,
@@ -576,7 +577,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_HUBER_BETA':      ('gain_match_huber_beta',          float),
     # P43: per-element Huber β = |tgt_ij| (L1 sat ±1; not relative Huber).
     'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': ('gain_match_huber_per_input',     _as_bool),
-    # P44: held settle before gain-match FD (0 = auto horizon; <0 = off).
+    # P44: held settle before gain-match FD (0 = auto control horizon;
+    # TM probe settle is 4×horizon; <0 = off).
     'DREAMER_GAIN_MATCH_SETTLE_LEN':      ('gain_match_settle_len',          int),
     'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
