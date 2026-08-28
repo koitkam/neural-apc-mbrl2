@@ -6391,6 +6391,19 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     return out, extras
 
 
+def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
+    """Promote dataclass 0 to ``horizon`` (TM settle ``S=H``).  ``<0`` stays off.
+
+    Do not use ``or 0`` — that would treat ``DREAMER_GAIN_MATCH_SETTLE_LEN=-1``
+    as auto.  Mutates ``cfg.gain_match_settle_len`` only when it was 0.
+    """
+    s = int(getattr(cfg, 'gain_match_settle_len', 0))
+    if s == 0:
+        s = int(getattr(cfg, 'horizon', 15) or 15)
+        cfg.gain_match_settle_len = s
+    return s
+
+
 def _resolve_gain_match_targets(
         env: 'APCEnv', cfg: TrainConfig, *, log_label: str = 'targets') -> None:
     """C(1): convert the identified steady-state gains (engineering units) into
@@ -6496,9 +6509,7 @@ def _resolve_gain_match_targets(
     if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
         cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
     # 0 = auto TM settle (S=H).  Negative = off (P43 FD-from-posterior).
-    # Do not use ``or 0`` — that would treat -1 as auto.
-    if int(getattr(cfg, 'gain_match_settle_len', 0)) == 0:
-        cfg.gain_match_settle_len = int(getattr(cfg, 'horizon', 15) or 15)
+    _auto_gain_match_settle_len(cfg)
     _resolve_aux_tbptt_steps(cfg)
     _beta_mv = _gain_col_rms(cfg.gain_match_mv_target)
     _beta_dv = _gain_col_rms(cfg.gain_match_dv_target)

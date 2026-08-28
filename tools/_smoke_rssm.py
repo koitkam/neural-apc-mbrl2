@@ -54,7 +54,8 @@ from training.train import (
                             _p1_need_agent_finetune,
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_state_from_feat,
-                            _gain_match_held_settle, _wm_gain_match_loss,
+                            _gain_match_held_settle, _auto_gain_match_settle_len,
+                            _wm_gain_match_loss,
                             _adv_action_corr, _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
@@ -857,6 +858,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_state_from_feat' in _src
+    assert '_auto_gain_match_settle_len' in _src
     assert '_adv_action_corr' in _src
     assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
@@ -1109,6 +1111,18 @@ def _test_gain_match_held_settle() -> None:
     gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
                 if p.grad is not None)
     assert gru_g > 0.0, 'held settle last feat lost GRU gradient'
+    c0_auto = TrainConfig()
+    c0_auto.horizon = 55
+    assert int(c0_auto.gain_match_settle_len) == 0
+    assert _auto_gain_match_settle_len(c0_auto) == 55
+    assert int(c0_auto.gain_match_settle_len) == 55
+    c_off = TrainConfig()
+    c_off.gain_match_settle_len = -1
+    c_off.horizon = 55
+    assert _auto_gain_match_settle_len(c_off) == -1
+    c_set = TrainConfig()
+    c_set.gain_match_settle_len = 12
+    assert _auto_gain_match_settle_len(c_set) == 12
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 
