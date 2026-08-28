@@ -53,6 +53,7 @@ from training.train import (
                             _resolve_compile_mode,
                             _clone_module_state, _refresh_module_state,
                             _p1_need_agent_finetune,
+                            _smooth_l1_gain_match,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
@@ -205,9 +206,10 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  last-ok snapshot refresh copy_ (same storage, not aliased)')
     _tc = TrainConfig()
     assert float(_tc.gain_match_huber_beta) == 1.0
+    assert _tc.gain_match_huber_per_input is True
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
-    print('[smoke] OK  gain-match defaults (abs Huber only, beta=1, TBPTT=16)')
+    print('[smoke] OK  gain-match defaults (abs Huber, per-input β, TBPTT=16)')
 
     # Isolation TBPTT is sim-adaptive: 16 of K≈55 (test_sim) scales as K/3.5.
     _tb = TrainConfig()
@@ -715,6 +717,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_N_CRITICS': '3',
         'DREAMER_STEP_TEST_INJECT_N': '7',
         'DREAMER_WM_ISOLATION_DCV_MATCH': '0',
+        'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': '0',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -727,6 +730,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.n_critics) == 3
         assert int(cfg.step_test_inject_n) == 7
         assert cfg.wm_isolation_dcv_match is False
+        assert cfg.gain_match_huber_per_input is False
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -873,6 +877,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_dv_loss' in _src
     assert '_should_lock_last_ok' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
+    assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
+    assert '_smooth_l1_gain_match' in _src
     assert '_wm_recon_scalar(wm_losses)' in _src
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
@@ -1002,9 +1008,12 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.n_critics) == 2
     assert c.return_scale_freeze_after_warmup is True
     assert c.dob_enabled is True
+    assert c.gain_match_huber_per_input is True
+    assert float(c.gain_match_huber_beta) == 1.0
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
+    assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
     assert not hasattr(c, 'wm_isolation_var_norm')
     assert c.wm_isolation_dcv_match is True
@@ -1021,6 +1030,27 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.wm_isolation_settle_episodes) == 0
     assert _isolation_teacher_on(c) is False
     print('[smoke] OK  env-free TrainConfig = gain-match observer / P28 actor')
+
+
+def _test_gain_match_per_input_huber() -> None:
+    """P43: per-input β = |tgt| saturates L1 at ±1/N, not P27 1/|tgt|."""
+    import torch.nn.functional as F
+    pred = torch.tensor([0.0, 0.0], requires_grad=True)
+    tgt = torch.tensor([2.62, 0.51])
+    loss = _smooth_l1_gain_match(pred, tgt, per_input=True)
+    loss.backward()
+    n = float(pred.numel())
+    assert torch.allclose(
+        pred.grad, torch.full_like(pred, -1.0 / n), atol=1e-5), pred.grad
+    rel = torch.tensor([-1.0 / (n * 2.62), -1.0 / (n * 0.51)])
+    assert float((pred.grad - rel).abs().min()) > 0.1, (
+        'per-input Huber looks like relative Huber (P27)')
+    a = torch.tensor([0.3, -0.1])
+    b = torch.tensor([2.62, 0.51])
+    got = _smooth_l1_gain_match(a, b, beta=1.0, per_input=False)
+    ref = F.smooth_l1_loss(a, b, beta=1.0)
+    assert torch.allclose(got, ref)
+    print('[smoke] OK  per-input Huber β=|tgt| (L1 sat ±1/N, not 1/|tgt|)')
 
 
 def _test_p1_fidelity_local_plateau() -> None:
@@ -1102,6 +1132,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     banner = buf.getvalue()
     assert 'lock=20' in banner, banner
     assert 'iso_dcv=off' in banner, banner
+    assert 'huber_per_in=True' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -1192,6 +1223,7 @@ if __name__ == '__main__':
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
+    _test_gain_match_per_input_huber()
     _test_p1_fidelity_local_plateau()
     _test_auto_if_unset_honours_explicit()
     _test_promote_isolation_aux()

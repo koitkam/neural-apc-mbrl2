@@ -6,7 +6,8 @@ import torch
 from training.train import (TrainConfig, build_model,
                             _wm_input_isolation_loss, _wm_gain_match_loss,
                             _wm_latent_overshoot_loss,
-                            _wm_held_rollout_stationarity_loss)
+                            _wm_held_rollout_stationarity_loss,
+                            _smooth_l1_gain_match)
 
 
 def _iso(model, obs, act, cfg):
@@ -16,6 +17,18 @@ def _iso(model, obs, act, cfg):
 
 def main():
     torch.manual_seed(0)
+    # P43: per-input Huber β = |tgt| (no RSSM).  G=0 → |e|=|tgt|=β
+    # → L1 sat, dL/dG = ±1/N for both channels, not P27 1/|tgt|.
+    pred = torch.tensor([0.0, 0.0], requires_grad=True)
+    tgt = torch.tensor([2.62, 0.51])
+    loss = _smooth_l1_gain_match(pred, tgt, per_input=True)
+    loss.backward()
+    n = float(pred.numel())
+    assert torch.allclose(
+        pred.grad, torch.full_like(pred, -1.0 / n), atol=1e-5), pred.grad
+    rel = torch.tensor([-1.0 / (n * 2.62), -1.0 / (n * 0.51)])
+    assert float((pred.grad - rel).abs().min()) > 0.1
+    print('[gain-match-per-beta] OK: dL/dG = ±1/N (not 1/|tgt|)')
     cfg = TrainConfig()
     cfg.obs_dim = 6
     cfg.action_dim = 1
@@ -376,12 +389,14 @@ def main():
         dv_s = dv0.clone()
         dv_s[:, 0] = dv_s[:, 0] + step
         g_dv = (_roll(a_base, dv_s) - cv_base) / step
-        tgt_mv = torch.tensor([0.4], device=obs.device, dtype=g_mv.dtype)
-        tgt_dv = torch.tensor([-0.2], device=obs.device, dtype=g_dv.dtype)
-        import torch.nn.functional as F
-        l_mv = F.smooth_l1_loss(g_mv, tgt_mv.expand_as(g_mv), beta=1.0)
-        l_dv = F.smooth_l1_loss(g_dv, tgt_dv.expand_as(g_dv), beta=1.0)
-        return (l_mv + l_dv) / 2.0
+        tgt = torch.tensor([[0.4], [-0.2]], device=obs.device, dtype=g_mv.dtype)
+        g_wm = torch.stack([g_mv, g_dv], dim=0)
+        tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
+                          g_wm.shape[-1]).expand_as(g_wm)
+        return _smooth_l1_gain_match(
+            g_wm, tgt_b,
+            beta=float(cfg.gain_match_huber_beta),
+            per_input=bool(getattr(cfg, 'gain_match_huber_per_input', False)))
 
     gm_seq = _seq_gain_match()
     assert torch.isfinite(gm_batched).all() and torch.isfinite(gm_seq).all()

@@ -862,9 +862,17 @@ class TrainConfig:
     # kept as opt-in.  Do not re-add ``gain_match_relative``.
     # Huber β for the gain-match residual (WM-norm gain units).  1.0 matches
     # the P24–P28 env default.  ``<=0`` = auto at resolve-time: median |tgt|
-    # (sim-adaptive; next attributed observer A/B, not the P28 default).
+    # (sim-adaptive; only when ``gain_match_huber_per_input`` is False —
+    # median of {2.62, 0.51} ≈ 1.56 does not equalize).
     # ``DREAMER_GAIN_MATCH_HUBER_BETA``.
     gain_match_huber_beta: float = 1.0
+    # Per-element Huber β = |tgt_ij| (P43).  L1 saturation is still ±1
+    # (same as abs Huber for large errors) so this is NOT relative Huber
+    # (P27 residual ``(g-tgt)/|tgt|`` → L1 grad 1/|tgt|).  A 25% DV miss
+    # stays in the L2 region scaled with |G|.  Isolation-off moved |tgt|
+    # drowning (test_sim MV 2.62 vs DV 0.51) into this sole DC supervisor.
+    # ``DREAMER_GAIN_MATCH_HUBER_PER_INPUT=0`` = scalar β.
+    gain_match_huber_per_input: bool = True
     # Isolation / ss-match TBPTT stride (GRU ``h`` only, ``keep_c``).  Never
     # cuts inside the settled SS-match window.  Dataclass 16 is the P24/P25
     # test_sim point (16 of K≈55).  ``_resolve_aux_tbptt_steps`` replaces the
@@ -3525,6 +3533,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
         f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
         f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
+        f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -5988,6 +5997,28 @@ def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
     return (se * w).mean()
 
 
+def _smooth_l1_gain_match(
+        pred: torch.Tensor, tgt: torch.Tensor, beta: float = 1.0,
+        per_input: bool = False) -> torch.Tensor:
+    """Gain-match Huber on ``G = ΔCV/Δu``.
+
+    ``per_input=False``: ``F.smooth_l1_loss`` with scalar ``beta`` (P26
+    abs Huber identity).  ``per_input=True``: β_ij = |tgt_ij| (clamped
+    ≥1e-6).  PyTorch smooth-L1: ``0.5 e²/β`` if ``|e|<β`` else
+    ``|e|-0.5β``.  L1 saturation is still ±1 per element — **not**
+    relative Huber (P27 divides the residual by |tgt| before Huber, so
+    the L1 grad is 1/|tgt|).  Mean reduction matches ``smooth_l1_loss``.
+    """
+    if not per_input:
+        return F.smooth_l1_loss(pred, tgt, beta=max(1e-6, float(beta)))
+    e = pred - tgt
+    b = tgt.abs().clamp_min(1e-6)
+    abs_e = e.abs()
+    quadratic = 0.5 * e.square() / b
+    linear = abs_e - 0.5 * b
+    return torch.where(abs_e < b, quadratic, linear).mean()
+
+
 def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                         obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig,
                         c_mean: Optional[torch.Tensor] = None,
@@ -6095,8 +6126,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # exploded full-BPTT.  Trust TrainConfig (ENV_OVERRIDES + resolve-time
     # auto).  Do NOT re-read ``DREAMER_GAIN_MATCH_HUBER_BETA`` here: env
     # ``<=0`` (median |tgt|) would overwrite the resolved β and pass β=0
-    # into smooth_l1.
+    # into smooth_l1.  P43: per-input β = |tgt_ij| (L1 sat still ±1).
     _hb = max(1e-6, float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 1.0))
+    _per = bool(getattr(cfg, 'gain_match_huber_per_input', False))
 
     def _huber_from_cv(cv_base, cv_step_stack, tgts):
         # ``cv_step_stack`` (n_in, Bm, n_cv).  One mean Huber ≡ mean of
@@ -6121,7 +6153,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
             tgt = _cached[1]
         tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
                          g_wm.shape[-1]).expand_as(g_wm)
-        return F.smooth_l1_loss(g_wm, tgt_b, beta=_hb)
+        return _smooth_l1_gain_match(g_wm, tgt_b, beta=_hb, per_input=_per)
 
     # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
     # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
@@ -6180,10 +6212,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts))
     loss = total
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
-    # Observability only (no extra FD; no loss change).  Abs Huber mean
-    # over concatenated MV+DV is count-equal per input but scale-unequal
-    # when |G_mv| ≫ |G_dv| (P42 test_sim |tgt| 2.62 vs 0.51).  Split
-    # Huber shows the drowning without reviving relative Huber.
+    # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
+    # (L1 sat ±1) is the loss change; the MV/DV split still shows
+    # per-channel Huber (abs mean used to drown |tgt| 2.62 vs 0.51).
     with torch.no_grad():
         if n_mv_t:
             diag['gain_match_mv_loss'] = _huber_from_cv(
@@ -6460,9 +6491,13 @@ def _resolve_gain_match_targets(
             for j, cvn in enumerate(cv_names)))
     cfg.gain_match_mv_target = tuple(mv_target)
     cfg.gain_match_dv_target = tuple(dv_target)
-    # ``gain_match_huber_beta <= 0`` → median |target| (sim-adaptive).  Default
-    # 1.0 stays the P24–P28 recipe so test_sim is unchanged.
-    if float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 0.0) <= 0.0:
+    _per = bool(getattr(cfg, 'gain_match_huber_per_input', False))
+    # ``gain_match_huber_beta <= 0`` → median |target| (sim-adaptive).
+    # Only when per-input β is off: median of {2.62, 0.51} ≈ 1.56 ≈
+    # scalar β=1 and does not equalize.  Per-input uses |tgt_ij|.
+    if ((not _per)
+            and float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 0.0)
+            <= 0.0):
         _abs = [abs(x) for row in list(mv_target) + list(dv_target)
                 for x in row if abs(float(x)) > 1e-9]
         cfg.gain_match_huber_beta = (
@@ -6477,9 +6512,14 @@ def _resolve_gain_match_targets(
     if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
         cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
     _resolve_aux_tbptt_steps(cfg)
+    _beta_mv = _gain_col_rms(cfg.gain_match_mv_target)
+    _beta_dv = _gain_col_rms(cfg.gain_match_dv_target)
     print(f'[gain-match] {log_label} (WM-norm) mv={cfg.gain_match_mv_target} '
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
           f'len={cfg.gain_match_len} huber_beta={cfg.gain_match_huber_beta} '
+          f'huber_per_input={_per} '
+          f'huber_beta_mv={["%.3g" % x for x in _beta_mv]} '
+          f'huber_beta_dv={["%.3g" % x for x in _beta_dv]} '
           f'aux_tbptt={cfg.aux_tbptt_steps}',
           flush=True)
 

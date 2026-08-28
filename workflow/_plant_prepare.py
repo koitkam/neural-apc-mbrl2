@@ -593,6 +593,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_MAX_STARTS':      ('gain_match_max_starts',          int),
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
     'DREAMER_GAIN_MATCH_HUBER_BETA':      ('gain_match_huber_beta',          float),
+    # P43: per-element Huber β = |tgt_ij| (L1 sat ±1; not relative Huber).
+    'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': ('gain_match_huber_per_input',     _as_bool),
     'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
     # per-input isolation trajectory match + the steady-state DC-gain match (the

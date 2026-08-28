@@ -327,11 +327,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > the P41 det_r-collapse fix** (freeze-66 stayed P41-class; P40 also froze
 > last_ok 104 with det_r 0.490). Extra-P1 recon stayed ≥14× so <5×
 > overwrite-prevention untested. Abs Huber gain-match |tgt| 2.62 vs 0.51
-> remains the DV drowning. Do not revive relative Huber.
+> was the remaining DV drowning. **P43** (`gain_match_huber_per_input=True`):
+> per-element Huber β = `|tgt_ij|`. L1 saturation is still ±1 — **not**
+> relative Huber (P27 residual `(g-tgt)/|tgt|`). `[resolved-cfg]` prints
+> `huber_per_in=`. Env-free. Do not revive relative Huber.
 > HEAD persist-on-lock writes the snapshot when the lock fires (not in
 > this pid). jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
-> `wm_gain_match_dv_loss` (abs Huber split; loss unchanged). One
-> attributed vs P41 launch.
+> `wm_gain_match_dv_loss`. P43 per-input β changes the Huber (split is
+> still observability). One attributed vs P41 launch.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
@@ -602,7 +605,9 @@ fixes BOTH:
   (`gain_match_mv_target`/`gain_match_dv_target`, resolved by
   `_resolve_gain_match_targets` from `dynamics_identification.json` + obs-norm +
   action scale: `g_dv_norm = g_eng·obs_std[dv]/obs_std[cv]`,
-  `g_mv_norm = g_eng·mv_action_scale/obs_std[cv]`). `sample=False` freezes the
+  `g_mv_norm = g_eng·mv_action_scale/obs_std[cv]`). Huber is **absolute**
+  on `G=ΔCV/Δu` (P26). Default **per-input β = |tgt_ij|** (P43): L1 sat
+  ±1, not P27 relative Huber. `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.
 - **DISTURBANCE block** (`cont_dist_dim = n_cv`): an **inherent amortized Kalman**.
