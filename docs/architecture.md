@@ -305,16 +305,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > DV pin** (not P26 ×0.87). P26 `run_plan` isolation=0 was the pre-rewrite
 > dump (jsonl iso 1.44). Gain-match is the DC supervisor. Opt in
 > `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when off.
-> **P41 first gate GPU-confirmed** (`run_p41_recentfloor`, `acb8a7b`,
-> iter 82): recent-floor **KEEP as mechanism**. Gain-probe **ran**
-> (P40 `not_plateaued` / no probe on ema_best 6.541). FAIL
-> **GAIN_NOT_READY 0.76@DV** (MV 1.01) → EXTEND extra-P1. Did not
-> freeze at original budget. Original-budget DV already P40-cap class
-> (0.76 vs P40 CAPPED 0.75). Extra-P1 through iter 96 **did not**
-> detonate at P40's extra-P1 iter-84 window or P37's iter 88.
-> Second gate iter 94 also **gain-probe** FAIL **0.76@DV** (MV 1.03)
-> EXTEND to 904752. Extra P1 did not move DV. `p1_gate_wm_ema_min=1.5`
-> recent max.
+> **P41 CAPPED GPU-confirmed** (`run_p41_recentfloor`, `acb8a7b`,
+> iter 104): recent-floor **KEEP as mechanism** (gain-probe at 82, 94,
+> and cap-time). Gates FAIL **0.76@DV**; CAPPED **0.74@DV** (MV 1.02)
+> — extra P1 FALSIFIED as DV lever (slightly worse). Freeze recon
+> 0.0028; last_ok 104 (overwrite 56→64 then extra-P1); warm-restore
+> SKIPPED. P2 dobg live, g frozen. Expect `[p3-skip]`.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
