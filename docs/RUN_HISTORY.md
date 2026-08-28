@@ -106,7 +106,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P39 | 2026-08-27 | dcv_match scale floor 1.0 | val MV ×0.954/×0.954 DV ×0.679/×0.785 det_r 0.326; CAPPED 0.70@DV; `[p3-skip]` | ❌ KEEP as P1 form; FALSIFIED as DV pin |
 | P40 | 2026-08-28 | isolation auto-enable OFF (gain-match-only) | val MV ×0.995/×0.964 DV ×0.723/×0.743 det_r 0.490; CAPPED 0.75@DV; `[p3-skip]` | ❌ KEEP as env-free default; FALSIFIED as DV pin |
 | P41 | 2026-08-28 | P1 gate recent-floor (not warmup ema_best) | val MV ×0.986/×0.973 DV ×0.700/×0.775 det_r 0.079; CAPPED 0.74@DV; `[p3-skip]` | ❌ KEEP as mechanism; FALSIFIED as DV pin / extra-P1 lever |
-| P42 | 2026-08-28 | last-ok lock after silent recon spike (20×) | LIVE extra-P1 iter 88; lock @67 last_ok 66; gate 82 gain-probe 0.01@DV | ⏳ GPU |
+| P42 | 2026-08-28 | last-ok lock after silent recon spike (20×) | LIVE extra-P1 iter 96; gates 82/94 gain-probe FAIL; last_ok 66 locked | ⏳ GPU |
 
 ## Run details
 
@@ -1445,7 +1445,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **One attributed GPU change vs P41 process `acb8a7b`:** last-ok **locks** when recon > `skip_storm_last_ok_lock_ratio=20` × best (recon-only call site). Recovered recon must not overwrite the pre-spike snapshot. Skip-storm restore still unlocks. Wrap ~5–10× must not lock. Recent-floor + isolation-off stay (P41/P40 KEEP).
 - **Not:** isolation reweight, extra-P1, leftover `DREAMER_*`, P3 on GAIN_NOT_READY.
 - **Step 4 resolved-cfg vs P41:** identical banner `latent=deterministic restore_p2=False gain_match=1 dob_ground=2 isolation=0 ss_match=0 iso_dcv=off n_critics=2 rs_freeze=True skip_invalid_p3=True storm_cap=2 compile=eager`. Attributed delta: `skip_storm_last_ok_lock_ratio=20` now in `run_plan` (P41 plan `<MISSING>` — field not in that pid).
-- **Liveness (11:27 CDT):** LIVE **P1 extra-P1** iter **88**. tmux `mbrl2_p42`, pid **4192010**, launch `72f7b48`. GPU ~15.7 GB. last_ok **66 locked=true** through 88 (never unlocked; never advanced). Iter 88 recon **0.108** (60× best 0.0018, still >5×) gmatch **0.0023** gnorm **3.89** skip **1**. Overwrite-prevention vs <5× recovery **not finished**. Skip-storm unlock untested. **First gate iter 82 `gain-probe`** FAIL **0.01@DV** (MV 2.01) on live detonated weights — not last_ok 66 quality. EXTEND to 829356. Second gate ~iter 94; **CAPPED ~iter 104** is the freeze+restore-66 test. **No second GPU job.** HEAD persist-on-lock `130a2f7` **not in pid**.
+- **Liveness (11:41 CDT):** LIVE **P1 extra-P1** iter **96**. tmux `mbrl2_p42`, pid **4192010**, launch `72f7b48`. GPU ~15.7 GB. last_ok **66 locked=true** through 96 (never unlocked). Iter 96 recon **0.045** (25× best 0.0018, still >5×) gmatch **0.0007** gnorm **1.74** skip **1**. Overwrite-prevention vs <5× recovery **not finished**. Skip-storm unlock untested. **Gate 82 `gain-probe`** FAIL **0.01@DV** (MV 2.01). **Gate 94 `gain-probe`** FAIL **3.26@MV** (DV 0.87, noisy spread_x37.5) — live detonated weights, **not** last_ok 66. EXTEND to 904752 (cap 929884). **CAPPED ~iter 104** is the restore-66 + re-probe test. **No second GPU job.** HEAD persist-on-lock **not in pid**.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
