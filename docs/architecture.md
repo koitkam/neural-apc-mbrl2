@@ -303,7 +303,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > off. **P40 LIVE** (`mbrl2_p40`, `run_p40_gmatchonly`, `73a5116`,
 > pid 4176670): `[resolved-cfg] isolation=0 ss_match=0 iso_dcv=True`
 > (inert; HEAD prints `iso_dcv=off`). Iter 66 after **storm 1/2 @65**
-> restored last-ok 63: recon **0.0041**, gmatch **0.0002**, skip
+> restored last-ok 63: recon **0.0041** then iter 70 **0.0021**, skip
 > banner 7 = cumulative inner skips (window cleared on restore).
 > Isolation-off did **not** eliminate storms. Iter-60 r@H55 **+0.219**
 > vs P39 **+0.521** (WATCH; do not stack overshoot CV-mask until EXIT).
