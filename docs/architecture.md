@@ -151,8 +151,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > stoch_flat width). Read `kl_loss` vs `joint_embed_loss` or the
 > train-start `latent=` banner. After gain-match resolve, train.py
 > rewrites `run_plan.json → config` and prints `[resolved-cfg]` so
-> env-free audits see auto-enabled `gain_match` / `dob_ground` /
-> isolation, not the dataclass sentinels. P29's on-disk plan is the
+> env-free audits see auto-enabled `gain_match` / `dob_ground`,
+> not the dataclass sentinels. Isolation is **not** auto-enabled
+> (P40). P29's on-disk plan is the
 > *pre-rewrite* dump (`rssm_latent_type=categorical`).
 > **Compile leftover (same class):** `TrainConfig.compile_mode=''` was
 > documented off, but `build_model` treated empty as default-on unless
@@ -285,15 +286,21 @@ env-gated off · **[planned]** = designed, not yet built.
 > (MV 1.12); gmatch stuck **1.30**; val MV ss/@H **×1.253 / ×1.293**,
 > DV **×0.007 / ×0.007**, det_r **0.428** amp-dead, `[p3-skip]`.
 > **FALSIFIED**. HEAD/P39 floor keeps MV edge |Δu|=0.60 and still
-> boosts DV to the cube. P39 CAPPED (`run_p39_isodcvfloor`, pid 4170377):
+> boosts DV to the cube. P39 EXIT (`run_p39_isodcvfloor`, 151 iters):
 > `[resolved-cfg] min_scale=1.0 edge_du 0.60/1.0`. Storm **1/2 @iter 53**
 > recovered, extension kept. Iter 75/85 EXTEND 0.71 then 0.69@DV.
-> Extra-P1 **did not detonate**. Iter 97 CAPPED **0.70@DV** (MV 1.00),
-> P2 recon 0.003 `dobg>0` (iter ~117 still P2). Cube-boost **FALSIFIED as DV pin**.
-> **Structural:** `|G_max|/|G_min| > 1/op_band` cannot equalize |ΔCV|
-> without shrinking the strong teacher (P38) or exceeding the cube.
-> Floor is `wm_isolation_dcv_min_scale=1.0`. Do not launch a second GPU
-> job. Expect `[p3-skip]`.
+> Extra-P1 **did not detonate**. Iter 97 CAPPED **0.70@DV** (MV 1.00).
+> Val MV ss/@H **×0.954 / ×0.954**, DV **×0.679 / ×0.785**, det_r
+> **0.326** (amp dead: pred_std 0.156 vs true 1.93), `[p3-skip]`.
+> Cube-boost **FALSIFIED as DV pin**. Floor KEEP as P1 form when
+> isolation is on. **Structural:** `|G_max|/|G_min| > 1/op_band` cannot
+> equalize |ΔCV| without shrinking the strong teacher (P38) or exceeding
+> the cube. Floor is `wm_isolation_dcv_min_scale=1.0`.
+> **P40:** P08 auto-enable isolation=1 / ss_match=3 is **off** env-free.
+> P26 `run_plan` isolation=0 was the pre-rewrite dump (jsonl iso 1.44).
+> Gain-match is the DC supervisor. Opt in
+> `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when
+> off. Do not launch a second GPU job. Expect `[p3-skip]` unless GAIN-READY.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free

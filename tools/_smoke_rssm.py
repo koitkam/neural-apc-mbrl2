@@ -45,7 +45,8 @@ from training.train import (
                             _should_warm_restore_wm_best,
                             _should_restore_last_ok_at_p1_freeze,
                             _wm_recon_scalar,
-                            _auto_if_unset, _write_resolved_run_plan,
+                            _auto_if_unset, _isolation_teacher_on,
+                            _promote_isolation_aux, _write_resolved_run_plan,
                             _resolve_compile_mode,
                             _clone_module_state, _refresh_module_state,
                             _p1_need_agent_finetune,
@@ -900,7 +901,11 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_RSSM_IMAG_LATENT_MODE' not in ENV_OVERRIDES
     assert c.cont_gain_deterministic_roll is True
     assert _resolve_compile_mode(c) == '', _resolve_compile_mode(c)
-    print('[smoke] OK  env-free TrainConfig = P26 observer / P28 actor recipe')
+    assert float(c.wm_input_isolation_coef) == 0.0
+    assert float(c.wm_ss_match_coef) == 0.0
+    assert int(c.wm_isolation_settle_episodes) == 0
+    assert _isolation_teacher_on(c) is False
+    print('[smoke] OK  env-free TrainConfig = gain-match observer / P28 actor')
 
 
 def _test_auto_if_unset_honours_explicit() -> None:
@@ -913,6 +918,29 @@ def _test_auto_if_unset_honours_explicit() -> None:
     assert _auto_if_unset(cfg2, 'dob_ground_coef', 2.0) is False
     assert float(cfg2.dob_ground_coef) == 0.0
     print('[smoke] OK  _auto_if_unset skips explicit 0 (A/B disable)')
+
+
+def _test_promote_isolation_aux() -> None:
+    """Env-free isolation stays off; opt-in fills len/settle."""
+    c = TrainConfig()
+    c.horizon = 55
+    assert _promote_isolation_aux(c) is False
+    assert float(c.wm_input_isolation_coef) == 0.0
+    assert float(c.wm_ss_match_coef) == 0.0
+    assert int(c.wm_input_isolation_len) == 0
+    assert int(c.wm_isolation_settle_episodes) == 0
+    c2 = TrainConfig()
+    c2.horizon = 55
+    c2.wm_input_isolation_coef = 1.0
+    assert _promote_isolation_aux(c2) is True
+    assert int(c2.wm_input_isolation_len) == 55
+    assert int(c2.wm_isolation_settle_episodes) == 24
+    c3 = TrainConfig()
+    c3.wm_ss_match_coef = 3.0
+    assert _promote_isolation_aux(c3) is True
+    assert abs(float(c3.wm_ss_match_settle_var) - 0.05) < 1e-12
+    assert int(c3.wm_isolation_settle_episodes) == 24
+    print('[smoke] OK  isolation aux off env-free; opt-in fills len/settle')
 
 
 def _test_write_resolved_run_plan(tmp_path: str) -> None:
@@ -1018,6 +1046,7 @@ if __name__ == '__main__':
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
     _test_auto_if_unset_honours_explicit()
+    _test_promote_isolation_aux()
     _test_isolation_dcv_scales()
     _test_mimo_hold_rows()
     _test_isolation_seq_is_mv()

@@ -888,10 +888,16 @@ class TrainConfig:
     # point) and INPUT-SYMMETRIC (MV or DV — the loss never looks at which input
     # it is).  ``sample=False`` routes the gradient into the continuous gain
     # channel (bypassing the categorical bottleneck that attenuates SUBDOMINANT
-    # inputs).  Auto-enabled (coef→0.5, len→horizon) when the cont gain channel
-    # is on AND isolated episodes exist.  ``DREAMER_WM_INPUT_ISOLATION_COEF``.
+    # inputs).  Env-free default is **off** (P40): P08 auto-enabled
+    # isolation=1 whenever cont-gain was on; P26 jsonl confirms that
+    # auto-enable ran (``wm_input_isolation_loss`` 1.44 at iter 1 — the
+    # on-disk ``run_plan`` 0.0 was the pre-rewrite dump).  P28+ whole-
+    # episode isolation + first-class ss-match then drowned DV (P26
+    # ×0.87 → P32–P39 ×0.66–0.70).  Gain-match (identified G, per-input
+    # FD Huber) is the DC supervisor.  Opt in
+    # ``DREAMER_WM_INPUT_ISOLATION_COEF`` (len/settle auto-fill).
     wm_input_isolation_coef: float = 0.0
-    wm_input_isolation_len: int = 0    # K-step prior rollout (auto = horizon)
+    wm_input_isolation_len: int = 0    # K-step prior rollout (auto = horizon when isolation on)
     # ---- Self-supervised STEADY-STATE (DC-gain) match (2026-08-03, p08 RCA) ----
     # The isolation loss's per-step trajectory MSE is TRANSIENT-dominated, so it
     # under-determines the DC (steady-state) gain → both WM gains SHRANK (p08:
@@ -900,8 +906,9 @@ class TrainConfig:
     # timing-INSENSITIVE, so it pins the DC gain WITHOUT the identified value
     # (nonlinear / black-box safe, local per operating point).  It is the
     # self-supervised generalisation of C(1) gain-match; fed by dedicated
-    # long-hold isolated SETTLE episodes.  Auto-enabled with isolation.
-    # ``DREAMER_WM_SS_MATCH_COEF``.
+    # long-hold isolated SETTLE episodes.  Stays off unless isolation is
+    # opted in (``DREAMER_WM_SS_MATCH_COEF``).  P08 auto-enable 3.0 is
+    # the same teacher that drowned DV on P32–P39.
     wm_ss_match_coef: float = 0.0
     wm_ss_match_window_frac: float = 0.34   # terminal fraction of K used as the SS window
     # Option 1 (2026-08-17): weight the DC-gain match by how SETTLED each seq's
@@ -3058,6 +3065,36 @@ def _auto_if_unset(cfg: 'TrainConfig', field: str, value) -> bool:
     if not unset:
         return False
     setattr(cfg, field, value)
+    return True
+
+
+def _isolation_teacher_on(cfg: 'TrainConfig') -> bool:
+    """True when isolation trajectory or ss-match DC loss is active."""
+    return (
+        float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) > 0.0
+        or float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) > 0.0)
+
+
+def _promote_isolation_aux(cfg: 'TrainConfig') -> bool:
+    """Fill isolation length / settle only when the teacher is opted in.
+
+    P08 auto-enabled isolation=1 / ss_match=3 whenever the cont-gain
+    channel was on.  P26 jsonl shows that auto-enable *did* run
+    (``wm_input_isolation_loss`` 1.44 at iter 1); the on-disk
+    ``run_plan`` 0.0 was the pre-rewrite dump.  P28+ whole-episode
+    holds + first-class ss-match then drowned DV (P26 ×0.87 → P32–P39
+    ×0.66–0.70).  Env-free default is gain-match only.  Opt in
+    ``DREAMER_WM_INPUT_ISOLATION_COEF`` / ``DREAMER_WM_SS_MATCH_COEF``.
+    """
+    if not _isolation_teacher_on(cfg):
+        return False
+    if float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) > 0.0:
+        _auto_if_unset(
+            cfg, 'wm_input_isolation_len',
+            int(getattr(cfg, 'horizon', 15) or 15))
+    if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) > 0.0:
+        _auto_if_unset(cfg, 'wm_ss_match_settle_var', 0.05)
+    _auto_if_unset(cfg, 'wm_isolation_settle_episodes', 24)
     return True
 
 
@@ -8595,26 +8632,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # gain_match still pins g, so d_t cleanly gets the load residual.
             cfg.cont_dist_dim = 0
             cfg.dist_match_coef = 0.0
-            # p08: auto-enable the self-supervised per-INPUT isolation loss (the
-            # nonlinear / black-box, no-known-gain generaliser) alongside the
-            # gain channel.  Input-symmetric; graceful no-op if no isolated eps.
-            _auto_if_unset(cfg, 'wm_input_isolation_coef', 1.0)
-            _auto_if_unset(
-                cfg, 'wm_input_isolation_len',
-                int(getattr(cfg, 'horizon', 15) or 15))
-            # Option 1 (2026-08-17): elevate the STEADY-STATE (DC-gain) match to a
-            # FIRST-CLASS, CLEAN, SYMMETRIC per-input objective — the control-
-            # relevant target (Lambert objective-mismatch: recon likelihood is not
-            # correlated with control accuracy).  Strong weight + settledness-gate
-            # (settle_var, undilutes the DC signal) + more long-hold settle data,
-            # identical for every input (MV & DV) — no asymmetric feedforward.
-            _auto_if_unset(cfg, 'wm_ss_match_coef', 3.0)
-            _auto_if_unset(cfg, 'wm_ss_match_settle_var', 0.05)
-            # Per isolated input (test_sim 1 MV + 1 DV → 24+24).  The
-            # seed loop emits n_per × n_mv MV-isolation episodes and
-            # n_per × n_dv DV-isolation episodes so MIMO plants keep
-            # the same per-channel SS coverage (P28 follow-up 7).
-            _auto_if_unset(cfg, 'wm_isolation_settle_episodes', 24)
             # P19 (2026-08-18): GROUND the DOB d_t on the true load (KalmanNet-
             # style) so the observer TRACKS the disturbance instead of under-
             # reaching it (p18: d_t vs load r=0.42, ~0.3x amplitude → imagination
@@ -8648,6 +8665,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator); '
                   f'dist_match_coef={cfg.dist_match_coef}.',
                   flush=True)
+        # Isolation/ss-match stay TrainConfig 0 unless opted in (P40).
+        # Aux (len / settle / settle_var) auto-fill only when the
+        # teacher is on — no isolated-settle seed when env-free.
+        _promote_isolation_aux(cfg)
     else:
         cfg.cont_gain_dim = 0
         cfg.cont_dist_dim = 0
@@ -9127,9 +9148,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # ONLY the isolated whole-episode settle holds (one input at a
     # stratified level, others at 0, action_std=0, process+meas noise off)
     # that train ``_wm_input_isolation_loss`` / ``wm_ss_match``.  Ordinary
-    # MIMO PRBS and all-DV PRBS stay in the main replay buffer.
+    # MIMO PRBS and all-DV PRBS stay in the main replay buffer.  Env-free
+    # P40: skip alloc + seed when the teacher is off (gain-match only).
     isolation_buf = None
-    if bool(getattr(cfg, 'cont_latent_enabled', False)):
+    if (bool(getattr(cfg, 'cont_latent_enabled', False))
+            and _isolation_teacher_on(cfg)):
         _n_mv_iso = int(len(getattr(env.sim, 'mv_indices', []) or []))
         _n_dv_iso = int(len(getattr(env.sim, 'dv_indices', []) or []))
         _n_settle_iso = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
