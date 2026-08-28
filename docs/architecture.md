@@ -316,21 +316,20 @@ env-gated off · **[planned]** = designed, not yet built.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
-> **P42 GPU-confirmed** (`run_p42_lastoklock`, pid 4192010, LIVE P2):
-> last-ok **locks** after a silent recon spike
+> **P42 EXIT** (`run_p42_lastoklock`, launch `72f7b48`, 158 iters,
+> `[p3-skip]`): last-ok **locks** after a silent recon spike
 > (`skip_storm_last_ok_lock_ratio=20`, recon-only). Spike iter **67**
-> recon **0.3066** (170× best 0.0018, skip 1) locked snapshot iter **66**.
-> Gates 82/94 FAIL on live detonated weights; gate **104 PASS 0.81@DV**
-> on live extra-P1 (not last_ok 66). Freeze restored **wm_last_ok iter 66**;
-> detonated-freeze gain-probe **GAIN_NOT_READY 0.75@DV** (MV 1.19) ≈ P40
-> 0.75 / P41 0.74 — not a DV pin vs those. First P2 recon **0.0025**
-> (last_ok class; extra-P1 104 was 0.0255). Extra-P1 recon stayed ≥14× so
-> <5× overwrite-prevention is untested (lock's restore-even-if-healthy
-> also untested; old detonated-freeze 14×>5× would have restored 66
-> anyway). `wm_last_ok.pt` written at freeze. Expect `[p3-skip]`. P2 dobg
-> live, g frozen. Skip-storm unlock untested. Wrap ~5–10× untested.
-> HEAD persist-on-lock (not in this pid) writes the snapshot when the lock
-> fires. jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
+> locked snapshot **66**. Freeze restored 66; freeze probe **GAIN_NOT_READY
+> 0.75@DV** (MV 1.19). Val MV ss/@H **×1.179 / ×1.161**, DV **×0.737 /
+> ×0.804**, det_r **0.124** / R² 0.013 (pred_std 0.164 vs true 1.93; P41
+> det_r **0.079**, P40 **0.490**). Actor INVALID. Isolation-off KEEP.
+> Recent-floor KEEP. Lock KEEP as 20× fire; **FALSIFIED as DV pin and as
+> the P41 det_r-collapse fix** (freeze-66 stayed P41-class; P40 also froze
+> last_ok 104 with det_r 0.490). Extra-P1 recon stayed ≥14× so <5×
+> overwrite-prevention untested. Abs Huber gain-match |tgt| 2.62 vs 0.51
+> remains the DV drowning. Do not revive relative Huber.
+> HEAD persist-on-lock writes the snapshot when the lock fires (not in
+> this pid). jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
 > `wm_gain_match_dv_loss` (abs Huber split; loss unchanged). One
 > attributed vs P41 launch.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
