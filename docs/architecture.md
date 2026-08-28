@@ -319,17 +319,17 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P42 GPU-confirmed** (`run_p42_lastoklock`, pid 4192010): last-ok
 > **locks** after a silent recon spike (`skip_storm_last_ok_lock_ratio=20`,
 > recon-only). Spike iter **67** recon **0.3066** (170× best 0.0018, skip
-> 1) locked snapshot iter **66**. last_ok held through 82. First gate
-> **82 gain-probe** FAIL **0.01@DV** was on **LIVE detonated** weights
-> (recon 0.92), not last_ok 66. Freeze+re-probe at cap is the lock test.
-> Extra-P1 EXTEND. P40 extra-P1 overwrote
-> 83→104; P41 original-P1 overwrote 56→64. Skip-storm restore unlocks
-> (untested this run). Wrap ~5–10× must not lock (untested; jump was
-> 170×). Pid has no `wm_last_ok.pt` until storm/freeze. HEAD persist-on-lock
-> writes the snapshot when the lock fires (crash after lock must not
-> lose freeze restore). jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
-> `wm_gain_match_dv_loss` (abs Huber split; loss unchanged). One attributed
-> vs P41 launch.
+> 1) locked snapshot iter **66**. last_ok held through extra-P1 iter **85**.
+> First gate **82 gain-probe** FAIL **0.01@DV** was on **LIVE detonated**
+> weights (recon 0.92), not last_ok 66. Extra-P1 gmatch twitched 1.11→0.0015
+> with recon still detonated; lock held. Freeze+re-probe at cap (~iter 104)
+> is the lock test (RAM `p1_last_ok_sd`; `wm_last_ok.pt` absent in this pid).
+> P40 extra-P1 overwrote 83→104; P41 original-P1 overwrote 56→64. Skip-storm
+> restore unlocks (untested this run). Wrap ~5–10× must not lock (untested;
+> jump was 170×). HEAD persist-on-lock writes the snapshot when the lock
+> fires (crash after lock must not lose freeze restore — not in this pid).
+> jsonl `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`
+> (abs Huber split; loss unchanged). One attributed vs P41 launch.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
