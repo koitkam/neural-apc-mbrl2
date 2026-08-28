@@ -310,9 +310,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > (P40 `not_plateaued` / no probe on ema_best 6.541). FAIL
 > **GAIN_NOT_READY 0.76@DV** (MV 1.01) → EXTEND extra-P1. Did not
 > freeze at original budget. Original-budget DV already P40-cap class
-> (0.76 vs P40 CAPPED 0.75). Extra-P1 through iter 86 **did not**
-> detonate at P40's extra-P1 iter-84 window (recon 0.0062 / gnorm 1.04).
-> `p1_gate_wm_ema_min=1.5` recent max.
+> (0.76 vs P40 CAPPED 0.75). Extra-P1 through iter 96 **did not**
+> detonate at P40's extra-P1 iter-84 window or P37's iter 88.
+> Second gate iter 94 also **gain-probe** FAIL **0.76@DV** (MV 1.03)
+> EXTEND to 904752. Extra P1 did not move DV. `p1_gate_wm_ema_min=1.5`
+> recent max.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
