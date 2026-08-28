@@ -623,14 +623,16 @@ class TransformerSSMDynamics(nn.Module):
                     actions: torch.Tensor,
                     dvs: Optional[torch.Tensor] = None,
                     sample: bool = True,
-                    c0: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    c0: Optional[torch.Tensor] = None,
+                    last_only: bool = False) -> torch.Tensor:
         """Prior-only rollout of K steps from ``(h0, z0[, c0])``.
 
         Same contract as ``RSSMDynamics.img_rollout`` so gain-match can
         stack baseline+per-input on the batch dim (one KV-cache loop,
         MIMO-width no longer sequential).  Fresh cache (``kv_cache=None``,
-        ``pos=0``) matches the sequential TSSM ``_roll`` fallback.
-        ``c0=None`` with ``cont_dim>0`` zero-fills like ``img_step``.
+        ``pos=0``) matches sequential ``img_step``.  ``c0=None`` with
+        ``cont_dim>0`` zero-fills like ``img_step``.  ``last_only=True``
+        returns ``(Bm, F)`` ≡ ``stack[:, -1]`` (gain-match last-step Huber).
         """
         Bm = h0.shape[0]
         K = actions.shape[1]
@@ -644,10 +646,14 @@ class TransformerSSMDynamics(nn.Module):
                                  device=h0.device, dtype=h0.dtype),
             z=z0, c=c, kv_cache=None, pos=0)
         feats = []
+        img_step = self.img_step
         for k in range(K):
             dv_k = dvs[:, k] if dvs is not None else None
-            state = self.img_step(state, actions[:, k], dv=dv_k, sample=sample)
-            feats.append(state.feat)
+            state = img_step(state, actions[:, k], dv=dv_k, sample=sample)
+            if not last_only:
+                feats.append(state.feat)
+        if last_only:
+            return state.feat
         return torch.stack(feats, dim=1)
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,

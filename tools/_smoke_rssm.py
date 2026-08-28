@@ -712,6 +712,34 @@ def _test_store_aux_feats_identity() -> None:
           f'kalman mix budget={bud}')
 
 
+def _test_img_rollout_last_only() -> None:
+    """Gain-match last-step Huber: last_only ≡ stack[:, -1]; GRU still gets grad."""
+    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
+    torch.manual_seed(0)
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     cont_gain_dim=2)
+    m = RSSMDynamics(cfg)
+    B, K = 3, 5
+    h0 = torch.randn(B, cfg.deter_dim, requires_grad=True)
+    z0 = torch.zeros(B, cfg.n_categoricals, cfg.n_classes)
+    z0[..., 0] = 1.0
+    acts = torch.rand(B, K, cfg.action_dim) * 2 - 1
+    roll = m.img_rollout(h0, z0, acts, sample=False)
+    last = m.img_rollout(h0, z0, acts, sample=False, last_only=True)
+    assert last.shape == roll[:, -1].shape, (last.shape, roll[:, -1].shape)
+    err = float((last - roll[:, -1]).detach().abs().max())
+    assert err < 1e-6, f'last_only != stack[:, -1] (max_err={err})'
+    m.zero_grad(set_to_none=True)
+    last.sum().backward()
+    gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
+                if p.grad is not None)
+    assert gru_g > 0.0, 'last_only decode/feat lost GRU gradient'
+    print(f'[smoke] OK  img_rollout last_only ≡ stack[:, -1] '
+          f'(max_err={err:.2e}); gru |g|={gru_g:.3f}')
+
+
 def _test_isolation_dcv_scales() -> None:
     """|ΔCV| excitation: Δu ∝ 1/|G| floored at op-band (not a loss reweight)."""
     import numpy as _np
@@ -1043,6 +1071,7 @@ if __name__ == '__main__':
     only = sys.argv[1] if len(sys.argv) > 1 else None
     _test_cfg_from_env_whitelist()
     _test_store_aux_feats_identity()
+    _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
     _test_auto_if_unset_honours_explicit()

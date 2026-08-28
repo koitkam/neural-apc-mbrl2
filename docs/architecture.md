@@ -300,7 +300,18 @@ env-gated off · **[planned]** = designed, not yet built.
 > P26 `run_plan` isolation=0 was the pre-rewrite dump (jsonl iso 1.44).
 > Gain-match is the DC supervisor. Opt in
 > `DREAMER_WM_INPUT_ISOLATION_COEF`. Isolated-settle seed skipped when
-> off. Do not launch a second GPU job. Expect `[p3-skip]` unless GAIN-READY.
+> off. **P40 LIVE** (`mbrl2_p40`, `run_p40_gmatchonly`, `73a5116`,
+> pid 4176670): `[resolved-cfg] isolation=0 ss_match=0 iso_dcv=off
+> gain_match=1`. Iter 24 recon 0.0034 gmatch 0.0002 skip 0;
+> t_wm ~99 s (P39 ~128 s; isolation unroll skipped). Probe iter 10
+> `gain_fid=0.903`. Wrap gnorm blips (~22) recover. GPU ~17 GB.
+> Do not launch a second GPU job.
+> **P40 GPU-occupied (HEAD):** gain-match `img_rollout(..., last_only=True)`
+> — last-step Huber does not keep the unused `(Bm, K, F)` stack
+> (test_sim ~Bm·55·F per inner step; GRU chain unchanged). Sequential
+> `img_step` gain-match fallback **REMOVED** (RSSM+TSSM both expose
+> `img_rollout`). `[resolved-cfg]` prints `iso_dcv=off` when the
+> teacher is off. Not a recipe change; live pid still `73a5116`.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free

@@ -113,7 +113,11 @@ def test_img_rollout_equals_img_step():
         seq = torch.stack(seq, dim=1)
     max_err = float((roll - seq).abs().max())
     assert max_err < 1e-6, f"img_rollout != img_step (max_err={max_err})"
-    print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e})")
+    last = m.img_rollout(h0, z0, acts, sample=False, last_only=True)
+    last_err = float((last - roll[:, -1]).detach().abs().max())
+    assert last_err < 1e-6, f"last_only != stack[:, -1] (max_err={last_err})"
+    print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e}); "
+          f"last_only ≡ stack[:, -1] (max_err={last_err:.2e})")
 
 
 def test_store_aux_feats_identity():

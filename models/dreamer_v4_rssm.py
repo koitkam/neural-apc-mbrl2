@@ -881,7 +881,8 @@ class RSSMDynamics(nn.Module):
                     actions: torch.Tensor,
                     dvs: Optional[torch.Tensor] = None,
                     sample: bool = True,
-                    c0: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    c0: Optional[torch.Tensor] = None,
+                    last_only: bool = False) -> torch.Tensor:
         """Prior-only (imagined) rollout of K steps from ``(h0, z0[, c0])``.
 
         ``h0`` (Bm, deter_dim), ``z0`` (Bm, n_categoricals, n_classes),
@@ -893,6 +894,9 @@ class RSSMDynamics(nn.Module):
         ``E[f(c_sampled)]`` on the first GRU step).  ``c0=None`` with
         ``cont_dim>0`` zero-fills — same as ``img_step`` when ``prev.c is None``.
         Returns stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
+        ``last_only=True`` returns only the K-step feat ``(Bm, F)`` — same
+        recurrence / last-step value as ``stack[:, -1]``, without keeping
+        the unused K-stack (gain-match FD Huber is last-step only).
 
         P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
         the open-loop gain supervisor trained a ``c=0`` GRU path while
@@ -922,11 +926,15 @@ class RSSMDynamics(nn.Module):
                                  device=h0.device, dtype=h0.dtype),
             z=z0, c=c)
         feats = []
+        img_step = self.img_step
         for k in range(K):
             dv_k = dvs[:, k] if dvs is not None else None
-            state = self.img_step(state, actions[:, k], dv=dv_k, sample=sample)
-            feats.append(state.feat)
-        return torch.stack(feats, dim=1)                          # (Bm, K, F)
+            state = img_step(state, actions[:, k], dv=dv_k, sample=sample)
+            if not last_only:
+                feats.append(state.feat)
+        if last_only:
+            return state.feat                                 # (Bm, F)
+        return torch.stack(feats, dim=1)                      # (Bm, K, F)
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the

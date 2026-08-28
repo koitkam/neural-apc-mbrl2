@@ -3360,12 +3360,26 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
               flush=True)
         return
     _span = ''
-    if _dcv.get('g_ratio') is not None:
+    _iso_on = _isolation_teacher_on(cfg)
+    if _iso_on and _dcv.get('g_ratio') is not None:
         _span = (
             f"g_ratio={float(_dcv['g_ratio']):.3g} "
             f"smax={_dcv.get('smax')} "
             f"equalize={_dcv.get('equalize_possible')} "
         )
+    if _iso_on:
+        _iso_txt = (
+            f"iso_dcv={_dcv['on']} "
+            f"min_scale={_dcv.get('min_scale', 1.0)} "
+            f"mv={['%.3g' % x for x in _dcv['mv']]} "
+            f"dv={['%.3g' % x for x in _dcv['dv']]} "
+            f"edge_du_mv={['%.3g' % x for x in (_dcv.get('edge_du_mv') or ())]} "
+            f"edge_du_dv={['%.3g' % x for x in (_dcv.get('edge_du_dv') or ())]} "
+            f"{_span}"
+        )
+    else:
+        # Env-free P40: dcv_match default True is inert while isolation is off.
+        _iso_txt = 'iso_dcv=off '
     print(
         '[resolved-cfg] '
         f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
@@ -3375,13 +3389,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
         f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
         f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
-        f"iso_dcv={_dcv['on']} "
-        f"min_scale={_dcv.get('min_scale', 1.0)} "
-        f"mv={['%.3g' % x for x in _dcv['mv']]} "
-        f"dv={['%.3g' % x for x in _dcv['dv']]} "
-        f"edge_du_mv={['%.3g' % x for x in (_dcv.get('edge_du_mv') or ())]} "
-        f"edge_du_dv={['%.3g' % x for x in (_dcv.get('edge_du_dv') or ())]} "
-        f"{_span}"
+        f"{_iso_txt}"
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
@@ -5873,19 +5881,18 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     the main-buffer ``seq_len`` was the same DC-gain miss isolation
     follow-up 10 already plugged for ``isolation_buf``.
 
-    Eager (P31 default): any backbone with ``img_rollout`` stacks the
-    baseline + one step per MV/DV into a single roll (batch
-    ``Bm·(1+n_mv+n_dv)``) so the K-step prior loop runs once.  Sequential
-    ``img_step`` paid ``1+n_mv+n_dv`` Python K-loops — linear in plant
-    width.  Same last-step ``ΔCV/Δu`` Huber (P26 DC-gain).  TSSM now
-    has ``img_rollout`` (fresh KV-cache per start, same as the old
-    sequential ``_roll``).
+    Eager (P31 default): RSSM/TSSM ``img_rollout`` stacks the baseline
+    + one step per MV/DV into a single roll (batch
+    ``Bm·(1+n_mv+n_dv)``) so the K-step prior loop runs once.  Huber is
+    last-step ``ΔCV/Δu`` (P26 DC-gain), so the roll uses
+    ``last_only=True`` (same last feat as ``stack[:, -1]``; no unused
+    K-stack).  Sequential ``img_step`` fallback REMOVED (both
+    RSSM-interface backbones expose ``img_rollout``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
     if float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0:
         return zero, diag
-    _wmt = getattr(model, 'world_model_type', 'sf_transformer')
     if not _is_rssm_interface(model):
         return zero, diag
     rssm = model.dynamics
@@ -5988,85 +5995,52 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # gradient that pins transfer-matrix gain (forward loss still
     # looks tiny; val MV stayed ×0.74).  Explosion defence for this
     # path is Huber + ``wm_grad_skip_norm`` (P24/P25), not a detach.
-    _use_batched = hasattr(rssm, 'img_rollout')
-    if _use_batched:
-        a_list = [a_base]
-        dv_list = ([dv0] if dv0 is not None else None)
-        for j in range(len(mv_tgts)):
-            a_j = a_base.clone()
-            a_j[:, j] = a_j[:, j] + step
-            a_list.append(a_j)
-            if dv_list is not None:
-                dv_list.append(dv0)
-        if dv0 is not None:
-            for j in range(len(dv_tgts)):
-                a_list.append(a_base)
-                dv_j = dv0.clone()
-                dv_j[:, j] = dv_j[:, j] + step
-                dv_list.append(dv_j)
-        n_rolls = len(a_list)
-
-        def _repeat_starts(t):
-            return (t.unsqueeze(0).expand(n_rolls, *t.shape)
-                    .reshape(n_rolls * Bm, *t.shape[1:]).contiguous())
-
-        h_b = _repeat_starts(h0)
-        z_b = _repeat_starts(z0)
-        c_b = _repeat_starts(c0) if c0 is not None else None
-        a_held = torch.stack(a_list, dim=0)
-        a_seq = (a_held.unsqueeze(2)
-                 .expand(n_rolls, Bm, K, a_held.shape[-1])
-                 .reshape(n_rolls * Bm, K, a_held.shape[-1])
-                 .contiguous())
-        dv_seq = None
+    # RSSM-interface always has ``img_rollout``; sequential ``img_step``
+    # K-loops (linear in n_mv+n_dv) were dead after P32 TSSM wiring.
+    a_list = [a_base]
+    dv_list = ([dv0] if dv0 is not None else None)
+    for j in range(len(mv_tgts)):
+        a_j = a_base.clone()
+        a_j[:, j] = a_j[:, j] + step
+        a_list.append(a_j)
         if dv_list is not None:
-            dv_held = torch.stack(dv_list, dim=0)
-            dv_seq = (dv_held.unsqueeze(2)
-                      .expand(n_rolls, Bm, K, dv_held.shape[-1])
-                      .reshape(n_rolls * Bm, K, dv_held.shape[-1])
-                      .contiguous())
-        roll_feats = rssm.img_rollout(
-            h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b)
-        cv_last = rssm.decode(roll_feats[:, -1]).index_select(-1, cv_idx)
-        cv_last = cv_last.view(n_rolls, Bm, -1)
-        cv_base = cv_last[0]
-        total = _huber_from_cv(
-            cv_base, cv_last[1:], list(mv_tgts) + list(dv_tgts))
-    else:
-        if _wmt == 'tssm':
-            from models.transformer_ssm import TSSMState as _State
-        else:
-            from models.dreamer_v4_rssm import RSSMState as _State
+            dv_list.append(dv0)
+    if dv0 is not None:
+        for j in range(len(dv_tgts)):
+            a_list.append(a_base)
+            dv_j = dv0.clone()
+            dv_j[:, j] = dv_j[:, j] + step
+            dv_list.append(dv_j)
+    n_rolls = len(a_list)
 
-        def _state():
-            kw = dict(
-                h=h0.clone(),
-                z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                                     device=obs.device, dtype=f0.dtype),
-                z=z0.clone(), c=(c0.clone() if c0 is not None else None))
-            if _wmt == 'tssm':
-                kw.update(kv_cache=None, pos=0)
-            return _State(**kw)
+    def _repeat_starts(t):
+        return (t.unsqueeze(0).expand(n_rolls, *t.shape)
+                .reshape(n_rolls * Bm, *t.shape[1:]).contiguous())
 
-        def _roll(a_held, dv_held):
-            st = _state()
-            for _i in range(K):
-                st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
-            return rssm.decode(st.feat).index_select(-1, cv_idx)
-
-        cv_base = _roll(a_base, dv0)
-        cv_steps = []
-        for j in range(len(mv_tgts)):
-            a_step = a_base.clone()
-            a_step[:, j] = a_step[:, j] + step
-            cv_steps.append(_roll(a_step, dv0))
-        if dv0 is not None:
-            for j in range(len(dv_tgts)):
-                dv_step = dv0.clone()
-                dv_step[:, j] = dv_step[:, j] + step
-                cv_steps.append(_roll(a_base, dv_step))
-        total = _huber_from_cv(cv_base, torch.stack(cv_steps, dim=0),
-                              list(mv_tgts) + list(dv_tgts))
+    h_b = _repeat_starts(h0)
+    z_b = _repeat_starts(z0)
+    c_b = _repeat_starts(c0) if c0 is not None else None
+    a_held = torch.stack(a_list, dim=0)
+    a_seq = (a_held.unsqueeze(2)
+             .expand(n_rolls, Bm, K, a_held.shape[-1])
+             .reshape(n_rolls * Bm, K, a_held.shape[-1])
+             .contiguous())
+    dv_seq = None
+    if dv_list is not None:
+        dv_held = torch.stack(dv_list, dim=0)
+        dv_seq = (dv_held.unsqueeze(2)
+                  .expand(n_rolls, Bm, K, dv_held.shape[-1])
+                  .reshape(n_rolls * Bm, K, dv_held.shape[-1])
+                  .contiguous())
+    # Last-step Huber only: skip the unused (Bm, K, F) stack.  Recurrence
+    # is identical; autograd still flows through the GRU chain.
+    last_feat = rssm.img_rollout(
+        h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b, last_only=True)
+    cv_last = rssm.decode(last_feat).index_select(-1, cv_idx)
+    cv_last = cv_last.view(n_rolls, Bm, -1)
+    cv_base = cv_last[0]
+    total = _huber_from_cv(
+        cv_base, cv_last[1:], list(mv_tgts) + list(dv_tgts))
     loss = total
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     return loss, diag
