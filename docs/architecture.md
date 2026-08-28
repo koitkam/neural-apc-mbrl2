@@ -316,20 +316,23 @@ env-gated off · **[planned]** = designed, not yet built.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
-> **P42 GPU-confirmed** (`run_p42_lastoklock`, pid 4192010): last-ok
-> **locks** after a silent recon spike (`skip_storm_last_ok_lock_ratio=20`,
-> recon-only). Spike iter **67** recon **0.3066** (170× best 0.0018, skip
-> 1) locked snapshot iter **66**. last_ok held through extra-P1 iter **85**.
-> First gate **82 gain-probe** FAIL **0.01@DV** was on **LIVE detonated**
-> weights (recon 0.92), not last_ok 66. Extra-P1 gmatch twitched 1.11→0.0015
-> with recon still detonated; lock held. Freeze+re-probe at cap (~iter 104)
-> is the lock test (RAM `p1_last_ok_sd`; `wm_last_ok.pt` absent in this pid).
-> P40 extra-P1 overwrote 83→104; P41 original-P1 overwrote 56→64. Skip-storm
-> restore unlocks (untested this run). Wrap ~5–10× must not lock (untested;
-> jump was 170×). HEAD persist-on-lock writes the snapshot when the lock
-> fires (crash after lock must not lose freeze restore — not in this pid).
-> jsonl `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`
-> (abs Huber split; loss unchanged). One attributed vs P41 launch.
+> **P42 GPU-confirmed** (`run_p42_lastoklock`, pid 4192010, LIVE P2):
+> last-ok **locks** after a silent recon spike
+> (`skip_storm_last_ok_lock_ratio=20`, recon-only). Spike iter **67**
+> recon **0.3066** (170× best 0.0018, skip 1) locked snapshot iter **66**.
+> Gates 82/94 FAIL on live detonated weights; gate **104 PASS 0.81@DV**
+> on live extra-P1 (not last_ok 66). Freeze restored **wm_last_ok iter 66**;
+> detonated-freeze gain-probe **GAIN_NOT_READY 0.75@DV** (MV 1.19) ≈ P40
+> 0.75 / P41 0.74 — not a DV pin vs those. First P2 recon **0.0025**
+> (last_ok class; extra-P1 104 was 0.0255). Extra-P1 recon stayed ≥14× so
+> <5× overwrite-prevention is untested (lock's restore-even-if-healthy
+> also untested; old detonated-freeze 14×>5× would have restored 66
+> anyway). `wm_last_ok.pt` written at freeze. Expect `[p3-skip]`. P2 dobg
+> live, g frozen. Skip-storm unlock untested. Wrap ~5–10× untested.
+> HEAD persist-on-lock (not in this pid) writes the snapshot when the lock
+> fires. jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
+> `wm_gain_match_dv_loss` (abs Huber split; loss unchanged). One
+> attributed vs P41 launch.
 > **P39 GPU-occupied (no second job):** May-2026 per-head
 > `autograd.grad(retain_graph=True)` + latent-stability probes defaulted
 > ON every 10 iters (not `ENV_OVERRIDES`; extra backward). Env-free
