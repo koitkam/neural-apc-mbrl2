@@ -1403,9 +1403,11 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **ROOT (SysID / signal):** match-at-`g_min` equalized |ΔCV| by **shrinking** the strong-|G| isolation step (MV |Δu| 0.19 vs P37 0.60). Isolation teacher too weak to pin G → gain-match Huber stuck at untrained |tgt| (~1.30). Same class as P36 weak teacher, different lever (data amplitude). Boosting DV to cube did **not** recover DV when MV SNR was starved. Val confirms CAPPED RCA.
 - **Next GPU launched:** env-free P39 `run_p39_isodcvfloor` — HEAD scale **floor 1.0** (already default). Watch `[seed] dcv_match min_scale=1` edge_du MV=0.60 DV=1.0; gmatch falling like P37; skip 0 through iter 53.
 
-### p39 GPU LAUNCH (`run_p39_isodcvfloor`, tmux `mbrl2_p39`) — dcv_match scale floor 1.0
-- Env-free det+eager. Attributed change vs P38: never shrink strong-|G| below op-band; still boost DV to cube. vs P37: DV edge |Δu| **1.0** not 0.60 (MV stays **0.60**).
-- Watch: `[resolved-cfg] min_scale=1 edge_du_mv=['0.6'] edge_du_dv=['1']`; gmatch 1.2→~0.001 by iter 17; skip 0 through 53; iter 75 DV ratio toward [0.8, 1.3]. If storm 2/2 early: cube-boost FALSIFIED → REVERT `wm_isolation_dcv_match=False`.
+### p39 GPU LIVE (`run_p39_isodcvfloor`, tmux `mbrl2_p39`, launch `92c7662`, pid 4170377) — dcv_match scale floor 1.0
+- **Launch KEEP:** env-free det+eager `storm_cap=2`. `[resolved-cfg] iso_dcv=True min_scale=1.0 mv=['1'] dv=['1.67'] edge_du_mv=['0.6'] edge_du_dv=['1']` isolation=1 ss_match=3 gain_match=1. Pre-iso tgt MV −2.48 DV 0.47; **post-seed re-resolve** MV −2.80 DV 0.49. device=cuda bs=128 GPU **17613 MiB**. pid **4170377**. `CUDA_VISIBLE_DEVICES=0` only (no leftover `DREAMER_*`).
+- **Attributed change vs P38:** never shrink strong-|G| below op-band; still boost DV to cube. vs P37: DV edge |Δu| **1.0** not 0.60 (MV stays **0.60**).
+- **P1 iter 1:** gmatch **1.169** iso **1.202** ss **0.904** skip **0** recon 0.131 kl 0 jemb 0.208 (P38 iter-1 iso/ss ~0.14/0.11 on starved MV; P37 ss ~1.0). Floor restored P37-class teacher amplitude.
+- Watch: gmatch 1.2→~0.001 by iter 17 (not stuck 1.30); skip 0 through 53; iter 75 DV ratio toward [0.8, 1.3]. If storm 2/2 early: cube-boost FALSIFIED → REVERT `wm_isolation_dcv_match=False`. Do not launch a second GPU job.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
@@ -1459,7 +1461,7 @@ Still not sim-adaptive:
 | Abs isolation/ss-match MSE on mixed MV/DV | P33 EXIT; P37 EXIT | KEPT as default (P36 REVERT); FALSIFIED as DV pin | YES — |tgt| MV 2.82 vs DV 0.49; P37 val MV ×0.98 DV ×0.69. Inv-var (P34–P36) skip-stormed worse. |
 | Isolation inv-var (AM/HM, per-seq, per-input `|G|²`) | P34–P36 | DISCARDED then **REMOVED** (P37-live; like relative Huber) | YES — relative-gain reweight; P36 LUT fired (ratio 33) then storm 2/2 @iter 7, val DV ×0.004 |
 | Isolation |ΔCV| excitation `Δu_i ∝ 1/|G_i|` match-at-`g_min` (no floor) | P38 EXIT (`run_p38_isodcv`, `42bc7c2`, 102 iters) | FALSIFIED as P1 form | YES — MV edge \|Δu\| 0.19 vs P37 0.60; gmatch stuck 1.30; storm 2/2 @iter 48; val MV ×1.25 DV ×0.007 det_r 0.43 `[p3-skip]`. Same weak-teacher class as P36. Cube-boost of DV did not recover DV. |
-| Isolation |ΔCV| excitation with **scale floor 1.0** | P39 LAUNCH (`run_p39_isodcvfloor`) | IN FLIGHT (default ON) | PARTIAL — P38 EXIT falsified shrink-the-strong-channel. Floor keeps P37 MV SNR and still boosts DV to cube. |
+| Isolation |ΔCV| excitation with **scale floor 1.0** | P39 LIVE (`run_p39_isodcvfloor`, `92c7662`, pid 4170377) | IN FLIGHT (default ON) | PARTIAL — P38 EXIT falsified shrink-the-strong-channel. Floor keeps P37 MV SNR (iter-1 iso 1.20 ss 0.90 vs P38 0.14). Watch gmatch fall. |
 | Late-P1 silent detonation (gnorm ~60 < skip 1e4) during extra P1 | P31 iter 95; P37 iter 88 | KEEP detonated-freeze last-ok (skip-storm silent) | YES — applied step explodes g; wrap blips (gnorm ~10) recover. Do not lower skip threshold. |
 | Skip post-seed gain-match resolve after pre-iso dcv | P37-live HEAD | REVERTED (always re-resolve) | YES — would freeze WM-norm \|G\| before isolation+expert update cv_std; P38 Huber targets ≠ P37 |
 | `mean(err/scale)*mean(scale)` isolation | P34 iter 1 | REVERTED (mean-1 `w·err`) | YES — AM/HM exploded iso 7088 skip 99 ES |
