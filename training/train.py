@@ -7476,16 +7476,28 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
 
 
 def _format_gain_probe_line(probe: dict) -> str:
-    """Compact P1-gate line: min/max + per-input DC ratios + unbiased/noise."""
+    """Compact P1-gate line: ss + @H per input + unbiased/noise."""
     pairs = probe.get('ss_pairs') or []
-    pair_s = ' '.join(f'{n}={r:.2f}' for n, r in pairs)
+    ath_map = {n: r for n, r in (probe.get('ath_pairs') or [])}
+    bits = []
+    for n, r in pairs:
+        s = f'{n}={r:.2f}'
+        if n in ath_map:
+            s += f'/@H={ath_map[n]:.2f}'
+        bits.append(s)
+    pair_s = ' '.join(bits)
     extra = (f" unbiased={bool(probe.get('unbiased'))}"
              f" not_noisy={bool(probe.get('not_noisy'))}")
     if pair_s:
         extra += f' pairs[{pair_s}]'
+    ath_lo, ath_hi = probe.get('atH_min'), probe.get('atH_max')
+    ath_s = ''
+    if ath_lo is not None and ath_hi is not None:
+        ath_s = f" @H[{float(ath_lo):.2f},{float(ath_hi):.2f}]"
     return (
         f"ready={probe.get('gain_ready')} "
-        f"DCgain_ratio[{probe['r_min']:.2f},{probe['r_max']:.2f}] "
+        f"DCgain_ratio[{probe['r_min']:.2f},{probe['r_max']:.2f}]"
+        f"{ath_s} "
         f"worst={probe['worst_ratio']:.2f}@{probe['worst_input']} "
         f"band={probe['band']} | noise: "
         f"spread_x{probe['noise_worst']:.1f} "
@@ -7559,19 +7571,20 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
             pass
 
     ss_ratios: List[Tuple[str, float]] = []   # aggregate DC-gain ratio (HARD gate)
-    ath_ratios: List[float] = []              # at-horizon ratio (diagnostic)
+    ath_pairs: List[Tuple[str, float]] = []   # at-horizon ratio (diagnostic)
     noises: List[float] = []                  # per-pair WM/real gain-spread (diag)
     flips = 0                                 # WM open-loop gain sign flips (diag)
 
     def _collect(res, tag):
         nonlocal flips
         for key, P in (res.get('pairs', {}) or {}).items():
+            name = f'{tag} {key}'
             sr = P.get('ss_gain_ratio_wm_over_real')
             if sr is not None and np.isfinite(sr):
-                ss_ratios.append((f'{tag} {key}', float(sr)))
+                ss_ratios.append((name, float(sr)))
             ar = P.get('gain_ratio_at_h')
             if ar is not None and np.isfinite(ar):
-                ath_ratios.append(float(ar))
+                ath_pairs.append((name, float(ar)))
             wm_ss = list((P.get('wm') or {}).get('ss_per_curve') or [])
             real_ss = list((P.get('real') or {}).get('ss_per_curve') or [])
             real_mean = float(P.get('real_ss_gain', 0.0) or 0.0)
@@ -7605,8 +7618,9 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
         'unbiased': bool(unbiased), 'not_noisy': bool(not_noisy),
         'r_min': float(min(srs)), 'r_max': float(max(srs)),
         'worst_ratio': float(worst_ratio), 'worst_input': worst_name,
-        'atH_min': float(min(ath_ratios)) if ath_ratios else None,
-        'atH_max': float(max(ath_ratios)) if ath_ratios else None,
+        'atH_min': float(min(r for _, r in ath_pairs)) if ath_pairs else None,
+        'atH_max': float(max(r for _, r in ath_pairs)) if ath_pairs else None,
+        'ath_pairs': [(str(n), float(r)) for n, r in ath_pairs],
         'noise_worst': worst_noise, 'sign_flips': int(flips),
         'n_checks': int(len(srs)), 'band': [band_lo, band_hi],
         'noise_max': noise_max,

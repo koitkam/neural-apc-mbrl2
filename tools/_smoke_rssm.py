@@ -53,7 +53,7 @@ from training.train import (
                             _clone_module_state, _refresh_module_state,
                             _p1_need_agent_finetune,
                             _smooth_l1_gain_match, _gain_match_fd_held,
-                            _adv_action_corr,
+                            _adv_action_corr, _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
@@ -1087,6 +1087,25 @@ def _test_adv_action_corr_vectorized() -> None:
     print('[smoke] OK  vectorized adv-action corr (P3 diag identity)')
 
 
+def _test_format_gain_probe_line() -> None:
+    """Gate line must print ss AND @H (already in the probe; was dropped)."""
+    line = _format_gain_probe_line({
+        'gain_ready': False,
+        'r_min': 0.75, 'r_max': 1.04,
+        'worst_ratio': 0.75, 'worst_input': 'DV CV0<-DV0',
+        'band': [0.8, 1.3], 'noise_worst': 0.5, 'sign_flips': 0,
+        'n_checks': 2, 'unbiased': False, 'not_noisy': True,
+        'atH_min': 0.78, 'atH_max': 1.01,
+        'ss_pairs': [('MV CV0<-MV0', 1.04), ('DV CV0<-DV0', 0.75)],
+        'ath_pairs': [('MV CV0<-MV0', 1.01), ('DV CV0<-DV0', 0.78)],
+    })
+    assert 'DCgain_ratio[0.75,1.04]' in line
+    assert '@H[0.78,1.01]' in line
+    assert 'MV CV0<-MV0=1.04/@H=1.01' in line
+    assert 'DV CV0<-DV0=0.75/@H=0.78' in line
+    print('[smoke] OK  gain-probe line prints ss and @H')
+
+
 def _test_p1_fidelity_local_plateau() -> None:
     """P40: warmup spike must not block the recent-floor gate."""
     # Too few probes.
@@ -1276,6 +1295,7 @@ if __name__ == '__main__':
     _test_gain_match_per_input_huber()
     _test_gain_match_fd_held()
     _test_adv_action_corr_vectorized()
+    _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()
     _test_auto_if_unset_honours_explicit()
     _test_promote_isolation_aux()

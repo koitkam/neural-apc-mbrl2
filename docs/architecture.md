@@ -337,8 +337,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > this pid). jsonl `p1_recon_best` + `wm_gain_match_mv_loss` /
 > `wm_gain_match_dv_loss`. P43 per-input β changes the Huber (split is
 > still observability). One attributed vs P41 launch.
-> **P43 GPU-occupied (no second job):** printed observer verdict is
-> `wm_observer_gain_*` (MV AND DV); lineage `wm_gain_pass` stays MV-only.
+> **P43 GPU-occupied (no second job):** first gate iter 82 **0.75@DV / 1.04@MV**
+> (P40/P41-class); gmatch already ~1e-4 so per-input Huber is not the DV lever.
+> Gain-probe line now prints ss **and** `@H` (was computed, dropped). Printed
+> observer verdict is `wm_observer_gain_*` (MV AND DV); lineage `wm_gain_pass`
+> stays MV-only.
 > Imagination-era critic knobs **REMOVED** (`critic_imag_loss_coef`,
 > `critic_replay_anchor_*`, `critic_anchor_*`, `critic_mc_tail_bootstrap`
 > — never read by `_realsim_actor_critic_step`). `DREAMER_CRITIC_MC_GROUNDING_COEF`
