@@ -3421,6 +3421,35 @@ def _refresh_module_state(
         return {k: v.detach().cpu().clone() for k, v in sd.items()}
 
 
+def _persist_last_ok_ckpt(
+        path: Path,
+        last_ok_sd: Optional[Dict[str, torch.Tensor]],
+        cfg: 'TrainConfig',
+        obs_norm,
+        last_ok_iter: int,
+) -> bool:
+    """Best-effort ``wm_last_ok.pt``.  RAM snapshot stays source of truth.
+
+    P42: lock fired at iter 67 but the pre-spike weights lived only in
+    RAM until skip-storm or P1→P2 freeze wrote the file.  A crash after
+    lock would lose the snapshot the freeze is supposed to restore.
+    Write once when the lock fires (same blob freeze/storm already
+    save).  Objective unchanged.
+    """
+    if last_ok_sd is None or path is None:
+        return False
+    try:
+        torch.save({
+            'model': last_ok_sd,
+            'cfg': asdict(cfg),
+            'obs_norm': obs_norm,
+            'iter': int(last_ok_iter),
+        }, path)
+        return True
+    except Exception:
+        return False
+
+
 def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
                             step_i: int, n_inner: int) -> bool:
     """P1 MTP is in ``total_loss`` only when ``reward_scale_loss_p1>0``.
@@ -6145,10 +6174,23 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     cv_last = last_obs.index_select(-1, cv_idx)
     cv_last = cv_last.view(n_rolls, Bm, -1)
     cv_base = cv_last[0]
+    cv_steps = cv_last[1:]
+    n_mv_t = len(mv_tgts)
     total = _huber_from_cv(
-        cv_base, cv_last[1:], list(mv_tgts) + list(dv_tgts))
+        cv_base, cv_steps, list(mv_tgts) + list(dv_tgts))
     loss = total
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
+    # Observability only (no extra FD; no loss change).  Abs Huber mean
+    # over concatenated MV+DV is count-equal per input but scale-unequal
+    # when |G_mv| ≫ |G_dv| (P42 test_sim |tgt| 2.62 vs 0.51).  Split
+    # Huber shows the drowning without reviving relative Huber.
+    with torch.no_grad():
+        if n_mv_t:
+            diag['gain_match_mv_loss'] = _huber_from_cv(
+                cv_base, cv_steps[:n_mv_t], mv_tgts)
+        if dv_tgts:
+            diag['gain_match_dv_loss'] = _huber_from_cv(
+                cv_base, cv_steps[n_mv_t:], dv_tgts)
     return loss, diag
 
 
@@ -10478,15 +10520,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             lr=eff_lr_world, eps=1e-8,
                             weight_decay=0.0)
                         p1_detonated_freeze_restored = True
-                        try:
-                            torch.save({
-                                'model': p1_last_ok_sd,
-                                'cfg': asdict(cfg),
-                                'obs_norm': env.get_obs_norm_stats(),
-                                'iter': int(p1_last_ok_iter),
-                            }, out_dir / 'wm_last_ok.pt')
-                        except Exception:
-                            pass
+                        _persist_last_ok_ckpt(
+                            out_dir / 'wm_last_ok.pt', p1_last_ok_sd, cfg,
+                            env.get_obs_norm_stats(), int(p1_last_ok_iter))
                         try:
                             _gp = _probe_observer_gain_ready(
                                 model, env, device, cfg)
@@ -11442,6 +11478,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                       f'P1→P2 freeze restores this snapshot even if recon '
                       f'recovers',
                       flush=True)
+                if p1_last_ok_ckpt_path is None:
+                    p1_last_ok_ckpt_path = out_dir / 'wm_last_ok.pt'
+                if _persist_last_ok_ckpt(
+                        p1_last_ok_ckpt_path, p1_last_ok_sd, cfg,
+                        env.get_obs_norm_stats(), int(p1_last_ok_iter)):
+                    print(f'[wm-last-ok] wrote {p1_last_ok_ckpt_path.name} '
+                          f'(iter {p1_last_ok_iter})',
+                          flush=True)
             if (not p1_last_ok_locked
                     and iter_wm_applied > 0
                     and iter_wm_skips == 0
@@ -11449,7 +11493,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # In-process snapshot — skip-storm restore never needs
                 # disk on the happy path.  Reuses last-ok storage
                 # (``copy_``) after the first alloc; CPU if VRAM is
-                # tight.  Written to wm_last_ok.pt only if a storm fires.
+                # tight.  Disk write on lock / storm / P1→P2 freeze.
                 try:
                     p1_last_ok_sd = _refresh_module_state(
                         p1_last_ok_sd, model, device)
@@ -11524,6 +11568,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 'p1_last_ok_iter': (int(p1_last_ok_iter)
                                     if int(p1_last_ok_iter) >= 0 else None),
                 'p1_last_ok_locked': bool(p1_last_ok_locked),
+                'p1_recon_best': (float(p1_recon_best)
+                                  if p1_recon_best is not None else None),
                 'wm_score_ema': (float(wm_score_ema)
                                   if wm_score_ema > -1e17 else None),
                 'wm_score_ema_best': (float(wm_score_ema_best)
@@ -11539,6 +11585,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # parsers read None while the banner printed ``iso 0``.  Emit 0.
             if 'gain_match_loss' in row:
                 row.setdefault('wm_gain_match_loss', row['gain_match_loss'])
+            row.setdefault('wm_gain_match_mv_loss',
+                           float(row.get('gain_match_mv_loss') or 0.0))
+            row.setdefault('wm_gain_match_dv_loss',
+                           float(row.get('gain_match_dv_loss') or 0.0))
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
@@ -11950,15 +12000,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     k: v.to(device)
                                     for k, v in p1_last_ok_sd.items()
                                 })
-                                try:
-                                    torch.save({
-                                        'model': p1_last_ok_sd,
-                                        'cfg': asdict(cfg),
-                                        'obs_norm': env.get_obs_norm_stats(),
-                                        'iter': int(p1_last_ok_iter),
-                                    }, out_dir / 'wm_last_ok.pt')
-                                except Exception:
-                                    pass
+                                _persist_last_ok_ckpt(
+                                    out_dir / 'wm_last_ok.pt', p1_last_ok_sd,
+                                    cfg, env.get_obs_norm_stats(),
+                                    int(p1_last_ok_iter))
                             else:
                                 _blob = torch.load(
                                     _ckpt, map_location=device,

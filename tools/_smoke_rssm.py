@@ -47,6 +47,7 @@ from training.train import (
                             _should_restore_last_ok_at_p1_freeze,
                             _should_lock_last_ok,
                             _wm_recon_scalar,
+                            _persist_last_ok_ckpt,
                             _auto_if_unset, _isolation_teacher_on,
                             _promote_isolation_aux, _write_resolved_run_plan,
                             _resolve_compile_mode,
@@ -247,6 +248,17 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         _best.unlink()
         _p, _src = _skip_storm_restore_ckpt(_last, _best)
         assert _src == 'none' and _p is None, (_src, _p)
+    with tempfile.TemporaryDirectory() as _td:
+        _path = _P(_td) / 'wm_last_ok.pt'
+        _sd = {'w': torch.tensor([1.0, 2.0])}
+        assert _persist_last_ok_ckpt(
+            _path, _sd, TrainConfig(), {'n': 1}, 66)
+        _blob = torch.load(_path, map_location='cpu', weights_only=False)
+        assert int(_blob['iter']) == 66
+        assert torch.equal(_blob['model']['w'], _sd['w'])
+        assert not _persist_last_ok_ckpt(
+            _path, None, TrainConfig(), None, 0)
+    print('[smoke] OK  persist last-ok ckpt (lock/freeze/storm)')
     assert _recon_still_healthy(0.004, None)
     assert _recon_still_healthy(0.004, 0.0039, 5.0)
     assert not _recon_still_healthy(0.50, 0.0039, 5.0)
@@ -854,6 +866,11 @@ def _test_isolation_dcv_scales() -> None:
     assert '_record_isolation_dcv_span' in _src
     assert "'p1_last_ok_iter'" in _src
     assert "'p1_last_ok_locked'" in _src
+    assert "'p1_recon_best'" in _src
+    assert '_persist_last_ok_ckpt' in _src
+    assert "wrote {p1_last_ok_ckpt_path.name}" in _src
+    assert 'gain_match_mv_loss' in _src
+    assert 'gain_match_dv_loss' in _src
     assert '_should_lock_last_ok' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert '_wm_recon_scalar(wm_losses)' in _src
