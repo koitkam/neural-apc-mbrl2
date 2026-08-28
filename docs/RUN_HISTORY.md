@@ -106,6 +106,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P39 | 2026-08-27 | dcv_match scale floor 1.0 | val MV ×0.954/×0.954 DV ×0.679/×0.785 det_r 0.326; CAPPED 0.70@DV; `[p3-skip]` | ❌ KEEP as P1 form; FALSIFIED as DV pin |
 | P40 | 2026-08-28 | isolation auto-enable OFF (gain-match-only) | val MV ×0.995/×0.964 DV ×0.723/×0.743 det_r 0.490; CAPPED 0.75@DV; `[p3-skip]` | ❌ KEEP as env-free default; FALSIFIED as DV pin |
 | P41 | 2026-08-28 | P1 gate recent-floor (not warmup ema_best) | val MV ×0.986/×0.973 DV ×0.700/×0.775 det_r 0.079; CAPPED 0.74@DV; `[p3-skip]` | ❌ KEEP as mechanism; FALSIFIED as DV pin / extra-P1 lever |
+| P42 | 2026-08-28 | last-ok lock after silent recon spike (20×) | LIVE P1 iter 1; lock_ratio=20 in plan | ⏳ GPU |
 
 ## Run details
 
@@ -1439,6 +1440,12 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Observer: MV pinned; recent-floor FALSIFIED as DV pin.** Val `final.pt`: MV ss/@H **×0.986 / ×0.973** (`wm_gain_rel_err=0.014` HEALTHY). DV ss/@H **×0.700 / ×0.775** (live **0.74@DV**; P40 ×0.723/×0.743; P26 ×0.87/×1.00). `wm_dv_ss_ratio_worst=0.700` (loose `wm_dv_gain_healthy=True` — not a DV pin). Decomp MV real→post **×0.986** compounding. DV real→post **×0.976** **faithful**. det_r **0.079** / R² **0.006** (amp dead: pred_std **0.196** vs true 1.93; P40 **0.490** / 0.152). Correlation-only is not a pass. det_r collapsed vs P40 because freeze is post-overwrite last_ok **104**, not locked pre-spike **56**.
 - **Actor INVALID.** `[p3-skip]` KEEP. `critic_r=+nan` (P3 never ran). econ **−34.7 vs baseline −102** is expert-BC. `cum_raw` **−46742**. Do not stack critic knobs. Do not revive relative Huber. Do not re-add inv-var. Do not lower skip threshold. Do not train P3 on GAIN_NOT_READY. Do not try another isolation reweight.
 - **ROOT:** recent-floor unblocked the original-budget gain-probe (KEEP as mechanism) but extra P1 cannot pin DV and the freeze still used recovered last_ok 104. Isolation-off stays env-free default (P40). Next GPU: last-ok lock already HEAD (`skip_storm_last_ok_lock_ratio=20`, recon-only) — one attributed vs P41 launch `acb8a7b`.
+
+### p42 (`run_p42_lastoklock`, branch `cursor/p28`) — FIX: last-ok lock after silent recon spike
+- **One attributed GPU change vs P41 process `acb8a7b`:** last-ok **locks** when recon > `skip_storm_last_ok_lock_ratio=20` × best (recon-only call site). Recovered recon must not overwrite the pre-spike snapshot. Skip-storm restore still unlocks. Wrap ~5–10× must not lock. Recent-floor + isolation-off stay (P41/P40 KEEP).
+- **Not:** isolation reweight, extra-P1, leftover `DREAMER_*`, P3 on GAIN_NOT_READY.
+- **Step 4 resolved-cfg vs P41:** identical banner `latent=deterministic restore_p2=False gain_match=1 dob_ground=2 isolation=0 ss_match=0 iso_dcv=off n_critics=2 rs_freeze=True skip_invalid_p3=True storm_cap=2 compile=eager`. Attributed delta: `skip_storm_last_ok_lock_ratio=20` now in `run_plan` (P41 plan `<MISSING>` — field not in that pid).
+- **Liveness (08:56 CDT):** LIVE **P1** iter **1**. tmux `mbrl2_p42`, pid **4192010**, HEAD `72f7b48` (lock `a80bad6` ancestor). GPU ~15.6 GB. device=cuda. recon **0.0699** kl **0** jemb **0.053** gmatch **0.009** iso **0** ss **0** skip **0**. **No second GPU job.** Watch `[wm-last-ok] locked` around P41 iter-57 class; first gate still **gain-probe**.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
