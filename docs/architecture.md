@@ -611,15 +611,19 @@ fixes BOTH:
 - **GAIN block** (`cont_gain_dim = n_cv·(n_mv+n_dv)`): inferred in-context from the
   lookback, feeds the GRU (so `h` carries the per-episode gain forward) **and**
   the decoder. Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
-  finite-difference step-response asymptote (roll the prior K=`gain_match_len`
-  steps, held baseline vs +`gain_match_step` per MV/DV input, ΔCV/step) matched to
+  finite-difference step-response asymptote (optionally hold a/dv
+  `gain_match_settle_len` steps — auto = horizon, same as the transfer-matrix
+  settle — then roll the prior K=`gain_match_len` steps, held baseline vs
+  +`gain_match_step` per MV/DV input, ΔCV/step) matched to
   the identified steady-state gain in WM-normalized units
   (`gain_match_mv_target`/`gain_match_dv_target`, resolved by
   `_resolve_gain_match_targets` from `dynamics_identification.json` + obs-norm +
   action scale: `g_dv_norm = g_eng·obs_std[dv]/obs_std[cv]`,
   `g_mv_norm = g_eng·mv_action_scale/obs_std[cv]`). Huber is **absolute**
   on `G=ΔCV/Δu` (P26). Default **per-input β = |tgt_ij|** (P43): L1 sat
-  ±1, not P27 relative Huber. `sample=False` freezes the
+  ±1, not P27 relative Huber. Default **held settle before FD** (P44):
+  teacher IC matches the rest-then-step probe; `DREAMER_GAIN_MATCH_SETTLE_LEN=-1`
+  recovers P43 FD-from-posterior. `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.
 - **DISTURBANCE block** (`cont_dist_dim = n_cv`): an **inherent amortized Kalman**.

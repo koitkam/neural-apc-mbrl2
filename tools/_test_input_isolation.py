@@ -232,6 +232,25 @@ def main():
     print(f'[gain-match-beta] OK: resolved beta used despite env=0 '
           f'(loss={float(gm_auto):.5f})')
 
+    # P44: held settle before FD still trains cont-gain (gradful; not P25
+    # detach).  settle=0 is the P43 identity already tested above.
+    cfg.gain_match_settle_len = 4
+    model.zero_grad(set_to_none=True)
+    gm_set, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm_set).all() and float(gm_set) > 0.0, float(gm_set)
+    gm_set.backward()
+    cont_grad_set = sum(float(p.grad.abs().sum())
+                        for n, p in model.dynamics.named_parameters()
+                        if p.grad is not None and 'cont' in n)
+    gru_grad_set = sum(float(p.grad.abs().sum())
+                       for n, p in model.dynamics.named_parameters()
+                       if p.grad is not None and 'gru' in n)
+    assert cont_grad_set > 0.0, 'gain-match settle did NOT reach cont-gain!'
+    assert gru_grad_set > 0.0, 'gain-match settle did NOT reach GRU!'
+    print(f'[gain-match-settle] OK: settle={cfg.gain_match_settle_len} '
+          f'trains cont-gain ({cont_grad_set:.4e}) gru ({gru_grad_set:.4e})')
+    cfg.gain_match_settle_len = 0
+
     # ---- P28 follow-up 12: img_rollout / overshoot / held must start from
     # posterior c.  Dropping c zero-fills the GRU input, so the open-loop
     # gain supervisor trained a different path than isolation / gain-match

@@ -794,6 +794,15 @@ class TrainConfig:
     # continuous gain channel is on AND the identified gains are available.
     gain_match_coef: float = 0.0
     gain_match_len: int = 0            # K step-response rollout steps (= horizon)
+    # Held prior-roll BEFORE the FD (P44).  Dataclass 0 = auto ``horizon``
+    # at resolve (same as the transfer-matrix settle ``S=H``).  ``<0`` =
+    # off (P43 identity: FD from the replay posterior).  P43 Huber ~1e-4
+    # from PRBS posteriors while the rest-then-step probe stays ~0.75@DV
+    # at both @H and 4×H — teacher IC ≠ TM IC, not a loss reweight.
+    # Gradful (P25: detaching the gain-match roll kills DC).  Extra cost
+    # is one ``Bm×S`` roll vs the FD's ``(1+n_mv+n_dv)·Bm×K``.
+    # ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
+    gain_match_settle_len: int = 0
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
@@ -3474,6 +3483,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
         f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
+        f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -5956,16 +5966,59 @@ def _gain_match_fd_held(
     return a_held, dv0.unsqueeze(0) + dd.unsqueeze(1)
 
 
+def _gain_match_state_from_feat(rssm, feat: torch.Tensor):
+    """Unpack ``img_rollout`` last feat into ``(h, z, c)`` for a follow-on roll.
+
+    Layout is ``[h, z_flat, (c), (dv), (d.detach())]``.  The follow-on
+    ``img_rollout`` takes DV via ``dvs`` and starts ``d=None`` (P1
+    ``d_t≡0``; gain-match is skipped when g is frozen in P2).
+    """
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    h = feat[..., :rssm.deter_dim].contiguous()
+    z = feat[..., rssm.deter_dim:_ze].reshape(
+        feat.shape[0], rssm.n_categoricals, rssm.n_classes).contiguous()
+    cd = int(getattr(rssm, 'cont_dim', 0) or 0)
+    c = feat[..., _ze:_ze + cd].contiguous() if cd > 0 else None
+    return h, z, c
+
+
+def _gain_match_held_settle(
+        rssm, h0: torch.Tensor, z0: torch.Tensor,
+        c0: Optional[torch.Tensor], a_base: torch.Tensor,
+        dv0: Optional[torch.Tensor], settle: int):
+    """Gradful held prior-roll of ``settle`` steps (TM rest-then-step IC).
+
+    P25: do not detach — TBPTT on the gain-match path kills DC-gain.
+    ``settle < 2`` is a no-op (P43 identity).
+    """
+    if int(settle) < 2:
+        return h0, z0, c0
+    Bm = h0.shape[0]
+    S = int(settle)
+    a_set = (a_base.unsqueeze(1).expand(Bm, S, a_base.shape[-1])
+             .contiguous())
+    dv_set = None
+    if dv0 is not None:
+        dv_set = (dv0.unsqueeze(1).expand(Bm, S, dv0.shape[-1])
+                  .contiguous())
+    last = rssm.img_rollout(
+        h0, z0, a_set, dvs=dv_set, sample=False, c0=c0,
+        last_only=True, out='feat')
+    return _gain_match_state_from_feat(rssm, last)
+
+
 def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                         obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig,
                         c_mean: Optional[torch.Tensor] = None,
                         ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """C(1): finite-difference step-response asymptote gain-matching (RSSM).
 
-    From a strided set of posterior start states, roll the PRIOR forward ``K``
-    steps under (a) a HELD baseline action/DV and (b) a unit STEP in each input
-    channel.  The DIFFERENCE of the decoded CV at step ``K`` cancels the common
-    transient and isolates the WM's realized STEADY-STATE gain ``ΔCV/Δinput``;
+    From a strided set of posterior start states, optionally hold a/dv for
+    ``gain_match_settle_len`` steps (TM rest-then-step IC; auto = horizon),
+    then roll the PRIOR forward ``K`` steps under (a) a HELD baseline
+    action/DV and (b) a unit STEP in each input channel.  The DIFFERENCE of
+    the decoded CV at step ``K`` cancels the common transient and isolates
+    the WM's realized STEADY-STATE gain ``ΔCV/Δinput``;
     we match it to the identified gain (in WM/normalized units).  The continuous
     gain channel gives the WM the un-quantized capacity this loss grabs onto, so
     together they pin the subdominant DV gain the categorical attenuates.
@@ -6039,6 +6092,13 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
     dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
            if getattr(rssm, 'dv_dim', 0) > 0 else None)
+    # P44: settle at the start's held a/dv BEFORE the FD so the teacher
+    # measures G at a rest-like prior (transfer-matrix protocol) instead
+    # of a PRBS posterior.  P43 Huber ~0 from replay starts while the
+    # rest-step probe stayed 0.75@DV.  Gradful (P25).
+    h0, z0, c0 = _gain_match_held_settle(
+        rssm, h0, z0, c0, a_base, dv0,
+        int(getattr(cfg, 'gain_match_settle_len', 0)))
 
     mv_tgts = []
     for j, tgt_row in enumerate(mv_target):
@@ -6435,12 +6495,17 @@ def _resolve_gain_match_targets(
         cfg.gain_match_coef = 1.0
     if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
         cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
+    # 0 = auto TM settle (S=H).  Negative = off (P43 FD-from-posterior).
+    # Do not use ``or 0`` — that would treat -1 as auto.
+    if int(getattr(cfg, 'gain_match_settle_len', 0)) == 0:
+        cfg.gain_match_settle_len = int(getattr(cfg, 'horizon', 15) or 15)
     _resolve_aux_tbptt_steps(cfg)
     _beta_mv = _gain_col_rms(cfg.gain_match_mv_target)
     _beta_dv = _gain_col_rms(cfg.gain_match_dv_target)
     print(f'[gain-match] {log_label} (WM-norm) mv={cfg.gain_match_mv_target} '
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
-          f'len={cfg.gain_match_len} huber_beta={cfg.gain_match_huber_beta} '
+          f'len={cfg.gain_match_len} settle={cfg.gain_match_settle_len} '
+          f'huber_beta={cfg.gain_match_huber_beta} '
           f'huber_per_input={_per} '
           f'huber_beta_mv={["%.3g" % x for x in _beta_mv]} '
           f'huber_beta_dv={["%.3g" % x for x in _beta_dv]} '

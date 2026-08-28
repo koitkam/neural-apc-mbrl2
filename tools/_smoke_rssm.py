@@ -53,6 +53,8 @@ from training.train import (
                             _clone_module_state, _refresh_module_state,
                             _p1_need_agent_finetune,
                             _smooth_l1_gain_match, _gain_match_fd_held,
+                            _gain_match_state_from_feat,
+                            _gain_match_held_settle, _wm_gain_match_loss,
                             _adv_action_corr, _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
@@ -190,6 +192,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _tc = TrainConfig()
     assert float(_tc.gain_match_huber_beta) == 1.0
     assert _tc.gain_match_huber_per_input is True
+    assert int(_tc.gain_match_settle_len) == 0
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
     print('[smoke] OK  gain-match defaults (abs Huber, per-input β, TBPTT=16)')
@@ -689,6 +692,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_STEP_TEST_INJECT_N': '7',
         'DREAMER_WM_ISOLATION_DCV_MATCH': '0',
         'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': '0',
+        'DREAMER_GAIN_MATCH_SETTLE_LEN': '-1',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -702,6 +706,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.step_test_inject_n) == 7
         assert cfg.wm_isolation_dcv_match is False
         assert cfg.gain_match_huber_per_input is False
+        assert int(cfg.gain_match_settle_len) == -1
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -849,6 +854,9 @@ def _test_isolation_dcv_scales() -> None:
     assert '_should_lock_last_ok' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
+    assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
+    assert '_gain_match_held_settle' in _src
+    assert '_gain_match_state_from_feat' in _src
     assert '_adv_action_corr' in _src
     assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
@@ -983,8 +991,10 @@ def _test_envfree_observer_recipe() -> None:
     assert c.dob_enabled is True
     assert c.gain_match_huber_per_input is True
     assert float(c.gain_match_huber_beta) == 1.0
+    assert int(c.gain_match_settle_len) == 0
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
+    assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
@@ -1065,6 +1075,41 @@ def _test_gain_match_fd_held() -> None:
     assert torch.allclose(a1[0], a_base[:, :1])
     assert torch.allclose(a1[1, :, 0], a_base[:, 0] + step)
     print('[smoke] OK  gain-match FD held stack (broadcast ≡ clone-loop)')
+
+
+def _test_gain_match_held_settle() -> None:
+    """P44: held settle unpacks last feat; <2 is identity; grad reaches GRU."""
+    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
+    torch.manual_seed(0)
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     cont_gain_dim=2)
+    m = RSSMDynamics(cfg)
+    B, S = 3, 4
+    h0 = torch.randn(B, cfg.deter_dim, requires_grad=True)
+    z0 = torch.zeros(B, cfg.n_categoricals, cfg.n_classes)
+    z0[..., 0] = 1.0
+    c0 = torch.randn(B, cfg.cont_gain_dim)
+    a_base = torch.rand(B, cfg.action_dim) * 2 - 1
+    hs, zs, cs = _gain_match_held_settle(m, h0, z0, c0, a_base, None, 0)
+    assert hs is h0 and zs is z0 and cs is c0
+    hs, zs, cs = _gain_match_held_settle(m, h0, z0, c0, a_base, None, -1)
+    assert hs is h0 and zs is z0 and cs is c0
+    a_seq = a_base.unsqueeze(1).expand(B, S, cfg.action_dim).contiguous()
+    last = m.img_rollout(h0, z0, a_seq, sample=False, c0=c0,
+                         last_only=True, out='feat')
+    hu, zu, cu = _gain_match_state_from_feat(m, last)
+    hs, zs, cs = _gain_match_held_settle(m, h0, z0, c0, a_base, None, S)
+    assert float((hs - hu).detach().abs().max()) < 1e-6
+    assert float((zs - zu).detach().abs().max()) < 1e-6
+    assert float((cs - cu).detach().abs().max()) < 1e-6
+    m.zero_grad(set_to_none=True)
+    hs.sum().backward()
+    gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
+                if p.grad is not None)
+    assert gru_g > 0.0, 'held settle last feat lost GRU gradient'
+    print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 
 def _test_adv_action_corr_vectorized() -> None:
@@ -1186,6 +1231,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'lock=20' in banner, banner
     assert 'iso_dcv=off' in banner, banner
     assert 'huber_per_in=True' in banner, banner
+    assert 'gmatch_settle=0' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -1294,6 +1340,7 @@ if __name__ == '__main__':
     _test_envfree_observer_recipe()
     _test_gain_match_per_input_huber()
     _test_gain_match_fd_held()
+    _test_gain_match_held_settle()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()
