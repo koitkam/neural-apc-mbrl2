@@ -136,6 +136,11 @@ class TrainConfig:
     # collapse, keeps entropy above the trip, and keeps on-policy exploration
     # alive so the (warmup-healthy) critic keeps getting diverse states to guide
     # μ.  Deterministic EVAL uses μ, so the wider training σ is exploration-only.
+    # p10 RCA: 1.6 → **1.2**.  Auto-tune used to ``max(1.3, cfg)`` which
+    # silently undid this default (P45/P46/P47 env-free resolved
+    # log_std_min from 1.3, entropy floor −0.363).  Formula now uses
+    # this field.  Leftover ``SIGMA_MIN_RATIO_OF_MAX`` still wins when
+    # the DREAMER_* field is not explicit.
     sigma_min_ratio: float = 1.2      # σ_min = σ_max / sigma_min_ratio (p10 RCA: 1.6→1.2, raise σ floor)
     # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
     # ``auto_initialize_hyperparams`` as ``η = η_v3 × σ_max / σ_v3_ref``
@@ -404,6 +409,12 @@ class TrainConfig:
     reward_cal_pct: float = 95.0
     reward_cal_pct_val: float = 0.5
     reward_cal_target_sym_mag: float = 6.0
+    # Gate for the percentile→twohot scale.  ``auto`` (env-free) runs
+    # calibration; ``off`` leaves scale=1; a numeric string forces
+    # that scale.  Was ``os.environ.get('OBJ_REWARD_SCALE')`` (worked,
+    # missing from ``run_plan``).  Leftover ``OBJ_REWARD_SCALE`` still
+    # wins when the DREAMER_* field is not explicit.
+    obj_reward_scale: str = 'auto'
     # May-2026 P39 probes.  Default OFF (extra retain_graph backward).
     # Was ``os.environ.get`` (not ENV_OVERRIDES).  Opt in ``=10``.
     diag_perhead_grads_every: int = 0
@@ -1897,6 +1908,10 @@ class TrainConfig:
     init_from_ckpt: str = ''
 
     # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1 opt-in) -----
+    # ``auto`` = SDPA on CUDA / manual on CPU (CausalAttention).  Canonical
+    # override is ``DREAMER_ATTN_IMPL``; leftover ``DREAMER_FAST_ATTN``
+    # maps to the same field (was CLI-only / constructor-env, so
+    # ``single_run`` silently dropped ATTN_IMPL).
     attn_impl: str = 'auto'          # 'auto'|'manual'|'sdpa'
     # '' = eager (P26/P28 observer). Opt in: DREAMER_COMPILE=1 /
     # DREAMER_COMPILE_MODE=default|reduce-overhead|max-autotune.
@@ -8078,6 +8093,44 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     }
 
 
+def _resolve_policy_sigma_bounds(cfg: 'TrainConfig', sigma_seed: float
+                                  ) -> Dict[str, float]:
+    """σ_max / σ_min from TrainConfig formula inputs.
+
+    Leftover ``SIGMA_MAX_*`` / ``SIGMA_MIN_RATIO_OF_MAX`` win only when
+    the DREAMER_* field is not explicit (same class as
+    ``SEED_TARGET_CV_FRAC``).  ``sigma_min_ratio`` is the TrainConfig
+    default (1.2).  Do **not** floor at 1.3 — that leftover
+    ``max(1.3, …)`` silently undid the p10 RCA and ignored
+    ``DREAMER_SIGMA_MIN_RATIO`` (P45/P46/P47 env-free entropy floor
+    −0.363 = H(σ_max/1.3)).
+    """
+    sigma_seed = float(sigma_seed)
+    sigma_max_mult, _ = _cfg_or_env(
+        cfg, 'sigma_max_mult', 'SIGMA_MAX_OVER_SEED', 1.0, float)
+    sigma_max_floor, _ = _cfg_or_env(
+        cfg, 'sigma_max_floor', 'SIGMA_MAX_FLOOR', 0.10, float)
+    sigma_max_cap, _ = _cfg_or_env(
+        cfg, 'sigma_max_cap', 'SIGMA_MAX_CAP', 0.30, float)
+    sigma_min_ratio, _ = _cfg_or_env(
+        cfg, 'sigma_min_ratio', 'SIGMA_MIN_RATIO_OF_MAX', 1.2, float)
+    sigma_min_ratio = max(1.01, float(sigma_min_ratio))
+    target_sigma_max = float(np.clip(
+        float(sigma_max_mult) * sigma_seed,
+        float(sigma_max_floor), float(sigma_max_cap)))
+    target_sigma_min = target_sigma_max / sigma_min_ratio
+    return {
+        'sigma_max_mult': float(sigma_max_mult),
+        'sigma_max_floor': float(sigma_max_floor),
+        'sigma_max_cap': float(sigma_max_cap),
+        'sigma_min_ratio': float(sigma_min_ratio),
+        'target_sigma_max': target_sigma_max,
+        'target_sigma_min': float(target_sigma_min),
+        'log_std_max': float(np.log(max(target_sigma_max, 1e-12))),
+        'log_std_min': float(np.log(max(target_sigma_min, 1e-12))),
+    }
+
+
 def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
                             ) -> Dict[str, Dict[str, object]]:
     """Derive plant-adaptive defaults for the cold-start seed buffer.
@@ -8309,35 +8362,17 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # 0.7×σ_seed.  This puts the policy clamp at the same scale the
     # seed buffer was collected with, aligning the actor's explore
     # band with the WM's training distribution.
-    # 2026-05-27 (P59 refactor): these formula inputs are now
-    # TrainConfig fields (``sigma_max_mult``, ``sigma_max_floor``,
-    # ``sigma_max_cap``) wired through ``ENV_OVERRIDES``.  Legacy
-    # ``DREAMER_SIGMA_MAX_*`` / ``SIGMA_MAX_*`` env-vars still honoured
-    # for back-compat but the canonical path is ``cfg.sigma_max_*``.
-    _legacy_mult_env = os.environ.get(
-        'DREAMER_SIGMA_MAX_OVER_SEED',
-        os.environ.get('SIGMA_MAX_OVER_SEED', None))
-    sigma_max_mult = float(_legacy_mult_env) if _legacy_mult_env is not None \
-        else float(getattr(cfg, 'sigma_max_mult', 1.0))
-    _legacy_floor_env = os.environ.get('SIGMA_MAX_FLOOR', None)
-    sigma_max_floor = float(_legacy_floor_env) if _legacy_floor_env is not None \
-        else float(getattr(cfg, 'sigma_max_floor', 0.10))
-    # Cap σ_max independently of the seed-σ cap so a wide seed-buffer
-    # exploration band does not propagate into a wide policy clamp.
-    # History: 0.20 → 0.30 on 2026-05-12 (p21 RCA: too tight for high-
-    # disturbance plants).  Lowered back 0.30 → 0.20 on 2026-05-18
-    # (p24 RCA: σ-saturation trap at 0.219 prevented critic learning).
-    # Restored 0.20 → 0.30 on 2026-05-19 (p26 RCA: reward-head fix
-    # removed the saturation-trap mechanism; σ-saturation is now
-    # benign).
-    _legacy_cap_env = os.environ.get(
-        'DREAMER_SIGMA_MAX_CAP',
-        os.environ.get('SIGMA_MAX_CAP', None))
-    sigma_max_cap = float(_legacy_cap_env) if _legacy_cap_env is not None \
-        else float(getattr(cfg, 'sigma_max_cap', 0.30))
-    target_sigma_max = float(np.clip(sigma_max_mult * sigma_seed,
-                                       sigma_max_floor, sigma_max_cap))
-    log_std_max_val = float(np.log(target_sigma_max))
+    # 2026-05-27 (P59 refactor): formula inputs are TrainConfig +
+    # ``ENV_OVERRIDES``.  Leftover ``SIGMA_MAX_*`` /
+    # ``SIGMA_MIN_RATIO_OF_MAX`` still win when the DREAMER_* field is
+    # not explicit.  Cap history: 0.20→0.30 (p21) →0.20 (p24) →0.30
+    # (p26).  ``sigma_min_ratio`` default 1.2 (p10); do not floor 1.3.
+    _sig = _resolve_policy_sigma_bounds(cfg, sigma_seed)
+    sigma_max_mult = _sig['sigma_max_mult']
+    sigma_max_floor = _sig['sigma_max_floor']
+    sigma_max_cap = _sig['sigma_max_cap']
+    target_sigma_max = _sig['target_sigma_max']
+    log_std_max_val = _sig['log_std_max']
     out['policy_log_std_max'] = {
         'value': log_std_max_val,
         'source': f'clip({sigma_max_mult:.1f}*baseline_seed_action_std,'
@@ -8348,32 +8383,8 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     }
 
     # ---- policy_log_std_min (auto-derived from σ_max) ------------------
-    # When σ_max is tightened (e.g. 0.10 for rate-style controls), the
-    # dataclass default log_std_min = -2.3 (σ_min = 0.10) collides with
-    # σ_max — there's no room left for the actor to express a
-    # *confident* action.  Auto-derive log_std_min as
-    # ``log(σ_max / sigma_min_ratio)`` so the actor always has at
-    # least one decade of headroom to commit to a near-deterministic
-    # action when it has learned a good μ.
-    #
-    # 2026-05-10 (run_p11 RCA): σ_min_ratio=5 → σ_min = σ_max / 5 was
-    # too aggressive on tight σ_max regimes: under noisy critic
-    # advantage the policy collapsed all the way to σ_min, killing
-    # exploration and producing a near-constant deterministic actor
-    # (validation policy_dist std = 0.015 across 1220 steps).  Tighten
-    # to ratio=2.5 → σ_min = σ_max / 2.5 ≈ 40 % of σ_max.  This keeps
-    # the actor confident-enough (still > 1 decade below the V3
-    # paper's σ_max=1.0 reference) while preventing total exploration
-    # collapse when the critic has not stabilised.
-    # 2026-05-27 (P59 refactor): ``sigma_min_ratio`` is now a TrainConfig
-    # field (default 2.5).  Legacy ``SIGMA_MIN_RATIO_OF_MAX`` env-var
-    # still honoured for back-compat.
-    _legacy_ratio_env = os.environ.get('SIGMA_MIN_RATIO_OF_MAX', None)
-    sigma_min_ratio = max(1.3,
-        float(_legacy_ratio_env) if _legacy_ratio_env is not None
-        else float(getattr(cfg, 'sigma_min_ratio', 1.6)))
-    target_sigma_min = target_sigma_max / sigma_min_ratio
-    log_std_min_val = float(np.log(target_sigma_min))
+    sigma_min_ratio = _sig['sigma_min_ratio']
+    log_std_min_val = _sig['log_std_min']
     out['policy_log_std_min'] = {
         'value': log_std_min_val,
         'source': f'log(sigma_max/{sigma_min_ratio:.1f})='
@@ -9296,7 +9307,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         pass
 
     # ---- Reward calibration (V4 reward head expects O(1) per-step rewards) ----
-    obj_scale_env = os.environ.get('OBJ_REWARD_SCALE', 'auto').strip().lower()
+    obj_scale_env, _ = _cfg_or_env(
+        cfg, 'obj_reward_scale', 'OBJ_REWARD_SCALE', 'auto', str)
+    obj_scale_env = str(obj_scale_env or 'auto').strip().lower()
     if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
         cal_mode = str(getattr(cfg, 'reward_cal_mode', 'baseline')
                        or 'baseline').strip().lower() or 'baseline'
@@ -13028,7 +13041,6 @@ _CLI_ONLY_ENV = (
     ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
     ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
     ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
-    ('DREAMER_ATTN_IMPL', 'attn_impl', str),
     ('AGENT_TOTAL_STEPS', 'total_steps', int),
     ('SIM_EPISODE_LENGTH', 'episode_length', int),
     ('SIM_SAMPLE_RATE', 'sample_rate', int),

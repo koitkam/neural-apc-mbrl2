@@ -193,6 +193,19 @@ def _as_compile_mode(s: str) -> str:
     return v
 
 
+def _as_attn_impl(s: str) -> str:
+    """Map ``DREAMER_ATTN_IMPL`` / leftover ``DREAMER_FAST_ATTN`` onto
+    TrainConfig ``attn_impl``.  ``auto`` = SDPA on CUDA."""
+    v = str(s).strip().lower()
+    if v in ('0', 'false', 'off', 'manual'):
+        return 'manual'
+    if v in ('1', 'true', 'yes', 'on', 'sdpa'):
+        return 'sdpa'
+    if v in ('auto', 'manual', 'sdpa'):
+        return v
+    raise ValueError(f'unknown attn_impl={s!r}')
+
+
 ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAE_LAMBDA':         ('gae_lambda',                 float),
     'DREAMER_PHASE1_FRAC':        ('phase1_frac',                float),
@@ -366,14 +379,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # for P3 (actor-critic) regardless of P1/P2 extensions.  Default
     # 0.20 in TrainConfig.  Set to 0.0 to disable (legacy behaviour).
     'DREAMER_PHASE3_MIN_FRAC':    ('phase3_min_frac',            float),
-    # 2026-05-27 (P59 refactor): σ_max / σ_min auto-tune formula inputs
-    # — previously read directly via os.environ.get inside the auto-tune
-    # body, now promoted to TrainConfig fields with whitelist entries
-    # so they appear in run_plan.json → config.  Legacy
-    # ``DREAMER_SIGMA_MAX_OVER_SEED`` / ``DREAMER_SIGMA_MAX_CAP`` /
-    # ``SIGMA_MAX_FLOOR`` / ``SIGMA_MIN_RATIO_OF_MAX`` env-vars still
-    # honoured for back-compat inside auto_tune_seed_buffer; the
-    # canonical path is the cfg field bound here.
+    # 2026-05-27 (P59 refactor): σ_max / σ_min auto-tune formula inputs.
+    # Canonical DREAMER_* path.  Leftover ``SIGMA_MAX_OVER_SEED`` /
+    # ``SIGMA_MAX_FLOOR`` / ``SIGMA_MAX_CAP`` / ``SIGMA_MIN_RATIO_OF_MAX``
+    # still win inside ``_resolve_policy_sigma_bounds`` when the field
+    # is not explicit.  Auto-tune no longer re-reads DREAMER_* (would
+    # beat leftover-vs-explicit order) and no longer floors
+    # ``sigma_min_ratio`` at 1.3 (that undid TrainConfig 1.2).
     'DREAMER_SIGMA_MAX_OVER_SEED': ('sigma_max_mult',            float),
     'DREAMER_SIGMA_MAX_FLOOR':     ('sigma_max_floor',           float),
     'DREAMER_SIGMA_MAX_CAP':       ('sigma_max_cap',             float),
@@ -395,6 +407,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_REWARD_CAL_PCT':              ('reward_cal_pct',               float),
     'DREAMER_REWARD_CAL_PCT_VAL':          ('reward_cal_pct_val',           float),
     'DREAMER_REWARD_CAL_TARGET_SYM_MAG':   ('reward_cal_target_sym_mag',    float),
+    # Gate for percentile→twohot scale.  Was leftover ``OBJ_REWARD_SCALE``
+    # (worked, missing from ``run_plan``).  Identity default ``auto``.
+    'DREAMER_OBJ_REWARD_SCALE':            ('obj_reward_scale',             str),
     # May-2026 P39 probes.  Default 0 / off.  Extra retain_graph
     # backward — not env-free.  Opt in ``=10``.
     'DREAMER_DIAG_PERHEAD_GRADS_EVERY':    ('diag_perhead_grads_every',      int),
@@ -482,6 +497,11 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # skip ``apply_dreamer_env_overrides`` still work.
     'DREAMER_COMPILE':                    ('compile_mode',                   _as_compile_mode),
     'DREAMER_COMPILE_MODE':               ('compile_mode',                   _as_compile_mode),
+    # Attention backend.  Env-free ``auto`` = SDPA on CUDA.  FAST_ATTN
+    # first so ATTN_IMPL wins if both are set.  Was CLI-only
+    # (``single_run`` silently dropped ATTN_IMPL) + constructor env.
+    'DREAMER_FAST_ATTN':                  ('attn_impl',                      _as_attn_impl),
+    'DREAMER_ATTN_IMPL':                  ('attn_impl',                      _as_attn_impl),
     # TSSM (transformer-SSM) backbone dims (world_model_type='tssm').
     'DREAMER_TSSM_D_MODEL':               ('tssm_d_model',                   int),
     'DREAMER_TSSM_N_LAYERS':              ('tssm_n_layers',                  int),

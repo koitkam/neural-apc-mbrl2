@@ -28,7 +28,7 @@ from training.train import (
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
                             _resolve_baseline_seed_op_band, _cfg_or_env,
-                            _cfg_or_env_float,
+                            _cfg_or_env_float, _resolve_policy_sigma_bounds,
                             collect_episode, collect_prbs_episode,
                             _build_dv_prbs_schedule,
                             _isolated_hold_action, _hold_other_action_dims,
@@ -725,6 +725,9 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_PRBS_SEG_MIN': '6',
         'DREAMER_TRAIN_STEPS_PER_ITER': '50',
         'DREAMER_P3_TRAIN_STEPS_PER_ITER': '4',
+        'DREAMER_OBJ_REWARD_SCALE': 'off',
+        'DREAMER_ATTN_IMPL': 'manual',
+        'DREAMER_SIGMA_MIN_RATIO': '1.4',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -753,6 +756,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.prbs_seg_min) == 6
         assert int(cfg.train_steps_per_iter) == 50
         assert int(cfg.phase3_train_steps_per_iter) == 4
+        assert cfg.obj_reward_scale == 'off'
+        assert cfg.attn_impl == 'manual'
+        assert abs(float(cfg.sigma_min_ratio) - 1.4) < 1e-12
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -768,6 +774,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'prbs_seg_min' in explicit
         assert 'train_steps_per_iter' in explicit
         assert 'phase3_train_steps_per_iter' in explicit
+        assert 'obj_reward_scale' in explicit
+        assert 'attn_impl' in explicit
+        assert 'sigma_min_ratio' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1210,6 +1219,13 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_PRBS_SEG_MIN_FLOOR' in ENV_OVERRIDES
     assert 'DREAMER_TRAIN_STEPS_PER_ITER' in ENV_OVERRIDES
     assert 'DREAMER_P3_TRAIN_STEPS_PER_ITER' in ENV_OVERRIDES
+    assert 'DREAMER_OBJ_REWARD_SCALE' in ENV_OVERRIDES
+    assert 'DREAMER_ATTN_IMPL' in ENV_OVERRIDES
+    assert 'DREAMER_FAST_ATTN' in ENV_OVERRIDES
+    assert 'DREAMER_SIGMA_MIN_RATIO' in ENV_OVERRIDES
+    assert c.obj_reward_scale == 'auto'
+    assert c.attn_impl == 'auto'
+    assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
@@ -1615,6 +1631,59 @@ def _test_auto_tune_formula_input_cfg_or_env() -> None:
     print('[smoke] OK  auto-tune formula-input cfg-or-env (default / explicit / leftover)')
 
 
+def _test_policy_sigma_bounds_honours_cfg() -> None:
+    """p10 σ_min_ratio=1.2 must not be floored at leftover 1.3."""
+    import os
+    c = TrainConfig()
+    assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
+    b = _resolve_policy_sigma_bounds(c, 0.219)
+    assert abs(b['sigma_min_ratio'] - 1.2) < 1e-12
+    assert abs(b['target_sigma_min'] - 0.219 / 1.2) < 1e-9
+    c.sigma_min_ratio = 1.2
+    c._explicit_fields = {'sigma_min_ratio'}  # type: ignore[attr-defined]
+    prev = os.environ.get('SIGMA_MIN_RATIO_OF_MAX')
+    try:
+        os.environ['SIGMA_MIN_RATIO_OF_MAX'] = '2.5'
+        b_exp = _resolve_policy_sigma_bounds(c, 0.219)
+        assert abs(b_exp['sigma_min_ratio'] - 1.2) < 1e-12
+        c2 = TrainConfig()
+        b_left = _resolve_policy_sigma_bounds(c2, 0.219)
+        assert abs(b_left['sigma_min_ratio'] - 2.5) < 1e-12
+    finally:
+        if prev is None:
+            os.environ.pop('SIGMA_MIN_RATIO_OF_MAX', None)
+        else:
+            os.environ['SIGMA_MIN_RATIO_OF_MAX'] = prev
+    v, user = _cfg_or_env(TrainConfig(), 'obj_reward_scale',
+                          'OBJ_REWARD_SCALE', 'auto', str)
+    assert v == 'auto' and user is False
+    print('[smoke] OK  policy σ bounds honour TrainConfig 1.2 (leftover still wins)')
+
+
+def _test_attention_auto_ignores_leftover_fast_attn() -> None:
+    """``attn_impl='auto'`` must not re-read leftover ``DREAMER_FAST_ATTN``.
+
+    Whitelist maps FAST_ATTN then ATTN_IMPL onto ``cfg.attn_impl``.
+    Constructor ``auto`` is device-only (SDPA on CUDA, manual on CPU).
+    Smoke uses ``CUDA_VISIBLE_DEVICES=""`` so leftover FAST_ATTN=1
+    used to force SDPA on CPU.
+    """
+    import os
+    from models.dreamer_v4 import CausalAttention
+    prev = os.environ.get('DREAMER_FAST_ATTN')
+    try:
+        os.environ['DREAMER_FAST_ATTN'] = '1'
+        blk = CausalAttention(8, 2, attn_impl='auto')
+        expected = 'sdpa' if torch.cuda.is_available() else 'manual'
+        assert blk.attn_impl == expected, (blk.attn_impl, expected)
+    finally:
+        if prev is None:
+            os.environ.pop('DREAMER_FAST_ATTN', None)
+        else:
+            os.environ['DREAMER_FAST_ATTN'] = prev
+    print('[smoke] OK  CausalAttention auto ignores leftover FAST_ATTN')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -1856,6 +1925,8 @@ if __name__ == '__main__':
     _test_resolve_baseline_seed_op_band()
     _test_cfg_or_env_float_identity()
     _test_auto_tune_formula_input_cfg_or_env()
+    _test_policy_sigma_bounds_honours_cfg()
+    _test_attention_auto_ignores_leftover_fast_attn()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

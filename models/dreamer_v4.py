@@ -163,12 +163,15 @@ class CausalAttention(nn.Module):
     causal attention in a single 1-D sequence.
 
     ``attn_impl`` selects the backend:
-      * ``'manual'`` (default if ``soft_cap > 0``) — explicit matmul + softmax
-        with logit soft-cap. Paper-faithful but ~2× slower.
-      * ``'sdpa'``  — ``F.scaled_dot_product_attention`` (auto-dispatches to
-        FlashAttention-2 / cuDNN / mem-efficient). Drops soft-cap; QKNorm
-        provides the main numerical safety net. Set via env
-        ``DREAMER_FAST_ATTN=1`` or constructor arg.
+      * ``'manual'`` — explicit matmul + softmax with logit soft-cap.
+        Paper-faithful but ~2× slower. ONNX export always passes this.
+      * ``'sdpa'``  — ``F.scaled_dot_product_attention`` (FlashAttention-2 /
+        cuDNN). Drops soft-cap; QKNorm is the numerical safety net.
+      * ``'auto'`` (TrainConfig default) — SDPA on CUDA, manual on CPU.
+        Do **not** re-read leftover ``DREAMER_FAST_ATTN`` here:
+        ``ENV_OVERRIDES`` already maps FAST_ATTN then ATTN_IMPL onto
+        ``cfg.attn_impl`` (ATTN_IMPL wins). Re-reading env on ``auto``
+        would let leftover FAST_ATTN beat an explicit ``auto``.
     """
 
     def __init__(self, dim: int, n_heads: int, soft_cap: float = 50.0,
@@ -183,25 +186,12 @@ class CausalAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.soft_cap = soft_cap
-        # Resolve backend.
-        # Default policy (2026-05-12): SDPA whenever a CUDA device is
-        # available (FlashAttention-2 / cuDNN — ~3-9× faster than the
-        # manual soft-cap path with QKNorm providing the numerical
-        # safety net). CPU paths stay on 'manual' (SDPA gains are tiny
-        # without GPU kernels and ONNX export still passes
-        # attn_impl='manual' explicitly). Override via env
-        # DREAMER_FAST_ATTN: '0'/'manual' forces manual, '1'/'sdpa'
-        # forces sdpa.
+        # Resolve ``auto`` from the device only.  Override is
+        # ``cfg.attn_impl`` (``DREAMER_ATTN_IMPL`` / leftover
+        # ``DREAMER_FAST_ATTN`` via ``ENV_OVERRIDES``).  CPU stays
+        # manual (SDPA gains are tiny; ONNX passes ``manual``).
         if attn_impl == 'auto':
-            env_fast = os.environ.get('DREAMER_FAST_ATTN', '').strip().lower()
-            if env_fast in ('0', 'false', 'manual', 'off'):
-                attn_impl = 'manual'
-            elif env_fast in ('1', 'true', 'sdpa', 'on'):
-                attn_impl = 'sdpa'
-            elif torch.cuda.is_available():
-                attn_impl = 'sdpa'
-            else:
-                attn_impl = 'manual'
+            attn_impl = 'sdpa' if torch.cuda.is_available() else 'manual'
         assert attn_impl in ('manual', 'sdpa'), f'unknown attn_impl={attn_impl}'
         self.attn_impl = attn_impl
 

@@ -251,17 +251,19 @@ search *and* keep warm-starting model weights.
 
 | Var | Effect |
 |---|---|
-| `OBJ_REWARD_SCALE` | `auto` (default) / `off` / `<float>` — disable or force reward scale |
+| `OBJ_REWARD_SCALE` | leftover alias of `DREAMER_OBJ_REWARD_SCALE` (`auto` / `off` / `<float>`). Canonical path is the DREAMER_* whitelist. |
+| `DREAMER_OBJ_REWARD_SCALE` | `auto` (default) / `off` / `<float>` — disable or force reward scale |
 | `OBJ_BATCH_SIZE` | force a batch size (else auto from GPU mem) |
 | `SIM_EPISODE_LENGTH` | force episode length (else auto from settling time) |
 | `SIM_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10`) |
 | `SEED` | RNG seed (default 0) |
-| `DREAMER_FAST_ATTN` | `1`/`sdpa` force SDPA, `0`/`manual` force the paper soft-cap path. **Default: SDPA whenever a CUDA device is available** (~6–9× faster than manual; QKNorm provides numerical safety). ONNX export always uses `manual`. |
-| `SEED_TARGET_CV_FRAC` | seed-PRBS amplitude as a fraction of avg CV-bound width (default 0.20). Lower → narrower exploration; raise for plants where the actor needs to learn large MV moves. |
-| `SIGMA_MAX_CAP` | upper bound on the auto-derived policy `σ_max` (default 0.30). Raise to allow wider directional MV swings; lower to keep exploration tight. |
-| `SIGMA_MAX_FLOOR` | lower bound on the auto-derived `σ_max` (default 0.10). |
-| `SIGMA_MAX_OVER_SEED` | multiplier of `baseline_seed_action_std` used to set `σ_max` (default 1.0). |
-| `SIGMA_MIN_RATIO_OF_MAX` | `σ_min = σ_max / ratio` (default 2.5, min 2.0). |
+| `DREAMER_ATTN_IMPL` | `auto` (default: SDPA on CUDA) / `sdpa` / `manual`. Leftover `DREAMER_FAST_ATTN` (`1`/`sdpa`, `0`/`manual`) maps to the same field. |
+| `DREAMER_FAST_ATTN` | leftover alias of `DREAMER_ATTN_IMPL`. |
+| `SEED_TARGET_CV_FRAC` | leftover alias of `DREAMER_SEED_TARGET_CV_FRAC` (default 0.20). |
+| `SIGMA_MAX_CAP` | leftover alias of `DREAMER_SIGMA_MAX_CAP` (default 0.30). |
+| `SIGMA_MAX_FLOOR` | leftover alias of `DREAMER_SIGMA_MAX_FLOOR` (default 0.10). |
+| `SIGMA_MAX_OVER_SEED` | leftover alias of `DREAMER_SIGMA_MAX_OVER_SEED` (default 1.0). |
+| `SIGMA_MIN_RATIO_OF_MAX` | leftover alias of `DREAMER_SIGMA_MIN_RATIO` (`σ_min = σ_max / ratio`, default **1.2**). |
 | `OBJ_AUTO_ECON_OVER_MOVE_RATIO` | minimum ratio of `econ_budget` to per-step MV move penalty at typical actor jitter (default 2.0). Caps `move_base` so the user's economics term always strictly dominates the move term. Set to 1.0 to disable the cap; set higher (e.g. 5.0) for plants where you want the actor to ignore move pressure entirely while economics is small. |
 
 #### Hidden unmeasured-disturbance model + noise curriculum (P90)
@@ -504,10 +506,10 @@ early via the `on_iter_end` callback in the trainer.
 | `model_size` | M | `S/M/L` from complexity score | — |
 | `trial_steps` | 50 000 | `40 eps × max(1, complexity / 4) × ep_len`, clamped | `--trial_steps` |
 | `final_steps` | 200 000 | `10 × trial_steps`, clamped | `--final_steps` |
-| `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_FAST_ATTN` |
-| `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, SEED_SIGMA_CAP)` with `target_cv_frac=0.20` | `SEED_TARGET_CV_FRAC`, `SEED_SIGMA_CAP` |
-| `policy_log_std_max` | log(1.0) | `log(clip(SIGMA_MAX_OVER_SEED × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `SIGMA_MAX_CAP`, `SIGMA_MAX_FLOOR`, `SIGMA_MAX_OVER_SEED` |
-| `policy_log_std_min` | log(0.1) | `log(σ_max / SIGMA_MIN_RATIO_OF_MAX)` (default ratio 2.5) | `SIGMA_MIN_RATIO_OF_MAX` |
+| `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_ATTN_IMPL` / leftover `DREAMER_FAST_ATTN` |
+| `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, SEED_SIGMA_CAP)` with `target_cv_frac=0.20` | `DREAMER_SEED_TARGET_CV_FRAC`, leftover `SEED_TARGET_CV_FRAC` |
+| `policy_log_std_max` | log(1.0) | `log(clip(σ_max_mult × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `DREAMER_SIGMA_MAX_*` / leftover `SIGMA_MAX_*` |
+| `policy_log_std_min` | log(0.1) | `log(σ_max / sigma_min_ratio)` (default ratio **1.2**) | `DREAMER_SIGMA_MIN_RATIO` / leftover `SIGMA_MIN_RATIO_OF_MAX` |
 
 ## Cascade stabilizers — fixed defaults
 
