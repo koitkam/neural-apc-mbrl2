@@ -152,7 +152,7 @@ def main() -> int:
     print('[run] phase 1a: dynamics identification', flush=True)
     from workflow._plant_prepare import (
         identify_dynamics, build_noise_config, identify_lookback,
-        apply_dreamer_env_overrides,
+        apply_dreamer_env_overrides, explicit_batch_size,
     )
     plant_dir = out_dir / 'plant_id'
     plant_info = identify_dynamics(plant_dir)
@@ -295,7 +295,10 @@ def main() -> int:
     # measure: the actor/critic/optimizer state and the Phase-3 imagination
     # rollout (horizon-step latent unroll).  TrainConfig ``wm_overhead``
     # (leftover ``DREAMER_WM_OVERHEAD``); identity 1.30.  Probe runs
-    # before TrainConfig exists, so this still reads env.
+    # before TrainConfig exists, so this still reads env.  Same class:
+    # ``gpu_target_util`` / ``gpu_max_bs`` (leftover ``DREAMER_TARGET_UTIL``
+    # / ``DREAMER_MAX_BS``).  ``explicit_batch_size`` pins B and skips
+    # the probe (``DREAMER_BATCH_SIZE`` then leftover ``OBJ_BATCH_SIZE``).
     try:
         _wm_overhead = float(os.environ.get('DREAMER_WM_OVERHEAD', '1.30'))
     except ValueError:
@@ -305,18 +308,10 @@ def main() -> int:
     # so a slow plant's DC-gain window is in the memory budget (follow-up 13).
     # test_sim seq_len=64, H≈55 → unchanged.
     _probe_T = wm_train_seq_len_for_plant(seq_len, horizon, int(episode_length))
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
-    if bs_env:
-        try:
-            batch_size = max(1, int(bs_env))
-            bs_info = {'batch_size': batch_size, 'source': 'env_override'}
-        except Exception:
-            bs_info = pick_batch_size_for_plant(
-                model_size=model_size, seq_len=_probe_T, lookback=lookback,
-                horizon=horizon, k_max=k_max, sample_rate=sample_rate,
-                episode_length=int(episode_length),
-                wm_overhead_factor=_wm_overhead)
-            batch_size = int(bs_info['batch_size'])
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        batch_size = bs_pin
+        bs_info = {'batch_size': batch_size, 'source': 'env_override'}
     else:
         bs_info = pick_batch_size_for_plant(
             model_size=model_size, seq_len=_probe_T, lookback=lookback,

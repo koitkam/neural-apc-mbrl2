@@ -206,6 +206,24 @@ def _as_attn_impl(s: str) -> str:
     raise ValueError(f'unknown attn_impl={s!r}')
 
 
+def explicit_batch_size() -> Optional[int]:
+    """Skip the GPU-calib probe when a batch size is already pinned.
+
+    Canonical ``DREAMER_BATCH_SIZE`` wins.  Leftover ``OBJ_BATCH_SIZE``
+    still wins when the DREAMER field is unset (same leftover-env class
+    as ``OBJ_REWARD_SCALE``).  ``None`` → empirical probe.
+    """
+    for key in ('DREAMER_BATCH_SIZE', 'OBJ_BATCH_SIZE'):
+        raw = os.environ.get(key, '').strip()
+        if not raw:
+            continue
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            continue
+    return None
+
+
 ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAE_LAMBDA':         ('gae_lambda',                 float),
     'DREAMER_PHASE1_FRAC':        ('phase1_frac',                float),
@@ -264,6 +282,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_INIT_RANDOMIZATION':      ('init_randomization',      _as_bool),
     'DREAMER_INIT_RANDOMIZATION_FRAC': ('init_randomization_frac', float),
     'DREAMER_WM_OVERHEAD':             ('wm_overhead',             float),
+    # GPU-calib budget + hard batch pin.  Were leftover ``os.environ.get``
+    # in ``tools/gpu_calibrate.py`` / ``OBJ_BATCH_SIZE`` in single_run/BO
+    # (worked, missing from ``run_plan``).  Identity 0.80 / 512.
+    # Probe still dual-reads env (runs before TrainConfig exists).
+    'DREAMER_TARGET_UTIL':             ('gpu_target_util',         float),
+    'DREAMER_MAX_BS':                  ('gpu_max_bs',              int),
+    'DREAMER_BATCH_SIZE':              ('batch_size',              int),
     # Per-CV rolling int_err/Δcv/var in aug-obs (P37 ON via leftover env).
     # Sentinel window 0 = auto 2τ/sr.  Identity: default ON / auto.
     'DREAMER_DERIVED_OBSERVABLES':     ('derived_observables',        _as_bool),

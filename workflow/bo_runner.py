@@ -147,6 +147,7 @@ from workflow._plant_prepare import (  # noqa: E402
     identify_lookback,
     build_noise_config as _build_noise_config,
     apply_dreamer_env_overrides,
+    explicit_batch_size,
 )
 
 
@@ -361,18 +362,10 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
     # horizon) so repeated trials with same shape skip the ~10 s probe).
     # Probe T is the P1/P2 DC-gain window (follow-up 13), not seq_len.
     _probe_T = _wm_probe_T(base, horizon)
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
-    if bs_env:
-        try:
-            bs = max(1, int(bs_env))
-            bs_info = {'batch_size': bs, 'source': 'env_override'}
-        except Exception:
-            bs_info = pick_batch_size_for_plant(
-                model_size=model_size, seq_len=_probe_T,
-                lookback=lookback, horizon=horizon, k_max=int(base.k_max),
-                sample_rate=int(base.sample_rate),
-                episode_length=int(base.episode_length))
-            bs = int(bs_info['batch_size'])
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        bs = bs_pin
+        bs_info = {'batch_size': bs, 'source': 'env_override'}
     else:
         bs_info = pick_batch_size_for_plant(
             model_size=model_size, seq_len=_probe_T,
@@ -498,17 +491,10 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
                            int(base.sample_rate))
     H_init = horizon
 
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
     _probe_T = _wm_probe_T(base, horizon)
-    if bs_env:
-        try:
-            bs = max(1, int(bs_env))
-        except Exception:
-            bs = int(pick_batch_size_for_plant(
-                model_size=model_size, seq_len=_probe_T,
-                lookback=lookback, horizon=horizon, k_max=int(base.k_max),
-                sample_rate=int(base.sample_rate),
-                episode_length=int(base.episode_length))['batch_size'])
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        bs = bs_pin
     else:
         bs = int(pick_batch_size_for_plant(
             model_size=model_size, seq_len=_probe_T,
@@ -726,19 +712,10 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
                                 float(plant.get('dead_time', 0.0)),
                                 int(base.sample_rate))
     _probe_T = _wm_probe_T(base, seed_horizon)
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
-    if bs_env:
-        try:
-            base.batch_size = max(1, int(bs_env))
-            bs_info = {'batch_size': base.batch_size, 'source': 'env_override'}
-        except Exception:
-            bs_info = pick_batch_size_for_plant(
-                model_size=derived_model_size,
-                seq_len=_probe_T, lookback=int(plant['lookback']),
-                horizon=int(seed_horizon), k_max=int(base.k_max),
-                sample_rate=int(base.sample_rate),
-                episode_length=int(base.episode_length))
-            base.batch_size = int(bs_info['batch_size'])
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        base.batch_size = bs_pin
+        bs_info = {'batch_size': base.batch_size, 'source': 'env_override'}
     else:
         bs_info = pick_batch_size_for_plant(
             model_size=derived_model_size,

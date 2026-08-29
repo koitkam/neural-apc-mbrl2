@@ -1986,6 +1986,13 @@ class TrainConfig:
     # missing from ``run_plan``).  Identity 1.30.  Probe still reads env
     # before TrainConfig exists (dual-read).
     wm_overhead: float = 1.30
+    # GPU-calib VRAM budget + hard ceiling.  Were leftover
+    # ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS`` in gpu_calibrate
+    # (worked, missing from ``run_plan``).  Identity 0.80 / 512.
+    # ``DREAMER_BATCH_SIZE`` pins ``batch_size`` and skips the probe
+    # (leftover ``OBJ_BATCH_SIZE`` still wins when DREAMER is unset).
+    gpu_target_util: float = 0.80
+    gpu_max_bs: int = 512
 
     # ----- Resolved at build-time -----
     obs_dim: int = 0

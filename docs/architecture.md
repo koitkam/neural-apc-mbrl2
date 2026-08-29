@@ -25,8 +25,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > val-suite gates, horizon formula (`horizon_settle_n_tau` /
 > `horizon_max`), IC randomization, GPU-calib `wm_overhead`, derived
 > observables, and **noise / hidden-load schedule** knobs
-> (`process_noise_amp_ramp`, `hidden_dist_*`, `disturbance_prob_*`) are
-> TrainConfig + `ENV_OVERRIDES`.
+> (`process_noise_amp_ramp`, `hidden_dist_*`, `disturbance_prob_*`) plus
+> GPU-calib budget (`gpu_target_util` / `gpu_max_bs` / `DREAMER_BATCH_SIZE`)
+> are TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**

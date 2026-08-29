@@ -736,6 +736,9 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_INIT_RANDOMIZATION': '0',
         'DREAMER_INIT_RANDOMIZATION_FRAC': '0.4',
         'DREAMER_WM_OVERHEAD': '1.5',
+        'DREAMER_TARGET_UTIL': '0.65',
+        'DREAMER_MAX_BS': '64',
+        'DREAMER_BATCH_SIZE': '32',
         'DREAMER_DERIVED_OBSERVABLES': '0',
         'DREAMER_DERIVED_OBS_WINDOW': '16',
         'DREAMER_PROCESS_NOISE_AMP_RAMP': '0.1:0.5',
@@ -782,6 +785,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.init_randomization is False
         assert abs(float(cfg.init_randomization_frac) - 0.4) < 1e-12
         assert abs(float(cfg.wm_overhead) - 1.5) < 1e-12
+        assert abs(float(cfg.gpu_target_util) - 0.65) < 1e-12
+        assert int(cfg.gpu_max_bs) == 64
+        assert int(cfg.batch_size) == 32
         assert cfg.derived_observables is False
         assert int(cfg.derived_observables_window) == 16
         assert cfg.process_noise_amp_ramp == '0.1:0.5'
@@ -815,6 +821,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'init_randomization' in explicit
         assert 'init_randomization_frac' in explicit
         assert 'wm_overhead' in explicit
+        assert 'gpu_target_util' in explicit
+        assert 'gpu_max_bs' in explicit
+        assert 'batch_size' in explicit
         assert 'derived_observables' in explicit
         assert 'derived_observables_window' in explicit
         assert 'process_noise_amp_ramp' in explicit
@@ -1290,11 +1299,16 @@ def _test_envfree_observer_recipe() -> None:
     assert c.init_randomization is True
     assert abs(float(c.init_randomization_frac) - 0.6) < 1e-12
     assert abs(float(c.wm_overhead) - 1.30) < 1e-12
+    assert abs(float(c.gpu_target_util) - 0.80) < 1e-12
+    assert int(c.gpu_max_bs) == 512
     assert 'DREAMER_HORIZON_SETTLE_NTAU' in ENV_OVERRIDES
     assert 'DREAMER_HORIZON_MAX' in ENV_OVERRIDES
     assert 'DREAMER_INIT_RANDOMIZATION' in ENV_OVERRIDES
     assert 'DREAMER_INIT_RANDOMIZATION_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_WM_OVERHEAD' in ENV_OVERRIDES
+    assert 'DREAMER_TARGET_UTIL' in ENV_OVERRIDES
+    assert 'DREAMER_MAX_BS' in ENV_OVERRIDES
+    assert 'DREAMER_BATCH_SIZE' in ENV_OVERRIDES
     assert c.obj_reward_scale == 'auto'
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -1807,6 +1821,8 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
     assert c.init_randomization is True
     assert abs(float(c.init_randomization_frac) - 0.6) < 1e-12
     assert abs(float(c.wm_overhead) - 1.30) < 1e-12
+    assert abs(float(c.gpu_target_util) - 0.80) < 1e-12
+    assert int(c.gpu_max_bs) == 512
     assert _enabled() is True
     assert abs(_frac() - 0.6) < 1e-12
     h, src = derive_horizon(tau=55.0, dead_time=8.0, sample_rate=4)
@@ -1939,6 +1955,35 @@ def _test_noise_hidden_cfg() -> None:
             else:
                 os.environ[k] = old
     print('[smoke] OK  process-noise / hidden-load TrainConfig + leftover env identity')
+
+
+def _test_gpu_calib_cfg() -> None:
+    """GPU-calib budget + batch pin: TrainConfig default, leftover OBJ, DREAMER wins."""
+    import os
+    from workflow._plant_prepare import ENV_OVERRIDES, explicit_batch_size
+    c = TrainConfig()
+    assert abs(float(c.gpu_target_util) - 0.80) < 1e-12
+    assert int(c.gpu_max_bs) == 512
+    assert 'DREAMER_TARGET_UTIL' in ENV_OVERRIDES
+    assert 'DREAMER_MAX_BS' in ENV_OVERRIDES
+    assert 'DREAMER_BATCH_SIZE' in ENV_OVERRIDES
+    keys = ('DREAMER_BATCH_SIZE', 'OBJ_BATCH_SIZE')
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        assert explicit_batch_size() is None
+        os.environ['OBJ_BATCH_SIZE'] = '24'
+        assert explicit_batch_size() == 24
+        os.environ['DREAMER_BATCH_SIZE'] = '48'
+        assert explicit_batch_size() == 48
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  GPU-calib TrainConfig + DREAMER_BATCH_SIZE beats leftover OBJ')
 
 
 def _test_adv_action_corr_vectorized() -> None:
@@ -2270,6 +2315,7 @@ if __name__ == '__main__':
     _test_horizon_ic_overhead_cfg_or_env()
     _test_derived_observables_cfg()
     _test_noise_hidden_cfg()
+    _test_gpu_calib_cfg()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

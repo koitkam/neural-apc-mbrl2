@@ -221,7 +221,9 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
             'target_util': target_util, 'min_bs': paper_default, 'max_bs': max_bs,
             'world_model_type': wmt,
             'wm_overhead_factor': wm_overhead_factor, 'bs_probe': bs_probe}
-    # Env-var overrides.
+    # Dual-read leftover env (probe runs before TrainConfig exists).
+    # Canonical fields: TrainConfig ``gpu_target_util`` / ``gpu_max_bs``
+    # + ``ENV_OVERRIDES`` ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``.
     env_util = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
     if env_util:
         try:
