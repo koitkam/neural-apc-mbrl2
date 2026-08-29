@@ -396,7 +396,7 @@ Warm-restore no-ops when `wm_best.pt` is essentially the current state.
 Four lightweight knobs to localise *why* a fidelity cliff happens even
 when supervised losses look healthy. **Default OFF** (extra
 `autograd.grad(retain_graph=True)` every N iters is not env-free). Opt
-in via env (read in `train.py`, not `ENV_OVERRIDES`). B and C stay
+in via `DREAMER_DIAG_*` (`ENV_OVERRIDES` / TrainConfig). B and C stay
 controlled-experiment switches.
 
 | Var | Effect |

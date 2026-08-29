@@ -15,11 +15,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
-> `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46 live A/B:
-> `DREAMER_P3_RESET_LOG_STD=1` (default False). P1 last-ok **locked 58**
-> (skip 0; P45 unlocked). One GPU job. Do not promote other plants until
-> linear observer+actor are healthy. P3 collect still omits measured DV
-> and Kalman (train/serve hole — do not patch until P46 verdicts).
+> `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46 EXIT: σ-reset
+> opened entropy (−0.101) then re-collapsed; econ **−256 vs −129**. Do
+> **not** promote `p3_reset_log_std` (default False). P47 completes Adam
+> log_std-row zero (same env). Do not promote other plants until linear
+> observer+actor are healthy. P3 collect still omits measured DV and
+> Kalman (train/serve hole — do not patch until P47 verdicts).
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**
@@ -372,13 +373,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > (pred_std 0.182 vs true 1.93). **P45 P3** first valid actor test:
 > freeze rscale KEEP (1.15→2.18); min-of-2 FALSIFIED as sufficient
 > (entropy pinned σ_min −0.363 from P1/P2 BC; econ −216 vs −92).
-> **P46 opt-in** `p3_reset_log_std` (`DREAMER_P3_RESET_LOG_STD=1`):
+> **P46 EXIT** `p3_reset_log_std` KEEP-AS-OVERRIDE (default False):
 > zero last-Linear log_std rows at P3 entry so σ=`policy_init_log_std`;
-> μ (BC) kept; **also zero Adam log_std-row moments** so P2 NLL momentum
-> cannot re-collapse σ at the first unfreeze (P46 pid 24426 is
-> weights-only). Default False until GPU. P3 on-policy collect streams
-> `_posterior_step` (skip unused prior heads; identity vs `obs_step` with
-> `obs=None`). Do not stack more critic knobs.
+> μ (BC) kept. Pid 24426 was **weights-only**. Entropy opened **−0.101**
+> then yanked −0.323 at unfreeze and re-collapsed; econ **−256 vs −129**.
+> Opening σ is not sufficient (frozen BC μ still limit-rides). HEAD also
+> zeros Adam log_std-row moments (P47 same env). P3 on-policy collect
+> streams `_posterior_step`. Do not stack more critic knobs.
 > Do not concat rest rows into the main `sample=True` WM rollout
 > (GRU would see sampled `c`). `actor_train_source` other than
 > `realsim` is refused at `train()` start.
@@ -519,8 +520,8 @@ flowchart TB
 P3 **collect** streams `_posterior_step` without measured DV (GRU zero-fills)
 and without the Kalman innovation (`obs=None` ⇒ `d_t` decays from 0).
 Training `_realsim_actor_critic_step` re-encodes the stored trajectory with
-both. That train/serve hole is a later attributed P3 change (not while P46
-σ-reset is live).
+both. That train/serve hole is a later attributed P3 change (not while P47
+Adam-complete σ-reset is live).
 
 ### Reading the diagram
 - **World model** learns the plant from `obs`: `encoder → posterior z` (sees obs),
@@ -680,11 +681,10 @@ fixes BOTH:
   `rollout_observed(..., last_only=True, return_feats=False)` via
   Stage-1 `_posterior_step`. When the rest cache is present, P44
   WM-held settle is skipped. Isolation loss stays 0. jsonl `*_ratio` =
-  mean G_pred/G_tgt. **P46** `p3_reset_log_std` (default False; opt-in
-  `DREAMER_P3_RESET_LOG_STD=1`) zeros last-Linear log_std rows at P3
-  entry (σ=`policy_init_log_std`; μ kept) **and** Adam log_std-row
-  moments — P45 P3 started at σ_min. P3 collect streams
-  `_posterior_step`.
+  mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE
+  (default False). Residual is last Linear (ent −0.101); opening σ
+  not sufficient (econ −256 vs −129). P47 zeros Adam log_std-row
+  moments on the same env. P3 collect streams `_posterior_step`.
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.

@@ -27,7 +27,7 @@ from training.train import (
                             _p1_fidelity_local_plateau,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
-                            _resolve_baseline_seed_op_band,
+                            _resolve_baseline_seed_op_band, _cfg_or_env_float,
                             collect_episode, collect_prbs_episode,
                             _build_dv_prbs_schedule,
                             _isolated_hold_action, _hold_other_action_dims,
@@ -715,6 +715,10 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_BASELINE_SEED_OP_BAND': '0.4',
         'DREAMER_CONST_ACTION_OP_BAND': '0.55',
         'DREAMER_PRBS_SEED_OP_BAND': '0.8',
+        'DREAMER_REWARD_RAW_CLIP_MIN': '-30',
+        'DREAMER_REWARD_CAL_PCT': '90',
+        'DREAMER_DIAG_PERHEAD_GRADS_EVERY': '10',
+        'DREAMER_RUN_WM_DIAGNOSTIC': '0',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -734,12 +738,20 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.baseline_seed_op_band) - 0.4) < 1e-12
         assert abs(float(cfg.constant_action_seed_op_band) - 0.55) < 1e-12
         assert abs(float(cfg.prbs_seed_op_band) - 0.8) < 1e-12
+        assert abs(float(cfg.reward_raw_clip_min) + 30.0) < 1e-12
+        assert abs(float(cfg.reward_cal_pct) - 90.0) < 1e-12
+        assert int(cfg.diag_perhead_grads_every) == 10
+        assert cfg.run_wm_diagnostic is False
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
         assert 'baseline_seed_op_band' in explicit
         assert 'constant_action_seed_op_band' in explicit
         assert 'prbs_seed_op_band' in explicit
+        assert 'reward_raw_clip_min' in explicit
+        assert 'reward_cal_pct' in explicit
+        assert 'diag_perhead_grads_every' in explicit
+        assert 'run_wm_diagnostic' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1005,8 +1017,13 @@ def _test_isolation_dcv_scales() -> None:
     assert 'bool(is_mv_bm.any())' not in _src
     assert 'wm_isolation_mv_traj' in _src
     assert 'summary_scope' in _src
-    assert "get('DREAMER_DIAG_PERHEAD_GRADS_EVERY', '0')" in _src
-    assert "get('DREAMER_DIAG_LATENT_STABILITY_EVERY', '0')" in _src
+    assert 'diag_perhead_grads_every' in _src
+    assert 'diag_latent_stability_every' in _src
+    assert "getattr(cfg, 'diag_perhead_grads_every'" in _src
+    assert "getattr(cfg, 'diag_latent_stability_every'" in _src
+    assert "getattr(cfg, 'reward_cal_mode'" in _src
+    assert "getattr(cfg, 'run_wm_diagnostic'" in _src
+    assert '_cfg_or_env_float' in _src
     assert _isolation_dcv_scales(cfg, 1, 0, 0.6) == ([1.0], [])
     assert _gain_col_rms(((-2.8, 0.0),))[0] > 1.0
     class _DvSim:
@@ -1128,6 +1145,16 @@ def _test_envfree_observer_recipe() -> None:
     assert abs(float(c.baseline_seed_op_band) - 0.6) < 1e-12
     assert abs(float(c.constant_action_seed_op_band) - 0.6) < 1e-12
     assert abs(float(c.prbs_seed_op_band) - 0.95) < 1e-12
+    assert abs(float(c.reward_raw_clip_min) + 1e6) < 1e-6
+    assert abs(float(c.reward_raw_clip_max) - 1e18) < 1e6
+    assert abs(float(c.reward_cal_pct) - 95.0) < 1e-12
+    assert abs(float(c.reward_cal_target_sym_mag) - 6.0) < 1e-12
+    assert int(c.diag_perhead_grads_every) == 0
+    assert int(c.diag_latent_stability_every) == 0
+    assert c.diag_disable_reward_mtp_in_p1 is False
+    assert c.run_wm_diagnostic is True
+    assert int(c.wm_diag_n_starts) == 8
+    assert int(c.wm_diag_horizon) == 0
     assert c.actor_train_source == 'realsim'
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
@@ -1137,6 +1164,20 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_BASELINE_SEED_OP_BAND' in ENV_OVERRIDES
     assert 'DREAMER_CONST_ACTION_OP_BAND' in ENV_OVERRIDES
     assert 'DREAMER_PRBS_SEED_OP_BAND' in ENV_OVERRIDES
+    assert 'DREAMER_REWARD_RAW_CLIP_MIN' in ENV_OVERRIDES
+    assert 'DREAMER_REWARD_RAW_CLIP_MAX' in ENV_OVERRIDES
+    assert 'DREAMER_REWARD_CAL_MODE' in ENV_OVERRIDES
+    assert 'DREAMER_REWARD_CAL_TARGET' in ENV_OVERRIDES
+    assert 'DREAMER_REWARD_CAL_PCT' in ENV_OVERRIDES
+    assert 'DREAMER_REWARD_CAL_PCT_VAL' in ENV_OVERRIDES
+    assert 'DREAMER_REWARD_CAL_TARGET_SYM_MAG' in ENV_OVERRIDES
+    assert 'DREAMER_DIAG_PERHEAD_GRADS_EVERY' in ENV_OVERRIDES
+    assert 'DREAMER_DIAG_LATENT_STABILITY_EVERY' in ENV_OVERRIDES
+    assert 'DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1' in ENV_OVERRIDES
+    assert 'DREAMER_DIAG_REWARD_MTP_STOP_GRAD_IN_P1' in ENV_OVERRIDES
+    assert 'DREAMER_RUN_WM_DIAGNOSTIC' in ENV_OVERRIDES
+    assert 'DREAMER_WM_DIAG_N_STARTS' in ENV_OVERRIDES
+    assert 'DREAMER_WM_DIAG_HORIZON' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
@@ -1489,6 +1530,33 @@ def _test_resolve_baseline_seed_op_band() -> None:
     print('[smoke] OK  baseline_seed_op_band env-free min(0.6, PRBS); explicit wins')
 
 
+def _test_cfg_or_env_float_identity() -> None:
+    """Reward clip/cal identity: TrainConfig default, explicit, leftover env."""
+    import os
+    c = TrainConfig()
+    v, user = _cfg_or_env_float(c, 'reward_raw_clip_min',
+                                'DREAMER_REWARD_RAW_CLIP_MIN', -1e6)
+    assert abs(v + 1e6) < 1e-6 and user is False
+    c.reward_raw_clip_min = -30.0
+    c._explicit_fields = {'reward_raw_clip_min'}  # type: ignore[attr-defined]
+    v, user = _cfg_or_env_float(c, 'reward_raw_clip_min',
+                                'DREAMER_REWARD_RAW_CLIP_MIN', -1e6)
+    assert abs(v + 30.0) < 1e-12 and user is True
+    prev = os.environ.get('DREAMER_REWARD_RAW_CLIP_MAX')
+    try:
+        os.environ['DREAMER_REWARD_RAW_CLIP_MAX'] = '100.0'
+        c2 = TrainConfig()
+        v, user = _cfg_or_env_float(c2, 'reward_raw_clip_max',
+                                    'DREAMER_REWARD_RAW_CLIP_MAX', 1e18)
+        assert abs(v - 100.0) < 1e-12 and user is True
+    finally:
+        if prev is None:
+            os.environ.pop('DREAMER_REWARD_RAW_CLIP_MAX', None)
+        else:
+            os.environ['DREAMER_REWARD_RAW_CLIP_MAX'] = prev
+    print('[smoke] OK  reward clip/cal cfg-or-env identity (default / explicit / leftover)')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -1728,6 +1796,7 @@ if __name__ == '__main__':
     _test_gain_match_rest_ic()
     _test_p3_reset_log_std()
     _test_resolve_baseline_seed_op_band()
+    _test_cfg_or_env_float_identity()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

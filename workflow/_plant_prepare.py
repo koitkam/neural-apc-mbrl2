@@ -367,6 +367,29 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # reward_clip_tail_k docstrings for rationale.
     'DREAMER_REWARD_CLIP_ASYM_THRESHOLD': ('reward_clip_asymmetry_threshold', float),
     'DREAMER_REWARD_CLIP_TAIL_K':         ('reward_clip_tail_k',              float),
+    # P43/P57/P62: raw-reward safety clip + calibration.  Were
+    # ``os.environ.get`` in APCEnv / ``train()`` (worked, missing from
+    # ``run_plan``).  Defaults unchanged (−1e6 / 1e18 / baseline /
+    # percentile / p95 / 0.5 / sym_mag 6.0).
+    'DREAMER_REWARD_RAW_CLIP_MIN':        ('reward_raw_clip_min',           float),
+    'DREAMER_REWARD_RAW_CLIP_MAX':        ('reward_raw_clip_max',           float),
+    'DREAMER_REWARD_CAL_MODE':             ('reward_cal_mode',              str),
+    'DREAMER_REWARD_CAL_TARGET':           ('reward_cal_target',            str),
+    'DREAMER_REWARD_CAL_PCT':              ('reward_cal_pct',               float),
+    'DREAMER_REWARD_CAL_PCT_VAL':          ('reward_cal_pct_val',           float),
+    'DREAMER_REWARD_CAL_TARGET_SYM_MAG':   ('reward_cal_target_sym_mag',    float),
+    # May-2026 P39 probes.  Default 0 / off.  Extra retain_graph
+    # backward — not env-free.  Opt in ``=10``.
+    'DREAMER_DIAG_PERHEAD_GRADS_EVERY':    ('diag_perhead_grads_every',      int),
+    'DREAMER_DIAG_LATENT_STABILITY_EVERY': ('diag_latent_stability_every',   int),
+    'DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1': (
+        'diag_disable_reward_mtp_in_p1', _as_bool),
+    'DREAMER_DIAG_REWARD_MTP_STOP_GRAD_IN_P1': (
+        'diag_reward_mtp_stop_grad_in_p1', _as_bool),
+    # End-of-training WM diagnostic (default ON).  Horizon 0 = auto.
+    'DREAMER_RUN_WM_DIAGNOSTIC':           ('run_wm_diagnostic',            _as_bool),
+    'DREAMER_WM_DIAG_N_STARTS':          ('wm_diag_n_starts',             int),
+    'DREAMER_WM_DIAG_HORIZON':           ('wm_diag_horizon',              int),
     # P79 (2026-06-02): return-scale ABSOLUTE cap — dimensionless (return
     # units).  Arrests the critic-pessimism cascade runaway once the spread
     # is implausibly large WITHOUT throttling legitimate early growth (the

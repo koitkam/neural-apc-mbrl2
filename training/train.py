@@ -386,6 +386,31 @@ class TrainConfig:
     # the asymmetry ratio to roughly 3 — symlog support becomes
     # near-symmetric and the bin distribution recovers.
     reward_clip_tail_k: float = 3.0
+    # Safety-net raw-reward clip (P43: -1e6 is "off").  Was
+    # ``os.environ.get`` inside ``APCEnv.__init__`` (worked, but
+    # missing from ``run_plan``).  ``DREAMER_REWARD_RAW_CLIP_MIN`` /
+    # ``_MAX`` are in ENV_OVERRIDES.
+    reward_raw_clip_min: float = -1e6
+    reward_raw_clip_max: float = 1e18
+    # Reward-scale calibration (percentile → twohot).  Was
+    # ``os.environ.get`` inside ``train()`` (worked, missing from
+    # ``run_plan``).  Unitless / mode strings.
+    reward_cal_mode: str = 'baseline'
+    reward_cal_target: str = 'percentile'
+    reward_cal_pct: float = 95.0
+    reward_cal_pct_val: float = 0.5
+    reward_cal_target_sym_mag: float = 6.0
+    # May-2026 P39 probes.  Default OFF (extra retain_graph backward).
+    # Was ``os.environ.get`` (not ENV_OVERRIDES).  Opt in ``=10``.
+    diag_perhead_grads_every: int = 0
+    diag_latent_stability_every: int = 0
+    diag_disable_reward_mtp_in_p1: bool = False
+    diag_reward_mtp_stop_grad_in_p1: bool = False
+    # End-of-training WM steady-state diagnostic (default ON).  Horizon
+    # 0 = auto ``max(200, 8·H)``.
+    run_wm_diagnostic: bool = True
+    wm_diag_n_starts: int = 8
+    wm_diag_horizon: int = 0
     # ---- Return-scale absolute cap (P79, 2026-06-02) ---------------
     # The (p95-p05)-spread EMA normaliser at ``DreamerV4.update_return_scale``
     # tracks a monotonically growing spread on the critic-pessimism
@@ -1872,6 +1897,34 @@ class TrainConfig:
 # Env wrapper — stacks state + aug-obs, builds lookback window, computes reward
 # ---------------------------------------------------------------------------
 
+def _cfg_or_env_float(cfg, field: str, env_key: str, default: float
+                     ) -> Tuple[float, bool]:
+    """TrainConfig field, else leftover env-var, else default.
+
+    ``user_set`` is True when the field is in ``_explicit_fields`` or
+    the env-var is present (P62 adaptive clip must not override an
+    explicit ``DREAMER_REWARD_RAW_CLIP_MIN``).
+    """
+    explicit = set(getattr(cfg, '_explicit_fields', set()) or set()) \
+        if cfg is not None else set()
+    if field in explicit:
+        try:
+            return float(getattr(cfg, field)), True
+        except Exception:
+            return float(default), True
+    raw = os.environ.get(env_key)
+    if raw not in (None, ''):
+        try:
+            return float(raw), True
+        except Exception:
+            pass
+    try:
+        val = getattr(cfg, field, default) if cfg is not None else default
+        return float(val), False
+    except Exception:
+        return float(default), False
+
+
 class APCEnv:
     """Slim env wrapper around the carryover simulator.
 
@@ -2071,24 +2124,15 @@ class APCEnv:
         # -1e6 / +1e18 clip is a runaway-bug safety net, not a routine
         # censor; ``_reward_clip_warned`` emits a one-shot warning if
         # it ever triggers so we notice silent saturation.
-        try:
-            self._reward_clip_min: float = float(
-                os.environ.get('DREAMER_REWARD_RAW_CLIP_MIN', '-1e6'))
-        except Exception:
-            self._reward_clip_min = -1e6
-        try:
-            self._reward_clip_max: float = float(
-                os.environ.get('DREAMER_REWARD_RAW_CLIP_MAX', '1e18'))
-        except Exception:
-            self._reward_clip_max = 1e18
+        self._reward_clip_min, self._reward_clip_min_user_set = (
+            _cfg_or_env_float(cfg, 'reward_raw_clip_min',
+                              'DREAMER_REWARD_RAW_CLIP_MIN', -1e6))
+        self._reward_clip_max, _ = (
+            _cfg_or_env_float(cfg, 'reward_raw_clip_max',
+                              'DREAMER_REWARD_RAW_CLIP_MAX', 1e18))
         self._reward_clip_warned: bool = False
-        # P62 (2026-05-28): track whether the negative-tail clip was set
-        # explicitly by the user (DREAMER_REWARD_RAW_CLIP_MIN in env)
-        # vs left at the default -1e6.  The post-calibration adaptive
-        # setter (see ``train`` after ``calibrate_reward_scale``) only
-        # overrides this when the user did NOT set it explicitly.
-        self._reward_clip_min_user_set: bool = (
-            'DREAMER_REWARD_RAW_CLIP_MIN' in os.environ)
+        # P62 (2026-05-28): adaptive clip only overrides when the user
+        # did NOT set the min explicitly (TrainConfig field or env).
 
         # ---- A' : potential-based reward shaping state ------------------
         # Dense band-keeping shaping (see TrainConfig.reward_shaping_coef).
@@ -8642,6 +8686,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
                             target_mode: str = 'percentile',
                             target_percentile: float = 50.0,
                             target_percentile_value: float = 0.5,
+                            target_sym_mag: float = 6.0,
                             ) -> Dict[str, float]:
     """Empirically choose a per-step reward scale to match V4's twohot range.
 
@@ -8797,8 +8842,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     # the percentile-floor scale, so operating-region resolution
     # cannot regress.
     raw_abs_max = float(abs_arr.max()) if abs_arr.size else 0.0
-    target_sym_mag = float(
-        os.environ.get('DREAMER_REWARD_CAL_TARGET_SYM_MAG', '6.0'))
+    target_sym_mag = float(target_sym_mag)
     if raw_abs_max > 1e-8 and target_sym_mag > 0.0:
         scale_fill = (math.exp(target_sym_mag) - 1.0) / raw_abs_max
         scale = max(scale, min(scale_fill, max_scale))
@@ -9224,21 +9268,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # ---- Reward calibration (V4 reward head expects O(1) per-step rewards) ----
     obj_scale_env = os.environ.get('OBJ_REWARD_SCALE', 'auto').strip().lower()
     if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
-        cal_mode = os.environ.get('DREAMER_REWARD_CAL_MODE',
-                                    'baseline').strip().lower() or 'baseline'
-        cal_target_mode = os.environ.get(
-            'DREAMER_REWARD_CAL_TARGET',
-            'percentile').strip().lower() or 'percentile'
+        cal_mode = str(getattr(cfg, 'reward_cal_mode', 'baseline')
+                       or 'baseline').strip().lower() or 'baseline'
+        cal_target_mode = str(getattr(cfg, 'reward_cal_target', 'percentile')
+                               or 'percentile').strip().lower() or 'percentile'
         try:
-            cal_target_pct = float(os.environ.get(
-                'DREAMER_REWARD_CAL_PCT', '95') or 95.0)
+            cal_target_pct = float(getattr(cfg, 'reward_cal_pct', 95.0) or 95.0)
         except Exception:
             cal_target_pct = 95.0
         try:
-            cal_target_pct_value = float(os.environ.get(
-                'DREAMER_REWARD_CAL_PCT_VAL', '0.5') or 0.5)
+            cal_target_pct_value = float(getattr(cfg, 'reward_cal_pct_val', 0.5)
+                                        or 0.5)
         except Exception:
             cal_target_pct_value = 0.5
+        try:
+            cal_target_sym_mag = float(getattr(cfg, 'reward_cal_target_sym_mag',
+                                            6.0) or 6.0)
+        except Exception:
+            cal_target_sym_mag = 6.0
         # Cover at least 2 episodes so the cohort is representative
         # (paper-aligned: V3 calibrates on rolling buffer of full episodes).
         ep_len = max(1, int(getattr(cfg, 'episode_length', 1500) or 1500))
@@ -9250,6 +9297,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             target_mode=cal_target_mode,
             target_percentile=cal_target_pct,
             target_percentile_value=cal_target_pct_value,
+            target_sym_mag=cal_target_sym_mag,
         )
         # Pop the obs trace before serialising — kept on the dict only
         # to feed the SNR diagnostic below; np.ndarray is not JSON-safe.
@@ -9360,6 +9408,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     target_mode=cal_target_mode,
                     target_percentile=cal_target_pct,
                     target_percentile_value=cal_target_pct_value,
+                    target_sym_mag=cal_target_sym_mag,
                 )
                 cal_post.pop('_obs_trace', None)
                 cal_post['reward_clip_asymmetry_threshold'] = cal[
@@ -10044,16 +10093,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # ----- Diagnostics for reward-MTP/WM coupling RCA (May-2026 P39) -----
     # Extra autograd.grad(retain_graph=True) + tokenizer encode.  Default
     # OFF (probes belong in gitignored scratch/; env-free must not pay
-    # a second backward every 10 iters).  Opt in via env (read here, not
-    # ENV_OVERRIDES).  B + C stay default OFF.
+    # a second backward every 10 iters).  Opt in via TrainConfig /
+    # ENV_OVERRIDES.  B + C stay default OFF.
     diag_perhead_grads_every = int(
-        os.environ.get('DREAMER_DIAG_PERHEAD_GRADS_EVERY', '0') or 0)
+        getattr(cfg, 'diag_perhead_grads_every', 0) or 0)
     diag_latent_stability_every = int(
-        os.environ.get('DREAMER_DIAG_LATENT_STABILITY_EVERY', '0') or 0)
-    diag_disable_reward_mtp_in_p1 = bool(int(
-        os.environ.get('DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1', '0') or 0))
-    diag_reward_mtp_stop_grad_in_p1 = bool(int(
-        os.environ.get('DREAMER_DIAG_REWARD_MTP_STOP_GRAD_IN_P1', '0') or 0))
+        getattr(cfg, 'diag_latent_stability_every', 0) or 0)
+    diag_disable_reward_mtp_in_p1 = bool(
+        getattr(cfg, 'diag_disable_reward_mtp_in_p1', False))
+    diag_reward_mtp_stop_grad_in_p1 = bool(
+        getattr(cfg, 'diag_reward_mtp_stop_grad_in_p1', False))
     diag_latent_ref: Optional[Dict[str, torch.Tensor]] = None
     diag_perhead_last: Dict[str, float] = {}
     if diag_disable_reward_mtp_in_p1 and diag_reward_mtp_stop_grad_in_p1:
@@ -12818,9 +12867,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # steady-state (not just transients) the actor's imagined
     # rollouts depend on for terminal-value bootstrapping.  Cheap on
     # GPU (~10s); falls back to CPU if GPU is busy.  Disable with
-    # DREAMER_RUN_WM_DIAGNOSTIC=0.
+    # DREAMER_RUN_WM_DIAGNOSTIC=0 (ENV_OVERRIDES / TrainConfig).
     # ---------------------------------------------------------------
-    if int(os.environ.get('DREAMER_RUN_WM_DIAGNOSTIC', '1') or 0) == 1:
+    if bool(getattr(cfg, 'run_wm_diagnostic', True)):
         try:
             # Pre-free GPU before the diagnostic so its auto-device
             # picker doesn't fall back to CPU just because OUR training
@@ -12848,15 +12897,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                        flush=True)
             from tools.wm_steady_state_diagnostic import (
                 run_wm_steady_state_diagnostic)
-            n_starts = int(os.environ.get('DREAMER_WM_DIAG_N_STARTS', '8'))
+            n_starts = int(getattr(cfg, 'wm_diag_n_starts', 8) or 8)
             # (c) value-equivalence: probe horizon adaptive to the training
             # horizon H (default max(200, 8·H)) so large-H sims aren't under-
             # probed and small-H sims still get the long structural drift
             # signal; the diagnostic separately reports convergence AT H.
             _H_train = int(getattr(cfg, 'horizon', 15))
             _diag_h_default = max(200, 8 * _H_train)
-            horizon = int(os.environ.get('DREAMER_WM_DIAG_HORIZON',
-                                          str(_diag_h_default)))
+            _h_cfg = int(getattr(cfg, 'wm_diag_horizon', 0) or 0)
+            horizon = _h_cfg if _h_cfg > 0 else _diag_h_default
             # Force CUDA for inline diagnostics: the auto-picker reads
             # nvidia-smi util, which sees *our own* training process as
             # "GPU busy" and falls back to CPU — making the WM rollout
