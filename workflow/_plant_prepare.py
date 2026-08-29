@@ -207,6 +207,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAMMA':              ('gamma',                      float),
     'DREAMER_TARGET_CRITIC_TAU':  ('target_critic_tau',          float),
     'DREAMER_P3_COLLECT_EVERY':   ('phase3_collect_every_iters', int),
+    # Inner WM / P3 steps per outer iter (already TrainConfig; were not
+    # in the whitelist so a DREAMER_* A/B silently lost).
+    'DREAMER_TRAIN_STEPS_PER_ITER':    ('train_steps_per_iter',          int),
+    'DREAMER_P3_TRAIN_STEPS_PER_ITER': ('phase3_train_steps_per_iter',   int),
     # mbrl2 real-sim (2026-07-08): the dedicated ON-POLICY buffer for the P3
     # actor-critic REINFORCE update (recent current-policy episodes only — the
     # shared replay buffer's off-policy seed actions corrupt the policy gradient,
@@ -223,6 +227,19 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_POLICY_LOG_STD_MAX': ('policy_log_std_max',         float),
     'DREAMER_POLICY_LOG_STD_MIN': ('policy_log_std_min',         float),
     'DREAMER_PMPO_ENTROPY_COEF':  ('pmpo_entropy_coef',          float),
+    # Auto-tune formula inputs (were ``os.environ.get`` inside
+    # ``auto_tune_seed_buffer``; identity defaults).  Leftover
+    # ``PMPO_ENTROPY_COEF_BASELINE`` / ``PMPO_ENTROPY_SIGMA_REF`` /
+    # ``SEED_TARGET_CV_FRAC`` / ``SEED_SIGMA_CAP`` / ``PRBS_SEG_MIN`` /
+    # ``PRBS_SEG_MIN_FLOOR`` still win when the DREAMER_* field is not
+    # explicit.  Do not collide with ``DREAMER_PMPO_ENTROPY_COEF`` (the
+    # resolved η).
+    'DREAMER_PMPO_ENTROPY_ETA_V3':     ('pmpo_entropy_eta_v3',     float),
+    'DREAMER_PMPO_ENTROPY_SIGMA_REF':  ('pmpo_entropy_sigma_ref',  float),
+    'DREAMER_SEED_TARGET_CV_FRAC':     ('seed_target_cv_frac',     float),
+    'DREAMER_SEED_SIGMA_CAP':          ('seed_sigma_cap',          float),
+    'DREAMER_PRBS_SEG_MIN':            ('prbs_seg_min',            int),
+    'DREAMER_PRBS_SEG_MIN_FLOOR':      ('prbs_seg_min_floor',      int),
     'DREAMER_HORIZON':            ('horizon',                    int),
     # 2026-05-21 (P37 robustness sweep): allow overriding the
     # plant-derived seq_len so longer-context WM training can be

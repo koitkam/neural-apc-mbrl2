@@ -27,7 +27,8 @@ from training.train import (
                             _p1_fidelity_local_plateau,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
-                            _resolve_baseline_seed_op_band, _cfg_or_env_float,
+                            _resolve_baseline_seed_op_band, _cfg_or_env,
+                            _cfg_or_env_float,
                             collect_episode, collect_prbs_episode,
                             _build_dv_prbs_schedule,
                             _isolated_hold_action, _hold_other_action_dims,
@@ -719,6 +720,11 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_REWARD_CAL_PCT': '90',
         'DREAMER_DIAG_PERHEAD_GRADS_EVERY': '10',
         'DREAMER_RUN_WM_DIAGNOSTIC': '0',
+        'DREAMER_SEED_TARGET_CV_FRAC': '0.25',
+        'DREAMER_PMPO_ENTROPY_ETA_V3': '2e-4',
+        'DREAMER_PRBS_SEG_MIN': '6',
+        'DREAMER_TRAIN_STEPS_PER_ITER': '50',
+        'DREAMER_P3_TRAIN_STEPS_PER_ITER': '4',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -742,6 +748,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.reward_cal_pct) - 90.0) < 1e-12
         assert int(cfg.diag_perhead_grads_every) == 10
         assert cfg.run_wm_diagnostic is False
+        assert abs(float(cfg.seed_target_cv_frac) - 0.25) < 1e-12
+        assert abs(float(cfg.pmpo_entropy_eta_v3) - 2e-4) < 1e-12
+        assert int(cfg.prbs_seg_min) == 6
+        assert int(cfg.train_steps_per_iter) == 50
+        assert int(cfg.phase3_train_steps_per_iter) == 4
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -752,6 +763,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'reward_cal_pct' in explicit
         assert 'diag_perhead_grads_every' in explicit
         assert 'run_wm_diagnostic' in explicit
+        assert 'seed_target_cv_frac' in explicit
+        assert 'pmpo_entropy_eta_v3' in explicit
+        assert 'prbs_seg_min' in explicit
+        assert 'train_steps_per_iter' in explicit
+        assert 'phase3_train_steps_per_iter' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1149,6 +1165,14 @@ def _test_envfree_observer_recipe() -> None:
     assert abs(float(c.reward_raw_clip_max) - 1e18) < 1e6
     assert abs(float(c.reward_cal_pct) - 95.0) < 1e-12
     assert abs(float(c.reward_cal_target_sym_mag) - 6.0) < 1e-12
+    assert abs(float(c.seed_target_cv_frac) - 0.20) < 1e-12
+    assert abs(float(c.seed_sigma_cap) - 0.30) < 1e-12
+    assert abs(float(c.pmpo_entropy_eta_v3) - 3e-4) < 1e-12
+    assert abs(float(c.pmpo_entropy_sigma_ref) - 1.0) < 1e-12
+    assert int(c.prbs_seg_min) == 8
+    assert int(c.prbs_seg_min_floor) == 2
+    assert int(c.train_steps_per_iter) == 100
+    assert int(c.phase3_train_steps_per_iter) == 8
     assert int(c.diag_perhead_grads_every) == 0
     assert int(c.diag_latent_stability_every) == 0
     assert c.diag_disable_reward_mtp_in_p1 is False
@@ -1178,6 +1202,14 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_RUN_WM_DIAGNOSTIC' in ENV_OVERRIDES
     assert 'DREAMER_WM_DIAG_N_STARTS' in ENV_OVERRIDES
     assert 'DREAMER_WM_DIAG_HORIZON' in ENV_OVERRIDES
+    assert 'DREAMER_SEED_TARGET_CV_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_SEED_SIGMA_CAP' in ENV_OVERRIDES
+    assert 'DREAMER_PMPO_ENTROPY_ETA_V3' in ENV_OVERRIDES
+    assert 'DREAMER_PMPO_ENTROPY_SIGMA_REF' in ENV_OVERRIDES
+    assert 'DREAMER_PRBS_SEG_MIN' in ENV_OVERRIDES
+    assert 'DREAMER_PRBS_SEG_MIN_FLOOR' in ENV_OVERRIDES
+    assert 'DREAMER_TRAIN_STEPS_PER_ITER' in ENV_OVERRIDES
+    assert 'DREAMER_P3_TRAIN_STEPS_PER_ITER' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
@@ -1557,6 +1589,32 @@ def _test_cfg_or_env_float_identity() -> None:
     print('[smoke] OK  reward clip/cal cfg-or-env identity (default / explicit / leftover)')
 
 
+def _test_auto_tune_formula_input_cfg_or_env() -> None:
+    """Seed/PRBS/η formula inputs: TrainConfig default, explicit, leftover env."""
+    import os
+    c = TrainConfig()
+    v, user = _cfg_or_env(c, 'seed_target_cv_frac', 'SEED_TARGET_CV_FRAC', 0.20, float)
+    assert abs(v - 0.20) < 1e-12 and user is False
+    v, user = _cfg_or_env(c, 'prbs_seg_min', 'PRBS_SEG_MIN', 8, int)
+    assert v == 8 and user is False
+    c.seed_target_cv_frac = 0.15
+    c._explicit_fields = {'seed_target_cv_frac'}  # type: ignore[attr-defined]
+    v, user = _cfg_or_env(c, 'seed_target_cv_frac', 'SEED_TARGET_CV_FRAC', 0.20, float)
+    assert abs(v - 0.15) < 1e-12 and user is True
+    prev = os.environ.get('SEED_SIGMA_CAP')
+    try:
+        os.environ['SEED_SIGMA_CAP'] = '0.22'
+        c2 = TrainConfig()
+        v, user = _cfg_or_env(c2, 'seed_sigma_cap', 'SEED_SIGMA_CAP', 0.30, float)
+        assert abs(v - 0.22) < 1e-12 and user is True
+    finally:
+        if prev is None:
+            os.environ.pop('SEED_SIGMA_CAP', None)
+        else:
+            os.environ['SEED_SIGMA_CAP'] = prev
+    print('[smoke] OK  auto-tune formula-input cfg-or-env (default / explicit / leftover)')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -1797,6 +1855,7 @@ if __name__ == '__main__':
     _test_p3_reset_log_std()
     _test_resolve_baseline_seed_op_band()
     _test_cfg_or_env_float_identity()
+    _test_auto_tune_formula_input_cfg_or_env()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

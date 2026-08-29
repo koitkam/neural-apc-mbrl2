@@ -144,10 +144,14 @@ class TrainConfig:
     # exploration bands typical of process control.
     # The dataclass default below (1e-4) is the sentinel value used
     # only when auto-tune is disabled or fails; it matches what the
-    # formula produces for σ_max ≈ 0.33. Set explicitly via env var
-    # PMPO_ENTROPY_COEF_BASELINE / PMPO_ENTROPY_SIGMA_REF or override
-    # the cfg field directly to bypass the auto-derivation.
+    # formula produces for σ_max ≈ 0.33. Formula inputs
+    # ``pmpo_entropy_eta_v3`` / ``pmpo_entropy_sigma_ref`` were
+    # ``os.environ.get`` (worked, missing from ``run_plan``). Leftover
+    # ``PMPO_ENTROPY_COEF_BASELINE`` / ``PMPO_ENTROPY_SIGMA_REF`` still
+    # win when the DREAMER_* field is not explicit.
     pmpo_entropy_coef: float = 1e-4
+    pmpo_entropy_eta_v3: float = 3e-4
+    pmpo_entropy_sigma_ref: float = 1.0
     # Actor loss type. ``'reinforce'`` (DreamerV3 §3) is robust across
     # simulators — V3 used this single recipe across 150+ tasks. The
     # ``'pmpo'`` option uses V4's eq. 11 advantage-sign-split loss; this
@@ -1045,6 +1049,13 @@ class TrainConfig:
     # Was ``os.environ.get('DREAMER_BASELINE_SEED_OP_BAND')`` inside
     # ``train()`` (worked, but invisible in ``run_plan``).
     baseline_seed_op_band: float = 0.6
+    # Seed-σ formula inputs (``σ = clip(frac·cv_w/mv_auth, 0.01, cap)``).
+    # Were ``os.environ.get('SEED_TARGET_CV_FRAC'/'SEED_SIGMA_CAP')``
+    # inside ``auto_tune_seed_buffer`` (worked, missing from
+    # ``run_plan``). Unitless. Leftover names still win when the
+    # DREAMER_* field is not explicit.
+    seed_target_cv_frac: float = 0.20
+    seed_sigma_cap: float = 0.30
     random_seed_episodes: int = 6
     # Structured PRBS-style exploration episodes for WM coverage breadth
     # (2026-05-08, run_p7 RCA).  Drives MV across the operating band
@@ -1089,6 +1100,11 @@ class TrainConfig:
     # system-ID remedy.  Auto-derived in ``auto_tune_seed_buffer``
     # to ``max(2, round(τ / (3 sr)))``.  Sentinel 0 = use auto.
     prbs_seed_segment_steps_min: int = 0
+    # Clip floors for the PRBS segment formula (agent steps, not
+    # engineering units).  Were ``os.environ.get('PRBS_SEG_MIN' /
+    # 'PRBS_SEG_MIN_FLOOR')`` (worked, missing from ``run_plan``).
+    prbs_seg_min: int = 8
+    prbs_seg_min_floor: int = 2
     # Constant-action seed episodes (2026-05-21, p31 RCA).  Holds the
     # action perfectly constant for the entire episode at a sampled
     # level in ``[-constant_action_seed_op_band, +constant_action_seed_op_band]``.
@@ -1897,32 +1913,40 @@ class TrainConfig:
 # Env wrapper — stacks state + aug-obs, builds lookback window, computes reward
 # ---------------------------------------------------------------------------
 
-def _cfg_or_env_float(cfg, field: str, env_key: str, default: float
-                     ) -> Tuple[float, bool]:
+def _cfg_or_env(cfg, field: str, env_key: str, default, cast=float):
     """TrainConfig field, else leftover env-var, else default.
 
     ``user_set`` is True when the field is in ``_explicit_fields`` or
     the env-var is present (P62 adaptive clip must not override an
-    explicit ``DREAMER_REWARD_RAW_CLIP_MIN``).
+    explicit ``DREAMER_REWARD_RAW_CLIP_MIN``).  Leftover non-DREAMER
+    names (``SEED_TARGET_CV_FRAC``, ``PRBS_SEG_MIN``, …) use the same
+    path so a thin launch cannot silently drop a formula input.
     """
     explicit = set(getattr(cfg, '_explicit_fields', set()) or set()) \
         if cfg is not None else set()
     if field in explicit:
         try:
-            return float(getattr(cfg, field)), True
+            return cast(getattr(cfg, field)), True
         except Exception:
-            return float(default), True
+            return cast(default), True
     raw = os.environ.get(env_key)
     if raw not in (None, ''):
         try:
-            return float(raw), True
+            return cast(raw), True
         except Exception:
             pass
     try:
         val = getattr(cfg, field, default) if cfg is not None else default
-        return float(val), False
+        return cast(val), False
     except Exception:
-        return float(default), False
+        return cast(default), False
+
+
+def _cfg_or_env_float(cfg, field: str, env_key: str, default: float
+                     ) -> Tuple[float, bool]:
+    """Float wrapper for ``_cfg_or_env`` (reward clip/cal call sites)."""
+    v, user = _cfg_or_env(cfg, field, env_key, default, float)
+    return float(v), bool(user)
 
 
 class APCEnv:
@@ -8170,16 +8194,19 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         # MV range) to 0.20: simulation-agnostic (still scales with the
         # plant's identified gain & CV width) but covers 2× more of the
         # MV range so the WM sees clean step-response transitions
-        # across most of the operating band.  Override via env
-        # ``SEED_TARGET_CV_FRAC``.
-        target_frac = float(os.environ.get('SEED_TARGET_CV_FRAC', '0.20'))
+        # across most of the operating band.  Override via
+        # ``DREAMER_SEED_TARGET_CV_FRAC`` (leftover ``SEED_TARGET_CV_FRAC``
+        # still wins when the field is not explicit).
+        target_frac, _ = _cfg_or_env(
+            cfg, 'seed_target_cv_frac', 'SEED_TARGET_CV_FRAC', 0.20, float)
         cv_w = float(np.mean(cv_widths))
         # Bumped 2026-05-08 (run_p7 RCA): cap raised 0.10 → 0.30 to give
         # low-MV-authority plants enough seed-buffer coverage breadth.
         # σ_max for the policy is now derived with its own independent
         # cap (see ``policy_log_std_max`` below) so the policy clamp
         # does not widen with this knob.
-        sigma_seed_cap = float(os.environ.get('SEED_SIGMA_CAP', '0.30'))
+        sigma_seed_cap, _ = _cfg_or_env(
+            cfg, 'seed_sigma_cap', 'SEED_SIGMA_CAP', 0.30, float)
         sigma = float(np.clip(target_frac * cv_w / mv_auth,
                                 0.01, sigma_seed_cap))
         sigma_source = (f'mv_authority(target_cv_frac={target_frac:.2f}, '
@@ -8371,9 +8398,10 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # auto-shrinks for plants whose σ_max is tighter. For test_sim
     # (σ_max=0.30) → η = 9e-5, matching the value found by manual
     # tuning in run_p7.
-    eta_v3_baseline = float(os.environ.get('PMPO_ENTROPY_COEF_BASELINE', '3e-4'))
-    sigma_v3_ref = max(1e-3,
-        float(os.environ.get('PMPO_ENTROPY_SIGMA_REF', '1.0')))
+    eta_v3_baseline, _ = _cfg_or_env(
+        cfg, 'pmpo_entropy_eta_v3', 'PMPO_ENTROPY_COEF_BASELINE', 3e-4, float)
+    sigma_v3_ref = max(1e-3, float(_cfg_or_env(
+        cfg, 'pmpo_entropy_sigma_ref', 'PMPO_ENTROPY_SIGMA_REF', 1.0, float)[0]))
     eta_adaptive = eta_v3_baseline * (target_sigma_max / sigma_v3_ref)
     out['pmpo_entropy_coef'] = {
         'value': float(eta_adaptive),
@@ -8538,14 +8566,16 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     if tau_plant > 0.0:
         ep_len = max(1, int(getattr(cfg, 'episode_length', 1)))
         seg_target = (theta_plant + 4.0 * tau_plant) / float(sr)
-        seg_min_pgate = int(os.environ.get('PRBS_SEG_MIN', '8'))
+        seg_min_pgate, _ = _cfg_or_env(
+            cfg, 'prbs_seg_min', 'PRBS_SEG_MIN', 8, int)
         seg_cap = max(seg_min_pgate + 1, ep_len // 4)
         seg_auto = int(np.clip(round(seg_target), seg_min_pgate, seg_cap))
         # Multi-timescale PRBS: fast hold ~ τ / 3 / sr.  This excites
         # the WM at the dominant pole's natural frequency so it learns
         # the *transient* dynamics (not just steady-state gain).
         # Floor 2 (need at least 2 steps for a settled action).
-        seg_min_floor = int(os.environ.get('PRBS_SEG_MIN_FLOOR', '2'))
+        seg_min_floor, _ = _cfg_or_env(
+            cfg, 'prbs_seg_min_floor', 'PRBS_SEG_MIN_FLOOR', 2, int)
         seg_min_target = (tau_plant / 3.0) / float(sr)
         seg_min_auto = int(np.clip(
             round(seg_min_target), seg_min_floor,
