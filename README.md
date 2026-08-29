@@ -273,17 +273,20 @@ search *and* keep warm-starting model weights.
 
 #### Hidden unmeasured-disturbance model + noise curriculum (P90)
 
-Unmeasured (truly hidden) CV upsets the controller must reject are modeled by a
-**realistic, simulator-adaptive event schedule** (`HiddenDisturbanceSchedule`)
-— not a constant wiggle. Each episode draws a sequence of discrete events with
-varied **shape** (`step` instant load change, `ramp` gradual drift, `pulse`
-temporary excursion, `ou_drift` noisy patch), **timing** (sometimes isolated
-with ≥ settling-time gaps so each upset reaches steady state, sometimes
-overlapping/serial), and **persistence** (some revert to baseline, some hold
-permanently). All timescales derive from the identified dead time + dominant
-time constant (`settle = (dead + N·τ)/sample_rate` agent steps); all magnitudes
-are capped by the agent's MV→CV authority. The schedule is never exposed to the
-agent or world model.
+Unmeasured (truly hidden) CV upsets the controller must reject are modeled by
+``HiddenDisturbance`` — a per-episode LOAD-event schedule filtered through a
+unit-DC FOPDT ``Gd`` (dead-time + lag). Not a constant wiggle and **not** a
+legacy OU added straight onto the CV (that path is deleted). Each episode draws
+discrete events with varied **shape** (`step` load change, `ramp` gradual drift,
+`pulse` temporary slug), **timing** (isolated with ≥ settling-time gaps, or
+overlapping), and **persistence** (some revert, some hold). All timescales
+derive from identified dead time + dominant τ
+(`settle = (dead + N·τ)/sample_rate`); magnitudes are capped by MV→CV authority.
+The schedule is never exposed to the agent or world model.
+
+These knobs are **TrainConfig + `ENV_OVERRIDES`** (identity defaults; leftover
+env still wins when the field is not explicit). Env-free `single_run` writes
+them into `run_plan.json`.
 
 **P89 noise RCA + fix:** the world model never learned a held-action steady
 state because *every* training trajectory — including the const-action
@@ -298,15 +301,17 @@ held-action seed episodes fully noise-free, and the **process-noise curriculum**
 | Var | Effect |
 |---|---|
 | `DREAMER_HIDDEN_DISTURBANCE` | `0` to disable the hidden disturbance entirely (default ON). |
-| `DREAMER_HIDDEN_DIST_MODE` | `schedule` (default, realistic event schedule) or `ou` (legacy single always-on OU drift). |
 | `DREAMER_HIDDEN_DIST_SETTLE_NTAU` | `N` in `settle = (dead + N·τ)/sr` (default 4 ≈ 98% settling). Controls event spacing + held-to-steady durations. |
 | `DREAMER_HIDDEN_DIST_MAX_EVENTS` | Cap on events per episode (default 6). |
 | `DREAMER_HIDDEN_DIST_P_ISOLATED` | P(gap ≥ settle, i.e. event fully settles before the next) vs overlap/serial (default 0.5). |
-| `DREAMER_HIDDEN_DIST_P_REVERT` | P(an event reverts to baseline) vs holds permanently (default 0.5; `pulse` always reverts). |
-| `DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS` | `"step,ramp,pulse,ou"` sampling weights (default `0.3,0.3,0.2,0.2`). |
+| `DREAMER_HIDDEN_DIST_P_REVERT` | P(an event reverts to baseline) vs holds permanently (default **0.7**; `pulse` always reverts). |
+| `DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS` | `"step,ramp,pulse"` sampling weights (default **`0.5,0.3,0.2`**). |
+| `DREAMER_HIDDEN_DIST_SPREAD` | `0` to restore front-loaded sequential placement (default ON = spread across the episode). |
+| `DREAMER_HIDDEN_DIST_TAU_FRAC` | `"lo:hi"`: `tau_d = U(lo,hi)*tau_dom` (default `0.5:1.0`). |
+| `DREAMER_HIDDEN_DIST_DEADTIME_FRAC` | `"lo:hi"`: `theta_d = U(lo,hi)*dead_time` (default `0.5:1.5`). |
 | `DREAMER_CLEAN_STEADY_SEEDS` | `0` to keep noise on the const-action / step-settle / isolation-settle seeds (default ON = noise-free seeds). |
 | `DREAMER_PROCESS_NOISE_CURRICULUM` | `0` to disable the P1 process+measurement noise ramp (default ON). |
-| `DREAMER_PROCESS_NOISE_AMP_RAMP` | `"<start>:<reach>"` (default `0.0:0.4`): noise scale ramps from `start` at progress=0 to full by `progress=reach` in P1/P2; P3 always full. |
+| `DREAMER_PROCESS_NOISE_AMP_RAMP` | `"<start>:<reach>"` (default `0.0:0.4`): noise scale ramps from `start` at progress=0 to full by `progress=reach` in P1/P2; P3 always full. Empty leftover env = full noise. |
 | `DREAMER_DISTURBANCE_PROB_WM` | Per-episode probability cap in P1/P2 (default 0.10). In P1 acts as the upper bound of the adaptive ramp; in P2 acts as the floor (P2 starts at this value). Observable schedule events (SP/DV) fire on 100% of episodes, so 0.10 gives the WM ~10× more clean episodes than disturbed ones during early learning. |
 | `DREAMER_DISTURBANCE_PROB_P2` | Per-episode probability cap in P2 (default 0.20). P2 linearly ramps from `DREAMER_DISTURBANCE_PROB_WM` (0.10) up to this cap as critic training progresses. Rationale: critic learns value of imagined rollouts starting from buffered real states; broadening buffer coverage with more disturbed episodes lets the critic estimate value across the disturbed manifold. |
 | `DREAMER_DISTURBANCE_PROB_AGENT` | Per-episode probability cap in P3 (**default 0.30**, P89: was 0.50 — a realistic plant sees occasional upsets ~20–30% of the time, and 50% corrupted too much of the actor's gradient + never let the CV settle). P3 linearly ramps from `DREAMER_DISTURBANCE_PROB_P2` (0.20) up to this cap. |

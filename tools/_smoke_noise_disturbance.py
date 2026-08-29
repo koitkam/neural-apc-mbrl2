@@ -68,6 +68,17 @@ def test_noise_curriculum():
     assert s20 < s40
     print(f'[smoke] OK noise curriculum: p=0->{s0:.2f} 0.2->{s20:.2f} '
           f'0.4->{s40:.2f} P3->{s_p3:.2f}')
+    # TrainConfig default ≡ unset env; empty leftover → full noise.
+    class _Cfg:
+        process_noise_amp_ramp = '0.0:0.4'
+    assert noise_curriculum_scale(0.2, phase=1, cfg=_Cfg()) == s20
+    os.environ['DREAMER_PROCESS_NOISE_AMP_RAMP'] = ''
+    try:
+        assert noise_curriculum_scale(0.0, phase=1) == 1.0
+        assert noise_curriculum_scale(0.0, phase=1, cfg=_Cfg()) == 1.0
+    finally:
+        os.environ.pop('DREAMER_PROCESS_NOISE_AMP_RAMP', None)
+    print('[smoke] OK noise curriculum cfg-or-env identity')
 
 
 def test_noise_scale_clean():

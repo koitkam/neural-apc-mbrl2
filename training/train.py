@@ -1443,6 +1443,34 @@ class TrainConfig:
     # trains ``wm_ss_match``).
     clean_steady_seeds: bool = True
     process_noise_curriculum: bool = True
+    # Noise / hidden-load schedule (were leftover ``os.environ.get`` in
+    # ``utils/noise_config.py`` / ``utils/hidden_disturbance.py`` —
+    # worked, missing from ``run_plan``).  Identity defaults.  Strings
+    # are unitless ``start:reach`` / ``lo:hi`` / CSV weights.
+    # ``hidden_ou_prob_max < 0`` = follow ``disturbance_prob_wm``.
+    process_noise_amp_ramp: str = '0.0:0.4'
+    hidden_disturbance: bool = True
+    hidden_ou_amp_ramp: str = '0.1:0.4'
+    hidden_ou_amp_max_scale: float = 0.2
+    hidden_ou_amp_max_scale_p3: float = 1.0
+    hidden_ou_amp_jitter: str = '0.6:1.6'
+    hidden_ou_drift_frac: float = 0.4
+    disturbance_prob_agent: float = 0.3
+    disturbance_prob_p2: float = 0.2
+    disturbance_prob_wm: float = 0.10
+    hidden_ou_prob_p3_ramp_reach: float = 0.5
+    hidden_ou_prob_p2_ramp_reach: float = 0.5
+    hidden_ou_prob_min: float = 0.05
+    hidden_ou_prob_max: float = -1.0
+    hidden_ou_prob_target_score: float = 2.0
+    hidden_dist_settle_n_tau: float = 4.0
+    hidden_dist_max_events: int = 6
+    hidden_dist_p_isolated: float = 0.5
+    hidden_dist_p_revert: float = 0.7
+    hidden_dist_shape_weights: str = '0.5,0.3,0.2'
+    hidden_dist_spread: bool = True
+    hidden_dist_tau_frac: str = '0.5:1.0'
+    hidden_dist_deadtime_frac: str = '0.5:1.5'
 
     # ---- (P90, 2026-06-06) freeze WM after P1 (critic/WM coherence) ----
     # The WM's held-action fixed point is UNSTABLE — it converges mid-P1 then
@@ -2619,7 +2647,7 @@ class APCEnv:
         # in validation to always build.
         prob = (self._disturbance_prob_override
                 if self._disturbance_prob_override is not None
-                else get_phase_disturbance_prob(phase=1))
+                else get_phase_disturbance_prob(phase=1, cfg=self.cfg))
         tau_dom, dead_time = self._resolve_plant_timing()
         sample_rate = float(getattr(self.cfg, 'sample_rate', 1.0) or 1.0)
         self._hidden_disturbance = maybe_build_hidden_disturbance(
@@ -2633,6 +2661,7 @@ class APCEnv:
             phase=int(self._current_phase),
             dead_time=dead_time,
             episode_length=int(self.cfg.episode_length),
+            cfg=self.cfg,
         )
         # P89 noise-amplitude curriculum: ramp process+measurement noise from
         # ~0 at progress=0 to full by ~40 % (P1), full in P3.  Applied every
@@ -2640,7 +2669,8 @@ class APCEnv:
         # steady-state seeds override this to 0.0 after their own reset().
         if bool(getattr(self.cfg, 'process_noise_curriculum', True)):
             self.set_sim_noise_scale(noise_curriculum_scale(
-                float(self._training_progress), int(self._current_phase)))
+                float(self._training_progress), int(self._current_phase),
+                cfg=self.cfg))
         else:
             self.set_sim_noise_scale(1.0)
         # Fresh per-episode trace for the WM disturbance-estimator head target.
@@ -4538,9 +4568,11 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # P1/P2 ``random_action=True`` is handled above (numpy-only).  P3
     # on-policy streams the posterior with measured DV + Kalman so the
     # served ``feat`` matches ``_realsim_actor_critic_step`` re-encode.
-    from models.dreamer_v4_rssm import stream_serve_step
+    from models.dreamer_v4_rssm import (
+        alloc_pinned_obs_host, copy_obs_row, stream_serve_step)
     # One autocast region for the episode (not per step).  RSSM obs is a
     # persistent GPU row — no per-step ``from_numpy().to().unsqueeze``.
+    # Pinned host staging makes the H2D non-blocking (identity values).
     _use_cuda_amp = (device.type == 'cuda')
     with torch.inference_mode(), torch.amp.autocast(
             device_type=device.type, dtype=torch.bfloat16,
@@ -4551,12 +4583,12 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                         if _is_rssm else None)
         _o = (torch.empty(1, D, device=device, dtype=torch.float32)
               if _is_rssm else None)
+        _o_host = (alloc_pinned_obs_host(device, D) if _is_rssm else None)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
             if _is_rssm:
-                _row = np.asarray(obs_window[-1], dtype=np.float32).reshape(-1)
-                _o[0].copy_(torch.from_numpy(_row))
+                copy_obs_row(_o, obs_window[-1], _o_host)
                 # Certainty-equivalent (sample=False) belief: the actor
                 # trains on the mode (``_realsim_actor_critic_step``) and
                 # LQG control acts on the optimal state estimate.  A
@@ -10641,7 +10673,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # Cached optimizer set per phase.
     # Initialize hidden-disturbance probability for the starting phase
     # (hidden CV disturbance is the default unmeasured-disturbance model).
-    env._disturbance_prob_override = get_phase_disturbance_prob(phase=1)
+    env._disturbance_prob_override = get_phase_disturbance_prob(phase=1, cfg=cfg)
     # neural-apc-mbrl JOINT mode: skip the P1/P2 curriculum entirely.  The
     # seed-buffer fill above is the random PREFILL (DreamerV3 prefill);
     # from here co-train WM + actor + critic every step via the P3 path.
@@ -10664,7 +10696,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         except Exception:
             pass
         env._current_phase = 3
-        env._disturbance_prob_override = get_phase_disturbance_prob(phase=3)
+        env._disturbance_prob_override = get_phase_disturbance_prob(
+            phase=3, cfg=cfg)
         # mbrl2 real-sim: joint mode goes straight to P3 -> enable DR now.
         if env.set_domain_randomization(True):
             print('[realsim] domain randomization ENABLED (joint P3)', flush=True)
@@ -10747,6 +10780,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 wm_best_score=(float(wm_best_score)
                                 if wm_best_score > -1e17 else None),
                 phase_progress=_phase_progress,
+                cfg=cfg,
             )
         except Exception:
             pass
@@ -11278,9 +11312,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # phase start (the schedule is phase-length adaptive).
                 p3_start_steps = total_env_steps
             # Refresh hidden-disturbance per-episode probability for the
-            # new phase (default: 0.3 in P1/P2, 0.5 in P3).
+            # new phase (P1/P2: disturbance_prob_wm/p2; P3: agent cap).
             env._disturbance_prob_override = get_phase_disturbance_prob(
-                phase=int(current_phase))
+                phase=int(current_phase), cfg=cfg)
 
         # ----- Periodic const/step injection (all phases) -----
         # Keep the steady-state + step-response regimes represented in

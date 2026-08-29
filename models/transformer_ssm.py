@@ -588,8 +588,12 @@ class TransformerSSMDynamics(nn.Module):
         cache = getattr(prev, 'kv_cache', None)
         pos = int(getattr(prev, 'pos', 0) or 0)
         h, new_cache = self._step(token, cache, pos)
-        d_new = (self.dob_decay() * prev.d
-                 if (self.dob_enabled and prev.d is not None) else prev.d)
+        # Stage-1: ``d`` is not a token input and ``d_t≡0`` is forced
+        # after the loop — skip unused sigmoid·d (same as RSSM).
+        d_new = prev.d
+        if (self.dob_enabled and prev.d is not None
+                and bool(getattr(self, 'dob_active', True))):
+            d_new = self.dob_decay() * prev.d
         dv_new = dv if self.dv_feedforward else None
         return h, d_new, dv_new, new_cache, pos + 1
 
@@ -799,14 +803,15 @@ class TransformerSSMDynamics(nn.Module):
         _stack_post = not last_only
         use_post_only = bool(last_only) and not two_pass and not _need_prior_core
         if use_post_only:
-            acts = act.unbind(1)
-            embs = embeds.unbind(1)
-            dv_seq = (dvs.unbind(1) if dvs is not None
-                      else (None,) * T)
             pstep = self._posterior_step
-            for t in range(T):
-                state = pstep(state, acts[t], embs[t], dv=dv_seq[t],
-                              sample=sample)
+            if dvs is None:
+                for t in range(T):
+                    state = pstep(state, act[:, t], embeds[:, t], dv=None,
+                                  sample=sample)
+            else:
+                for t in range(T):
+                    state = pstep(state, act[:, t], embeds[:, t],
+                                  dv=dvs[:, t], sample=sample)
         else:
             for t in range(T):
                 dv_t = dvs[:, t] if dvs is not None else None

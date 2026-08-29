@@ -52,7 +52,8 @@ def _span(bounds):
 
 
 def noise_curriculum_scale(progress: float,
-                            phase: Optional[int] = None) -> float:
+                            phase: Optional[int] = None,
+                            cfg=None) -> float:
     """P1 process+measurement noise amplitude curriculum (P89, 2026-06-06).
 
     Returns a multiplier in ``[0, 1]`` applied to BOTH the OU process noise
@@ -66,22 +67,32 @@ def noise_curriculum_scale(progress: float,
     100 % of episodes, so the plant never sits still.  Ramping noise from ~0
     lets P1 establish the attractor before noise is added.
 
-    Schedule: ``DREAMER_PROCESS_NOISE_AMP_RAMP="<start>:<reach>"`` (default
+    Schedule: TrainConfig ``process_noise_amp_ramp`` / leftover
+    ``DREAMER_PROCESS_NOISE_AMP_RAMP="<start>:<reach>"`` (default
     ``"0.0:0.4"`` \u2014 start fully clean, reach full noise by 40 % progress).
     ``start``: scale at ``progress=0``.  ``reach``: progress fraction at which
     the scale reaches 1.0.  Phase-aware: **P3 always returns 1.0** (the WM is
     frozen and the actor must learn to reject realistic-magnitude noise);
     P1/P2 follow the ramp.  Disable the curriculum entirely (full noise from
-    step 0, legacy behaviour) with ``DREAMER_PROCESS_NOISE_AMP_RAMP=1.0:1e-6``
-    or by setting ``process_noise_curriculum=False`` on the cfg.
+    step 0, legacy behaviour) with ramp ``"1.0:1e-6"`` or by setting
+    ``process_noise_curriculum=False`` on the cfg.
+
+    Dual-read: explicit TrainConfig wins; leftover env wins if not explicit;
+    else cfg default.  Unset → ``0.0:0.4``.  Empty leftover env → 1.0
+    (full noise, same as the historical ``os.environ.get`` empty-string path).
     """
     if phase is not None and int(phase) >= 3:
         return 1.0
-    raw = os.environ.get('DREAMER_PROCESS_NOISE_AMP_RAMP', '0.0:0.4').strip()
-    if not raw:
+    from utils.hidden_disturbance import _knob_raw
+    raw, leftover = _knob_raw(cfg, 'process_noise_amp_ramp',
+                              'DREAMER_PROCESS_NOISE_AMP_RAMP')
+    if leftover and (raw is None or str(raw).strip() == ''):
+        return 1.0
+    text = '0.0:0.4' if raw is None else str(raw).strip()
+    if not text:
         return 1.0
     try:
-        start_str, reach_str = raw.split(':')
+        start_str, reach_str = text.split(':')
         start = float(start_str)
         reach = float(reach_str)
     except Exception:

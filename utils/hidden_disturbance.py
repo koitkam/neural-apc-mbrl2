@@ -55,29 +55,63 @@ from typing import Dict, List, Optional
 import numpy as np
 
 
-def _env_float(name: str, default: float) -> float:
-    """Read a float env var with a fallback (never raises)."""
+_BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f')
+
+
+def _explicit(cfg, field: str) -> bool:
+    if cfg is None:
+        return False
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _knob_raw(cfg, field: str, env_key: str):
+    """Explicit TrainConfig, else leftover env, else cfg default.
+
+    Second return is True when the leftover env key is present (even
+    empty).  Empty leftover is distinct from unset.
+    """
+    if _explicit(cfg, field):
+        return getattr(cfg, field), False
+    if env_key in os.environ:
+        return os.environ.get(env_key), True
+    if cfg is not None:
+        return getattr(cfg, field, None), False
+    return None, False
+
+
+def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
+    raw, leftover = _knob_raw(cfg, field, env_key)
+    if leftover and (raw is None or str(raw).strip() == ''):
+        return float(default)
+    if raw is None or str(raw).strip() == '':
+        return float(default)
     try:
-        return float(os.environ.get(name, str(default)))
+        return float(raw)
     except Exception:
         return float(default)
 
 
-def _env_pair(name: str, lo_default: float, hi_default: float) -> tuple:
-    """Read a ``"lo:hi"`` env var as a (lo, hi) float pair (never raises).
+def _knob_bool(cfg, field: str, env_key: str, default: bool) -> bool:
+    if _explicit(cfg, field):
+        return bool(getattr(cfg, field))
+    raw = os.environ.get(env_key)
+    if raw is not None:
+        return str(raw).strip().lower() not in _BOOL_OFF
+    if cfg is not None:
+        return bool(getattr(cfg, field, default))
+    return bool(default)
 
-    Returns ``(lo_default, hi_default)`` when unset/malformed; if a single
-    value is given it is used for both ends; ensures ``hi >= lo``.
-    """
-    raw = os.environ.get(name, '').strip()
-    if not raw:
+
+def _parse_pair(raw, lo_default: float, hi_default: float) -> tuple:
+    text = '' if raw is None else str(raw).strip()
+    if not text:
         return float(lo_default), float(hi_default)
     try:
-        if ':' in raw:
-            a, b = raw.split(':')
+        if ':' in text:
+            a, b = text.split(':')
             lo, hi = float(a), float(b)
         else:
-            lo = hi = float(raw)
+            lo = hi = float(text)
         if hi < lo:
             hi = lo
         return lo, hi
@@ -85,7 +119,7 @@ def _env_pair(name: str, lo_default: float, hi_default: float) -> tuple:
         return float(lo_default), float(hi_default)
 
 
-def hidden_disturbance_enabled(default: bool = True) -> bool:
+def hidden_disturbance_enabled(default: bool = True, cfg=None) -> bool:
     """Whether the hidden CV disturbance is active.
 
     Default: ON.  The legacy step-shaped unmeasured-CV events are gone
@@ -93,50 +127,35 @@ def hidden_disturbance_enabled(default: bool = True) -> bool:
     spikes the WM has no observation to predict).  Off-switch only:
     set ``DREAMER_HIDDEN_DISTURBANCE=0`` to disable for ablations.
     """
-    raw = os.environ.get('DREAMER_HIDDEN_DISTURBANCE')
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() not in {'0', 'false', 'no', 'off', ''}
+    return _knob_bool(cfg, 'hidden_disturbance',
+                      'DREAMER_HIDDEN_DISTURBANCE', default)
 
 
-def curriculum_amp_scale(progress: float, phase: Optional[int] = None) -> float:
+def curriculum_amp_scale(progress: float, phase: Optional[int] = None,
+                         cfg=None) -> float:
     """Amplitude curriculum scale (≤cap) as a function of training progress.
 
-    Reads ``DREAMER_HIDDEN_OU_AMP_RAMP="<start_frac>:<reach_full_at>"``.
-    ``start_frac``: amplitude scale at ``progress=0`` (e.g. 0.1 = 10% of
-    nominal).  ``reach_full_at``: progress fraction at which the scale
-    reaches the cap (e.g. 0.4 = full amplitude by 40% of training).
-
-    Phase-aware cap (P38, 2026-05-22):
-      - P1/P2 (or phase unknown): ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE``
-        (default 0.2). Keeps the WM in a regime where it can learn
-        base dynamics first; the critic only sees lightly-disturbed
-        imagined starts.
-      - P3: ``DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3`` (default 1.0). The
-        WM is frozen and the actor must learn to reject
-        realistic-magnitude upsets.
-
-    Default (env unset or malformed ramp): cap value — no curriculum,
-    cap still applies.
-
-    The OU is still hidden — only its magnitude is shaped over time.
+    Reads TrainConfig ``hidden_ou_amp_ramp`` /
+    leftover ``DREAMER_HIDDEN_OU_AMP_RAMP="<start_frac>:<reach_full_at>"``.
+    Phase-aware cap: P1/P2 ``hidden_ou_amp_max_scale`` (0.2); P3
+    ``hidden_ou_amp_max_scale_p3`` (1.0).  Malformed/empty leftover → cap.
     """
     if phase is not None and int(phase) >= 3:
-        env_key = 'DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3'
-        cap_default = 1.0
+        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale_p3',
+                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3', 1.0)
     else:
-        env_key = 'DREAMER_HIDDEN_OU_AMP_MAX_SCALE'
-        cap_default = 0.2
-    try:
-        cap = float(os.environ.get(env_key, str(cap_default)))
-    except Exception:
-        cap = cap_default
+        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale',
+                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE', 0.2)
     cap = float(np.clip(cap, 0.0, 1.0))
-    raw = os.environ.get('DREAMER_HIDDEN_OU_AMP_RAMP', '0.1:0.4').strip()
-    if not raw:
+    raw, leftover = _knob_raw(cfg, 'hidden_ou_amp_ramp',
+                              'DREAMER_HIDDEN_OU_AMP_RAMP')
+    if leftover and (raw is None or str(raw).strip() == ''):
+        return cap
+    text = '0.1:0.4' if raw is None else str(raw).strip()
+    if not text:
         return cap
     try:
-        start_str, reach_str = raw.split(':')
+        start_str, reach_str = text.split(':')
         start = float(start_str)
         reach = float(reach_str)
     except Exception:
@@ -146,12 +165,11 @@ def curriculum_amp_scale(progress: float, phase: Optional[int] = None) -> float:
     reach = float(np.clip(reach, 1e-6, 1.0))
     if p >= reach:
         return cap
-    # Linear ramp from start at p=0 to 1.0 at p=reach, then clamped at cap.
     val = start + (1.0 - start) * (p / reach)
     return float(min(val, cap))
 
 
-def _sample_amp_jitter(rng: np.random.Generator) -> float:
+def _sample_amp_jitter(rng: np.random.Generator, cfg=None) -> float:
     """Per-episode amplitude DR factor (multiplier on amp_frac).
 
     Reads ``DREAMER_HIDDEN_OU_AMP_JITTER="<lo>:<hi>"`` (uniform band).
@@ -163,11 +181,15 @@ def _sample_amp_jitter(rng: np.random.Generator) -> float:
     """
     # Default ON (P37 onward): uniform ±60% around nominal amplitude.
     # Set ``DREAMER_HIDDEN_OU_AMP_JITTER=1.0:1.0`` to disable.
-    raw = os.environ.get('DREAMER_HIDDEN_OU_AMP_JITTER', '0.6:1.6').strip()
-    if not raw:
+    raw, leftover = _knob_raw(cfg, 'hidden_ou_amp_jitter',
+                              'DREAMER_HIDDEN_OU_AMP_JITTER')
+    if leftover and (raw is None or str(raw).strip() == ''):
+        return 1.0
+    text = '0.6:1.6' if raw is None else str(raw).strip()
+    if not text:
         return 1.0
     try:
-        lo_str, hi_str = raw.split(':')
+        lo_str, hi_str = text.split(':')
         lo = float(lo_str); hi = float(hi_str)
         if hi <= lo:
             return float(lo)
@@ -176,7 +198,7 @@ def _sample_amp_jitter(rng: np.random.Generator) -> float:
         return 1.0
 
 
-def _sample_drift_frac(rng: np.random.Generator) -> float:
+def _sample_drift_frac(rng: np.random.Generator, cfg=None) -> float:
     """Per-episode constant drift offset (as a fraction of amp).
 
     Reads ``DREAMER_HIDDEN_OU_DRIFT_FRAC="<max>"`` (uniform in ``[-max,+max]``).
@@ -189,13 +211,8 @@ def _sample_drift_frac(rng: np.random.Generator) -> float:
     # Default ON (P37 onward): up to ±40% of nominal amplitude as a
     # constant per-episode mean offset.  Set ``DREAMER_HIDDEN_OU_DRIFT_FRAC=0``
     # to disable.
-    raw = os.environ.get('DREAMER_HIDDEN_OU_DRIFT_FRAC', '0.4').strip()
-    if not raw:
-        return 0.0
-    try:
-        mx = float(raw)
-    except Exception:
-        return 0.0
+    mx = _knob_float(cfg, 'hidden_ou_drift_frac',
+                     'DREAMER_HIDDEN_OU_DRIFT_FRAC', 0.4)
     if mx <= 0.0:
         return 0.0
     return float(rng.uniform(-mx, mx))
@@ -205,96 +222,54 @@ def get_phase_disturbance_prob(
     phase: int,
     wm_best_score: Optional[float] = None,
     phase_progress: Optional[float] = None,
+    cfg=None,
 ) -> float:
     """Return the per-episode probability that hidden disturbance fires.
 
-    **Adaptive triggering (P38, 2026-05-22).**  Observable forcing
-    (setpoint steps, DV ramps, MV exploration) fires on 100% of
-    episodes; the hidden OU is a much harder learning signal because
-    the WM has no observation to attribute it to.  Per-phase curriculum:
-
-      - **P1 (WM training)**: adaptive on ``wm_best_score``. Interpolates
-        between ``DREAMER_HIDDEN_OU_PROB_MIN`` (default 0.05) at score=0
-        and ``DREAMER_DISTURBANCE_PROB_WM`` (default 0.10) at
-        score=``DREAMER_HIDDEN_OU_PROB_TARGET_SCORE`` (default 2.0).
-      - **P2 (critic training)**: ramp on ``phase_progress`` from the
-        P1/P2 cap (``DREAMER_DISTURBANCE_PROB_WM``, 0.10) to
-        ``DREAMER_DISTURBANCE_PROB_P2`` (default 0.20). Reaches the P2
-        cap by ``DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH`` (default 0.5 =
-        midpoint of P2). Rationale: critic learns value of imagined
-        rollouts that start from buffered real states. If the buffer
-        only contains lightly-disturbed states (P1 cap), the critic
-        never learns values for the disturbed manifold. Ramping P2
-        gradually broadens buffer coverage without destabilising the
-        still-updating WM.
-      - **P3 (actor + critic)**: ramp on ``phase_progress`` from the P2
-        cap (0.20) to ``DREAMER_DISTURBANCE_PROB_AGENT`` (default 0.30,
-        P89: was 0.50 — 50 % hidden-upset episodes corrupted too much of
-        the actor's gradient and never let the CV settle; a realistic
-        plant sees occasional upsets, ~20-30 % of the time).
-        Reaches the P3 cap by ``DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH``
-        (default 0.5 = midpoint of P3). Rationale: actor needs to learn
-        observable tracking before robust rejection; a step to 0.50 from
-        day one of P3 corrupts ~half of its gradient signal on a
-        randomly-initialised policy.
-
-    Backward compatible: omitting ``phase_progress`` returns the
-    phase-end cap (P1 still uses wm_best_score adaptation when supplied).
+    TrainConfig / leftover env (identity defaults).  Omitting
+    ``phase_progress`` returns the phase-end cap (P1 still uses
+    ``wm_best_score`` when supplied).
     """
     # ---- P3 ----
     if int(phase) >= 3:
-        try:
-            p3_cap = float(np.clip(
-                float(os.environ.get('DREAMER_DISTURBANCE_PROB_AGENT', '0.3')),
-                0.0, 1.0))
-        except Exception:
-            p3_cap = 0.3
-        try:
-            p3_floor = float(np.clip(
-                float(os.environ.get('DREAMER_DISTURBANCE_PROB_P2', '0.2')),
-                0.0, 1.0))
-        except Exception:
-            p3_floor = 0.2
+        p3_cap = float(np.clip(
+            _knob_float(cfg, 'disturbance_prob_agent',
+                        'DREAMER_DISTURBANCE_PROB_AGENT', 0.3),
+            0.0, 1.0))
+        p3_floor = float(np.clip(
+            _knob_float(cfg, 'disturbance_prob_p2',
+                        'DREAMER_DISTURBANCE_PROB_P2', 0.2),
+            0.0, 1.0))
         if phase_progress is None:
             return p3_cap
-        try:
-            reach = float(np.clip(
-                float(os.environ.get(
-                    'DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH', '0.5')),
-                1e-6, 1.0))
-        except Exception:
-            reach = 0.5
+        reach = float(np.clip(
+            _knob_float(cfg, 'hidden_ou_prob_p3_ramp_reach',
+                        'DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH', 0.5),
+            1e-6, 1.0))
         pp = float(np.clip(phase_progress, 0.0, 1.0))
         if pp >= reach:
             return p3_cap
         return float(p3_floor + (p3_cap - p3_floor) * (pp / reach))
 
-    # P1/P2 share the static WM cap (also the P2 floor).
-    raw_wm = os.environ.get('DREAMER_DISTURBANCE_PROB_WM', '0.10')
-    try:
-        wm_cap = float(np.clip(float(raw_wm), 0.0, 1.0))
-    except Exception:
-        wm_cap = 0.10
+    wm_cap = float(np.clip(
+        _knob_float(cfg, 'disturbance_prob_wm',
+                    'DREAMER_DISTURBANCE_PROB_WM', 0.10),
+        0.0, 1.0))
 
     # ---- P2 ----
     if int(phase) == 2:
-        try:
-            p2_cap = float(np.clip(
-                float(os.environ.get('DREAMER_DISTURBANCE_PROB_P2', '0.2')),
-                0.0, 1.0))
-        except Exception:
-            p2_cap = 0.2
+        p2_cap = float(np.clip(
+            _knob_float(cfg, 'disturbance_prob_p2',
+                        'DREAMER_DISTURBANCE_PROB_P2', 0.2),
+            0.0, 1.0))
         if p2_cap < wm_cap:
             p2_cap = wm_cap
         if phase_progress is None:
             return p2_cap
-        try:
-            reach = float(np.clip(
-                float(os.environ.get(
-                    'DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH', '0.5')),
-                1e-6, 1.0))
-        except Exception:
-            reach = 0.5
+        reach = float(np.clip(
+            _knob_float(cfg, 'hidden_ou_prob_p2_ramp_reach',
+                        'DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH', 0.5),
+            1e-6, 1.0))
         pp = float(np.clip(phase_progress, 0.0, 1.0))
         if pp >= reach:
             return p2_cap
@@ -303,25 +278,19 @@ def get_phase_disturbance_prob(
     # ---- P1 (adaptive on wm_best_score) ----
     if wm_best_score is None:
         return wm_cap
-    try:
-        p_min = float(os.environ.get('DREAMER_HIDDEN_OU_PROB_MIN', '0.05'))
-    except Exception:
-        p_min = 0.05
-    try:
-        p_max = float(os.environ.get(
-            'DREAMER_HIDDEN_OU_PROB_MAX', str(wm_cap)))
-    except Exception:
-        p_max = wm_cap
-    try:
-        target = float(os.environ.get(
-            'DREAMER_HIDDEN_OU_PROB_TARGET_SCORE', '2.0'))
-    except Exception:
-        target = 2.0
-    p_min = float(np.clip(p_min, 0.0, 1.0))
+    p_min = float(np.clip(
+        _knob_float(cfg, 'hidden_ou_prob_min',
+                    'DREAMER_HIDDEN_OU_PROB_MIN', 0.05),
+        0.0, 1.0))
+    p_max_raw = _knob_float(cfg, 'hidden_ou_prob_max',
+                            'DREAMER_HIDDEN_OU_PROB_MAX', -1.0)
+    p_max = wm_cap if p_max_raw < 0.0 else float(p_max_raw)
     p_max = float(np.clip(p_max, 0.0, 1.0))
     if p_max < p_min:
         p_max = p_min
-    target = float(max(target, 1e-6))
+    target = float(max(_knob_float(
+        cfg, 'hidden_ou_prob_target_score',
+        'DREAMER_HIDDEN_OU_PROB_TARGET_SCORE', 2.0), 1e-6))
     score = float(max(0.0, wm_best_score))
     frac = float(np.clip(score / target, 0.0, 1.0))
     return float(p_min + (p_max - p_min) * frac)
@@ -434,7 +403,9 @@ class HiddenDisturbance:
                  tau_dom: float, sample_rate: float, dead_time: float,
                  episode_length: int, amp_frac: float = 0.10,
                  drift_frac: float = 0.0,
-                 identifier_ctx: Optional[Dict] = None) -> None:
+                 identifier_ctx: Optional[Dict] = None,
+                 cfg=None) -> None:
+        self._cfg = cfg
         self.sim = sim
         self.cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []))]
         n_cv = len(self.cv_indices)
@@ -460,16 +431,20 @@ class HiddenDisturbance:
         sr = max(1e-6, float(sample_rate))
         tau_steps = max(1.0, float(tau_dom) / sr)         # agent steps
         dead_steps = max(0.0, float(dead_time) / sr)
-        n_settle = _env_float('DREAMER_HIDDEN_DIST_SETTLE_NTAU', 4.0)
+        n_settle = _knob_float(cfg, 'hidden_dist_settle_n_tau',
+                               'DREAMER_HIDDEN_DIST_SETTLE_NTAU', 4.0)
         settle = max(2.0, dead_steps + n_settle * tau_steps)
         self._settle = float(settle)
         self._tau_steps = float(tau_steps)
         T = int(episode_length)
-        max_events = int(_env_float('DREAMER_HIDDEN_DIST_MAX_EVENTS', 6.0))
+        max_events = int(_knob_float(cfg, 'hidden_dist_max_events',
+                                     'DREAMER_HIDDEN_DIST_MAX_EVENTS', 6.0))
         p_isolated = float(np.clip(
-            _env_float('DREAMER_HIDDEN_DIST_P_ISOLATED', 0.5), 0.0, 1.0))
+            _knob_float(cfg, 'hidden_dist_p_isolated',
+                        'DREAMER_HIDDEN_DIST_P_ISOLATED', 0.5), 0.0, 1.0))
         p_revert = float(np.clip(
-            _env_float('DREAMER_HIDDEN_DIST_P_REVERT', 0.7), 0.0, 1.0))
+            _knob_float(cfg, 'hidden_dist_p_revert',
+                        'DREAMER_HIDDEN_DIST_P_REVERT', 0.7), 0.0, 1.0))
         shapes = ['step', 'ramp', 'pulse']
         weights = self._shape_weights()
 
@@ -480,8 +455,12 @@ class HiddenDisturbance:
         # sim-adaptive (from the identified plant) + env-overridable.  UNIT DC
         # gain (the lag has no extra gain) so the authority-based amp cap on
         # the load is preserved at the CV.
-        tau_lo, tau_hi = _env_pair('DREAMER_HIDDEN_DIST_TAU_FRAC', 0.5, 1.0)
-        dt_lo, dt_hi = _env_pair('DREAMER_HIDDEN_DIST_DEADTIME_FRAC', 0.5, 1.5)
+        tau_raw, _ = _knob_raw(cfg, 'hidden_dist_tau_frac',
+                               'DREAMER_HIDDEN_DIST_TAU_FRAC')
+        dt_raw, _ = _knob_raw(cfg, 'hidden_dist_deadtime_frac',
+                              'DREAMER_HIDDEN_DIST_DEADTIME_FRAC')
+        tau_lo, tau_hi = _parse_pair(tau_raw, 0.5, 1.0)
+        dt_lo, dt_hi = _parse_pair(dt_raw, 0.5, 1.5)
         self.tau_d_steps = np.maximum(
             rng.uniform(tau_lo, tau_hi, size=n_cv) * tau_steps, 1.0)
         self._alpha = np.clip(1.0 / self.tau_d_steps, 1e-3, 1.0)
@@ -504,8 +483,8 @@ class HiddenDisturbance:
         # the whole episode (a realistic sequence of distinct upsets) instead of
         # the legacy front-loaded sequential placement.  Set
         # ``DREAMER_HIDDEN_DIST_SPREAD=0`` to restore the legacy placement.
-        spread = str(os.environ.get('DREAMER_HIDDEN_DIST_SPREAD', '1')).strip() \
-            .lower() not in ('0', 'false', 'no', 'off', '')
+        spread = _knob_bool(cfg, 'hidden_dist_spread',
+                            'DREAMER_HIDDEN_DIST_SPREAD', True)
         events: List[Dict] = []
         if spread:
             earliest = float(rng.uniform(0.0, settle))
@@ -572,10 +551,16 @@ class HiddenDisturbance:
         # ``ou_drift`` shape — a per-step random walk that read as
         # high-frequency noise — is removed.)
         default = np.array([0.5, 0.3, 0.2], dtype='float64')
-        raw = os.environ.get('DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS', '').strip()
-        if raw:
+        raw, leftover = _knob_raw(getattr(self, '_cfg', None),
+                                  'hidden_dist_shape_weights',
+                                  'DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS')
+        text = '' if raw is None else str(raw).strip()
+        if leftover and not text:
+            return default
+        if text:
             try:
-                w = np.array([float(x) for x in raw.split(',')], dtype='float64')
+                w = np.array([float(x) for x in text.split(',')],
+                             dtype='float64')
                 if w.size == 3 and w.sum() > 0:
                     return w / w.sum()
             except Exception:
@@ -667,6 +652,7 @@ def maybe_build_hidden_disturbance(
     phase: Optional[int] = None,
     dead_time: float = 0.0,
     episode_length: int = 0,
+    cfg=None,
 ):
     """Bernoulli-toggle the per-episode hidden LOAD disturbance.
 
@@ -679,30 +665,20 @@ def maybe_build_hidden_disturbance(
     per-episode jitter / drift DR knobs to produce the effective
     ``amp_frac`` and ``drift_frac`` for this episode.  ``phase`` (optional)
     selects the phase-aware amp cap (P1/P2 vs P3).
-
-    Single consolidated model (2026-06-10): a hidden unmeasured LOAD (the
-    upset events) propagated to the CV through its OWN disturbance transfer
-    function ``Gd`` (dead-time + first-order lag), adaptive from the identified
-    plant — see ``HiddenDisturbance``.  Needs ``episode_length`` to schedule
-    the load events.
     """
-    if not hidden_disturbance_enabled(default=True):
+    if not hidden_disturbance_enabled(default=True, cfg=cfg):
         return None
     if int(episode_length) <= 0:
-        # The consolidated model schedules LOAD events across the episode, so a
-        # disturbance needs a positive horizon.  (Every live caller passes
-        # cfg.episode_length > 0; this guards degenerate/unit-test inputs.)
         return None
     if not force:
         if prob <= 0.0:
             return None
         if rng.uniform() >= float(prob):
             return None
-    # Effective amp_frac = nominal × curriculum scale × per-episode jitter.
-    curr_scale = curriculum_amp_scale(float(progress), phase=phase)
-    jitter = _sample_amp_jitter(rng)
+    curr_scale = curriculum_amp_scale(float(progress), phase=phase, cfg=cfg)
+    jitter = _sample_amp_jitter(rng, cfg=cfg)
     eff_amp_frac = float(amp_frac) * float(curr_scale) * float(jitter)
-    drift_frac = _sample_drift_frac(rng)
+    drift_frac = _sample_drift_frac(rng, cfg=cfg)
     dist = HiddenDisturbance(
         rng=rng,
         sim=sim,
@@ -713,6 +689,7 @@ def maybe_build_hidden_disturbance(
         amp_frac=eff_amp_frac,
         drift_frac=drift_frac,
         identifier_ctx=identifier_ctx,
+        cfg=cfg,
     )
     if dist.is_empty():
         return None

@@ -645,8 +645,14 @@ class RSSMDynamics(nn.Module):
                                  dtype=prev_action.dtype)
             parts.append(dv)
         h = self.gru(self.pre_gru(torch.cat(parts, dim=-1)), prev.h)
-        d_new = (self.dob_decay() * prev.d
-                 if (self.dob_enabled and prev.d is not None) else prev.d)
+        # Stage-1 (``dob_active=False``) forces ``d_t≡0`` after the loop
+        # and ``d`` is not a GRU input — skip the unused sigmoid·d
+        # (P1 rest-IC + main WM T-loop, 100 inner steps).  P2 Kalman
+        # still needs the prior predict ``A·d``.
+        d_new = prev.d
+        if (self.dob_enabled and prev.d is not None
+                and bool(getattr(self, 'dob_active', True))):
+            d_new = self.dob_decay() * prev.d
         dv_new = dv if self.dv_feedforward else None
         return h, d_new, dv_new
 
@@ -849,14 +855,17 @@ class RSSMDynamics(nn.Module):
         # cont-dist two-pass still need obs_step + prior.feat.
         use_post_only = bool(last_only) and not two_pass and not _need_prior_core
         if use_post_only:
-            acts = act.unbind(1)
-            embs = embeds.unbind(1)
-            dv_seq = (dvs.unbind(1) if dvs is not None
-                      else (None,) * T)
+            # Slice, don't unbind: T Python tensor objects on the rest-IC
+            # hot path (N=6, L=lookback, every WM inner step).
             pstep = self._posterior_step
-            for t in range(T):
-                state = pstep(state, acts[t], embs[t], dv=dv_seq[t],
-                              sample=sample)
+            if dvs is None:
+                for t in range(T):
+                    state = pstep(state, act[:, t], embeds[:, t], dv=None,
+                                  sample=sample)
+            else:
+                for t in range(T):
+                    state = pstep(state, act[:, t], embeds[:, t],
+                                  dv=dvs[:, t], sample=sample)
         else:
             for t in range(T):
                 dv_t = dvs[:, t] if dvs is not None else None
@@ -1076,6 +1085,34 @@ def stream_serve_step(dyn, state, prev_action: torch.Tensor,
     post, _ = dyn.obs_step(
         state, prev_action, emb, dv=dv, sample=sample, obs=None)
     return post
+
+
+def alloc_pinned_obs_host(device, obs_dim: int):
+    """Pinned 1-D host row for H2D obs copies.  ``None`` off CUDA."""
+    if getattr(device, 'type', '') != 'cuda':
+        return None
+    try:
+        return torch.empty(int(obs_dim), dtype=torch.float32, pin_memory=True)
+    except Exception:
+        return None
+
+
+def copy_obs_row(dst: torch.Tensor, row, host: Optional[torch.Tensor] = None
+                 ) -> None:
+    """Copy a 1-D obs vector into ``dst[0]``.
+
+    Collect/val used to ``from_numpy`` a new CPU tensor every step.
+    Optional pinned ``host`` (from ``alloc_pinned_obs_host``) stages the
+    row so the H2D can be non-blocking.  Identity values.
+    """
+    src = row if isinstance(row, torch.Tensor) else torch.as_tensor(
+        row, dtype=torch.float32)
+    src = src.detach().to(dtype=torch.float32).reshape(-1)
+    if host is not None:
+        host.copy_(src)
+        dst[0].copy_(host, non_blocking=True)
+    else:
+        dst[0].copy_(src)
 
 
 # ---------------------------------------------------------------------------

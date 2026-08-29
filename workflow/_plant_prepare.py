@@ -575,13 +575,35 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_HELD_ROLLOUT_WIN':        ('wm_held_rollout_win',            int),
     'DREAMER_WM_HELD_ROLLOUT_MAX_STARTS': ('wm_held_rollout_max_starts',     int),
     'DREAMER_WM_HELD_ROLLOUT_GATE_RECON': ('wm_held_rollout_gate_recon',     float),
-    # (P89) noise curriculum + clean steady-state seeds (default ON).  The
-    # process-noise ramp + per-event hidden-disturbance schedule knobs are read
-    # straight from os.environ (not cfg fields): DREAMER_PROCESS_NOISE_AMP_RAMP,
-    # DREAMER_HIDDEN_DIST_{MODE,SETTLE_NTAU,MAX_EVENTS,P_ISOLATED,P_REVERT,
-    # SHAPE_WEIGHTS}.  These two booleans gate the cfg-level behaviour.
+    # (P89) noise curriculum + clean steady-state seeds (default ON).
+    # Ramp / hidden-load schedule knobs were leftover ``os.environ.get``
+    # (worked, missing from ``run_plan``).  Identity defaults.  Dual-read
+    # at noise_config / hidden_disturbance (APCEnv.reset has cfg).
     'DREAMER_CLEAN_STEADY_SEEDS':         ('clean_steady_seeds',             _as_bool),
     'DREAMER_PROCESS_NOISE_CURRICULUM':   ('process_noise_curriculum',       _as_bool),
+    'DREAMER_PROCESS_NOISE_AMP_RAMP':     ('process_noise_amp_ramp',         str),
+    'DREAMER_HIDDEN_DISTURBANCE':         ('hidden_disturbance',             _as_bool),
+    'DREAMER_HIDDEN_OU_AMP_RAMP':         ('hidden_ou_amp_ramp',             str),
+    'DREAMER_HIDDEN_OU_AMP_MAX_SCALE':    ('hidden_ou_amp_max_scale',        float),
+    'DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3': ('hidden_ou_amp_max_scale_p3',     float),
+    'DREAMER_HIDDEN_OU_AMP_JITTER':       ('hidden_ou_amp_jitter',           str),
+    'DREAMER_HIDDEN_OU_DRIFT_FRAC':       ('hidden_ou_drift_frac',           float),
+    'DREAMER_DISTURBANCE_PROB_AGENT':     ('disturbance_prob_agent',         float),
+    'DREAMER_DISTURBANCE_PROB_P2':        ('disturbance_prob_p2',            float),
+    'DREAMER_DISTURBANCE_PROB_WM':        ('disturbance_prob_wm',            float),
+    'DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH': ('hidden_ou_prob_p3_ramp_reach', float),
+    'DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH': ('hidden_ou_prob_p2_ramp_reach', float),
+    'DREAMER_HIDDEN_OU_PROB_MIN':         ('hidden_ou_prob_min',             float),
+    'DREAMER_HIDDEN_OU_PROB_MAX':         ('hidden_ou_prob_max',             float),
+    'DREAMER_HIDDEN_OU_PROB_TARGET_SCORE': ('hidden_ou_prob_target_score',   float),
+    'DREAMER_HIDDEN_DIST_SETTLE_NTAU':    ('hidden_dist_settle_n_tau',       float),
+    'DREAMER_HIDDEN_DIST_MAX_EVENTS':     ('hidden_dist_max_events',         int),
+    'DREAMER_HIDDEN_DIST_P_ISOLATED':     ('hidden_dist_p_isolated',         float),
+    'DREAMER_HIDDEN_DIST_P_REVERT':       ('hidden_dist_p_revert',           float),
+    'DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS':  ('hidden_dist_shape_weights',      str),
+    'DREAMER_HIDDEN_DIST_SPREAD':         ('hidden_dist_spread',             _as_bool),
+    'DREAMER_HIDDEN_DIST_TAU_FRAC':       ('hidden_dist_tau_frac',           str),
+    'DREAMER_HIDDEN_DIST_DEADTIME_FRAC':  ('hidden_dist_deadtime_frac',      str),
     'DREAMER_WM_FREEZE_AFTER_P1':         ('wm_freeze_after_p1',             _as_bool),
     # WM-fix workstream (2026-06-09): all default-OFF (identity to p106).
     'DREAMER_WM_FREEZE_AFTER_ITERS':      ('wm_freeze_after_iters',          int),

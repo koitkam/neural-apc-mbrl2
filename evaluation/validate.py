@@ -430,10 +430,13 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                     if _is_rssm else None)
     _serve_step = None
     _o = None
+    _o_host = None
     if _is_rssm:
-        from models.dreamer_v4_rssm import stream_serve_step as _serve_step
+        from models.dreamer_v4_rssm import (
+            alloc_pinned_obs_host, copy_obs_row, stream_serve_step as _serve_step)
         _o = torch.empty(1, int(obs_window.shape[-1]), device=device,
                          dtype=torch.float32)
+        _o_host = alloc_pinned_obs_host(device, int(obs_window.shape[-1]))
 
     _use_cuda_amp = (device.type == 'cuda')
     with torch.inference_mode(), torch.amp.autocast(
@@ -441,8 +444,7 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
             enabled=_use_cuda_amp):
         for t in range(T):
             if _is_rssm:
-                _row = np.asarray(obs_window[-1], dtype=np.float32).reshape(-1)
-                _o[0].copy_(torch.from_numpy(_row))
+                copy_obs_row(_o, obs_window[-1], _o_host)
                 # Certainty-equivalent belief + the same DV/Kalman feat
                 # ``collect_episode`` / ``_realsim_actor_critic_step`` use.
                 _rssm_state = _serve_step(

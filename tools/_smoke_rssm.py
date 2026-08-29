@@ -738,6 +738,11 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_WM_OVERHEAD': '1.5',
         'DREAMER_DERIVED_OBSERVABLES': '0',
         'DREAMER_DERIVED_OBS_WINDOW': '16',
+        'DREAMER_PROCESS_NOISE_AMP_RAMP': '0.1:0.5',
+        'DREAMER_HIDDEN_DIST_SETTLE_NTAU': '3.0',
+        'DREAMER_HIDDEN_DISTURBANCE': '0',
+        'DREAMER_HIDDEN_DIST_P_REVERT': '0.4',
+        'DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS': '0.4,0.4,0.2',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -779,6 +784,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.wm_overhead) - 1.5) < 1e-12
         assert cfg.derived_observables is False
         assert int(cfg.derived_observables_window) == 16
+        assert cfg.process_noise_amp_ramp == '0.1:0.5'
+        assert abs(float(cfg.hidden_dist_settle_n_tau) - 3.0) < 1e-12
+        assert cfg.hidden_disturbance is False
+        assert abs(float(cfg.hidden_dist_p_revert) - 0.4) < 1e-12
+        assert cfg.hidden_dist_shape_weights == '0.4,0.4,0.2'
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -807,6 +817,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'wm_overhead' in explicit
         assert 'derived_observables' in explicit
         assert 'derived_observables_window' in explicit
+        assert 'process_noise_amp_ramp' in explicit
+        assert 'hidden_dist_settle_n_tau' in explicit
+        assert 'hidden_disturbance' in explicit
+        assert 'hidden_dist_p_revert' in explicit
+        assert 'hidden_dist_shape_weights' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1869,6 +1884,63 @@ def _test_derived_observables_cfg() -> None:
     print('[smoke] OK  derived_observables TrainConfig + leftover env identity')
 
 
+def _test_noise_hidden_cfg() -> None:
+    """Process-noise ramp + hidden-load: TrainConfig default, leftover, explicit."""
+    import os
+    from utils.hidden_disturbance import (
+        get_phase_disturbance_prob, hidden_disturbance_enabled)
+    from utils.noise_config import noise_curriculum_scale
+    keys = (
+        'DREAMER_PROCESS_NOISE_AMP_RAMP',
+        'DREAMER_DISTURBANCE_PROB_WM',
+        'DREAMER_HIDDEN_DISTURBANCE',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        c = TrainConfig()
+        assert c.process_noise_amp_ramp == '0.0:0.4'
+        assert c.hidden_disturbance is True
+        assert abs(float(c.hidden_dist_p_revert) - 0.7) < 1e-12
+        assert c.hidden_dist_shape_weights == '0.5,0.3,0.2'
+        s0 = noise_curriculum_scale(0.0, phase=1)
+        s_cfg = noise_curriculum_scale(0.0, phase=1, cfg=c)
+        assert s0 == 0.0 and s_cfg == 0.0
+        assert noise_curriculum_scale(0.4, phase=1, cfg=c) == 1.0
+        assert noise_curriculum_scale(0.0, phase=3, cfg=c) == 1.0
+        assert get_phase_disturbance_prob(phase=1) == get_phase_disturbance_prob(
+            phase=1, cfg=c)
+        assert hidden_disturbance_enabled(cfg=c) is True
+        os.environ['DREAMER_PROCESS_NOISE_AMP_RAMP'] = '0.5:0.4'
+        assert abs(noise_curriculum_scale(0.0, phase=1, cfg=c) - 0.5) < 1e-12
+        os.environ['DREAMER_PROCESS_NOISE_AMP_RAMP'] = ''
+        assert noise_curriculum_scale(0.0, phase=1, cfg=c) == 1.0
+        os.environ.pop('DREAMER_PROCESS_NOISE_AMP_RAMP', None)
+        c_ex = TrainConfig()
+        c_ex.process_noise_amp_ramp = '0.2:0.4'
+        c_ex._explicit_fields = {'process_noise_amp_ramp'}  # type: ignore
+        os.environ['DREAMER_PROCESS_NOISE_AMP_RAMP'] = '0.9:0.4'
+        assert abs(noise_curriculum_scale(0.0, phase=1, cfg=c_ex) - 0.2) < 1e-12
+        os.environ.pop('DREAMER_PROCESS_NOISE_AMP_RAMP', None)
+        os.environ['DREAMER_DISTURBANCE_PROB_WM'] = '0.25'
+        assert abs(get_phase_disturbance_prob(phase=1, cfg=c) - 0.25) < 1e-12
+        os.environ.pop('DREAMER_DISTURBANCE_PROB_WM', None)
+        os.environ['DREAMER_HIDDEN_DISTURBANCE'] = '0'
+        assert hidden_disturbance_enabled(cfg=c) is False
+        c_on = TrainConfig()
+        c_on.hidden_disturbance = True
+        c_on._explicit_fields = {'hidden_disturbance'}  # type: ignore
+        assert hidden_disturbance_enabled(cfg=c_on) is True  # explicit beats leftover
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  process-noise / hidden-load TrainConfig + leftover env identity')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -2197,6 +2269,7 @@ if __name__ == '__main__':
     _test_wm_tf_knobs_cfg_or_env()
     _test_horizon_ic_overhead_cfg_or_env()
     _test_derived_observables_cfg()
+    _test_noise_hidden_cfg()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

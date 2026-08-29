@@ -23,7 +23,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > stream measured DV + Kalman. Do not promote other plants until linear
 > observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
 > val-suite gates, horizon formula (`horizon_settle_n_tau` /
-> `horizon_max`), IC randomization, and GPU-calib `wm_overhead` are
+> `horizon_max`), IC randomization, GPU-calib `wm_overhead`, derived
+> observables, and **noise / hidden-load schedule** knobs
+> (`process_noise_amp_ramp`, `hidden_dist_*`, `disturbance_prob_*`) are
 > TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
@@ -526,9 +528,15 @@ P3 **collect** and val stream `stream_serve_step`: measured DV into the
 GRU and Kalman `d_t` when `dob_active`, so served `feat` matches
 training `_realsim_actor_critic_step` / `rollout_observed`. P47 EXIT
 falsified Adam log_std-row zero as the entropy-yank lever. RSSM
-collect/val reuse a persistent GPU obs row (no per-step lookback H2D).
-Per-CV derived observables (`int_err` / Δcv / var) are TrainConfig
-`derived_observables` (default ON; window 0 = auto 2τ/sr).
+collect/val reuse a persistent GPU obs row; CUDA H2D stages through a
+pinned host buffer (identity values). Stage-1 (`dob_active=False`)
+skips unused `sigmoid·d` decay (`d` is not a GRU input; `d_t≡0` is
+forced after the loop). Rest-IC `last_only` slices `act/embed/dv`
+(`[:, t]`) instead of `unbind`. Per-CV derived observables (`int_err` /
+Δcv / var) are TrainConfig `derived_observables` (default ON; window 0
+= auto 2τ/sr). Process-noise ramp and hidden-load schedule knobs are
+the same leftover-env class (identity defaults; dual-read at
+`noise_curriculum_scale` / `HiddenDisturbance`).
 
 ### Reading the diagram
 - **World model** learns the plant from `obs`: `encoder → posterior z` (sees obs),
