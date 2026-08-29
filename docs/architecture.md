@@ -19,8 +19,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > KEEP-AS-OVERRIDE (default False): opened entropy (−0.101) then yanked
 > at unfreeze even with Adam log_std-row zero (P47 EXIT econ **−221 vs
 > −121**, bang-bang 0.53). Do **not** promote `p3_reset_log_std`. P48
-> (`run_p48_collectdv`) closes the train/serve hole: P3 collect/val
-> stream measured DV + Kalman. Do not promote other plants until linear
+> EXIT (`run_p48_collectdv`): `stream_serve_step` **KEEP** as train/serve
+> identity, **FALSIFIED as cascade lever** (ES @236; freeze last_ok **24**
+> 0.81@DV vs live 0.89). P49 tests original-P1 wrap last-ok unlock.
+> Do not promote other plants until linear
 > observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
 > val-suite gates, horizon formula (`horizon_settle_n_tau` /
 > `horizon_max`), IC randomization, GPU-calib `wm_overhead`, derived
@@ -29,7 +31,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > GPU-calib budget (`gpu_target_util` / `gpu_max_bs` / `DREAMER_BATCH_SIZE`)
 > and plant-SNR (`sim_noise_adaptive` / `sim_ou_*` / `sim_meas_noise_*`)
 > plus wrapper seed/jitter/DR (`sim_noise_enabled` / `sim_noise_jitter_pct` /
-> `sim_domain_randomization`)
+> `sim_domain_randomization` / `sim_param_randomization_pct` sentinel −1=auto)
 > are TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
@@ -336,6 +338,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > **0.490**). `[p3-skip]`. Actor INVALID. Isolation-off KEEP as env-free
 > default. Freeze last_ok **104** (overwrite 56→64 then extra-P1);
 > detonated-freeze missed 56. **FALSIFIED as DV pin.**
+> **P48 EXIT freeze:** original-P1 wrap lock at iter 24 never unlocked
+> after recon recovered; freeze restored 24 (0.81@DV) vs live 0.89@DV.
+> P49 unlocks original-P1 wrap recovery (recon back below 20×);
+> extra-P1 recovered basin stays locked (P40). Do not raise lock_ratio.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
@@ -703,8 +709,9 @@ fixes BOTH:
   mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE
   (default False). Residual is last Linear (ent −0.101); opening σ
   not sufficient (econ −256 vs −129). **P47 EXIT:** Adam log_std-row
-  zero FALSIFIED as yank lever (econ −221 vs −121). P48 collect/val
-  streams `stream_serve_step` (DV + Kalman).
+  zero FALSIFIED as yank lever (econ −221 vs −121). **P48 EXIT:**
+  `stream_serve_step` KEEP / FALSIFIED as cascade lever. Original-P1 wrap
+  recovery unlocks last-ok (P48 freeze restored 24 vs live 0.89@DV).
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.

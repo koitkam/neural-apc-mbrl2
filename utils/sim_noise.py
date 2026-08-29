@@ -148,11 +148,17 @@ class DomainRandomizer:
 
         # --- fraction ---
         env_pct = None
-        for pfx in prefixes:
-            v = os.environ.get(f'{pfx}_PARAM_RANDOMIZATION_PCT')
+        for key in ('DREAMER_SIM_PARAM_RANDOMIZATION_PCT',):
+            v = os.environ.get(key)
             if v is not None:
                 env_pct = v
                 break
+        if env_pct is None:
+            for pfx in prefixes:
+                v = os.environ.get(f'{pfx}_PARAM_RANDOMIZATION_PCT')
+                if v is not None:
+                    env_pct = v
+                    break
         if param_randomization_pct is not None:
             self.frac = float(param_randomization_pct)
         elif env_pct is not None:

@@ -625,6 +625,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_SIM_NOISE_JITTER_PCT':       ('sim_noise_jitter_pct',         float),
     'DREAMER_SIM_DOMAIN_RANDOMIZATION':   ('sim_domain_randomization',     _as_bool),
     'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED': ('sim_domain_randomization_seed', str),
+    # Sentinel <0 = identifier-derived bake.  Leftover SIM_PARAM was
+    # dead after wrap overwrite.  Identity env-free (auto).
+    'DREAMER_SIM_PARAM_RANDOMIZATION_PCT': ('sim_param_randomization_pct', float),
     'DREAMER_HIDDEN_DISTURBANCE':         ('hidden_disturbance',             _as_bool),
     'DREAMER_HIDDEN_OU_AMP_RAMP':         ('hidden_ou_amp_ramp',             str),
     'DREAMER_HIDDEN_OU_AMP_MAX_SCALE':    ('hidden_ou_amp_max_scale',        float),

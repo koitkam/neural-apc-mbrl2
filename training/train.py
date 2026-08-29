@@ -1493,6 +1493,12 @@ class TrainConfig:
     sim_noise_jitter_pct: float = 0.20
     sim_domain_randomization: bool = True
     sim_domain_randomization_seed: str = ''
+    # Runtime DR magnitude.  Sentinel <0 = identifier-derived bake
+    # (test_sim ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT`` was
+    # overwritten by that bake after wrap, so the env A/B was dead.
+    # Explicit ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` / leftover SIM_*
+    # now win at bake.  ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``.
+    sim_param_randomization_pct: float = -1.0
 
     # ---- (P90, 2026-06-06) freeze WM after P1 (critic/WM coherence) ----
     # The WM's held-action fixed point is UNSTABLE — it converges mid-P1 then
@@ -1871,7 +1877,9 @@ class TrainConfig:
     # Lock last-ok when recon exceeds this × best (default 20 = 4× the
     # snapshot band). Wrap jitter stays below it; skip-storm restore
     # unlocks so post-storm healthy P1 can snapshot again.
-    # ``DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO``.
+    # P48: original-P1 wrap recovery also unlocks (freeze restored 24
+    # after a recovered 43× wrap and discarded live 0.89@DV). Extra-P1
+    # recovered basin stays locked (P40). ``DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO``.
     skip_storm_last_ok_lock_ratio: float = 20.0
     # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first
     # (keep extension) then cap.  ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
@@ -3145,12 +3153,14 @@ def _should_lock_last_ok(
         has_last_ok: bool,
         skip_storm_restored: bool,
         already_locked: bool,
+        extra_p1: bool = False,
 ) -> bool:
     """Lock last-ok after a silent recon spike so recovery cannot overwrite it.
 
     P40: extra-P1 iter 84 recon 0.48 / skip 0 (skip-storm silent). Recovery
     iter 98 recon 0.0068 < 5× best overwrote last-ok 83→104. Iter 104
     CAPPED with healthy recon so detonated-freeze did **not** restore 83.
+    Recovered extra-P1 stays locked (``extra_p1=True``).
 
     Skip-storm restore **unlocks** (post-restore healthy P1 should resume
     snapshots — P40 storm 1/2 @65 then last-ok 66+). Wrap jitter at
@@ -3161,10 +3171,27 @@ def _should_lock_last_ok(
     / gnorm 1.99 (42× best 0.0021) then recovered 0.0098 < 5× overwrote
     last-ok 56→64. Iter 58 of that spike had skip 1 — lock must not
     require a skip-free iter or a 0.48-class extra-P1 only.
+
+    P48 freeze: original-P1 wrap iter 25 recon 0.145 (43×) locked 24;
+    recon recovered iter 26 but the lock never unlocked, so freeze
+    restored 24 (0.81@DV) and discarded live gate 0.89@DV at iter 82.
+    Original-P1 wrap recovery (``already_locked`` and recon back below
+    ``lock_ratio``, ``extra_p1=False``) **unlocks** so last-ok can
+    advance. Extra-P1 recovered basin stays locked (P40).
     """
     if skip_storm_restored:
         return False
     if already_locked:
+        if extra_p1:
+            return True
+        try:
+            r = float(recon)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(r):
+            return True
+        if _recon_still_healthy(r, recon_best, lock_ratio):
+            return False
         return True
     if not has_last_ok:
         return False
@@ -12038,7 +12065,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # spike (P40 extra-P1 0.48; P41 original-P1 0.089) locks the
         # snapshot so a later recovered recon cannot overwrite it.
         # Lock is recon-only (not skip-free): P41 iter 58 skip 1 sat on
-        # the same spike.  Skip-storm restore unlocks.
+        # the same spike.  Skip-storm restore unlocks.  Original-P1 wrap
+        # recovery also unlocks (P48 freeze restored 24 after a recovered
+        # 43× wrap); extra-P1 recovered basin stays locked (P40).
         if (current_phase == 1
                 and bool(getattr(cfg, 'skip_storm_recover_p1', True))):
             _rlv = _wm_recon_scalar(wm_losses)
@@ -12053,14 +12082,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 lock_ratio=_lock_ratio,
                 has_last_ok=p1_last_ok_sd is not None,
                 skip_storm_restored=False,
-                already_locked=_was_locked)
+                already_locked=_was_locked,
+                extra_p1=int(p1_ext_steps) > 0)
+            if _was_locked and not p1_last_ok_locked:
+                _best_s = (f'{p1_recon_best:.4f}'
+                           if p1_recon_best is not None else 'n/a')
+                print(f'[wm-last-ok] unlocked after wrap recovery '
+                      f'(recon {_rlv:.4f} < {_lock_ratio:g}× best {_best_s}); '
+                      f'last-ok can advance',
+                      flush=True)
             if p1_last_ok_locked and not _was_locked:
                 _best_s = (f'{p1_recon_best:.4f}'
                            if p1_recon_best is not None else 'n/a')
                 print(f'[wm-last-ok] locked iter {p1_last_ok_iter} '
                       f'(recon {_rlv:.4f} > {_lock_ratio:g}× best {_best_s}); '
-                      f'P1→P2 freeze restores this snapshot even if recon '
-                      f'recovers',
+                      f'freeze restores this snapshot until wrap recovery '
+                      f'or skip-storm unlock',
                       flush=True)
                 if p1_last_ok_ckpt_path is None:
                     p1_last_ok_ckpt_path = out_dir / 'wm_last_ok.pt'

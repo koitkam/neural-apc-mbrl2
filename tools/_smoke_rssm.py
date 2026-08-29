@@ -318,9 +318,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _should_lock_last_ok(
         recon=0.02, recon_best=0.003, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=False, already_locked=False)
+    # P40 recovered extra-P1 basin stays locked (freeze must restore 83).
     assert _should_lock_last_ok(
         recon=0.0068, recon_best=0.0015, lock_ratio=20.0,
-        has_last_ok=True, skip_storm_restored=False, already_locked=True)
+        has_last_ok=True, skip_storm_restored=False, already_locked=True,
+        extra_p1=True)
     assert not _should_lock_last_ok(
         recon=0.4657, recon_best=0.0021, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=True, already_locked=True)
@@ -337,6 +339,21 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _should_lock_last_ok(
         recon=float('nan'), recon_best=0.0021, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=False, already_locked=False)
+    # P48: original-P1 wrap 43× locks; recovered 2.8× unlocks so last-ok
+    # can advance (freeze must not restore the wrap-era snapshot).
+    assert _should_lock_last_ok(
+        recon=0.1447, recon_best=0.0033, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=False,
+        extra_p1=False)
+    assert not _should_lock_last_ok(
+        recon=0.0093, recon_best=0.0033, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=True,
+        extra_p1=False)
+    # Still in the wrap (recon remains >20×) → stay locked.
+    assert _should_lock_last_ok(
+        recon=0.1447, recon_best=0.0033, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=True,
+        extra_p1=False)
     # Freeze recon healthy — restore because locked (P40 CAPPED 0.0045).
     assert _should_restore_last_ok_at_p1_freeze(
         recon=0.0045, recon_best=0.0015, ratio=5.0,
@@ -757,6 +774,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_SIM_NOISE_JITTER_PCT': '0.15',
         'DREAMER_SIM_DOMAIN_RANDOMIZATION': '0',
         'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED': '11',
+        'DREAMER_SIM_PARAM_RANDOMIZATION_PCT': '0.22',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -817,6 +835,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.sim_noise_jitter_pct) - 0.15) < 1e-12
         assert cfg.sim_domain_randomization is False
         assert cfg.sim_domain_randomization_seed == '11'
+        assert abs(float(cfg.sim_param_randomization_pct) - 0.22) < 1e-12
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -864,6 +883,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'sim_noise_jitter_pct' in explicit
         assert 'sim_domain_randomization' in explicit
         assert 'sim_domain_randomization_seed' in explicit
+        assert 'sim_param_randomization_pct' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1091,6 +1111,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_dv_ratio' in _src
     assert '_gain_match_pred_over_tgt' in _src
     assert '_should_lock_last_ok' in _src
+    assert 'extra_p1=int(p1_ext_steps) > 0' in _src
+    assert 'unlocked after wrap recovery' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
@@ -1359,11 +1381,13 @@ def _test_envfree_observer_recipe() -> None:
     assert abs(float(c.sim_noise_jitter_pct) - 0.20) < 1e-12
     assert c.sim_domain_randomization is True
     assert c.sim_domain_randomization_seed == ''
+    assert abs(float(c.sim_param_randomization_pct) + 1.0) < 1e-12
     assert 'DREAMER_SIM_NOISE_ENABLED' in ENV_OVERRIDES
     assert 'DREAMER_SIM_NOISE_SEED' in ENV_OVERRIDES
     assert 'DREAMER_SIM_NOISE_JITTER_PCT' in ENV_OVERRIDES
     assert 'DREAMER_SIM_DOMAIN_RANDOMIZATION' in ENV_OVERRIDES
     assert 'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_PARAM_RANDOMIZATION_PCT' in ENV_OVERRIDES
     assert c.obj_reward_scale == 'auto'
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -2109,6 +2133,7 @@ def _test_sim_runtime_cfg() -> None:
     assert c.sim_noise_enabled is True
     assert abs(float(c.sim_noise_jitter_pct) - 0.20) < 1e-12
     assert c.sim_domain_randomization is True
+    assert abs(float(c.sim_param_randomization_pct) + 1.0) < 1e-12
     keys = (
         'DREAMER_SIM_NOISE_ENABLED', 'SIM_NOISE_ENABLED',
         'DREAMER_SIM_NOISE_SEED', 'SIM_NOISE_SEED',
@@ -2118,6 +2143,8 @@ def _test_sim_runtime_cfg() -> None:
         'DREAMER_DOMAIN_RANDOMIZATION',
         'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
         'SIM_DOMAIN_RANDOMIZATION_SEED',
+        'DREAMER_SIM_PARAM_RANDOMIZATION_PCT',
+        'SIM_PARAM_RANDOMIZATION_PCT',
     )
     prev = {k: os.environ.get(k) for k in keys}
 
@@ -2145,6 +2172,7 @@ def _test_sim_runtime_cfg() -> None:
         assert abs(float(kn['jitter_pct']) - 0.20) < 1e-12
         assert kn['domain_randomization'] is True
         assert kn['noise_seed'] == ''
+        assert kn['param_randomization_pct'] is None
         wrap = SimNoiseWrapper(_Bare())
         assert wrap._has_noise is True
         assert abs(float(wrap._noise_jitter_pct) - 0.20) < 1e-9
@@ -2174,6 +2202,21 @@ def _test_sim_runtime_cfg() -> None:
         assert resolve_sim_runtime_knobs()['domain_randomization'] is False
         os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '1'
         assert resolve_sim_runtime_knobs()['domain_randomization'] is True
+        os.environ['SIM_PARAM_RANDOMIZATION_PCT'] = '0.25'
+        assert abs(float(resolve_sim_runtime_knobs()['param_randomization_pct'])
+                   - 0.25) < 1e-12
+        baked_ov = build_noise_config(
+            state_variables=['CV', 'x', 'y', 'DV'],
+            cv_indices=[0], dv_indices=[3], mv_indices=[1],
+            cv_normalization_ranges=[[68.0, 96.0]],
+            dv_normalization_ranges=[[60.0, 140.0]],
+            sample_rate=4, noise_stdv=0.03,
+        )
+        assert abs(float(baked_ov['domain_randomization']
+                         ['param_randomization_pct']) - 0.25) < 1e-12
+        os.environ['DREAMER_SIM_PARAM_RANDOMIZATION_PCT'] = '0.12'
+        assert abs(float(resolve_sim_runtime_knobs()['param_randomization_pct'])
+                   - 0.12) < 1e-12
         c_ex = TrainConfig()
         c_ex.sim_noise_jitter_pct = 0.33
         c_ex._explicit_fields = {'sim_noise_jitter_pct'}  # type: ignore

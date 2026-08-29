@@ -246,7 +246,40 @@ def resolve_sim_runtime_knobs(cfg=None) -> Dict[str, Any]:
             cfg, 'sim_domain_randomization_seed',
             'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
             'SIM_DOMAIN_RANDOMIZATION_SEED', ''),
+        'param_randomization_pct': resolve_sim_param_randomization_pct(cfg),
     }
+
+
+def resolve_sim_param_randomization_pct(cfg=None) -> Optional[float]:
+    """Override for baked DR ±%.  ``None`` = identifier-derived auto.
+
+    Env-free identity: bake stays ``_domain_randomization_pct`` (test_sim
+    ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT`` used to set
+    ``DomainRandomizer.frac`` at sim init then get overwritten by that
+    bake after wrap — the A/B was dead.  Explicit cfg / ``DREAMER_*`` /
+    leftover now win at bake.  Sentinel ``<0`` is auto.
+    """
+    if _snr_explicit(cfg, 'sim_param_randomization_pct'):
+        try:
+            v = float(getattr(cfg, 'sim_param_randomization_pct'))
+        except Exception:
+            return None
+        return None if v < 0.0 else float(v)
+    d_raw = os.environ.get('DREAMER_SIM_PARAM_RANDOMIZATION_PCT')
+    if d_raw not in (None, ''):
+        try:
+            v = float(d_raw)
+            return None if v < 0.0 else float(v)
+        except Exception:
+            pass
+    l_raw = os.environ.get('SIM_PARAM_RANDOMIZATION_PCT')
+    if l_raw not in (None, ''):
+        try:
+            v = float(l_raw)
+            return None if v < 0.0 else float(v)
+        except Exception:
+            pass
+    return None
 
 
 def _span(bounds):
@@ -583,6 +616,11 @@ def build_noise_config(
 
     # ── Domain randomization ─────────────────────────────────────────────
     dr_pct = _domain_randomization_pct(per_mv, per_cv)
+    dr_ov = runtime.get('param_randomization_pct')
+    if dr_ov is None:
+        dr_ov = resolve_sim_param_randomization_pct(cfg)
+    if dr_ov is not None:
+        dr_pct = float(np.clip(float(dr_ov), 0.0, 0.5))
     dr_on = bool(runtime['domain_randomization'])
 
     config = {
