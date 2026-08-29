@@ -770,11 +770,26 @@ def _test_store_aux_feats_identity() -> None:
     gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
                 if p.grad is not None)
     assert gru_g > 0.0, 'last_only observed encode lost GRU gradient'
+    m.zero_grad(set_to_none=True)
+    _, _, _, st_nf, *_ = m.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True,
+        return_feats=False)
+    nf_h = float((st_nf.h.detach() - st_full.h).abs().max())
+    nf_z = float((st_nf.z.detach() - st_full.z).abs().max())
+    assert nf_h < 1e-6 and nf_z < 1e-6, (nf_h, nf_z)
+    if st_nf.c_mean is not None:
+        nf_c = float((st_nf.c_mean.detach() - st_full.c_mean).abs().max())
+        assert nf_c < 1e-6, nf_c
+    st_nf.h.sum().backward()
+    gru_g_nf = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
+                   if p.grad is not None)
+    assert gru_g_nf > 0.0, 'return_feats=False last_only lost GRU gradient'
     bud = _dob_scan_mix_budget_bytes()
     assert 4 * 1024 * 1024 <= bud <= 64 * 1024 * 1024
     print(f'[smoke] OK  store_aux=False feats identity (max_err={err:.2e}); '
           f'observed last_only ≡ stack[:, -1] (feat={last_err:.2e} '
           f'h={h_err:.2e} z={z_err:.2e}); gru |g|={gru_g:.3f}; '
+          f'return_feats=False h={nf_h:.2e} z={nf_z:.2e} gru |g|={gru_g_nf:.3f}; '
           f'kalman mix budget={bud}')
 
 
@@ -898,6 +913,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_cache_gain_match_rest_ic' in _src
     assert '_require_realsim_actor' in _src
     assert 'store_aux=False, last_only=True' in _src
+    assert 'return_feats=False' in _src
     assert 'refusing PRBS-posterior fallback' in _src
     assert 'collect_rest_lookback' in _src
     assert '_gain_match_state_from_feat' in _src

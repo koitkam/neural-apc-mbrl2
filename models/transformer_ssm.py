@@ -727,7 +727,8 @@ class TransformerSSMDynamics(nn.Module):
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
                          sample: bool = True, store_aux: bool = True,
-                         last_only: bool = False
+                         last_only: bool = False,
+                         return_feats: bool = True
                          ) -> Tuple[torch.Tensor, torch.Tensor,
                                     torch.Tensor, TSSMState]:
         """Teacher-forced posterior rollout over (B, T, *).  ``act[:, t]`` drives
@@ -738,7 +739,9 @@ class TransformerSSMDynamics(nn.Module):
         cont = continuous-latent stats (always None on the TSSM scaffold).
         ``store_aux=False`` skips logit/cont stacks (same feats; isolation
         encode).  ``last_only=True`` returns T=1 feats/ds (last step); GRU
-        recurrence identical; rest-IC encode only needs the last state."""
+        recurrence identical; rest-IC encode only needs the last state.
+        ``return_feats=False`` (with ``last_only``) skips the last feat /
+        Stage-1 zero-``d`` tail.  Ignored when ``last_only`` is False."""
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                         # (B, T, embed_dim)
@@ -758,7 +761,8 @@ class TransformerSSMDynamics(nn.Module):
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         keep_aux = bool(store_aux) and not last_only
-        last_core = None
+        # last_only: materialize post.feat once after the loop (rest-IC).
+        _stack_post = not last_only
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             # COMPILE-EFFICIENT recurrence (2026-06-12, mirror of RSSMDynamics):
@@ -767,9 +771,8 @@ class TransformerSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            last_core = post.feat[..., :dec_in]          # decoder feat [h,z,(c),(dv)]
-            if not last_only:
-                feats_l.append(last_core)
+            if _stack_post:
+                feats_l.append(post.feat[..., :dec_in])
             if keep_aux:
                 post_l.append(post.z_logits)
                 prior_l.append(prior.z_logits)
@@ -785,16 +788,14 @@ class TransformerSSMDynamics(nn.Module):
             state = self.initial_state(B, device)
             feats_l, post_l, prior_l, prior_core_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
-            last_core = None
             for t in range(T):
                 dv_t = dvs[:, t] if dvs is not None else None
                 post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                             dv=dv_t, sample=sample, obs=None,
                                             cont_innov=nu_seq[:, t])
                 state = post
-                last_core = post.feat[..., :dec_in]
-                if not last_only:
-                    feats_l.append(last_core)
+                if _stack_post:
+                    feats_l.append(post.feat[..., :dec_in])
                 if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
@@ -802,8 +803,10 @@ class TransformerSSMDynamics(nn.Module):
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
                     prior_core_l.append(prior.feat[..., :dec_in])
+        if last_only and not return_feats:
+            return None, None, None, state, None, None
         if last_only:
-            post_core = last_core.unsqueeze(1)           # (B, 1, dec_in)
+            post_core = state.feat[..., :dec_in].unsqueeze(1)  # (B, 1, dec_in)
         else:
             post_core = torch.stack(feats_l, dim=1)      # (B, T, dec_in) = [h,z,(dv)]
         post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)

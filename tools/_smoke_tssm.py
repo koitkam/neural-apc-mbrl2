@@ -157,8 +157,14 @@ def test_store_aux_feats_identity():
     assert last_err < 1e-6, f'last_only feats != stack[:, -1] (max_err={last_err})'
     h_err = float((st_last.h - st_full.h).abs().max())
     assert h_err < 1e-6, h_err
+    _, _, _, st_nf, *_ = m.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True,
+        return_feats=False)
+    nf_h = float((st_nf.h.detach() - st_full.h).abs().max())
+    assert nf_h < 1e-6, nf_h
     print(f"[smoke] OK store_aux=False feats identity (max_err={err:.2e}); "
-          f"observed last_only ≡ stack[:, -1] (feat={last_err:.2e} h={h_err:.2e})")
+          f"observed last_only ≡ stack[:, -1] (feat={last_err:.2e} h={h_err:.2e}); "
+          f"return_feats=False h={nf_h:.2e}")
 
 
 def test_stepwise_equals_full_sequence():

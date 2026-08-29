@@ -743,7 +743,8 @@ class RSSMDynamics(nn.Module):
     # ----- sequence rollout ---------------------------------------------
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
                          sample: bool = True, store_aux: bool = True,
-                         last_only: bool = False
+                         last_only: bool = False,
+                         return_feats: bool = True
                          ) -> Tuple[torch.Tensor, torch.Tensor,
                                     torch.Tensor, RSSMState]:
         """Teacher-forced posterior rollout over a (B, T, *) batch.
@@ -768,6 +769,9 @@ class RSSMDynamics(nn.Module):
         ``RSSMState`` ≡ full-roll last state (P45 rest-IC encode only
         needs that IC).  Aux logit/cont stacks stay ``None`` (T-stacks
         would not match).  Isolation / main WM still need the full T.
+        ``return_feats=False`` (with ``last_only``) skips even the last
+        feat / Stage-1 zero-``d`` tail — rest-IC only reads ``h/z/c_mean``.
+        Ignored when ``last_only`` is False.
         """
         B, T = obs.shape[:2]
         device = obs.device
@@ -802,7 +806,11 @@ class RSSMDynamics(nn.Module):
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         keep_aux = bool(store_aux) and not last_only
-        last_core = None
+        # last_only rest-IC only needs the last RSSMState.  Building
+        # post.feat every t was T concatenations of [h,z,c,dv,d] then
+        # discarding all but the last.  Kalman / two-pass still need
+        # per-step prior.feat.  Materialize the last post.feat once.
+        _stack_post = not last_only
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z) recurrence
@@ -815,9 +823,8 @@ class RSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            last_core = post.feat[..., :dec_in]        # decoder feat [h,z,(c),(dv)]
-            if not last_only:
-                feats_l.append(last_core)
+            if _stack_post:
+                feats_l.append(post.feat[..., :dec_in])
             if keep_aux:
                 post_l.append(post.z_logits)
                 prior_l.append(prior.z_logits)
@@ -835,16 +842,14 @@ class RSSMDynamics(nn.Module):
             state = self.initial_state(B, device)
             feats_l, post_l, prior_l, prior_core_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
-            last_core = None
             for t in range(T):
                 dv_t = dvs[:, t] if dvs is not None else None
                 post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                             dv=dv_t, sample=sample, obs=None,
                                             cont_innov=nu_seq[:, t])
                 state = post
-                last_core = post.feat[..., :dec_in]
-                if not last_only:
-                    feats_l.append(last_core)
+                if _stack_post:
+                    feats_l.append(post.feat[..., :dec_in])
                 if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
@@ -852,8 +857,10 @@ class RSSMDynamics(nn.Module):
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
                     prior_core_l.append(prior.feat[..., :dec_in])
+        if last_only and not return_feats:
+            return None, None, None, state, None, None
         if last_only:
-            post_core = last_core.unsqueeze(1)       # (B, 1, dec_in)
+            post_core = state.feat[..., :dec_in].unsqueeze(1)  # (B, 1, dec_in)
         else:
             post_core = torch.stack(feats_l, dim=1)    # (B, T, dec_in)=[h,z,(c),(dv)]
         post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)
