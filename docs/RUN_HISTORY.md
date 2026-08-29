@@ -113,7 +113,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 | P46 | 2026-08-29 | P3 log_std reset (`DREAMER_P3_RESET_LOG_STD=1`, weights-only) | GAIN-READY 0.88@DV; first P3 ent **−0.101**; warmup still railed; ES entropy-collapse @220; econ **−256 vs −129** | ❌ KEEP-AS-OVERRIDE (do not promote); next P47 Adam-complete |
 | P47 | 2026-08-29 | P3 σ-reset + Adam log_std-row zero | GAIN-READY 0.90@DV; first P3 ent **−0.101**; unfreeze yank 145 **−0.336** (Adam FALSIFIED); ES entropy-collapse @253; econ **−221 vs −121**; reversal **0.53** | ❌ Adam-complete **FALSIFIED as yank lever**; do not promote `p3_reset_log_std`; next P48 collect DV+Kalman |
 | P48 | 2026-08-29 | P3 collect/val stream measured DV + Kalman | ES entropy_collapse @236; best.pt **161**. GAIN-READY live **0.89@DV** @82; freeze last_ok **24** → **0.81@DV**. First P3 ent **−0.283**; rscale **2.51 KEEP**; rtgt 0.059→0.0004; mvv 17k/223k. Val TM skipped ImportError | ❌ KEEP train/serve; **FALSIFIED as cascade lever**. Freeze-24 confound. Next P49 wrap-unlock |
-| P49 | 2026-08-29 | original-P1 wrap last-ok unlock | LIVE P1 iter 25; last_ok 25 locked=False; wrap **not** at P48's iter-25 (recon 0.0039) | 🔬 in progress; GPU occupied — no second job |
+| P49 | 2026-08-29 | original-P1 wrap last-ok unlock | LIVE P1 iter 32; last_ok 32 locked=False; **no wrap** through P48's lock window (recon 0.0032, max 1.5×) | 🔬 in progress; unlock path untested; GPU occupied |
 
 ## Run details
 
@@ -1534,7 +1534,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Not:** leftover `DREAMER_*`, `p3_reset_log_std`, extra critic knobs, raise lock_ratio, require gnorm/skip, rest-IC settle=`wm_tf_horizon`.
 - **Step 4 resolved-cfg vs P48:** identical banner. `sim_param_randomization_pct` now in plan (−1=auto; P48 pid lacked the field; bake still identifier ~0.115). Watch `[wm-last-ok] unlocked after wrap recovery`; freeze last_ok **not** 24.
 - **Watch:** lock on >20× wrap; unlock when recon <20×; `p1_last_ok_iter` advances after unlock; freeze last_ok late-P1 (~80) and freeze DV ≈ live gate; P3 cascade vs P48. If still cascade → freeze-24 was not the actor confound (re-diagnose; do not stack critic knobs).
-- **Live (2026-08-29 ~13:20 CDT, pid 41994, launch `4ef9bcb`):** P1 iter **25**, last_ok **25** `locked=False`, skip **0**, recon **0.0039**. P48 locked at this iter (recon 0.145 = 43×); P49 did **not** wrap here. Hypothesis still untested until a >20× recon spike. **Do not launch.** GPU-occupied leftover: `AGENT_DISTURBANCE_*` → TrainConfig (identity).
+- **Live (2026-08-29 ~13:35 CDT, pid 41994, launch `4ef9bcb`):** P1 iter **32**, last_ok **32** `locked=False`, skip **0**, recon **0.0032** (best 0.0027, max ratio **1.5×** @14). No `[wm-last-ok]` lock/unlock. P48 locked iter 24 (recon 0.145 = 43×) and stayed locked; P49 did not spike. Probe iter 30: H=55 r=+0.507 gain_fid=0.919 (P48 after wrap: H=55 r=+0.391 conv=0.75). Teacher FD `*_ratio` ~×1 (not TM). Unlock path **untested** until a >20× recon spike; if none, freeze last_ok can still be late-P1 (~80) vs P48's 24. **Do not launch.** Leftover `AGENT_DISTURBANCE_*` is `2ec8345` (not this pid).
 
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
