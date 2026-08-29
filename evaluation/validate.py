@@ -429,72 +429,77 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     _rssm_prev_a = (torch.zeros(1, action_dim, device=device)
                     if _is_rssm else None)
     _serve_step = None
+    _o = None
     if _is_rssm:
         from models.dreamer_v4_rssm import stream_serve_step as _serve_step
+        _o = torch.empty(1, int(obs_window.shape[-1]), device=device,
+                         dtype=torch.float32)
 
-    for t in range(T):
-        ow = torch.from_numpy(obs_window).to(device)
-        a_ctx = torch.from_numpy(a_history).to(device)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=device.type,
-                                     dtype=torch.bfloat16,
-                                     enabled=(device.type == 'cuda')):
-                if _is_rssm:
-                    _o = torch.from_numpy(
-                        obs_window[-1]).to(device).unsqueeze(0)
-                    # Certainty-equivalent belief + the same DV/Kalman feat
-                    # ``collect_episode`` / ``_realsim_actor_critic_step`` use.
-                    _rssm_state = _serve_step(
-                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
-                        sample=False)
-                    agent_hid = _rssm_state.feat
-                else:
-                    z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
-                    tau = torch.full((1, L), tau_ctx_val, device=device,
-                                      dtype=z_ctx.dtype)
-                    d = torch.full((1, L), d_min, device=device,
-                                    dtype=z_ctx.dtype)
-                    out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
-                    agent_hid = out['agent_hid'][:, -1]
-                action_t, _, _ = model.policy(agent_hid,
-                                                deterministic=deterministic)
-        a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-        if _is_rssm:
-            _rssm_prev_a = torch.from_numpy(a_np).to(device).unsqueeze(0)
-        next_window, scaled_r, done, info = env.step(a_np)
-        comps = info.get('reward_components', {}) or {}
-        # Record the *raw* (physical-units) state so plots/npz read true
-        # plant values, not the post-standardizer z-scores that the
-        # tokenizer sees.  Falls back to the normalized obs slice if the
-        # env did not expose ``raw_state`` for back-compat.
-        raw_st = info.get('raw_state')
-        if raw_st is None:
-            states[t] = next_window[-1, :state_dim]
-        else:
-            arr = np.asarray(raw_st, dtype='float32').reshape(-1)
-            states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
-        actions_norm[t] = a_np
-        controls[t] = np.asarray(env._prev_control, dtype='float32')
-        raw_rewards[t] = float(info.get('raw_reward', 0.0))
-        scaled_rewards[t] = float(scaled_r)
-        cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
-        mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
-        hd = info.get('hidden_disturbance')
-        if hd is not None:
-            hd = np.asarray(hd, dtype='float32').reshape(-1)
-            hidden_dist_t[t, :min(n_cv_h, hd.shape[0])] = hd[:n_cv_h]
-        if n_mv_aux > 0:
-            current_mv_bounds_t[t] = np.asarray(
-                env.setpoint_mgr.current_mv_bounds, dtype='float32')
-        if n_cv_aux > 0:
-            current_cv_bounds_t[t] = np.asarray(
-                env.setpoint_mgr.current_cv_bounds, dtype='float32')
-            current_cv_targets_t[t] = np.asarray(
-                env.setpoint_mgr.current_cv_targets, dtype='float32')
-        a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
-        obs_window = next_window
-        if done:
-            break
+    _use_cuda_amp = (device.type == 'cuda')
+    with torch.inference_mode(), torch.amp.autocast(
+            device_type=device.type, dtype=torch.bfloat16,
+            enabled=_use_cuda_amp):
+        for t in range(T):
+            if _is_rssm:
+                _row = np.asarray(obs_window[-1], dtype=np.float32).reshape(-1)
+                _o[0].copy_(torch.from_numpy(_row))
+                # Certainty-equivalent belief + the same DV/Kalman feat
+                # ``collect_episode`` / ``_realsim_actor_critic_step`` use.
+                _rssm_state = _serve_step(
+                    model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                    sample=False)
+                agent_hid = _rssm_state.feat
+            else:
+                ow = torch.from_numpy(obs_window).to(device)
+                a_ctx = torch.from_numpy(a_history).to(device)
+                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]
+            action_t, _, _ = model.policy(agent_hid,
+                                            deterministic=deterministic)
+            a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
+            if _is_rssm:
+                _rssm_prev_a = action_t.detach().float().reshape(1, -1)
+            next_window, scaled_r, done, info = env.step(a_np)
+            comps = info.get('reward_components', {}) or {}
+            # Record the *raw* (physical-units) state so plots/npz read true
+            # plant values, not the post-standardizer z-scores that the
+            # tokenizer sees.  Falls back to the normalized obs slice if the
+            # env did not expose ``raw_state`` for back-compat.
+            raw_st = info.get('raw_state')
+            if raw_st is None:
+                states[t] = next_window[-1, :state_dim]
+            else:
+                arr = np.asarray(raw_st, dtype='float32').reshape(-1)
+                states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
+            actions_norm[t] = a_np
+            controls[t] = np.asarray(env._prev_control, dtype='float32')
+            raw_rewards[t] = float(info.get('raw_reward', 0.0))
+            scaled_rewards[t] = float(scaled_r)
+            cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
+            mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
+            hd = info.get('hidden_disturbance')
+            if hd is not None:
+                hd = np.asarray(hd, dtype='float32').reshape(-1)
+                hidden_dist_t[t, :min(n_cv_h, hd.shape[0])] = hd[:n_cv_h]
+            if n_mv_aux > 0:
+                current_mv_bounds_t[t] = np.asarray(
+                    env.setpoint_mgr.current_mv_bounds, dtype='float32')
+            if n_cv_aux > 0:
+                current_cv_bounds_t[t] = np.asarray(
+                    env.setpoint_mgr.current_cv_bounds, dtype='float32')
+                current_cv_targets_t[t] = np.asarray(
+                    env.setpoint_mgr.current_cv_targets, dtype='float32')
+            if not _is_rssm:
+                a_history = np.concatenate(
+                    [a_history[1:], a_np[None, :]], axis=0)
+            obs_window = next_window
+            if done:
+                break
 
     return {
         'states': states[:t + 1],

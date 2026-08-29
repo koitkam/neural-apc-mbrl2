@@ -626,7 +626,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         finally:
             model.dynamics.obs_step = _orig_obs
             model.dynamics._posterior_step = _orig_post
-        print('[smoke] OK  random collect skips RSSM; on-policy streams _posterior_step (no DV/DOB)')
+        print('[smoke] OK  random collect skips RSSM; on-policy streams stream_serve_step')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
@@ -736,6 +736,8 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_INIT_RANDOMIZATION': '0',
         'DREAMER_INIT_RANDOMIZATION_FRAC': '0.4',
         'DREAMER_WM_OVERHEAD': '1.5',
+        'DREAMER_DERIVED_OBSERVABLES': '0',
+        'DREAMER_DERIVED_OBS_WINDOW': '16',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -775,6 +777,8 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.init_randomization is False
         assert abs(float(cfg.init_randomization_frac) - 0.4) < 1e-12
         assert abs(float(cfg.wm_overhead) - 1.5) < 1e-12
+        assert cfg.derived_observables is False
+        assert int(cfg.derived_observables_window) == 16
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -801,6 +805,8 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'init_randomization' in explicit
         assert 'init_randomization_frac' in explicit
         assert 'wm_overhead' in explicit
+        assert 'derived_observables' in explicit
+        assert 'derived_observables_window' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1820,6 +1826,49 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
     print('[smoke] OK  horizon/IC/overhead cfg-or-env identity')
 
 
+def _test_derived_observables_cfg() -> None:
+    """Derived-obs block: TrainConfig default ON, explicit, leftover env."""
+    import os
+    from utils.derived_observations import (
+        derived_observables_enabled, derived_observables_window)
+    c = TrainConfig()
+    assert c.derived_observables is True
+    assert int(c.derived_observables_window) == 0
+    assert derived_observables_enabled(c) is True
+    auto = derived_observables_window(cfg=c, tau=53.0, sample_rate=4.0)
+    assert auto == 26, auto  # round(2*53/4)=26 (ties-to-even), clamp [8,128]
+    c.derived_observables = False
+    c._explicit_fields = {'derived_observables'}  # type: ignore[attr-defined]
+    prev = os.environ.get('DREAMER_DERIVED_OBSERVABLES')
+    prev_w = os.environ.get('DREAMER_DERIVED_OBS_WINDOW')
+    try:
+        os.environ['DREAMER_DERIVED_OBSERVABLES'] = '1'
+        assert derived_observables_enabled(c) is False  # explicit beats leftover
+        os.environ.pop('DREAMER_DERIVED_OBSERVABLES', None)
+        c2 = TrainConfig()
+        os.environ['DREAMER_DERIVED_OBSERVABLES'] = '0'
+        assert derived_observables_enabled(c2) is False  # leftover env
+        os.environ.pop('DREAMER_DERIVED_OBSERVABLES', None)
+        os.environ['DREAMER_DERIVED_OBS_WINDOW'] = '16'
+        assert derived_observables_window(cfg=TrainConfig(), tau=53.0,
+                                          sample_rate=4.0) == 16
+        c3 = TrainConfig()
+        c3.derived_observables_window = 0
+        c3._explicit_fields = {'derived_observables_window'}  # type: ignore
+        assert derived_observables_window(cfg=c3, tau=53.0,
+                                          sample_rate=4.0) == 26
+    finally:
+        if prev is None:
+            os.environ.pop('DREAMER_DERIVED_OBSERVABLES', None)
+        else:
+            os.environ['DREAMER_DERIVED_OBSERVABLES'] = prev
+        if prev_w is None:
+            os.environ.pop('DREAMER_DERIVED_OBS_WINDOW', None)
+        else:
+            os.environ['DREAMER_DERIVED_OBS_WINDOW'] = prev_w
+    print('[smoke] OK  derived_observables TrainConfig + leftover env identity')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -2147,6 +2196,7 @@ if __name__ == '__main__':
     _test_attention_auto_ignores_leftover_fast_attn()
     _test_wm_tf_knobs_cfg_or_env()
     _test_horizon_ic_overhead_cfg_or_env()
+    _test_derived_observables_cfg()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

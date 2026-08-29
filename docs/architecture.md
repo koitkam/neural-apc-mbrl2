@@ -525,7 +525,10 @@ flowchart TB
 P3 **collect** and val stream `stream_serve_step`: measured DV into the
 GRU and Kalman `d_t` when `dob_active`, so served `feat` matches
 training `_realsim_actor_critic_step` / `rollout_observed`. P47 EXIT
-falsified Adam log_std-row zero as the entropy-yank lever.
+falsified Adam log_std-row zero as the entropy-yank lever. RSSM
+collect/val reuse a persistent GPU obs row (no per-step lookback H2D).
+Per-CV derived observables (`int_err` / Δcv / var) are TrainConfig
+`derived_observables` (default ON; window 0 = auto 2τ/sr).
 
 ### Reading the diagram
 - **World model** learns the plant from `obs`: `encoder → posterior z` (sees obs),

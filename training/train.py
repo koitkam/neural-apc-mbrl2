@@ -636,6 +636,16 @@ class TrainConfig:
     # only their nominal starting value.  Set False (``DREAMER_RUNTIME_SETPOINT
     # _VARIATION=0``) only to freeze active≡base for a no-limit-step ablation.
     runtime_setpoint_variation: bool = True
+    # Per-CV rolling int_err / Δcv / var appended to aug-obs (P37 ON).
+    # Was leftover ``DREAMER_DERIVED_OBSERVABLES`` (worked, missing from
+    # ``run_plan``).  ``=0`` restores the legacy obs layout (different
+    # ``obs_dim`` — do not mix with an ON checkpoint).
+    derived_observables: bool = True
+    # Rolling window in agent steps.  Sentinel 0 = auto
+    # ``round(2·τ/sample_rate)`` clamped to ``[8, 128]``.  Leftover
+    # ``DREAMER_DERIVED_OBS_WINDOW`` still wins when the field is not
+    # explicit.
+    derived_observables_window: int = 0
 
     # ---- WM disturbance-estimator head (P87, 2026-06-05) ----
     # ML analogue of an APC disturbance observer / "prediction-error
@@ -2109,12 +2119,12 @@ class APCEnv:
         # ---- Derived observable block (Stage B, 2026-05-21) ---------------
         # Belief-state augmentation: cheap per-CV rolling statistics
         # (mean tracking error, Δcv, variance) appended to the
-        # augmented-obs block.  Default ON (`derived_observables_enabled`);
+        # augmented-obs block.  Default ON (`derived_observables`);
         # disable via ``DREAMER_DERIVED_OBSERVABLES=0``.  When ON,
         # ``aug_obs_dim`` grows by ``3 * n_cv`` and the running obs
         # normalizer auto-adapts (features are bounded by construction).
         self._derived_features: Optional[DerivedFeatures] = None
-        if derived_observables_enabled():
+        if derived_observables_enabled(self.cfg):
             n_cv = int(len(self.cv_indices))
             self._derived_features = DerivedFeatures(
                 n_cv=n_cv,
@@ -2122,6 +2132,7 @@ class APCEnv:
                     tau=(self._resolve_plant_timing()[0] or None),
                     sample_rate=float(getattr(self.cfg, 'sample_rate', 1.0)
                                        or 1.0),
+                    cfg=self.cfg,
                 ),
             )
             self.aug_obs_dim += int(self._derived_features.feat_dim)
@@ -4528,31 +4539,36 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # on-policy streams the posterior with measured DV + Kalman so the
     # served ``feat`` matches ``_realsim_actor_critic_step`` re-encode.
     from models.dreamer_v4_rssm import stream_serve_step
-    with torch.inference_mode():
+    # One autocast region for the episode (not per step).  RSSM obs is a
+    # persistent GPU row — no per-step ``from_numpy().to().unsqueeze``.
+    _use_cuda_amp = (device.type == 'cuda')
+    with torch.inference_mode(), torch.amp.autocast(
+            device_type=device.type, dtype=torch.bfloat16,
+            enabled=_use_cuda_amp):
         _rssm_state = (model.dynamics.initial_state(1, device)
                        if _is_rssm else None)
         _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
                         if _is_rssm else None)
+        _o = (torch.empty(1, D, device=device, dtype=torch.float32)
+              if _is_rssm else None)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
             if _is_rssm:
-                with torch.amp.autocast(device_type=device.type,
-                                         dtype=torch.bfloat16,
-                                         enabled=(device.type == 'cuda')):
-                    _o = torch.from_numpy(obs_window[-1]).to(device).unsqueeze(0)
-                    # Certainty-equivalent (sample=False) belief: the actor
-                    # trains on the mode (``_realsim_actor_critic_step``) and
-                    # LQG control acts on the optimal state estimate.  A
-                    # sampled belief injects latent noise into the MV (p01
-                    # chatter).  ``stream_serve_step`` threads measured DV
-                    # into the GRU and Kalman ``d_t`` when DOB is live —
-                    # same feat the frozen observer uses at train time.
-                    _rssm_state = stream_serve_step(
-                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
-                        sample=False)
-                    action_t, _, _ = model.policy(_rssm_state.feat,
-                                                   deterministic=deterministic)
+                _row = np.asarray(obs_window[-1], dtype=np.float32).reshape(-1)
+                _o[0].copy_(torch.from_numpy(_row))
+                # Certainty-equivalent (sample=False) belief: the actor
+                # trains on the mode (``_realsim_actor_critic_step``) and
+                # LQG control acts on the optimal state estimate.  A
+                # sampled belief injects latent noise into the MV (p01
+                # chatter).  ``stream_serve_step`` threads measured DV
+                # into the GRU and Kalman ``d_t`` when DOB is live —
+                # same feat the frozen observer uses at train time.
+                _rssm_state = stream_serve_step(
+                    model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                    sample=False)
+                action_t, _, _ = model.policy(_rssm_state.feat,
+                                               deterministic=deterministic)
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
                 # Reuse the on-device action for the next GRU step — no
                 # host→device round-trip (the .cpu() above already paid the
@@ -4561,18 +4577,15 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
             else:
                 ow = torch.from_numpy(obs_window).to(device)            # (L, D)
                 a_ctx = torch.from_numpy(a_history).to(device)           # (L, A)
-                with torch.amp.autocast(device_type=device.type,
-                                         dtype=torch.bfloat16,
-                                         enabled=(device.type == 'cuda')):
-                    z_ctx = model.tokenizer.encode(ow).unsqueeze(0)     # (1, L, z)
-                    tau = torch.full((1, L), tau_ctx_val, device=device,
-                                      dtype=z_ctx.dtype)
-                    d = torch.full((1, L), d_min, device=device,
-                                    dtype=z_ctx.dtype)
-                    out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
-                    agent_hid = out['agent_hid'][:, -1]                  # (1, D)
-                    action_t, _, _ = model.policy(agent_hid,
-                                                    deterministic=deterministic)
+                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)     # (1, L, z)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]                  # (1, D)
+                action_t, _, _ = model.policy(agent_hid,
+                                                deterministic=deterministic)
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
             next_window, reward, done, _ = env.step(a_np)
             act_buf[t] = a_np

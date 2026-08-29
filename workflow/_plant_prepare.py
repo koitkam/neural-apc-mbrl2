@@ -264,6 +264,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_INIT_RANDOMIZATION':      ('init_randomization',      _as_bool),
     'DREAMER_INIT_RANDOMIZATION_FRAC': ('init_randomization_frac', float),
     'DREAMER_WM_OVERHEAD':             ('wm_overhead',             float),
+    # Per-CV rolling int_err/Δcv/var in aug-obs (P37 ON via leftover env).
+    # Sentinel window 0 = auto 2τ/sr.  Identity: default ON / auto.
+    'DREAMER_DERIVED_OBSERVABLES':     ('derived_observables',        _as_bool),
+    'DREAMER_DERIVED_OBS_WINDOW':      ('derived_observables_window', int),
     # 2026-05-21 (P37 robustness sweep): allow overriding the
     # plant-derived seq_len so longer-context WM training can be
     # launched without code changes.  Useful when the hidden OU
