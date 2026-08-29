@@ -869,6 +869,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert '_cache_gain_match_rest_ic' in _src
+    assert 'refusing PRBS-posterior fallback' in _src
     assert 'collect_rest_lookback' in _src
     assert '_gain_match_state_from_feat' in _src
     assert '_auto_gain_match_settle_len' in _src

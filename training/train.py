@@ -811,11 +811,11 @@ class TrainConfig:
     # (noise-free const-action), teacher-force ``rollout_observed``
     # (gradful; P25), then FD from that posterior.  Isolation **loss**
     # stays 0.  Real rest replaces the P44 WM-held settle of a PRBS
-    # start (CPU probe: PRBS+S=H still FD DV×0.969 while TM rest-step
-    # is 0.75@DV; P44 storm 2/2 G_pred≈0).  Default False until P44
-    # EXIT; ``DREAMER_GAIN_MATCH_REST_IC=1`` is the one attributed P45
-    # change (does not retry S=H).  Collect settle = max(H, lookback)
-    # — **not** ``wm_tf_horizon`` (that 4H window is a later A/B).
+    # start (P44 EXIT: S=H storm 2/2, val DV ss/@H ×0.751/×0.842,
+    # freeze last_ok 57).  Default False; ``DREAMER_GAIN_MATCH_REST_IC=1``
+    # is the one attributed P45 change (does not retry S=H).  Collect
+    # settle = max(H, lookback) — **not** ``wm_tf_horizon`` (that 4H
+    # window is a later A/B).
     gain_match_rest_ic: bool = False
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
@@ -6253,6 +6253,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     if _cfg_on(cfg, 'gain_match_rest_ic', False):
         rest = _gain_match_rest_ic_state(
             rssm, cfg, obs.device, obs.dtype)
+        if rest is None and not getattr(
+                cfg, '_gain_match_rest_fallback_logged', False):
+            print('[gain-match] rest-ic cache empty; FD using PRBS starts '
+                  '(P45 confound if this is a rest-ic GPU job)',
+                  flush=True)
+            cfg._gain_match_rest_fallback_logged = True  # type: ignore[attr-defined]
     if rest is not None:
         # P45: TM-protocol IC (real rest encode).  Skip P44 WM-held
         # settle of a PRBS start — the lookback *is* the rest.
@@ -10461,8 +10467,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     try:
         _cache_gain_match_rest_ic(env, cfg)
     except Exception as _rest_exc:
-        print(f'[gain-match] rest-ic cache FAILED ({_rest_exc!r}); '
-              f'FD falls back to PRBS starts', flush=True)
+        print(f'[gain-match] rest-ic cache FAILED ({_rest_exc!r})',
+              flush=True)
+        if _cfg_on(cfg, 'gain_match_rest_ic', False):
+            raise RuntimeError(
+                'gain_match_rest_ic=True but rest cache failed; '
+                'refusing PRBS-posterior fallback (would confound P45)'
+            ) from _rest_exc
+    if (_cfg_on(cfg, 'gain_match_rest_ic', False)
+            and getattr(cfg, '_gain_match_rest_obs', None) is None):
+        raise RuntimeError(
+            'gain_match_rest_ic=True but rest cache is empty; '
+            'refusing PRBS-posterior fallback (would confound P45)')
     _resolve_aux_tbptt_steps(cfg)
     _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:
