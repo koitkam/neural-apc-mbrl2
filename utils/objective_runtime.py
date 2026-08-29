@@ -40,6 +40,15 @@ import numpy as np
 
 from utils.state_normalization import state_value_in_mode
 
+try:
+    from utils.auto_weights import adaptive_penalty_clip as _adaptive_clip_fn
+except Exception:  # pragma: no cover
+    _adaptive_clip_fn = None
+
+_BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f')
+_AUTO_W_CACHE: Dict[tuple, Dict] = {}
+_AUTO_W_CACHE_MAX = 64
+
 
 def _safe_float(v, default=0.0):
     try:
@@ -154,12 +163,34 @@ def _objective_uses_normalized(obj_w: Dict, terms: Dict) -> bool:
     return bool(int(_safe_float(obj_w.get('objective_use_normalized', 1), 1)))
 
 
+def _bounds_fp(bounds) -> tuple:
+    """Round bound rows so cache keys are stable across float noise."""
+    if not bounds:
+        return ()
+    out = []
+    for row in bounds:
+        try:
+            out.append((round(float(row[0]), 6), round(float(row[1]), 6)))
+        except Exception:
+            try:
+                out.append(tuple(row))
+            except Exception:
+                out.append((row,))
+    return tuple(out)
+
+
 def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
                         mv_bounds: Optional[list] = None,
                         cv_bounds: Optional[list] = None,
                         mv_norm_ranges: Optional[list] = None,
                         cv_norm_ranges: Optional[list] = None) -> Dict:
-    """Fill in violation/move/target weight vectors if absent, using auto-derivation."""
+    """Fill in violation/move/target weight vectors if absent, using auto-derivation.
+
+    ``control_objective.json`` often omits the vectors (test_sim), so the
+    historical path re-derived them on **every** ``env.step``.  Cache on
+    ``(obj_w id, dims, current bounds)`` — operator limit-steps still
+    miss and re-derive (identity); quiet steps reuse the merged dict.
+    """
     needs = (
         not obj_w.get('mv_violation_weights')
         or not obj_w.get('cv_violation_weights')
@@ -170,6 +201,14 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
     )
     if not needs:
         return obj_w
+    key = (
+        id(obj_w), int(n_mv), int(n_cv),
+        _bounds_fp(mv_bounds), _bounds_fp(cv_bounds),
+        _bounds_fp(mv_norm_ranges), _bounds_fp(cv_norm_ranges),
+    )
+    cached = _AUTO_W_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         from utils.auto_weights import derive_auto_weights
     except Exception:
@@ -192,35 +231,137 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
     # sliding-mode rate term.
     if 'auto_violation_rate_coef' not in merged:
         merged['auto_violation_rate_coef'] = float(auto.get('violation_rate_coef', 0.0))
+    if len(_AUTO_W_CACHE) >= _AUTO_W_CACHE_MAX:
+        _AUTO_W_CACHE.clear()
+    _AUTO_W_CACHE[key] = merged
     return merged
 
 
-def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
+def _obj_explicit(cfg, field: str) -> bool:
+    if cfg is None:
+        return False
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _obj_float(cfg, field: str, dreamer_key: str, leftover_key: str,
+               default: float, spec=None, spec_key: str = '') -> float:
+    """Explicit TrainConfig, else DREAMER_*, else leftover, else spec, else default.
+
+    Matches historical ``os.environ.get`` then spec then default.  Identity
+    env-free (TrainConfig defaults = leftover fallbacks).
+    """
+    if _obj_explicit(cfg, field):
+        try:
+            return float(getattr(cfg, field))
+        except Exception:
+            return float(default)
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        try:
+            return float(d_raw)
+        except Exception:
+            pass
+    l_raw = os.environ.get(leftover_key)
+    if l_raw not in (None, ''):
+        try:
+            return float(l_raw)
+        except Exception:
+            pass
+    if spec_key and isinstance(spec, dict) and spec.get(spec_key) is not None:
+        try:
+            return float(spec.get(spec_key))
+        except Exception:
+            pass
+    if cfg is not None:
+        try:
+            return float(getattr(cfg, field, default))
+        except Exception:
+            pass
+    return float(default)
+
+
+def _obj_bool(cfg, field: str, dreamer_key: str, leftover_key: str,
+              default: bool) -> bool:
+    if _obj_explicit(cfg, field):
+        return bool(getattr(cfg, field))
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        return str(d_raw).strip().lower() not in _BOOL_OFF
+    l_raw = os.environ.get(leftover_key)
+    if l_raw not in (None, ''):
+        return str(l_raw).strip().lower() not in _BOOL_OFF
+    if cfg is not None:
+        return bool(getattr(cfg, field, default))
+    return bool(default)
+
+
+def _obj_str(cfg, field: str, dreamer_key: str, leftover_key: str,
+             default: str, spec=None, spec_key: str = '') -> str:
+    if _obj_explicit(cfg, field):
+        return str(getattr(cfg, field, default) or default)
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        return str(d_raw).strip()
+    l_raw = os.environ.get(leftover_key)
+    if l_raw not in (None, ''):
+        return str(l_raw).strip()
+    if spec_key and isinstance(spec, dict) and spec.get(spec_key) is not None:
+        return str(spec.get(spec_key)).strip()
+    if cfg is not None:
+        return str(getattr(cfg, field, default) or default)
+    return str(default)
+
+
+def _plant_timing_for_integral(cfg) -> Tuple[float, float]:
+    """``(tau, dead)`` for integral dead-time damping.
+
+    Prefer TrainConfig identified timing (``single_run`` writes it);
+    leftover ``IDENTIFIED_*`` / ``SIM_IDENTIFIED_*`` when the field is 0.
+    """
+    tau = 0.0
+    dead = 0.0
+    if cfg is not None:
+        try:
+            tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+        except Exception:
+            tau = 0.0
+        try:
+            dead = float(getattr(cfg, 'identified_dead_time', 0.0) or 0.0)
+        except Exception:
+            dead = 0.0
+    if tau <= 0.0:
+        tau = _safe_float(
+            os.environ.get('IDENTIFIED_TAU_DOMINANT')
+            or os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT'), 0.0)
+    if dead <= 0.0:
+        dead = _safe_float(
+            os.environ.get('IDENTIFIED_DEAD_TIME')
+            or os.environ.get('SIM_IDENTIFIED_DEAD_TIME'), 0.0)
+    return float(tau), float(dead)
+
+
+def resolve_integral_config(objective_spec=None, cfg=None) -> Tuple[bool, float, float]:
     """Resolve the integral (accumulated-violation) term configuration.
 
     Shared single source of truth for both
     :func:`compute_objective_components` (which applies the penalty) and
     the environment (which sizes/normalises the exposed accumulator
-    observation channel).  Precedence: env var > objective_spec key >
-    default — identical to the in-function resolution.
+    observation channel).  Precedence: explicit TrainConfig >
+    ``DREAMER_*`` > leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*`` > spec >
+    default.  Identity env-free.
 
     Returns ``(enabled, coef, windup)``.
     """
     spec = objective_spec if isinstance(objective_spec, dict) else {}
 
-    def _r(env_key: str, spec_key: str, default):
-        v = os.environ.get(env_key)
-        if v is not None and str(v).strip() != '':
-            return v
-        if spec_key in spec and spec.get(spec_key) is not None:
-            return spec.get(spec_key)
-        return default
-
     # ON by default (opt-out): a small positive coefficient applies a
     # dwell penalty for SUSTAINED limit violation, attacking the passive
     # "park just outside the bound" attractor. Opt out by setting the coef
     # to 0 (env ``OBJECTIVE_INTEGRAL_COEF`` or spec ``integral_coef``).
-    coef = float(_safe_float(_r('OBJECTIVE_INTEGRAL_COEF', 'integral_coef', 0.05), 0.05))
+    coef = _obj_float(
+        cfg, 'objective_integral_coef',
+        'DREAMER_OBJECTIVE_INTEGRAL_COEF', 'OBJECTIVE_INTEGRAL_COEF',
+        0.05, spec=spec, spec_key='integral_coef')
     # Economic-led CV compensation (2026-06-09): when the INSTANTANEOUS CV
     # bound-violation penalty is softened relative to economics (``OBJ_AUTO_CV_
     # OVER_ECON_RATIO`` set BELOW ``OBJ_AUTO_VIOLATION_MARGIN`` in auto_weights),
@@ -232,55 +373,58 @@ def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
     # COMPENSATE_MAX`` (default 10x) for safety; disable with
     # ``OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE=0``.
     try:
-        if str(os.environ.get('OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE', '1')).strip() \
-                not in ('0', 'false', 'False', 'no', 'off'):
-            _margin = float(os.environ.get('OBJ_AUTO_VIOLATION_MARGIN', '2.0'))
-            _cv_ratio = float(os.environ.get('OBJ_AUTO_CV_OVER_ECON_RATIO',
-                                             str(_margin)))
+        if _obj_bool(
+                cfg, 'obj_auto_integral_soft_compensate',
+                'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE',
+                'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE', True):
+            _margin = _obj_float(
+                cfg, 'obj_auto_violation_margin',
+                'DREAMER_OBJ_AUTO_VIOLATION_MARGIN',
+                'OBJ_AUTO_VIOLATION_MARGIN', 2.0)
+            # Sentinel 0 = follow margin (historical default
+            # ``os.environ.get(..., str(_margin))``).
+            _cv_ratio = _obj_float(
+                cfg, 'obj_auto_cv_over_econ_ratio',
+                'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO',
+                'OBJ_AUTO_CV_OVER_ECON_RATIO', 0.0)
+            if _cv_ratio <= 1e-12:
+                _cv_ratio = float(_margin)
             if _cv_ratio > 1e-6 and _margin > _cv_ratio:
-                _boost_max = float(os.environ.get(
-                    'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX', '10.0'))
+                _boost_max = _obj_float(
+                    cfg, 'obj_auto_integral_soft_compensate_max',
+                    'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX',
+                    'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX', 10.0)
                 _boost = float(min(max(1.0, _margin / _cv_ratio),
                                    max(1.0, _boost_max)))
                 # Dead-time-aware LIMIT-CYCLE damping (2026-06-09, p107 RCA).
-                # Integral action + plant dead time is the classic limit-cycle
-                # generator (p107: soft CV brake parked the CV on the limit ->
-                # the boosted integral + θ=8/τ=53 dead time produced a sustained
-                # cycle).  The phase margin a pure-integral loop loses to dead
-                # time scales with the dead-time fraction f_dt = θ/(θ+τ); to keep
-                # the closed loop away from the oscillation boundary the integral
-                # gain must be REDUCED as f_dt grows.  Damp the soft-compensation
-                # boost by ``(1 - k·f_dt)`` (k = OBJ_AUTO_INTEGRAL_DEADTIME_K,
-                # default 2.0), floored at 1.0 so a boosted integral on a dead-
-                # time plant is never stronger than a fast plant's, and never
-                # below the un-boosted coef.  Sim-agnostic: θ, τ come from the
-                # identified-plant env vars the workflow already exports.  No
-                # effect when there is no dead time (f_dt=0 -> factor 1.0) or the
-                # boost is off.  Disable via OBJ_AUTO_INTEGRAL_DEADTIME_K=0.
+                # Prefer TrainConfig identified τ/θ; leftover IDENTIFIED_*
+                # when the field is 0.
                 try:
-                    _k = float(os.environ.get('OBJ_AUTO_INTEGRAL_DEADTIME_K', '2.0'))
+                    _k = _obj_float(
+                        cfg, 'obj_auto_integral_deadtime_k',
+                        'DREAMER_OBJ_AUTO_INTEGRAL_DEADTIME_K',
+                        'OBJ_AUTO_INTEGRAL_DEADTIME_K', 2.0)
                     if _k > 0.0:
-                        _theta = _safe_float(os.environ.get('IDENTIFIED_DEAD_TIME')
-                                             or os.environ.get('SIM_IDENTIFIED_DEAD_TIME'), 0.0)
-                        _tau = _safe_float(os.environ.get('IDENTIFIED_TAU_DOMINANT')
-                                           or os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT'), 0.0)
+                        _tau, _theta = _plant_timing_for_integral(cfg)
                         if _theta > 0.0 and _tau > 0.0:
                             _f_dt = _theta / (_theta + _tau)
                             _damp = max(0.0, min(1.0, 1.0 - _k * _f_dt))
-                            # Damp only the boost ABOVE 1.0, never below 1.0.
                             _boost = 1.0 + (_boost - 1.0) * _damp
                 except Exception:
                     pass
                 coef *= _boost
     except Exception:
         pass
-    windup = float(_safe_float(_r('OBJECTIVE_INTEGRAL_WINDUP', 'integral_windup', 5.0), 5.0))
+    windup = _obj_float(
+        cfg, 'objective_integral_windup',
+        'DREAMER_OBJECTIVE_INTEGRAL_WINDUP', 'OBJECTIVE_INTEGRAL_WINDUP',
+        5.0, spec=spec, spec_key='integral_windup')
     if windup <= 0.0:
         windup = 5.0
     return (coef > 0.0, coef, windup)
 
 
-def resolve_integral_leak(objective_spec=None) -> float:
+def resolve_integral_leak(objective_spec=None, cfg=None) -> float:
     """Resolve the in-band leak (bleed-off) factor for the integral
     accumulator.
 
@@ -293,22 +437,23 @@ def resolve_integral_leak(objective_spec=None) -> float:
     permanently taxing the rest of the episode.  This restores a positive
     "recovery" gradient for clearing a violation.
 
-    Precedence: env ``OBJECTIVE_INTEGRAL_LEAK`` > spec ``integral_leak`` >
+    Precedence: explicit TrainConfig / ``DREAMER_OBJECTIVE_INTEGRAL_LEAK`` >
+    leftover env ``OBJECTIVE_INTEGRAL_LEAK`` > spec ``integral_leak`` >
     default 0.98 (~50-step recovery memory).  Clamped to ``(0, 1]``; a
     value of 1.0 disables the leak (legacy hold-forever behaviour).
     """
     spec = objective_spec if isinstance(objective_spec, dict) else {}
-    raw = os.environ.get('OBJECTIVE_INTEGRAL_LEAK')
-    if raw is None or str(raw).strip() == '':
-        raw = spec.get('integral_leak') if 'integral_leak' in spec else 0.98
-    leak = float(_safe_float(raw, 0.98))
+    leak = _obj_float(
+        cfg, 'objective_integral_leak',
+        'DREAMER_OBJECTIVE_INTEGRAL_LEAK', 'OBJECTIVE_INTEGRAL_LEAK',
+        0.98, spec=spec, spec_key='integral_leak')
     if leak <= 0.0:
         leak = 0.98
     return float(min(1.0, leak))
 
 
 
-def _shaping_linear_equiv_scale() -> float:
+def _shaping_linear_equiv_scale(cfg=None) -> float:
     """Quadratic→linear conversion scale for the integral / derivative
     shaping terms.
 
@@ -328,10 +473,15 @@ def _shaping_linear_equiv_scale() -> float:
     violation and stays strictly bounded below it for smaller dwells,
     restoring a usable gradient.  Adaptive: it scales with the per-channel
     derived CV/MV violation weight.  Mirrors ``OBJ_AUTO_VIOLATION_TOLERANCE``
-    (default 0.02).
+    (default 0.02).  TrainConfig ``obj_auto_violation_tolerance`` +
+    ``DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE``; leftover still wins when
+    DREAMER is unset.
     """
     try:
-        return max(1e-4, float(os.environ.get('OBJ_AUTO_VIOLATION_TOLERANCE', 0.02)))
+        return max(1e-4, _obj_float(
+            cfg, 'obj_auto_violation_tolerance',
+            'DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE',
+            'OBJ_AUTO_VIOLATION_TOLERANCE', 0.02))
     except Exception:
         return 0.02
 
@@ -350,6 +500,7 @@ def compute_objective_components(
     prev_cv_violation_per_channel=None,
     prev_integral_cv_per_channel=None,
     prev_prev_control=None,
+    cfg=None,
 ) -> Dict[str, float]:
     state = np.asarray(state, dtype='float32').reshape(-1)
     control = np.asarray(control, dtype='float32').reshape(-1)
@@ -441,16 +592,9 @@ def compute_objective_components(
     # OPTIONAL PID-style shaping terms can be switched on independently:
     #   - derivative (violation-rate) term  -> OBJECTIVE_VIOLATION_RATE_COEF
     #   - integral (accumulated-violation)  -> OBJECTIVE_INTEGRAL_COEF
-    # Precedence for every knob: env var > objective_spec key > default.
+    # Precedence: explicit TrainConfig > DREAMER_* > leftover env >
+    # spec > default.
     _spec_cfg = objective_spec if isinstance(objective_spec, dict) else {}
-
-    def _resolve_cfg(env_key: str, spec_key: str, default):
-        v = os.environ.get(env_key)
-        if v is not None and str(v).strip() != '':
-            return v
-        if spec_key in _spec_cfg and _spec_cfg.get(spec_key) is not None:
-            return _spec_cfg.get(spec_key)
-        return default
 
     # ---- MV violations (quadratic in bound-violation depth) ----
     mv_violation_per_channel = []        # shaped magnitude (matches mode)
@@ -634,20 +778,29 @@ def compute_objective_components(
     # depth ``d_diff`` across every simulator and economic configuration
     # (see utils.auto_weights.adaptive_penalty_clip). An explicit env
     # override (OBJECTIVE_PENALTY_CLIP / OBJECTIVE_REWARD_CLIP) always wins
-    # so the user keeps a manual escape hatch.
+    # so the user keeps a manual escape hatch.  TrainConfig sentinel ``<0``
+    # = adaptive (identity).
     try:
-        from utils.auto_weights import adaptive_penalty_clip as _adaptive_clip
         _mv_vw = [abs(float(w)) for w in mv_violation_weights]
         _cv_vw = [abs(float(w)) for w in cv_violation_weights]
         _max_vw = max(_mv_vw + _cv_vw + [0.0])
-        _clip_auto = _adaptive_clip(_max_vw)
+        _clip_auto = (
+            float(_adaptive_clip_fn(_max_vw)) if _adaptive_clip_fn is not None
+            else 50.0)
     except Exception:
         _clip_auto = 50.0
-    _penalty_env = os.environ.get('OBJECTIVE_PENALTY_CLIP')
-    _reward_env = os.environ.get('OBJECTIVE_REWARD_CLIP')
-    penalty_clip = float(_penalty_env) if _penalty_env is not None else float(_clip_auto)
-    reward_clip = float(_reward_env) if _reward_env is not None else float(_clip_auto)
-    sat_mode = str(os.environ.get('OBJECTIVE_PENALTY_SAT_MODE', 'tanh')).strip().lower()
+    _pen_cfg = _obj_float(
+        cfg, 'objective_penalty_clip',
+        'DREAMER_OBJECTIVE_PENALTY_CLIP', 'OBJECTIVE_PENALTY_CLIP', -1.0)
+    _rew_cfg = _obj_float(
+        cfg, 'objective_reward_clip',
+        'DREAMER_OBJECTIVE_REWARD_CLIP', 'OBJECTIVE_REWARD_CLIP', -1.0)
+    penalty_clip = float(_clip_auto) if _pen_cfg < 0.0 else float(_pen_cfg)
+    reward_clip = float(_clip_auto) if _rew_cfg < 0.0 else float(_rew_cfg)
+    sat_mode = _obj_str(
+        cfg, 'objective_penalty_sat_mode',
+        'DREAMER_OBJECTIVE_PENALTY_SAT_MODE', 'OBJECTIVE_PENALTY_SAT_MODE',
+        'tanh').strip().lower()
     if sat_mode not in ('hard', 'tanh'):
         sat_mode = 'tanh'
     # ---- Optional violation-rate (derivative) term ----
@@ -664,7 +817,11 @@ def compute_objective_components(
     # ``auto_violation_rate_coef`` computed in ``utils.auto_weights``.
     # Opt out by setting the coefficient to ``0`` (env or spec).
     auto_rate_default = float(obj_w.get('auto_violation_rate_coef', 0.0))
-    _rate_raw = _resolve_cfg('OBJECTIVE_VIOLATION_RATE_COEF', 'violation_rate_coef', 'auto')
+    _rate_raw = _obj_str(
+        cfg, 'objective_violation_rate_coef',
+        'DREAMER_OBJECTIVE_VIOLATION_RATE_COEF',
+        'OBJECTIVE_VIOLATION_RATE_COEF', 'auto',
+        spec=_spec_cfg, spec_key='violation_rate_coef')
     if isinstance(_rate_raw, str) and _rate_raw.strip().lower() == 'auto':
         violation_rate_coef = auto_rate_default
     else:
@@ -673,7 +830,7 @@ def compute_objective_components(
     # Quadratic→linear conversion scale shared by the derivative (rate) and
     # integral shaping terms below; keeps their linear-in-depth penalties
     # bounded below the quadratic base penalty (prevents the dwell cliff).
-    _shaping_lin = _shaping_linear_equiv_scale()
+    _shaping_lin = _shaping_linear_equiv_scale(cfg)
     if (violation_rate_coef > 0.0
             and prev_cv_violation_per_channel is not None):
         for j in range(cv_dim):
@@ -717,8 +874,9 @@ def compute_objective_components(
     # > 5.0.  ``prev_integral_cv_per_channel`` carries I_{t-1} (owned and
     # reset per-episode by the env); the updated I_t is returned for the
     # env to store + expose next step.
-    _intg_enabled, integral_coef, integral_windup = resolve_integral_config(objective_spec)
-    integral_leak = resolve_integral_leak(objective_spec)
+    _intg_enabled, integral_coef, integral_windup = resolve_integral_config(
+        objective_spec, cfg=cfg)
+    integral_leak = resolve_integral_leak(objective_spec, cfg=cfg)
     integral_cv_per_channel = [0.0] * cv_dim
     integral_penalty = 0.0
     if integral_coef > 0.0:
@@ -772,8 +930,14 @@ def compute_objective_components(
     # MV+CV channels; ``feasibility -> 1`` in-band and ``-> 0`` as the
     # excursion grows. ``cap`` bounds the argument so a huge excursion does
     # not underflow before the gate has fully closed.
-    feas_cap = max(0.0, float(os.environ.get('OBJECTIVE_FEASIBILITY_CAP', '4.0')))
-    feas_scale = max(1e-6, float(os.environ.get('OBJECTIVE_FEASIBILITY_SCALE', '0.08')))
+    feas_cap = max(0.0, _obj_float(
+        cfg, 'objective_feasibility_cap',
+        'DREAMER_OBJECTIVE_FEASIBILITY_CAP', 'OBJECTIVE_FEASIBILITY_CAP',
+        4.0))
+    feas_scale = max(1e-6, _obj_float(
+        cfg, 'objective_feasibility_scale',
+        'DREAMER_OBJECTIVE_FEASIBILITY_SCALE', 'OBJECTIVE_FEASIBILITY_SCALE',
+        0.08))
     total_violation_norm = float(
         sum(mv_violation_per_channel) + sum(cv_violation_per_channel))
     feasibility = float(np.exp(-min(total_violation_norm, feas_cap) / feas_scale))

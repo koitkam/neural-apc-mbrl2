@@ -449,6 +449,29 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Gate for percentile→twohot scale.  Was leftover ``OBJ_REWARD_SCALE``
     # (worked, missing from ``run_plan``).  Identity default ``auto``.
     'DREAMER_OBJ_REWARD_SCALE':            ('obj_reward_scale',             str),
+    # Reward-engine leftovers (``utils/objective_runtime.py``).  Identity.
+    # Dual-read leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*``.  Clip ``<0``
+    # = adaptive.  ``obj_auto_cv_over_econ_ratio=0`` follows margin.
+    'DREAMER_OBJECTIVE_INTEGRAL_COEF':     ('objective_integral_coef',      float),
+    'DREAMER_OBJECTIVE_INTEGRAL_WINDUP':   ('objective_integral_windup',    float),
+    'DREAMER_OBJECTIVE_INTEGRAL_LEAK':     ('objective_integral_leak',      float),
+    'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE': (
+        'obj_auto_integral_soft_compensate', _as_bool),
+    'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX': (
+        'obj_auto_integral_soft_compensate_max', float),
+    'DREAMER_OBJ_AUTO_INTEGRAL_DEADTIME_K': (
+        'obj_auto_integral_deadtime_k', float),
+    'DREAMER_OBJ_AUTO_VIOLATION_MARGIN':   ('obj_auto_violation_margin',    float),
+    'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO': ('obj_auto_cv_over_econ_ratio',  float),
+    'DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE': (
+        'obj_auto_violation_tolerance', float),
+    'DREAMER_OBJECTIVE_VIOLATION_RATE_COEF': (
+        'objective_violation_rate_coef', str),
+    'DREAMER_OBJECTIVE_PENALTY_SAT_MODE':  ('objective_penalty_sat_mode',   str),
+    'DREAMER_OBJECTIVE_PENALTY_CLIP':      ('objective_penalty_clip',       float),
+    'DREAMER_OBJECTIVE_REWARD_CLIP':       ('objective_reward_clip',        float),
+    'DREAMER_OBJECTIVE_FEASIBILITY_CAP':   ('objective_feasibility_cap',    float),
+    'DREAMER_OBJECTIVE_FEASIBILITY_SCALE': ('objective_feasibility_scale',  float),
     # May-2026 P39 probes.  Default 0 / off.  Extra retain_graph
     # backward — not env-free.  Opt in ``=10``.
     'DREAMER_DIAG_PERHEAD_GRADS_EVERY':    ('diag_perhead_grads_every',      int),

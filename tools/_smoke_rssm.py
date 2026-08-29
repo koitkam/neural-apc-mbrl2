@@ -779,6 +779,8 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_DISTURBANCE_RECOVERY_FRAC': '0.15',
         'DREAMER_DISTURBANCE_SETTLE_STEPS': '40',
         'DREAMER_DISTURBANCE_QUIET_FRAC': '0.20',
+        'DREAMER_OBJECTIVE_INTEGRAL_COEF': '0.08',
+        'DREAMER_OBJECTIVE_PENALTY_CLIP': '40',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -844,6 +846,8 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.disturbance_recovery_frac) - 0.15) < 1e-12
         assert int(cfg.disturbance_settle_steps) == 40
         assert abs(float(cfg.disturbance_quiet_frac) - 0.20) < 1e-12
+        assert abs(float(cfg.objective_integral_coef) - 0.08) < 1e-12
+        assert abs(float(cfg.objective_penalty_clip) - 40.0) < 1e-12
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -896,6 +900,8 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'disturbance_recovery_frac' in explicit
         assert 'disturbance_settle_steps' in explicit
         assert 'disturbance_quiet_frac' in explicit
+        assert 'objective_integral_coef' in explicit
+        assert 'objective_penalty_clip' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1406,6 +1412,17 @@ def _test_envfree_observer_recipe() -> None:
     assert abs(float(c.disturbance_quiet_frac) - 0.12) < 1e-12
     assert abs(float(c.identified_tau_dominant)) < 1e-12
     assert abs(float(c.identified_dead_time)) < 1e-12
+    assert abs(float(c.objective_integral_coef) - 0.05) < 1e-12
+    assert abs(float(c.objective_integral_windup) - 5.0) < 1e-12
+    assert abs(float(c.objective_integral_leak) - 0.98) < 1e-12
+    assert c.obj_auto_integral_soft_compensate is True
+    assert abs(float(c.obj_auto_cv_over_econ_ratio)) < 1e-12
+    assert abs(float(c.objective_penalty_clip) + 1.0) < 1e-12
+    assert c.objective_penalty_sat_mode == 'tanh'
+    assert c.objective_violation_rate_coef == 'auto'
+    assert 'DREAMER_OBJECTIVE_INTEGRAL_COEF' in ENV_OVERRIDES
+    assert 'DREAMER_OBJECTIVE_PENALTY_CLIP' in ENV_OVERRIDES
+    assert 'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE' in ENV_OVERRIDES
     assert 'DREAMER_DISTURBANCE_AUTHORITY_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_DISTURBANCE_RECOVERY_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_DISTURBANCE_SETTLE_STEPS' in ENV_OVERRIDES
@@ -1480,6 +1497,91 @@ def _test_identified_tau_cfg() -> None:
         else:
             os.environ['IDENTIFIED_DEAD_TIME'] = prev_dead
     print('[smoke] OK  identified tau/dead_time TrainConfig beats leftover env')
+
+
+def _test_objective_runtime_cfg() -> None:
+    """Reward-engine leftovers: TrainConfig default, leftover OBJECTIVE_*, DREAMER wins."""
+    import os
+    from utils.objective_runtime import (
+        resolve_integral_config, resolve_integral_leak,
+        _maybe_auto_weights, _AUTO_W_CACHE,
+    )
+    from workflow._plant_prepare import ENV_OVERRIDES
+
+    c = TrainConfig()
+    assert abs(float(c.objective_integral_coef) - 0.05) < 1e-12
+    assert abs(float(c.objective_integral_leak) - 0.98) < 1e-12
+    assert c.obj_auto_integral_soft_compensate is True
+    assert abs(float(c.objective_penalty_clip) + 1.0) < 1e-12
+    assert 'DREAMER_OBJECTIVE_INTEGRAL_COEF' in ENV_OVERRIDES
+    keys = (
+        'DREAMER_OBJECTIVE_INTEGRAL_COEF', 'OBJECTIVE_INTEGRAL_COEF',
+        'DREAMER_OBJECTIVE_INTEGRAL_LEAK', 'OBJECTIVE_INTEGRAL_LEAK',
+        'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE',
+        'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE',
+        'DREAMER_OBJ_AUTO_VIOLATION_MARGIN', 'OBJ_AUTO_VIOLATION_MARGIN',
+        'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO', 'OBJ_AUTO_CV_OVER_ECON_RATIO',
+        'DREAMER_OBJECTIVE_PENALTY_CLIP', 'OBJECTIVE_PENALTY_CLIP',
+        'IDENTIFIED_TAU_DOMINANT', 'IDENTIFIED_DEAD_TIME',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        on, coef, windup = resolve_integral_config()
+        assert on is True
+        assert abs(coef - 0.05) < 1e-12, coef
+        assert abs(windup - 5.0) < 1e-12
+        assert abs(resolve_integral_leak() - 0.98) < 1e-12
+        on_c, coef_c, _ = resolve_integral_config(cfg=c)
+        assert abs(coef_c - 0.05) < 1e-12
+        os.environ['OBJECTIVE_INTEGRAL_COEF'] = '0.11'
+        _, coef_l, _ = resolve_integral_config(cfg=c)
+        assert abs(coef_l - 0.11) < 1e-12, coef_l
+        os.environ['DREAMER_OBJECTIVE_INTEGRAL_COEF'] = '0.07'
+        _, coef_d, _ = resolve_integral_config(cfg=c)
+        assert abs(coef_d - 0.07) < 1e-12, coef_d
+        c_ex = TrainConfig()
+        c_ex.objective_integral_coef = 0.03
+        c_ex._explicit_fields = {'objective_integral_coef'}  # type: ignore
+        _, coef_e, _ = resolve_integral_config(cfg=c_ex)
+        assert abs(coef_e - 0.03) < 1e-12, coef_e
+        os.environ.pop('DREAMER_OBJECTIVE_INTEGRAL_COEF', None)
+        os.environ.pop('OBJECTIVE_INTEGRAL_COEF', None)
+        os.environ['OBJECTIVE_INTEGRAL_LEAK'] = '0.90'
+        assert abs(resolve_integral_leak() - 0.90) < 1e-12
+        os.environ['DREAMER_OBJECTIVE_INTEGRAL_LEAK'] = '0.85'
+        assert abs(resolve_integral_leak(cfg=c) - 0.85) < 1e-12
+        # Ratio sentinel 0 follows leftover margin (historical get(..., str(margin))).
+        os.environ.pop('DREAMER_OBJECTIVE_INTEGRAL_LEAK', None)
+        os.environ.pop('OBJECTIVE_INTEGRAL_LEAK', None)
+        os.environ['OBJ_AUTO_VIOLATION_MARGIN'] = '4.0'
+        os.environ['OBJ_AUTO_CV_OVER_ECON_RATIO'] = '1.0'
+        os.environ['OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE'] = '1'
+        os.environ['OBJ_AUTO_INTEGRAL_DEADTIME_K'] = '0'
+        _, coef_b, _ = resolve_integral_config()
+        assert abs(coef_b - 0.20) < 1e-9, coef_b  # 0.05 * min(4/1, 10)
+        # Cache: second derive with same empty obj_w + bounds is the same object.
+        _AUTO_W_CACHE.clear()
+        ow = {}
+        a = _maybe_auto_weights(
+            ow, n_mv=1, n_cv=1, spec={},
+            mv_bounds=[[20.0, 80.0]], cv_bounds=[[78.5, 85.5]],
+            mv_norm_ranges=[[20.0, 80.0]], cv_norm_ranges=[[78.5, 85.5]])
+        b = _maybe_auto_weights(
+            ow, n_mv=1, n_cv=1, spec={},
+            mv_bounds=[[20.0, 80.0]], cv_bounds=[[78.5, 85.5]],
+            mv_norm_ranges=[[20.0, 80.0]], cv_norm_ranges=[[78.5, 85.5]])
+        assert a is b
+        assert a.get('mv_violation_weights')
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+        _AUTO_W_CACHE.clear()
+    print('[smoke] OK  objective leftover TrainConfig + DREAMER beats OBJECTIVE_*')
 
 
 def _test_pin_eval_modules() -> None:
@@ -2691,6 +2793,7 @@ if __name__ == '__main__':
     _test_stream_serve_matches_rollout()
     _test_envfree_observer_recipe()
     _test_identified_tau_cfg()
+    _test_objective_runtime_cfg()
     _test_pin_eval_modules()
     _test_require_realsim_actor()
     _test_gain_match_per_input_huber()

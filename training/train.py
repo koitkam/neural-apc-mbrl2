@@ -435,6 +435,29 @@ class TrainConfig:
     # missing from ``run_plan``).  Leftover ``OBJ_REWARD_SCALE`` still
     # wins when the DREAMER_* field is not explicit.
     obj_reward_scale: str = 'auto'
+    # Reward-engine leftovers (``utils/objective_runtime.py``).  Were
+    # ``os.environ.get`` every ``env.step`` (worked, missing from
+    # ``run_plan``).  Identity defaults.  Clip sentinel ``<0`` = adaptive
+    # ``adaptive_penalty_clip``.  ``obj_auto_cv_over_econ_ratio=0`` =
+    # follow ``obj_auto_violation_margin`` (historical
+    # ``get(..., str(margin))``).  Dual-read leftover ``OBJECTIVE_*`` /
+    # ``OBJ_AUTO_*`` when DREAMER is unset.  Integral dead-time damping
+    # prefers ``identified_tau_dominant`` / ``identified_dead_time``.
+    objective_integral_coef: float = 0.05
+    objective_integral_windup: float = 5.0
+    objective_integral_leak: float = 0.98
+    obj_auto_integral_soft_compensate: bool = True
+    obj_auto_integral_soft_compensate_max: float = 10.0
+    obj_auto_integral_deadtime_k: float = 2.0
+    obj_auto_violation_margin: float = 2.0
+    obj_auto_cv_over_econ_ratio: float = 0.0
+    obj_auto_violation_tolerance: float = 0.02
+    objective_violation_rate_coef: str = 'auto'
+    objective_penalty_sat_mode: str = 'tanh'
+    objective_penalty_clip: float = -1.0
+    objective_reward_clip: float = -1.0
+    objective_feasibility_cap: float = 4.0
+    objective_feasibility_scale: float = 0.08
     # May-2026 P39 probes.  Default OFF (extra retain_graph backward).
     # Was ``os.environ.get`` (not ENV_OVERRIDES).  Opt in ``=10``.
     diag_perhead_grads_every: int = 0
@@ -2227,7 +2250,7 @@ class APCEnv:
         # accumulator is normalised by the windup cap to [0, 1].  CV-only.
         from utils.objective_runtime import resolve_integral_config
         self._integral_enabled, _intg_coef, self._integral_windup = \
-            resolve_integral_config(self.obj_spec)
+            resolve_integral_config(self.obj_spec, cfg=self.cfg)
         n_cv_intg = int(len(self.cv_indices))
         self._integral_cv = np.zeros(n_cv_intg, dtype='float32')
         if self._integral_enabled:
@@ -2980,6 +3003,7 @@ class APCEnv:
             prev_cv_violation_per_channel=self._prev_cv_violation_per_channel,
             prev_integral_cv_per_channel=self._integral_cv,
             prev_prev_control=self._prev_prev_control,
+            cfg=self.cfg,
         )
         raw_reward = float(comps['reward'])
         # Apply raw clip BEFORE scaling so calibration (which percentile-

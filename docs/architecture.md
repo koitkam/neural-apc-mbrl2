@@ -21,9 +21,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > −121**, bang-bang 0.53). Do **not** promote `p3_reset_log_std`. P48
 > EXIT (`run_p48_collectdv`): `stream_serve_step` **KEEP** as train/serve
 > identity, **FALSIFIED as cascade lever** (ES @236; freeze last_ok **24**
-> 0.81@DV vs live 0.89). P49 tests original-P1 wrap last-ok unlock.
-> Do not promote other plants until linear
-> observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
+> 0.81@DV vs live 0.89). P49 LIVE **P2** (`run_p49_wrapunlock`): gate
+> **GAIN-READY** @82 worst **0.82@MV** (DV 0.88/@H 0.94); last_ok **82**
+> (skip-storm unlock, not wrap-unlock); no detonated-freeze. Reward-engine
+> leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
+> adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
+> until linear observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
 > val-suite gates, horizon formula (`horizon_settle_n_tau` /
 > `horizon_max`), IC randomization, GPU-calib `wm_overhead`, derived
 > observables, and **noise / hidden-load schedule** knobs
@@ -348,8 +351,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > detonated-freeze missed 56. **FALSIFIED as DV pin.**
 > **P48 EXIT freeze:** original-P1 wrap lock at iter 24 never unlocked
 > after recon recovered; freeze restored 24 (0.81@DV) vs live 0.89@DV.
-> P49 unlocks original-P1 wrap recovery (recon back below 20×);
-> extra-P1 recovered basin stays locked (P40). Do not raise lock_ratio.
+> P49 LIVE P2: skip-storm 1/2 unlocked last-ok (advancing to **82**);
+> wrap-recovery unlock still untested. Extra-P1 recovered basin stays
+> locked (P40). Do not raise lock_ratio.
 > Gain-match `img_rollout(..., last_only=True, out='obs')`. jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
