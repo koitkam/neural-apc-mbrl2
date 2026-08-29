@@ -56,6 +56,7 @@ from training.train import (
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt,
+                            _gain_match_rest_window, collect_rest_lookback,
                             _wm_gain_match_loss,
                             _adv_action_corr, _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
@@ -194,7 +195,8 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _tc = TrainConfig()
     assert float(_tc.gain_match_huber_beta) == 1.0
     assert _tc.gain_match_huber_per_input is True
-    assert int(_tc.gain_match_settle_len) == 0
+    assert int(_tc.gain_match_settle_len) == -1
+    assert _tc.gain_match_rest_ic is False
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
     print('[smoke] OK  gain-match defaults (abs Huber, per-input β, TBPTT=16)')
@@ -694,7 +696,8 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_STEP_TEST_INJECT_N': '7',
         'DREAMER_WM_ISOLATION_DCV_MATCH': '0',
         'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': '0',
-        'DREAMER_GAIN_MATCH_SETTLE_LEN': '-1',
+        'DREAMER_GAIN_MATCH_SETTLE_LEN': '55',
+        'DREAMER_GAIN_MATCH_REST_IC': '1',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -708,7 +711,8 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.step_test_inject_n) == 7
         assert cfg.wm_isolation_dcv_match is False
         assert cfg.gain_match_huber_per_input is False
-        assert int(cfg.gain_match_settle_len) == -1
+        assert int(cfg.gain_match_settle_len) == 55
+        assert cfg.gain_match_rest_ic is True
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -860,7 +864,12 @@ def _test_isolation_dcv_scales() -> None:
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
+    assert "gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic'" in _src
     assert '_gain_match_held_settle' in _src
+    assert '_gain_match_rest_window' in _src
+    assert '_gain_match_rest_ic_state' in _src
+    assert '_cache_gain_match_rest_ic' in _src
+    assert 'collect_rest_lookback' in _src
     assert '_gain_match_state_from_feat' in _src
     assert '_auto_gain_match_settle_len' in _src
     assert '_adv_action_corr' in _src
@@ -997,10 +1006,12 @@ def _test_envfree_observer_recipe() -> None:
     assert c.dob_enabled is True
     assert c.gain_match_huber_per_input is True
     assert float(c.gain_match_huber_beta) == 1.0
-    assert int(c.gain_match_settle_len) == 0
+    assert int(c.gain_match_settle_len) == -1
+    assert c.gain_match_rest_ic is False
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
+    assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
@@ -1127,8 +1138,8 @@ def _test_gain_match_held_settle() -> None:
                 if p.grad is not None)
     assert gru_g > 0.0, 'held settle last feat lost GRU gradient'
     c0_auto = TrainConfig()
+    c0_auto.gain_match_settle_len = 0
     c0_auto.horizon = 55
-    assert int(c0_auto.gain_match_settle_len) == 0
     assert _auto_gain_match_settle_len(c0_auto) == 55
     assert int(c0_auto.gain_match_settle_len) == 55
     c_off = TrainConfig()
@@ -1147,6 +1158,128 @@ def _test_gain_match_held_settle() -> None:
     assert wm_tf_roll_len(_cfg_h, 0) == 220
     assert wm_tf_roll_len(_cfg_h, 100) == 100
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
+
+
+def _test_gain_match_rest_window() -> None:
+    """P45 collect window is max(H, lookback), not TM 4H."""
+    from evaluation.wm_transfer_matrix import wm_tf_horizon
+    c = TrainConfig()
+    c.horizon = 55
+    c.lookback = 128
+    s, L = _gain_match_rest_window(c)
+    assert (s, L) == (128, 128), (s, L)
+    assert s != wm_tf_horizon(55)
+    c.lookback = 32
+    assert _gain_match_rest_window(c) == (55, 32)
+    c.horizon = 15
+    c.lookback = 8
+    assert _gain_match_rest_window(c) == (15, 8)
+    print('[smoke] OK  rest-ic window = max(H, lookback) not wm_tf_horizon')
+
+
+def _test_collect_rest_lookback_tm_pairing() -> None:
+    """Rest collect records obs AFTER the hold step (TM ``_settle_capture``)."""
+    import numpy as _np
+
+    class _Fake:
+        action_dim = 1
+        t = 0
+        _schedule: list = []
+        _hidden_disturbance = None
+        sim = type('S', (), {})()
+
+        def reset(self, exploration=False):
+            self.t = 0
+            return _np.zeros((2, 3), dtype='float32')
+
+        def step(self, _a):
+            self.t += 1
+            o = _np.full((2, 3), float(self.t), dtype='float32')
+            return o, 0.0, False, {}
+
+        def set_sim_noise_scale(self, _x):
+            pass
+
+    cfg = TrainConfig()
+    o, a = collect_rest_lookback(
+        _Fake(), cfg, 0.0, settle=5, lookback=3)
+    assert o.shape == (3, 3) and a.shape == (3, 1), (o.shape, a.shape)
+    # After-step marks 1..5; last L=3 → 3,4,5.  Before-step would be 2,3,4
+    # (and would include the reset frame when S==L).
+    assert _np.allclose(o[:, 0], [3.0, 4.0, 5.0]), o[:, 0]
+    assert _np.allclose(a, 0.0)
+    print('[smoke] OK  rest-ic collect is TM post-step pairing')
+
+
+def _test_gain_match_rest_ic() -> None:
+    """Rest cache is the FD IC: changing rest tensors moves the loss."""
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim = 6
+    cfg.action_dim = 1
+    cfg.lookback = 8
+    cfg.world_model_type = 'rssm'
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.d_model = 32
+    cfg.head_hidden = 32
+    cfg.head_n_layers = 1
+    cfg.mtp_length = 2
+    cfg.horizon = 4
+    cfg.seq_len = 16
+    cfg.dv_dim = 1
+    cfg.dv_indices = (3,)
+    cfg.cv_obs_indices = (0,)
+    cfg.dob_enabled = False
+    cfg.cont_latent_enabled = True
+    cfg.cont_gain_dim = 2
+    cfg.cont_dist_dim = 0
+    cfg.gain_match_coef = 1.0
+    cfg.gain_match_len = 4
+    cfg.gain_match_settle_len = 8
+    cfg.gain_match_rest_ic = True
+    cfg.gain_match_mv_target = ((-1.0,),)
+    cfg.gain_match_dv_target = ((0.5,),)
+    cfg.gain_match_huber_per_input = False
+    model = build_model(cfg)
+    B, T, O, A = 2, 16, 6, 1
+    obs = torch.randn(B, T, O)
+    act = torch.rand(B, T, A) * 2 - 1
+    with torch.no_grad():
+        feats, *_ = model.dynamics.rollout_observed(obs, act, sample=False)
+    N, L = 3, 8
+    rest_o = torch.randn(N, L, O)
+    rest_a = torch.rand(N, L, A) * 2 - 1
+    cfg._gain_match_rest_obs = rest_o.numpy()
+    cfg._gain_match_rest_act = rest_a.numpy()
+    model.zero_grad(set_to_none=True)
+    gm1, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm1).all() and float(gm1) > 0.0, float(gm1)
+    gm1.backward()
+    cont_g = sum(float(p.grad.abs().sum())
+                 for n, p in model.dynamics.named_parameters()
+                 if p.grad is not None and 'cont' in n)
+    gru_g = sum(float(p.grad.abs().sum())
+                for n, p in model.dynamics.named_parameters()
+                if p.grad is not None and 'gru' in n)
+    assert cont_g > 0.0, 'rest-ic FD did not reach cont-gain'
+    assert gru_g > 0.0, 'rest-ic encode/FD did not reach GRU'
+    cfg._gain_match_rest_obs = (rest_o + 1.5).numpy()
+    cfg._gain_match_rest_dev = None
+    model.zero_grad(set_to_none=True)
+    gm2, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert abs(float(gm1) - float(gm2)) > 1e-6, (
+        f'rest IC unused (gm1={float(gm1):.6f} gm2={float(gm2):.6f})')
+    cfg._gain_match_rest_obs = None
+    cfg._gain_match_rest_act = None
+    cfg._gain_match_rest_dev = None
+    gm3, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm3).all() and float(gm3) > 0.0
+    print(f'[smoke] OK  rest-ic encode is the FD IC '
+          f'(Δloss={abs(float(gm1) - float(gm2)):.4g})')
 
 
 def _test_adv_action_corr_vectorized() -> None:
@@ -1268,7 +1401,8 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'lock=20' in banner, banner
     assert 'iso_dcv=off' in banner, banner
     assert 'huber_per_in=True' in banner, banner
-    assert 'gmatch_settle=0' in banner, banner
+    assert 'gmatch_settle=-1' in banner, banner
+    assert 'gmatch_rest=False' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -1379,6 +1513,9 @@ if __name__ == '__main__':
     _test_gain_match_pred_over_tgt()
     _test_gain_match_fd_held()
     _test_gain_match_held_settle()
+    _test_gain_match_rest_window()
+    _test_collect_rest_lookback_tm_pairing()
+    _test_gain_match_rest_ic()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

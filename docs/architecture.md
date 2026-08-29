@@ -339,14 +339,21 @@ env-gated off · **[planned]** = designed, not yet built.
 > Teacher IC (PRBS posterior FD, Huber ~0) ≠ TM rest-then-step.
 > `[resolved-cfg]` prints `huber_per_in=`. Env-free. Do not revive
 > relative Huber. **P44** (`gain_match_settle_len` auto=control H):
-> held prior-roll at the start's a/dv before FD.  This is **not** the
-> TM protocol (TM settles the real env for `wm_tf_horizon(H)=max(80,4H)`
-> then encodes that lookback).  CPU probe on P43 freeze: P44 teacher
-> (PRBS+S=H) still FD DV×0.969 — Huber~0 does not pin the rest-step
-> gate.  P43 DV @H ×0.849 vs ss ×0.740 — do not cite `@H≈ss`
-> for DV.  `DREAMER_GAIN_MATCH_SETTLE_LEN=-1` recovers P43.
+> held prior-roll at the start's a/dv before FD.  Storm **2/2 @iter 66**
+> (G_pred≈0) CAPPED 0.76@DV → **REVERT default `-1`** (P43 identity).
+> This is **not** the TM protocol (TM settles the real env for
+> `wm_tf_horizon(H)=max(80,4H)` then encodes that lookback).  CPU probe
+> on P43 freeze: P44 teacher (PRBS+S=H) still FD DV×0.969 — Huber~0
+> does not pin the rest-step gate.  P43 DV @H ×0.849 vs ss ×0.740 —
+> do not cite `@H≈ss` for DV.  `DREAMER_GAIN_MATCH_SETTLE_LEN=0` is
+> auto-H A/B only. Do not retry S=H.
 > jsonl `wm_gain_match_mv_ratio` / `wm_gain_match_dv_ratio` =
 > mean `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss; not in P44 pid).
+> **P45 opt-in** `gain_match_rest_ic` (default False): real held-OP
+> lookback → `rollout_observed` → FD (TM rest-then-step IC; obs after
+> step like `_settle_capture`; skips P44 WM-held settle).  Isolation
+> loss stays 0.  Collect settle = max(H, lookback), not `wm_tf_horizon`.
+> `DREAMER_GAIN_MATCH_REST_IC=1` after P44 EXIT if still 0.75@DV.
 > Head persist-on-lock writes the snapshot when the lock fires. jsonl
 > `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`.
 > Gain-probe line prints ss **and** `@H`. Printed observer verdict is
@@ -630,9 +637,13 @@ fixes BOTH:
   action scale: `g_dv_norm = g_eng·obs_std[dv]/obs_std[cv]`,
   `g_mv_norm = g_eng·mv_action_scale/obs_std[cv]`). Huber is **absolute**
   on `G=ΔCV/Δu` (P26). Default **per-input β = |tgt_ij|** (P43): L1 sat
-  ±1, not P27 relative Huber. Default **held settle before FD** (P44):
-  prior-hold at start a/dv for control H; `DREAMER_GAIN_MATCH_SETTLE_LEN=-1`
-  recovers P43 FD-from-posterior. jsonl `*_ratio` = mean G_pred/G_tgt.
+  ±1, not P27 relative Huber. Default **no held settle** (`-1`; P44
+  storm 2/2 REVERT). `DREAMER_GAIN_MATCH_SETTLE_LEN=0` auto=control H
+  A/B only. **Opt-in rest-IC** (`gain_match_rest_ic`,
+  default False): encode real held-OP lookbacks then FD (TM protocol IC;
+  `DREAMER_GAIN_MATCH_REST_IC=1`). Collect pairing = TM `_settle_capture`
+  (obs after step). When the rest cache is present, P44 WM-held settle
+  is skipped. Isolation loss stays 0. jsonl `*_ratio` = mean G_pred/G_tgt.
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.

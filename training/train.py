@@ -794,19 +794,29 @@ class TrainConfig:
     # continuous gain channel is on AND the identified gains are available.
     gain_match_coef: float = 0.0
     gain_match_len: int = 0            # K step-response rollout steps (= horizon)
-    # Held prior-roll BEFORE the FD (P44).  Dataclass 0 = auto
-    # ``horizon`` (one *control* settling response).  ``<0`` = off
-    # (P43 identity: FD from the replay posterior).  The transfer-matrix
-    # probe's default window is ``wm_tf_horizon(H) = max(80, 4·H)`` and
-    # settle ``S = H_tf`` (test_sim 220, not 55) — matching that 4H
-    # settle is a *second* attributed change after P44's S=H test.
-    # P43 Huber ~1e-4 from PRBS posteriors while the rest-then-step
-    # probe stays ~0.75@DV.  P43 DV @H ×0.849 vs ss ×0.740 is a real
-    # 4H-asymptote gap (MV @H≈ss); do not cite "@H≈ss" for DV.
-    # Gradful (P25: detaching the gain-match roll kills DC).  Extra cost
-    # is one ``Bm×S`` roll vs the FD's ``(1+n_mv+n_dv)·Bm×K``.
-    # ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
-    gain_match_settle_len: int = 0
+    # Held prior-roll BEFORE the FD (P44).  Dataclass ``-1`` = off
+    # (P43 identity: FD from the replay posterior).  ``0`` = auto
+    # ``horizon`` (A/B only).  P44 env-free auto=H storm **2/2 @iter 66**
+    # (G_pred≈0, CAPPED 0.76@DV) → REVERT default off.  The TM probe's
+    # default window is ``wm_tf_horizon(H) = max(80, 4·H)`` and settle
+    # ``S = H_tf`` (test_sim 220, not 55) — matching that 4H settle is a
+    # later A/B, not a retry of S=H.  P43 Huber ~1e-4 from PRBS
+    # posteriors while the rest-then-step probe stays ~0.75@DV.  P43 DV
+    # @H ×0.849 vs ss ×0.740 is a real 4H-asymptote gap (MV @H≈ss); do
+    # not cite "@H≈ss" for DV.  Gradful (P25: detaching the gain-match
+    # roll kills DC).  Extra cost is one ``Bm×S`` roll vs the FD's
+    # ``(1+n_mv+n_dv)·Bm×K``.  ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
+    gain_match_settle_len: int = -1
+    # P45 opt-in: TM-protocol rest IC.  Collect real held-OP lookbacks
+    # (noise-free const-action), teacher-force ``rollout_observed``
+    # (gradful; P25), then FD from that posterior.  Isolation **loss**
+    # stays 0.  Real rest replaces the P44 WM-held settle of a PRBS
+    # start (CPU probe: PRBS+S=H still FD DV×0.969 while TM rest-step
+    # is 0.75@DV; P44 storm 2/2 G_pred≈0).  Default False until P44
+    # EXIT; ``DREAMER_GAIN_MATCH_REST_IC=1`` is the one attributed P45
+    # change (does not retry S=H).  Collect settle = max(H, lookback)
+    # — **not** ``wm_tf_horizon`` (that 4H window is a later A/B).
+    gain_match_rest_ic: bool = False
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
@@ -3488,6 +3498,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
+        f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -6034,6 +6045,138 @@ def _gain_match_held_settle(
     return _gain_match_state_from_feat(rssm, last)
 
 
+def _gain_match_rest_window(cfg: 'TrainConfig') -> Tuple[int, int]:
+    """Real-rest collect settle + encode lookback (not ``wm_tf_horizon``).
+
+    ``settle = max(H, lookback)`` so the captured window is already at
+    SS and fills the RSSM encode.  TM default settle is
+    ``wm_tf_horizon(H)=max(80,4H)`` — matching that is a *later* A/B.
+    """
+    h = max(1, int(getattr(cfg, 'horizon', 15) or 15))
+    l_cap = max(2, int(getattr(cfg, 'lookback', 0)
+                       or getattr(cfg, 'seq_len', 8) or 8))
+    settle = max(h, l_cap)
+    return settle, min(l_cap, settle)
+
+
+def _gain_match_rest_ic_tensors(
+        cfg: 'TrainConfig', device, dtype
+        ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Device cache of rest lookbacks.  Busts when numpy source changes."""
+    obs = getattr(cfg, '_gain_match_rest_obs', None)
+    act = getattr(cfg, '_gain_match_rest_act', None)
+    if obs is None or act is None:
+        return None, None
+    key = (id(obs), id(act), str(device), str(dtype))
+    cache = getattr(cfg, '_gain_match_rest_dev', None)
+    if cache is None or cache[0] != key:
+        o = torch.as_tensor(obs, device=device, dtype=dtype)
+        a = torch.as_tensor(act, device=device, dtype=dtype)
+        if o.ndim != 3 or a.ndim != 3 or o.shape[0] != a.shape[0]:
+            return None, None
+        cfg._gain_match_rest_dev = (key, o, a)  # type: ignore[attr-defined]
+        return o, a
+    return cache[1], cache[2]
+
+
+def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
+    """Encode cached rest lookbacks → ``(h0, z0, c0, a_base, dv0)``.
+
+    Teacher-forced posterior (TM ``_imagine_open_loop_rssm`` warm-start).
+    ``sample=False`` + last ``c_mean`` (follow-up 14).  ``store_aux=False``
+    skips unused logit stacks.  None if the cache is empty.
+    """
+    o, a = _gain_match_rest_ic_tensors(cfg, device, dtype)
+    if o is None or a is None:
+        return None
+    _, _, _, state, *_ = rssm.rollout_observed(
+        o, a, sample=False, store_aux=False)
+    h0 = state.h
+    z0 = state.z
+    c0 = state.c_mean if getattr(state, 'c_mean', None) is not None else state.c
+    a_base = a[:, -1].contiguous()
+    dv0 = None
+    if int(getattr(rssm, 'dv_dim', 0) or 0) > 0:
+        dv0 = o[:, -1].index_select(-1, rssm.dv_index_t).contiguous()
+    return h0, z0, c0, a_base, dv0
+
+
+def collect_rest_lookback(
+        env: 'APCEnv', cfg: 'TrainConfig', action_level,
+        *, settle: int, lookback: int
+        ) -> Tuple[np.ndarray, np.ndarray]:
+    """Hold ``action_level`` for ``settle`` steps; return last ``lookback`` frames.
+
+    Matches TM ``_settle_capture``: quiet env, held action, **obs after
+    the step** (the action that drove the transition INTO ``obs[t]``),
+    tiled ``lookback_act``.  Training replay is obs-*before*-step;
+    rest-IC follows the TM rest-then-step gate, not the replay pairing.
+    Isolation loss is not used.  ``clean_steady_seeds`` still zeros
+    process/measurement noise (P89).
+    """
+    from tools.wm_steady_state_diagnostic import _quiet_env
+    S = max(2, int(settle))
+    L = max(2, min(int(lookback), S))
+    _quiet_env(env)
+    env.reset(exploration=False)
+    env._schedule = []
+    env._hidden_disturbance = None
+    _maybe_clean_steady_seed(env, cfg)
+    a_const = _as_hold_action(action_level, env.action_dim)
+    obs_hist: List[np.ndarray] = []
+    for _ in range(S):
+        ow, _, done, _ = env.step(a_const)
+        obs_hist.append(np.asarray(ow[-1], dtype='float32').copy())
+        if done:
+            env.reset(exploration=False)
+            env._schedule = []
+            env._hidden_disturbance = None
+            _maybe_clean_steady_seed(env, cfg)
+    obs_arr = np.stack(obs_hist, axis=0)
+    lookback_obs = obs_arr[-L:]
+    lookback_act = np.tile(
+        np.asarray(a_const, dtype='float32').reshape(-1), (L, 1))
+    return lookback_obs, lookback_act
+
+
+def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
+    """Seed-time real rest lookbacks for the TM-protocol teacher.
+
+    No-op when ``gain_match_rest_ic`` is off or a cache already exists.
+    Isolation teacher stays off — this is encode data for gain-match FD,
+    not ``_wm_input_isolation_loss``.
+    """
+    if not _cfg_on(cfg, 'gain_match_rest_ic', False):
+        return
+    if getattr(cfg, '_gain_match_rest_obs', None) is not None:
+        return
+    settle, L = _gain_match_rest_window(cfg)
+    n = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
+    op_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6) or 0.6)
+    rng = getattr(env, 'rng', None) or np.random.default_rng(0)
+    levels = np.linspace(-op_band, op_band, n, dtype='float32')
+    jit = rng.uniform(-0.05, 0.05, size=levels.shape).astype('float32')
+    levels = np.clip(levels + jit * op_band, -1.0, 1.0)
+    n_mv = _env_n_mv(env)
+    hold_rows = _per_mv_hold_rows(levels, n_mv, env.action_dim, rng)
+    obs_l: List[np.ndarray] = []
+    act_l: List[np.ndarray] = []
+    for i in range(n):
+        lvl = hold_rows[i] if hold_rows is not None else float(levels[i])
+        o, a = collect_rest_lookback(
+            env, cfg, lvl, settle=settle, lookback=L)
+        obs_l.append(o)
+        act_l.append(a)
+    cfg._gain_match_rest_obs = np.stack(obs_l, axis=0)  # type: ignore[attr-defined]
+    cfg._gain_match_rest_act = np.stack(act_l, axis=0)  # type: ignore[attr-defined]
+    cfg._gain_match_rest_dev = None  # type: ignore[attr-defined]
+    from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
+    print(f'[gain-match] rest-ic N={n} L={L} settle={settle} '
+          f'(TM-protocol real-rest encode; isolation loss stays 0; '
+          f'not wm_tf_horizon={_wm_tf_h(int(getattr(cfg, "horizon", 15) or 15))})',
+          flush=True)
+
+
 def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                         obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig,
                         c_mean: Optional[torch.Tensor] = None,
@@ -6044,7 +6187,13 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     ``gain_match_settle_len`` steps (P44: auto = control horizon; TM
     probe settle is 4×horizon — see TrainConfig),
     then roll the PRIOR forward ``K`` steps under (a) a HELD baseline
-    action/DV and (b) a unit STEP in each input channel.  The DIFFERENCE of
+    action/DV and (b) a unit STEP in each input channel.
+
+    ``gain_match_rest_ic`` (P45 opt-in): replace PRBS-posterior starts
+    with a teacher-forced encode of **real** rest lookbacks (TM
+    rest-then-step IC).  Isolation loss stays 0.  When the rest cache
+    is present, P44 WM-held settle is skipped (the lookback is already
+    rest).  The DIFFERENCE of
     the decoded CV at step ``K`` cancels the common transient and isolates
     the WM's realized STEADY-STATE gain ``ΔCV/Δinput``;
     we match it to the identified gain (in WM/normalized units).  The continuous
@@ -6099,34 +6248,43 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # T > K keep the historical start restriction (test_sim T=64,
     # K=55 → n_valid=9).  When T <= K roll the full K from every start.
     step = float(getattr(cfg, 'gain_match_step', 1.0) or 1.0)
-    max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
-    n_valid = (T - K) if T > K else T
-    if n_valid < 1:
-        return zero, diag
-    stride = max(1, n_valid // max_starts)
-    starts = torch.arange(0, n_valid, stride, device=obs.device)
-    S = int(starts.numel())
-    f0 = feats[:, starts]                                   # (B, S, F)
-    Bm = B * S
-    h0 = f0[..., :rssm.deter_dim].reshape(Bm, -1)
-    _ze = rssm.deter_dim + rssm.stoch_flat_dim
-    z0 = f0[..., rssm.deter_dim:_ze].reshape(
-        Bm, rssm.n_categoricals, rssm.n_classes)
-    # Follow-up 14: first GRU step of the FD roll must see posterior MEAN c
-    # (actor / TM / isolation path), not the sample packed into feat.
-    c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     cv_idx = rssm.cv_index_t
-
-    a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
-    dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
-           if getattr(rssm, 'dv_dim', 0) > 0 else None)
-    # P44: settle at the start's held a/dv BEFORE the FD so the *student*
-    # FD (matched to identified G, not a teacher FD) starts from a held
-    # OP instead of a PRBS posterior.  P43 Huber ~0 from replay starts
-    # while the rest-step probe stayed 0.75@DV.  Gradful (P25).
-    h0, z0, c0 = _gain_match_held_settle(
-        rssm, h0, z0, c0, a_base, dv0,
-        int(getattr(cfg, 'gain_match_settle_len', 0)))
+    rest = None
+    if _cfg_on(cfg, 'gain_match_rest_ic', False):
+        rest = _gain_match_rest_ic_state(
+            rssm, cfg, obs.device, obs.dtype)
+    if rest is not None:
+        # P45: TM-protocol IC (real rest encode).  Skip P44 WM-held
+        # settle of a PRBS start — the lookback *is* the rest.
+        h0, z0, c0, a_base, dv0 = rest
+        Bm = int(h0.shape[0])
+    else:
+        max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
+        n_valid = (T - K) if T > K else T
+        if n_valid < 1:
+            return zero, diag
+        stride = max(1, n_valid // max_starts)
+        starts = torch.arange(0, n_valid, stride, device=obs.device)
+        S = int(starts.numel())
+        f0 = feats[:, starts]                                   # (B, S, F)
+        Bm = B * S
+        h0 = f0[..., :rssm.deter_dim].reshape(Bm, -1)
+        _ze = rssm.deter_dim + rssm.stoch_flat_dim
+        z0 = f0[..., rssm.deter_dim:_ze].reshape(
+            Bm, rssm.n_categoricals, rssm.n_classes)
+        # Follow-up 14: first GRU step of the FD roll must see posterior MEAN c
+        # (actor / TM / isolation path), not the sample packed into feat.
+        c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
+        a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
+        dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+               if getattr(rssm, 'dv_dim', 0) > 0 else None)
+        # P44: settle at the start's held a/dv BEFORE the FD so the *student*
+        # FD (matched to identified G, not a teacher FD) starts from a held
+        # OP instead of a PRBS posterior.  P43 Huber ~0 from replay starts
+        # while the rest-step probe stayed 0.75@DV.  Gradful (P25).
+        h0, z0, c0 = _gain_match_held_settle(
+            rssm, h0, z0, c0, a_base, dv0,
+            int(getattr(cfg, 'gain_match_settle_len', 0)))
 
     mv_tgts = []
     for j, tgt_row in enumerate(mv_target):
@@ -6427,13 +6585,15 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
 
 
 def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
-    """Promote dataclass 0 to ``horizon`` (control H).  ``<0`` stays off.
+    """Promote explicit ``0`` to ``horizon`` (control H).  ``<0`` stays off.
 
-    P44 tests S=H.  The TM probe defaults to ``wm_tf_horizon(H)``
+    P44 env-free auto=H storm **2/2 @iter 66** (G_pred≈0, CAPPED 0.76@DV)
+    → default is ``-1`` (P43 FD-from-posterior).  ``DREAMER_GAIN_MATCH_SETTLE_LEN=0``
+    still means auto H.  The TM probe defaults to ``wm_tf_horizon(H)``
     (test_sim 220) and settle ``S = H_tf``.  Matching that 4H settle is
-    a later A/B (``DREAMER_GAIN_MATCH_SETTLE_LEN``), not this auto.
-    Do not use ``or 0`` — that would treat ``DREAMER_GAIN_MATCH_SETTLE_LEN=-1``
-    as auto.  Mutates ``cfg.gain_match_settle_len`` only when it was 0.
+    a later A/B, not a retry of S=H.
+    Do not use ``or 0`` — that would treat ``-1`` as auto.  Mutates
+    ``cfg.gain_match_settle_len`` only when it was 0.
     """
     s = int(getattr(cfg, 'gain_match_settle_len', 0))
     if s == 0:
@@ -10298,6 +10458,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         else:
             print(f'[gain-match] post-seed re-resolve FAILED ({_gm_exc!r}); '
                   f'keeping pre-iso targets', flush=True)
+    try:
+        _cache_gain_match_rest_ic(env, cfg)
+    except Exception as _rest_exc:
+        print(f'[gain-match] rest-ic cache FAILED ({_rest_exc!r}); '
+              f'FD falls back to PRBS starts', flush=True)
     _resolve_aux_tbptt_steps(cfg)
     _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:

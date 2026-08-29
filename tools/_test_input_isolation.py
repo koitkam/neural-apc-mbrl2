@@ -251,6 +251,35 @@ def main():
           f'trains cont-gain ({cont_grad_set:.4e}) gru ({gru_grad_set:.4e})')
     cfg.gain_match_settle_len = 0
 
+    # P45: rest-IC cache is the FD start (PRBS feats unchanged; rest
+    # tensors move the loss).  Isolation loss stays off.
+    cfg.gain_match_rest_ic = True
+    cfg.gain_match_settle_len = 4
+    N, L = 3, 8
+    rest_o = torch.randn(N, L, cfg.obs_dim)
+    rest_a = torch.rand(N, L, cfg.action_dim) * 2 - 1
+    cfg._gain_match_rest_obs = rest_o.numpy()
+    cfg._gain_match_rest_act = rest_a.numpy()
+    model.zero_grad(set_to_none=True)
+    gm_rest, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm_rest).all() and float(gm_rest) > 0.0
+    gm_rest.backward()
+    cont_grad_rest = sum(float(p.grad.abs().sum())
+                         for n, p in model.dynamics.named_parameters()
+                         if p.grad is not None and 'cont' in n)
+    assert cont_grad_rest > 0.0, 'rest-ic did NOT reach cont-gain!'
+    cfg._gain_match_rest_obs = (rest_o + 1.5).numpy()
+    cfg._gain_match_rest_dev = None
+    gm_rest2, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert abs(float(gm_rest) - float(gm_rest2)) > 1e-6
+    cfg.gain_match_rest_ic = False
+    cfg._gain_match_rest_obs = None
+    cfg._gain_match_rest_act = None
+    cfg._gain_match_rest_dev = None
+    cfg.gain_match_settle_len = 0
+    print(f'[gain-match-rest-ic] OK: rest encode is FD IC '
+          f'(cont {cont_grad_rest:.4e})')
+
     # ---- P28 follow-up 12: img_rollout / overshoot / held must start from
     # posterior c.  Dropping c zero-fills the GRU input, so the open-loop
     # gain supervisor trained a different path than isolation / gain-match

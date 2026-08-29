@@ -577,9 +577,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_HUBER_BETA':      ('gain_match_huber_beta',          float),
     # P43: per-element Huber β = |tgt_ij| (L1 sat ±1; not relative Huber).
     'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': ('gain_match_huber_per_input',     _as_bool),
-    # P44: held settle before gain-match FD (0 = auto control horizon;
-    # TM probe settle is 4×horizon; <0 = off).
+    # P44: held settle before gain-match FD (default -1 = off / P43;
+    # 0 = auto control horizon; TM probe settle is 4×horizon).
+    # P44 storm 2/2 REVERT of env-free auto=H.
     'DREAMER_GAIN_MATCH_SETTLE_LEN':      ('gain_match_settle_len',          int),
+    # P45 opt-in: TM-protocol rest-IC teacher (real held-OP encode → FD).
+    # Default False (P44 recipe).  Isolation loss stays 0.
+    'DREAMER_GAIN_MATCH_REST_IC':         ('gain_match_rest_ic',             _as_bool),
     'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
     # per-input isolation trajectory match + the steady-state DC-gain match (the
