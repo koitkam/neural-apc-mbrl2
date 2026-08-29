@@ -4525,14 +4525,14 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # because the simulator runs on CPU/numpy.
     #
     # P1/P2 ``random_action=True`` is handled above (numpy-only).  P3
-    # on-policy still streams the posterior.
+    # on-policy streams the posterior with measured DV + Kalman so the
+    # served ``feat`` matches ``_realsim_actor_critic_step`` re-encode.
+    from models.dreamer_v4_rssm import stream_serve_step
     with torch.inference_mode():
         _rssm_state = (model.dynamics.initial_state(1, device)
                        if _is_rssm else None)
         _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
                         if _is_rssm else None)
-        _pstep = (getattr(model.dynamics, '_posterior_step', None)
-                  if _is_rssm else None)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
@@ -4541,31 +4541,16 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                                          dtype=torch.bfloat16,
                                          enabled=(device.type == 'cuda')):
                     _o = torch.from_numpy(obs_window[-1]).to(device).unsqueeze(0)
-                    _emb = model.dynamics.embed(_o)
-                    # mbrl2 real-sim: advance the posterior with the MODE
-                    # (sample=False) when the POLICY drives.  The actor is TRAINED
-                    # on the mode belief (``_realsim_actor_critic_step`` re-encodes
-                    # with sample=False) and LQG separation puts control on the
-                    # OPTIMAL STATE ESTIMATE — so acting on a SAMPLED belief here is
-                    # a train/inference mismatch that injects latent-sampling noise
-                    # into the MV (part of the p01 chatter, esp. at deterministic
-                    # eval).  P1/P2 random collect (above) does not stream the
-                    # posterior at all — replay teacher-force is the WM path.
-                    # Prior heads are unused (next GRU input is this posterior).
-                    # ``dv`` is omitted on purpose for this pid/HEAD: GRU
-                    # zero-fills measured DV (``_gru_transition``) and Kalman
-                    # stays off (no ``obs``).  Training
-                    # ``rollout_observed`` slices DV from obs AND runs the
-                    # batched Kalman when ``dob_active``.  That train/serve
-                    # mismatch is a P3 lever — do not patch while P46
-                    # σ-reset is the live A/B.  Same h/z/c_mean as
-                    # obs_step(..., obs=None, dv=None)[0] (rest-IC smoke).
-                    if callable(_pstep):
-                        _rssm_state = _pstep(
-                            _rssm_state, _rssm_prev_a, _emb, sample=False)
-                    else:
-                        _rssm_state, _ = model.dynamics.obs_step(
-                            _rssm_state, _rssm_prev_a, _emb, sample=False)
+                    # Certainty-equivalent (sample=False) belief: the actor
+                    # trains on the mode (``_realsim_actor_critic_step``) and
+                    # LQG control acts on the optimal state estimate.  A
+                    # sampled belief injects latent noise into the MV (p01
+                    # chatter).  ``stream_serve_step`` threads measured DV
+                    # into the GRU and Kalman ``d_t`` when DOB is live —
+                    # same feat the frozen observer uses at train time.
+                    _rssm_state = stream_serve_step(
+                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                        sample=False)
                     action_t, _, _ = model.policy(_rssm_state.feat,
                                                    deterministic=deterministic)
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
@@ -10654,6 +10639,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         if _cfg_on(cfg, 'p3_reset_log_std', False):
             model.reset_policy_exploration(opt_actor)
             print('[p3] reset policy log_std residual (joint)', flush=True)
+        print('[p3] on-policy collect streams measured DV + Kalman '
+              '(train/serve match with rollout_observed)',
+              flush=True)
         model.snapshot_prior_policy()
         p3_start_steps = total_env_steps
         try:
@@ -11256,6 +11244,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                           'Adam log_std-row moments zeroed '
                           '(P45: P1/P2 BC pinned σ_min)',
                           flush=True)
+                print('[p3] on-policy collect streams measured DV + Kalman '
+                      '(train/serve match with rollout_observed)',
+                      flush=True)
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
                 model.snapshot_prior_policy()
                 # 2026-05-23 (P41 RCA): snapshot return_scale at P3 start

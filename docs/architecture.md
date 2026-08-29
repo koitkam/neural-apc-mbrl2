@@ -15,14 +15,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
-> `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46 EXIT: σ-reset
-> opened entropy (−0.101) then re-collapsed; econ **−256 vs −129**. Do
-> **not** promote `p3_reset_log_std` (default False). P47 (`run_p47_p3sigadam`,
-> pid **29434**) is **P2**: storm 2/2 capped P1 at iter **80**, GAIN-READY
-> **0.90@DV** (freeze last_ok **77**, probe 0.91@DV); `dobg` live. Do not
-> promote other plants until linear observer+actor are healthy. P3
-> collect still omits measured DV and Kalman (train/serve hole — do
-> not patch until P47 verdicts). Eval TM protocol (`wm_tf_*`) and
+> `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
+> KEEP-AS-OVERRIDE (default False): opened entropy (−0.101) then yanked
+> at unfreeze even with Adam log_std-row zero (P47 EXIT econ **−221 vs
+> −121**, bang-bang 0.53). Do **not** promote `p3_reset_log_std`. P48
+> (`run_p48_collectdv`) closes the train/serve hole: P3 collect/val
+> stream measured DV + Kalman. Do not promote other plants until linear
+> observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
 > val-suite gates, horizon formula (`horizon_settle_n_tau` /
 > `horizon_max`), IC randomization, and GPU-calib `wm_overhead` are
 > TrainConfig + `ENV_OVERRIDES`.
@@ -383,8 +382,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > μ (BC) kept. Pid 24426 was **weights-only**. Entropy opened **−0.101**
 > then yanked −0.323 at unfreeze and re-collapsed; econ **−256 vs −129**.
 > Opening σ is not sufficient (frozen BC μ still limit-rides). HEAD also
-> zeros Adam log_std-row moments (P47 same env). P3 on-policy collect
-> streams `_posterior_step`. Do not stack more critic knobs.
+> zeros Adam log_std-row moments (P47 EXIT: **FALSIFIED as yank lever**).
+> P3 on-policy collect/val streams `stream_serve_step` (DV + Kalman).
+> Do not stack more critic knobs.
 > Do not concat rest rows into the main `sample=True` WM rollout
 > (GRU would see sampled `c`). `actor_train_source` other than
 > `realsim` is refused at `train()` start.
@@ -522,11 +522,10 @@ flowchart TB
   DOBS -. feedforward .-> POL
 ```
 
-P3 **collect** streams `_posterior_step` without measured DV (GRU zero-fills)
-and without the Kalman innovation (`obs=None` ⇒ `d_t` decays from 0).
-Training `_realsim_actor_critic_step` re-encodes the stored trajectory with
-both. That train/serve hole is a later attributed P3 change (not while P47
-Adam-complete σ-reset is live).
+P3 **collect** and val stream `stream_serve_step`: measured DV into the
+GRU and Kalman `d_t` when `dob_active`, so served `feat` matches
+training `_realsim_actor_critic_step` / `rollout_observed`. P47 EXIT
+falsified Adam log_std-row zero as the entropy-yank lever.
 
 ### Reading the diagram
 - **World model** learns the plant from `obs`: `encoder → posterior z` (sees obs),
@@ -688,8 +687,9 @@ fixes BOTH:
   WM-held settle is skipped. Isolation loss stays 0. jsonl `*_ratio` =
   mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE
   (default False). Residual is last Linear (ent −0.101); opening σ
-  not sufficient (econ −256 vs −129). P47 zeros Adam log_std-row
-  moments on the same env. P3 collect streams `_posterior_step`.
+  not sufficient (econ −256 vs −129). **P47 EXIT:** Adam log_std-row
+  zero FALSIFIED as yank lever (econ −221 vs −121). P48 collect/val
+  streams `stream_serve_step` (DV + Kalman).
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.

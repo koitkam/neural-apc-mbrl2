@@ -428,6 +428,9 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                    if _is_rssm else None)
     _rssm_prev_a = (torch.zeros(1, action_dim, device=device)
                     if _is_rssm else None)
+    _serve_step = None
+    if _is_rssm:
+        from models.dreamer_v4_rssm import stream_serve_step as _serve_step
 
     for t in range(T):
         ow = torch.from_numpy(obs_window).to(device)
@@ -439,17 +442,12 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                 if _is_rssm:
                     _o = torch.from_numpy(
                         obs_window[-1]).to(device).unsqueeze(0)
-                    _emb = model.dynamics.embed(_o)
-                    # mbrl2 real-sim: certainty-equivalent (posterior MODE) belief
-                    # for control — matches training (``_realsim_actor_critic_step``
-                    # re-encodes sample=False) and ``collect_episode``.  A SAMPLED
-                    # belief here would inject latent-sampling noise into the
-                    # deterministic-eval MV (part of the p01 chatter the user saw
-                    # in the disturbance-rejection plots).
-                    _post, _ = model.dynamics.obs_step(
-                        _rssm_state, _rssm_prev_a, _emb, sample=False)
-                    agent_hid = _post.feat
-                    _rssm_state = _post
+                    # Certainty-equivalent belief + the same DV/Kalman feat
+                    # ``collect_episode`` / ``_realsim_actor_critic_step`` use.
+                    _rssm_state = _serve_step(
+                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                        sample=False)
+                    agent_hid = _rssm_state.feat
                 else:
                     z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
                     tau = torch.full((1, L), tau_ctx_val, device=device,

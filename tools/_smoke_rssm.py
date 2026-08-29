@@ -578,8 +578,8 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  isolation skip when g frozen (_dynamics_g_trainable)')
     print('[smoke] OK  g-only aux (overshoot/held/gain-match) skip when g frozen')
 
-    # P1/P2 random collect is numpy-only (no RSSM).  P3 on-policy still
-    # streams obs_step.
+    # P1/P2 random collect is numpy-only (no RSSM).  P3 on-policy streams
+    # stream_serve_step (DV + Kalman when DOB is live).
     if wm_type == 'rssm':
         class _DummyCollectEnv:
             def __init__(self):
@@ -626,7 +626,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         finally:
             model.dynamics.obs_step = _orig_obs
             model.dynamics._posterior_step = _orig_post
-        print('[smoke] OK  random collect skips RSSM; on-policy streams _posterior_step')
+        print('[smoke] OK  random collect skips RSSM; on-policy streams _posterior_step (no DV/DOB)')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
@@ -1039,7 +1039,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
-    assert "callable(_pstep)" in _src
+    assert 'stream_serve_step' in _src
+    assert '[p3] on-policy collect streams measured DV + Kalman' in _src
     assert "setdefault('jemb_loss'" in _src
     assert '_require_realsim_actor' in _src
     assert 'store_aux=False, last_only=True' in _src
@@ -2031,6 +2032,87 @@ def _test_stage1_dob_ground_skip() -> None:
     print('[smoke] OK  Stage-1 dob_ground skipped; apply_dob identity')
 
 
+def _test_stream_serve_matches_rollout() -> None:
+    """P3 serve feat matches training re-encode (measured DV + Kalman d_t)."""
+    from models.dreamer_v4_rssm import stream_serve_step
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 8, 4
+    cfg.mtp_length = 4
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.head_hidden = 16
+    cfg.dob_enabled = True
+    cfg.cv_obs_indices = (0,)
+    cfg.dv_as_input = True
+    cfg.dv_indices = (3,)
+    cfg.dv_dim = 1
+    cfg.dv_feedforward = True
+    cfg.compile_mode = 'off'
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    cfg.gain_match_coef = 0.0
+    cfg.wm_input_isolation_coef = 0.0
+    model = build_model(cfg)
+    model.set_dob_active(True)
+    rssm = model.dynamics
+    assert rssm.dob_enabled and rssm.dv_dim == 1, (rssm.dob_enabled, rssm.dv_dim)
+    B, T = 2, 8
+    obs = torch.randn(B, T, cfg.obs_dim)
+    act = torch.rand(B, T, cfg.action_dim) * 2 - 1
+    feats, *_ = rssm.rollout_observed(obs, act, sample=False, store_aux=False)
+    state = rssm.initial_state(B, obs.device)
+    streamed = []
+    for t in range(T):
+        state = stream_serve_step(
+            rssm, state, act[:, t], obs[:, t], sample=False)
+        streamed.append(state.feat)
+    streamed = torch.stack(streamed, dim=1)
+    assert streamed.shape == feats.shape, (streamed.shape, feats.shape)
+    # GRU does not take d; Kalman on feat must match batched dob_kalman_scan.
+    if not torch.allclose(streamed, feats, atol=1e-5, rtol=1e-4):
+        err = (streamed - feats).abs().max().item()
+        raise AssertionError(f'serve vs rollout_observed max|Δ|={err:.4e}')
+    # Collect with DOB+DV must stream obs_step (Kalman needs the prior decode).
+    class _Dummy:
+        def __init__(self):
+            self.action_dim = cfg.action_dim
+            self.obs_dim = cfg.obs_dim
+            self.rng = __import__('numpy').random.default_rng(0)
+        def reset(self, exploration=True):
+            return __import__('numpy').zeros((1, self.obs_dim), dtype='float32')
+        def step(self, a):
+            o = __import__('numpy').zeros((1, self.obs_dim), dtype='float32')
+            o[0, 3] = 0.4
+            return o, 0.0, False, {}
+    _n_obs = {'n': 0}
+    _orig = rssm.obs_step
+
+    def _count(*a, **k):
+        _n_obs['n'] += 1
+        return _orig(*a, **k)
+
+    rssm.obs_step = _count
+    _ccfg = TrainConfig()
+    _ccfg.episode_length = 5
+    _ccfg.lookback = 4
+    _ccfg.k_max = 4
+    _ccfg.tau_ctx = 0.1
+    _ccfg.world_model_type = 'rssm'
+    try:
+        collect_episode(_Dummy(), model, torch.device('cpu'),
+                        _ccfg, random_action=False)
+        assert _n_obs['n'] == 5, _n_obs['n']
+    finally:
+        rssm.obs_step = _orig
+    print('[smoke] OK  stream_serve_step ≡ rollout_observed (DV+Kalman); '
+          'P3 collect uses obs_step')
+
+
 if __name__ == '__main__':
     import os
     import sys
@@ -2046,6 +2128,7 @@ if __name__ == '__main__':
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()
+    _test_stream_serve_matches_rollout()
     _test_envfree_observer_recipe()
     _test_require_realsim_actor()
     _test_gain_match_per_input_huber()

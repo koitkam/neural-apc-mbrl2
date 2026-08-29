@@ -1042,6 +1042,42 @@ class RSSMDynamics(nn.Module):
         return out
 
 
+def stream_serve_step(dyn, state, prev_action: torch.Tensor,
+                      obs_t: torch.Tensor, sample: bool = False):
+    """One on-policy / val posterior step matching ``rollout_observed``.
+
+    Training ``_realsim_actor_critic_step`` re-encodes with measured DV
+    sliced from obs and batched Kalman when ``dob_active``. Collect/val
+    used to call ``_posterior_step`` / ``obs_step`` with ``dv=None`` and
+    ``obs=None`` (GRU zero-fills DV; ``d_t`` decays from 0). The actor
+    then trained on a different ``feat=[h,z,(c),(dv),d_t]`` than it
+    acted on — the P3 train/serve hole (P45–P47 bang-bang / limit-ride).
+
+    ``obs_t`` is ``(B, obs_dim)`` or ``(obs_dim,)``. Duck-typed for
+    RSSM and TSSM. ``d`` is not a GRU input, so Kalman here matches
+    the batched ``dob_kalman_scan`` on feats; Stage-1
+    (``dob_active=False``) still skips Kalman like the teacher.
+    """
+    if obs_t.dim() == 1:
+        obs_t = obs_t.unsqueeze(0)
+    emb = dyn.embed(obs_t)
+    dv = None
+    if int(getattr(dyn, 'dv_dim', 0) or 0) > 0:
+        dv = obs_t.index_select(-1, dyn.dv_index_t)
+    dob_live = (bool(getattr(dyn, 'dob_enabled', False))
+                and bool(getattr(dyn, 'dob_active', True)))
+    if dob_live:
+        post, _ = dyn.obs_step(
+            state, prev_action, emb, dv=dv, sample=sample, obs=obs_t)
+        return post
+    pstep = getattr(dyn, '_posterior_step', None)
+    if callable(pstep):
+        return pstep(state, prev_action, emb, dv=dv, sample=sample)
+    post, _ = dyn.obs_step(
+        state, prev_action, emb, dv=dv, sample=sample, obs=None)
+    return post
+
+
 # ---------------------------------------------------------------------------
 # KL-balanced free-bits loss
 # ---------------------------------------------------------------------------
