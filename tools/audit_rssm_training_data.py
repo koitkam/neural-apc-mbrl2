@@ -129,7 +129,7 @@ from training.train import (  # noqa: E402
     TrainConfig, APCEnv, auto_tune_seed_buffer,
     collect_baseline_episode, collect_episode, collect_prbs_episode,
     _seed_one_const_or_step, collect_step_test_episode,
-    _per_mv_hold_rows, _env_n_mv,
+    _per_mv_hold_rows, _env_n_mv, _resolve_baseline_seed_op_band,
 )
 
 _valid = {f.name for f in _dc_fields(TrainConfig)}
@@ -307,8 +307,7 @@ baseline_std = float(getattr(cfg, 'baseline_seed_action_std', 0.05))
 n_random = int(getattr(cfg, 'random_seed_episodes', 0))
 n_prbs = int(getattr(cfg, 'exploration_seed_episodes', 0))
 prbs_band = float(getattr(cfg, 'prbs_seed_op_band', 0.95))
-baseline_band = float(os.environ.get(
-    'DREAMER_BASELINE_SEED_OP_BAND', str(min(0.6, prbs_band))))
+baseline_band = _resolve_baseline_seed_op_band(cfg, prbs_band)
 
 # --- baseline (stratified centres) -------------------------------------
 if n_baseline > 0:

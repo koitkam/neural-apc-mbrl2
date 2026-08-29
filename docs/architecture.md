@@ -16,8 +16,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46 live A/B:
-> `DREAMER_P3_RESET_LOG_STD=1` (default False). One GPU job. Do not promote
-> other plants until linear observer+actor are healthy.
+> `DREAMER_P3_RESET_LOG_STD=1` (default False). P1 last-ok **locked 58**
+> (skip 0; P45 unlocked). One GPU job. Do not promote other plants until
+> linear observer+actor are healthy. P3 collect still omits measured DV
+> and Kalman (train/serve hole — do not patch until P46 verdicts).
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**
@@ -513,6 +515,12 @@ flowchart TB
   ACT --> PLANT
   DOBS -. feedforward .-> POL
 ```
+
+P3 **collect** streams `_posterior_step` without measured DV (GRU zero-fills)
+and without the Kalman innovation (`obs=None` ⇒ `d_t` decays from 0).
+Training `_realsim_actor_critic_step` re-encodes the stored trajectory with
+both. That train/serve hole is a later attributed P3 change (not while P46
+σ-reset is live).
 
 ### Reading the diagram
 - **World model** learns the plant from `obs`: `encoder → posterior z` (sees obs),

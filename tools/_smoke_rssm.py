@@ -27,6 +27,7 @@ from training.train import (
                             _p1_fidelity_local_plateau,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
+                            _resolve_baseline_seed_op_band,
                             collect_episode, collect_prbs_episode,
                             _build_dv_prbs_schedule,
                             _isolated_hold_action, _hold_other_action_dims,
@@ -711,6 +712,9 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_GAIN_MATCH_SETTLE_LEN': '55',
         'DREAMER_GAIN_MATCH_REST_IC': '1',
         'DREAMER_P3_RESET_LOG_STD': '1',
+        'DREAMER_BASELINE_SEED_OP_BAND': '0.4',
+        'DREAMER_CONST_ACTION_OP_BAND': '0.55',
+        'DREAMER_PRBS_SEED_OP_BAND': '0.8',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -727,9 +731,15 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.gain_match_settle_len) == 55
         assert cfg.gain_match_rest_ic is True
         assert cfg.p3_reset_log_std is True
+        assert abs(float(cfg.baseline_seed_op_band) - 0.4) < 1e-12
+        assert abs(float(cfg.constant_action_seed_op_band) - 0.55) < 1e-12
+        assert abs(float(cfg.prbs_seed_op_band) - 0.8) < 1e-12
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
+        assert 'baseline_seed_op_band' in explicit
+        assert 'constant_action_seed_op_band' in explicit
+        assert 'prbs_seed_op_band' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1115,12 +1125,18 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.gain_match_settle_len) == -1
     assert c.gain_match_rest_ic is True
     assert c.p3_reset_log_std is False
+    assert abs(float(c.baseline_seed_op_band) - 0.6) < 1e-12
+    assert abs(float(c.constant_action_seed_op_band) - 0.6) < 1e-12
+    assert abs(float(c.prbs_seed_op_band) - 0.95) < 1e-12
     assert c.actor_train_source == 'realsim'
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
     assert 'DREAMER_P3_RESET_LOG_STD' in ENV_OVERRIDES
+    assert 'DREAMER_BASELINE_SEED_OP_BAND' in ENV_OVERRIDES
+    assert 'DREAMER_CONST_ACTION_OP_BAND' in ENV_OVERRIDES
+    assert 'DREAMER_PRBS_SEED_OP_BAND' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
@@ -1462,6 +1478,17 @@ def _test_p3_reset_log_std() -> None:
     print('[smoke] OK  P3 reset_log_std restores σ=init, keeps μ, zeros Adam log_std rows')
 
 
+def _test_resolve_baseline_seed_op_band() -> None:
+    """Env-free min(0.6, PRBS); explicit override is not PRBS-capped."""
+    c = TrainConfig()
+    assert abs(_resolve_baseline_seed_op_band(c, 0.95) - 0.6) < 1e-12
+    assert abs(_resolve_baseline_seed_op_band(c, 0.4) - 0.4) < 1e-12
+    c.baseline_seed_op_band = 0.8
+    c._explicit_fields = {'baseline_seed_op_band'}  # type: ignore[attr-defined]
+    assert abs(_resolve_baseline_seed_op_band(c, 0.4) - 0.8) < 1e-12
+    print('[smoke] OK  baseline_seed_op_band env-free min(0.6, PRBS); explicit wins')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -1700,6 +1727,7 @@ if __name__ == '__main__':
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
     _test_p3_reset_log_std()
+    _test_resolve_baseline_seed_op_band()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

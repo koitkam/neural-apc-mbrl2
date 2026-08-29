@@ -265,6 +265,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # test_sim sentinel; MIMO covers OP combinations via per-MV
     # permutations, not extra episodes.
     'DREAMER_CONST_ACTION_SEEDS': ('constant_action_seed_episodes', int),
+    # Unitless operating-band fractions (sim-agnostic).  Baseline used to
+    # read ``DREAMER_BASELINE_SEED_OP_BAND`` via ``os.environ.get`` inside
+    # ``train()`` (worked, but missing from ``run_plan``).  Const-action /
+    # PRBS bands were TrainConfig-only (``single_run`` could not A/B them).
+    'DREAMER_BASELINE_SEED_OP_BAND': ('baseline_seed_op_band',        float),
+    'DREAMER_CONST_ACTION_OP_BAND':  ('constant_action_seed_op_band', float),
+    'DREAMER_PRBS_SEED_OP_BAND':     ('prbs_seed_op_band',            float),
     # P1 re-inject cadence (P28 follow-up 5/6): EVERY auto-scales from
     # buffer lap; N auto-scales from n_mv/n_dv.  Explicit env wins; 0 disables.
     'DREAMER_CONST_ACTION_INJECT_EVERY':  ('const_action_inject_every',      int),

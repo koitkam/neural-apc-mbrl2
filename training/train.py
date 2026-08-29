@@ -1012,6 +1012,14 @@ class TrainConfig:
     # diagnosed in run_p0adapt.
     baseline_seed_episodes: int = 16
     baseline_seed_action_std: float = 0.05
+    # Unitless fraction of normalised action for stratified baseline-seed
+    # centres.  Env-free 0.6 matches the historical
+    # ``min(0.6, prbs_seed_op_band)`` default (PRBS default 0.95).
+    # When not explicitly overridden, still capped at the PRBS band so a
+    # tighter PRBS envelope cannot leave baseline centres outside it.
+    # Was ``os.environ.get('DREAMER_BASELINE_SEED_OP_BAND')`` inside
+    # ``train()`` (worked, but invisible in ``run_plan``).
+    baseline_seed_op_band: float = 0.6
     random_seed_episodes: int = 6
     # Structured PRBS-style exploration episodes for WM coverage breadth
     # (2026-05-08, run_p7 RCA).  Drives MV across the operating band
@@ -4329,6 +4337,22 @@ def _collect_random_episode(env: APCEnv, cfg: TrainConfig
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
 
+def _resolve_baseline_seed_op_band(cfg: 'TrainConfig', prbs_op_band: float
+                                   ) -> float:
+    """Stratified baseline-seed centres: unitless fraction of action.
+
+    Explicit ``DREAMER_BASELINE_SEED_OP_BAND`` / field override wins.
+    Otherwise ``min(baseline_seed_op_band, prbs_op_band)`` so a tighter
+    PRBS envelope cannot leave baseline centres outside the excited band
+    (historical ``os.environ.get(..., min(0.6, prbs))``).
+    """
+    band = float(getattr(cfg, 'baseline_seed_op_band', 0.6) or 0.6)
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    if 'baseline_seed_op_band' in explicit:
+        return band
+    return min(band, float(prbs_op_band))
+
+
 def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                     cfg: TrainConfig, *, random_action: bool = False,
                     deterministic: bool = False) -> Dict[str, np.ndarray]:
@@ -4412,9 +4436,15 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                     # into the MV (part of the p01 chatter, esp. at deterministic
                     # eval).  P1/P2 random collect (above) does not stream the
                     # posterior at all — replay teacher-force is the WM path.
-                    # Prior heads are unused (next GRU input is this posterior;
-                    # collect does not pass obs so Kalman is off anyway).  Same
-                    # h/z/c_mean as obs_step(..., obs=None)[0] (rest-IC smoke).
+                    # Prior heads are unused (next GRU input is this posterior).
+                    # ``dv`` is omitted on purpose for this pid/HEAD: GRU
+                    # zero-fills measured DV (``_gru_transition``) and Kalman
+                    # stays off (no ``obs``).  Training
+                    # ``rollout_observed`` slices DV from obs AND runs the
+                    # batched Kalman when ``dob_active``.  That train/serve
+                    # mismatch is a P3 lever — do not patch while P46
+                    # σ-reset is the live A/B.  Same h/z/c_mean as
+                    # obs_step(..., obs=None, dv=None)[0] (rest-IC smoke).
                     if callable(_pstep):
                         _rssm_state = _pstep(
                             _rssm_state, _rssm_prev_a, _emb, sample=False)
@@ -10169,11 +10199,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # only mid-MV.  Audit (output/test_sim/_data_audit_v2_*) showed the
     # legacy zero-centred baseline_seed only excited 20 % of the MV
     # band; this stratification raises that to ~100 % with the same
-    # episode budget.  Op-band defaults to PRBS-1-sigma (0.6) and is
-    # overridable via ``DREAMER_BASELINE_SEED_OP_BAND``.
-    baseline_op_band = float(os.environ.get(
-        'DREAMER_BASELINE_SEED_OP_BAND',
-        str(min(0.6, float(prbs_op_band)))))
+    # episode budget.  Op-band is a TrainConfig field (unitless);
+    # ``DREAMER_BASELINE_SEED_OP_BAND`` is in ENV_OVERRIDES.
+    baseline_op_band = _resolve_baseline_seed_op_band(cfg, prbs_op_band)
     if n_baseline_seed > 0:
         # Stratified centres: split the operating band into
         # ``n_baseline_seed`` equal strata, draw one centre per stratum
