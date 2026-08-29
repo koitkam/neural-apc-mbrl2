@@ -862,17 +862,20 @@ _PINNED_EVAL_MODULES = False
 def pin_eval_modules_at_launch() -> None:
     """Import validation/TM/diag modules once at train start.
 
-    P47 ``ImportError: resolve_wm_tf_knobs`` and P48
-    ``ImportError: alloc_pinned_obs_host``: late
-    ``from evaluation.validate import run_validation`` loaded HEAD
-    ``validate.py`` against already-imported launch-time
-    ``wm_transfer_matrix`` / ``dreamer_v4_rssm``.  Pinning at launch
-    binds the process to the launch-time eval stack so a GPU-occupied
-    leftover commit cannot race the val pass.
+    P47 ``ImportError: resolve_wm_tf_knobs``, P48
+    ``ImportError: alloc_pinned_obs_host``, P49
+    ``TypeError: get_authority_target_frac() got an unexpected
+    keyword argument 'cfg'``: late ``from evaluation.validate import
+    run_validation`` loaded HEAD ``validate.py`` against already-imported
+    launch-time ``wm_transfer_matrix`` / ``dreamer_v4_rssm`` /
+    ``training_disturbance``.  Pinning at launch binds the process to
+    the launch-time eval stack so a GPU-occupied leftover commit cannot
+    race the val pass.
     """
     global _PINNED_EVAL_MODULES
     if _PINNED_EVAL_MODULES:
         return
+    import utils.training_disturbance  # noqa: F401
     import evaluation.diagnostics  # noqa: F401
     import evaluation.validate  # noqa: F401
     import evaluation.wm_disturbance_prediction  # noqa: F401

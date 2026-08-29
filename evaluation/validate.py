@@ -179,6 +179,61 @@ def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
     return out
 
 
+def control_quality_gates(
+    disturbance_records: Optional[List[Dict]] = None,
+    seed_metrics: Optional[List[Dict]] = None,
+) -> Dict:
+    """Paired scripted-disturbance agent vs open-loop baseline.
+
+    Empty records must **not** pass (P49: leftover ``cfg=`` TypeError
+    skipped every scripted episode → 0.0 vs 0.0 falsely PASSED
+    ``beats_baseline``).  Seed-episode KPIs have no paired baseline, so
+    they can fill reversal / agent econ for the log but cannot pass
+    ``beats_baseline``.
+    """
+    _dr = list(disturbance_records or [])
+    out: Dict = {
+        'mv_reversal_rate_max': 0.5,
+        'n_scripted_pairs': len(_dr),
+    }
+    if not _dr:
+        revs: List[float] = []
+        econs: List[float] = []
+        if seed_metrics:
+            revs = [float(r.get('kpi_mv_reversal_rate', 0.0))
+                    for r in seed_metrics]
+            econs = [float(r.get('kpi_economic_score', 0.0))
+                     for r in seed_metrics]
+        rev_mean = float(np.mean(revs)) if revs else float('nan')
+        agent_econ = float(np.mean(econs)) if econs else float('nan')
+        out.update({
+            'mv_reversal_rate_observed': rev_mean,
+            'agent_economic_score': agent_econ,
+            'baseline_economic_score': float('nan'),
+            'smooth_pass': bool(revs) and bool(rev_mean <= 0.5),
+            'beats_baseline_pass': False,
+            'control_gate_skipped': 'no_scripted_disturbance_pairs',
+        })
+        return out
+    _rev = [float((r.get('episode_metrics_agent') or {}).get(
+        'mv_reversal_rate', 0.0)) for r in _dr]
+    _ae = [float((r.get('episode_metrics_agent') or {}).get(
+        'economic_score', 0.0)) for r in _dr]
+    _be = [float((r.get('episode_metrics_baseline') or {}).get(
+        'economic_score', 0.0)) for r in _dr]
+    rev_mean = float(np.mean(_rev)) if _rev else 0.0
+    agent_econ = float(np.mean(_ae)) if _ae else 0.0
+    base_econ = float(np.mean(_be)) if _be else 0.0
+    out.update({
+        'mv_reversal_rate_observed': rev_mean,
+        'agent_economic_score': agent_econ,
+        'baseline_economic_score': base_econ,
+        'smooth_pass': bool(rev_mean <= 0.5),
+        'beats_baseline_pass': bool(agent_econ >= base_econ),
+    })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Scripted disturbance schedule (deterministic, for rejection plots)
 # ---------------------------------------------------------------------------
@@ -266,7 +321,15 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
                     if cv_widths else 10.0)
 
     mv_authority_cv = compute_mv_authority_to_cv(env.sim, id_ctx)
-    authority_frac = get_authority_target_frac(cfg=getattr(env, 'cfg', None))
+    # P49 leftover race: HEAD validate.py passed cfg= while the live pid
+    # still had launch-time get_authority_target_frac(default=) only.
+    # TypeError skipped every scripted-disturbance episode → empty
+    # paired records → 0.0 vs 0.0 falsely PASSED beats_baseline.
+    try:
+        authority_frac = get_authority_target_frac(
+            cfg=getattr(env, 'cfg', None))
+    except TypeError:
+        authority_frac = get_authority_target_frac()
     cumulative_offset: Dict[str, float] = {}
     cumulative_cv_impact = 0.0
 
@@ -2102,25 +2165,14 @@ def run_validation(*,
             # validation.  smooth_pass flags the oscillation directly;
             # beats_baseline_pass flags any policy no better than doing nothing.
             try:
-                _dr = locals().get('disturbance_records') or []
-                _rev = [float((r.get('episode_metrics_agent') or {}).get(
-                    'mv_reversal_rate', 0.0)) for r in _dr]
-                _ae = [float((r.get('episode_metrics_agent') or {}).get(
-                    'economic_score', 0.0)) for r in _dr]
-                _be = [float((r.get('episode_metrics_baseline') or {}).get(
-                    'economic_score', 0.0)) for r in _dr]
-                rev_mean = float(np.mean(_rev)) if _rev else 0.0
-                agent_econ = float(np.mean(_ae)) if _ae else 0.0
-                base_econ = float(np.mean(_be)) if _be else 0.0
-                fidelity_gates['mv_reversal_rate_max'] = 0.5
-                fidelity_gates['mv_reversal_rate_observed'] = rev_mean
-                fidelity_gates['agent_economic_score'] = agent_econ
-                fidelity_gates['baseline_economic_score'] = base_econ
-                fidelity_gates['smooth_pass'] = bool(rev_mean <= 0.5)
-                fidelity_gates['beats_baseline_pass'] = bool(agent_econ >= base_econ)
+                _cq = control_quality_gates(
+                    locals().get('disturbance_records') or [],
+                    seed_metrics=locals().get('metrics_records') or [],
+                )
+                fidelity_gates.update(_cq)
             except Exception as _cge:
-                fidelity_gates['smooth_pass'] = True
-                fidelity_gates['beats_baseline_pass'] = True
+                fidelity_gates['smooth_pass'] = False
+                fidelity_gates['beats_baseline_pass'] = False
                 fidelity_gates['control_gate_error'] = repr(_cge)
             fidelity_gates['all_pass'] = bool(
                 fidelity_gates['wm_pass']
@@ -2147,10 +2199,16 @@ def run_validation(*,
                           ' > 0.5 (BANG-BANG: MV reverses direction most steps)',
                           flush=True)
                 if not fidelity_gates.get('beats_baseline_pass', True):
-                    print(f'        - agent economic_score='
-                          f'{fidelity_gates.get("agent_economic_score", 0.0):+.4f}'
-                          f' < baseline={fidelity_gates.get("baseline_economic_score", 0.0):+.4f}'
-                          ' (policy WORSE than open-loop baseline)', flush=True)
+                    if fidelity_gates.get('control_gate_skipped'):
+                        print('        - no scripted agent/baseline pairs '
+                              f'({fidelity_gates.get("control_gate_skipped")}); '
+                              'cannot claim beats-baseline (P49 0-vs-0 false pass)',
+                              flush=True)
+                    else:
+                        print(f'        - agent economic_score='
+                              f'{fidelity_gates.get("agent_economic_score", 0.0):+.4f}'
+                              f' < baseline={fidelity_gates.get("baseline_economic_score", 0.0):+.4f}'
+                              ' (policy WORSE than open-loop baseline)', flush=True)
             else:
                 print(f'[val] internal-fidelity gates PASSED '
                       f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '

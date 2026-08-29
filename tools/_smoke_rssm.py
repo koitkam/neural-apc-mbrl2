@@ -1591,14 +1591,43 @@ def _test_objective_runtime_cfg() -> None:
 
 
 def _test_pin_eval_modules() -> None:
-    """Launch pin binds validate/TM; second call is a no-op."""
+    """Launch pin binds validate/TM/training_disturbance; second call is a no-op."""
     import sys
     from workflow._plant_prepare import pin_eval_modules_at_launch
     pin_eval_modules_at_launch()
     assert 'evaluation.validate' in sys.modules
     assert 'evaluation.wm_transfer_matrix' in sys.modules
+    assert 'utils.training_disturbance' in sys.modules
     pin_eval_modules_at_launch()
-    print('[smoke] OK  pin eval modules at launch (P47/P48 race)')
+    print('[smoke] OK  pin eval modules at launch (P47/P48/P49 race)')
+
+
+def _test_control_quality_gates() -> None:
+    """Empty scripted pairs must not 0-vs-0 pass (P49 false all_pass)."""
+    from evaluation.validate import control_quality_gates
+    empty = control_quality_gates([])
+    assert empty['beats_baseline_pass'] is False
+    assert empty['n_scripted_pairs'] == 0
+    assert empty.get('control_gate_skipped') == 'no_scripted_disturbance_pairs'
+    seeded = control_quality_gates(
+        [],
+        seed_metrics=[{'kpi_mv_reversal_rate': 0.1, 'kpi_economic_score': -700.0}],
+    )
+    assert seeded['beats_baseline_pass'] is False
+    assert abs(float(seeded['agent_economic_score']) + 700.0) < 1e-9
+    assert seeded['smooth_pass'] is True
+    paired = control_quality_gates([{
+        'episode_metrics_agent': {'mv_reversal_rate': 0.1, 'economic_score': -50.0},
+        'episode_metrics_baseline': {'economic_score': -90.0},
+    }])
+    assert paired['beats_baseline_pass'] is True
+    assert abs(float(paired['agent_economic_score']) + 50.0) < 1e-9
+    worse = control_quality_gates([{
+        'episode_metrics_agent': {'mv_reversal_rate': 0.1, 'economic_score': -200.0},
+        'episode_metrics_baseline': {'economic_score': -90.0},
+    }])
+    assert worse['beats_baseline_pass'] is False
+    print('[smoke] OK  control_quality_gates empty records do not 0-vs-0 pass')
 
 
 def _test_require_realsim_actor() -> None:
@@ -2830,6 +2859,7 @@ if __name__ == '__main__':
     _test_identified_tau_cfg()
     _test_objective_runtime_cfg()
     _test_pin_eval_modules()
+    _test_control_quality_gates()
     _test_require_realsim_actor()
     _test_gain_match_per_input_huber()
     _test_gain_match_pred_over_tgt()

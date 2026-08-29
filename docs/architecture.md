@@ -21,10 +21,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > −121**, bang-bang 0.53). Do **not** promote `p3_reset_log_std`. P48
 > EXIT (`run_p48_collectdv`): `stream_serve_step` **KEEP** as train/serve
 > identity, **FALSIFIED as cascade lever** (ES @236; freeze last_ok **24**
-> 0.81@DV vs live 0.89). P49 LIVE **P3** (`run_p49_wrapunlock`): gate
-> **GAIN-READY** @82 last_ok **82**; freeze-24 **FALSIFIED as cascade
-> lever** (unfreeze 147 still mvv 667k / rtgt collapse / ent −0.283).
-> Wrap-unlock untested (skip-storm unlocked). Reward-engine
+> 0.81@DV vs live 0.89). P49 EXIT (`run_p49_wrapunlock`, `4ef9bcb`):
+> wrap-unlock KEEP as lock hygiene; **FALSIFIED as cascade lever**
+> (last_ok **82**; first P3 ent −0.283; val MV ×0.816/×0.830 DV
+> ×0.867/×0.924 det_r 0.632 amp-dead; seed kpi **−714**; 0-vs-0 false
+> all_pass from skipped scripted dist). Next GPU: env-free P50
+> `bc_mean_only=True`. Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
 > adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
 > until linear observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
