@@ -259,6 +259,8 @@ search *and* keep warm-starting model weights.
 | `SEED` | RNG seed (default 0) |
 | `DREAMER_ATTN_IMPL` | `auto` (default: SDPA on CUDA) / `sdpa` / `manual`. Leftover `DREAMER_FAST_ATTN` (`1`/`sdpa`, `0`/`manual`) maps to the same field. |
 | `DREAMER_FAST_ATTN` | leftover alias of `DREAMER_ATTN_IMPL`. |
+| `DREAMER_WM_TF_LEVELS` / `_SPAN` / `_STEP_FRAC` / `_HORIZON` / `_SETTLE` | eval TM protocol (defaults 5 / 0.6 / 0.4 / 0=auto `max(80,4H)` / 0=auto). |
+| `DREAMER_VAL_WM_TRANSFER` / `_POSTPRIOR` / `_DISTPRED` | val-suite gates (default ON). |
 | `SEED_TARGET_CV_FRAC` | leftover alias of `DREAMER_SEED_TARGET_CV_FRAC` (default 0.20). |
 | `SIGMA_MAX_CAP` | leftover alias of `DREAMER_SIGMA_MAX_CAP` (default 0.30). |
 | `SIGMA_MAX_FLOOR` | leftover alias of `DREAMER_SIGMA_MAX_FLOOR` (default 0.10). |

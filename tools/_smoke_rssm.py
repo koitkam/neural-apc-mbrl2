@@ -728,6 +728,9 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_OBJ_REWARD_SCALE': 'off',
         'DREAMER_ATTN_IMPL': 'manual',
         'DREAMER_SIGMA_MIN_RATIO': '1.4',
+        'DREAMER_WM_TF_LEVELS': '7',
+        'DREAMER_WM_TF_SPAN': '0.5',
+        'DREAMER_VAL_WM_TRANSFER': '0',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -759,6 +762,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.obj_reward_scale == 'off'
         assert cfg.attn_impl == 'manual'
         assert abs(float(cfg.sigma_min_ratio) - 1.4) < 1e-12
+        assert int(cfg.wm_tf_levels) == 7
+        assert abs(float(cfg.wm_tf_span) - 0.5) < 1e-12
+        assert cfg.val_wm_transfer is False
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -777,6 +783,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'obj_reward_scale' in explicit
         assert 'attn_impl' in explicit
         assert 'sigma_min_ratio' in explicit
+        assert 'wm_tf_levels' in explicit
+        assert 'wm_tf_span' in explicit
+        assert 'val_wm_transfer' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1223,6 +1232,22 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_ATTN_IMPL' in ENV_OVERRIDES
     assert 'DREAMER_FAST_ATTN' in ENV_OVERRIDES
     assert 'DREAMER_SIGMA_MIN_RATIO' in ENV_OVERRIDES
+    assert 'DREAMER_WM_TF_LEVELS' in ENV_OVERRIDES
+    assert 'DREAMER_WM_TF_SPAN' in ENV_OVERRIDES
+    assert 'DREAMER_WM_TF_STEP_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_WM_TF_HORIZON' in ENV_OVERRIDES
+    assert 'DREAMER_WM_TF_SETTLE' in ENV_OVERRIDES
+    assert 'DREAMER_VAL_WM_TRANSFER' in ENV_OVERRIDES
+    assert 'DREAMER_VAL_WM_POSTPRIOR' in ENV_OVERRIDES
+    assert 'DREAMER_VAL_WM_DISTPRED' in ENV_OVERRIDES
+    assert int(c.wm_tf_levels) == 5
+    assert abs(float(c.wm_tf_span) - 0.6) < 1e-12
+    assert abs(float(c.wm_tf_step_frac) - 0.4) < 1e-12
+    assert int(c.wm_tf_horizon) == 0
+    assert int(c.wm_tf_settle) == 0
+    assert c.val_wm_transfer is True
+    assert c.val_wm_postprior is True
+    assert c.val_wm_distpred is True
     assert c.obj_reward_scale == 'auto'
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -1684,6 +1709,46 @@ def _test_attention_auto_ignores_leftover_fast_attn() -> None:
     print('[smoke] OK  CausalAttention auto ignores leftover FAST_ATTN')
 
 
+def _test_wm_tf_knobs_cfg_or_env() -> None:
+    """Eval TM knobs: TrainConfig default, explicit, leftover env."""
+    import os
+    from evaluation.wm_transfer_matrix import resolve_wm_tf_knobs, val_diag_enabled
+    c = TrainConfig()
+    k = resolve_wm_tf_knobs(c)
+    assert k['n_levels'] == 5
+    assert abs(k['span'] - 0.6) < 1e-12
+    assert abs(k['step_frac'] - 0.4) < 1e-12
+    assert k['horizon'] == 0 and k['settle'] == 0
+    assert val_diag_enabled(c, 'val_wm_transfer', 'DREAMER_VAL_WM_TRANSFER') is True
+    c.wm_tf_levels = 7
+    c._explicit_fields = {'wm_tf_levels'}  # type: ignore[attr-defined]
+    assert resolve_wm_tf_knobs(c)['n_levels'] == 7
+    prev_span = os.environ.get('DREAMER_WM_TF_SPAN')
+    prev_val = os.environ.get('DREAMER_VAL_WM_TRANSFER')
+    try:
+        os.environ['DREAMER_WM_TF_SPAN'] = '0.5'
+        c2 = TrainConfig()
+        assert abs(resolve_wm_tf_knobs(c2)['span'] - 0.5) < 1e-12
+        os.environ['DREAMER_VAL_WM_TRANSFER'] = '0'
+        assert val_diag_enabled(
+            TrainConfig(), 'val_wm_transfer', 'DREAMER_VAL_WM_TRANSFER') is False
+        c3 = TrainConfig()
+        c3.val_wm_transfer = True
+        c3._explicit_fields = {'val_wm_transfer'}  # type: ignore[attr-defined]
+        assert val_diag_enabled(
+            c3, 'val_wm_transfer', 'DREAMER_VAL_WM_TRANSFER') is True
+    finally:
+        if prev_span is None:
+            os.environ.pop('DREAMER_WM_TF_SPAN', None)
+        else:
+            os.environ['DREAMER_WM_TF_SPAN'] = prev_span
+        if prev_val is None:
+            os.environ.pop('DREAMER_VAL_WM_TRANSFER', None)
+        else:
+            os.environ['DREAMER_VAL_WM_TRANSFER'] = prev_val
+    print('[smoke] OK  WM TF knobs cfg-or-env identity (default / explicit / leftover)')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -1927,6 +1992,7 @@ if __name__ == '__main__':
     _test_auto_tune_formula_input_cfg_or_env()
     _test_policy_sigma_bounds_honours_cfg()
     _test_attention_auto_ignores_leftover_fast_attn()
+    _test_wm_tf_knobs_cfg_or_env()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

@@ -422,6 +422,18 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RUN_WM_DIAGNOSTIC':           ('run_wm_diagnostic',            _as_bool),
     'DREAMER_WM_DIAG_N_STARTS':          ('wm_diag_n_starts',             int),
     'DREAMER_WM_DIAG_HORIZON':           ('wm_diag_horizon',              int),
+    # Eval TM protocol + val-suite gates.  Were ``os.environ.get`` in
+    # ``evaluation/`` (worked, missing from ``run_plan``).  Identity
+    # defaults (levels=5, span=0.6, step_frac=0.4, horizon/settle 0=auto,
+    # all three val gates ON).  ``DREAMER_WM_DIAG_DEVICE`` stays env-only.
+    'DREAMER_WM_TF_LEVELS':              ('wm_tf_levels',                 int),
+    'DREAMER_WM_TF_SPAN':                ('wm_tf_span',                   float),
+    'DREAMER_WM_TF_STEP_FRAC':           ('wm_tf_step_frac',              float),
+    'DREAMER_WM_TF_HORIZON':             ('wm_tf_horizon',                int),
+    'DREAMER_WM_TF_SETTLE':              ('wm_tf_settle',                 int),
+    'DREAMER_VAL_WM_TRANSFER':           ('val_wm_transfer',              _as_bool),
+    'DREAMER_VAL_WM_POSTPRIOR':          ('val_wm_postprior',             _as_bool),
+    'DREAMER_VAL_WM_DISTPRED':           ('val_wm_distpred',              _as_bool),
     # P79 (2026-06-02): return-scale ABSOLUTE cap — dimensionless (return
     # units).  Arrests the critic-pessimism cascade runaway once the spread
     # is implausibly large WITHOUT throttling legitimate early growth (the

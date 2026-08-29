@@ -2163,10 +2163,11 @@ def run_validation(*,
     # the operating region with a min/max variation band.  Directly measures
     # whether the world model captured the true GAINS + DYNAMICS (the
     # correlation-based fidelity probe does NOT).  Gated ON by default; skip
-    # with DREAMER_VAL_WM_TRANSFER=0.
-    if os.environ.get('DREAMER_VAL_WM_TRANSFER', '1').strip() not in ('0', 'false', 'False'):
+    # with DREAMER_VAL_WM_TRANSFER=0 (TrainConfig ``val_wm_transfer``).
+    from evaluation.wm_transfer_matrix import (
+        compute_and_plot, resolve_wm_tf_knobs, val_diag_enabled, wm_tf_roll_len)
+    if val_diag_enabled(cfg, 'val_wm_transfer', 'DREAMER_VAL_WM_TRANSFER'):
         try:
-            from evaluation.wm_transfer_matrix import compute_and_plot
             tf_env = APCEnv(cfg, np.random.default_rng(77_777))
             tf_env._disturbance_prob_override = 0.0
             tf_obs_std = None
@@ -2242,9 +2243,10 @@ def run_validation(*,
     # Localises WHERE the WM loses the steady-state gain (autoencoder vs the
     # prior<->posterior gap vs open-loop compounding) so the right lever is
     # obvious from the saved artefact alone — no manual probe re-run.  Gated
-    # ON by default (RSSM/TSSM only); skip with DREAMER_VAL_WM_POSTPRIOR=0.
+    # ON by default (RSSM/TSSM only); skip with DREAMER_VAL_WM_POSTPRIOR=0
+    # (TrainConfig ``val_wm_postprior``).
     # Reuses a fresh disturbance-free env; guarded so it never breaks a run.
-    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+    if val_diag_enabled(cfg, 'val_wm_postprior', 'DREAMER_VAL_WM_POSTPRIOR'):
         try:
             from tools.wm_posterior_prior_probe import compute_posterior_prior_decomp
             pp_env = APCEnv(cfg, np.random.default_rng(43_210))
@@ -2258,8 +2260,7 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
-            from evaluation.wm_transfer_matrix import wm_tf_roll_len
-            _tf_h = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
+            _tf_h = resolve_wm_tf_knobs(cfg)['horizon']
             _pp_h = wm_tf_roll_len(cfg, _tf_h)
             pp_res = compute_posterior_prior_decomp(
                 model, pp_env, cfg, device, horizon=_pp_h, settle=_pp_h)
@@ -2287,7 +2288,7 @@ def run_validation(*,
     # explaining why every excitation/data fix failed.  Saved as
     # wm_dv_posterior_prior_decomp.json.  ON by default (RSSM/TSSM + DV-as-input
     # + sim.set_disturbance_offset); shares the DREAMER_VAL_WM_POSTPRIOR gate.
-    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+    if val_diag_enabled(cfg, 'val_wm_postprior', 'DREAMER_VAL_WM_POSTPRIOR'):
         try:
             from tools.wm_posterior_prior_probe import compute_dv_posterior_prior_decomp
             dpp_env = APCEnv(cfg, np.random.default_rng(43_211))
@@ -2301,8 +2302,7 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
-            from evaluation.wm_transfer_matrix import wm_tf_roll_len
-            _tf_h2 = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
+            _tf_h2 = resolve_wm_tf_knobs(cfg)['horizon']
             _dpp_h = wm_tf_roll_len(cfg, _tf_h2)
             dvpp_res = compute_dv_posterior_prior_decomp(
                 model, dpp_env, cfg, device, horizon=_dpp_h, settle=_dpp_h)
@@ -2326,8 +2326,8 @@ def run_validation(*,
     # forced-disturbance episode, runs the head over the streamed WM posterior,
     # and scores pred-vs-true per CV channel (NRMSE / r / R² / lead-lag).  Saves
     # wm_disturbance_prediction.{json,png}.  ON by default (RSSM/TSSM + head);
-    # skip with DREAMER_VAL_WM_DISTPRED=0.
-    if os.environ.get('DREAMER_VAL_WM_DISTPRED', '1').strip() not in ('0', 'false', 'False'):
+    # skip with DREAMER_VAL_WM_DISTPRED=0 (TrainConfig ``val_wm_distpred``).
+    if val_diag_enabled(cfg, 'val_wm_distpred', 'DREAMER_VAL_WM_DISTPRED'):
         try:
             from evaluation.wm_disturbance_prediction import (
                 compute_disturbance_prediction, plot_disturbance_prediction)

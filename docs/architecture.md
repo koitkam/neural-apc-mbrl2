@@ -17,13 +17,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46 EXIT: σ-reset
 > opened entropy (−0.101) then re-collapsed; econ **−256 vs −129**. Do
-> **not** promote `p3_reset_log_std` (default False). P47 completes Adam
-> log_std-row zero (same env; P1 live ~iter 27, tracking P46). Do not
+> **not** promote `p3_reset_log_std` (default False). P47 (`run_p47_p3sigadam`,
+> pid **29434**) is **P2**: storm 2/2 capped P1 at iter **80**, GAIN-READY
+> **0.90@DV** (freeze last_ok **77**, probe 0.91@DV); `dobg` live. Do not
 > promote other plants until linear observer+actor are healthy. P3
 > collect still omits measured DV and Kalman (train/serve hole — do
-> not patch until P47 verdicts). Auto-tune formula inputs
-> (`seed_target_cv_frac`, `pmpo_entropy_eta_v3`, `prbs_seg_min`, …)
-> and inner-step counts are TrainConfig + `ENV_OVERRIDES`.
+> not patch until P47 verdicts). Eval TM protocol (`wm_tf_*`) and
+> val-suite gates are TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**

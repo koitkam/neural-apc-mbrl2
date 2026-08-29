@@ -34,7 +34,6 @@ Standalone use:
 """
 from __future__ import annotations
 
-import os
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -53,7 +52,7 @@ def wm_tf_horizon(control_horizon: int) -> int:
 
     Slow WM prior τ~2× plant; 1.5H under-settled and under-read DC-gain.
     Floor 80 covers fast plants (H=15 → 80, not 60).  Callers pass
-    ``horizon>0`` (CLI ``DREAMER_WM_TF_HORIZON``) to override.  P44
+    ``horizon>0`` (TrainConfig ``wm_tf_horizon`` / leftover env) to override.  P44
     gain-match settle is *control* H, not this window — do not silently
     retarget the teacher here.
     """
@@ -66,6 +65,43 @@ def wm_tf_roll_len(cfg, horizon: int = 0) -> int:
     if int(horizon or 0) > 0:
         return int(horizon)
     return wm_tf_horizon(int(getattr(cfg, 'horizon', 30) or 30))
+
+
+def resolve_wm_tf_knobs(cfg=None) -> Dict:
+    """TM protocol from TrainConfig, else leftover ``DREAMER_WM_TF_*``.
+
+    Identity defaults match the historical env fallbacks (levels=5,
+    span=0.6, step_frac=0.4, horizon/settle 0 = auto).  Explicit
+    ``_explicit_fields`` wins over leftover env.
+    """
+    from training.train import _cfg_or_env
+    n_levels, _ = _cfg_or_env(cfg, 'wm_tf_levels', 'DREAMER_WM_TF_LEVELS', 5, int)
+    span, _ = _cfg_or_env(cfg, 'wm_tf_span', 'DREAMER_WM_TF_SPAN', 0.6, float)
+    step_frac, _ = _cfg_or_env(
+        cfg, 'wm_tf_step_frac', 'DREAMER_WM_TF_STEP_FRAC', 0.4, float)
+    horizon, _ = _cfg_or_env(
+        cfg, 'wm_tf_horizon', 'DREAMER_WM_TF_HORIZON', 0, int)
+    settle, _ = _cfg_or_env(
+        cfg, 'wm_tf_settle', 'DREAMER_WM_TF_SETTLE', 0, int)
+    return {
+        'n_levels': int(n_levels),
+        'span': float(span),
+        'step_frac': float(step_frac),
+        'horizon': int(horizon),
+        'settle': int(settle),
+    }
+
+
+def val_diag_enabled(cfg, field: str, env_key: str, default: bool = True
+                     ) -> bool:
+    """Val-suite gate from TrainConfig, else leftover ``DREAMER_VAL_WM_*``."""
+    from training.train import _cfg_or_env
+
+    def _as_b(s) -> bool:
+        return str(s).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')
+
+    v, _ = _cfg_or_env(cfg, field, env_key, default, _as_b)
+    return bool(v)
 
 
 def _settle_capture(env, base_action: np.ndarray, settle_steps: int,
@@ -245,7 +281,7 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
     n_mv = int(env.action_dim)
     obs_dim = int(env.obs_dim)
     # ``wm_tf_horizon``: 4×H so the slow WM prior reaches SS (was 1.5×).
-    # Callers pass ``horizon=`` from CLI ``DREAMER_WM_TF_HORIZON``.
+    # Callers pass ``horizon=`` from TrainConfig ``wm_tf_horizon``.
     H = wm_tf_roll_len(cfg, horizon)
     S = int(settle_steps) if settle_steps > 0 else H
     L = min(int(getattr(cfg, 'lookback', 64)), S)
@@ -350,7 +386,7 @@ def compute_transfer_matrix(model, env, cfg, device, *,
     n_mv = int(env.action_dim)
     obs_dim = int(env.obs_dim)
     # ``wm_tf_horizon``: 4×H so the slow WM prior reaches SS (was 1.5×).
-    # Callers pass ``horizon=`` from CLI ``DREAMER_WM_TF_HORIZON``.
+    # Callers pass ``horizon=`` from TrainConfig ``wm_tf_horizon``.
     H = wm_tf_roll_len(cfg, horizon)
     S = int(settle_steps) if settle_steps > 0 else H
     L = min(int(getattr(cfg, 'lookback', 64)), S)
@@ -732,15 +768,16 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
     """Convenience wrapper for validation: compute, plot, and dump JSON.
 
     Fully guarded — returns ``None`` (and prints) on any failure so it can
-    never break a validation run.  Knobs via env:
-      DREAMER_WM_TF_LEVELS, _SPAN, _STEP_FRAC, _HORIZON, _SETTLE.
+    never break a validation run.  Knobs via TrainConfig (``wm_tf_*``)
+    with leftover ``DREAMER_WM_TF_*`` env fallback (identity defaults).
     """
     try:
-        n_levels = int(os.environ.get('DREAMER_WM_TF_LEVELS', '5'))
-        span = float(os.environ.get('DREAMER_WM_TF_SPAN', '0.6'))
-        step_frac = float(os.environ.get('DREAMER_WM_TF_STEP_FRAC', '0.4'))
-        horizon = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0'))
-        settle = int(os.environ.get('DREAMER_WM_TF_SETTLE', '0'))
+        knobs = resolve_wm_tf_knobs(cfg)
+        n_levels = knobs['n_levels']
+        span = knobs['span']
+        step_frac = knobs['step_frac']
+        horizon = knobs['horizon']
+        settle = knobs['settle']
         result = compute_transfer_matrix(
             model, env, cfg, device, obs_std=obs_std, n_levels=n_levels,
             level_span=span, step_frac=step_frac, horizon=horizon,

@@ -426,6 +426,20 @@ class TrainConfig:
     run_wm_diagnostic: bool = True
     wm_diag_n_starts: int = 8
     wm_diag_horizon: int = 0
+    # Eval TM protocol + val-suite gates.  Were ``os.environ.get`` in
+    # ``evaluation/wm_transfer_matrix.py`` / ``validate.py`` (worked,
+    # missing from ``run_plan``).  Identity defaults.  Horizon/settle
+    # 0 = auto ``wm_tf_horizon(H)=max(80, 4·H)`` (already sim-adaptive).
+    # Levels / span / step_frac are unitless.  ``DREAMER_WM_DIAG_DEVICE``
+    # stays env-only (device picker).
+    wm_tf_levels: int = 5
+    wm_tf_span: float = 0.6
+    wm_tf_step_frac: float = 0.4
+    wm_tf_horizon: int = 0
+    wm_tf_settle: int = 0
+    val_wm_transfer: bool = True
+    val_wm_postprior: bool = True
+    val_wm_distpred: bool = True
     # ---- Return-scale absolute cap (P79, 2026-06-02) ---------------
     # The (p95-p05)-spread EMA normaliser at ``DreamerV4.update_return_scale``
     # tracks a monotonically growing spread on the critic-pessimism
