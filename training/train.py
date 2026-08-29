@@ -806,16 +806,17 @@ class TrainConfig:
     # roll kills DC).  Extra cost is one ``Bm×S`` roll vs the FD's
     # ``(1+n_mv+n_dv)·Bm×K``.  ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
     gain_match_settle_len: int = -1
-    # P45 opt-in: TM-protocol rest IC.  Collect real held-OP lookbacks
+    # P45 EXIT PROMOTE: TM-protocol rest IC.  Collect real held-OP lookbacks
     # (noise-free const-action), teacher-force ``rollout_observed``
     # (gradful; P25), then FD from that posterior.  Isolation **loss**
     # stays 0.  Real rest replaces the P44 WM-held settle of a PRBS
     # start (P44 EXIT: S=H storm 2/2, val DV ss/@H ×0.751/×0.842,
-    # freeze last_ok 57).  Default False; ``DREAMER_GAIN_MATCH_REST_IC=1``
-    # is the one attributed P45 change (does not retry S=H).  Collect
-    # settle = max(H, lookback) — **not** ``wm_tf_horizon`` (that 4H
-    # window is a later A/B).
-    gain_match_rest_ic: bool = False
+    # freeze last_ok 57).  **P45 EXIT PROMOTE** default True: first
+    # GAIN-READY freeze since P40–P44 0.75@DV (gate 0.86@DV; val MV
+    # ss/@H ×0.877/×0.887, DV ×0.815/×0.875).  ``DREAMER_GAIN_MATCH_REST_IC=0``
+    # reverts to PRBS-posterior FD.  Collect settle = max(H, lookback)
+    # — **not** ``wm_tf_horizon`` (that 4H window is a later A/B).
+    gain_match_rest_ic: bool = True
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
@@ -1567,6 +1568,15 @@ class TrainConfig:
     # couples to the actor, so P3 doesn't open with a self-inflating critic
     # (promoted 2026-06-14; paper co-trains from P3 start = 0).
     p3_critic_warmup_iters: int = 10
+    # P45 RCA / P46: P1/P2 expert-BC pins the Gaussian log_std residual
+    # at ``σ_min`` (P45 P3 iter 137 entropy = h_floor −0.363). Critic
+    # warmup then collects railed on-policy episodes (mv_viol thousands);
+    # actor unfreeze explodes REINFORCE and ``critic_rew_to_tgt_var``
+    # 0.08→0.0004.  At P3 entry, zero the log_std half of the last
+    # Linear so σ = auto-tuned ``policy_init_log_std``; leave μ (BC
+    # launchpad) intact.  Default False until P46 GPU; opt in
+    # ``DREAMER_P3_RESET_LOG_STD=1``.  Do not stack critic knobs.
+    p3_reset_log_std: bool = False
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
     # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
@@ -3498,6 +3508,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
+        f"p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std', False))} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -6214,7 +6225,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     then roll the PRIOR forward ``K`` steps under (a) a HELD baseline
     action/DV and (b) a unit STEP in each input channel.
 
-    ``gain_match_rest_ic`` (P45 opt-in): replace PRBS-posterior starts
+    ``gain_match_rest_ic`` (P45 EXIT default): replace PRBS-posterior starts
     with a teacher-forced encode of **real** rest lookbacks (TM
     rest-then-step IC).  Isolation loss stays 0.  When the rest cache
     is present, P44 WM-held settle is skipped (the lookback is already
@@ -10452,6 +10463,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # decay + cascade canary) since we never hit the phase-transition block.
     if joint_mode:
         current_phase = 3
+        if _cfg_on(cfg, 'p3_reset_log_std', False):
+            model.reset_policy_exploration()
+            print('[p3] reset policy log_std residual (joint)', flush=True)
         model.snapshot_prior_policy()
         p3_start_steps = total_env_steps
         try:
@@ -11043,6 +11057,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # also leaked one extra gain-match step onto the freeze).
             _apply_curriculum_stage(int(current_phase))
             if current_phase == 3:
+                # P45 RCA / P46: restore σ BEFORE the PMPO prior snapshot
+                # so warmup collect + KL prior see the exploring policy,
+                # not the P1/P2 BC-pinned σ_min.  μ (expert mean) stays.
+                if _cfg_on(cfg, 'p3_reset_log_std', False):
+                    model.reset_policy_exploration()
+                    _init = float(getattr(cfg, 'policy_init_log_std', -1.5))
+                    print('[p3] reset policy log_std residual → '
+                          f'σ=init ({_init:.3f}); μ (BC) kept '
+                          '(P45: P1/P2 BC pinned σ_min)',
+                          flush=True)
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
                 model.snapshot_prior_policy()
                 # 2026-05-23 (P41 RCA): snapshot return_scale at P3 start

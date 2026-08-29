@@ -196,10 +196,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert float(_tc.gain_match_huber_beta) == 1.0
     assert _tc.gain_match_huber_per_input is True
     assert int(_tc.gain_match_settle_len) == -1
-    assert _tc.gain_match_rest_ic is False
+    assert _tc.gain_match_rest_ic is True
+    assert _tc.p3_reset_log_std is False
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
-    print('[smoke] OK  gain-match defaults (abs Huber, per-input β, TBPTT=16)')
+    print('[smoke] OK  gain-match defaults (abs Huber, per-input β, rest-IC, TBPTT=16)')
 
     # Isolation TBPTT is sim-adaptive: 16 of K≈55 (test_sim) scales as K/3.5.
     _tb = TrainConfig()
@@ -698,6 +699,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': '0',
         'DREAMER_GAIN_MATCH_SETTLE_LEN': '55',
         'DREAMER_GAIN_MATCH_REST_IC': '1',
+        'DREAMER_P3_RESET_LOG_STD': '1',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -713,6 +715,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.gain_match_huber_per_input is False
         assert int(cfg.gain_match_settle_len) == 55
         assert cfg.gain_match_rest_ic is True
+        assert cfg.p3_reset_log_std is True
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -947,10 +950,12 @@ def _test_isolation_dcv_scales() -> None:
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic'" in _src
+    assert "p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std'" in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert '_cache_gain_match_rest_ic' in _src
+    assert 'reset_policy_exploration' in _src
     assert '_require_realsim_actor' in _src
     assert 'store_aux=False, last_only=True' in _src
     assert 'return_feats=False' in _src
@@ -1094,12 +1099,14 @@ def _test_envfree_observer_recipe() -> None:
     assert c.gain_match_huber_per_input is True
     assert float(c.gain_match_huber_beta) == 1.0
     assert int(c.gain_match_settle_len) == -1
-    assert c.gain_match_rest_ic is False
+    assert c.gain_match_rest_ic is True
+    assert c.p3_reset_log_std is False
     assert c.actor_train_source == 'realsim'
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
+    assert 'DREAMER_P3_RESET_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
@@ -1386,6 +1393,32 @@ def _test_gain_match_rest_ic() -> None:
           f'(Δloss={abs(float(gm1) - float(gm2)):.4g})')
 
 
+def _test_p3_reset_log_std() -> None:
+    """P46: zeroing log_std residual restores σ=init and leaves μ."""
+    from models.dreamer_v4 import ContinuousPolicyHead, PolicyHead
+    torch.manual_seed(0)
+    pol = ContinuousPolicyHead(
+        in_dim=8, hidden_dim=16, action_dim=2, n_layers=2, mtp_length=1,
+        init_log_std=-1.5, log_std_min=-2.3, log_std_max=0.0)
+    z = torch.zeros(5, 8)
+    last = pol.head.net[-1]
+    n = int(pol.mtp_length) * int(pol.action_dim)
+    idx = torch.arange(n, device=last.weight.device) * 2 + 1
+    with torch.no_grad():
+        last.weight.index_fill_(0, idx, -8.0)
+        last.bias.index_fill_(0, idx, -8.0)
+    mu0, ls0 = pol.dist_params(z)
+    assert float(ls0.max()) <= pol.log_std_min + 1e-4, float(ls0.max())
+    mu_saved = mu0.detach().clone()
+    pol.reset_log_std()
+    mu1, ls1 = pol.dist_params(z)
+    assert torch.allclose(mu1, mu_saved, atol=1e-6)
+    assert torch.allclose(ls1, torch.full_like(ls1, -1.5), atol=1e-5)
+    disc = PolicyHead(8, 16, 2, n_action_bins=5, n_layers=1, mtp_length=1)
+    disc.reset_log_std()
+    print('[smoke] OK  P3 reset_log_std restores σ=init, keeps μ')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -1506,7 +1539,8 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'iso_dcv=off' in banner, banner
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
-    assert 'gmatch_rest=False' in banner, banner
+    assert 'gmatch_rest=True' in banner, banner
+    assert 'p3_sigreset=False' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -1621,6 +1655,7 @@ if __name__ == '__main__':
     _test_gain_match_rest_window()
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
+    _test_p3_reset_log_std()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

@@ -371,6 +371,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
         'return_scale_freeze_after_warmup', _as_bool),
     # P26 RCA / P27: TD3 min-of-N twohot critics (default 2).
     'DREAMER_N_CRITICS':                  ('n_critics',                      int),
+    # P45 RCA / P46: restore Gaussian σ at P3 entry (default off).
+    'DREAMER_P3_RESET_LOG_STD':           ('p3_reset_log_std',               _as_bool),
     'DREAMER_WM_GRAD_SKIP_NORM':          ('wm_grad_skip_norm',              float),
     # P27 RCA / P28: restore wm_best and continue to P2 on a P1 skip-storm
     # instead of aborting the run (default ON).
@@ -583,8 +585,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # 0 = auto control horizon; TM probe settle is 4×horizon).
     # P44 storm 2/2 REVERT of env-free auto=H.
     'DREAMER_GAIN_MATCH_SETTLE_LEN':      ('gain_match_settle_len',          int),
-    # P45 opt-in: TM-protocol rest-IC teacher (real held-OP encode → FD).
-    # Default False (P44 recipe).  Isolation loss stays 0.
+    # P45 EXIT PROMOTE: TM-protocol rest-IC teacher (env-free True).
+    # Isolation loss stays 0.  ``=0`` reverts to PRBS-posterior FD.
     'DREAMER_GAIN_MATCH_REST_IC':         ('gain_match_rest_ic',             _as_bool),
     'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):

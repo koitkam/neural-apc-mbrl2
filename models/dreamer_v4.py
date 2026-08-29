@@ -955,6 +955,10 @@ class PolicyHead(nn.Module):
         p = log_p.exp()
         return -(p * log_p).sum(-1).sum(-1)                       # (B,)
 
+    def reset_log_std(self) -> None:
+        """No-op: discrete policy has no Gaussian log_std residual."""
+        return
+
     @staticmethod
     def reference_entropy(action_dim: int, n_action_bins: int) -> float:
         """Max-entropy reference: uniform over all bins per dim."""
@@ -1168,6 +1172,26 @@ class ContinuousPolicyHead(nn.Module):
         _, log_std = self.dist_params(latent)
         return (0.5 * (math.log(2.0 * math.pi * math.e)
                         + 2.0 * log_std)).sum(-1)
+
+    def reset_log_std(self) -> None:
+        """Zero the log_std residual so σ = ``log_std_init``. Leave μ intact.
+
+        P45 RCA: P1/P2 expert-BC drives the last-layer log_std rows to
+        ``σ_min`` (entropy at the early-stop floor from the first P3
+        iter). Critic warmup then sees railed on-policy rollouts; actor
+        unfreeze explodes REINFORCE. Zeroing only the log_std half of
+        the ``(μ, log_std)`` last Linear restores exploration without
+        wiping the BC mean.
+        """
+        last = self.head.net[-1]
+        if not isinstance(last, nn.Linear):
+            return
+        n = int(self.mtp_length) * int(self.action_dim)
+        idx = torch.arange(n, device=last.weight.device) * 2 + 1
+        with torch.no_grad():
+            last.weight.index_fill_(0, idx, 0.0)
+            if last.bias is not None:
+                last.bias.index_fill_(0, idx, 0.0)
 
     @staticmethod
     def reference_entropy(action_dim: int, n_action_bins: int = 0) -> float:
@@ -1621,6 +1645,12 @@ class DreamerV4(nn.Module):
         self.prior_policy.load_state_dict(self.policy.state_dict())
         for p in self.prior_policy.parameters():
             p.requires_grad_(False)
+
+    def reset_policy_exploration(self) -> None:
+        """Restore Gaussian σ to ``log_std_init``; no-op for discrete π."""
+        fn = getattr(self.policy, 'reset_log_std', None)
+        if callable(fn):
+            fn()
 
     def update_return_scale(self, returns: torch.Tensor,
                              ema: float = 0.99,

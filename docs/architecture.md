@@ -349,21 +349,25 @@ env-gated off · **[planned]** = designed, not yet built.
 > for DV. `DREAMER_GAIN_MATCH_SETTLE_LEN=0` is auto-H A/B only.
 > jsonl `wm_gain_match_mv_ratio` / `wm_gain_match_dv_ratio` =
 > mean `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss; not in P44 pid).
-> **P45 opt-in** `gain_match_rest_ic` (default False): real held-OP
-> lookback → `rollout_observed(..., last_only=True)` → FD (TM rest-then-step
-> IC; obs after step like `_settle_capture`; skips P44 WM-held settle).
-> Isolation loss stays 0.  Collect settle = max(H, lookback), not
-> `wm_tf_horizon`.  Encode uses last state only (same `h/z/c_mean` as the
-> full T-stack; unused `(N,L,F)` dropped; `return_feats=False` skips the
-> last feat / Stage-1 zero-`d` tail).  Stage-1 encode uses `_posterior_step`
-> (skip unused `prior_net` / `cont_prior_net`; identity vs `obs_step` last
-> `h/z/c_mean`; not in P45 pid).  Cache miss aborts (no PRBS
-> fallback). `DREAMER_GAIN_MATCH_REST_IC=1`. Remaining rest-IC `t_wm`
-> cost is the L-step GRU (T sequential kernels, N-independent);
-> `last_only` does not skip it. Do not concat rest rows into the main
-> `sample=True` WM rollout (GRU would see sampled `c`).
-> `actor_train_source` other than `realsim` is refused at `train()`
-> start (leftover imagination override skipped `onpol_buf` → p01 chatter).
+> **P45 EXIT PROMOTE** `gain_match_rest_ic` (default True): first
+> GAIN-READY freeze since P40–P44 (gate 0.86@DV; val MV ss/@H
+> **×0.877 / ×0.887**, DV **×0.815 / ×0.875**, det_r 0.148). Real held-OP
+> lookback → `rollout_observed(..., last_only=True, return_feats=False)`
+> via Stage-1 `_posterior_step` → FD (TM rest-then-step IC; obs after
+> step like `_settle_capture`; skips P44 WM-held settle). Isolation loss
+> stays 0. Collect settle = max(H, lookback), not `wm_tf_horizon`.
+> Cache miss aborts. `DREAMER_GAIN_MATCH_REST_IC=0` reverts to
+> PRBS-posterior FD. Do not set settle=`wm_tf_horizon` (P45 was
+> GAIN-READY without it). Remaining observer hole: DOB amp-dead
+> (pred_std 0.182 vs true 1.93). **P45 P3** first valid actor test:
+> freeze rscale KEEP (1.15→2.18); min-of-2 FALSIFIED as sufficient
+> (entropy pinned σ_min −0.363 from P1/P2 BC; econ −216 vs −92).
+> **P46 opt-in** `p3_reset_log_std` (`DREAMER_P3_RESET_LOG_STD=1`):
+> zero last-Linear log_std rows at P3 entry so σ=`policy_init_log_std`;
+> μ (BC) kept. Default False until GPU. Do not stack more critic knobs.
+> Do not concat rest rows into the main `sample=True` WM rollout
+> (GRU would see sampled `c`). `actor_train_source` other than
+> `realsim` is refused at `train()` start.
 > Head persist-on-lock writes the snapshot when the lock fires. jsonl
 > `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`.
 > Gain-probe line prints ss **and** `@H`. Printed observer verdict is
@@ -649,14 +653,16 @@ fixes BOTH:
   on `G=ΔCV/Δu` (P26). Default **per-input β = |tgt_ij|** (P43): L1 sat
   ±1, not P27 relative Huber. Default **no held settle** (`-1`; P44
   storm 2/2 REVERT). `DREAMER_GAIN_MATCH_SETTLE_LEN=0` auto=control H
-  A/B only. **Opt-in rest-IC** (`gain_match_rest_ic`,
-  default False): encode real held-OP lookbacks then FD (TM protocol IC;
-  `DREAMER_GAIN_MATCH_REST_IC=1`). Collect pairing = TM `_settle_capture`
-  (obs after step). Encode is `rollout_observed(..., last_only=True,
-  return_feats=False)` via Stage-1 `_posterior_step` (last `h/z/c_mean`
-  ≡ full T-stack; unused T-stack, last feat / Stage-1 zero-`d` tail, and
-  unused prior heads dropped). When the rest
-  cache is present, P44 WM-held settle is skipped. Isolation loss stays 0. jsonl `*_ratio` = mean G_pred/G_tgt.
+  A/B only. **Rest-IC** (`gain_match_rest_ic`, default **True**; P45
+  EXIT PROMOTE): encode real held-OP lookbacks then FD (TM protocol IC).
+  `DREAMER_GAIN_MATCH_REST_IC=0` reverts to PRBS-posterior FD. Collect
+  pairing = TM `_settle_capture` (obs after step). Encode is
+  `rollout_observed(..., last_only=True, return_feats=False)` via
+  Stage-1 `_posterior_step`. When the rest cache is present, P44
+  WM-held settle is skipped. Isolation loss stays 0. jsonl `*_ratio` =
+  mean G_pred/G_tgt. **P46** `p3_reset_log_std` (default False; opt-in
+  `DREAMER_P3_RESET_LOG_STD=1`) zeros last-Linear log_std rows at P3
+  entry (σ=`policy_init_log_std`; μ kept) — P45 P3 started at σ_min.
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.
