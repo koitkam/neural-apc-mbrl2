@@ -11,6 +11,14 @@ expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 Status legend: **[current]** = implemented & default · **[opt-in]** = implemented,
 env-gated off · **[planned]** = designed, not yet built.
 
+> **2026-08-29 CURRENT env-free recipe (test_sim first):** RSSM **deterministic**
+> continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
+> **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
+> `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46 live A/B:
+> `DREAMER_P3_RESET_LOG_STD=1` (default False). One GPU job. Do not promote
+> other plants until linear observer+actor are healthy.
+
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**
 > (`TrainConfig.dob_enabled=True`; opt out `DREAMER_DOB_ENABLED=0`). Exp A

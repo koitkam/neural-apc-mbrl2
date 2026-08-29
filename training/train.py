@@ -1434,10 +1434,13 @@ class TrainConfig:
     # Default coef 0.5 / max_starts 8 = p117 recipe: the held-action steady-state
     # lever that kills multi-step compounding drift (promoted 2026-06-14; were
     # 0.0 / 12).  ``wm_held_rollout_len`` is set = horizon in single_run.
+    # ``wm_held_rollout_win`` is clamped to ``(K-1)//4`` at use (two
+    # non-overlapping windows; identity 8 at test_sim K=55).  ``<=0`` auto
+    # ``round(K/7)``.
     wm_held_rollout_coef: float = 0.5
     wm_held_rollout_len: int = 64          # K prior steps under the HELD action
     wm_held_rollout_settle_frac: float = 0.5   # early window starts at frac·K
-    wm_held_rollout_win: int = 8           # window length for drift averaging
+    wm_held_rollout_win: int = 8           # window length; clamped to (K-1)/4 at use (identity 8 at K=55)
     wm_held_rollout_max_starts: int = 8    # cap start positions (stride) for cost
     wm_held_rollout_gate_recon: float = 0.1    # soft recon-fidelity ramp gate
 
@@ -3120,6 +3123,27 @@ def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
     auto = max(8, int(round(float(max(1, k)) / 3.5)))
     cfg.aux_tbptt_steps = int(auto)
     return int(auto)
+
+
+def _held_rollout_win(K: int, win: int = 8) -> int:
+    """Held-rollout drift-window length that fits inside a K-step prior roll.
+
+    ``_wm_held_rollout_stationarity_loss`` needs two *non-overlapping*
+    windows of length ``win`` in ``[0, K)`` with ``settle_frac=0.5``.
+    That requires ``win < K/4``.  Dataclass default 8 is identity at
+    test_sim ``K=H=55`` (cap 13).  On a fast plant ``K=15``, win=8 made
+    ``s+win`` overlap the late window and the loss returned **0** —
+    held-rollout was dead.  Clamp to ``(K-1)//4`` (unitless).  ``win<=0``
+    auto-picks ``max(2, round(K/7))`` (~8 at K=55).
+    """
+    K = max(4, int(K))
+    # Strict ``win < K/4`` so ``s≈K/2`` windows do not share an edge
+    # (loss treats ``K-win <= s+win`` as empty).  K=55 → cap 13.
+    cap = max(1, (K - 1) // 4)
+    w = int(win)
+    if w <= 0:
+        w = max(2, int(round(float(K) / 7.0)))
+    return max(1, min(w, cap))
 
 
 def _field_is_explicit(cfg: 'TrainConfig', field: str) -> bool:
@@ -5870,13 +5894,19 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
         return zero, 0.0
     rssm = model.dynamics
     B, T = obs.shape[:2]
-    win = max(1, int(getattr(cfg, 'wm_held_rollout_win', 8) or 8))
+    _win_req = int(getattr(cfg, 'wm_held_rollout_win', 8) or 8)
+    win = _held_rollout_win(K, _win_req)
+    if (win != _win_req
+            and not getattr(cfg, '_held_rollout_win_logged', False)):
+        print(f'[held-rollout] win {_win_req}→{win} (K={K} cap (K-1)/4; '
+              f'test_sim K=55 stays 8)', flush=True)
+        cfg._held_rollout_win_logged = True  # type: ignore[attr-defined]
     s = int(float(getattr(cfg, 'wm_held_rollout_settle_frac', 0.5) or 0.5) * K)
     # keep the two averaging windows non-overlapping inside [0, K)
     s = max(win, min(s, K - 2 * win))
     if s < win or K - win <= s + win:
         return zero, 0.0
-    max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 12) or 12))
+    max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 8) or 8))
     stride = max(1, T // max_starts)
     starts = torch.arange(0, T, stride, device=device)            # (S,)
     S = int(starts.numel())

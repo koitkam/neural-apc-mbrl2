@@ -56,7 +56,8 @@ from training.train import (
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt,
-                            _gain_match_rest_window, collect_rest_lookback,
+                            _gain_match_rest_window, _held_rollout_win,
+                            collect_rest_lookback,
                             _wm_gain_match_loss, _require_realsim_actor,
                             _adv_action_corr, _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
@@ -1301,6 +1302,22 @@ def _test_gain_match_rest_window() -> None:
     print('[smoke] OK  rest-ic window = max(H, lookback) not wm_tf_horizon')
 
 
+def _test_held_rollout_win_fits_k() -> None:
+    """win=8 is identity at test_sim K=55; clamp (K-1)/4 so fast plants are not 0."""
+    assert _held_rollout_win(55, 8) == 8
+    assert _held_rollout_win(55, 0) == 8
+    assert _held_rollout_win(15, 8) == 3
+    assert _held_rollout_win(15, 0) == 2
+    assert _held_rollout_win(32, 8) == 7
+    # Two windows of win plus settle_frac=0.5 must fit in K (same test as loss).
+    for k, w_req in ((55, 8), (15, 8), (15, 0), (32, 8)):
+        w = _held_rollout_win(k, w_req)
+        s = int(0.5 * k)
+        s = max(w, min(s, k - 2 * w))
+        assert s >= w and (k - w) > (s + w), (k, w_req, w, s)
+    print('[smoke] OK  held-rollout win clamps to (K-1)/4 (test_sim 8)')
+
+
 def _test_collect_rest_lookback_tm_pairing() -> None:
     """Rest collect records obs AFTER the hold step (TM ``_settle_capture``)."""
     import numpy as _np
@@ -1679,6 +1696,7 @@ if __name__ == '__main__':
     _test_gain_match_fd_held()
     _test_gain_match_held_settle()
     _test_gain_match_rest_window()
+    _test_held_rollout_win_fits_k()
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
     _test_p3_reset_log_std()
