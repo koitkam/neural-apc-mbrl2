@@ -364,7 +364,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > (entropy pinned σ_min −0.363 from P1/P2 BC; econ −216 vs −92).
 > **P46 opt-in** `p3_reset_log_std` (`DREAMER_P3_RESET_LOG_STD=1`):
 > zero last-Linear log_std rows at P3 entry so σ=`policy_init_log_std`;
-> μ (BC) kept. Default False until GPU. Do not stack more critic knobs.
+> μ (BC) kept; **also zero Adam log_std-row moments** so P2 NLL momentum
+> cannot re-collapse σ at the first unfreeze (P46 pid 24426 is
+> weights-only). Default False until GPU. P3 on-policy collect streams
+> `_posterior_step` (skip unused prior heads; identity vs `obs_step` with
+> `obs=None`). Do not stack more critic knobs.
 > Do not concat rest rows into the main `sample=True` WM rollout
 > (GRU would see sampled `c`). `actor_train_source` other than
 > `realsim` is refused at `train()` start.
@@ -662,7 +666,9 @@ fixes BOTH:
   WM-held settle is skipped. Isolation loss stays 0. jsonl `*_ratio` =
   mean G_pred/G_tgt. **P46** `p3_reset_log_std` (default False; opt-in
   `DREAMER_P3_RESET_LOG_STD=1`) zeros last-Linear log_std rows at P3
-  entry (σ=`policy_init_log_std`; μ kept) — P45 P3 started at σ_min.
+  entry (σ=`policy_init_log_std`; μ kept) **and** Adam log_std-row
+  moments — P45 P3 started at σ_min. P3 collect streams
+  `_posterior_step`.
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.

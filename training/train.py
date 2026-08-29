@@ -1568,14 +1568,19 @@ class TrainConfig:
     # couples to the actor, so P3 doesn't open with a self-inflating critic
     # (promoted 2026-06-14; paper co-trains from P3 start = 0).
     p3_critic_warmup_iters: int = 10
+    # P93: first N P3 iters train the critic only (actor frozen at the
+    # P3-entry snapshot).  LIVE default 10.  The old p3_critic_stability_*
+    # gate was removed 2026-05-20; this freeze was not.
     # P45 RCA / P46: P1/P2 expert-BC pins the Gaussian log_std residual
     # at ``σ_min`` (P45 P3 iter 137 entropy = h_floor −0.363). Critic
     # warmup then collects railed on-policy episodes (mv_viol thousands);
     # actor unfreeze explodes REINFORCE and ``critic_rew_to_tgt_var``
     # 0.08→0.0004.  At P3 entry, zero the log_std half of the last
     # Linear so σ = auto-tuned ``policy_init_log_std``; leave μ (BC
-    # launchpad) intact.  Default False until P46 GPU; opt in
-    # ``DREAMER_P3_RESET_LOG_STD=1``.  Do not stack critic knobs.
+    # launchpad) intact.  Also zero Adam log_std-row moments so P2 NLL
+    # momentum cannot re-collapse σ at the first unfreeze step.  Default
+    # False until P46 GPU; opt in ``DREAMER_P3_RESET_LOG_STD=1``.  Do not
+    # stack critic knobs.
     p3_reset_log_std: bool = False
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
@@ -1600,16 +1605,9 @@ class TrainConfig:
     # 2026-06-14; was False).  DREAMER_WM_TRUNK_STOPGRAD_IN_P2.
     wm_trunk_stopgrad_in_p2: bool = True
 
-    # NOTE: ``p3_critic_warmup_iters`` and the ``p3_critic_stability_*``
-    # gate (introduced 2026-05-06 and 2026-05-08) were removed on
-    # 2026-05-20 along with the entropy-decay belt.  They were
-    # short-budget symptom fixes: at 600k env steps a freshly-init
-    # critic produced noisy advantages for a few iters before settling
-    # and we papered over it by freezing the actor.  With the budget
-    # bumped to 1M (paper's control-task minimum) the critic settles
-    # naturally during normal training; the freeze just wasted P3
-    # iters that the actor needs.
-
+    # NOTE: the ``p3_critic_stability_*`` gate (2026-05-06/08) was
+    # removed 2026-05-20.  ``p3_critic_warmup_iters`` itself is still
+    # the P3 actor-freeze (default 10).
 
     # NOTE: the adaptive σ-saturation entropy-decay belt (2026-05-08
     # → 2026-05-20) was removed.  Paper (DreamerV3/V4) uses a constant
@@ -4370,6 +4368,8 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                        if _is_rssm else None)
         _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
                         if _is_rssm else None)
+        _pstep = (getattr(model.dynamics, '_posterior_step', None)
+                  if _is_rssm else None)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
@@ -4388,12 +4388,18 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                     # into the MV (part of the p01 chatter, esp. at deterministic
                     # eval).  P1/P2 random collect (above) does not stream the
                     # posterior at all — replay teacher-force is the WM path.
-                    _post, _ = model.dynamics.obs_step(
-                        _rssm_state, _rssm_prev_a, _emb, sample=False)
-                    action_t, _, _ = model.policy(_post.feat,
+                    # Prior heads are unused (next GRU input is this posterior;
+                    # collect does not pass obs so Kalman is off anyway).  Same
+                    # h/z/c_mean as obs_step(..., obs=None)[0] (rest-IC smoke).
+                    if callable(_pstep):
+                        _rssm_state = _pstep(
+                            _rssm_state, _rssm_prev_a, _emb, sample=False)
+                    else:
+                        _rssm_state, _ = model.dynamics.obs_step(
+                            _rssm_state, _rssm_prev_a, _emb, sample=False)
+                    action_t, _, _ = model.policy(_rssm_state.feat,
                                                    deterministic=deterministic)
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-                _rssm_state = _post
                 # Reuse the on-device action for the next GRU step — no
                 # host→device round-trip (the .cpu() above already paid the
                 # only unavoidable sync for env.step).
@@ -10464,7 +10470,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     if joint_mode:
         current_phase = 3
         if _cfg_on(cfg, 'p3_reset_log_std', False):
-            model.reset_policy_exploration()
+            model.reset_policy_exploration(opt_actor)
             print('[p3] reset policy log_std residual (joint)', flush=True)
         model.snapshot_prior_policy()
         p3_start_steps = total_env_steps
@@ -11061,10 +11067,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # so warmup collect + KL prior see the exploring policy,
                 # not the P1/P2 BC-pinned σ_min.  μ (expert mean) stays.
                 if _cfg_on(cfg, 'p3_reset_log_std', False):
-                    model.reset_policy_exploration()
+                    model.reset_policy_exploration(opt_actor)
                     _init = float(getattr(cfg, 'policy_init_log_std', -1.5))
                     print('[p3] reset policy log_std residual → '
-                          f'σ=init ({_init:.3f}); μ (BC) kept '
+                          f'σ=init ({_init:.3f}); μ (BC) kept; '
+                          'Adam log_std-row moments zeroed '
                           '(P45: P1/P2 BC pinned σ_min)',
                           flush=True)
                 # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
@@ -11911,6 +11918,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # Diagnosis scripts look for ``wm_gain_match_loss`` / isolation
             # keys.  Isolation off (P40 env-free) used to omit the keys so
             # parsers read None while the banner printed ``iso 0``.  Emit 0.
+            if 'joint_embed_loss' in row:
+                row.setdefault('jemb_loss', row['joint_embed_loss'])
             if 'gain_match_loss' in row:
                 row.setdefault('wm_gain_match_loss', row['gain_match_loss'])
             row.setdefault('wm_gain_match_mv_loss',

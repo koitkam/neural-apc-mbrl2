@@ -955,7 +955,7 @@ class PolicyHead(nn.Module):
         p = log_p.exp()
         return -(p * log_p).sum(-1).sum(-1)                       # (B,)
 
-    def reset_log_std(self) -> None:
+    def reset_log_std(self, optimizer=None) -> None:
         """No-op: discrete policy has no Gaussian log_std residual."""
         return
 
@@ -1173,7 +1173,7 @@ class ContinuousPolicyHead(nn.Module):
         return (0.5 * (math.log(2.0 * math.pi * math.e)
                         + 2.0 * log_std)).sum(-1)
 
-    def reset_log_std(self) -> None:
+    def reset_log_std(self, optimizer=None) -> None:
         """Zero the log_std residual so σ = ``log_std_init``. Leave μ intact.
 
         P45 RCA: P1/P2 expert-BC drives the last-layer log_std rows to
@@ -1182,6 +1182,11 @@ class ContinuousPolicyHead(nn.Module):
         unfreeze explodes REINFORCE. Zeroing only the log_std half of
         the ``(μ, log_std)`` last Linear restores exploration without
         wiping the BC mean.
+
+        P46 GPU-occupied: P2 NLL also fills Adam ``exp_avg`` / ``exp_avg_sq``
+        on those rows. Weight-only reset then first ``opt_actor.step`` after
+        warmup re-collapses σ. When ``optimizer`` is the actor AdamW, zero
+        those moments on the log_std rows only (μ rows keep BC momentum).
         """
         last = self.head.net[-1]
         if not isinstance(last, nn.Linear):
@@ -1192,6 +1197,29 @@ class ContinuousPolicyHead(nn.Module):
             last.weight.index_fill_(0, idx, 0.0)
             if last.bias is not None:
                 last.bias.index_fill_(0, idx, 0.0)
+            if optimizer is not None:
+                self._zero_log_std_adam(optimizer, last, idx)
+
+    @staticmethod
+    def _zero_log_std_adam(optimizer, last: nn.Linear,
+                           idx: torch.Tensor) -> None:
+        """Zero Adam/AdamW row moments for log_std outputs of ``last``."""
+        params = {id(last.weight), id(last.bias)} if last.bias is not None \
+            else {id(last.weight)}
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if id(p) not in params:
+                    continue
+                st = optimizer.state.get(p)
+                if not st:
+                    continue
+                for key in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq'):
+                    buf = st.get(key)
+                    if buf is None or buf.ndim < 1:
+                        continue
+                    if buf.shape[0] != p.shape[0]:
+                        continue
+                    buf.index_fill_(0, idx.to(device=buf.device), 0.0)
 
     @staticmethod
     def reference_entropy(action_dim: int, n_action_bins: int = 0) -> float:
@@ -1646,11 +1674,15 @@ class DreamerV4(nn.Module):
         for p in self.prior_policy.parameters():
             p.requires_grad_(False)
 
-    def reset_policy_exploration(self) -> None:
-        """Restore Gaussian σ to ``log_std_init``; no-op for discrete π."""
+    def reset_policy_exploration(self, optimizer=None) -> None:
+        """Restore Gaussian σ to ``log_std_init``; no-op for discrete π.
+
+        Pass the actor AdamW so log_std-row moments are cleared with the
+        weights (P2 NLL otherwise re-collapses σ at the first unfreeze).
+        """
         fn = getattr(self.policy, 'reset_log_std', None)
         if callable(fn):
-            fn()
+            fn(optimizer)
 
     def update_return_scale(self, returns: torch.Tensor,
                              ema: float = 0.99,

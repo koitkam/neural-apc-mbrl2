@@ -591,13 +591,20 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
                                                   dtype='float32'),
                         0.0, False, {})
         _n_obs = {'n': 0}
+        _n_post = {'n': 0}
         _orig_obs = model.dynamics.obs_step
+        _orig_post = model.dynamics._posterior_step
 
         def _count_obs(*a, **k):
             _n_obs['n'] += 1
             return _orig_obs(*a, **k)
 
+        def _count_post(*a, **k):
+            _n_post['n'] += 1
+            return _orig_post(*a, **k)
+
         model.dynamics.obs_step = _count_obs
+        model.dynamics._posterior_step = _count_post
         _ccfg = TrainConfig()
         _ccfg.episode_length = 8
         _ccfg.lookback = 4
@@ -608,12 +615,15 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
             collect_episode(_DummyCollectEnv(), model, torch.device('cpu'),
                             _ccfg, random_action=True)
             assert _n_obs['n'] == 0, _n_obs['n']
+            assert _n_post['n'] == 0, _n_post['n']
             collect_episode(_DummyCollectEnv(), model, torch.device('cpu'),
                             _ccfg, random_action=False)
-            assert _n_obs['n'] == 8, _n_obs['n']
+            assert _n_obs['n'] == 0, _n_obs['n']
+            assert _n_post['n'] == 8, _n_post['n']
         finally:
             model.dynamics.obs_step = _orig_obs
-        print('[smoke] OK  random collect skips RSSM obs_step; on-policy streams')
+            model.dynamics._posterior_step = _orig_post
+        print('[smoke] OK  random collect skips RSSM; on-policy streams _posterior_step')
 
     # (mbrl2 p04) critic_batch split (Fix 2) + MC-grounding (Fix 1): pass a
     # DISTINCT replay critic_batch; the critic loss must stay finite and
@@ -956,6 +966,9 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_rest_ic_state' in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
+    assert 'reset_policy_exploration(opt_actor)' in _src
+    assert "callable(_pstep)" in _src
+    assert "setdefault('jemb_loss'" in _src
     assert '_require_realsim_actor' in _src
     assert 'store_aux=False, last_only=True' in _src
     assert 'return_feats=False' in _src
@@ -1394,7 +1407,7 @@ def _test_gain_match_rest_ic() -> None:
 
 
 def _test_p3_reset_log_std() -> None:
-    """P46: zeroing log_std residual restores σ=init and leaves μ."""
+    """P46: zeroing log_std residual restores σ=init, keeps μ, clears Adam rows."""
     from models.dreamer_v4 import ContinuousPolicyHead, PolicyHead
     torch.manual_seed(0)
     pol = ContinuousPolicyHead(
@@ -1404,19 +1417,32 @@ def _test_p3_reset_log_std() -> None:
     last = pol.head.net[-1]
     n = int(pol.mtp_length) * int(pol.action_dim)
     idx = torch.arange(n, device=last.weight.device) * 2 + 1
+    opt = torch.optim.AdamW(pol.parameters(), lr=1e-3)
+    mu_g, ls_g = pol.dist_params(z)
+    loss = (ls_g ** 2).mean() + (mu_g ** 2).mean()
+    loss.backward()
+    opt.step()
+    st_w = opt.state[last.weight]
+    assert float(st_w['exp_avg'][idx].abs().max()) > 0.0
+    mu_idx = torch.arange(n, device=last.weight.device) * 2
+    mu_mom0 = float(st_w['exp_avg'][mu_idx].abs().max())
+    assert mu_mom0 > 0.0
     with torch.no_grad():
         last.weight.index_fill_(0, idx, -8.0)
         last.bias.index_fill_(0, idx, -8.0)
     mu0, ls0 = pol.dist_params(z)
     assert float(ls0.max()) <= pol.log_std_min + 1e-4, float(ls0.max())
     mu_saved = mu0.detach().clone()
-    pol.reset_log_std()
+    pol.reset_log_std(opt)
     mu1, ls1 = pol.dist_params(z)
     assert torch.allclose(mu1, mu_saved, atol=1e-6)
     assert torch.allclose(ls1, torch.full_like(ls1, -1.5), atol=1e-5)
+    assert float(st_w['exp_avg'][idx].abs().max()) == 0.0
+    # μ rows keep their Adam moments
+    assert abs(float(st_w['exp_avg'][mu_idx].abs().max()) - mu_mom0) < 1e-12
     disc = PolicyHead(8, 16, 2, n_action_bins=5, n_layers=1, mtp_length=1)
     disc.reset_log_std()
-    print('[smoke] OK  P3 reset_log_std restores σ=init, keeps μ')
+    print('[smoke] OK  P3 reset_log_std restores σ=init, keeps μ, zeros Adam log_std rows')
 
 
 def _test_adv_action_corr_vectorized() -> None:
