@@ -84,11 +84,13 @@ def derive_horizon(
     - ``source='default'``: paper floor (15) when no dynamics are available.
 
     Floored at ``min_h`` (the DreamerV3/V4 paper default, 15) so fast plants
-    never go below the paper minimum, and capped at ``max_h`` (env
-    ``DREAMER_HORIZON_MAX``) to bound imagination compute / WM-rollout error.
-    ``settle_n_tau`` is overridable via ``DREAMER_HORIZON_SETTLE_NTAU``.  An
-    explicit ``DREAMER_HORIZON`` still hard-overrides downstream via the
-    env-override layer.
+    never go below the paper minimum, and capped at ``max_h`` (TrainConfig
+    ``horizon_max`` / leftover ``DREAMER_HORIZON_MAX``) to bound WM-rollout
+    error.  ``settle_n_tau`` is TrainConfig ``horizon_settle_n_tau`` /
+    leftover ``DREAMER_HORIZON_SETTLE_NTAU``.  Called before TrainConfig
+    exists, so this still reads env (ENV_OVERRIDES records the same keys
+    on the later cfg).  An explicit ``DREAMER_HORIZON`` still hard-overrides
+    downstream via the env-override layer.
     """
     try:
         n_tau = float(os.environ.get('DREAMER_HORIZON_SETTLE_NTAU', '').strip()

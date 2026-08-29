@@ -23,7 +23,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > promote other plants until linear observer+actor are healthy. P3
 > collect still omits measured DV and Kalman (train/serve hole — do
 > not patch until P47 verdicts). Eval TM protocol (`wm_tf_*`) and
-> val-suite gates are TrainConfig + `ENV_OVERRIDES`.
+> val-suite gates, horizon formula (`horizon_settle_n_tau` /
+> `horizon_max`), IC randomization, and GPU-calib `wm_overhead` are
+> TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**

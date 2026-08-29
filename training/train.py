@@ -206,6 +206,19 @@ class TrainConfig:
     seq_len: int = 64
     batch_size: int = 16
     horizon: int = 15
+    # Formula inputs for ``derive_horizon``:
+    # ``H = round((θ + n_τ·τ) / sample_rate)`` floored at 15, capped at
+    # ``horizon_max``.  Were leftover ``DREAMER_HORIZON_SETTLE_NTAU`` /
+    # ``DREAMER_HORIZON_MAX`` in ``utils.auto_episode_length`` (worked,
+    # missing from ``run_plan``).  Identity: 4.0 (2% settle) / 120.
+    horizon_settle_n_tau: float = 4.0
+    horizon_max: int = 120
+    # Wide uniform IC randomization (domain randomization).  Simulators
+    # still read leftover ``DREAMER_INIT_RANDOMIZATION`` /
+    # ``DREAMER_INIT_RANDOMIZATION_FRAC`` at ``reset()``; these fields
+    # record the same identity defaults (ON / 0.6 of span) in ``run_plan``.
+    init_randomization: bool = True
+    init_randomization_frac: float = 0.6
 
     # ----- Phase budget fractions (paper Algorithm 1) -----
     phase1_frac: Optional[float] = None
@@ -1930,6 +1943,11 @@ class TrainConfig:
     # '' = eager (P26/P28 observer). Opt in: DREAMER_COMPILE=1 /
     # DREAMER_COMPILE_MODE=default|reduce-overhead|max-autotune.
     compile_mode: str = ''
+    # GPU-calib WM-only probe overhead (actor/critic/opt + P3 headroom).
+    # Was leftover ``DREAMER_WM_OVERHEAD`` in ``single_run`` (worked,
+    # missing from ``run_plan``).  Identity 1.30.  Probe still reads env
+    # before TrainConfig exists (dual-read).
+    wm_overhead: float = 1.30
 
     # ----- Resolved at build-time -----
     obs_dim: int = 0
@@ -2091,10 +2109,10 @@ class APCEnv:
         # ---- Derived observable block (Stage B, 2026-05-21) ---------------
         # Belief-state augmentation: cheap per-CV rolling statistics
         # (mean tracking error, Δcv, variance) appended to the
-        # augmented-obs block.  OFF by default; enable via
-        # ``DREAMER_DERIVED_OBSERVABLES=1``.  When ON, ``aug_obs_dim``
-        # grows by ``3 * n_cv`` and the running obs normalizer auto-
-        # adapts (features are bounded by construction).
+        # augmented-obs block.  Default ON (`derived_observables_enabled`);
+        # disable via ``DREAMER_DERIVED_OBSERVABLES=0``.  When ON,
+        # ``aug_obs_dim`` grows by ``3 * n_cv`` and the running obs
+        # normalizer auto-adapts (features are bounded by construction).
         self._derived_features: Optional[DerivedFeatures] = None
         if derived_observables_enabled():
             n_cv = int(len(self.cv_indices))

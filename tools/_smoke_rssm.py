@@ -731,6 +731,11 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_WM_TF_LEVELS': '7',
         'DREAMER_WM_TF_SPAN': '0.5',
         'DREAMER_VAL_WM_TRANSFER': '0',
+        'DREAMER_HORIZON_SETTLE_NTAU': '3.5',
+        'DREAMER_HORIZON_MAX': '80',
+        'DREAMER_INIT_RANDOMIZATION': '0',
+        'DREAMER_INIT_RANDOMIZATION_FRAC': '0.4',
+        'DREAMER_WM_OVERHEAD': '1.5',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -765,6 +770,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.wm_tf_levels) == 7
         assert abs(float(cfg.wm_tf_span) - 0.5) < 1e-12
         assert cfg.val_wm_transfer is False
+        assert abs(float(cfg.horizon_settle_n_tau) - 3.5) < 1e-12
+        assert int(cfg.horizon_max) == 80
+        assert cfg.init_randomization is False
+        assert abs(float(cfg.init_randomization_frac) - 0.4) < 1e-12
+        assert abs(float(cfg.wm_overhead) - 1.5) < 1e-12
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -786,6 +796,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'wm_tf_levels' in explicit
         assert 'wm_tf_span' in explicit
         assert 'val_wm_transfer' in explicit
+        assert 'horizon_settle_n_tau' in explicit
+        assert 'horizon_max' in explicit
+        assert 'init_randomization' in explicit
+        assert 'init_randomization_frac' in explicit
+        assert 'wm_overhead' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1248,6 +1263,16 @@ def _test_envfree_observer_recipe() -> None:
     assert c.val_wm_transfer is True
     assert c.val_wm_postprior is True
     assert c.val_wm_distpred is True
+    assert abs(float(c.horizon_settle_n_tau) - 4.0) < 1e-12
+    assert int(c.horizon_max) == 120
+    assert c.init_randomization is True
+    assert abs(float(c.init_randomization_frac) - 0.6) < 1e-12
+    assert abs(float(c.wm_overhead) - 1.30) < 1e-12
+    assert 'DREAMER_HORIZON_SETTLE_NTAU' in ENV_OVERRIDES
+    assert 'DREAMER_HORIZON_MAX' in ENV_OVERRIDES
+    assert 'DREAMER_INIT_RANDOMIZATION' in ENV_OVERRIDES
+    assert 'DREAMER_INIT_RANDOMIZATION_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_WM_OVERHEAD' in ENV_OVERRIDES
     assert c.obj_reward_scale == 'auto'
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -1749,6 +1774,51 @@ def _test_wm_tf_knobs_cfg_or_env() -> None:
     print('[smoke] OK  WM TF knobs cfg-or-env identity (default / explicit / leftover)')
 
 
+def _test_horizon_ic_overhead_cfg_or_env() -> None:
+    """Horizon formula + IC DR + WM overhead: TrainConfig default, leftover env."""
+    import os
+    from utils.auto_episode_length import derive_horizon
+    from utils.initial_conditions import _enabled, _frac
+    c = TrainConfig()
+    assert abs(float(c.horizon_settle_n_tau) - 4.0) < 1e-12
+    assert int(c.horizon_max) == 120
+    assert c.init_randomization is True
+    assert abs(float(c.init_randomization_frac) - 0.6) < 1e-12
+    assert abs(float(c.wm_overhead) - 1.30) < 1e-12
+    assert _enabled() is True
+    assert abs(_frac() - 0.6) < 1e-12
+    h, src = derive_horizon(tau=55.0, dead_time=8.0, sample_rate=4)
+    assert h == 57, (h, src)
+    prev_max = os.environ.get('DREAMER_HORIZON_MAX')
+    prev_n = os.environ.get('DREAMER_HORIZON_SETTLE_NTAU')
+    prev_ic = os.environ.get('DREAMER_INIT_RANDOMIZATION')
+    prev_frac = os.environ.get('DREAMER_INIT_RANDOMIZATION_FRAC')
+    try:
+        os.environ['DREAMER_HORIZON_MAX'] = '40'
+        h2, _ = derive_horizon(tau=55.0, dead_time=8.0, sample_rate=4)
+        assert h2 == 40, h2
+        os.environ.pop('DREAMER_HORIZON_MAX', None)
+        os.environ['DREAMER_HORIZON_SETTLE_NTAU'] = '2.0'
+        h3, src3 = derive_horizon(tau=55.0, dead_time=8.0, sample_rate=4)
+        assert h3 == 30, (h3, src3)
+        os.environ['DREAMER_INIT_RANDOMIZATION'] = '0'
+        os.environ['DREAMER_INIT_RANDOMIZATION_FRAC'] = '0.4'
+        assert _enabled() is False
+        assert abs(_frac() - 0.4) < 1e-12
+    finally:
+        for key, prev in (
+            ('DREAMER_HORIZON_MAX', prev_max),
+            ('DREAMER_HORIZON_SETTLE_NTAU', prev_n),
+            ('DREAMER_INIT_RANDOMIZATION', prev_ic),
+            ('DREAMER_INIT_RANDOMIZATION_FRAC', prev_frac),
+        ):
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+    print('[smoke] OK  horizon/IC/overhead cfg-or-env identity')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -1993,6 +2063,7 @@ if __name__ == '__main__':
     _test_policy_sigma_bounds_honours_cfg()
     _test_attention_auto_ignores_leftover_fast_attn()
     _test_wm_tf_knobs_cfg_or_env()
+    _test_horizon_ic_overhead_cfg_or_env()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

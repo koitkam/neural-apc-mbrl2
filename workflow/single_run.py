@@ -293,8 +293,9 @@ def main() -> int:
     #
     # ``wm_overhead_factor`` reserves headroom the WM-only probe does NOT
     # measure: the actor/critic/optimizer state and the Phase-3 imagination
-    # rollout (horizon-step latent unroll).  Tunable via DREAMER_WM_OVERHEAD;
-    # default 1.30 (≈30% reserve) keeps the RSSM run inside the card in P3.
+    # rollout (horizon-step latent unroll).  TrainConfig ``wm_overhead``
+    # (leftover ``DREAMER_WM_OVERHEAD``); identity 1.30.  Probe runs
+    # before TrainConfig exists, so this still reads env.
     try:
         _wm_overhead = float(os.environ.get('DREAMER_WM_OVERHEAD', '1.30'))
     except ValueError:

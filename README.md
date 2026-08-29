@@ -261,6 +261,9 @@ search *and* keep warm-starting model weights.
 | `DREAMER_FAST_ATTN` | leftover alias of `DREAMER_ATTN_IMPL`. |
 | `DREAMER_WM_TF_LEVELS` / `_SPAN` / `_STEP_FRAC` / `_HORIZON` / `_SETTLE` | eval TM protocol (defaults 5 / 0.6 / 0.4 / 0=auto `max(80,4H)` / 0=auto). |
 | `DREAMER_VAL_WM_TRANSFER` / `_POSTPRIOR` / `_DISTPRED` | val-suite gates (default ON). |
+| `DREAMER_HORIZON_SETTLE_NTAU` / `DREAMER_HORIZON_MAX` | `H=(θ+n_τ·τ)/sr` formula (defaults 4.0 / 120). |
+| `DREAMER_INIT_RANDOMIZATION` / `_FRAC` | IC domain randomization (default ON / 0.6 of span). |
+| `DREAMER_WM_OVERHEAD` | GPU-calib WM-only probe headroom (default 1.30). |
 | `SEED_TARGET_CV_FRAC` | leftover alias of `DREAMER_SEED_TARGET_CV_FRAC` (default 0.20). |
 | `SIGMA_MAX_CAP` | leftover alias of `DREAMER_SIGMA_MAX_CAP` (default 0.30). |
 | `SIGMA_MAX_FLOOR` | leftover alias of `DREAMER_SIGMA_MAX_FLOOR` (default 0.10). |

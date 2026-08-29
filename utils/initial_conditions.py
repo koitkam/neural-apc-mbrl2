@@ -16,16 +16,19 @@ each simulator already knows its own ``(lo, hi)`` bounds for every
 variable, so this helper only needs the bounds and the legacy nominal /
 σ — no per-sim configuration is required.
 
-Env vars
---------
-* ``DREAMER_INIT_RANDOMIZATION`` — master switch.  Default ``1`` (on).
-  Set to ``0`` to restore the legacy narrow-Gaussian behaviour.
-* ``DREAMER_INIT_RANDOMIZATION_FRAC`` — fraction of the bounded range
-  used for the wide uniform draw.  Default ``0.6`` = uniform over a
-  60% slice of ``(hi - lo)`` centred on the legacy nominal.
+Env vars / TrainConfig
+----------------------
+* ``DREAMER_INIT_RANDOMIZATION`` / ``TrainConfig.init_randomization`` —
+  master switch.  Default ON.  Set to ``0`` to restore the legacy
+  narrow-Gaussian behaviour.
+* ``DREAMER_INIT_RANDOMIZATION_FRAC`` / ``TrainConfig.init_randomization_frac``
+  — fraction of the bounded range used for the wide uniform draw.
+  Default ``0.6`` = uniform over a 60% slice of ``(hi - lo)`` centred
+  on the legacy nominal.
 
-Both are read fresh on every call so test code can flip them without
-restarting the process.
+Simulators read leftover env at ``reset()`` (no cfg).  ENV_OVERRIDES
+records the same identity defaults in ``run_plan``.  Both env keys are
+read fresh on every call so test code can flip them without restarting.
 """
 
 from __future__ import annotations

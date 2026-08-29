@@ -25,10 +25,9 @@ All three are zero-mean / bounded by construction so the running obs
 normalizer in ``APCEnv._update_obs_norm`` does not have to compensate
 for arbitrary CV scaling.
 
-Toggle via ``DREAMER_DERIVED_OBSERVABLES=1`` (default OFF — preserves
-backward compat with existing checkpoints).  Window size is controlled
-by ``DREAMER_DERIVED_OBS_WINDOW`` (default 32 agent steps ≈ τ_dom for
-test_sim at sample_rate=4).
+Toggle via ``DREAMER_DERIVED_OBSERVABLES`` (default ON since P37;
+``=0`` disables).  Window size is ``DREAMER_DERIVED_OBS_WINDOW`` or
+auto ``round(2·τ/sample_rate)`` clamped to ``[8, 128]``.
 """
 
 from __future__ import annotations
