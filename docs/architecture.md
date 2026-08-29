@@ -355,7 +355,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > Isolation loss stays 0.  Collect settle = max(H, lookback), not
 > `wm_tf_horizon`.  Encode uses last state only (same `h/z/c_mean` as the
 > full T-stack; unused `(N,L,F)` dropped).  Cache miss aborts (no PRBS
-> fallback). `DREAMER_GAIN_MATCH_REST_IC=1`.
+> fallback). `DREAMER_GAIN_MATCH_REST_IC=1`. Remaining rest-IC `t_wm`
+> cost is the L-step GRU (T sequential kernels, N-independent);
+> `last_only` does not skip it. Do not concat rest rows into the main
+> `sample=True` WM rollout (GRU would see sampled `c`).
+> `actor_train_source` other than `realsim` is refused at `train()`
+> start (leftover imagination override skipped `onpol_buf` → p01 chatter).
 > Head persist-on-lock writes the snapshot when the lock fires. jsonl
 > `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`.
 > Gain-probe line prints ss **and** `@H`. Printed observer verdict is

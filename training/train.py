@@ -215,12 +215,11 @@ class TrainConfig:
     # the value head calibrates before actor coupling.  DREAMER_TRAIN_MODE.
     train_mode: str = 'phased'
     # ----- Actor training data source (mbrl2 fork) -----
-    # ``realsim`` (default; the only supported mode — imagination was removed):
-    # the WM(RSSM)+DOB are a FROZEN OBSERVER and the actor-critic trains on
-    # λ-returns from REAL rollouts of the true simulator with domain
-    # randomisation (``_realsim_actor_critic_step``).  Exact policy gradient
-    # w.r.t. the true dynamics, real-return-grounded critic (no cascade),
-    # DreamerV3 scale-invariant normalisation.  DREAMER_ACTOR_SOURCE.
+    # ``realsim`` is the only supported mode (imagination actor deleted).
+    # ``train()`` refuses any other value: a leftover ``imagination`` override
+    # used to skip the on-policy buffer and train P3 off replay (p01 chatter).
+    # DREAMER_ACTOR_SOURCE stays in ENV_OVERRIDES so a bad A/B is visible
+    # then aborted, not silently ignored.
     actor_train_source: str = 'realsim'
     # joint mode: re-snapshot the PMPO prior policy every N iters (0 = once at
     # start, like phased P3).  A slowly-refreshed prior keeps the KL anchor
@@ -4031,6 +4030,21 @@ def _cfg_on(cfg: 'TrainConfig', name: str, default: bool = True) -> bool:
     return bool(v)
 
 
+def _require_realsim_actor(cfg: 'TrainConfig') -> None:
+    """Imagination actor is deleted; P3 is ``_realsim_actor_critic_step``.
+
+    A leftover ``DREAMER_ACTOR_SOURCE=imagination`` used to skip
+    ``onpol_buf`` and train the actor on shared replay (p01 MV-chatter).
+    Fail loud instead of a false A/B.
+    """
+    src = str(getattr(cfg, 'actor_train_source', 'realsim') or 'realsim')
+    src = src.strip().lower()
+    if src not in ('realsim', ''):
+        raise RuntimeError(
+            f'actor_train_source={src!r} is not supported; '
+            'imagination actor is deleted (P3 is _realsim_actor_critic_step)')
+
+
 def _isolation_seq_is_mv(act: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """(B,) bool: isolated-MV hold (action energy) vs isolated-DV (action≈0).
 
@@ -6087,6 +6101,12 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     skips unused logit stacks.  ``last_only=True`` skips the unused T-stack
     (rest-IC only needs the last state; GRU recurrence identical).  None
     if the cache is empty.
+
+    Do **not** concat rest rows into the main WM ``rollout_observed``
+    (``sample=True``): the GRU would see sampled ``c``, so ``h`` ≠ this
+    mean-c IC.  The extra cost is a second T-loop of skinny N=6 kernels
+    (launch-bound, N-independent); ``last_only`` drops the unused T-stack
+    but does not skip the GRU.
     """
     o, a = _gain_match_rest_ic_tensors(cfg, device, dtype)
     if o is None or a is None:
@@ -8956,6 +8976,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     _nth, _blas = _configure_runtime_threads(device)
     print(f'[runtime] cpu_threads={_nth} host_cpus={_host_cpu_count()} '
           f'device={device.type} blas={_blas}', flush=True)
+    _require_realsim_actor(cfg)
 
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim
@@ -9528,11 +9549,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # MV-chatter RCA).  This ring buffer keeps ONLY the last
     # ``phase3_onpolicy_buffer_eps`` current-policy episodes (n_dist=0: the frozen
     # observer needs no disturbance target at P3).
-    onpol_buf = None
-    if str(getattr(cfg, 'actor_train_source', 'realsim')) == 'realsim':
-        _onpol_eps = max(2, int(getattr(cfg, 'phase3_onpolicy_buffer_eps', 16) or 16))
-        onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
-                                     cfg.obs_dim, cfg.action_dim, n_dist=0)
+    # On-policy P3 buffer (``_require_realsim_actor`` already ran).
+    _onpol_eps = max(2, int(getattr(cfg, 'phase3_onpolicy_buffer_eps', 16) or 16))
+    onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
+                                 cfg.obs_dim, cfg.action_dim, n_dist=0)
 
     # MIMO per-INPUT isolation buffer (2026-07-10 / P28 follow-up 9): holds
     # ONLY the isolated whole-episode settle holds (one input at a
@@ -11626,20 +11646,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         opt_actor.step()
                 t_wm_acc += time.time() - _t
 
-            else:  # Phase 3 — imagination RL + continuous WM update
-                # Paper Algorithm 1: tokenizer + dynamics + reward head
-                # keep training in P3 alongside the actor / critic so the
-                # world model tracks the on-policy state-visit
-                # distribution.  We split the gradient steps: each P3
-                # iter does (a) one WM step on a fresh buffer batch
-                # (recon/sf + reward MTP), (b) one actor/critic step
-                # via imagination from a possibly different batch.
+            else:  # Phase 3 — real-sim actor-critic (frozen observer)
                 _t = time.time()
-                # mbrl2 real-sim controller: the WM(RSSM)+DOB is a FROZEN
-                # OBSERVER — there is NO P3 world-model update.  Train ONLY the
-                # actor + critic on λ-returns from the REAL simulator (the
-                # on-policy ``batch`` collected by ``collect_episode``, with
-                # domain randomisation), via ``_realsim_actor_critic_step``.
+                # mbrl2: the WM(RSSM)+DOB is a FROZEN OBSERVER — there is
+                # NO P3 world-model update.  Train ONLY the actor + critic
+                # on λ-returns from the REAL simulator (the on-policy
+                # ``batch`` collected by ``collect_episode``, with domain
+                # randomisation), via ``_realsim_actor_critic_step``.
                 # ``wm_losses``/``ag_losses`` stay empty so the log-row merge
                 # ``{**wm_losses, **ag_losses, **ac_losses}`` is a clean no-op.
                 wm_grad_norm = 0.0

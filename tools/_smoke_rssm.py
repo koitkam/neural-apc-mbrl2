@@ -57,7 +57,7 @@ from training.train import (
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt,
                             _gain_match_rest_window, collect_rest_lookback,
-                            _wm_gain_match_loss,
+                            _wm_gain_match_loss, _require_realsim_actor,
                             _adv_action_corr, _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
@@ -896,6 +896,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert '_cache_gain_match_rest_ic' in _src
+    assert '_require_realsim_actor' in _src
     assert 'store_aux=False, last_only=True' in _src
     assert 'refusing PRBS-posterior fallback' in _src
     assert 'collect_rest_lookback' in _src
@@ -1037,6 +1038,7 @@ def _test_envfree_observer_recipe() -> None:
     assert float(c.gain_match_huber_beta) == 1.0
     assert int(c.gain_match_settle_len) == -1
     assert c.gain_match_rest_ic is False
+    assert c.actor_train_source == 'realsim'
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
@@ -1070,6 +1072,22 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.wm_isolation_settle_episodes) == 0
     assert _isolation_teacher_on(c) is False
     print('[smoke] OK  env-free TrainConfig = gain-match observer / P28 actor')
+
+
+def _test_require_realsim_actor() -> None:
+    """Imagination actor_train_source is a false A/B (p01 off-policy chatter)."""
+    ok = TrainConfig()
+    _require_realsim_actor(ok)
+    bad = TrainConfig()
+    bad.actor_train_source = 'imagination'
+    try:
+        _require_realsim_actor(bad)
+    except RuntimeError as exc:
+        assert 'imagination' in str(exc).lower()
+        assert '_realsim_actor_critic_step' in str(exc)
+    else:
+        raise AssertionError('imagination actor_train_source was allowed')
+    print('[smoke] OK  non-realsim actor_train_source is refused')
 
 
 def _test_gain_match_per_input_huber() -> None:
@@ -1538,6 +1556,7 @@ if __name__ == '__main__':
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()
     _test_envfree_observer_recipe()
+    _test_require_realsim_actor()
     _test_gain_match_per_input_huber()
     _test_gain_match_pred_over_tgt()
     _test_gain_match_fd_held()
