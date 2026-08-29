@@ -266,7 +266,7 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
                     if cv_widths else 10.0)
 
     mv_authority_cv = compute_mv_authority_to_cv(env.sim, id_ctx)
-    authority_frac = get_authority_target_frac()
+    authority_frac = get_authority_target_frac(cfg=getattr(env, 'cfg', None))
     cumulative_offset: Dict[str, float] = {}
     cumulative_cv_impact = 0.0
 
@@ -317,6 +317,7 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
                 cumulative_cv_impact=float(cumulative_cv_impact),
                 mv_authority_cv=float(mv_authority_cv),
                 target_frac=float(authority_frac),
+                cfg=getattr(env, 'cfg', None),
             )
             mag = float(new_delta)
             cumulative_cv_impact += float(achieved)

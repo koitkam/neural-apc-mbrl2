@@ -33,19 +33,50 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
-def _bool_env(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+# Identifier JSON is static for a single_run.  Glob every env.reset()
+# (P1 ~5 episodes/iter) was host-CPU waste; cache on cwd + path env.
+_ID_CTX_CACHE = None
+_ID_CTX_KEY = None
 
 
-def disturbance_curriculum_enabled(default: bool = True) -> bool:
-    return _bool_env("AGENT_DISTURBANCE_CURRICULUM", default)
+def _explicit(cfg, field: str) -> bool:
+    if cfg is None:
+        return False
+    return field in (getattr(cfg, "_explicit_fields", set()) or set())
 
 
-def disturbance_progressive_enabled(default: bool = True) -> bool:
-    return _bool_env("AGENT_DISTURBANCE_PROGRESSIVE", default)
+def _knob_float(cfg, field: str, dreamer_key: str, leftover_key: str,
+                default: float) -> float:
+    """Explicit TrainConfig, else DREAMER_*, else leftover AGENT_*, else default."""
+    if _explicit(cfg, field):
+        try:
+            return float(getattr(cfg, field))
+        except Exception:
+            return float(default)
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ""):
+        try:
+            return float(d_raw)
+        except Exception:
+            pass
+    l_raw = os.environ.get(leftover_key)
+    if l_raw not in (None, ""):
+        try:
+            return float(l_raw)
+        except Exception:
+            pass
+    if cfg is not None:
+        try:
+            return float(getattr(cfg, field, default))
+        except Exception:
+            pass
+    return float(default)
+
+
+def _knob_int(cfg, field: str, dreamer_key: str, leftover_key: str,
+              default: int) -> int:
+    return int(round(_knob_float(cfg, field, dreamer_key, leftover_key,
+                                 float(default))))
 
 
 def _state_name(sim, idx: int) -> str:
@@ -108,6 +139,15 @@ def _state_group_value(state: np.ndarray, sim, group: str, pos: int, idx: int) -
 
 
 def _load_identifier_context() -> Dict:
+    global _ID_CTX_CACHE, _ID_CTX_KEY
+    key = (
+        os.getcwd(),
+        str(os.environ.get("CONTROL_SETUP_JSON", "")).strip(),
+        str(os.environ.get("AGENT_DYNAMICS_JSON", "")).strip(),
+        str(os.environ.get("AGENT_LOOKBACK_JSON", "")).strip(),
+    )
+    if _ID_CTX_CACHE is not None and _ID_CTX_KEY == key:
+        return _ID_CTX_CACHE
     roots = []
     setup_json = str(os.environ.get('CONTROL_SETUP_JSON', '')).strip()
     if setup_json:
@@ -200,12 +240,15 @@ def _load_identifier_context() -> Dict:
         for k, v in mv_gain.items() if v
     }
 
-    return {
+    out = {
         'lookback': lb if isinstance(lb, dict) else {},
         'dynamics': dyn if isinstance(dyn, dict) else {},
         'dv_gain_to_cv': dv_gain,
         'mv_gain_to_cv': mv_gain,
     }
+    _ID_CTX_CACHE = out
+    _ID_CTX_KEY = key
+    return out
 
 
 def load_mv_gain_to_cv() -> Dict[str, float]:
@@ -225,17 +268,8 @@ def load_mv_gain_to_cv() -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Shared MV-authority budget + saturation + intensity helpers
+# Shared MV-authority budget (training + validation schedulers)
 # ---------------------------------------------------------------------------
-#
-# These utilities are simulator-agnostic: they read only public sim metadata
-# (mv_indices, mv_normalization_ranges, state_variables) plus the identifier
-# context produced by ``_load_identifier_context``.  They are used by both
-# the training-time disturbance scheduler (this module) and the validation-
-# time scheduler in ``evaluation/validate_latent.py``, so any simulator that
-# exposes the standard mv/cv/dv index + normalization-range attributes —
-# including ONNX-driven surrogates and the analytic test_sim — works without
-# code changes.
 
 
 def compute_mv_authority_to_cv(sim, identifier_ctx: Optional[Dict] = None) -> float:
@@ -289,17 +323,19 @@ def compute_mv_authority_to_cv(sim, identifier_ctx: Optional[Dict] = None) -> fl
     return float(total)
 
 
-def get_authority_target_frac(default: float = 0.65) -> float:
+def get_authority_target_frac(default: float = 0.65, cfg=None) -> float:
     """Fraction of total MV->CV authority the disturbance budget may consume.
 
     Default 0.65 leaves 35% headroom for OU drift, measurement noise, and
-    transient overshoot.  Override via ``AGENT_DISTURBANCE_AUTHORITY_FRAC``.
-    Set to 0 to disable the budget entirely (legacy behaviour).
+    transient overshoot.  TrainConfig ``disturbance_authority_frac``;
+    leftover ``AGENT_DISTURBANCE_AUTHORITY_FRAC``.  Set to 0 to disable
+    the budget entirely (legacy behaviour).
     """
-    try:
-        val = float(os.environ.get('AGENT_DISTURBANCE_AUTHORITY_FRAC', default))
-    except (TypeError, ValueError):
-        val = default
+    val = _knob_float(
+        cfg, 'disturbance_authority_frac',
+        'DREAMER_DISTURBANCE_AUTHORITY_FRAC',
+        'AGENT_DISTURBANCE_AUTHORITY_FRAC',
+        default)
     return float(np.clip(val, 0.0, 1.5))
 
 
@@ -309,6 +345,7 @@ def clamp_event_to_authority_budget(
     cumulative_cv_impact: float,
     mv_authority_cv: float,
     target_frac: float,
+    cfg=None,
 ) -> Tuple[float, float]:
     """Clip a proposed event ``delta`` so cumulative CV impact stays under budget.
 
@@ -334,14 +371,13 @@ def clamp_event_to_authority_budget(
     # the channel can begin returning toward the budget envelope rather
     # than zeroing out (which previously starved late multi-event
     # episodes on low-gain plants of any meaningful state movement).
-    # Cap at ``AGENT_DISTURBANCE_RECOVERY_FRAC`` (default 0.20) of the
+    # Cap at ``disturbance_recovery_frac`` (default 0.20) of the
     # proposed magnitude.
-    try:
-        recovery_frac = float(os.environ.get(
-            'AGENT_DISTURBANCE_RECOVERY_FRAC', '0.20'))
-    except (TypeError, ValueError):
-        recovery_frac = 0.20
-    recovery_frac = float(np.clip(recovery_frac, 0.0, 1.0))
+    recovery_frac = float(np.clip(_knob_float(
+        cfg, 'disturbance_recovery_frac',
+        'DREAMER_DISTURBANCE_RECOVERY_FRAC',
+        'AGENT_DISTURBANCE_RECOVERY_FRAC',
+        0.20), 0.0, 1.0))
     if (allowed_cv == 0.0) or (np.sign(allowed_cv) != sign):
         if recovery_frac <= 0.0:
             return 0.0, 0.0
@@ -355,433 +391,6 @@ def clamp_event_to_authority_budget(
     return float(proposed_delta) * scale, proposed_cv * scale
 
 
-class MVSaturationMonitor:
-    """Track recent MV saturation and gate disturbance event firing.
-
-    Sim-agnostic: reads only ``state[mv_indices[i]]`` and the simulator's
-    ``mv_normalization_ranges``.  Maintains an exponential moving average of
-    saturated-step indicators per MV and collapses to a worst-case scalar.
-
-    Intended use::
-
-        mon = MVSaturationMonitor(sim)
-        ...
-        mon.update(state)               # call after every sim.step
-        if mon.should_suppress():
-            # skip / shrink the next scheduled disturbance event
-            ...
-
-    The default suppression threshold is 0.20 (i.e. >20% of recent steps
-    saturated).  Override via ``AGENT_DISTURBANCE_SUPPRESS_SAT_FRAC``.  The
-    EMA window length defaults to the identified lookback (or 64 steps);
-    override via ``AGENT_DISTURBANCE_SUPPRESS_WINDOW``.
-    """
-
-    def __init__(
-        self,
-        sim,
-        edge_frac: float = 0.02,
-        threshold: Optional[float] = None,
-        window: Optional[int] = None,
-    ) -> None:
-        self.mv_indices = [int(i) for i in list(getattr(sim, 'mv_indices', []) or [])]
-        self.mv_ranges = list(getattr(sim, 'mv_normalization_ranges', []) or [])
-        self.is_normalized = bool(getattr(sim, 'state_is_normalized', False))
-        self.edge_frac = float(np.clip(edge_frac, 1e-6, 0.49))
-        try:
-            thr_env = os.environ.get('AGENT_DISTURBANCE_SUPPRESS_SAT_FRAC')
-            self.threshold = (
-                float(thr_env) if thr_env is not None and threshold is None
-                else float(threshold if threshold is not None else 0.20)
-            )
-        except (TypeError, ValueError):
-            self.threshold = 0.20
-        try:
-            win_env = os.environ.get('AGENT_DISTURBANCE_SUPPRESS_WINDOW')
-            win = int(win_env) if win_env is not None and window is None else int(
-                window if window is not None else 64
-            )
-        except (TypeError, ValueError):
-            win = 64
-        self.window = max(8, int(win))
-        self._ema = np.zeros(max(1, len(self.mv_indices)), dtype='float64')
-        self._alpha = 1.0 / float(self.window)
-        # Persistent saturation count (independent of EMA) so we can also
-        # track per-episode saturation fraction for the intensity controller.
-        self._sat_count = np.zeros(max(1, len(self.mv_indices)), dtype='int64')
-        self._step_count = 0
-
-    def reset_episode(self) -> None:
-        self._ema[:] = 0.0
-        self._sat_count[:] = 0
-        self._step_count = 0
-
-    def _instant_sat(self, state: np.ndarray) -> np.ndarray:
-        out = np.zeros(max(1, len(self.mv_indices)), dtype='float64')
-        for i, mv_idx in enumerate(self.mv_indices):
-            if mv_idx < 0 or mv_idx >= len(state):
-                continue
-            if i >= len(self.mv_ranges):
-                continue
-            try:
-                lo, hi = float(self.mv_ranges[i][0]), float(self.mv_ranges[i][1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            span = max(1e-6, hi - lo)
-            if self.is_normalized:
-                v = float(np.clip(state[mv_idx], 0.0, 1.0)) * span + lo
-            else:
-                v = float(state[mv_idx])
-            margin = self.edge_frac * span
-            if (v <= lo + margin) or (v >= hi - margin):
-                out[i] = 1.0
-        return out
-
-    def update(self, state: np.ndarray) -> None:
-        if not self.mv_indices:
-            return
-        inst = self._instant_sat(state)
-        self._ema = (1.0 - self._alpha) * self._ema + self._alpha * inst
-        self._sat_count += inst.astype('int64')
-        self._step_count += 1
-
-    def saturation_fraction(self) -> float:
-        if self._step_count <= 0 or not self.mv_indices:
-            return 0.0
-        return float(np.max(self._sat_count) / float(self._step_count))
-
-    def recent_saturation_fraction(self) -> float:
-        if not self.mv_indices:
-            return 0.0
-        return float(np.max(self._ema))
-
-    def should_suppress(self) -> bool:
-        return self.recent_saturation_fraction() > self.threshold
-
-
-class DisturbanceIntensityController:
-    """Replaces the per-episode-index intensity lambda with an adaptive
-    schedule that backs off when MV saturates and recovers when it doesn't.
-
-    The base curriculum is identical to the previous lambda
-    (warmup -> ramp from ``intensity_min`` to ``intensity_max`` over the
-    estimated episode budget), but a multiplicative ``adaptive`` factor in
-    ``[adaptive_min, 1.0]`` modulates the result based on per-episode MV
-    saturation feedback.  Reduce by ``decay`` when episode saturation
-    exceeds ``target_sat`` and recover by ``recovery`` (geometric, capped at
-    1.0) when it stays below.
-    """
-
-    def __init__(
-        self,
-        intensity_min: float,
-        intensity_max: float,
-        warmup_episodes: int,
-        total_episodes: int,
-        progressive: bool = True,
-    ) -> None:
-        self.intensity_min = float(intensity_min)
-        self.intensity_max = float(intensity_max)
-        self.warmup_episodes = max(0, int(warmup_episodes))
-        self.total_episodes = max(1, int(total_episodes))
-        self.progressive = bool(progressive)
-        try:
-            self.target_sat = float(os.environ.get('AGENT_TARGET_SATURATION_FRAC', '0.20'))
-        except (TypeError, ValueError):
-            self.target_sat = 0.20
-        try:
-            self.decay = float(os.environ.get('AGENT_DISTURBANCE_INTENSITY_DECAY', '0.85'))
-        except (TypeError, ValueError):
-            self.decay = 0.85
-        try:
-            self.recovery = float(os.environ.get('AGENT_DISTURBANCE_INTENSITY_RECOVERY', '1.05'))
-        except (TypeError, ValueError):
-            self.recovery = 1.05
-        try:
-            self.adaptive_min = float(os.environ.get('AGENT_DISTURBANCE_INTENSITY_FLOOR', '0.30'))
-        except (TypeError, ValueError):
-            self.adaptive_min = 0.30
-        self.target_sat = float(np.clip(self.target_sat, 0.0, 1.0))
-        self.decay = float(np.clip(self.decay, 0.5, 1.0))
-        self.recovery = float(np.clip(self.recovery, 1.0, 1.5))
-        self.adaptive_min = float(np.clip(self.adaptive_min, 0.05, 1.0))
-        self._adaptive = 1.0
-        self._low_sat_streak = 0
-
-    def get_intensity(self, episode_index: int) -> float:
-        if not self.progressive:
-            return self.intensity_max * self._adaptive
-        ep = max(0, int(episode_index))
-        if ep < self.warmup_episodes:
-            return 0.0
-        remaining = max(1.0, float(self.total_episodes - self.warmup_episodes - 1))
-        frac = float(np.clip(float(ep - self.warmup_episodes) / remaining, 0.0, 1.0))
-        base = self.intensity_min + (self.intensity_max - self.intensity_min) * frac
-        return float(np.clip(base * self._adaptive, 0.0, self.intensity_max))
-
-    def update_from_episode(self, sat_frac: float) -> None:
-        """Adjust the adaptive multiplier from last episode's MV saturation."""
-        sat = float(np.clip(sat_frac, 0.0, 1.0))
-        if sat > self.target_sat:
-            self._adaptive = float(np.clip(self._adaptive * self.decay, self.adaptive_min, 1.0))
-            self._low_sat_streak = 0
-        else:
-            # Mild hysteresis: only recover after a few consecutive low-sat episodes
-            self._low_sat_streak += 1
-            if self._low_sat_streak >= 3:
-                self._adaptive = float(np.clip(self._adaptive * self.recovery, self.adaptive_min, 1.0))
-                self._low_sat_streak = 0
-
-    @property
-    def adaptive_factor(self) -> float:
-        return float(self._adaptive)
-
-
-def compute_episode_mv_saturation(
-    mv_value_series: List[float],
-    mv_lo: float,
-    mv_hi: float,
-    edge_frac: float = 0.02,
-) -> float:
-    """Compute MV saturation fraction over a single episode trace.
-
-    Generic helper for training scripts: pass the raw MV-engineering-unit
-    series captured during the episode and the bounds from
-    ``mv_normalization_ranges[mv_pos]``.  Returns the fraction of steps the
-    MV spent within ``edge_frac`` of either bound.
-    """
-    if not mv_value_series:
-        return 0.0
-    span = max(1e-6, float(mv_hi) - float(mv_lo))
-    margin = float(edge_frac) * span
-    arr = np.asarray(mv_value_series, dtype='float64')
-    sat = np.logical_or(arr <= float(mv_lo) + margin, arr >= float(mv_hi) - margin)
-    return float(np.mean(sat.astype('float32')))
-
-
-# ---------------------------------------------------------------------------
-# Mixed-mode episode initialization
-# ---------------------------------------------------------------------------
-
-def choose_episode_init_mode(
-    rng: np.random.Generator,
-    completed_episodes: int = 0,
-    warmup_episodes: int = 5,
-) -> str:
-    """Select episode initialization mode.
-
-    Returns one of:
-      'center'  — (50%) normal reset near center operating point
-      'explore' — (40%) wide random operating point
-      'extreme' — (10%) near edge of operating envelope
-    Early warmup episodes always use 'center'.
-    """
-    if completed_episodes < warmup_episodes:
-        return 'center'
-    # R8: shift mix toward explore/extreme so the policy rarely trains from
-    # a comfortable center-of-envelope start. Constraint-only objectives with
-    # strong MV economic pull (e.g. test_sim mv_economic=5, cv_econ=0) cause
-    # the policy to park MV at its economic optimum; we want disturbances
-    # hitting while MV is at that optimum, not at the midpoint.
-    r = rng.uniform()
-    if r < 0.30:
-        return 'center'
-    elif r < 0.75:
-        return 'explore'
-    else:
-        return 'extreme'
-
-
-def apply_episode_init_offsets(
-    state: np.ndarray,
-    sim,
-    mode: str,
-    rng: np.random.Generator,
-) -> Dict:
-    """Shift the post-reset state to a random operating point.
-
-    Uses only configuration-derived metadata (indices, normalization ranges
-    from control_setup.json attached by the sim factory) and system
-    identification results.  Does **not** access simulator internals
-    (u_actual, u_history, episode_array, etc.) so it works generically
-    with any simulator backend including neural-network surrogates.
-
-    For 'explore': DV offset across 15-85% of identified range, MV shifted
-    to a moderate random offset.
-    For 'extreme': DV near 5-20% from range edges, MV near opposite edges.
-    For 'center': no changes.
-
-    Returns a dict:
-      - 'state':     the (in-place) modified state array
-      - 'mv_values': np.ndarray of MV targets in engineering units
-                     (caller should use for prev_control)
-      - 'mode':      the mode that was applied
-    """
-    # Default MV values at midpoint of ranges (used when mode == 'center')
-    mv_indices = [int(i) for i in list(getattr(sim, 'mv_indices', []))]
-    mv_ranges = list(getattr(sim, 'mv_normalization_ranges', []))
-    default_mv = np.array([
-        0.5 * (float(mv_ranges[p][0]) + float(mv_ranges[p][1]))
-        if p < len(mv_ranges) else 50.0
-        for p in range(len(mv_indices))
-    ], dtype='float32')
-
-    if mode == 'center':
-        return {'state': state, 'mv_values': default_mv, 'mode': mode}
-
-    dv_indices = [int(i) for i in list(getattr(sim, 'dv_indices', []))]
-    dv_ranges = list(getattr(sim, 'dv_normalization_ranges', []))
-    is_normalized = bool(getattr(sim, 'state_is_normalized', False))
-
-    # --- DV offsets ---------------------------------------------------------
-    for dv_pos, dv_idx in enumerate(dv_indices):
-        if dv_pos >= len(dv_ranges):
-            continue
-        dv_lo, dv_hi = float(dv_ranges[dv_pos][0]), float(dv_ranges[dv_pos][1])
-        dv_center = (dv_lo + dv_hi) * 0.5
-        dv_span = max(1e-6, dv_hi - dv_lo)
-
-        if mode == 'explore':
-            dv_target = float(rng.uniform(dv_lo + 0.15 * dv_span, dv_hi - 0.15 * dv_span))
-        else:  # extreme
-            if rng.uniform() < 0.5:
-                dv_target = float(rng.uniform(dv_lo + 0.05 * dv_span, dv_lo + 0.20 * dv_span))
-            else:
-                dv_target = float(rng.uniform(dv_hi - 0.20 * dv_span, dv_hi - 0.05 * dv_span))
-
-        dv_offset = dv_target - dv_center
-
-        # Persistent DV offset via generic mixin API (if available).
-        if hasattr(sim, 'set_disturbance_offset'):
-            sim.set_disturbance_offset('dv', dv_pos, float(dv_offset))
-
-        # Update observable state array.
-        if is_normalized:
-            state[dv_idx] = float(np.clip((dv_target - dv_lo) / dv_span, 0.0, 1.0))
-        else:
-            state[dv_idx] = float(np.clip(dv_target, dv_lo, dv_hi))
-
-    # --- MV offsets ---------------------------------------------------------
-    mv_values = np.copy(default_mv)
-    for mv_pos, mv_idx in enumerate(mv_indices):
-        if mv_pos >= len(mv_ranges):
-            continue
-        mv_lo, mv_hi = float(mv_ranges[mv_pos][0]), float(mv_ranges[mv_pos][1])
-        mv_center = (mv_lo + mv_hi) * 0.5
-        mv_span = max(1e-6, mv_hi - mv_lo)
-
-        if mode == 'explore':
-            mv_frac = float(rng.uniform(0.05, 0.35))
-            mv_target = mv_center + float(rng.uniform(-mv_frac, mv_frac)) * mv_span
-        else:  # extreme
-            if rng.uniform() < 0.5:
-                mv_target = float(rng.uniform(mv_lo + 0.05 * mv_span, mv_lo + 0.20 * mv_span))
-            else:
-                mv_target = float(rng.uniform(mv_hi - 0.20 * mv_span, mv_hi - 0.05 * mv_span))
-
-        mv_target = float(np.clip(mv_target, mv_lo, mv_hi))
-        mv_values[mv_pos] = mv_target
-
-        if is_normalized:
-            state[mv_idx] = float(np.clip((mv_target - mv_lo) / mv_span, 0.0, 1.0))
-        else:
-            state[mv_idx] = float(np.clip(mv_target, mv_lo, mv_hi))
-
-    # --- CV offsets (init-only) --------------------------------------------
-    # Why: the agent previously only saw CVs at boundaries via dynamics
-    # (DV impact + MV pressure).  In ``extreme`` mode that produces only
-    # one boundary side per episode and never starts at a boundary.  Add
-    # a deliberate persistent CV offset on init so the policy trains
-    # episodes that begin near a CV bound and must recover.
-    #
-    # Anti-saturation safety: cap each CV offset by
-    # ``init_cv_offset_authority_frac`` (default 0.30) of the per-channel
-    # MV->CV recoverable authority, so the agent always has \u2265 70 % of
-    # MV travel free to defend against the offset.  Falls back to a span
-    # cap when no MV gain is available, and is opt-out via env-var
-    # ``AGENT_INIT_CV_OFFSET_FRAC=0``.
-    cv_indices = [int(i) for i in list(getattr(sim, 'cv_indices', []) or [])]
-    cv_ranges = list(getattr(sim, 'cv_normalization_ranges', []) or [])
-    try:
-        init_cv_auth_frac = float(os.environ.get(
-            'AGENT_INIT_CV_OFFSET_FRAC', '0.30'))
-    except (TypeError, ValueError):
-        init_cv_auth_frac = 0.30
-    init_cv_auth_frac = float(np.clip(init_cv_auth_frac, 0.0, 1.0))
-    if cv_indices and cv_ranges and init_cv_auth_frac > 0.0:
-        # Per-CV recoverable authority in CV engineering units:
-        # sum_m |k_{m,c}| * 0.35 * mv_span_m  (35 % MV travel headroom).
-        try:
-            id_ctx = _load_identifier_context()
-        except Exception:
-            id_ctx = {}
-        mv_gain_map = (id_ctx or {}).get('mv_gain_to_cv', {}) or {}
-        state_vars = list(getattr(sim, 'state_variables', []) or [])
-        # mv_gain_map is collapsed across CVs in the identifier context,
-        # so we can only produce a single shared authority estimate.
-        # Divide evenly across CVs as a conservative per-CV cap.
-        total_auth = 0.0
-        for mv_pos, mv_idx in enumerate(mv_indices):
-            if mv_pos >= len(mv_ranges):
-                continue
-            mv_lo, mv_hi = float(mv_ranges[mv_pos][0]), float(mv_ranges[mv_pos][1])
-            mv_span = max(0.0, mv_hi - mv_lo)
-            mv_state_name = ''
-            if 0 <= mv_idx < len(state_vars):
-                try:
-                    mv_state_name = str(state_vars[mv_idx])
-                except Exception:
-                    mv_state_name = ''
-            try:
-                gain = float(
-                    mv_gain_map.get(mv_state_name, 0.0)
-                    or mv_gain_map.get(f'mv_{mv_pos}', 0.0)
-                    or 0.0
-                )
-            except (TypeError, ValueError):
-                gain = 0.0
-            total_auth += abs(gain) * 0.35 * mv_span
-        per_cv_auth = total_auth / max(1, len(cv_indices))
-        for cv_pos, cv_idx in enumerate(cv_indices):
-            if cv_pos >= len(cv_ranges):
-                continue
-            cv_lo, cv_hi = float(cv_ranges[cv_pos][0]), float(cv_ranges[cv_pos][1])
-            cv_center = (cv_lo + cv_hi) * 0.5
-            cv_span = max(1e-6, cv_hi - cv_lo)
-            # Magnitude budget: prefer the gain-based authority cap when
-            # available (keeps MV ~70 % free), else fall back to a small
-            # span cap so we never demand an excursion the actuator
-            # cannot recover from.
-            if per_cv_auth > 1e-9:
-                cap = init_cv_auth_frac * per_cv_auth
-            else:
-                cap = init_cv_auth_frac * 0.30 * cv_span  # ~9 % span at default
-            if mode == 'explore':
-                cv_offset = float(rng.uniform(-1.0, 1.0)) * 0.6 * cap
-            else:  # extreme
-                sign = -1.0 if rng.uniform() < 0.5 else 1.0
-                cv_offset = sign * float(rng.uniform(0.6, 1.0)) * cap
-            # Hard clip so the resulting CV stays inside the normalisation
-            # range with a small inward margin.
-            cv_target_eu = cv_center + cv_offset
-            inward = 0.05 * cv_span
-            cv_target_eu = float(np.clip(cv_target_eu, cv_lo + inward, cv_hi - inward))
-            cv_offset_clipped = cv_target_eu - cv_center
-            if hasattr(sim, 'set_disturbance_offset'):
-                # Persistent offset; sims that honor CV offsets observe
-                # a state change immediately, others see it only via the
-                # objective-side bounds delta.  Either way the agent
-                # learns a boundary-near initial condition.
-                sim.set_disturbance_offset('cv', cv_pos, float(cv_offset_clipped))
-            # Mirror into the observable state so the seed buffer / WM
-            # see the boundary-near initial CV right away.
-            if is_normalized:
-                state[cv_idx] = float(np.clip((cv_target_eu - cv_lo) / cv_span, 0.0, 1.0))
-            else:
-                state[cv_idx] = float(np.clip(cv_target_eu, cv_lo, cv_hi))
-
-    return {'state': state, 'mv_values': mv_values, 'mode': mode}
-
 
 def build_training_disturbance_schedule(
     episode_length: int,
@@ -789,6 +398,7 @@ def build_training_disturbance_schedule(
     max_events: int = 5,
     intensity: float = 1.0,
     sim=None,
+    cfg=None,
 ) -> List[Dict]:
     """Build the per-episode operator-event schedule.
 
@@ -799,6 +409,16 @@ def build_training_disturbance_schedule(
     around 1.15 in P33.
     """
     ep_len = max(220, int(episode_length))
+    intensity = float(max(0.05, min(1.6, intensity)))
+    # Quiet gate first (identity): no catalog / identifier on ~12% of
+    # episodes.  ``rng.uniform`` stays the first draw.
+    quiet_frac = float(np.clip(_knob_float(
+        cfg, 'disturbance_quiet_frac',
+        'DREAMER_DISTURBANCE_QUIET_FRAC',
+        'AGENT_DISTURBANCE_QUIET_FRAC',
+        0.12), 0.0, 0.5))
+    if rng.uniform() < quiet_frac:
+        return []
 
     channels = {'dv': [], 'cv': []}
     if sim is not None:
@@ -822,36 +442,20 @@ def build_training_disturbance_schedule(
     dyn_horizon = max(1.0, dead_time + tau_dom)
     dv_gain = id_ctx.get('dv_gain_to_cv', {}) if isinstance(id_ctx, dict) else {}
 
-    intensity = float(max(0.05, min(1.6, intensity)))
-    settle_steps_env = int(os.environ.get("AGENT_DISTURBANCE_SETTLE_STEPS", "0") or 0)
-    if settle_steps_env > 0:
-        settle = max(32, int(settle_steps_env))
+    settle_steps = _knob_int(
+        cfg, 'disturbance_settle_steps',
+        'DREAMER_DISTURBANCE_SETTLE_STEPS',
+        'AGENT_DISTURBANCE_SETTLE_STEPS',
+        0)
+    if settle_steps > 0:
+        settle = max(32, int(settle_steps))
     else:
         settle = int(max(32.0, round(max(0.55 * float(lookback), 1.15 * dyn_horizon))))
     settle = int(max(24, min(settle, int(0.30 * ep_len))))
 
     # Per-episode event count is randomised in [0, max_events] so the
-    # agent sees both dense and sparse episodes — plus a configurable
-    # fraction of fully-quiet episodes where no operator events fire and
-    # the policy must hold its current operating point against only
-    # OU / measurement noise.  Quiet fraction is controlled by
-    # ``AGENT_DISTURBANCE_QUIET_FRAC`` (default 0.12 = ~1 in 8
-    # episodes).  Dense episodes train constraint reaction under
-    # overlapping transients; sparse episodes expose the reach-steady-
-    # state regime; quiet episodes expose the agent to the drift/hold
-    # task so the learned policy does not rely on disturbance arrival as
-    # an exploration trigger.  Operator limit/target changes from the
-    # RuntimeSetpointManager remain active during quiet episodes so the
-    # agent still sees limit-tracking events without a concurrent
-    # disturbance.
-    try:
-        quiet_frac = float(os.environ.get('AGENT_DISTURBANCE_QUIET_FRAC', '0.12'))
-    except Exception:
-        quiet_frac = 0.12
-    quiet_frac = float(np.clip(quiet_frac, 0.0, 0.5))
-    if rng.uniform() < quiet_frac:
-        return []  # quiet episode — no disturbance events
-
+    # agent sees both dense and sparse episodes.  Quiet episodes (no
+    # operator events) are decided above, before identifier load.
     n_cap = max(1, int(ep_len // max(22, int(0.5 * settle))))
     max_events_eff = int(np.clip(max_events, 1, min(6, n_cap)))
     n_events = int(rng.integers(1, max_events_eff + 1))
@@ -904,7 +508,7 @@ def build_training_disturbance_schedule(
     # back to magnitude-only clipping when the identifier produced no
     # usable MV gain.
     mv_authority_cv = compute_mv_authority_to_cv(sim, id_ctx) if sim is not None else 0.0
-    authority_frac = get_authority_target_frac()
+    authority_frac = get_authority_target_frac(cfg=cfg)
     _cumulative_cv_impact = 0.0  # signed sum across events (CV engineering units)
     schedule: List[Dict] = []
     last_start = 0
@@ -1018,6 +622,7 @@ def build_training_disturbance_schedule(
                 cumulative_cv_impact=float(_cumulative_cv_impact),
                 mv_authority_cv=float(mv_authority_cv),
                 target_frac=float(authority_frac),
+                cfg=cfg,
             )
             total_magnitude = float(new_delta)
             _cumulative_cv_impact += float(achieved_cv)
@@ -1122,6 +727,7 @@ def build_training_disturbance_schedule(
                         cumulative_cv_impact=float(_cumulative_cv_impact),
                         mv_authority_cv=float(mv_authority_cv),
                         target_frac=float(authority_frac),
+                        cfg=cfg,
                     )
                     co_delta = float(co_new_delta)
                     _cumulative_cv_impact += float(co_achieved_cv)
@@ -1293,18 +899,11 @@ def apply_disturbance_schedule(
     state: np.ndarray,
     sim,
     schedule: List[Dict],
-    mv_monitor: Optional[MVSaturationMonitor] = None,
 ) -> List[str]:
     """Apply pending step disturbances at their trigger time.
 
     Each event is an instantaneous step applied once at ``event['start']``.
     The ``_applied`` flag prevents re-application on subsequent steps.
-
-    When ``mv_monitor`` is supplied and reports ``should_suppress()``, the
-    pending event is marked suppressed (delta zeroed) instead of fired.
-    This guarantees that even with a poorly-calibrated schedule the agent
-    is not asked to absorb yet another disturbance while its MV is already
-    pinned to a limit.
     """
     if not schedule:
         return []
@@ -1323,25 +922,13 @@ def apply_disturbance_schedule(
         if shape == 'step' or duration <= 1:
             if t_local != 0:
                 continue
-            if mv_monitor is not None and mv_monitor.should_suppress():
-                ev['_applied'] = True
-                ev['_suppressed'] = True
-                ev['delta'] = 0.0
-                continue
             _apply_event_to_state(state, sim, ev)
             ev['_applied'] = True
             active.append(str(ev.get("name", "disturbance")))
         else:
             # Shaped (ramp/drift/oscillation) events: apply incremental piece
-            # for each step in [start, start + duration).  Saturation
-            # suppression only freezes the current increment; the next step
-            # will resume the trajectory.
+            # for each step in [start, start + duration).
             if t_local >= duration:
-                continue
-            if mv_monitor is not None and mv_monitor.should_suppress():
-                if t_local == duration - 1:
-                    ev['_applied'] = True
-                    ev['_suppressed'] = True
                 continue
             inc = _shape_step_increment(ev, int(t_local), int(duration))
             if abs(inc) > 1e-12:

@@ -775,6 +775,10 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_SIM_DOMAIN_RANDOMIZATION': '0',
         'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED': '11',
         'DREAMER_SIM_PARAM_RANDOMIZATION_PCT': '0.22',
+        'DREAMER_DISTURBANCE_AUTHORITY_FRAC': '0.50',
+        'DREAMER_DISTURBANCE_RECOVERY_FRAC': '0.15',
+        'DREAMER_DISTURBANCE_SETTLE_STEPS': '40',
+        'DREAMER_DISTURBANCE_QUIET_FRAC': '0.20',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -836,6 +840,10 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.sim_domain_randomization is False
         assert cfg.sim_domain_randomization_seed == '11'
         assert abs(float(cfg.sim_param_randomization_pct) - 0.22) < 1e-12
+        assert abs(float(cfg.disturbance_authority_frac) - 0.50) < 1e-12
+        assert abs(float(cfg.disturbance_recovery_frac) - 0.15) < 1e-12
+        assert int(cfg.disturbance_settle_steps) == 40
+        assert abs(float(cfg.disturbance_quiet_frac) - 0.20) < 1e-12
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -884,6 +892,10 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'sim_domain_randomization' in explicit
         assert 'sim_domain_randomization_seed' in explicit
         assert 'sim_param_randomization_pct' in explicit
+        assert 'disturbance_authority_frac' in explicit
+        assert 'disturbance_recovery_frac' in explicit
+        assert 'disturbance_settle_steps' in explicit
+        assert 'disturbance_quiet_frac' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1388,6 +1400,14 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_SIM_DOMAIN_RANDOMIZATION' in ENV_OVERRIDES
     assert 'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED' in ENV_OVERRIDES
     assert 'DREAMER_SIM_PARAM_RANDOMIZATION_PCT' in ENV_OVERRIDES
+    assert abs(float(c.disturbance_authority_frac) - 0.65) < 1e-12
+    assert abs(float(c.disturbance_recovery_frac) - 0.20) < 1e-12
+    assert int(c.disturbance_settle_steps) == 0
+    assert abs(float(c.disturbance_quiet_frac) - 0.12) < 1e-12
+    assert 'DREAMER_DISTURBANCE_AUTHORITY_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_DISTURBANCE_RECOVERY_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_DISTURBANCE_SETTLE_STEPS' in ENV_OVERRIDES
+    assert 'DREAMER_DISTURBANCE_QUIET_FRAC' in ENV_OVERRIDES
     assert c.obj_reward_scale == 'auto'
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -2123,6 +2143,85 @@ def _test_sim_snr_cfg() -> None:
     print('[smoke] OK  plant-SNR TrainConfig + DREAMER_SIM_* beats leftover SIM_*')
 
 
+def _test_agent_disturbance_cfg() -> None:
+    """Operator-event schedule: TrainConfig default, leftover AGENT_*, DREAMER wins."""
+    import os
+    from utils.training_disturbance import (
+        build_training_disturbance_schedule, get_authority_target_frac,
+        clamp_event_to_authority_budget)
+    from workflow._plant_prepare import ENV_OVERRIDES
+
+    c = TrainConfig()
+    assert abs(float(c.disturbance_authority_frac) - 0.65) < 1e-12
+    assert abs(float(c.disturbance_recovery_frac) - 0.20) < 1e-12
+    assert int(c.disturbance_settle_steps) == 0
+    assert abs(float(c.disturbance_quiet_frac) - 0.12) < 1e-12
+    assert 'DREAMER_DISTURBANCE_AUTHORITY_FRAC' in ENV_OVERRIDES
+    keys = (
+        'DREAMER_DISTURBANCE_AUTHORITY_FRAC', 'AGENT_DISTURBANCE_AUTHORITY_FRAC',
+        'DREAMER_DISTURBANCE_RECOVERY_FRAC', 'AGENT_DISTURBANCE_RECOVERY_FRAC',
+        'DREAMER_DISTURBANCE_QUIET_FRAC', 'AGENT_DISTURBANCE_QUIET_FRAC',
+        'DREAMER_DISTURBANCE_SETTLE_STEPS', 'AGENT_DISTURBANCE_SETTLE_STEPS',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        assert abs(get_authority_target_frac() - 0.65) < 1e-12
+        assert abs(get_authority_target_frac(cfg=c) - 0.65) < 1e-12
+        os.environ['AGENT_DISTURBANCE_AUTHORITY_FRAC'] = '0.40'
+        assert abs(get_authority_target_frac(cfg=c) - 0.40) < 1e-12
+        os.environ['DREAMER_DISTURBANCE_AUTHORITY_FRAC'] = '0.55'
+        assert abs(get_authority_target_frac(cfg=c) - 0.55) < 1e-12
+        c_ex = TrainConfig()
+        c_ex.disturbance_authority_frac = 0.70
+        c_ex._explicit_fields = {'disturbance_authority_frac'}  # type: ignore
+        assert abs(get_authority_target_frac(cfg=c_ex) - 0.70) < 1e-12
+        os.environ.pop('DREAMER_DISTURBANCE_AUTHORITY_FRAC', None)
+        os.environ.pop('AGENT_DISTURBANCE_AUTHORITY_FRAC', None)
+        os.environ['AGENT_DISTURBANCE_RECOVERY_FRAC'] = '0.50'
+        d0, _ = clamp_event_to_authority_budget(
+            proposed_delta=1.0, cv_impact_per_unit=1.0,
+            cumulative_cv_impact=10.0, mv_authority_cv=1.0,
+            target_frac=0.65)
+        assert abs(d0 + 0.50) < 1e-12
+        c_rec = TrainConfig()
+        c_rec.disturbance_recovery_frac = 0.10
+        c_rec._explicit_fields = {'disturbance_recovery_frac'}  # type: ignore
+        d1, _ = clamp_event_to_authority_budget(
+            proposed_delta=1.0, cv_impact_per_unit=1.0,
+            cumulative_cv_impact=10.0, mv_authority_cv=1.0,
+            target_frac=0.65, cfg=c_rec)
+        assert abs(d1 + 0.10) < 1e-12
+        os.environ.pop('AGENT_DISTURBANCE_RECOVERY_FRAC', None)
+        # Quiet-frac clips to 0.5 (HEAD identity). Stub uniform=0 so
+        # the gate is deterministic (seed-0 Generator is not).
+        class _QuietRng:
+            def uniform(self, *a, **k):
+                return 0.0
+            def integers(self, *a, **k):
+                raise AssertionError('quiet path must not draw integers')
+        c_q = TrainConfig()
+        c_q.disturbance_quiet_frac = 1.0
+        c_q._explicit_fields = {'disturbance_quiet_frac'}  # type: ignore
+        assert build_training_disturbance_schedule(1220, _QuietRng(), cfg=c_q) == []
+        import utils.training_disturbance as td
+        a = td._load_identifier_context()
+        b = td._load_identifier_context()
+        assert a is b, 'identifier JSON must be process-cached'
+        assert not hasattr(td, 'MVSaturationMonitor')
+        assert not hasattr(td, 'DisturbanceIntensityController')
+        assert not hasattr(td, 'disturbance_curriculum_enabled')
+        assert not hasattr(td, 'apply_episode_init_offsets')
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  operator-event TrainConfig + leftover AGENT_* identity')
+
+
 def _test_sim_runtime_cfg() -> None:
     """Wrapper seed/jitter/enable/DR: TrainConfig default, leftover SIM_*, DREAMER wins."""
     import os
@@ -2561,6 +2660,7 @@ if __name__ == '__main__':
     _test_noise_hidden_cfg()
     _test_gpu_calib_cfg()
     _test_sim_snr_cfg()
+    _test_agent_disturbance_cfg()
     _test_sim_runtime_cfg()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()

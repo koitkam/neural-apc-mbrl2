@@ -1499,6 +1499,17 @@ class TrainConfig:
     # Explicit ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` / leftover SIM_*
     # now win at bake.  ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``.
     sim_param_randomization_pct: float = -1.0
+    # Operator-event schedule (measured DV steps).  Were leftover
+    # ``AGENT_DISTURBANCE_*`` in ``utils/training_disturbance.py``
+    # (worked, missing from ``run_plan``).  Identity.  Dual-read at
+    # schedule build.  ``disturbance_settle_steps=0`` = identifier-
+    # derived.  Unused AGENT_* helpers (curriculum/progressive flags,
+    # MVSaturationMonitor, intensity controller, init-offset mix) were
+    # never called and are removed.
+    disturbance_authority_frac: float = 0.65
+    disturbance_recovery_frac: float = 0.20
+    disturbance_settle_steps: int = 0
+    disturbance_quiet_frac: float = 0.12
 
     # ---- (P90, 2026-06-06) freeze WM after P1 (critic/WM coherence) ----
     # The WM's held-action fixed point is UNSTABLE — it converges mid-P1 then
@@ -2678,6 +2689,7 @@ class APCEnv:
             rng=self.rng,
             intensity=intensity,
             sim=self.sim,
+            cfg=self.cfg,
         )
         # Per-episode hidden OU disturbance.  Bernoulli toggle gated
         # by phase-aware prob (P1/P2: 0.3, P3: 0.5).  Set force=True

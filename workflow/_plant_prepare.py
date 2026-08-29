@@ -628,6 +628,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Sentinel <0 = identifier-derived bake.  Leftover SIM_PARAM was
     # dead after wrap overwrite.  Identity env-free (auto).
     'DREAMER_SIM_PARAM_RANDOMIZATION_PCT': ('sim_param_randomization_pct', float),
+    # Operator-event schedule.  Were leftover ``AGENT_DISTURBANCE_*``
+    # (worked, missing from ``run_plan``).  Identity.  Dual-read at
+    # ``build_training_disturbance_schedule``.  Settle 0 = auto.
+    'DREAMER_DISTURBANCE_AUTHORITY_FRAC': ('disturbance_authority_frac',    float),
+    'DREAMER_DISTURBANCE_RECOVERY_FRAC':  ('disturbance_recovery_frac',     float),
+    'DREAMER_DISTURBANCE_SETTLE_STEPS':   ('disturbance_settle_steps',      int),
+    'DREAMER_DISTURBANCE_QUIET_FRAC':     ('disturbance_quiet_frac',        float),
     'DREAMER_HIDDEN_DISTURBANCE':         ('hidden_disturbance',             _as_bool),
     'DREAMER_HIDDEN_OU_AMP_RAMP':         ('hidden_ou_amp_ramp',             str),
     'DREAMER_HIDDEN_OU_AMP_MAX_SCALE':    ('hidden_ou_amp_max_scale',        float),

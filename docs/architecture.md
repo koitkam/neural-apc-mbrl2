@@ -32,6 +32,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > and plant-SNR (`sim_noise_adaptive` / `sim_ou_*` / `sim_meas_noise_*`)
 > plus wrapper seed/jitter/DR (`sim_noise_enabled` / `sim_noise_jitter_pct` /
 > `sim_domain_randomization` / `sim_param_randomization_pct` sentinel −1=auto)
+> and operator-event schedule (`disturbance_authority_frac` /
+> `disturbance_recovery_frac` / `disturbance_settle_steps` /
+> `disturbance_quiet_frac`; leftover `AGENT_DISTURBANCE_*`)
 > are TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
