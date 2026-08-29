@@ -607,6 +607,24 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_CLEAN_STEADY_SEEDS':         ('clean_steady_seeds',             _as_bool),
     'DREAMER_PROCESS_NOISE_CURRICULUM':   ('process_noise_curriculum',       _as_bool),
     'DREAMER_PROCESS_NOISE_AMP_RAMP':     ('process_noise_amp_ramp',         str),
+    # Plant SNR (process OU + measurement).  Were leftover ``SIM_*``
+    # ``os.environ.get`` in ``utils/noise_config.py`` (worked, missing
+    # from ``run_plan``).  Identity.  Dual-read at bake (phase 1a,
+    # before TrainConfig).  ``SIM_NOISE_CONFIG_JSON`` stays env-only.
+    'DREAMER_SIM_NOISE_ADAPTIVE':         ('sim_noise_adaptive',            _as_bool),
+    'DREAMER_SIM_OU_SIGMA_FRAC':          ('sim_ou_sigma_frac',             float),
+    'DREAMER_SIM_OU_GAIN_CV':             ('sim_ou_gain_cv',                float),
+    'DREAMER_SIM_OU_GAIN_DV':             ('sim_ou_gain_dv',                float),
+    'DREAMER_SIM_MEAS_NOISE_CV_FRAC':     ('sim_meas_noise_cv_frac',        float),
+    'DREAMER_SIM_MEAS_NOISE_DV_FRAC':     ('sim_meas_noise_dv_frac',        float),
+    # Runtime wrapper.  Were leftover ``SIM_NOISE_SEED`` /
+    # ``SIM_NOISE_JITTER_PCT`` / ``SIM_DOMAIN_RANDOMIZATION``.
+    # Identity.  Dual-read at wrap / DomainRandomizer (no cfg).
+    'DREAMER_SIM_NOISE_ENABLED':          ('sim_noise_enabled',            _as_bool),
+    'DREAMER_SIM_NOISE_SEED':             ('sim_noise_seed',               str),
+    'DREAMER_SIM_NOISE_JITTER_PCT':       ('sim_noise_jitter_pct',         float),
+    'DREAMER_SIM_DOMAIN_RANDOMIZATION':   ('sim_domain_randomization',     _as_bool),
+    'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED': ('sim_domain_randomization_seed', str),
     'DREAMER_HIDDEN_DISTURBANCE':         ('hidden_disturbance',             _as_bool),
     'DREAMER_HIDDEN_OU_AMP_RAMP':         ('hidden_ou_amp_ramp',             str),
     'DREAMER_HIDDEN_OU_AMP_MAX_SCALE':    ('hidden_ou_amp_max_scale',        float),

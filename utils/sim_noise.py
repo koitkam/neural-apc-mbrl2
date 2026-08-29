@@ -119,12 +119,24 @@ class DomainRandomizer:
         prefixes = list(env_prefixes or ['SIM'])
 
         # --- enabled ---
+        # Canonical DREAMER_SIM_* then leftover DREAMER_DOMAIN_RANDOMIZATION
+        # (comments claimed this worked; it never did) then prefix SIM_ /
+        # DISTILLATION_ leftovers.
         env_val = None
-        for pfx in prefixes:
-            v = os.environ.get(f'{pfx}_DOMAIN_RANDOMIZATION')
+        for key in (
+            'DREAMER_SIM_DOMAIN_RANDOMIZATION',
+            'DREAMER_DOMAIN_RANDOMIZATION',
+        ):
+            v = os.environ.get(key)
             if v is not None:
                 env_val = v
                 break
+        if env_val is None:
+            for pfx in prefixes:
+                v = os.environ.get(f'{pfx}_DOMAIN_RANDOMIZATION')
+                if v is not None:
+                    env_val = v
+                    break
         if domain_randomization is not None:
             self.enabled = bool(domain_randomization)
         elif env_val is not None:
@@ -151,11 +163,20 @@ class DomainRandomizer:
 
         # --- seed / rng ---
         env_seed = ''
-        for pfx in prefixes:
-            v = os.environ.get(f'{pfx}_DOMAIN_RANDOMIZATION_SEED', '').strip()
+        for key in (
+            'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
+            'DREAMER_DOMAIN_RANDOMIZATION_SEED',
+        ):
+            v = os.environ.get(key, '').strip()
             if v:
                 env_seed = v
                 break
+        if not env_seed:
+            for pfx in prefixes:
+                v = os.environ.get(f'{pfx}_DOMAIN_RANDOMIZATION_SEED', '').strip()
+                if v:
+                    env_seed = v
+                    break
         seed_str = (
             str(randomization_seed).strip()
             if randomization_seed is not None
@@ -505,8 +526,10 @@ class SimNoiseWrapper:
     On each ``reset()`` the wrapper multiplies every OU gain and measurement
     sigma by a uniform random factor in ``[1 - noise_jitter_pct,
     1 + noise_jitter_pct]``.  This prevents the agent from overfitting to a
-    single noise profile.  Controlled by the ``SIM_NOISE_JITTER_PCT`` env
-    var (default **0.20**, i.e. ±20 %).
+    single noise profile.  TrainConfig ``sim_noise_jitter_pct`` /
+    ``DREAMER_SIM_NOISE_JITTER_PCT`` (leftover ``SIM_NOISE_JITTER_PCT``;
+    dead ``SIM_NOISE_AMPLITUDE_JITTER_PCT`` still written by SysID
+    ``clean_mode``).  Default **0.20**, i.e. ±20 %.
 
     Domain-randomization passthrough
     ---------------------------------
@@ -534,8 +557,15 @@ class SimNoiseWrapper:
         if cfg is None:
             cfg = getattr(sim, 'noise_config', None) or {}
 
+        # --- Runtime knobs (TrainConfig / DREAMER_SIM_* / leftover SIM_*) -
+        from utils.noise_config import resolve_sim_runtime_knobs
+        runtime = resolve_sim_runtime_knobs()
+        noise_on = bool(runtime['noise_enabled'])
+        if not noise_on:
+            cfg = {}
+
         # --- Local RNG for all noise operations ---------------------------
-        seed_str = os.environ.get('SIM_NOISE_SEED', '').strip()
+        seed_str = str(runtime.get('noise_seed') or '').strip()
         if noise_seed is not None:
             self._rng = np.random.default_rng(int(noise_seed))
         elif seed_str:
@@ -544,9 +574,8 @@ class SimNoiseWrapper:
             self._rng = np.random.default_rng()
 
         # --- Noise amplitude jitter per episode ---------------------------
-        jitter_str = os.environ.get('SIM_NOISE_JITTER_PCT', '').strip()
-        self._noise_jitter_pct = float(jitter_str) if jitter_str else 0.20
-        self._noise_jitter_pct = float(np.clip(self._noise_jitter_pct, 0.0, 0.5))
+        self._noise_jitter_pct = float(np.clip(
+            float(runtime.get('jitter_pct', 0.20)), 0.0, 0.5))
 
         self._ou_sources: List[_OUSource] = []
         for entry in cfg.get('ou_noise', []):

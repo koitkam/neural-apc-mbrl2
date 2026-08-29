@@ -27,6 +27,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > observables, and **noise / hidden-load schedule** knobs
 > (`process_noise_amp_ramp`, `hidden_dist_*`, `disturbance_prob_*`) plus
 > GPU-calib budget (`gpu_target_util` / `gpu_max_bs` / `DREAMER_BATCH_SIZE`)
+> and plant-SNR (`sim_noise_adaptive` / `sim_ou_*` / `sim_meas_noise_*`)
+> plus wrapper seed/jitter/DR (`sim_noise_enabled` / `sim_noise_jitter_pct` /
+> `sim_domain_randomization`)
 > are TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance

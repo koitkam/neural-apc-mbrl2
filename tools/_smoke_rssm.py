@@ -746,6 +746,17 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_HIDDEN_DISTURBANCE': '0',
         'DREAMER_HIDDEN_DIST_P_REVERT': '0.4',
         'DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS': '0.4,0.4,0.2',
+        'DREAMER_SIM_NOISE_ADAPTIVE': '0',
+        'DREAMER_SIM_OU_SIGMA_FRAC': '0.01',
+        'DREAMER_SIM_OU_GAIN_CV': '0.2',
+        'DREAMER_SIM_OU_GAIN_DV': '0.4',
+        'DREAMER_SIM_MEAS_NOISE_CV_FRAC': '0.006',
+        'DREAMER_SIM_MEAS_NOISE_DV_FRAC': '0.012',
+        'DREAMER_SIM_NOISE_ENABLED': '0',
+        'DREAMER_SIM_NOISE_SEED': '7',
+        'DREAMER_SIM_NOISE_JITTER_PCT': '0.15',
+        'DREAMER_SIM_DOMAIN_RANDOMIZATION': '0',
+        'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED': '11',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -795,6 +806,17 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.hidden_disturbance is False
         assert abs(float(cfg.hidden_dist_p_revert) - 0.4) < 1e-12
         assert cfg.hidden_dist_shape_weights == '0.4,0.4,0.2'
+        assert cfg.sim_noise_adaptive is False
+        assert abs(float(cfg.sim_ou_sigma_frac) - 0.01) < 1e-12
+        assert abs(float(cfg.sim_ou_gain_cv) - 0.2) < 1e-12
+        assert abs(float(cfg.sim_ou_gain_dv) - 0.4) < 1e-12
+        assert abs(float(cfg.sim_meas_noise_cv_frac) - 0.006) < 1e-12
+        assert abs(float(cfg.sim_meas_noise_dv_frac) - 0.012) < 1e-12
+        assert cfg.sim_noise_enabled is False
+        assert cfg.sim_noise_seed == '7'
+        assert abs(float(cfg.sim_noise_jitter_pct) - 0.15) < 1e-12
+        assert cfg.sim_domain_randomization is False
+        assert cfg.sim_domain_randomization_seed == '11'
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -831,6 +853,17 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'hidden_disturbance' in explicit
         assert 'hidden_dist_p_revert' in explicit
         assert 'hidden_dist_shape_weights' in explicit
+        assert 'sim_noise_adaptive' in explicit
+        assert 'sim_ou_sigma_frac' in explicit
+        assert 'sim_ou_gain_cv' in explicit
+        assert 'sim_ou_gain_dv' in explicit
+        assert 'sim_meas_noise_cv_frac' in explicit
+        assert 'sim_meas_noise_dv_frac' in explicit
+        assert 'sim_noise_enabled' in explicit
+        assert 'sim_noise_seed' in explicit
+        assert 'sim_noise_jitter_pct' in explicit
+        assert 'sim_domain_randomization' in explicit
+        assert 'sim_domain_randomization_seed' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1309,6 +1342,28 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_TARGET_UTIL' in ENV_OVERRIDES
     assert 'DREAMER_MAX_BS' in ENV_OVERRIDES
     assert 'DREAMER_BATCH_SIZE' in ENV_OVERRIDES
+    assert c.sim_noise_adaptive is True
+    assert abs(float(c.sim_ou_sigma_frac) - 0.008) < 1e-12
+    assert abs(float(c.sim_ou_gain_cv) - 0.15) < 1e-12
+    assert abs(float(c.sim_ou_gain_dv) - 0.60) < 1e-12
+    assert abs(float(c.sim_meas_noise_cv_frac) - 0.005) < 1e-12
+    assert abs(float(c.sim_meas_noise_dv_frac) - 0.010) < 1e-12
+    assert 'DREAMER_SIM_NOISE_ADAPTIVE' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_OU_SIGMA_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_OU_GAIN_CV' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_OU_GAIN_DV' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_MEAS_NOISE_CV_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_MEAS_NOISE_DV_FRAC' in ENV_OVERRIDES
+    assert c.sim_noise_enabled is True
+    assert c.sim_noise_seed == ''
+    assert abs(float(c.sim_noise_jitter_pct) - 0.20) < 1e-12
+    assert c.sim_domain_randomization is True
+    assert c.sim_domain_randomization_seed == ''
+    assert 'DREAMER_SIM_NOISE_ENABLED' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_NOISE_SEED' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_NOISE_JITTER_PCT' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_DOMAIN_RANDOMIZATION' in ENV_OVERRIDES
+    assert 'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED' in ENV_OVERRIDES
     assert c.obj_reward_scale == 'auto'
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -1986,6 +2041,152 @@ def _test_gpu_calib_cfg() -> None:
     print('[smoke] OK  GPU-calib TrainConfig + DREAMER_BATCH_SIZE beats leftover OBJ')
 
 
+def _test_sim_snr_cfg() -> None:
+    """Plant SNR: TrainConfig default, leftover SIM_*, DREAMER beats leftover."""
+    import os
+    from utils.noise_config import build_noise_config, resolve_sim_snr_knobs
+    c = TrainConfig()
+    assert c.sim_noise_adaptive is True
+    assert abs(float(c.sim_ou_gain_cv) - 0.15) < 1e-12
+    assert abs(float(c.sim_ou_gain_dv) - 0.60) < 1e-12
+    keys = (
+        'DREAMER_SIM_NOISE_ADAPTIVE', 'SIM_NOISE_ADAPTIVE',
+        'DREAMER_SIM_OU_GAIN_CV', 'SIM_OU_GAIN_CV',
+        'DREAMER_SIM_OU_GAIN_DV', 'SIM_OU_GAIN_DV',
+        'DREAMER_SIM_OU_SIGMA_FRAC', 'SIM_OU_SIGMA_FRAC',
+        'DREAMER_SIM_MEAS_NOISE_CV_FRAC', 'SIM_MEAS_NOISE_CV_FRAC',
+        'DREAMER_SIM_MEAS_NOISE_DV_FRAC', 'SIM_MEAS_NOISE_DV_FRAC',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        kn = resolve_sim_snr_knobs()
+        kn_cfg = resolve_sim_snr_knobs(c)
+        assert kn == kn_cfg
+        assert kn['adaptive'] is True
+        assert abs(float(kn['ou_gain_cv']) - 0.15) < 1e-12
+        baked = build_noise_config(
+            state_variables=['CV', 'x', 'y', 'DV'],
+            cv_indices=[0], dv_indices=[3], mv_indices=[1],
+            cv_normalization_ranges=[[68.0, 96.0]],
+            dv_normalization_ranges=[[60.0, 140.0]],
+            sample_rate=4, noise_stdv=0.03,
+        )
+        ou = {row['channel_type']: row for row in baked['ou_noise']}
+        assert abs(float(ou['cv']['gain']) - 0.225) < 1e-9, ou['cv']
+        assert abs(float(ou['dv']['gain']) - 0.9) < 1e-9, ou['dv']
+        os.environ['SIM_OU_GAIN_CV'] = '0.25'
+        assert abs(float(resolve_sim_snr_knobs()['ou_gain_cv']) - 0.25) < 1e-12
+        os.environ['DREAMER_SIM_OU_GAIN_CV'] = '0.35'
+        assert abs(float(resolve_sim_snr_knobs()['ou_gain_cv']) - 0.35) < 1e-12
+        c_ex = TrainConfig()
+        c_ex.sim_ou_gain_cv = 0.11
+        c_ex._explicit_fields = {'sim_ou_gain_cv'}  # type: ignore
+        assert abs(float(resolve_sim_snr_knobs(c_ex)['ou_gain_cv']) - 0.11) < 1e-12
+        os.environ.pop('DREAMER_SIM_OU_GAIN_CV', None)
+        os.environ.pop('SIM_OU_GAIN_CV', None)
+        os.environ['SIM_NOISE_ADAPTIVE'] = '0'
+        assert resolve_sim_snr_knobs()['adaptive'] is False
+        os.environ['DREAMER_SIM_NOISE_ADAPTIVE'] = '1'
+        assert resolve_sim_snr_knobs()['adaptive'] is True
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  plant-SNR TrainConfig + DREAMER_SIM_* beats leftover SIM_*')
+
+
+def _test_sim_runtime_cfg() -> None:
+    """Wrapper seed/jitter/enable/DR: TrainConfig default, leftover SIM_*, DREAMER wins."""
+    import os
+    from utils.noise_config import build_noise_config, resolve_sim_runtime_knobs
+    from utils.sim_noise import DomainRandomizer, SimNoiseWrapper
+
+    c = TrainConfig()
+    assert c.sim_noise_enabled is True
+    assert abs(float(c.sim_noise_jitter_pct) - 0.20) < 1e-12
+    assert c.sim_domain_randomization is True
+    keys = (
+        'DREAMER_SIM_NOISE_ENABLED', 'SIM_NOISE_ENABLED',
+        'DREAMER_SIM_NOISE_SEED', 'SIM_NOISE_SEED',
+        'DREAMER_SIM_NOISE_JITTER_PCT', 'SIM_NOISE_JITTER_PCT',
+        'SIM_NOISE_AMPLITUDE_JITTER_PCT',
+        'DREAMER_SIM_DOMAIN_RANDOMIZATION', 'SIM_DOMAIN_RANDOMIZATION',
+        'DREAMER_DOMAIN_RANDOMIZATION',
+        'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
+        'SIM_DOMAIN_RANDOMIZATION_SEED',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+
+    class _Bare:
+        noise_config = {
+            'ou_noise': [{'index': 0, 'sigma': 0.01, 'gain': 1.0,
+                          'bounds': (-1.0, 1.0)}],
+            'measurement_noise': [],
+        }
+        _randomizer = None
+
+        def step(self, action):
+            return [0.0], False
+
+        def reset(self):
+            return [0.0]
+
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        kn = resolve_sim_runtime_knobs()
+        kn_cfg = resolve_sim_runtime_knobs(c)
+        assert kn == kn_cfg
+        assert kn['noise_enabled'] is True
+        assert abs(float(kn['jitter_pct']) - 0.20) < 1e-12
+        assert kn['domain_randomization'] is True
+        assert kn['noise_seed'] == ''
+        wrap = SimNoiseWrapper(_Bare())
+        assert wrap._has_noise is True
+        assert abs(float(wrap._noise_jitter_pct) - 0.20) < 1e-9
+        dr = DomainRandomizer()
+        assert dr.enabled is True
+        baked = build_noise_config(
+            state_variables=['CV', 'x', 'y', 'DV'],
+            cv_indices=[0], dv_indices=[3], mv_indices=[1],
+            cv_normalization_ranges=[[68.0, 96.0]],
+            dv_normalization_ranges=[[60.0, 140.0]],
+            sample_rate=4, noise_stdv=0.03,
+        )
+        assert baked['domain_randomization']['enabled'] is True
+        os.environ['SIM_NOISE_AMPLITUDE_JITTER_PCT'] = '0'
+        assert abs(float(resolve_sim_runtime_knobs()['jitter_pct'])) < 1e-12
+        os.environ['SIM_NOISE_JITTER_PCT'] = '0.10'
+        assert abs(float(resolve_sim_runtime_knobs()['jitter_pct']) - 0.10) < 1e-12
+        os.environ['DREAMER_SIM_NOISE_JITTER_PCT'] = '0.05'
+        assert abs(float(resolve_sim_runtime_knobs()['jitter_pct']) - 0.05) < 1e-12
+        os.environ['SIM_NOISE_ENABLED'] = '0'
+        assert resolve_sim_runtime_knobs()['noise_enabled'] is False
+        wrap_off = SimNoiseWrapper(_Bare())
+        assert wrap_off._has_noise is False
+        os.environ['DREAMER_SIM_NOISE_ENABLED'] = '1'
+        assert resolve_sim_runtime_knobs()['noise_enabled'] is True
+        os.environ['SIM_DOMAIN_RANDOMIZATION'] = '0'
+        assert resolve_sim_runtime_knobs()['domain_randomization'] is False
+        os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '1'
+        assert resolve_sim_runtime_knobs()['domain_randomization'] is True
+        c_ex = TrainConfig()
+        c_ex.sim_noise_jitter_pct = 0.33
+        c_ex._explicit_fields = {'sim_noise_jitter_pct'}  # type: ignore
+        assert abs(float(resolve_sim_runtime_knobs(c_ex)['jitter_pct']) - 0.33) < 1e-12
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  wrapper jitter/enable/DR TrainConfig + dead AMPLITUDE name')
+
+
 def _test_adv_action_corr_vectorized() -> None:
     """P3 diag: batched |corr(adv, a_i)| ≡ the old per-channel loop."""
     torch.manual_seed(0)
@@ -2316,6 +2517,8 @@ if __name__ == '__main__':
     _test_derived_observables_cfg()
     _test_noise_hidden_cfg()
     _test_gpu_calib_cfg()
+    _test_sim_snr_cfg()
+    _test_sim_runtime_cfg()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
     _test_p1_fidelity_local_plateau()

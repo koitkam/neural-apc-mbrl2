@@ -510,6 +510,7 @@ def identify_dynamics(
                 'SIM_DOMAIN_RANDOMIZATION',
                 'DISTILLATION_DOMAIN_RANDOMIZATION',
                 'SIM_NOISE_AMPLITUDE_JITTER_PCT',
+                'SIM_NOISE_JITTER_PCT',
                 'SIM_NOISE_ENABLED',
                 'SIM_DOMAIN_RANDOMIZATION_SEED',
             )
@@ -517,6 +518,7 @@ def identify_dynamics(
         os.environ['SIM_DOMAIN_RANDOMIZATION'] = '0'
         os.environ['DISTILLATION_DOMAIN_RANDOMIZATION'] = '0'
         os.environ['SIM_NOISE_AMPLITUDE_JITTER_PCT'] = '0'
+        os.environ['SIM_NOISE_JITTER_PCT'] = '0'
         os.environ['SIM_NOISE_ENABLED'] = '0'
         os.environ['SIM_DOMAIN_RANDOMIZATION_SEED'] = '1337'
         noise_stdv = 0.0
