@@ -1487,6 +1487,7 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **Not:** S=H retry, Huber/isolation reweight, leftover `DREAMER_*`, P3 on GAIN_NOT_READY. Env-free settle stays `-1`.
 - **Step 4 resolved-cfg vs P44:** identical banner except `gmatch_settle=-1` (P43 identity) and `gmatch_rest=True`. `latent=deterministic restore_p2=False gain_match=1 dob_ground=2 isolation=0 ss_match=0 iso_dcv=off n_critics=2 rs_freeze=True skip_invalid_p3=True storm_cap=2 lock=20 huber_per_in=True compile=eager`.
 - **Watch:** `[gain-match] rest-ic N=` (not FAILED / empty fallback). `[resolved-cfg] gmatch_rest=True gmatch_settle=-1`. jsonl `wm_gain_match_{mv,dv}_ratio` not stuck at 0. Skip 0 through iter 53. Iter 82 DV toward `[0.8,1.3]` not 0.75. Val DV toward P26 ×0.87 not P44 ×0.75. Storm 2/2 or G_pred≈0 → REVERT False. Still 0.75@DV at cap → FALSIFIED as DV pin. Expect `[p3-skip]` unless GAIN-READY.
+- **Liveness:** **P1 live.** GPU ~11.2 GB. tmux `mbrl2_p45`, pid **16548**, launch `cf25923`. `[env-override] gain_match_rest_ic=True`. `[gain-match] rest-ic N=6 L=128 settle=128` (not `wm_tf_horizon=220`). `[resolved-cfg] gmatch_rest=True gmatch_settle=-1`. Iter 1 recon **0.170** gmatch **0.021** skip **0** gnorm **11.4**. jsonl ratio MV **×1.031** DV **×1.071** (not G_pred≈0). `t_wm` **133 s**. **Do not launch a second GPU job.**
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
