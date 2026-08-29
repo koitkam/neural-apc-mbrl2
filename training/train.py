@@ -1366,6 +1366,20 @@ class TrainConfig:
     expert_action_jitter: float = 0.03  # Gaussian σ around expert action (norm units)
     expert_keep_schedule: bool = True   # demonstrate under curriculum disturbances
     expert_use_ss_samples: bool = True  # fit/train from a fresh steady-state sweep
+    # Move-law (unitless fractions / counts).  Were leftover
+    # ``DREAMER_EXPERT_*`` ``os.environ.get`` inside ``apc_expert``
+    # (worked, missing from ``run_plan``).  Identity defaults match
+    # the constructor fallbacks.  Dual-read leftover when the field
+    # is not explicit; explicit cfg wins.
+    expert_move_frac: float = 0.30
+    expert_backoff_frac: float = 0.12
+    expert_econ_frac: float = 0.02
+    expert_loop_gain: float = 0.6
+    expert_ridge_frac: float = 0.05
+    expert_feas_scale: float = 0.02
+    expert_econ_scale: float = 1.0
+    expert_opt_iters: int = 40
+    expert_opt_lr: float = 0.1
 
     # ----- P83: decaying P3 expert-BC anchor (anti-reversion) -----
     # P79/P80/P81b all show the SAME late-P3 reversion: the deterministic
@@ -10780,6 +10794,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 mv_names=mv_names, cv_names=cv_names, dv_names=dv_names,
                 use_ss_samples=bool(getattr(cfg, 'expert_use_ss_samples', True)),
                 seed=int(getattr(cfg, 'seed', 0)),
+                cfg=cfg,
             )
         except Exception as _exc:
             expert, expert_info = None, {'expert_type': expert_type,
@@ -13245,9 +13260,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 # ---------------------------------------------------------------------------
 
 # Architecture / runtime keys that ``workflow._plant_prepare.ENV_OVERRIDES``
-# does not own (those are plant-derived in ``single_run`` / ``bo_runner``).
-# ``_cfg_from_env`` applies these first, then the shared whitelist, so
-# ``python -m training.train`` honors the same ``DREAMER_*`` contract.
+# also owns for ``single_run`` (P50 GPU-occupied: CLI-only extras used to
+# silently drop).  ``_cfg_from_env`` applies these first, then the shared
+# whitelist.  Non-DREAMER keys stay CLI-only.
 _CLI_ONLY_ENV = (
     ('DREAMER_D_MODEL', 'd_model', int),
     ('DREAMER_N_LAYERS', 'n_layers', int),

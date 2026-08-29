@@ -41,7 +41,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > and operator-event schedule (`disturbance_authority_frac` /
 > `disturbance_recovery_frac` / `disturbance_settle_steps` /
 > `disturbance_quiet_frac`; leftover `AGENT_DISTURBANCE_*`)
-> are TrainConfig + `ENV_OVERRIDES`.
+> plus expert move-law (`expert_move_frac` / `backoff_frac` / …)
+> and CLI extras (`DREAMER_PMPO_{ALPHA,BETA}` / `POLICY_*` /
+> `GRAD_CLIP` / seed counts / plant-derived arch) that `single_run`
+> used to drop are TrainConfig + `ENV_OVERRIDES`.
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**

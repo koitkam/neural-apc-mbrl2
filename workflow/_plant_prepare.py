@@ -596,7 +596,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # expert_type ∈ {none, static, nn}; bc_scale auto-set to expert_bc_scale when
     # the expert is usable (cloning MASKED to expert steps).  See
     # utils/apc_expert.py + TrainConfig for rationale.  Dimensionless / sim-
-    # adaptive; the DREAMER_EXPERT_* move-law knobs are read inside apc_expert.
+    # adaptive.  Move-law knobs are TrainConfig + whitelist below.
     'DREAMER_EXPERT_TYPE':                ('expert_type',                    str),
     'DREAMER_EXPERT_BC_SCALE':            ('expert_bc_scale',                float),
     # P50: P1/P2 BC clones μ only (default ON). Legacy Gaussian NLL
@@ -606,6 +606,18 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_EXPERT_ACTION_JITTER':       ('expert_action_jitter',           float),
     'DREAMER_EXPERT_KEEP_SCHEDULE':       ('expert_keep_schedule',           _as_bool),
     'DREAMER_EXPERT_USE_SS_SAMPLES':      ('expert_use_ss_samples',          _as_bool),
+    # Move-law (were leftover ``os.environ.get`` in ``apc_expert``).
+    # Identity 0.30 / 0.12 / 0.02 / 0.6 / 0.05 / 0.02 / 1.0 / 40 / 0.1.
+    # Dual-read leftover when the field is not explicit.
+    'DREAMER_EXPERT_MOVE_FRAC':           ('expert_move_frac',               float),
+    'DREAMER_EXPERT_BACKOFF_FRAC':        ('expert_backoff_frac',            float),
+    'DREAMER_EXPERT_ECON_FRAC':           ('expert_econ_frac',               float),
+    'DREAMER_EXPERT_LOOP_GAIN':           ('expert_loop_gain',               float),
+    'DREAMER_EXPERT_RIDGE_FRAC':          ('expert_ridge_frac',              float),
+    'DREAMER_EXPERT_FEAS_SCALE':          ('expert_feas_scale',              float),
+    'DREAMER_EXPERT_ECON_SCALE':          ('expert_econ_scale',              float),
+    'DREAMER_EXPERT_OPT_ITERS':           ('expert_opt_iters',               int),
+    'DREAMER_EXPERT_OPT_LR':              ('expert_opt_lr',                  float),
     # P83: decaying P3 expert-BC anchor (default ON via TrainConfig; expose
     # for ablation).  expert_bc_p3 toggles the anchor, _floor sets the decay
     # floor, _adaptive_scale enables the TD3+BC return-scale normalisation.
@@ -809,6 +821,34 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # p09 RCA: tight SEPARATE actor grad clip (the tanh-squashed REINFORCE actor
     # explodes in P3; the shared grad_clip=100 is too loose for it).
     'DREAMER_ACTOR_GRAD_CLIP':            ('actor_grad_clip',                float),
+    # CLI-only extras that ``single_run`` previously dropped (only
+    # ``python -m training.train`` honored them via ``_CLI_ONLY_ENV``).
+    # Identity defaults.  Architecture / lookback are plant-derived in
+    # ``single_run``; an explicit env now wins after that construction.
+    'DREAMER_PMPO_ALPHA':                 ('pmpo_alpha',                     float),
+    'DREAMER_PMPO_BETA':                  ('pmpo_beta',                      float),
+    'DREAMER_MAE_PMAX':                   ('mae_p_max',                      float),
+    'DREAMER_POLICY_TYPE':                ('policy_type',                    str),
+    'DREAMER_POLICY_INIT_LOG_STD':        ('policy_init_log_std',            float),
+    'DREAMER_ACTOR_LOSS':                 ('actor_loss_type',                str),
+    'DREAMER_GRAD_CLIP':                  ('grad_clip',                      float),
+    'DREAMER_BASELINE_SEED_EPS':          ('baseline_seed_episodes',         int),
+    'DREAMER_BASELINE_SEED_STD':          ('baseline_seed_action_std',       float),
+    'DREAMER_RANDOM_SEED_EPS':            ('random_seed_episodes',           int),
+    'DREAMER_EXPLORATION_SEED_EPS':       ('exploration_seed_episodes',      int),
+    'DREAMER_DV_PRBS_SEEDS':              ('dv_prbs_seed_episodes',          int),
+    'DREAMER_DV_PRBS_OP_FRAC':            ('dv_prbs_op_frac',                float),
+    'DREAMER_PRBS_SEED_N_STRATA':         ('prbs_seed_n_strata',             int),
+    'DREAMER_D_MODEL':                    ('d_model',                        int),
+    'DREAMER_N_LAYERS':                   ('n_layers',                       int),
+    'DREAMER_N_HEADS':                    ('n_heads',                        int),
+    'DREAMER_FF_MULT':                    ('ff_mult',                        int),
+    'DREAMER_N_REGISTER':                 ('n_register',                     int),
+    'DREAMER_Z_DIM':                      ('z_dim',                          int),
+    'DREAMER_TOK_HIDDEN':                 ('tok_hidden',                     int),
+    'DREAMER_HEAD_HIDDEN':                ('head_hidden',                    int),
+    'DREAMER_K_MAX':                      ('k_max',                          int),
+    'DREAMER_LOOKBACK':                   ('lookback',                       int),
     # Fix B: performance-aware entropy-collapse early-stop gate (only trip when
     # the policy is also degenerate: low imag_adv_action_corr).
     'DREAMER_EARLY_STOP_ENT_COLLAPSE_MIN_ADV_CORR': ('early_stop_entropy_collapse_min_adv_corr', float),

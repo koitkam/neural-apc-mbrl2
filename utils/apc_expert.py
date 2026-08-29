@@ -53,7 +53,9 @@ Adaptivity / sim-agnosticism
 All inputs are per-sim and already produced (objective spec + identified gains +
 the SS sweep).  No plant-specific constants.  SISO and MIMO use the identical code
 path; the pseudo-inverse / surrogate degenerate gracefully to the scalar case.
-Dimensionless knobs are overridable via ``DREAMER_EXPERT_*`` env vars.
+Dimensionless knobs are overridable via TrainConfig ``expert_*`` fields
+(``DREAMER_EXPERT_*`` in ``ENV_OVERRIDES``).  Leftover env still wins
+when the field is not explicit.
 """
 
 from __future__ import annotations
@@ -66,14 +68,40 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
+def _explicit(cfg, field: str) -> bool:
+    if cfg is None:
+        return False
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
+    """Explicit TrainConfig, else leftover ``DREAMER_EXPERT_*``, else default.
+
+    Identity with the historical ``os.environ.get`` path when ``cfg`` is
+    None / the field is not explicit.  Same leftover-env class as
+    ``objective_runtime`` / ``training_disturbance``.
+    """
+    if _explicit(cfg, field):
+        try:
+            return float(getattr(cfg, field))
+        except Exception:
+            return float(default)
+    raw = os.environ.get(env_key)
+    if raw not in (None, ''):
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    if cfg is not None:
+        try:
+            return float(getattr(cfg, field, default))
+        except Exception:
+            pass
+    return float(default)
+
+
 def _env_float(key: str, default: float) -> float:
-    v = os.environ.get(key, '')
-    if v is None or str(v).strip() == '':
-        return float(default)
-    try:
-        return float(v)
-    except ValueError:
-        return float(default)
+    return _knob_float(None, '', key, default)
 
 
 # ---------------------------------------------------------------------------
@@ -379,11 +407,13 @@ class SteadyStateExpert(ABC):
     normalised ``[-1, 1]`` action space.
     """
 
-    def __init__(self, *, mv_bounds: np.ndarray, move_frac: float = 0.30):
+    def __init__(self, *, mv_bounds: np.ndarray, move_frac: float = 0.30,
+                 cfg=None):
         self.mv_bounds = np.asarray(mv_bounds, dtype='float64').reshape(-1, 2)
         self.n_mv = self.mv_bounds.shape[0]
         self.mv_span = np.maximum(self.mv_bounds[:, 1] - self.mv_bounds[:, 0], 1e-9)
-        self.move_frac = _env_float('DREAMER_EXPERT_MOVE_FRAC', move_frac)
+        self.move_frac = _knob_float(
+            cfg, 'expert_move_frac', 'DREAMER_EXPERT_MOVE_FRAC', move_frac)
         self._u = self.mv_bounds.mean(axis=1).astype('float64')
 
     # ---- lifecycle -----------------------------------------------------
@@ -459,8 +489,9 @@ class GainScheduleExpert(SteadyStateExpert):
         loop_gain: float = 0.6,
         ridge_frac: float = 0.05,
         feas_scale: float = 0.02,
+        cfg=None,
     ) -> None:
-        super().__init__(mv_bounds=mv_bounds, move_frac=move_frac)
+        super().__init__(mv_bounds=mv_bounds, move_frac=move_frac, cfg=cfg)
         self.cv_bounds = np.asarray(cv_bounds, dtype='float64').reshape(-1, 2)
         self.n_cv = self.cv_bounds.shape[0]
         self.cv_span = np.maximum(self.cv_bounds[:, 1] - self.cv_bounds[:, 0], 1e-9)
@@ -469,11 +500,16 @@ class GainScheduleExpert(SteadyStateExpert):
         self.cv_side_hi = np.asarray(cv_side_hi, dtype='float64').reshape(-1)
         self.mv_econ_sign = np.asarray(mv_econ_sign, dtype='float64').reshape(-1)
 
-        self.backoff_frac = _env_float('DREAMER_EXPERT_BACKOFF_FRAC', backoff_frac)
-        self.econ_frac = _env_float('DREAMER_EXPERT_ECON_FRAC', econ_frac)
-        self.loop_gain = _env_float('DREAMER_EXPERT_LOOP_GAIN', loop_gain)
-        self.ridge_frac = _env_float('DREAMER_EXPERT_RIDGE_FRAC', ridge_frac)
-        self.feas_scale = _env_float('DREAMER_EXPERT_FEAS_SCALE', feas_scale)
+        self.backoff_frac = _knob_float(
+            cfg, 'expert_backoff_frac', 'DREAMER_EXPERT_BACKOFF_FRAC', backoff_frac)
+        self.econ_frac = _knob_float(
+            cfg, 'expert_econ_frac', 'DREAMER_EXPERT_ECON_FRAC', econ_frac)
+        self.loop_gain = _knob_float(
+            cfg, 'expert_loop_gain', 'DREAMER_EXPERT_LOOP_GAIN', loop_gain)
+        self.ridge_frac = _knob_float(
+            cfg, 'expert_ridge_frac', 'DREAMER_EXPERT_RIDGE_FRAC', ridge_frac)
+        self.feas_scale = _knob_float(
+            cfg, 'expert_feas_scale', 'DREAMER_EXPERT_FEAS_SCALE', feas_scale)
 
         self.anchor_ops = [np.asarray(op, dtype='float64').reshape(-1) for op, _ in anchors]
         self.anchor_G = [np.asarray(G, dtype='float64').reshape(self.n_cv, self.n_mv)
@@ -680,8 +716,9 @@ class NNSteadyStateExpert(SteadyStateExpert):
         opt_iters: int = 40,
         opt_lr: float = 0.1,
         feas_scale: float = 0.02,
+        cfg=None,
     ) -> None:
-        super().__init__(mv_bounds=mv_bounds, move_frac=move_frac)
+        super().__init__(mv_bounds=mv_bounds, move_frac=move_frac, cfg=cfg)
         self.cv_bounds = np.asarray(cv_bounds, dtype='float64').reshape(-1, 2)
         self.n_cv = self.cv_bounds.shape[0]
         self.cv_span = np.maximum(self.cv_bounds[:, 1] - self.cv_bounds[:, 0], 1e-9)
@@ -693,11 +730,16 @@ class NNSteadyStateExpert(SteadyStateExpert):
         self.surrogate = surrogate
         self.nominal_dv_eu = np.asarray(nominal_dv_eu, dtype='float64').reshape(-1)
 
-        self.backoff_frac = _env_float('DREAMER_EXPERT_BACKOFF_FRAC', backoff_frac)
-        self.econ_scale = _env_float('DREAMER_EXPERT_ECON_SCALE', econ_scale)
-        self.opt_iters = int(_env_float('DREAMER_EXPERT_OPT_ITERS', float(opt_iters)))
-        self.opt_lr = _env_float('DREAMER_EXPERT_OPT_LR', opt_lr)
-        self.feas_scale = _env_float('DREAMER_EXPERT_FEAS_SCALE', feas_scale)
+        self.backoff_frac = _knob_float(
+            cfg, 'expert_backoff_frac', 'DREAMER_EXPERT_BACKOFF_FRAC', backoff_frac)
+        self.econ_scale = _knob_float(
+            cfg, 'expert_econ_scale', 'DREAMER_EXPERT_ECON_SCALE', econ_scale)
+        self.opt_iters = int(_knob_float(
+            cfg, 'expert_opt_iters', 'DREAMER_EXPERT_OPT_ITERS', float(opt_iters)))
+        self.opt_lr = _knob_float(
+            cfg, 'expert_opt_lr', 'DREAMER_EXPERT_OPT_LR', opt_lr)
+        self.feas_scale = _knob_float(
+            cfg, 'expert_feas_scale', 'DREAMER_EXPERT_FEAS_SCALE', feas_scale)
         self._dv_eu: Optional[np.ndarray] = None
 
     def is_usable(self) -> bool:
@@ -865,6 +907,7 @@ def build_static_expert(
     dv_names: Sequence[str],
     samples: Optional[Dict[str, np.ndarray]] = None,
     n_anchor: int = 5,
+    cfg=None,
 ) -> Tuple[Optional[GainScheduleExpert], Dict[str, Any]]:
     """Build a gain-scheduled static expert.
 
@@ -899,7 +942,7 @@ def build_static_expert(
     expert = GainScheduleExpert(
         mv_bounds=mv_bounds, cv_bounds=cv_bounds,
         cv_priority_weight=cv_pw, cv_side_lo=side_lo, cv_side_hi=side_hi,
-        mv_econ_sign=econ_sign, anchors=anchors, Gd=Gd,
+        mv_econ_sign=econ_sign, anchors=anchors, Gd=Gd, cfg=cfg,
     )
     ginfo['gain_condition_number'] = expert.gain_condition_number()
     ginfo['usable'] = expert.is_usable()
@@ -920,6 +963,7 @@ def build_nn_expert(
     samples: Dict[str, np.ndarray],
     epochs: int = 400,
     seed: int = 0,
+    cfg=None,
 ) -> Tuple[Optional[NNSteadyStateExpert], Dict[str, Any]]:
     """Train an MLP steady-state surrogate and wrap it in an NN expert."""
     mv = np.asarray(samples['mv'], dtype='float64')
@@ -953,6 +997,7 @@ def build_nn_expert(
         cv_violation_weight=cv_vw, cv_priority_weight=cv_pw,
         cv_side_lo=side_lo, cv_side_hi=side_hi,
         mv_econ_weight=econ_w, surrogate=surrogate, nominal_dv_eu=nominal_dv,
+        cfg=cfg,
     )
     info['usable'] = expert.is_usable()
     if not expert.is_usable():
@@ -973,6 +1018,7 @@ def build_expert(
     dv_names: Sequence[str],
     use_ss_samples: bool = True,
     seed: int = 0,
+    cfg=None,
 ) -> Tuple[Optional[SteadyStateExpert], Dict[str, Any]]:
     """Top-level dispatcher used by the trainer.
 
@@ -1008,7 +1054,7 @@ def build_expert(
             dyn_id=dyn_id, obj_spec=obj_spec, obj_w=obj_w,
             mv_bounds=mv_bounds, cv_bounds=cv_bounds,
             mv_names=mv_names, cv_names=cv_names, dv_names=dv_names,
-            samples=samples,
+            samples=samples, cfg=cfg,
         )
         info.update(ginfo)
         return expert, info
@@ -1021,7 +1067,7 @@ def build_expert(
         expert, ninfo = build_nn_expert(
             obj_spec=obj_spec, obj_w=obj_w,
             mv_bounds=mv_bounds, cv_bounds=cv_bounds,
-            cv_names=cv_names, samples=samples, seed=seed,
+            cv_names=cv_names, samples=samples, seed=seed, cfg=cfg,
         )
         info.update(ninfo)
         return expert, info

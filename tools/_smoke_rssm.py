@@ -783,6 +783,13 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_DISTURBANCE_QUIET_FRAC': '0.20',
         'DREAMER_OBJECTIVE_INTEGRAL_COEF': '0.08',
         'DREAMER_OBJECTIVE_PENALTY_CLIP': '40',
+        'DREAMER_EXPERT_MOVE_FRAC': '0.22',
+        'DREAMER_PMPO_ALPHA': '0.55',
+        'DREAMER_BASELINE_SEED_EPS': '12',
+        'DREAMER_EXPLORATION_SEED_EPS': '4',
+        'DREAMER_DV_PRBS_SEEDS': '18',
+        'DREAMER_DV_PRBS_OP_FRAC': '0.7',
+        'DREAMER_GRAD_CLIP': '80',
     }
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -851,6 +858,13 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.disturbance_quiet_frac) - 0.20) < 1e-12
         assert abs(float(cfg.objective_integral_coef) - 0.08) < 1e-12
         assert abs(float(cfg.objective_penalty_clip) - 40.0) < 1e-12
+        assert abs(float(cfg.expert_move_frac) - 0.22) < 1e-12
+        assert abs(float(cfg.pmpo_alpha) - 0.55) < 1e-12
+        assert int(cfg.baseline_seed_episodes) == 12
+        assert int(cfg.exploration_seed_episodes) == 4
+        assert int(cfg.dv_prbs_seed_episodes) == 18
+        assert abs(float(cfg.dv_prbs_op_frac) - 0.7) < 1e-12
+        assert abs(float(cfg.grad_clip) - 80.0) < 1e-12
         explicit = getattr(cfg, '_explicit_fields', set()) or set()
         assert 'aux_tbptt_steps' in explicit
         assert 'step_test_inject_n' in explicit
@@ -905,6 +919,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'disturbance_quiet_frac' in explicit
         assert 'objective_integral_coef' in explicit
         assert 'objective_penalty_clip' in explicit
+        assert 'expert_move_frac' in explicit
+        assert 'pmpo_alpha' in explicit
+        assert 'baseline_seed_episodes' in explicit
+        assert 'exploration_seed_episodes' in explicit
+        assert 'dv_prbs_seed_episodes' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1433,6 +1452,19 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_DISTURBANCE_RECOVERY_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_DISTURBANCE_SETTLE_STEPS' in ENV_OVERRIDES
     assert 'DREAMER_DISTURBANCE_QUIET_FRAC' in ENV_OVERRIDES
+    assert abs(float(c.expert_move_frac) - 0.30) < 1e-12
+    assert abs(float(c.expert_backoff_frac) - 0.12) < 1e-12
+    assert abs(float(c.pmpo_alpha) - 0.7) < 1e-12
+    assert abs(float(c.pmpo_beta) - 0.01) < 1e-12
+    assert int(c.dv_prbs_seed_episodes) == 24
+    assert 'DREAMER_EXPERT_MOVE_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_PMPO_ALPHA' in ENV_OVERRIDES
+    assert 'DREAMER_PMPO_BETA' in ENV_OVERRIDES
+    assert 'DREAMER_BASELINE_SEED_EPS' in ENV_OVERRIDES
+    assert 'DREAMER_EXPLORATION_SEED_EPS' in ENV_OVERRIDES
+    assert 'DREAMER_DV_PRBS_SEEDS' in ENV_OVERRIDES
+    assert 'DREAMER_GRAD_CLIP' in ENV_OVERRIDES
+    assert 'DREAMER_POLICY_INIT_LOG_STD' in ENV_OVERRIDES
     assert c.obj_reward_scale == 'auto'
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -1588,6 +1620,54 @@ def _test_objective_runtime_cfg() -> None:
                 os.environ[k] = old
         _AUTO_W_CACHE.clear()
     print('[smoke] OK  objective leftover TrainConfig + DREAMER beats OBJECTIVE_*')
+
+
+def _test_expert_move_law_cfg() -> None:
+    """Expert move-law leftovers: TrainConfig default, leftover env, explicit wins."""
+    import os
+    import numpy as np
+    from utils.apc_expert import GainScheduleExpert
+    from workflow._plant_prepare import ENV_OVERRIDES
+
+    c = TrainConfig()
+    assert abs(float(c.expert_move_frac) - 0.30) < 1e-12
+    assert abs(float(c.expert_backoff_frac) - 0.12) < 1e-12
+    assert abs(float(c.expert_econ_scale) - 1.0) < 1e-12
+    assert int(c.expert_opt_iters) == 40
+    assert 'DREAMER_EXPERT_MOVE_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_EXPERT_OPT_ITERS' in ENV_OVERRIDES
+    mv = np.array([[0.0, 1.0]])
+    cv = np.array([[0.0, 1.0]])
+    G = np.array([[-0.28]])
+    kw = dict(
+        mv_bounds=mv, cv_bounds=cv,
+        cv_priority_weight=np.ones(1), cv_side_lo=np.ones(1),
+        cv_side_hi=np.ones(1), mv_econ_sign=np.ones(1),
+        anchors=[(np.array([0.5]), G)],
+    )
+    keys = ('DREAMER_EXPERT_MOVE_FRAC', 'DREAMER_EXPERT_BACKOFF_FRAC')
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        e0 = GainScheduleExpert(cfg=c, **kw)
+        assert abs(e0.move_frac - 0.30) < 1e-12
+        assert abs(e0.backoff_frac - 0.12) < 1e-12
+        os.environ['DREAMER_EXPERT_MOVE_FRAC'] = '0.22'
+        e1 = GainScheduleExpert(cfg=c, **kw)
+        assert abs(e1.move_frac - 0.22) < 1e-12
+        c_ex = TrainConfig()
+        c_ex.expert_move_frac = 0.11
+        c_ex._explicit_fields = {'expert_move_frac'}  # type: ignore[attr-defined]
+        e2 = GainScheduleExpert(cfg=c_ex, **kw)
+        assert abs(e2.move_frac - 0.11) < 1e-12
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  expert move-law TrainConfig + leftover env identity')
 
 
 def _test_pin_eval_modules() -> None:
@@ -2858,6 +2938,7 @@ if __name__ == '__main__':
     _test_envfree_observer_recipe()
     _test_identified_tau_cfg()
     _test_objective_runtime_cfg()
+    _test_expert_move_law_cfg()
     _test_pin_eval_modules()
     _test_control_quality_gates()
     _test_require_realsim_actor()
