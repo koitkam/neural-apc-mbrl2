@@ -409,7 +409,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > Opening σ is not sufficient (frozen BC μ still limit-rides). HEAD also
 > zeros Adam log_std-row moments (P47 EXIT: **FALSIFIED as yank lever**).
 > P3 on-policy collect/val streams `stream_serve_step` (DV + Kalman).
-> Do not stack more critic knobs.
+> **P1/P2 BC default is MSE-on-μ** (`bc_mean_only=True`; same form as
+> P3 `expert_bc_p3_loss`) so cloning does not train log_std. P45–P49
+> Gaussian NLL pinned σ_min (P49 first P3 ent −0.283; P2 `bc_loss` ≈ −1).
+> Opt out `DREAMER_BC_MEAN_ONLY=0`. Do not stack more critic knobs.
 > Do not concat rest rows into the main `sample=True` WM rollout
 > (GRU would see sampled `c`). `actor_train_source` other than
 > `realsim` is refused at `train()` start.

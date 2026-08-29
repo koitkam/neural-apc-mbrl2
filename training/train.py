@@ -1354,6 +1354,14 @@ class TrainConfig:
     # auto-set to ``expert_bc_scale`` (cloning is MASKED to expert steps only).
     expert_type: str = 'static'
     expert_bc_scale: float = 0.15     # bc_scale applied when expert populates buffer
+    # P45–P49 RCA: P1/P2 Gaussian NLL BC pins last-Linear log_std to
+    # σ_min (P49 first P3 entropy −0.283 = H(σ_min) at ratio 1.2; P2
+    # ``bc_loss`` ≈ −1 is a peaked NLL). P3 ``expert_bc_p3_loss`` is
+    # already MSE-on-μ so it does not fight σ. Align P1/P2 to that
+    # form: clone μ, leave σ at ``policy_init_log_std``. Expert BC is
+    # a mean launchpad, not a variance teacher. Opt out
+    # ``DREAMER_BC_MEAN_ONLY=0`` (legacy NLL).
+    bc_mean_only: bool = True
     expert_seed_episodes: int = 24    # expert-driven seed episodes added in P1
     expert_action_jitter: float = 0.03  # Gaussian σ around expert action (norm units)
     expert_keep_schedule: bool = True   # demonstrate under curriculum disturbances
@@ -1776,8 +1784,9 @@ class TrainConfig:
     # Linear so σ = auto-tuned ``policy_init_log_std``; leave μ (BC
     # launchpad) intact.  Also zero Adam log_std-row moments so P2 NLL
     # momentum cannot re-collapse σ at the first unfreeze step.  Default
-    # False until P46 GPU; opt in ``DREAMER_P3_RESET_LOG_STD=1``.  Do not
-    # stack critic knobs.
+    # False (P46/P47 KEEP-AS-OVERRIDE; opening σ was not sufficient).
+    # P50 prevents the pin with ``bc_mean_only`` instead of undoing it.
+    # Opt in ``DREAMER_P3_RESET_LOG_STD=1``.  Do not stack critic knobs.
     p3_reset_log_std: bool = False
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
@@ -3809,6 +3818,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
         f"p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std', False))} "
+        f"bc_mean={bool(getattr(cfg, 'bc_mean_only', True))} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -7546,6 +7556,9 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     ``agent_hid[t]`` and predict the next ``L`` actions and rewards
     ``(a_{t+1..t+L}, r_{t+1..t+L})``. Per the paper this is implemented as
     one head with ``L`` parallel output projections (shared trunk).
+
+    Default BC is MSE-on-μ (``cfg.bc_mean_only``) so cloning does not
+    train log_std. ``DREAMER_BC_MEAN_ONLY=0`` restores Gaussian NLL.
     """
     act = batch['act']                       # (B, T, A)
     rew = batch['rew']                       # (B, T)
@@ -7586,7 +7599,22 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # it.  ``batch['expert'][t]`` flags transitions produced by the APC expert;
     # only those anchor the policy mean.  When no expert steps are present in a
     # batch the BC term is exactly zero (no gradient).
-    if L_mtp_eff < model.policy.mtp_length:
+    # ``batch['expert']`` is always present (TrajectoryBuffer.sample always
+    # emits the channel — zeros for non-expert episodes).  Align with
+    # context positions t (predicting a_{t+1..t+L}); denom>=1 keeps the
+    # term well-defined (and exactly zero) when a batch has no expert steps.
+    em = batch['expert'][:, :T_ctx].reshape(-1).to(dtype=feat.dtype)
+    denom = em.sum().clamp_min(1.0)
+    # Default MSE-on-μ (P50): same form as P3 ``expert_bc_p3_loss``.
+    # Gaussian NLL trains log_std onto the near-deterministic expert and
+    # pins σ_min before P3 (P45–P49). Discrete policies have no mean head.
+    mean_only = (bool(getattr(cfg, 'bc_mean_only', True))
+                 and hasattr(model.policy, 'mean_of_mtp'))
+    if mean_only:
+        det = model.policy.mean_of_mtp(feat, L=L_mtp_eff)
+        se = ((det - fut_act.to(dtype=det.dtype)) ** 2).mean(dim=(-1, -2))
+        bc_loss = (se * em).sum() / denom
+    elif L_mtp_eff < model.policy.mtp_length:
         # Pad target with zeros so we can use logits_mtp; mask out the pad in loss.
         pad_act = torch.zeros(B * T_ctx,
                                model.policy.mtp_length - L_mtp_eff, A,
@@ -7594,18 +7622,11 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         fut_act_full = torch.cat([fut_act, pad_act], dim=1)
         bc_lp_full = model.policy.log_prob_of_mtp(feat, fut_act_full)
         bc_lp_pos = bc_lp_full[:, :L_mtp_eff].mean(dim=1)          # (BT,)
+        bc_loss = -(bc_lp_pos * em).sum() / denom
     else:
         bc_lp = model.policy.log_prob_of_mtp(feat, fut_act)        # (BT, L)
         bc_lp_pos = bc_lp.mean(dim=1)                              # (BT,)
-
-    # ``batch['expert']`` is always present (TrajectoryBuffer.sample always
-    # emits the channel — zeros for non-expert episodes), so the mask is the
-    # single BC code path.  Align it with context positions t (predicting
-    # a_{t+1..t+L}) and clone ONLY expert-flagged steps; denom>=1 keeps the
-    # term well-defined (and exactly zero) when a batch has no expert steps.
-    em = batch['expert'][:, :T_ctx].reshape(-1).to(bc_lp_pos.dtype)  # (BT,)
-    denom = em.sum().clamp_min(1.0)
-    bc_loss = -(bc_lp_pos * em).sum() / denom
+        bc_loss = -(bc_lp_pos * em).sum() / denom
 
     # Reward MTP (twohot CE over L future rewards)
     rew_logits_all = model.reward.forward_mtp(feat)           # (BT, L, K)
@@ -7799,13 +7820,10 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         ret_c = _lambda_returns(rew_c, v_slow_c, gamma, lam, _ret_cap)
         critic_loss = critic_loss + _critic_ce(
             feat_c, v_slow_c, rew_c, ret_c)
-        # P83 FIX (p19 RCA, 2026-08-19): re-wire the P3 expert-BC anchor — it was
-        # DEAD CODE (expert_bc_p3_loss defined + unit-tested but NEVER called),
-        # so the P3 actor had NO anchor and diverged off the good BC-seeded
-        # policy once the critic advantage went noisy (return_scale runaway ->
-        # econ collapse worse than the open-loop baseline).  MSE-on-μ over the
-        # expert-flagged steps in the seed batch; grad reaches ONLY the policy
-        # (feat is detached inside expert_bc_p3_loss).
+        # P83: P3 expert-BC is MSE-on-μ (does not fight σ). Grad reaches
+        # ONLY the policy (feat is detached inside expert_bc_p3_loss).
+        # P1/P2 ``agent_finetune_loss`` uses the same form when
+        # ``bc_mean_only`` (default).
         if expert_bc_weight > 0.0:
             bc_loss_p3, _n_exp = expert_bc_p3_loss(model, critic_batch, _fc)
             bc_term = expert_bc_weight * bc_loss_p3

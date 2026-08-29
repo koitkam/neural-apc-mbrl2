@@ -29,8 +29,6 @@ Key design notes (April 2026 refactor):
   ``current_cv_bounds`` and ``current_cv_targets`` take precedence over the
   static ``bounds`` argument so the objective tracks operator setpoint
   changes during an episode.
-- ``estimate_reward_scale`` derives a per-step O(5) reward target so any
-  plant trains with similar Q-value magnitudes.
 """
 
 import os
@@ -1029,80 +1027,3 @@ def compute_objective_components(
         'production_state_index': int(production_idx),
         'cv_penalties': [float(x) for x in cv_violation_per_channel],
     }
-
-
-def estimate_reward_scale(obj_w: Dict, use_normalized: bool = True) -> Tuple[float, float]:
-    """Estimate reward_scale and penalty_clip from the objective weights.
-
-    Returns ``(reward_scale, penalty_clip)``.
-
-    Updated for April 2026 quadratic refactor:
-    - MV/CV violations are quadratic: penalty ~ weight * violation².
-    - Targets are linear: penalty ~ weight * |deviation|.
-    - Economic terms are clipped to bounds; contribution ~ weight * 0.5.
-    """
-    if not use_normalized:
-        return 1.0, 250.0
-
-    typical_cv_violation = 0.05
-    worst_cv_violation = 0.20
-    typical_mv_violation = 0.01
-    worst_mv_violation = 0.10
-    typical_target_dev = 0.10
-    worst_target_dev = 0.25
-    typical_econ_dev = 0.05
-    worst_econ_dev = 0.25
-    typical_move = 0.02
-    worst_move = 0.10
-
-    mv_tw = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_target_weights') or []))
-    cv_tw = sum(abs(_safe_float(w)) for w in (obj_w.get('cv_target_weights') or []))
-    mv_ew = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_economic_weights') or []))
-    cv_ew = sum(abs(_safe_float(w)) for w in (obj_w.get('cv_economic_weights') or []))
-    mv_mw = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_move_weights') or []))
-    cv_vw = sum(abs(_safe_float(w)) for w in (obj_w.get('cv_violation_weights') or []))
-    mv_vw = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_violation_weights') or []))
-    scalar_cv_viol = abs(_safe_float(obj_w.get('cv_violation', 0.0), 0.0))
-
-    est_typical = 0.0
-    # Quadratic violation contributions.
-    est_typical += cv_vw * (typical_cv_violation ** 2)
-    est_typical += scalar_cv_viol * typical_cv_violation
-    est_typical += mv_vw * (typical_mv_violation ** 2)
-    # Linear target contributions.
-    est_typical += (mv_tw + cv_tw) * typical_target_dev
-    est_typical += (mv_ew + cv_ew) * typical_econ_dev
-    est_typical += mv_mw * typical_move
-
-    est_worst = 0.0
-    est_worst += cv_vw * (worst_cv_violation ** 2)
-    est_worst += scalar_cv_viol * worst_cv_violation
-    est_worst += mv_vw * (worst_mv_violation ** 2)
-    est_worst += (mv_tw + cv_tw) * worst_target_dev
-    est_worst += (mv_ew + cv_ew) * worst_econ_dev
-    est_worst += mv_mw * worst_move
-
-    override_scale = os.environ.get('REWARD_SCALE', '').strip()
-    override_clip = os.environ.get('OBJECTIVE_PENALTY_CLIP', '').strip()
-    target_magnitude = float(os.environ.get('REWARD_SCALE_TARGET', '5.0'))
-
-    if override_scale:
-        try:
-            reward_scale = max(1.0, float(override_scale))
-        except ValueError:
-            reward_scale = 1.0
-    elif est_typical < 1e-8:
-        reward_scale = 1.0
-    else:
-        reward_scale = float(np.clip(target_magnitude / est_typical, 1.0, 200.0))
-
-    if override_clip:
-        try:
-            penalty_clip = max(10.0, float(override_clip))
-        except ValueError:
-            penalty_clip = 250.0
-    else:
-        worst_scaled = est_worst * reward_scale
-        penalty_clip = float(np.clip(worst_scaled / 0.8, 50.0, 5000.0))
-
-    return float(reward_scale), float(penalty_clip)

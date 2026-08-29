@@ -1130,6 +1130,19 @@ class ContinuousPolicyHead(nn.Module):
         u = 0.5 * torch.log1p(2.0 * a_clamped / (1.0 - a_clamped))
         return self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
 
+    def mean_of_mtp(self, latent: torch.Tensor,
+                    L: Optional[int] = None) -> torch.Tensor:
+        """Deterministic ``tanh(μ)`` for offsets ``[0, L)``. Shape ``(B, L, A)``.
+
+        P1/P2 MSE-on-μ BC (``bc_mean_only``) clones the mean without a
+        log_std gradient. Matches ``expert_bc_p3_loss`` at offset 0.
+        """
+        if L is None:
+            L = int(self.mtp_length)
+        L = max(1, min(int(L), int(self.mtp_length)))
+        mu, _log_std = self._params_offset(latent, L=L)
+        return torch.tanh(mu)
+
     # ---- shared interface (matches PolicyHead) ------------------------
 
     def kl_to(self, other: 'ContinuousPolicyHead',

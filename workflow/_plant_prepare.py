@@ -599,6 +599,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # adaptive; the DREAMER_EXPERT_* move-law knobs are read inside apc_expert.
     'DREAMER_EXPERT_TYPE':                ('expert_type',                    str),
     'DREAMER_EXPERT_BC_SCALE':            ('expert_bc_scale',                float),
+    # P50: P1/P2 BC clones μ only (default ON). Legacy Gaussian NLL
+    # pinned σ_min (P45–P49). Opt out ``=0``.
+    'DREAMER_BC_MEAN_ONLY':               ('bc_mean_only',                   _as_bool),
     'DREAMER_EXPERT_SEED_EPISODES':       ('expert_seed_episodes',           int),
     'DREAMER_EXPERT_ACTION_JITTER':       ('expert_action_jitter',           float),
     'DREAMER_EXPERT_KEEP_SCHEDULE':       ('expert_keep_schedule',           _as_bool),
