@@ -726,7 +726,8 @@ class TransformerSSMDynamics(nn.Module):
         return post, prior
 
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
-                         sample: bool = True, store_aux: bool = True
+                         sample: bool = True, store_aux: bool = True,
+                         last_only: bool = False
                          ) -> Tuple[torch.Tensor, torch.Tensor,
                                     torch.Tensor, TSSMState]:
         """Teacher-forced posterior rollout over (B, T, *).  ``act[:, t]`` drives
@@ -736,7 +737,8 @@ class TransformerSSMDynamics(nn.Module):
         the last state, ds (B, T, n_cv) = per-step DOB estimate (None=off), and
         cont = continuous-latent stats (always None on the TSSM scaffold).
         ``store_aux=False`` skips logit/cont stacks (same feats; isolation
-        encode)."""
+        encode).  ``last_only=True`` returns T=1 feats/ds (last step); GRU
+        recurrence identical; rest-IC encode only needs the last state."""
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                         # (B, T, embed_dim)
@@ -755,6 +757,8 @@ class TransformerSSMDynamics(nn.Module):
         _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
+        keep_aux = bool(store_aux) and not last_only
+        last_core = None
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             # COMPILE-EFFICIENT recurrence (2026-06-12, mirror of RSSMDynamics):
@@ -763,8 +767,10 @@ class TransformerSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            feats_l.append(post.feat[..., :dec_in])      # decoder feat [h,z,(c),(dv)]
-            if store_aux:
+            last_core = post.feat[..., :dec_in]          # decoder feat [h,z,(c),(dv)]
+            if not last_only:
+                feats_l.append(last_core)
+            if keep_aux:
                 post_l.append(post.z_logits)
                 prior_l.append(prior.z_logits)
                 if self.cont_dim > 0:
@@ -779,23 +785,29 @@ class TransformerSSMDynamics(nn.Module):
             state = self.initial_state(B, device)
             feats_l, post_l, prior_l, prior_core_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
+            last_core = None
             for t in range(T):
                 dv_t = dvs[:, t] if dvs is not None else None
                 post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                             dv=dv_t, sample=sample, obs=None,
                                             cont_innov=nu_seq[:, t])
                 state = post
-                feats_l.append(post.feat[..., :dec_in])
-                if store_aux:
+                last_core = post.feat[..., :dec_in]
+                if not last_only:
+                    feats_l.append(last_core)
+                if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
                     c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
                     prior_core_l.append(prior.feat[..., :dec_in])
-        post_core = torch.stack(feats_l, dim=1)          # (B, T, dec_in) = [h,z,(dv)]
-        post_logits = (torch.stack(post_l, dim=1) if store_aux else None)
-        prior_logits = (torch.stack(prior_l, dim=1) if store_aux else None)
+        if last_only:
+            post_core = last_core.unsqueeze(1)           # (B, 1, dec_in)
+        else:
+            post_core = torch.stack(feats_l, dim=1)      # (B, T, dec_in) = [h,z,(dv)]
+        post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)
+        prior_logits = (torch.stack(prior_l, dim=1) if keep_aux else None)
         ds = None
         if self.dob_enabled:
             if self.dob_active:
@@ -808,10 +820,12 @@ class TransformerSSMDynamics(nn.Module):
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
                 coef = (1.0 - K) * A                                  # (n_cv,)
                 ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
+                if last_only:
+                    ds = ds[:, -1:]
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
-                ds = torch.zeros(B, T, self.n_cv, device=device,
-                                 dtype=post_core.dtype)
+                ds = torch.zeros(B, post_core.shape[1], self.n_cv,
+                                 device=device, dtype=post_core.dtype)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = TSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               kv_cache=state.kv_cache, pos=state.pos,
@@ -823,7 +837,7 @@ class TransformerSSMDynamics(nn.Module):
         # gain+disturbance latent), matching RSSMDynamics.rollout_observed so the
         # shared _rssm_world_model_loss unpacks both backbones.  None when off.
         cont = None
-        if self.cont_dim > 0 and store_aux:
+        if self.cont_dim > 0 and keep_aux:
             cont = {
                 'post_mean': torch.stack(c_qm_l, dim=1),
                 'post_std': torch.stack(c_qs_l, dim=1),

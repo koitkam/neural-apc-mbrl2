@@ -350,10 +350,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > jsonl `wm_gain_match_mv_ratio` / `wm_gain_match_dv_ratio` =
 > mean `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss; not in P44 pid).
 > **P45 opt-in** `gain_match_rest_ic` (default False): real held-OP
-> lookback → `rollout_observed` → FD (TM rest-then-step IC; obs after
-> step like `_settle_capture`; skips P44 WM-held settle).  Isolation
-> loss stays 0.  Collect settle = max(H, lookback), not `wm_tf_horizon`.
-> Cache miss aborts (no PRBS fallback). `DREAMER_GAIN_MATCH_REST_IC=1`.
+> lookback → `rollout_observed(..., last_only=True)` → FD (TM rest-then-step
+> IC; obs after step like `_settle_capture`; skips P44 WM-held settle).
+> Isolation loss stays 0.  Collect settle = max(H, lookback), not
+> `wm_tf_horizon`.  Encode uses last state only (same `h/z/c_mean` as the
+> full T-stack; unused `(N,L,F)` dropped).  Cache miss aborts (no PRBS
+> fallback). `DREAMER_GAIN_MATCH_REST_IC=1`.
 > Head persist-on-lock writes the snapshot when the lock fires. jsonl
 > `p1_recon_best` + `wm_gain_match_mv_loss` / `wm_gain_match_dv_loss`.
 > Gain-probe line prints ss **and** `@H`. Printed observer verdict is
@@ -642,8 +644,9 @@ fixes BOTH:
   A/B only. **Opt-in rest-IC** (`gain_match_rest_ic`,
   default False): encode real held-OP lookbacks then FD (TM protocol IC;
   `DREAMER_GAIN_MATCH_REST_IC=1`). Collect pairing = TM `_settle_capture`
-  (obs after step). When the rest cache is present, P44 WM-held settle
-  is skipped. Isolation loss stays 0. jsonl `*_ratio` = mean G_pred/G_tgt.
+  (obs after step). Encode is `rollout_observed(..., last_only=True)`
+  (last state ≡ full T-stack; unused `(N,L,F)` dropped). When the rest
+  cache is present, P44 WM-held settle is skipped. Isolation loss stays 0. jsonl `*_ratio` = mean G_pred/G_tgt.
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —
   the un-cheatable DC supervisor.

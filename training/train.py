@@ -6084,13 +6084,15 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
 
     Teacher-forced posterior (TM ``_imagine_open_loop_rssm`` warm-start).
     ``sample=False`` + last ``c_mean`` (follow-up 14).  ``store_aux=False``
-    skips unused logit stacks.  None if the cache is empty.
+    skips unused logit stacks.  ``last_only=True`` skips the unused T-stack
+    (rest-IC only needs the last state; GRU recurrence identical).  None
+    if the cache is empty.
     """
     o, a = _gain_match_rest_ic_tensors(cfg, device, dtype)
     if o is None or a is None:
         return None
     _, _, _, state, *_ = rssm.rollout_observed(
-        o, a, sample=False, store_aux=False)
+        o, a, sample=False, store_aux=False, last_only=True)
     h0 = state.h
     z0 = state.z
     c0 = state.c_mean if getattr(state, 'c_mean', None) is not None else state.c

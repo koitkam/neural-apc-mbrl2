@@ -745,9 +745,36 @@ def _test_store_aux_feats_identity() -> None:
     assert post2 is None and prior2 is None
     err = float((f_full - f_iso).abs().max())
     assert err < 1e-6, f'store_aux=False feats drifted (max_err={err})'
+    with torch.no_grad():
+        f_last, _, _, st_last, ds_last, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False, last_only=True)
+        _, _, _, st_full, ds_full, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False)
+    assert f_last.shape[1] == 1, f_last.shape
+    last_err = float((f_last[:, 0] - f_full[:, -1]).abs().max())
+    assert last_err < 1e-6, f'last_only feats != stack[:, -1] (max_err={last_err})'
+    h_err = float((st_last.h - st_full.h).abs().max())
+    z_err = float((st_last.z - st_full.z).abs().max())
+    assert h_err < 1e-6 and z_err < 1e-6, (h_err, z_err)
+    if st_last.c_mean is not None:
+        c_err = float((st_last.c_mean - st_full.c_mean).abs().max())
+        assert c_err < 1e-6, c_err
+    if ds_full is not None:
+        ds_err = float((ds_last[:, 0] - ds_full[:, -1]).abs().max())
+        assert ds_err < 1e-6, ds_err
+    m.train()
+    m.zero_grad(set_to_none=True)
+    f_b, *_ = m.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True)
+    f_b.sum().backward()
+    gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
+                if p.grad is not None)
+    assert gru_g > 0.0, 'last_only observed encode lost GRU gradient'
     bud = _dob_scan_mix_budget_bytes()
     assert 4 * 1024 * 1024 <= bud <= 64 * 1024 * 1024
     print(f'[smoke] OK  store_aux=False feats identity (max_err={err:.2e}); '
+          f'observed last_only ≡ stack[:, -1] (feat={last_err:.2e} '
+          f'h={h_err:.2e} z={z_err:.2e}); gru |g|={gru_g:.3f}; '
           f'kalman mix budget={bud}')
 
 
@@ -869,6 +896,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert '_cache_gain_match_rest_ic' in _src
+    assert 'store_aux=False, last_only=True' in _src
     assert 'refusing PRBS-posterior fallback' in _src
     assert 'collect_rest_lookback' in _src
     assert '_gain_match_state_from_feat' in _src

@@ -148,7 +148,17 @@ def test_store_aux_feats_identity():
     assert post2 is None and prior2 is None
     err = float((f_full - f_iso).abs().max())
     assert err < 1e-6, f"store_aux=False feats drifted (max_err={err})"
-    print(f"[smoke] OK store_aux=False feats identity (max_err={err:.2e})")
+    with torch.no_grad():
+        f_last, _, _, st_last, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False, last_only=True)
+        _, _, _, st_full, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False)
+    last_err = float((f_last[:, 0] - f_full[:, -1]).abs().max())
+    assert last_err < 1e-6, f'last_only feats != stack[:, -1] (max_err={last_err})'
+    h_err = float((st_last.h - st_full.h).abs().max())
+    assert h_err < 1e-6, h_err
+    print(f"[smoke] OK store_aux=False feats identity (max_err={err:.2e}); "
+          f"observed last_only ≡ stack[:, -1] (feat={last_err:.2e} h={h_err:.2e})")
 
 
 def test_stepwise_equals_full_sequence():

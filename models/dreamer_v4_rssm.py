@@ -742,7 +742,8 @@ class RSSMDynamics(nn.Module):
 
     # ----- sequence rollout ---------------------------------------------
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
-                         sample: bool = True, store_aux: bool = True
+                         sample: bool = True, store_aux: bool = True,
+                         last_only: bool = False
                          ) -> Tuple[torch.Tensor, torch.Tensor,
                                     torch.Tensor, RSSMState]:
         """Teacher-forced posterior rollout over a (B, T, *) batch.
@@ -761,6 +762,12 @@ class RSSMDynamics(nn.Module):
         ``feats``).  Isolation's no-grad encode discards those tensors;
         keeping them alive for T steps was a dead alloc on the P1 hot path
         (100 WM steps/iter).  Default ``True`` is the training path.
+
+        ``last_only=True`` returns feats/ds with T=1 (the last step) and
+        skips the unused T-stack.  GRU recurrence is identical; last
+        ``RSSMState`` ≡ full-roll last state (P45 rest-IC encode only
+        needs that IC).  Aux logit/cont stacks stay ``None`` (T-stacks
+        would not match).  Isolation / main WM still need the full T.
         """
         B, T = obs.shape[:2]
         device = obs.device
@@ -794,6 +801,8 @@ class RSSMDynamics(nn.Module):
         _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
         feats_l, post_l, prior_l, prior_core_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
+        keep_aux = bool(store_aux) and not last_only
+        last_core = None
         for t in range(T):
             dv_t = dvs[:, t] if dvs is not None else None
             # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z) recurrence
@@ -806,8 +815,10 @@ class RSSMDynamics(nn.Module):
             post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                         dv=dv_t, sample=sample, obs=None)
             state = post
-            feats_l.append(post.feat[..., :dec_in])    # decoder feat [h,z,(c),(dv)]
-            if store_aux:
+            last_core = post.feat[..., :dec_in]        # decoder feat [h,z,(c),(dv)]
+            if not last_only:
+                feats_l.append(last_core)
+            if keep_aux:
                 post_l.append(post.z_logits)
                 prior_l.append(prior.z_logits)
                 if self.cont_dim > 0:
@@ -824,23 +835,29 @@ class RSSMDynamics(nn.Module):
             state = self.initial_state(B, device)
             feats_l, post_l, prior_l, prior_core_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
+            last_core = None
             for t in range(T):
                 dv_t = dvs[:, t] if dvs is not None else None
                 post, prior = self.obs_step(state, act[:, t], embeds[:, t],
                                             dv=dv_t, sample=sample, obs=None,
                                             cont_innov=nu_seq[:, t])
                 state = post
-                feats_l.append(post.feat[..., :dec_in])
-                if store_aux:
+                last_core = post.feat[..., :dec_in]
+                if not last_only:
+                    feats_l.append(last_core)
+                if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
                     c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
                     prior_core_l.append(prior.feat[..., :dec_in])
-        post_core = torch.stack(feats_l, dim=1)        # (B, T, dec_in)=[h,z,(c),(dv)]
-        post_logits = (torch.stack(post_l, dim=1) if store_aux else None)
-        prior_logits = (torch.stack(prior_l, dim=1) if store_aux else None)
+        if last_only:
+            post_core = last_core.unsqueeze(1)       # (B, 1, dec_in)
+        else:
+            post_core = torch.stack(feats_l, dim=1)    # (B, T, dec_in)=[h,z,(c),(dv)]
+        post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)
+        prior_logits = (torch.stack(prior_l, dim=1) if keep_aux else None)
         ds = None
         if self.dob_enabled:
             if self.dob_active:
@@ -854,10 +871,12 @@ class RSSMDynamics(nn.Module):
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
                 coef = (1.0 - K) * A                                  # (n_cv,)
                 ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
+                if last_only:
+                    ds = ds[:, -1:]
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
-                ds = torch.zeros(B, T, self.n_cv, device=device,
-                                 dtype=post_core.dtype)
+                ds = torch.zeros(B, post_core.shape[1], self.n_cv,
+                                 device=device, dtype=post_core.dtype)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               d=ds[:, -1], dv=state.dv, c=state.c,
@@ -867,7 +886,7 @@ class RSSMDynamics(nn.Module):
         # Continuous-latent KL stats + posterior sample (for the cont KL +
         # gain-matching aux loss + disturbance readout).  ``None`` when off.
         cont = None
-        if self.cont_dim > 0 and store_aux:
+        if self.cont_dim > 0 and keep_aux:
             cont = {
                 'post_mean': torch.stack(c_qm_l, dim=1),   # (B,T,cont_dim)
                 'post_std': torch.stack(c_qs_l, dim=1),
