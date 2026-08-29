@@ -148,6 +148,7 @@ from workflow._plant_prepare import (  # noqa: E402
     build_noise_config as _build_noise_config,
     apply_dreamer_env_overrides,
     explicit_batch_size,
+    pin_eval_modules_at_launch,
 )
 
 
@@ -633,6 +634,9 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
 
     print('[BO] Phase 1a: dynamics identification', flush=True)
     plant = identify_dynamics_from_plant(out_dir / 'plant_id')
+    base.identified_tau_dominant = float(plant['tau'])
+    base.identified_dead_time = float(plant['dead_time'])
+    pin_eval_modules_at_launch()
 
     # Plant-aware noise config — see ``workflow/_plant_prepare.build_noise_config``.
     # Builds dynamics-derived OU + measurement noise and exports

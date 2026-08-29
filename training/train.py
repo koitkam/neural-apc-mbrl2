@@ -198,6 +198,13 @@ class TrainConfig:
     lookback: int = 32        # transformer context length T_ctx
     sample_rate: int = 5
     episode_length: int = 600
+    # Identified plant timing (seconds).  Sentinel 0 = fall back to
+    # leftover ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME``
+    # env (CLI / old paths).  ``single_run`` / ``bo_runner`` write the
+    # identifier values so APCEnv / PRBS / SNR do not depend on env
+    # (P49 GPU-occupied leftover; identity).
+    identified_tau_dominant: float = 0.0
+    identified_dead_time: float = 0.0
 
     # ----- Training overall -----
     total_steps: int = 100_000
@@ -2598,17 +2605,17 @@ class APCEnv:
     def _resolve_plant_timing(self) -> "tuple[float, float]":
         """Resolve ``(tau_dominant, dead_time)`` in plant time units.
 
-        ``TrainConfig`` carries NO plant-timing fields, so reading
-        ``cfg.tau`` / ``cfg.dead_time`` always yielded 0.0 — which collapsed
-        the hidden-disturbance schedule to a 1-sample timescale (settle≈4):
-        ``ou_drift`` became α=1 white noise and step/ramp events became
-        sub-settling spikes crammed into the first ~50 steps (front-loaded,
-        high-frequency, never reaching steady state).  Both ``single_run.py``
-        and ``evaluation.validate`` export the identified plant timing as
-        ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME`` env vars, so
-        source from there (with the legacy ``SIM_`` prefix and the sim's own
-        attributes as fallbacks).  Fixed 2026-06-08.
+        Prefer ``TrainConfig.identified_tau_dominant`` /
+        ``identified_dead_time`` (set by ``single_run`` / ``bo_runner``).
+        Fall back to leftover ``IDENTIFIED_TAU_DOMINANT`` /
+        ``IDENTIFIED_DEAD_TIME`` env (CLI / old paths), then the sim's
+        own attributes.  Cached per env (timing is static for a
+        ``single_run``).
         """
+        cached = getattr(self, '_plant_timing', None)
+        if cached is not None:
+            return cached
+
         def _envf(*names: str) -> float:
             for n in names:
                 v = str(os.environ.get(n, '')).strip()
@@ -2621,19 +2628,34 @@ class APCEnv:
                 if x > 0:
                     return x
             return 0.0
+
+        def _cfgf(*names: str) -> float:
+            cfg = getattr(self, 'cfg', None)
+            if cfg is None:
+                return 0.0
+            for n in names:
+                try:
+                    x = float(getattr(cfg, n, 0.0) or 0.0)
+                except Exception:
+                    x = 0.0
+                if x > 0:
+                    return x
+            return 0.0
+
         sim = getattr(self, 'sim', None)
-        tau = float(getattr(self.cfg, 'tau', 0.0) or 0.0)
+        tau = _cfgf('identified_tau_dominant', 'tau')
         if tau <= 0:
             tau = _envf('IDENTIFIED_TAU_DOMINANT', 'SIM_IDENTIFIED_TAU_DOMINANT')
         if tau <= 0 and sim is not None:
             tau = float(getattr(sim, 'tau_dominant', 0.0)
                         or getattr(sim, 'tau', 0.0) or 0.0)
-        dead = float(getattr(self.cfg, 'dead_time', 0.0) or 0.0)
+        dead = _cfgf('identified_dead_time', 'dead_time')
         if dead <= 0:
             dead = _envf('IDENTIFIED_DEAD_TIME', 'SIM_IDENTIFIED_DEAD_TIME')
         if dead <= 0 and sim is not None:
             dead = float(getattr(sim, 'dead_time', 0.0) or 0.0)
-        return float(tau), float(dead)
+        self._plant_timing = (float(tau), float(dead))
+        return self._plant_timing
 
     def set_domain_randomization(self, enabled: bool) -> bool:
         """Toggle the sim's per-episode domain randomizer (output gain/bias/
@@ -4864,18 +4886,27 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     cont_buf = np.ones(T, dtype='float32')
     # Segment length: prefer cfg-supplied (auto-derived from plant
     # timing in auto_tune_seed_buffer ⇒ (θ + 4τ)/sr ≈ 98% settling
-    # time).  Fall back to env-var SIM_IDENTIFIED_TAU_DOMINANT for
-    # back-compat (old runs) and finally to a generous T/12 default
-    # (only triggers when neither plant timing nor cfg is available).
+    # time).  Fall back to ``cfg.identified_tau_dominant`` then leftover
+    # ``IDENTIFIED_TAU_DOMINANT`` / ``SIM_IDENTIFIED_TAU_DOMINANT`` and
+    # finally to a generous T/12 default.
     seg_cfg = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
     if seg_cfg > 0:
         seg_max = max(8, min(seg_cfg, T // 4))
     else:
         sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
-        tau_dom_env = float(os.environ.get(
-            'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
-        if tau_dom_env > 0:
-            seg_max = max(8, int(round(4.0 * tau_dom_env / sr)))
+        tau_dom = 0.0
+        try:
+            tau_dom = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+        except Exception:
+            tau_dom = 0.0
+        if tau_dom <= 0:
+            tau_dom = float(os.environ.get(
+                'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
+        if tau_dom <= 0:
+            tau_dom = float(os.environ.get(
+                'IDENTIFIED_TAU_DOMINANT', '0') or 0)
+        if tau_dom > 0:
+            seg_max = max(8, int(round(4.0 * tau_dom / sr)))
             seg_max = min(seg_max, T // 4)
         else:
             seg_max = max(8, T // 12)
@@ -9272,6 +9303,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     print(f'[runtime] cpu_threads={_nth} host_cpus={_host_cpu_count()} '
           f'device={device.type} blas={_blas}', flush=True)
     _require_realsim_actor(cfg)
+    from workflow._plant_prepare import pin_eval_modules_at_launch
+    pin_eval_modules_at_launch()
 
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim
@@ -9704,6 +9737,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 tau_dom, _ = env._resolve_plant_timing()
             except Exception:
                 tau_dom = 0.0
+            if tau_dom <= 0:
+                try:
+                    tau_dom = float(getattr(
+                        cfg, 'identified_tau_dominant', 0.0) or 0.0)
+                except Exception:
+                    tau_dom = 0.0
             if tau_dom <= 0:
                 tau_dom = float(os.environ.get(
                     'SIM_IDENTIFIED_TAU_DOMINANT', '50') or 50)

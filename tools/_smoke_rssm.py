@@ -17,7 +17,7 @@ All outputs must be finite.  Run:
 import torch
 
 from training.train import (
-    TrainConfig, build_model, world_model_loss,
+    TrainConfig, APCEnv, build_model, world_model_loss,
                             agent_finetune_loss, _realsim_actor_critic_step,
                             expert_bc_p3_loss, _adaptive_return_cap,
                             _steady_held_mask, _force_p1_cap_at,
@@ -1404,6 +1404,8 @@ def _test_envfree_observer_recipe() -> None:
     assert abs(float(c.disturbance_recovery_frac) - 0.20) < 1e-12
     assert int(c.disturbance_settle_steps) == 0
     assert abs(float(c.disturbance_quiet_frac) - 0.12) < 1e-12
+    assert abs(float(c.identified_tau_dominant)) < 1e-12
+    assert abs(float(c.identified_dead_time)) < 1e-12
     assert 'DREAMER_DISTURBANCE_AUTHORITY_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_DISTURBANCE_RECOVERY_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_DISTURBANCE_SETTLE_STEPS' in ENV_OVERRIDES
@@ -1440,6 +1442,55 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.wm_isolation_settle_episodes) == 0
     assert _isolation_teacher_on(c) is False
     print('[smoke] OK  env-free TrainConfig = gain-match observer / P28 actor')
+
+
+def _test_identified_tau_cfg() -> None:
+    """Plant τ/θ on TrainConfig; APCEnv cache; leftover env only when unset."""
+    import os
+    c = TrainConfig()
+    c.identified_tau_dominant = 53.0
+    c.identified_dead_time = 8.0
+    env = APCEnv.__new__(APCEnv)
+    env.cfg = c
+    env.sim = None
+    prev_tau = os.environ.get('IDENTIFIED_TAU_DOMINANT')
+    prev_dead = os.environ.get('IDENTIFIED_DEAD_TIME')
+    try:
+        os.environ['IDENTIFIED_TAU_DOMINANT'] = '99'
+        os.environ['IDENTIFIED_DEAD_TIME'] = '1'
+        tau, dead = env._resolve_plant_timing()
+        assert abs(tau - 53.0) < 1e-12, tau
+        assert abs(dead - 8.0) < 1e-12, dead
+        tau2, dead2 = env._resolve_plant_timing()
+        assert (tau2, dead2) == (tau, dead)
+        c0 = TrainConfig()
+        env0 = APCEnv.__new__(APCEnv)
+        env0.cfg = c0
+        env0.sim = None
+        tau0, dead0 = env0._resolve_plant_timing()
+        assert abs(tau0 - 99.0) < 1e-12, tau0
+        assert abs(dead0 - 1.0) < 1e-12, dead0
+    finally:
+        if prev_tau is None:
+            os.environ.pop('IDENTIFIED_TAU_DOMINANT', None)
+        else:
+            os.environ['IDENTIFIED_TAU_DOMINANT'] = prev_tau
+        if prev_dead is None:
+            os.environ.pop('IDENTIFIED_DEAD_TIME', None)
+        else:
+            os.environ['IDENTIFIED_DEAD_TIME'] = prev_dead
+    print('[smoke] OK  identified tau/dead_time TrainConfig beats leftover env')
+
+
+def _test_pin_eval_modules() -> None:
+    """Launch pin binds validate/TM; second call is a no-op."""
+    import sys
+    from workflow._plant_prepare import pin_eval_modules_at_launch
+    pin_eval_modules_at_launch()
+    assert 'evaluation.validate' in sys.modules
+    assert 'evaluation.wm_transfer_matrix' in sys.modules
+    pin_eval_modules_at_launch()
+    print('[smoke] OK  pin eval modules at launch (P47/P48 race)')
 
 
 def _test_require_realsim_actor() -> None:
@@ -2639,6 +2690,8 @@ if __name__ == '__main__':
     _test_stage1_dob_ground_skip()
     _test_stream_serve_matches_rollout()
     _test_envfree_observer_recipe()
+    _test_identified_tau_cfg()
+    _test_pin_eval_modules()
     _test_require_realsim_actor()
     _test_gain_match_per_input_huber()
     _test_gain_match_pred_over_tgt()

@@ -153,6 +153,7 @@ def main() -> int:
     from workflow._plant_prepare import (
         identify_dynamics, build_noise_config, identify_lookback,
         apply_dreamer_env_overrides, explicit_batch_size,
+        pin_eval_modules_at_launch,
     )
     plant_dir = out_dir / 'plant_id'
     plant_info = identify_dynamics(plant_dir)
@@ -339,6 +340,8 @@ def main() -> int:
         lookback=lookback,
         sample_rate=sample_rate,
         episode_length=episode_length,
+        identified_tau_dominant=float(tau),
+        identified_dead_time=float(dead),
         total_steps=total_steps,
         horizon=horizon,
         seq_len=seq_len,
@@ -363,6 +366,7 @@ def main() -> int:
     # ``workflow/bo_runner.py`` so future knobs only need to be added
     # in one place.
     apply_dreamer_env_overrides(cfg)
+    pin_eval_modules_at_launch()
 
     plan = {
         'simulation_dir': str(sim_dir),

@@ -179,7 +179,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > rewrites `run_plan.json → config` and prints `[resolved-cfg]` so
 > env-free audits see auto-enabled `gain_match` / `dob_ground`,
 > not the dataclass sentinels. Isolation is **not** auto-enabled
-> (P40). P29's on-disk plan is the
+> (P40). `single_run` / `train()` pin `evaluation.validate` + TM/diag
+> modules at launch so a mid-run HEAD leftover cannot race the val
+> import (P47 `resolve_wm_tf_knobs`, P48 `alloc_pinned_obs_host`).
+> Identified plant `τ`/`θ` live on TrainConfig
+> (`identified_tau_dominant` / `identified_dead_time`); APCEnv
+> caches them. P29's on-disk plan is the
 > *pre-rewrite* dump (`rssm_latent_type=categorical`).
 > **Compile leftover (same class):** `TrainConfig.compile_mode=''` was
 > documented off, but `build_model` treated empty as default-on unless

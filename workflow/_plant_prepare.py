@@ -824,3 +824,35 @@ def apply_dreamer_env_overrides(cfg) -> Iterable[str]:
         except Exception as e:
             print(f"[env-override] {env_k}={val!r} ignored: {e}", flush=True)
     return overridden
+
+
+# ---------------------------------------------------------------------------
+# 5. Pin eval modules at launch (P47/P48 late-import race)
+# ---------------------------------------------------------------------------
+
+_PINNED_EVAL_MODULES = False
+
+
+def pin_eval_modules_at_launch() -> None:
+    """Import validation/TM/diag modules once at train start.
+
+    P47 ``ImportError: resolve_wm_tf_knobs`` and P48
+    ``ImportError: alloc_pinned_obs_host``: late
+    ``from evaluation.validate import run_validation`` loaded HEAD
+    ``validate.py`` against already-imported launch-time
+    ``wm_transfer_matrix`` / ``dreamer_v4_rssm``.  Pinning at launch
+    binds the process to the launch-time eval stack so a GPU-occupied
+    leftover commit cannot race the val pass.
+    """
+    global _PINNED_EVAL_MODULES
+    if _PINNED_EVAL_MODULES:
+        return
+    import evaluation.diagnostics  # noqa: F401
+    import evaluation.validate  # noqa: F401
+    import evaluation.wm_disturbance_prediction  # noqa: F401
+    import evaluation.wm_transfer_matrix  # noqa: F401
+    import tools.wm_posterior_prior_probe  # noqa: F401
+    import tools.wm_steady_state_diagnostic  # noqa: F401
+    _PINNED_EVAL_MODULES = True
+    print('[run] pinned eval modules at launch '
+          '(P47/P48 late-import race)', flush=True)
