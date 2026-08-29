@@ -6101,7 +6101,9 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     skips unused logit stacks.  ``last_only=True`` + ``return_feats=False``
     skips the unused T-stack **and** the last feat / Stage-1 zero-``d``
     tail (rest-IC only needs ``h/z/c_mean``; GRU recurrence identical).
-    None if the cache is empty.
+    Stage-1 encode uses ``_posterior_step`` (skip unused ``prior_net`` /
+    ``cont_prior_net``; next GRU input is the posterior).  None if the
+    cache is empty.
 
     Do **not** concat rest rows into the main WM ``rollout_observed``
     (``sample=True``): the GRU would see sampled ``c``, so ``h`` ≠ this

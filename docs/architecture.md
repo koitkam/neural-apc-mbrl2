@@ -355,7 +355,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > Isolation loss stays 0.  Collect settle = max(H, lookback), not
 > `wm_tf_horizon`.  Encode uses last state only (same `h/z/c_mean` as the
 > full T-stack; unused `(N,L,F)` dropped; `return_feats=False` skips the
-> last feat / Stage-1 zero-`d` tail).  Cache miss aborts (no PRBS
+> last feat / Stage-1 zero-`d` tail).  Stage-1 encode uses `_posterior_step`
+> (skip unused `prior_net` / `cont_prior_net`; identity vs `obs_step` last
+> `h/z/c_mean`; not in P45 pid).  Cache miss aborts (no PRBS
 > fallback). `DREAMER_GAIN_MATCH_REST_IC=1`. Remaining rest-IC `t_wm`
 > cost is the L-step GRU (T sequential kernels, N-independent);
 > `last_only` does not skip it. Do not concat rest rows into the main
@@ -651,8 +653,9 @@ fixes BOTH:
   default False): encode real held-OP lookbacks then FD (TM protocol IC;
   `DREAMER_GAIN_MATCH_REST_IC=1`). Collect pairing = TM `_settle_capture`
   (obs after step). Encode is `rollout_observed(..., last_only=True,
-  return_feats=False)` (last `h/z/c_mean` ≡ full T-stack; unused T-stack
-  and last feat / Stage-1 zero-`d` tail dropped). When the rest
+  return_feats=False)` via Stage-1 `_posterior_step` (last `h/z/c_mean`
+  ≡ full T-stack; unused T-stack, last feat / Stage-1 zero-`d` tail, and
+  unused prior heads dropped). When the rest
   cache is present, P44 WM-held settle is skipped. Isolation loss stays 0. jsonl `*_ratio` = mean G_pred/G_tgt.
   `sample=False` freezes the
   categorical so the gain gradient flows into the continuous channel + decoder —

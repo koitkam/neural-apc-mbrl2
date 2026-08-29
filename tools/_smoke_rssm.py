@@ -784,12 +784,52 @@ def _test_store_aux_feats_identity() -> None:
     gru_g_nf = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
                    if p.grad is not None)
     assert gru_g_nf > 0.0, 'return_feats=False last_only lost GRU gradient'
+    # Stage-1 rest-IC path (dob_active=False): _posterior_step must match
+    # the full obs_step last state (prior heads unused).
+    m.dob_active = False
+    with torch.no_grad():
+        _, _, _, st_full_s1, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False)
+        _, _, _, st_lo_s1, *_ = m.rollout_observed(
+            obs, act, sample=False, store_aux=False, last_only=True,
+            return_feats=False)
+    s1_h = float((st_lo_s1.h - st_full_s1.h).abs().max())
+    s1_z = float((st_lo_s1.z - st_full_s1.z).abs().max())
+    assert s1_h < 1e-6 and s1_z < 1e-6, (s1_h, s1_z)
+    if st_lo_s1.c_mean is not None:
+        s1_c = float((st_lo_s1.c_mean - st_full_s1.c_mean).abs().max())
+        assert s1_c < 1e-6, s1_c
+    m.zero_grad(set_to_none=True)
+    _, _, _, st_s1_b, *_ = m.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True,
+        return_feats=False)
+    st_s1_b.h.sum().backward()
+    gru_g_s1 = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
+                   if p.grad is not None)
+    assert gru_g_s1 > 0.0, 'Stage-1 last_only posterior-step lost GRU gradient'
+    prior_g_s1 = sum(float(p.grad.abs().sum()) for p in m.prior_net.parameters()
+                     if p.grad is not None)
+    post_g_s1 = sum(float(p.grad.abs().sum()) for p in m.post_net.parameters()
+                    if p.grad is not None)
+    assert prior_g_s1 == 0.0, f'Stage-1 rest-IC still used prior_net (|g|={prior_g_s1})'
+    assert post_g_s1 > 0.0, 'Stage-1 last_only lost post_net gradient'
+    if m.cont_dim > 0:
+        cprior_g = sum(float(p.grad.abs().sum())
+                       for p in m.cont_prior_net.parameters()
+                       if p.grad is not None)
+        cpost_g = sum(float(p.grad.abs().sum())
+                      for p in m.cont_post_net.parameters()
+                      if p.grad is not None)
+        assert cprior_g == 0.0, f'Stage-1 rest-IC still used cont_prior (|g|={cprior_g})'
+        assert cpost_g > 0.0, 'Stage-1 last_only lost cont_post_net gradient'
+    m.dob_active = True
     bud = _dob_scan_mix_budget_bytes()
     assert 4 * 1024 * 1024 <= bud <= 64 * 1024 * 1024
     print(f'[smoke] OK  store_aux=False feats identity (max_err={err:.2e}); '
           f'observed last_only ≡ stack[:, -1] (feat={last_err:.2e} '
           f'h={h_err:.2e} z={z_err:.2e}); gru |g|={gru_g:.3f}; '
           f'return_feats=False h={nf_h:.2e} z={nf_z:.2e} gru |g|={gru_g_nf:.3f}; '
+          f'Stage-1 last_only ≡ full h={s1_h:.2e} gru |g|={gru_g_s1:.3f}; '
           f'kalman mix budget={bud}')
 
 
@@ -914,6 +954,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_require_realsim_actor' in _src
     assert 'store_aux=False, last_only=True' in _src
     assert 'return_feats=False' in _src
+    assert '_posterior_step' in _src
     assert 'refusing PRBS-posterior fallback' in _src
     assert 'collect_rest_lookback' in _src
     assert '_gain_match_state_from_feat' in _src

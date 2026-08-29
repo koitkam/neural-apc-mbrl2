@@ -162,9 +162,24 @@ def test_store_aux_feats_identity():
         return_feats=False)
     nf_h = float((st_nf.h.detach() - st_full.h).abs().max())
     assert nf_h < 1e-6, nf_h
+    # dob off (default): last_only already uses _posterior_step.  Confirm
+    # prior_net is unused on that path.
+    m.train()
+    m.zero_grad(set_to_none=True)
+    _, _, _, st_b, *_ = m.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True,
+        return_feats=False)
+    st_b.h.sum().backward()
+    prior_g = sum(float(p.grad.abs().sum()) for p in m.prior_net.parameters()
+                  if p.grad is not None)
+    post_g = sum(float(p.grad.abs().sum()) for p in m.post_net.parameters()
+                 if p.grad is not None)
+    assert prior_g == 0.0, f'TSSM last_only used prior_net (|g|={prior_g})'
+    assert post_g > 0.0, 'TSSM last_only lost post_net gradient'
     print(f"[smoke] OK store_aux=False feats identity (max_err={err:.2e}); "
           f"observed last_only ≡ stack[:, -1] (feat={last_err:.2e} h={h_err:.2e}); "
-          f"return_feats=False h={nf_h:.2e}")
+          f"return_feats=False h={nf_h:.2e}; Stage-1 prior_net |g|={prior_g:.1f} "
+          f"post_net |g|={post_g:.3f}")
 
 
 def test_stepwise_equals_full_sequence():

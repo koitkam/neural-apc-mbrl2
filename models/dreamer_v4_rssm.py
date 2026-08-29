@@ -617,17 +617,18 @@ class RSSMDynamics(nn.Module):
         return out
 
     # ----- transitions --------------------------------------------------
-    def img_step(self, prev: RSSMState, prev_action: torch.Tensor,
-                 dv: Optional[torch.Tensor] = None,
-                 sample: bool = True) -> RSSMState:
-        """Imagined (prior-only) step: advance the state with no obs.
+    def _gru_transition(self, prev: RSSMState, prev_action: torch.Tensor,
+                        dv: Optional[torch.Tensor] = None
+                        ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+                                   Optional[torch.Tensor]]:
+        """pre_gru + GRUCell + DOB predict + DV carry.
 
-        ``dv`` (B, dv_dim) is the exogenous measured-DV input when DV-as-input
-        is enabled (``dv_dim > 0``); ``None`` is filled with zeros.  Ignored
-        entirely when ``dv_dim == 0`` (paper behaviour)."""
-        # GRU transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
-        # latent feeds the recurrence so ``h`` carries the gain/disturbance
-        # forward and the prior ``cont_prior_net(h')`` can roll them.
+        Shared by ``img_step`` (prior heads on ``h``) and rest-IC
+        ``_posterior_step`` (posterior heads on ``h``; prior_net unused).
+        Returns ``(h, d_new, dv_new)``.
+        """
+        # GRU input = [z_flat ; (c) ; action ; (dv)].  Continuous latent
+        # feeds the recurrence so ``h`` carries gain/disturbance forward.
         parts = [prev.stoch_flat]
         if self.cont_dim > 0:
             c_prev = prev.c
@@ -643,9 +644,21 @@ class RSSMDynamics(nn.Module):
                                  device=prev_action.device,
                                  dtype=prev_action.dtype)
             parts.append(dv)
-        x = torch.cat(parts, dim=-1)
-        x = self.pre_gru(x)
-        h = self.gru(x, prev.h)
+        h = self.gru(self.pre_gru(torch.cat(parts, dim=-1)), prev.h)
+        d_new = (self.dob_decay() * prev.d
+                 if (self.dob_enabled and prev.d is not None) else prev.d)
+        dv_new = dv if self.dv_feedforward else None
+        return h, d_new, dv_new
+
+    def img_step(self, prev: RSSMState, prev_action: torch.Tensor,
+                 dv: Optional[torch.Tensor] = None,
+                 sample: bool = True) -> RSSMState:
+        """Imagined (prior-only) step: advance the state with no obs.
+
+        ``dv`` (B, dv_dim) is the exogenous measured-DV input when DV-as-input
+        is enabled (``dv_dim > 0``); ``None`` is filled with zeros.  Ignored
+        entirely when ``dv_dim == 0`` (paper behaviour)."""
+        h, d_new, dv_new = self._gru_transition(prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
         # Continuous-latent prior p(c'|h'): gain persists (carried via h) and
         # the disturbance OU-rolls; both inferred from the recurrent state.
@@ -674,14 +687,30 @@ class RSSMDynamics(nn.Module):
                     if self.cont_dist_deterministic_roll
                     else c_new[..., self.cont_gain_dim:])
                 c_new = torch.cat([gain_part, dist_part], dim=-1)
-        # DOB predict step: decay the disturbance estimate (no obs to correct).
-        d_new = (self.dob_decay() * prev.d
-                 if (self.dob_enabled and prev.d is not None) else prev.d)
-        # DV feedforward: carry the (real / held / zero-filled) DV into the
-        # state so ``feat`` + ``decode`` expose it to the decoder and heads.
-        dv_new = dv if self.dv_feedforward else None
         return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
+
+    def _posterior_step(self, prev: RSSMState, prev_action: torch.Tensor,
+                        embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
+                        sample: bool = True) -> RSSMState:
+        """Teacher-forced posterior step without unused prior heads.
+
+        Rest-IC ``last_only`` encode: the next GRU input is this posterior
+        ``(z, c)``, never the prior.  ``prior_net`` / ``cont_prior_net`` do
+        not feed ``h/z/c_mean``.  Same GRU + posterior nets as
+        ``obs_step(..., obs=None)[0]`` when Kalman / two-pass are off
+        (Stage-1 P1 rest-IC: ``dob_active=False``, ``cont_dist_dim=0``).
+        """
+        h, d_new, dv_new = self._gru_transition(prev, prev_action, dv)
+        post_in = torch.cat([h, embed], dim=-1)
+        post_logits, post_z = self.post_net(post_in, sample=sample)
+        c_post = c_post_mean = c_post_std = None
+        if self.cont_dim > 0:
+            c_post, c_post_mean, c_post_std = self.cont_post_net(
+                post_in, sample=sample)
+        return RSSMState(h=h, z_logits=post_logits, z=post_z, d=d_new,
+                         dv=dv_new, c=c_post, c_mean=c_post_mean,
+                         c_std=c_post_std)
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -772,6 +801,11 @@ class RSSMDynamics(nn.Module):
         ``return_feats=False`` (with ``last_only``) skips even the last
         feat / Stage-1 zero-``d`` tail — rest-IC only reads ``h/z/c_mean``.
         Ignored when ``last_only`` is False.
+
+        When ``last_only`` and Kalman / two-pass are off, the loop uses
+        ``_posterior_step`` (skip unused ``prior_net`` / ``cont_prior_net``;
+        next GRU input is the posterior).  Identity vs ``obs_step`` last
+        ``h/z/c_mean``.  P2 ``dob_active`` still needs the prior core.
         """
         B, T = obs.shape[:2]
         device = obs.device
@@ -811,28 +845,40 @@ class RSSMDynamics(nn.Module):
         # discarding all but the last.  Kalman / two-pass still need
         # per-step prior.feat.  Materialize the last post.feat once.
         _stack_post = not last_only
-        for t in range(T):
-            dv_t = dvs[:, t] if dvs is not None else None
-            # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z) recurrence
-            # with ``obs=None`` so neither the DOB d-update NOR the per-step prior
-            # decode (used for both the DOB and the cont innovation) enters the
-            # compiled loop — the EXPENSIVE decode is hoisted OUT and done ONCE,
-            # batched, below (the T× decoder-MLP copies otherwise made the
-            # rollout ~15 min to compile / run launch-bound).  ``d`` does NOT
-            # affect h/z, and the cont innovation is fed in pass 2.
-            post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        dv=dv_t, sample=sample, obs=None)
-            state = post
-            if _stack_post:
-                feats_l.append(post.feat[..., :dec_in])
-            if keep_aux:
-                post_l.append(post.z_logits)
-                prior_l.append(prior.z_logits)
-                if self.cont_dim > 0:
-                    c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                    c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-            if _need_prior_core:
-                prior_core_l.append(prior.feat[..., :dec_in])
+        # Stage-1 rest-IC: posterior-only (prior heads unused).  P2 DOB /
+        # cont-dist two-pass still need obs_step + prior.feat.
+        use_post_only = bool(last_only) and not two_pass and not _need_prior_core
+        if use_post_only:
+            acts = act.unbind(1)
+            embs = embeds.unbind(1)
+            dv_seq = (dvs.unbind(1) if dvs is not None
+                      else (None,) * T)
+            pstep = self._posterior_step
+            for t in range(T):
+                state = pstep(state, acts[t], embs[t], dv=dv_seq[t],
+                              sample=sample)
+        else:
+            for t in range(T):
+                dv_t = dvs[:, t] if dvs is not None else None
+                # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z)
+                # recurrence with ``obs=None`` so neither the DOB d-update
+                # NOR the per-step prior decode enters the compiled loop —
+                # the EXPENSIVE decode is hoisted OUT and done ONCE, batched,
+                # below.  ``d`` does NOT affect h/z; cont innovation is
+                # fed in pass 2.
+                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                                            dv=dv_t, sample=sample, obs=None)
+                state = post
+                if _stack_post:
+                    feats_l.append(post.feat[..., :dec_in])
+                if keep_aux:
+                    post_l.append(post.z_logits)
+                    prior_l.append(prior.z_logits)
+                    if self.cont_dim > 0:
+                        c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                        c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if _need_prior_core:
+                    prior_core_l.append(prior.feat[..., :dec_in])
         if two_pass:
             # ONE batched prior decode → CV forecast → innovation ν, then
             # re-roll with the innovation-driven cont posterior.

@@ -572,6 +572,27 @@ class TransformerSSMDynamics(nn.Module):
         return x[:, 0], new_cache
 
     # ----- transitions -----
+    def _core_transition(self, prev: 'TSSMState', prev_action: torch.Tensor,
+                         dv: Optional[torch.Tensor] = None
+                         ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+                                    Optional[torch.Tensor], list, int]:
+        """Token + KV-cache step + DOB predict + DV carry.
+
+        Shared by ``img_step`` (prior heads) and rest-IC ``_posterior_step``.
+        Returns ``(h, d_new, dv_new, new_cache, new_pos)``.
+        """
+        if self.dv_feedforward and dv is None:
+            dv = torch.zeros(prev_action.shape[0], self.dv_dim,
+                             device=prev_action.device, dtype=prev_action.dtype)
+        token = self._build_token(prev.z, prev_action, dv, getattr(prev, 'c', None))
+        cache = getattr(prev, 'kv_cache', None)
+        pos = int(getattr(prev, 'pos', 0) or 0)
+        h, new_cache = self._step(token, cache, pos)
+        d_new = (self.dob_decay() * prev.d
+                 if (self.dob_enabled and prev.d is not None) else prev.d)
+        dv_new = dv if self.dv_feedforward else None
+        return h, d_new, dv_new, new_cache, pos + 1
+
     def img_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  dv: Optional[torch.Tensor] = None,
                  sample: bool = True) -> TSSMState:
@@ -580,15 +601,8 @@ class TransformerSSMDynamics(nn.Module):
         new position.  ``dv`` (B, dv_dim) is the exogenous measured-DV input
         when DV-as-input is on; ``None`` -> zeros.  ``kv_cache=None`` (feat-only
         reconstruction by a Markovian consumer) starts a fresh context."""
-        # DV feedforward: materialise the (possibly zero-filled) DV so it can be
-        # both fed to the token AND stored in the state (decoder + heads read it).
-        if self.dv_feedforward and dv is None:
-            dv = torch.zeros(prev_action.shape[0], self.dv_dim,
-                             device=prev_action.device, dtype=prev_action.dtype)
-        token = self._build_token(prev.z, prev_action, dv, getattr(prev, 'c', None))
-        cache = getattr(prev, 'kv_cache', None)
-        pos = int(getattr(prev, 'pos', 0) or 0)
-        h, new_cache = self._step(token, cache, pos)
+        h, d_new, dv_new, new_cache, new_pos = self._core_transition(
+            prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
         # Continuous-latent prior p(c'|h') (gain persists, disturbance OU-rolls).
         c_new = c_mean = c_std = None
@@ -612,12 +626,30 @@ class TransformerSSMDynamics(nn.Module):
                     if self.cont_dist_deterministic_roll
                     else c_new[..., self.cont_gain_dim:])
                 c_new = torch.cat([gain_part, dist_part], dim=-1)
-        d_new = (self.dob_decay() * prev.d
-                 if (self.dob_enabled and prev.d is not None) else prev.d)
-        dv_new = dv if self.dv_feedforward else None
         return TSSMState(h=h, z_logits=z_logits, z=z,
-                         kv_cache=new_cache, pos=pos + 1, d=d_new, dv=dv_new,
+                         kv_cache=new_cache, pos=new_pos, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
+
+    def _posterior_step(self, prev: TSSMState, prev_action: torch.Tensor,
+                        embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
+                        sample: bool = True) -> TSSMState:
+        """Teacher-forced posterior step without unused prior heads.
+
+        Rest-IC ``last_only`` encode: next token is this posterior ``(z, c)``.
+        Same core + posterior nets as ``obs_step(..., obs=None)[0]`` when
+        Kalman / two-pass are off.
+        """
+        h, d_new, dv_new, new_cache, new_pos = self._core_transition(
+            prev, prev_action, dv)
+        post_in = torch.cat([h, embed], dim=-1)
+        post_logits, post_z = self.post_net(post_in, sample=sample)
+        c_post = c_post_mean = c_post_std = None
+        if self.cont_dim > 0:
+            c_post, c_post_mean, c_post_std = self.cont_post_net(
+                post_in, sample=sample)
+        return TSSMState(h=h, z_logits=post_logits, z=post_z,
+                         kv_cache=new_cache, pos=new_pos, d=d_new, dv=dv_new,
+                         c=c_post, c_mean=c_post_mean, c_std=c_post_std)
 
     def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,
                     actions: torch.Tensor,
@@ -738,10 +770,12 @@ class TransformerSSMDynamics(nn.Module):
         the last state, ds (B, T, n_cv) = per-step DOB estimate (None=off), and
         cont = continuous-latent stats (always None on the TSSM scaffold).
         ``store_aux=False`` skips logit/cont stacks (same feats; isolation
-        encode).  ``last_only=True`` returns T=1 feats/ds (last step); GRU
+        encode).  ``last_only=True`` returns T=1 feats/ds (last step); core
         recurrence identical; rest-IC encode only needs the last state.
         ``return_feats=False`` (with ``last_only``) skips the last feat /
-        Stage-1 zero-``d`` tail.  Ignored when ``last_only`` is False."""
+        Stage-1 zero-``d`` tail.  Ignored when ``last_only`` is False.
+        When ``last_only`` and Kalman / two-pass are off, uses
+        ``_posterior_step`` (skip unused prior heads)."""
         B, T = obs.shape[:2]
         device = obs.device
         embeds = self.embed(obs)                         # (B, T, embed_dim)
@@ -763,24 +797,34 @@ class TransformerSSMDynamics(nn.Module):
         keep_aux = bool(store_aux) and not last_only
         # last_only: materialize post.feat once after the loop (rest-IC).
         _stack_post = not last_only
-        for t in range(T):
-            dv_t = dvs[:, t] if dvs is not None else None
-            # COMPILE-EFFICIENT recurrence (2026-06-12, mirror of RSSMDynamics):
-            # ``obs=None`` keeps the per-step prior decode (for the DOB d-update
-            # AND the cont innovation) OUT of the loop — hoisted + batched below.
-            post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        dv=dv_t, sample=sample, obs=None)
-            state = post
-            if _stack_post:
-                feats_l.append(post.feat[..., :dec_in])
-            if keep_aux:
-                post_l.append(post.z_logits)
-                prior_l.append(prior.z_logits)
-                if self.cont_dim > 0:
-                    c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                    c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-            if _need_prior_core:
-                prior_core_l.append(prior.feat[..., :dec_in])
+        use_post_only = bool(last_only) and not two_pass and not _need_prior_core
+        if use_post_only:
+            acts = act.unbind(1)
+            embs = embeds.unbind(1)
+            dv_seq = (dvs.unbind(1) if dvs is not None
+                      else (None,) * T)
+            pstep = self._posterior_step
+            for t in range(T):
+                state = pstep(state, acts[t], embs[t], dv=dv_seq[t],
+                              sample=sample)
+        else:
+            for t in range(T):
+                dv_t = dvs[:, t] if dvs is not None else None
+                # COMPILE-EFFICIENT recurrence (2026-06-12, mirror of RSSM):
+                # ``obs=None`` keeps the per-step prior decode OUT of the loop.
+                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                                            dv=dv_t, sample=sample, obs=None)
+                state = post
+                if _stack_post:
+                    feats_l.append(post.feat[..., :dec_in])
+                if keep_aux:
+                    post_l.append(post.z_logits)
+                    prior_l.append(prior.z_logits)
+                    if self.cont_dim > 0:
+                        c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                        c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if _need_prior_core:
+                    prior_core_l.append(prior.feat[..., :dec_in])
         if two_pass:
             prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
             base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
