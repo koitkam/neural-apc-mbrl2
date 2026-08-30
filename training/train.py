@@ -6816,8 +6816,16 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
         return _rest_ic_last_tensors(rssm, o, a)
 
     try:
-        graphed = torch.cuda.make_graphed_callables(
-            _fn, (obs, act), num_warmup_iters=2)
+        # Eager WM steps run inside bf16 autocast.
+        # ``make_graphed_callables`` rejects autocast cache (P55 first
+        # GPU capture: RuntimeError … set cache_enabled=False). Nested
+        # cache_enabled=False records the same bf16 kernels. Fail still
+        # falls back to the eager T-loop.
+        with torch.amp.autocast(
+                device_type=obs.device.type, dtype=torch.bfloat16,
+                enabled=True, cache_enabled=False):
+            graphed = torch.cuda.make_graphed_callables(
+                _fn, (obs, act), num_warmup_iters=2)
     except Exception as e:
         print('[gain-match] rest-ic CUDA graph capture failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)

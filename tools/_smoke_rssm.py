@@ -1335,6 +1335,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_rest_ic_state' in _src
     assert '_rest_ic_can_cuda_graph' in _src
     assert 'make_graphed_callables' in _src
+    assert 'cache_enabled=False' in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src

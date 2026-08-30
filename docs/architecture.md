@@ -63,7 +63,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > `critic_mc_loss`. Do **not** promote
 > `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
 > reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
-> canary restores in-flight grads.
+> canary restores in-flight grads. P55 pid capture failed (autocast
+> cache) → eager T-loop; HEAD `cache_enabled=False`.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
