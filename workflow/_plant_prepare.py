@@ -840,6 +840,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_ES_P3_PATIENCE':             ('early_stop_p3_patience_iters',   int),
     'DREAMER_ES_P3_MIN_IMPROVEMENT':      ('early_stop_p3_min_improvement',  float),
     'DREAMER_ES_ENT_FRAC':                ('early_stop_entropy_collapse_frac',          float),
+    'DREAMER_ES_ENT_FLOOR_FRAC':          ('early_stop_entropy_collapse_floor_frac',    float),
     'DREAMER_ES_ENT_PATIENCE':            ('early_stop_entropy_collapse_patience_iters', int),
     'DREAMER_ES_ENT_WINDOW':              ('early_stop_entropy_collapse_window_iters',   int),
     'DREAMER_ES_ENT_MIN_BELOW':           ('early_stop_entropy_collapse_min_frac_below', float),

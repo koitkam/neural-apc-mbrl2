@@ -1974,6 +1974,13 @@ class TrainConfig:
     # collapse and never accumulates a long enough consecutive streak,
     # so the legacy patience-based detector never trips.
     early_stop_entropy_collapse_frac: float = 0.20
+    # P53 RCA: a 0.20-*nat* floor margin is larger than the whole
+    # allowed σ band when ``sigma_min_ratio=1.2`` (log(1.2)≈0.182), so
+    # H(σ_max)≈H(σ_init) sat *below* the trip and frozen-σ P3 died on
+    # ``adv_corr<0.05``.  Unitless fraction of ``H(σ_max)−H(σ_min)``
+    # above the floor (0.25 = bottom quartile).  ≤0 → legacy
+    # ``frac * H(σ=1)`` only.  ``DREAMER_ES_ENT_FLOOR_FRAC``.
+    early_stop_entropy_collapse_floor_frac: float = 0.25
     early_stop_entropy_collapse_window_iters: int = 30
     early_stop_entropy_collapse_min_frac_below: float = 0.70
     # Performance gate (Fix B, 2026-06-22): an entropy-near-floor window is only
@@ -4022,6 +4029,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
         f"p3_logpclip={float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0):g} "
         f"p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0):g} "
+        f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -7929,6 +7937,54 @@ def _p3_logp_clip_bound(clip: float, n_act: int) -> float:
     if c <= 0.0:
         return 0.0
     return c * float(max(1, int(n_act)))
+
+
+def _gaussian_entropy_nats(log_std: float, n_act: int) -> float:
+    """Independent-Gaussian H = n_act · (log σ + ½ log(2πe))."""
+    unit_g = 0.5 * math.log(2.0 * math.pi * math.e)
+    return float(max(1, int(n_act))) * (float(log_std) + unit_g)
+
+
+def _entropy_collapse_threshold(
+        cfg: 'TrainConfig',
+        n_act: int,
+        reference_entropy: float,
+        ) -> Optional[float]:
+    """P3 entropy-collapse trip, or ``None`` to skip (no distinguishable band).
+
+    P53 RCA: with ``sigma_min_ratio=1.2``, a 0.20-nat floor *margin*
+    (never a TrainConfig field) was larger than the allowed σ band
+    (``log(1.2)≈0.182``), so H(σ_max)≈H(σ_init) sat *below* the trip
+    (P53 thr=−0.083, open-σ ent=−0.101). Frozen-σ P3 then died on
+    ``adv_corr<0.05`` while entropy was at the designed operating
+    point.
+
+    Continuous: trip at ``H(σ_min) + floor_frac · (H(σ_max)−H(σ_min))``
+    (unitless; default 0.25 = bottom quartile). Still ``min``'d with
+    the legacy ``frac · H(σ=1)`` so the band check only *loosens*.
+    Discrete: legacy ``frac · log(K)``. ``floor_frac<=0`` → legacy
+    only. Tiny σ-band (ratio≈1) → ``None`` (p3_plateau still runs).
+    """
+    frac = float(getattr(cfg, 'early_stop_entropy_collapse_frac', 0.20))
+    legacy = frac * float(reference_entropy)
+    ptype = str(getattr(cfg, 'policy_type', 'continuous') or '').lower()
+    if ptype != 'continuous':
+        return float(legacy)
+    n = max(1, int(n_act or 1))
+    h_min = _gaussian_entropy_nats(
+        float(getattr(cfg, 'policy_log_std_min', -2.3)), n)
+    h_max = _gaussian_entropy_nats(
+        float(getattr(cfg, 'policy_log_std_max', 0.0)), n)
+    gap = h_max - h_min
+    if gap <= 1e-6:
+        return None
+    floor_frac = float(getattr(
+        cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0)
+    if floor_frac <= 0.0:
+        return float(legacy)
+    floor_frac = min(float(floor_frac), 0.99)
+    band_thr = h_min + floor_frac * gap
+    return float(band_thr if band_thr < legacy else legacy)
 
 
 def _p3_policy_logp(policy, feat: torch.Tensor, act: torch.Tensor,
@@ -13217,119 +13273,81 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 if early_stop_reason is None and current_phase == 3:
                     ent = row.get('entropy_mean')
                     if ent is not None:
-                        thr = (float(getattr(cfg,
-                                'early_stop_entropy_collapse_frac', 0.20))
-                               * n_action_bins_log)
-                        # Floor-relative collapse threshold
-                        # (2026-05-14, run_p22 RCA): the legacy
-                        # ceiling-relative formula
-                        #   thr = H_max(σ_max) − 0.10
-                        # tripped on every healthy run with a tight
-                        # σ_max because *any* shrink below the ceiling
-                        # (even down to σ_max/2) was flagged as
-                        # collapse.  σ legitimately moves below the
-                        # ceiling as the actor learns to commit;
-                        # collapse only matters when σ is approaching
-                        # σ_min (the floor) and exploration is dying.
-                        # Recompute thr from σ_min:
-                        #   H_floor(σ_min) = log_std_min + 0.5·log(2πe)
-                        #   thr = H_floor + margin
-                        # Trip only when entropy stays within ``margin``
-                        # nats of the floor (default 0.20 ≈ σ within
-                        # 22% of σ_min).  Keep the legacy ``thr`` as
-                        # the *upper* bound (still trip on truly
-                        # silent policies that fall below
-                        # 0.20·log(n_bins)), so the floor-relative
-                        # check only loosens the trip, never tightens
-                        # it past the legacy default.
-                        if str(getattr(cfg, 'policy_type', 'continuous')
-                                ).lower() == 'continuous':
-                            log_std_min = float(getattr(cfg,
-                                    'policy_log_std_min', -2.3))
-                            unit_g = 0.5 * math.log(2.0 * math.pi * math.e)
-                            h_floor = (
-                                float(cfg.action_dim)
-                                * (log_std_min + unit_g))
-                            margin = float(getattr(cfg,
-                                    'early_stop_entropy_collapse_floor_margin',
-                                    0.20))
-                            floor_aware_thr = h_floor + margin
-                            # Use the *lower* of the two: the heuristic
-                            # is "collapse when entropy is essentially
-                            # at the floor".  Floor-relative thr is
-                            # always ≤ legacy thr for any σ_min ≤ 1,
-                            # so this only loosens the trip on tight
-                            # σ_max regimes — never overrides a true
-                            # discrete-policy entropy crash.
-                            if floor_aware_thr < thr:
-                                thr = floor_aware_thr
-                        # Maintain sliding window of P3 entropy values.
-                        ent_window.append(float(ent))
-                        win_n = max(2, int(getattr(cfg,
-                                'early_stop_entropy_collapse_window_iters',
-                                30)))
-                        if len(ent_window) > win_n:
-                            ent_window.pop(0)
-                        # Sliding-window detector: trip when a sufficient
-                        # fraction of the last ``win_n`` entropies is
-                        # below ``thr``.
-                        # PERFORMANCE-AWARE GATE (Fix B, 2026-06-22): a low σ is
-                        # only a COLLAPSE if the policy is also DEGENERATE — a
-                        # healthy actor that has legitimately COMMITTED (low σ,
-                        # GOOD returns) reads the same entropy.  The p136
-                        # collapse had imag_adv_action_corr crash 0.77→0.014;
-                        # a committed-and-learning policy keeps it high.  So
-                        # only trip when the recent advantage-action correlation
-                        # is also low (genuine degeneracy), never on a
-                        # performing low-σ policy.  ``adv_corr`` None (pre-corr
-                        # logging) ⇒ fall back to the entropy-only trip.
-                        _ac = row.get('imag_adv_action_corr')
-                        if _ac is not None:
-                            adv_corr_window.append(abs(float(_ac)))
-                            if len(adv_corr_window) > win_n:
-                                adv_corr_window.pop(0)
-                        if len(ent_window) >= win_n:
-                            n_below = sum(1 for e in ent_window if e < thr)
-                            min_below = (float(getattr(cfg,
-                                    'early_stop_entropy_collapse_min_frac_below',
-                                    0.70))
-                                          * win_n)
-                            _corr_gate = float(getattr(cfg,
-                                    'early_stop_entropy_collapse_min_adv_corr',
-                                    0.05))
-                            _recent_corr = (float(np.median(adv_corr_window))
+                        # P53 RCA: 0.20-nat floor margin > log(σ_max/σ_min)
+                        # at ratio 1.2 → H(σ_init) already below thr.
+                        # Band-relative helper; None = skip (tiny σ-band).
+                        thr = _entropy_collapse_threshold(
+                            cfg,
+                            int(getattr(cfg, 'action_dim', 1) or 1),
+                            n_action_bins_log)
+                        if thr is not None:
+                            # Maintain sliding window of P3 entropy values.
+                            ent_window.append(float(ent))
+                            win_n = max(2, int(getattr(cfg,
+                                    'early_stop_entropy_collapse_window_iters',
+                                    30)))
+                            if len(ent_window) > win_n:
+                                ent_window.pop(0)
+                            # Sliding-window detector: trip when a sufficient
+                            # fraction of the last ``win_n`` entropies is
+                            # below ``thr``.
+                            # PERFORMANCE-AWARE GATE (Fix B, 2026-06-22): a low σ is
+                            # only a COLLAPSE if the policy is also DEGENERATE — a
+                            # healthy actor that has legitimately COMMITTED (low σ,
+                            # GOOD returns) reads the same entropy.  The p136
+                            # collapse had imag_adv_action_corr crash 0.77→0.014;
+                            # a committed-and-learning policy keeps it high.  So
+                            # only trip when the recent advantage-action correlation
+                            # is also low (genuine degeneracy), never on a
+                            # performing low-σ policy.  ``adv_corr`` None (pre-corr
+                            # logging) ⇒ fall back to the entropy-only trip.
+                            _ac = row.get('imag_adv_action_corr')
+                            if _ac is not None:
+                                adv_corr_window.append(abs(float(_ac)))
+                                if len(adv_corr_window) > win_n:
+                                    adv_corr_window.pop(0)
+                            if len(ent_window) >= win_n:
+                                n_below = sum(1 for e in ent_window if e < thr)
+                                min_below = (float(getattr(cfg,
+                                        'early_stop_entropy_collapse_min_frac_below',
+                                        0.70))
+                                              * win_n)
+                                _corr_gate = float(getattr(cfg,
+                                        'early_stop_entropy_collapse_min_adv_corr',
+                                        0.05))
+                                _recent_corr = (float(np.median(adv_corr_window))
+                                                if adv_corr_window else 0.0)
+                                _degenerate = (_recent_corr < _corr_gate
+                                               or not adv_corr_window)
+                                if n_below >= min_below and _degenerate:
+                                    early_stop_reason = (
+                                        f'entropy_collapse_window: '
+                                        f'{n_below}/{win_n} iters below '
+                                        f'thr={thr:.3f} '
+                                        f'(latest={ent:.3f}, '
+                                        f'adv_corr={_recent_corr:.3f})')
+                            # Legacy consecutive-streak detector (kept as a
+                            # fallback for very long sustained collapse).  Same
+                            # performance gate: only a DEGENERATE low-σ streak trips.
+                            if ent < thr:
+                                ent_collapse_streak += 1
+                            else:
+                                ent_collapse_streak = 0
+                            _streak_corr = (float(np.median(adv_corr_window))
                                             if adv_corr_window else 0.0)
-                            _degenerate = (_recent_corr < _corr_gate
-                                           or not adv_corr_window)
-                            if n_below >= min_below and _degenerate:
+                            _streak_degen = (
+                                _streak_corr < float(getattr(cfg,
+                                    'early_stop_entropy_collapse_min_adv_corr', 0.05))
+                                or not adv_corr_window)
+                            if (early_stop_reason is None
+                                    and _streak_degen
+                                    and ent_collapse_streak >= int(getattr(cfg,
+                                    'early_stop_entropy_collapse_patience_iters',
+                                    30))):
                                 early_stop_reason = (
-                                    f'entropy_collapse_window: '
-                                    f'{n_below}/{win_n} iters below '
-                                    f'thr={thr:.3f} '
-                                    f'(latest={ent:.3f}, '
-                                    f'adv_corr={_recent_corr:.3f})')
-                        # Legacy consecutive-streak detector (kept as a
-                        # fallback for very long sustained collapse).  Same
-                        # performance gate: only a DEGENERATE low-σ streak trips.
-                        if ent < thr:
-                            ent_collapse_streak += 1
-                        else:
-                            ent_collapse_streak = 0
-                        _streak_corr = (float(np.median(adv_corr_window))
-                                        if adv_corr_window else 0.0)
-                        _streak_degen = (
-                            _streak_corr < float(getattr(cfg,
-                                'early_stop_entropy_collapse_min_adv_corr', 0.05))
-                            or not adv_corr_window)
-                        if (early_stop_reason is None
-                                and _streak_degen
-                                and ent_collapse_streak >= int(getattr(cfg,
-                                'early_stop_entropy_collapse_patience_iters',
-                                30))):
-                            early_stop_reason = (
-                                f'entropy_collapse: ent={ent:.3f} < '
-                                f'{thr:.3f} for {ent_collapse_streak} iters '
-                                f'(adv_corr={_streak_corr:.3f})')
+                                    f'entropy_collapse: ent={ent:.3f} < '
+                                    f'{thr:.3f} for {ent_collapse_streak} iters '
+                                    f'(adv_corr={_streak_corr:.3f})')
 
                     cl = row.get('critic_loss')
                     if cl is not None and cl > 0:

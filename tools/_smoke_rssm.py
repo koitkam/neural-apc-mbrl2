@@ -64,6 +64,7 @@ from training.train import (
                             collect_rest_lookback,
                             _wm_gain_match_loss, _require_realsim_actor,
                             _adv_action_corr, _p3_logp_clip_bound,
+                            _gaussian_entropy_nats, _entropy_collapse_threshold,
                             _p3_mu_ratio_surrogate, _p3_frozen_unfreeze_policy,
                             _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
@@ -210,6 +211,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.p3_stop_grad_log_std is True
     assert abs(float(_tc.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(_tc.p3_mu_ratio_clip) - 0.2) < 1e-12
+    assert abs(float(_tc.early_stop_entropy_collapse_floor_frac) - 0.25) < 1e-12
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
     print('[smoke] OK  gain-match defaults (abs Huber, per-input β, rest-IC, TBPTT=16)')
@@ -753,6 +755,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_P3_STOP_GRAD_LOG_STD': '0',
         'DREAMER_P3_LOGP_CLIP': '0',
         'DREAMER_P3_MU_RATIO_CLIP': '0',
+        'DREAMER_ES_ENT_FLOOR_FRAC': '0.1',
         'DREAMER_BC_MEAN_ONLY': '0',
         'DREAMER_BASELINE_SEED_OP_BAND': '0.4',
         'DREAMER_CONST_ACTION_OP_BAND': '0.55',
@@ -848,6 +851,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.p3_stop_grad_log_std is False
         assert abs(float(cfg.p3_logp_clip)) < 1e-12
         assert abs(float(cfg.p3_mu_ratio_clip)) < 1e-12
+        assert abs(float(cfg.early_stop_entropy_collapse_floor_frac) - 0.1) < 1e-12
         assert cfg.bc_mean_only is False
         assert abs(float(cfg.baseline_seed_op_band) - 0.4) < 1e-12
         assert abs(float(cfg.constant_action_seed_op_band) - 0.55) < 1e-12
@@ -1238,7 +1242,9 @@ def _test_isolation_dcv_scales() -> None:
     assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
     assert "p3_logpclip={float(getattr(cfg, 'p3_logp_clip'" in _src
     assert "p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip'" in _src
+    assert "es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac'" in _src
     assert '_p3_logp_clip_bound' in _src
+    assert '_entropy_collapse_threshold' in _src
     assert '_p3_mu_ratio_surrogate' in _src
     assert '_p3_frozen_unfreeze_policy' in _src
     assert "SIM_IDENTIFIED_TAU_DOMINANT', '50'" not in _src
@@ -1406,6 +1412,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.p3_stop_grad_log_std is True
     assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(c.p3_mu_ratio_clip) - 0.2) < 1e-12
+    assert abs(float(c.early_stop_entropy_collapse_floor_frac) - 0.25) < 1e-12
     assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
     assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
     assert int(c.runtime_setpoint_bounds_changes_min) == 1
@@ -1443,6 +1450,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_P3_STOP_GRAD_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_LOGP_CLIP' in ENV_OVERRIDES
     assert 'DREAMER_P3_MU_RATIO_CLIP' in ENV_OVERRIDES
+    assert 'DREAMER_ES_ENT_FLOOR_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_BC_MEAN_ONLY' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
     assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC' in ENV_OVERRIDES
@@ -2461,6 +2469,49 @@ def _test_p3_mu_ratio_clip() -> None:
     print('[smoke] OK  p3_mu_ratio_clip bounds μ-grad vs frozen snapshot; ε=0 identity')
 
 
+def _test_entropy_collapse_threshold() -> None:
+    """P53: 0.20-nat floor margin false-trips open-σ; band frac does not."""
+    import math
+    unit_g = 0.5 * math.log(2.0 * math.pi * math.e)
+    assert abs(_gaussian_entropy_nats(0.0, 1) - unit_g) < 1e-12
+    assert abs(_gaussian_entropy_nats(-1.5, 2)
+               - 2.0 * (-1.5 + unit_g)) < 1e-12
+
+    cfg = TrainConfig()
+    cfg.policy_type = 'continuous'
+    # P53 auto-tune σ bounds (test_sim).
+    cfg.policy_log_std_min = -1.7020867503855468
+    cfg.policy_log_std_max = -1.5197651935915923
+    ref = unit_g
+    thr = _entropy_collapse_threshold(cfg, 1, ref)
+    assert thr is not None
+    h_open = _gaussian_entropy_nats(cfg.policy_log_std_max, 1)
+    h_floor = _gaussian_entropy_nats(cfg.policy_log_std_min, 1)
+    gap = h_open - h_floor
+    expect = h_floor + 0.25 * gap
+    assert abs(float(thr) - expect) < 1e-9, (thr, expect)
+    # Open-σ / H(σ_init) must sit ABOVE the trip (P53 −0.101 vs old −0.083).
+    assert h_open > float(thr)
+    assert h_floor < float(thr)
+    old_nats_thr = h_floor + 0.20
+    assert h_open < old_nats_thr  # documents the P53 false trip
+
+    cfg.early_stop_entropy_collapse_floor_frac = 0.0
+    thr_legacy = _entropy_collapse_threshold(cfg, 1, ref)
+    assert abs(float(thr_legacy) - 0.20 * ref) < 1e-12
+
+    cfg.early_stop_entropy_collapse_floor_frac = 0.25
+    cfg.policy_log_std_min = cfg.policy_log_std_max
+    assert _entropy_collapse_threshold(cfg, 1, ref) is None
+
+    cfg.policy_type = 'discrete'
+    cfg.policy_log_std_min = -1.7
+    cfg.policy_log_std_max = -1.5
+    assert abs(float(_entropy_collapse_threshold(cfg, 1, math.log(21)))
+               - 0.20 * math.log(21)) < 1e-12
+    print('[smoke] OK  entropy-collapse thr is σ-band frac; open-σ does not trip')
+
+
 def _test_id_tau_no_plant_sentinel() -> None:
     """Missing SysID keys must not invent τ=50 s / θ=5 s."""
     from pathlib import Path
@@ -3287,6 +3338,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'p3_sglogstd=True' in banner, banner
     assert 'p3_logpclip=8' in banner, banner
     assert 'p3_muratio=0.2' in banner, banner
+    assert 'es_ent_floor=0.25' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -3497,6 +3549,7 @@ if __name__ == '__main__':
     _test_p3_stop_grad_log_std()
     _test_p3_logp_clip()
     _test_p3_mu_ratio_clip()
+    _test_entropy_collapse_threshold()
     _test_id_tau_no_plant_sentinel()
     _test_resolve_baseline_seed_op_band()
     _test_cfg_or_env_float_identity()
