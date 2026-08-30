@@ -38,12 +38,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > (μ-rail logp_std 0.54→38 @147; val paired **−72 vs −111**, worse
 > than P50 **−56 vs −104**; best.pt **161** during cascade).
 > P52 LIVE P3 (`run_p52_logpclip`, `d910ee2`, pid **64705**,
-> iter **182**): unfreeze 147 ent **−0.101 HELD**; first-step
-> logp_std **6.11** / actor **−0.77** (not P51 38 / −4.66);
-> **@165** delayed μ-rail unclipped std **80.8** actor **−5.80**
-> (peak 100.7@169); rtgt **0.0002**; best.pt **176**; rscale
-> **2.83**. Gate @82 last-ok **78** MV **0.95** DV **0.84**.
-> Default `p3_logp_clip=8` nats **per MV** (summed
+> iter **201**): unfreeze 147 ent HELD; delayed μ-rail @165
+> std **80.8** / actor **−5.80**; later std **0.88@196** with
+> actor **−9.81** mvv **813k**; rtgt **0.00012**; best.pt
+> **176**; rscale **2.83**. Gate @82 last-ok **78** MV **0.95**
+> DV **0.84**. Default `p3_logp_clip=8` nats **per MV** (summed
 > logp clamp `8×n_mv`; 1-MV identity). Do **not**
 > promote `p3_reset_log_std`. Do not stack critic knobs. Do not
 > revive `actor_kl_coef`. `derive_horizon` / sim `reset()` now
