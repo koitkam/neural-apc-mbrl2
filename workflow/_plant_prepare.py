@@ -311,13 +311,14 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_PRBS_SEG_MIN':            ('prbs_seg_min',            int),
     'DREAMER_PRBS_SEG_MIN_FLOOR':      ('prbs_seg_min_floor',      int),
     'DREAMER_HORIZON':            ('horizon',                    int),
-    # Formula inputs for ``derive_horizon`` (worked via leftover env,
-    # missing from ``run_plan``).  Identity 4.0 / 120.  ``derive_horizon``
-    # still reads the env (called before TrainConfig exists).
+    # Formula inputs for ``derive_horizon``.  Identity 4.0 / 120.
+    # ``horizon_formula_knobs()`` reads TrainConfig then leftover env
+    # (called before a plant-filled cfg exists).
     'DREAMER_HORIZON_SETTLE_NTAU': ('horizon_settle_n_tau',       float),
     'DREAMER_HORIZON_MAX':         ('horizon_max',                int),
-    # IC domain-randomization + GPU-calib overhead.  Simulators / the
-    # WM-only probe still read leftover env (no cfg at those call sites).
+    # IC domain-randomization + GPU-calib overhead.  ``ic_randomization_knobs()``
+    # / ``gpu_probe_knobs()`` read TrainConfig then leftover env (no plant-filled
+    # cfg at those call sites).
     'DREAMER_INIT_RANDOMIZATION':      ('init_randomization',      _as_bool),
     'DREAMER_INIT_RANDOMIZATION_FRAC': ('init_randomization_frac', float),
     'DREAMER_WM_OVERHEAD':             ('wm_overhead',             float),

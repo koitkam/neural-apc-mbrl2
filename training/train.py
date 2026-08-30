@@ -215,15 +215,14 @@ class TrainConfig:
     horizon: int = 15
     # Formula inputs for ``derive_horizon``:
     # ``H = round((θ + n_τ·τ) / sample_rate)`` floored at 15, capped at
-    # ``horizon_max``.  Were leftover ``DREAMER_HORIZON_SETTLE_NTAU`` /
-    # ``DREAMER_HORIZON_MAX`` in ``utils.auto_episode_length`` (worked,
-    # missing from ``run_plan``).  Identity: 4.0 (2% settle) / 120.
+    # ``horizon_max``.  ``horizon_formula_knobs()`` reads these then
+    # leftover ``DREAMER_HORIZON_SETTLE_NTAU`` / ``DREAMER_HORIZON_MAX``.
+    # Identity: 4.0 (2% settle) / 120.  Changing the dataclass sizes H.
     horizon_settle_n_tau: float = 4.0
     horizon_max: int = 120
-    # Wide uniform IC randomization (domain randomization).  Simulators
-    # still read leftover ``DREAMER_INIT_RANDOMIZATION`` /
-    # ``DREAMER_INIT_RANDOMIZATION_FRAC`` at ``reset()``; these fields
-    # record the same identity defaults (ON / 0.6 of span) in ``run_plan``.
+    # Wide uniform IC randomization (domain randomization).
+    # ``ic_randomization_knobs()`` at sim ``reset()`` reads these then
+    # leftover ``DREAMER_INIT_RANDOMIZATION`` / ``_FRAC``.  Identity ON / 0.6.
     init_randomization: bool = True
     init_randomization_frac: float = 0.6
 

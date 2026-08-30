@@ -179,9 +179,11 @@ def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
     the identified 2%% settling time ``dead_time + 4*tau`` (converted to agent
     steps via ``sample_rate``) so the actor/critic credit the full settling
     response of the slowest loop.  Floored at the DreamerV3/V4 paper default
-    (15) and capped by ``DREAMER_HORIZON_MAX``; the settle multiple is tunable
-    via ``DREAMER_HORIZON_SETTLE_NTAU``.  An explicit ``DREAMER_HORIZON`` still
-    hard-overrides downstream via ``apply_dreamer_env_overrides``.
+    (15) and capped via ``horizon_formula_knobs()`` (TrainConfig
+    ``horizon_settle_n_tau`` / ``horizon_max``, leftover
+    ``DREAMER_HORIZON_SETTLE_NTAU`` / ``DREAMER_HORIZON_MAX``).  An explicit
+    ``DREAMER_HORIZON`` still hard-overrides downstream via
+    ``apply_dreamer_env_overrides``.
 
     Returns the paper floor (15) when no usable dynamics are available.
     Signature retained so BO trial code that multiplies the base by

@@ -60,13 +60,48 @@ def derive_episode_length(
     return int(default_fallback), 'default'
 
 
+def horizon_formula_knobs() -> Tuple[float, int]:
+    """``settle_n_tau`` / ``horizon_max`` for ``derive_horizon``.
+
+    ``single_run`` / BO call ``derive_horizon`` before a plant-filled
+    ``TrainConfig`` exists, so the formula used to hard-code ``4.0 / 120``.
+    Identity for env-free: those numbers **are** the TrainConfig defaults.
+    Changing the dataclass now actually sizes H.  Leftover
+    ``DREAMER_HORIZON_SETTLE_NTAU`` / ``DREAMER_HORIZON_MAX`` still win
+    when set (same keys as ``ENV_OVERRIDES``).  Does **not** call
+    ``apply_dreamer_env_overrides``.
+    """
+    n_tau = 4.0
+    max_h = 120
+    try:
+        from training.train import TrainConfig
+        cfg = TrainConfig()
+        n_tau = float(getattr(cfg, 'horizon_settle_n_tau', n_tau) or n_tau)
+        max_h = int(getattr(cfg, 'horizon_max', max_h) or max_h)
+    except Exception:
+        pass
+    raw = os.environ.get('DREAMER_HORIZON_SETTLE_NTAU', '').strip()
+    if raw:
+        try:
+            n_tau = float(raw)
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_HORIZON_MAX', '').strip()
+    if raw:
+        try:
+            max_h = int(float(raw))
+        except ValueError:
+            pass
+    return float(n_tau), max(15, int(max_h))
+
+
 def derive_horizon(
     tau: float,
     dead_time: float,
     sample_rate: int,
-    settle_n_tau: float = 4.0,
+    settle_n_tau: Optional[float] = None,
     min_h: int = 15,
-    max_h: int = 120,
+    max_h: Optional[int] = None,
 ) -> Tuple[int, str]:
     """Return ``(horizon, source)`` — the imagination horizon in AGENT steps.
 
@@ -80,27 +115,32 @@ def derive_horizon(
         ``H = round((dead_time + settle_n_tau * tau) / sample_rate)``
 
     Resolution order:
+    - leftover ``DREAMER_HORIZON_SETTLE_NTAU`` / ``DREAMER_HORIZON_MAX``
+    - explicit ``settle_n_tau`` / ``max_h`` args
+    - TrainConfig ``horizon_settle_n_tau`` / ``horizon_max`` (identity 4.0 / 120)
     - ``source='auto:{n}tau_settle'``: derived from identified dynamics.
     - ``source='default'``: paper floor (15) when no dynamics are available.
 
     Floored at ``min_h`` (the DreamerV3/V4 paper default, 15) so fast plants
-    never go below the paper minimum, and capped at ``max_h`` (TrainConfig
-    ``horizon_max`` / leftover ``DREAMER_HORIZON_MAX``) to bound WM-rollout
-    error.  ``settle_n_tau`` is TrainConfig ``horizon_settle_n_tau`` /
-    leftover ``DREAMER_HORIZON_SETTLE_NTAU``.  Called before TrainConfig
-    exists, so this still reads env (ENV_OVERRIDES records the same keys
-    on the later cfg).  An explicit ``DREAMER_HORIZON`` still hard-overrides
-    downstream via the env-override layer.
+    never go below the paper minimum, and capped at ``max_h``.  An explicit
+    ``DREAMER_HORIZON`` still hard-overrides downstream via ENV_OVERRIDES.
     """
-    try:
-        n_tau = float(os.environ.get('DREAMER_HORIZON_SETTLE_NTAU', '').strip()
-                      or settle_n_tau)
-    except Exception:
-        n_tau = settle_n_tau
-    try:
-        cap = int(float(os.environ.get('DREAMER_HORIZON_MAX', '').strip() or max_h))
-    except Exception:
-        cap = int(max_h)
+    kn_tau, kn_max = horizon_formula_knobs()
+    n_tau = kn_tau if settle_n_tau is None else float(settle_n_tau)
+    cap = kn_max if max_h is None else int(max_h)
+    # Leftover env still wins over an explicit arg (historical A/B).
+    raw = os.environ.get('DREAMER_HORIZON_SETTLE_NTAU', '').strip()
+    if raw:
+        try:
+            n_tau = float(raw)
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_HORIZON_MAX', '').strip()
+    if raw:
+        try:
+            cap = int(float(raw))
+        except ValueError:
+            pass
     cap = max(int(min_h), cap)
 
     tau_v = _safe_float(tau, 0.0)

@@ -242,9 +242,9 @@ def main() -> int:
     # actor/critic credit the full settling response of the slowest loop —
     # including the consequence of riding vs not-riding a moved operator
     # limit over the whole transient.  Floored at the paper default 15 and
-    # capped (DREAMER_HORIZON_MAX) to bound WM-rollout error; tune the settle
-    # multiple via DREAMER_HORIZON_SETTLE_NTAU.  An explicit DREAMER_HORIZON
-    # still hard-overrides downstream via the env-override layer.
+    # capped (TrainConfig ``horizon_max`` / leftover ``DREAMER_HORIZON_MAX``)
+    # via ``horizon_formula_knobs()``.  An explicit ``DREAMER_HORIZON`` still
+    # hard-overrides downstream via the env-override layer.
     horizon, horizon_source = derive_horizon(
         tau=tau, dead_time=dead, sample_rate=sample_rate)
     print(f'[run] horizon={horizon} ({horizon_source}; '
