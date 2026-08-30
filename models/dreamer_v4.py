@@ -1111,10 +1111,17 @@ class ContinuousPolicyHead(nn.Module):
         action = torch.tanh(raw)
         return self._tanh_log_prob(mu, log_std, raw, action).sum(-1)
 
-    def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor
+    def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor,
+                     *, stop_grad_log_std: bool = False
                      ) -> torch.Tensor:
-        """Log-prob of a continuous action ``(B, action_dim)`` ∈ [-1, 1]."""
+        """Log-prob of a continuous action ``(B, action_dim)`` ∈ [-1, 1].
+
+        ``stop_grad_log_std`` detaches σ so REINFORCE trains μ only
+        (P51; P50 unfreeze yanked log_std).
+        """
         mu, log_std = self.dist_params(latent)
+        if stop_grad_log_std:
+            log_std = log_std.detach()
         # Invert tanh: u = atanh(action), clamped for numerical stability
         # near ±1 (atanh(±1) is ±inf).
         a_clamped = action.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
@@ -1162,7 +1169,8 @@ class ContinuousPolicyHead(nn.Module):
                        - 0.5)
         return kl_per_dim.sum(-1)                                # (B,)
 
-    def entropy(self, latent: torch.Tensor) -> torch.Tensor:
+    def entropy(self, latent: torch.Tensor, *,
+                 stop_grad_log_std: bool = False) -> torch.Tensor:
         """Per-state Gaussian entropy summed over action dims.
 
         We report the entropy of the underlying Gaussian (pre-tanh)
@@ -1171,8 +1179,12 @@ class ContinuousPolicyHead(nn.Module):
         roughly state-independent, so it does not affect gradient
         directions for the entropy bonus / collapse trip.  Matches the
         SAC convention.
+
+        ``stop_grad_log_std`` makes η a constant w.r.t. σ (P51).
         """
         _, log_std = self.dist_params(latent)
+        if stop_grad_log_std:
+            log_std = log_std.detach()
         return (0.5 * (math.log(2.0 * math.pi * math.e)
                         + 2.0 * log_std)).sum(-1)
 

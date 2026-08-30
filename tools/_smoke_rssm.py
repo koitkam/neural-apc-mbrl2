@@ -204,6 +204,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.gain_match_rest_ic is True
     assert _tc.p3_reset_log_std is False
     assert _tc.bc_mean_only is True
+    assert _tc.p3_stop_grad_log_std is True
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
     print('[smoke] OK  gain-match defaults (abs Huber, per-input β, rest-IC, TBPTT=16)')
@@ -744,6 +745,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_GAIN_MATCH_SETTLE_LEN': '55',
         'DREAMER_GAIN_MATCH_REST_IC': '1',
         'DREAMER_P3_RESET_LOG_STD': '1',
+        'DREAMER_P3_STOP_GRAD_LOG_STD': '0',
         'DREAMER_BC_MEAN_ONLY': '0',
         'DREAMER_BASELINE_SEED_OP_BAND': '0.4',
         'DREAMER_CONST_ACTION_OP_BAND': '0.55',
@@ -819,6 +821,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.gain_match_settle_len) == 55
         assert cfg.gain_match_rest_ic is True
         assert cfg.p3_reset_log_std is True
+        assert cfg.p3_stop_grad_log_std is False
         assert cfg.bc_mean_only is False
         assert abs(float(cfg.baseline_seed_op_band) - 0.4) < 1e-12
         assert abs(float(cfg.constant_action_seed_op_band) - 0.55) < 1e-12
@@ -1175,6 +1178,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic'" in _src
     assert "p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std'" in _src
     assert "bc_mean={bool(getattr(cfg, 'bc_mean_only'" in _src
+    assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
@@ -1335,6 +1339,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.gain_match_rest_ic is True
     assert c.p3_reset_log_std is False
     assert c.bc_mean_only is True
+    assert c.p3_stop_grad_log_std is True
     assert abs(float(c.baseline_seed_op_band) - 0.6) < 1e-12
     assert abs(float(c.constant_action_seed_op_band) - 0.6) < 1e-12
     assert abs(float(c.prbs_seed_op_band) - 0.95) < 1e-12
@@ -1362,6 +1367,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
     assert 'DREAMER_P3_RESET_LOG_STD' in ENV_OVERRIDES
+    assert 'DREAMER_P3_STOP_GRAD_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_BC_MEAN_ONLY' in ENV_OVERRIDES
     assert 'DREAMER_BASELINE_SEED_OP_BAND' in ENV_OVERRIDES
     assert 'DREAMER_CONST_ACTION_OP_BAND' in ENV_OVERRIDES
@@ -2063,6 +2069,39 @@ def _test_bc_mean_only() -> None:
     assert float(last_n.weight.grad[idx].abs().max()) > 1e-4, (
         float(last_n.weight.grad[idx].abs().max()))
     print('[smoke] OK  bc_mean_only MSE has zero log_std grad (NLL does not)')
+
+
+def _test_p3_stop_grad_log_std() -> None:
+    """P51: REINFORCE + η with stop_grad_log_std has zero log_std grad."""
+    from models.dreamer_v4 import ContinuousPolicyHead
+    torch.manual_seed(0)
+    kwargs = dict(
+        in_dim=8, hidden_dim=16, action_dim=2, n_layers=2, mtp_length=1,
+        init_log_std=-1.5, log_std_min=-2.3, log_std_max=0.0)
+    feat = torch.randn(6, 8)
+    act = torch.tanh(torch.randn(6, 2))
+    adv = torch.randn(6)
+    n = 2
+    idx = torch.arange(n) * 2 + 1
+    mu_idx = torch.arange(n) * 2
+    pol = ContinuousPolicyHead(**kwargs)
+    last = pol.head.net[-1]
+    logp = pol.log_prob_of(feat, act, stop_grad_log_std=True)
+    ent = pol.entropy(feat, stop_grad_log_std=True)
+    loss = -(adv * logp).mean() - 1e-4 * ent.mean()
+    loss.backward()
+    assert float(last.weight.grad[idx].abs().max()) < 1e-8, (
+        float(last.weight.grad[idx].abs().max()))
+    assert float(last.weight.grad[mu_idx].abs().max()) > 1e-6
+    pol2 = ContinuousPolicyHead(**kwargs)
+    last2 = pol2.head.net[-1]
+    logp2 = pol2.log_prob_of(feat, act)
+    ent2 = pol2.entropy(feat)
+    loss2 = -(adv * logp2).mean() - 1e-4 * ent2.mean()
+    loss2.backward()
+    assert float(last2.weight.grad[idx].abs().max()) > 1e-4, (
+        float(last2.weight.grad[idx].abs().max()))
+    print('[smoke] OK  p3_stop_grad_log_std zeros log_std REINFORCE grad')
 
 
 def _test_resolve_baseline_seed_op_band() -> None:
@@ -2790,6 +2829,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
     assert 'p3_sigreset=False' in banner, banner
+    assert 'p3_sglogstd=True' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -2994,6 +3034,7 @@ if __name__ == '__main__':
     _test_gain_match_rest_ic()
     _test_p3_reset_log_std()
     _test_bc_mean_only()
+    _test_p3_stop_grad_log_std()
     _test_resolve_baseline_seed_op_band()
     _test_cfg_or_env_float_identity()
     _test_auto_tune_formula_input_cfg_or_env()

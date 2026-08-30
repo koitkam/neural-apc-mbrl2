@@ -509,6 +509,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_N_CRITICS':                  ('n_critics',                      int),
     # P45 RCA / P46: restore Gaussian σ at P3 entry (default off).
     'DREAMER_P3_RESET_LOG_STD':           ('p3_reset_log_std',               _as_bool),
+    # P51: P3 REINFORCE stop-grad log_std (default ON). Opt out ``=0``.
+    'DREAMER_P3_STOP_GRAD_LOG_STD':       ('p3_stop_grad_log_std',           _as_bool),
     'DREAMER_WM_GRAD_SKIP_NORM':          ('wm_grad_skip_norm',              float),
     # P27 RCA / P28: restore wm_best and continue to P2 on a P1 skip-storm
     # instead of aborting the run (default ON).

@@ -1802,6 +1802,13 @@ class TrainConfig:
     # P50 prevents the pin with ``bc_mean_only`` instead of undoing it.
     # Opt in ``DREAMER_P3_RESET_LOG_STD=1``.  Do not stack critic knobs.
     p3_reset_log_std: bool = False
+    # P50 EXIT: μ-only opened σ (first P3 ent −0.107) then unfreeze
+    # REINFORCE still yanked log_std (169: −0.107→−0.268, logp_std
+    # 0.56→54). Detach log_std in P3 ``log_prob_of`` / entropy so
+    # REINFORCE + η train μ only; σ stays at ``policy_init_log_std``.
+    # Discrete policy ignores this (no Gaussian). Opt out
+    # ``DREAMER_P3_STOP_GRAD_LOG_STD=0``. Not ``p3_reset_log_std``.
+    p3_stop_grad_log_std: bool = True
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
     # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
@@ -3859,6 +3866,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
         f"p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std', False))} "
         f"bc_mean={bool(getattr(cfg, 'bc_mean_only', True))} "
+        f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -7887,8 +7895,18 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # ----- actor loss: REINFORCE on the TAKEN real action + entropy bonus -----
     act_flat = act.reshape(B * T, -1)
-    logp = model.policy.log_prob_of(feat_flat, act_flat)     # (B*T,)
-    entropy = model.policy.entropy(feat_flat)                # (B*T,)
+    # P50 EXIT / P51: stop-grad log_std so REINFORCE cannot yank σ
+    # (P50 unfreeze 169: ent −0.107→−0.268). Discrete heads have no
+    # ``dist_params`` and ignore the flag.
+    _sg_logstd = bool(getattr(cfg, 'p3_stop_grad_log_std', True))
+    if _sg_logstd and hasattr(model.policy, 'dist_params'):
+        logp = model.policy.log_prob_of(
+            feat_flat, act_flat, stop_grad_log_std=True)
+        entropy = model.policy.entropy(
+            feat_flat, stop_grad_log_std=True)
+    else:
+        logp = model.policy.log_prob_of(feat_flat, act_flat)     # (B*T,)
+        entropy = model.policy.entropy(feat_flat)                # (B*T,)
     ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
     actor_loss = -(adv_flat * logp).mean() - ent_coef * entropy.mean() + bc_term
 
