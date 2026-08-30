@@ -811,6 +811,14 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC': '0.31',
         'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX': '3',
         'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC': '0.12',
+        'DREAMER_STEP_SEED_DELTA_MIN': '0.25',
+        'DREAMER_STEP_SEED_DELTA_MAX': '0.50',
+        'DREAMER_STEP_SEED_PREFIX_FRAC_MIN': '0.08',
+        'DREAMER_STEP_SEED_PREFIX_FRAC_MAX': '0.18',
+        'DREAMER_SHAPING_SAFE_MARGIN_FRAC': '0.30',
+        'DREAMER_PRBS_SEED_SEGMENT_STEPS': '40',
+        'DREAMER_PRBS_SEED_SEGMENT_STEPS_MIN': '6',
+        'DREAMER_WM_SS_MATCH_WINDOW_FRAC': '0.40',
         'DREAMER_EXPERT_MOVE_FRAC': '0.22',
         'DREAMER_PMPO_ALPHA': '0.55',
         'DREAMER_BASELINE_SEED_EPS': '12',
@@ -897,6 +905,14 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.runtime_setpoint_target_jitter_frac) - 0.31) < 1e-12
         assert int(cfg.runtime_setpoint_bounds_changes_max) == 3
         assert abs(float(cfg.runtime_setpoint_ramp_duration_frac) - 0.12) < 1e-12
+        assert abs(float(cfg.step_seed_delta_min) - 0.25) < 1e-12
+        assert abs(float(cfg.step_seed_delta_max) - 0.50) < 1e-12
+        assert abs(float(cfg.step_seed_prefix_frac_min) - 0.08) < 1e-12
+        assert abs(float(cfg.step_seed_prefix_frac_max) - 0.18) < 1e-12
+        assert abs(float(cfg.shaping_safe_margin_frac) - 0.30) < 1e-12
+        assert int(cfg.prbs_seed_segment_steps) == 40
+        assert int(cfg.prbs_seed_segment_steps_min) == 6
+        assert abs(float(cfg.wm_ss_match_window_frac) - 0.40) < 1e-12
         assert abs(float(cfg.expert_move_frac) - 0.22) < 1e-12
         assert abs(float(cfg.pmpo_alpha) - 0.55) < 1e-12
         assert int(cfg.baseline_seed_episodes) == 12
@@ -967,6 +983,11 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'runtime_setpoint_target_jitter_frac' in explicit
         assert 'runtime_setpoint_bounds_changes_max' in explicit
         assert 'runtime_setpoint_ramp_duration_frac' in explicit
+        assert 'step_seed_delta_min' in explicit
+        assert 'step_seed_prefix_frac_max' in explicit
+        assert 'shaping_safe_margin_frac' in explicit
+        assert 'prbs_seed_segment_steps' in explicit
+        assert 'wm_ss_match_window_frac' in explicit
         assert 'expert_move_frac' in explicit
         assert 'pmpo_alpha' in explicit
         assert 'baseline_seed_episodes' in explicit
@@ -1814,6 +1835,33 @@ def _test_runtime_setpoint_schedule_cfg() -> None:
             else:
                 os.environ[k] = old
     print('[smoke] OK  runtime-setpoint schedule TrainConfig + auto_derive jitter 0.15/0.20')
+
+
+def _test_step_seed_shaping_prbs_seg_cfg() -> None:
+    """Step-seed / shaping-safe / PRBS-seg / ss-window: TrainConfig identity + whitelist."""
+    from workflow._plant_prepare import ENV_OVERRIDES
+
+    c = TrainConfig()
+    assert abs(float(c.step_seed_delta_min) - 0.20) < 1e-12
+    assert abs(float(c.step_seed_delta_max) - 0.60) < 1e-12
+    assert abs(float(c.step_seed_prefix_frac_min) - 0.05) < 1e-12
+    assert abs(float(c.step_seed_prefix_frac_max) - 0.20) < 1e-12
+    assert abs(float(c.shaping_safe_margin_frac) - 0.25) < 1e-12
+    assert int(c.prbs_seed_segment_steps) == 0
+    assert int(c.prbs_seed_segment_steps_min) == 0
+    assert abs(float(c.wm_ss_match_window_frac) - 0.34) < 1e-12
+    for k in (
+        'DREAMER_STEP_SEED_DELTA_MIN',
+        'DREAMER_STEP_SEED_DELTA_MAX',
+        'DREAMER_STEP_SEED_PREFIX_FRAC_MIN',
+        'DREAMER_STEP_SEED_PREFIX_FRAC_MAX',
+        'DREAMER_SHAPING_SAFE_MARGIN_FRAC',
+        'DREAMER_PRBS_SEED_SEGMENT_STEPS',
+        'DREAMER_PRBS_SEED_SEGMENT_STEPS_MIN',
+        'DREAMER_WM_SS_MATCH_WINDOW_FRAC',
+    ):
+        assert k in ENV_OVERRIDES, k
+    print('[smoke] OK  step-seed / shaping-safe / PRBS-seg / ss-window TrainConfig + ENV_OVERRIDES')
 
 
 def _test_expert_move_law_cfg() -> None:
@@ -3341,6 +3389,7 @@ if __name__ == '__main__':
     _test_objective_runtime_cfg()
     _test_auto_weights_cfg()
     _test_runtime_setpoint_schedule_cfg()
+    _test_step_seed_shaping_prbs_seg_cfg()
     _test_expert_move_law_cfg()
     _test_pin_eval_modules()
     _test_control_quality_gates()

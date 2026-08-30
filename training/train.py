@@ -574,6 +574,7 @@ class TrainConfig:
     # exactly in the near-constraint zone where disturbance-driven overshoot
     # happens.  Still potential-based (policy-invariant) and sim-adaptive (a
     # fraction of the plant's own half-band).  ``1.0`` recovers the legacy tent.
+    # In ``ENV_OVERRIDES`` (identity 0.25; sibling of econ-margin).
     shaping_safe_margin_frac: float = 0.25
     # Fix 2a economic-shaping weight (2026-06-19, p129 RC-A).  Φ = Φ_safe +
     # ``shaping_econ_coef``·gate·Φ_econ, where Φ_econ ∈ [0,1] is a STATE-BASED
@@ -1044,7 +1045,9 @@ class TrainConfig:
     # opted in (``DREAMER_WM_SS_MATCH_COEF``).  P08 auto-enable 3.0 is
     # the same teacher that drowned DV on P32–P39.
     wm_ss_match_coef: float = 0.0
-    wm_ss_match_window_frac: float = 0.34   # terminal fraction of K used as the SS window
+    # Terminal fraction of K used as the SS window.  Isolation off
+    # env-free (P40).  In ``ENV_OVERRIDES`` (identity 0.34).
+    wm_ss_match_window_frac: float = 0.34
     # Option 1 (2026-08-17): weight the DC-gain match by how SETTLED each seq's
     # REAL CV window is (exp(-Var/ss_var), normalized units) so the per-input
     # steady-state gain is identified ONLY from settled data — undilutes the
@@ -1221,7 +1224,8 @@ class TrainConfig:
     # time constant) rather than just the early transient slope.
     # Floor 8, cap T/4 so each episode still contains ≥ 4 segments.
     # Sentinel 0 means "use auto-derived" — any positive value
-    # overrides.
+    # overrides.  In ``ENV_OVERRIDES`` so A/B is not silently dropped
+    # (auto-tune honours ``_explicit_fields``).
     prbs_seed_segment_steps: int = 0
     # PRBS segment-length MIN (agent steps).  When > 1 and
     # < prbs_seed_segment_steps, each PRBS segment's hold time is
@@ -1283,7 +1287,8 @@ class TrainConfig:
     # readout; max keeps the step in a regime where the plant doesn't
     # saturate at one end.  ``u₀`` is stratified over op_band as before;
     # ``u₁ = clip(u₀ + Δ, -1, 1)`` with Δ uniformly sampled from
-    # ``±[step_seed_delta_min, step_seed_delta_max]``.
+    # ``±[step_seed_delta_min, step_seed_delta_max]``.  In
+    # ``ENV_OVERRIDES`` (identity; ``single_run`` used to drop A/B).
     step_seed_delta_min: float = 0.20
     step_seed_delta_max: float = 0.60
     # Fraction of the episode used for the pre-step hold (settling
@@ -1291,6 +1296,7 @@ class TrainConfig:
     # ep_len=1220 ≈ 7 settling times at τ=53/sr=4 (τ_steps≈13) — well
     # past the SS for u₀.  Leaves 1098 steps post-step for the new
     # settling, ~84 settling times → ample long-horizon SS coverage.
+    # In ``ENV_OVERRIDES`` (identity 0.05 / 0.20).
     step_seed_prefix_frac_min: float = 0.05
     step_seed_prefix_frac_max: float = 0.20
     # ---- APC step-test seed (P51 design, 2026-05-25) ----

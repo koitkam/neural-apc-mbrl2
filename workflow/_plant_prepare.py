@@ -313,6 +313,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_SEED_SIGMA_CAP':          ('seed_sigma_cap',          float),
     'DREAMER_PRBS_SEG_MIN':            ('prbs_seg_min',            int),
     'DREAMER_PRBS_SEG_MIN_FLOOR':      ('prbs_seg_min_floor',      int),
+    # Resolved PRBS hold (sentinel 0 = auto (θ+4τ)/sr).  Were
+    # TrainConfig only; auto-tune already honours ``_explicit_fields``.
+    'DREAMER_PRBS_SEED_SEGMENT_STEPS':     ('prbs_seed_segment_steps',     int),
+    'DREAMER_PRBS_SEED_SEGMENT_STEPS_MIN': ('prbs_seed_segment_steps_min', int),
     'DREAMER_HORIZON':            ('horizon',                    int),
     # Formula inputs for ``derive_horizon``.  Identity 4.0 / 120.
     # ``horizon_formula_knobs()`` reads TrainConfig then leftover env
@@ -420,6 +424,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # supervision; recommended ≥0.5 for plants with long settling
     # times where pure const-action seeds are info-poor.
     'DREAMER_STEP_SETTLE_FRAC':   ('step_settle_seed_fraction',  float),
+    # Step-settle |Δu| band + pre-step hold fraction.  Were TrainConfig
+    # only (``single_run`` silently dropped A/B).  Identity 0.20 / 0.60
+    # / 0.05 / 0.20 (unitless).
+    'DREAMER_STEP_SEED_DELTA_MIN': ('step_seed_delta_min',       float),
+    'DREAMER_STEP_SEED_DELTA_MAX': ('step_seed_delta_max',       float),
+    'DREAMER_STEP_SEED_PREFIX_FRAC_MIN': ('step_seed_prefix_frac_min', float),
+    'DREAMER_STEP_SEED_PREFIX_FRAC_MAX': ('step_seed_prefix_frac_max', float),
     # 2026-05-25 (P51): APC step-test seed episodes — mixed MV+DV step
     # events with held baselines.  Strict superset of step_settle
     # (adds DV coverage with held action).  Default 20 in TrainConfig.
@@ -628,6 +639,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # suppressed near a constraint.  Policy-invariant.  0.0 disables Φ_econ.
     'DREAMER_SHAPING_ECON_COEF':          ('shaping_econ_coef',              float),
     'DREAMER_SHAPING_ECON_MARGIN_FRAC':   ('shaping_econ_margin_frac',       float),
+    # RANGE/limit Φ flat-top width (p125).  Sibling of econ-margin;
+    # was TrainConfig-only so ``single_run`` dropped A/B.  Identity 0.25.
+    'DREAMER_SHAPING_SAFE_MARGIN_FRAC':   ('shaping_safe_margin_frac',       float),
     # Imagination-era critic_replay_anchor / critic_anchor_* / imag CE
     # REMOVED (never read by ``_realsim_actor_critic_step``).  Real-sim
     # grounding is ``DREAMER_CRITIC_MC_GROUNDING_COEF`` (default 2.0).
@@ -912,6 +926,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_INPUT_ISOLATION_LEN':     ('wm_input_isolation_len',         int),
     'DREAMER_WM_SS_MATCH_COEF':           ('wm_ss_match_coef',               float),
     'DREAMER_WM_SS_MATCH_SETTLE_VAR':     ('wm_ss_match_settle_var',         float),
+    # Terminal fraction of K used as the SS window.  Isolation/ss-match
+    # off env-free (P40); identity 0.34 when the teacher is on.
+    'DREAMER_WM_SS_MATCH_WINDOW_FRAC':    ('wm_ss_match_window_frac',        float),
     'DREAMER_WM_ISOLATION_SETTLE_EPISODES': ('wm_isolation_settle_episodes', int),
     # Per isolated input (auto 24).  Seed loop emits n × n_mv + n × n_dv.
     # Equalize isolation |ΔCV| via Δu ∝ 1/|G| with scale floor 1.0

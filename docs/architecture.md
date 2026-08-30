@@ -50,6 +50,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > invent τ=50 s / θ=5 s. APCEnv operator-limit schedule
 > (change counts 1–2, ramp/warmup 0.10, strata 3, inside-margin 0.05)
 > is TrainConfig + `ENV_OVERRIDES`; `auto_derive` jitter is **0.15 / 0.20**.
+> Step-settle `|Δu|` 0.20/0.60 + prefix 0.05/0.20, `shaping_safe_margin_frac=0.25`,
+> PRBS-seg sentinel 0, `wm_ss_match_window_frac=0.34` are in `ENV_OVERRIDES`.
 > Do **not** switch APCEnv to `auto_derive`. Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
 > adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
