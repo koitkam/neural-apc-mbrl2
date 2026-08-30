@@ -2005,6 +2005,9 @@ class TrainConfig:
     # and noise/sign-flip limits — already sim-agnostic; promoted so they
     # appear in run_plan.json instead of silent os.environ.  ``p1_gain_gate``
     # off skips the probe (fidelity-only freeze — not for actor experiments).
+    # When live recon is > ``skip_storm_last_ok_recon_ratio`` × best, the
+    # probe runs on last-ok (P50 wrap-adjacent MV ×1.37 EXTEND), then
+    # restores live weights. Healthy-recon gates are unchanged.
     p1_gain_gate: bool = True
     gain_ready_lo: float = 0.80
     gain_ready_hi: float = 1.30
@@ -3311,6 +3314,29 @@ def _should_restore_last_ok_at_p1_freeze(
         return False
     if last_ok_locked:
         return True
+    return not _recon_still_healthy(recon, recon_best, ratio)
+
+
+def _should_probe_gain_on_last_ok(
+        *,
+        recon: float,
+        recon_best: Optional[float],
+        ratio: float,
+        has_last_ok: bool,
+) -> bool:
+    """True when a live gain-probe would measure wrap/detonated weights.
+
+    P50: gate 82 recon 0.0283 = 19× best (wrap-adjacent, just under the
+    20× lock) reported MV ×1.37 and EXTENDed extra-P1. Extra-P1
+    detonated iter 89 (recon 0.63). Gate 94 probed exploded g (recon
+    0.107, skip 1, spread×6.1, 3 signflips) → 0.69@DV. Extra P1 is
+    FALSIFIED as a DV lever (P41). The last-ok snapshot is the
+    observer the freeze already restores when recon is unhealthy
+    (P31 detonated-freeze). Identity when recon is healthy (P45–P49
+    first-gate path). Scale-invariant recon/recon.
+    """
+    if not has_last_ok:
+        return False
     return not _recon_still_healthy(recon, recon_best, ratio)
 
 
@@ -8170,6 +8196,8 @@ def _format_gain_probe_line(probe: dict) -> str:
     pair_s = ' '.join(bits)
     extra = (f" unbiased={bool(probe.get('unbiased'))}"
              f" not_noisy={bool(probe.get('not_noisy'))}")
+    if probe.get('probed_last_ok'):
+        extra += f" last_ok_iter={probe.get('last_ok_iter')}"
     if pair_s:
         extra += f' pairs[{pair_s}]'
     ath_lo, ath_hi = probe.get('atH_min'), probe.get('atH_max')
@@ -8308,6 +8336,53 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
         'noise_max': noise_max,
         'ss_pairs': [(str(n), float(r)) for n, r in ss_ratios],
     }
+
+
+def _load_module_state(
+        model: torch.nn.Module,
+        sd: Dict[str, torch.Tensor],
+        device: torch.device,
+) -> None:
+    """Load an in-process snapshot (GPU or CPU-spilled) onto ``model``."""
+    model.load_state_dict({k: v.to(device) for k, v in sd.items()})
+
+
+def _probe_observer_gain_ready_maybe_last_ok(
+        model, env, device, cfg: 'TrainConfig', *,
+        recon: float,
+        recon_best: Optional[float],
+        last_ok_sd: Optional[Dict[str, torch.Tensor]],
+        last_ok_iter: int,
+):
+    """Gain-probe live weights, or last-ok when live recon is detonated.
+
+    Always restores live weights after a last-ok probe.  A PASS still
+    freezes last-ok at P1→P2 via detonated-freeze (recon unhealthy).
+    Returns ``(probe, used_last_ok)``.  ``probe`` may be ``None``.
+    """
+    ratio = float(getattr(cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
+    use_last = _should_probe_gain_on_last_ok(
+        recon=recon, recon_best=recon_best, ratio=ratio,
+        has_last_ok=last_ok_sd is not None)
+    if not use_last:
+        return _probe_observer_gain_ready(model, env, device, cfg), False
+    assert last_ok_sd is not None
+    live = _clone_module_state(model, device)
+    try:
+        _load_module_state(model, last_ok_sd, device)
+        _best_s = (f'{float(recon_best):.4f}'
+                   if recon_best is not None else 'n/a')
+        print(f'[gain-ready-probe] last-ok iter {int(last_ok_iter)} '
+              f'(live recon {float(recon):.4f} > {ratio:g}× best '
+              f'{_best_s}) — not measuring wrap/detonated g',
+              flush=True)
+        probe = _probe_observer_gain_ready(model, env, device, cfg)
+        if probe is not None:
+            probe['probed_last_ok'] = True
+            probe['last_ok_iter'] = int(last_ok_iter)
+        return probe, True
+    finally:
+        _load_module_state(model, live, device)
 
 
 def _resolve_policy_sigma_bounds(cfg: 'TrainConfig', sigma_seed: float
@@ -10985,7 +11060,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _gain_probe = None
             if (_ema_ok and _plateau_ok
                     and _cfg_on(cfg, 'p1_gain_gate', True)):
-                _gain_probe = _probe_observer_gain_ready(model, env, device, cfg)
+                _gain_probe, _ = _probe_observer_gain_ready_maybe_last_ok(
+                    model, env, device, cfg,
+                    recon=_wm_recon_scalar(wm_losses),
+                    recon_best=p1_recon_best,
+                    last_ok_sd=p1_last_ok_sd,
+                    last_ok_iter=int(p1_last_ok_iter))
                 if _gain_probe is not None:
                     _gain_ok = bool(_gain_probe.get('gain_ready', True))
                     print(f"[gate p1->p2] gain-probe "
@@ -11003,6 +11083,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'local_flat': bool(_local_flat),
                     'gain_worst_ratio': (float(_gain_probe['worst_ratio'])
                                           if _gain_probe else None),
+                    'gain_probed_last_ok': bool(
+                        (_gain_probe or {}).get('probed_last_ok')),
                 })
                 print(f'[gate p1->p2] PASS at iter {total_iters}: '
                       f'recent_max={_recent_max:.3f} '
@@ -11030,6 +11112,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'wm_ema_recent_max': float(_recent_max)
                         if math.isfinite(_recent_max) else None,
                     'local_flat': bool(_local_flat),
+                    'gain_probed_last_ok': bool(
+                        (_gain_probe or {}).get('probed_last_ok')),
                 })
                 if reason == 'ema_below_floor':
                     _why = (f'recent_max={_recent_max:.3f} < '
@@ -11058,8 +11142,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # only not_plateaued, ``actor_experiment_valid`` stayed True).
                 if (_gain_probe is None
                         and _cfg_on(cfg, 'p1_gain_gate', True)):
-                    _gain_probe = _probe_observer_gain_ready(
-                        model, env, device, cfg)
+                    _gain_probe, _ = _probe_observer_gain_ready_maybe_last_ok(
+                        model, env, device, cfg,
+                        recon=_wm_recon_scalar(wm_losses),
+                        recon_best=p1_recon_best,
+                        last_ok_sd=p1_last_ok_sd,
+                        last_ok_iter=int(p1_last_ok_iter))
                     if _gain_probe is not None:
                         _gain_ok = bool(_gain_probe.get('gain_ready', True))
                         print(f"[gate p1->p2] cap-time gain-probe "
@@ -11075,6 +11163,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                           if _gain_probe else None),
                     'gain_ready': (bool(_gain_probe.get('gain_ready'))
                                    if _gain_probe else None),
+                    'gain_probed_last_ok': bool(
+                        (_gain_probe or {}).get('probed_last_ok')),
                 })
                 _cap_why = []
                 if not _ema_ok:

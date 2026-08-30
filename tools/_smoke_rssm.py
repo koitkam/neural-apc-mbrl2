@@ -47,12 +47,14 @@ from training.train import (
                             _should_warm_restore_wm_best,
                             _should_restore_last_ok_at_p1_freeze,
                             _should_lock_last_ok,
+                            _should_probe_gain_on_last_ok,
                             _wm_recon_scalar,
                             _persist_last_ok_ckpt,
                             _auto_if_unset, _isolation_teacher_on,
                             _promote_isolation_aux, _write_resolved_run_plan,
                             _resolve_compile_mode,
                             _clone_module_state, _refresh_module_state,
+                            _load_module_state,
                             _p1_need_agent_finetune,
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_state_from_feat,
@@ -362,7 +364,18 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _should_restore_last_ok_at_p1_freeze(
         recon=0.0045, recon_best=0.0015, ratio=5.0,
         has_last_ok=True, last_ok_locked=False)
+    # P50: wrap-adjacent recon 19× best (under 20× lock) must probe
+    # last-ok, not live wrap-damaged g. Healthy recon stays live.
+    assert _should_probe_gain_on_last_ok(
+        recon=0.0283, recon_best=0.0015, ratio=5.0, has_last_ok=True)
+    assert _should_probe_gain_on_last_ok(
+        recon=0.1069, recon_best=0.0015, ratio=5.0, has_last_ok=True)
+    assert not _should_probe_gain_on_last_ok(
+        recon=0.0041, recon_best=0.0015, ratio=5.0, has_last_ok=True)
+    assert not _should_probe_gain_on_last_ok(
+        recon=0.0283, recon_best=0.0015, ratio=5.0, has_last_ok=False)
     print('[smoke] OK  last-ok lock after silent recon spike (P40 RCA)')
+    print('[smoke] OK  P1 gain-probe uses last-ok when recon detonated (P50)')
 
     # P28 follow-up 5: P1 re-inject EVERY is f(buffer lap).  test_sim
     # (ep_len=1220, 400k cap, 5 eps/iter) stays 20/10.
@@ -1151,6 +1164,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_dv_ratio' in _src
     assert '_gain_match_pred_over_tgt' in _src
     assert '_should_lock_last_ok' in _src
+    assert '_should_probe_gain_on_last_ok' in _src
+    assert '_probe_observer_gain_ready_maybe_last_ok' in _src
+    assert '[gain-ready-probe] last-ok iter' in _src
     assert 'extra_p1=int(p1_ext_steps) > 0' in _src
     assert 'unlocked after wrap recovery' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
@@ -2662,7 +2678,33 @@ def _test_format_gain_probe_line() -> None:
     assert '@H[0.78,1.01]' in line
     assert 'MV CV0<-MV0=1.04/@H=1.01' in line
     assert 'DV CV0<-DV0=0.75/@H=0.78' in line
+    line_lo = _format_gain_probe_line({
+        'gain_ready': True,
+        'r_min': 0.91, 'r_max': 1.02,
+        'worst_ratio': 0.91, 'worst_input': 'DV CV0<-DV0',
+        'band': [0.8, 1.3], 'noise_worst': 0.4, 'sign_flips': 0,
+        'n_checks': 2, 'unbiased': True, 'not_noisy': True,
+        'atH_min': 0.90, 'atH_max': 1.00,
+        'ss_pairs': [('MV CV0<-MV0', 1.02), ('DV CV0<-DV0', 0.91)],
+        'ath_pairs': [('MV CV0<-MV0', 1.00), ('DV CV0<-DV0', 0.90)],
+        'probed_last_ok': True, 'last_ok_iter': 81,
+    })
+    assert 'last_ok_iter=81' in line_lo
     print('[smoke] OK  gain-probe line prints ss and @H')
+
+
+def _test_load_module_state_roundtrip() -> None:
+    """Last-ok gain-probe must restore live weights after the swap."""
+    m = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        m.weight.fill_(1.0)
+    live = _clone_module_state(m, torch.device('cpu'))
+    last = {k: torch.full_like(v, 2.0) for k, v in live.items()}
+    _load_module_state(m, last, torch.device('cpu'))
+    assert float(m.weight[0, 0]) == 2.0
+    _load_module_state(m, live, torch.device('cpu'))
+    assert float(m.weight[0, 0]) == 1.0
+    print('[smoke] OK  last-ok probe swap restores live weights')
 
 
 def _test_p1_fidelity_local_plateau() -> None:
@@ -2967,6 +3009,7 @@ if __name__ == '__main__':
     _test_sim_runtime_cfg()
     _test_adv_action_corr_vectorized()
     _test_format_gain_probe_line()
+    _test_load_module_state_roundtrip()
     _test_p1_fidelity_local_plateau()
     _test_auto_if_unset_honours_explicit()
     _test_promote_isolation_aux()

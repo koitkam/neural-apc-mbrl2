@@ -25,8 +25,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > wrap-unlock KEEP as lock hygiene; **FALSIFIED as cascade lever**
 > (last_ok **82**; first P3 ent −0.283; val MV ×0.816/×0.830 DV
 > ×0.867/×0.924 det_r 0.632 amp-dead; seed kpi **−714**; 0-vs-0 false
-> all_pass from skipped scripted dist). Next GPU: env-free P50
-> `bc_mean_only=True`. Reward-engine
+> all_pass from skipped scripted dist). P50 LIVE (`run_p50_bcmean`,
+> `9cbf771`): `bc_mean_only=True`. Gate 82 FAIL **1.37@MV** wrap-adjacent
+> (recon 0.0283); extra-P1 detonated iter 89; gate 94 FAIL **0.69@DV**
+> on exploded g. Do **not** score BC until GAIN-READY. HEAD (not P50
+> pid): gain-probe last-ok when recon >5× best. Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
 > adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
 > until linear observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
