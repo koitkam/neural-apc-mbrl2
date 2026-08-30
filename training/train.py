@@ -166,8 +166,9 @@ class TrainConfig:
     # PMPO prior-refresh cadence (iters).  Real-sim default is V3 REINFORCE
     # (``_realsim_actor_critic_step``); π_prior is unused there so snapshots
     # are skipped.  ``DREAMER_ACTOR_LOSS=pmpo`` is a **false A/B** (P3
-    # always inlines REINFORCE + μ-ratio; ``pmpo_loss`` is never called)
-    # — ``train()`` refuses it, same class as leftover imagination
+    # always inlines REINFORCE + μ-ratio; ``pmpo_loss`` was never called
+    # and is **REMOVED** from ``models/dreamer_v4.py``).
+    # ``train()`` refuses it, same class as leftover imagination
     # ``actor_train_source``.  Discrete-PMPO remains a future wiring, not
     # a silent run_plan bit.  The p136 ``actor_kl_coef`` TR was FALSIFIED
     # and **REMOVED** (never wired into real-sim P3).
@@ -1730,16 +1731,11 @@ class TrainConfig:
     # MTP compute.  Override via DREAMER_MTP_LENGTH.
     mtp_length: int = 8               # paper default (P41 RCA)
 
-    # ----- PMPO (Phase 3) -----
-    # alpha=0.7 (paper default).  alpha=0.5 caused near-perfect
-    # cancellation between positive and negative-advantage gradient
-    # branches whenever the actor sampled the same action repeatedly
-    # within a trajectory (which is the failure mode we observed).
+    # ----- PMPO (unused; ``pmpo_loss`` REMOVED) -----
+    # Kept so ``DREAMER_PMPO_ALPHA`` / ``DREAMER_PMPO_BETA`` stay in
+    # ``run_plan`` and ``train()`` still refuses ``actor_loss_type=pmpo``
+    # as a false A/B.  Not read by ``_realsim_actor_critic_step``.
     pmpo_alpha: float = 0.7
-    # PMPO KL-to-prior weight.  Lowered from the paper's 0.1 because the
-    # prior_policy snapshot at start of P3 is taken from a near-uniform
-    # policy (no expert BC), so a stronger KL pull would freeze the
-    # policy at uniform.  0.01 lets the advantage signal dominate.
     pmpo_beta: float = 0.01
 
     # ----- Returns -----
@@ -8108,6 +8104,16 @@ def expert_bc_p3_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     return bc_loss, em.sum()
 
 
+def _pearson_r(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Scalar Pearson r. Constant inputs → 0 (denom clamp). P3 diag only."""
+    x = a.reshape(-1).float()
+    y = b.reshape(-1).float()
+    x = x - x.mean()
+    y = y - y.mean()
+    den = (x.norm() * y.norm()).clamp_min(1e-8)
+    return (x * y).sum() / den
+
+
 def _adv_action_corr(adv_raw: torch.Tensor, act_flat: torch.Tensor
                      ) -> torch.Tensor:
     """Mean |corr(advantage, action_i)| over action channels.
@@ -8242,7 +8248,7 @@ def _p3_mu_ratio_surrogate(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Imagination training (PMPO + TD-λ)
+# Phase 3 — real-sim actor-critic (REINFORCE + TD-λ)
 # ---------------------------------------------------------------------------
 
 def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
@@ -8318,13 +8324,16 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # BOOTSTRAP and ADVANTAGE use min-of-N (TD3) so a single optimistic head
     # cannot inflate the λ-return / return_scale.
     _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
+    mc_parts: List[torch.Tensor] = []
 
     def _critic_ce(feat, vslow, rew_b, lam_ret):
         """Ensemble twohot-CE to the λ-return + optional PURE-MC (λ=1)."""
         loss = model.critic_ensemble_ce(feat, lam_ret)
         if _mc_coef > 0.0:
             rmc = _lambda_returns(rew_b, vslow, gamma, 1.0, _ret_cap)
-            loss = loss + _mc_coef * model.critic_ensemble_ce(feat, rmc)
+            mc = model.critic_ensemble_ce(feat, rmc)
+            mc_parts.append(mc.detach())
+            loss = loss + _mc_coef * mc
         return loss
 
     # (a) ON-POLICY term — the distribution the advantage is evaluated on.
@@ -8423,6 +8432,14 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         rew_var = rew.var().clamp_min(1e-8)
         tgt_var = target_returns.float().var().clamp_min(1e-8)
         adv_action_corr = _adv_action_corr(adv_raw, act_flat)
+        pred_target_r = _pearson_r(v_pred, target_returns)
+        target_v_r = _pearson_r(target_returns, v_slow)
+        if mc_parts:
+            critic_mc_loss = mc_parts[0]
+            for _mc in mc_parts[1:]:
+                critic_mc_loss = critic_mc_loss + _mc
+        else:
+            critic_mc_loss = torch.zeros((), device=device)
     return {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
@@ -8434,6 +8451,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'adv_global_std': adv_raw.std().detach(),
         'return_scale': scale.detach().squeeze(),
         'critic_rew_to_tgt_var': (rew_var / tgt_var).clamp_max(10.0).detach(),
+        'critic_pred_target_r': pred_target_r.detach(),
+        'critic_target_v_r': target_v_r.detach(),
+        'critic_mc_loss': critic_mc_loss.detach(),
         'imag_adv_action_corr': adv_action_corr.detach(),
         'actor_logp_mean': logp.mean().detach(),
         'actor_logp_std': logp.std().detach(),
@@ -9903,7 +9923,8 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
             'iter_cv_violation_mean', 'iter_mv_violation_mean',     # panel 6
             # Critic-cascade canary (not plotted; essential for triage).
             'critic_rew_to_tgt_var', 'critic_pred_target_r',
-            'critic_target_v_r', 'imagined_return_mean', 'return_scale',
+            'critic_target_v_r', 'critic_mc_loss',
+            'imagined_return_mean', 'return_scale',
         ]
         with open(csv_path, 'w', newline='') as fh:
             w = csv.writer(fh)

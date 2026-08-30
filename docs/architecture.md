@@ -51,13 +51,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`p3_mu_ratio_clip=0.2`) KEEP as μ-walk limiter **and**
 > cascade (paired **−13 vs −98 BEATS 9/9**; actor champion).
 > ES @262 was H(σ_init) below a 0.20-nat floor margin
-> (thr −0.083). **P54 LIVE** (`run_p54_esentband`, pid **95956**):
-> `early_stop_entropy_collapse_floor_frac=0.25`. Gate **82 PASS
+> (thr −0.083). **P54 LIVE P3** (`run_p54_esentband`, pid **95956**,
+> ~iter 400): `early_stop_entropy_collapse_floor_frac=0.25`. Gate **82 PASS
 > GAIN-READY 0.91@DV / 0.93@MV** (@H 0.96/0.93); last_ok **82
-> unlocked**; no storm. P2 dobg live, g frozen. ES A/B not yet
-> scored (still P2). p136 `actor_kl_coef` **REMOVED**.
+> unlocked**; no storm. P2→P3 **136 PASS**. Open-σ **−0.101**; **0/264**
+> P3 iters below new trip **−0.238** (all 264 were below old **−0.083**).
+> Passed P53 ES death @262. Do **not** Step-5 PROMOTE until EXIT+val.
+> p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
-> P3 always REINFORCE + μ-ratio). Do **not** promote
+> dead `pmpo_loss`/`kl_to` **REMOVED**). `_realsim` now logs
+> `critic_mc_loss` (not in this pid). Do **not** promote
 > `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
 > reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
 > canary restores in-flight grads.
@@ -472,9 +475,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > KEEP** as delayed first-unfreeze bound (`p3_logp_clip=8`);
 > **FALSIFIED as cascade** (in-support μ-walk; val **−377 vs −87
 > FAIL**). **P53 EXIT KEEP** as μ-walk limiter **and** cascade
-> (`p3_mu_ratio_clip=0.2`; val **−13 vs −98** 9/9). **P54 LIVE:**
+> (`p3_mu_ratio_clip=0.2`; val **−13 vs −98** 9/9). **P54 LIVE P3:**
 > entropy ES vs open-σ (`early_stop_entropy_collapse_floor_frac=0.25`;
-> trip at `H(σ_min)+frac·(H(σ_max)−H(σ_min))`). Opt out
+> trip at `H(σ_min)+frac·(H(σ_max)−H(σ_min))`; ~iter 400 still
+> H≈−0.101, 0 trips at −0.238). `critic_mc_loss` is now in the
+> P3 jsonl (HEAD; not this pid). Opt out
 > `DREAMER_P3_MU_RATIO_CLIP=0`. Not a lag-copy (1 update/batch
 > ⇒ ratio≡1). Not same-forward `logp.detach()`.
 > Opt out `DREAMER_P3_LOGP_CLIP=0`. Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.

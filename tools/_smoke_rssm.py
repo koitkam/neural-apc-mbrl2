@@ -159,6 +159,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert len(model.values) == model.n_critics
     diag = _realsim_actor_critic_step(model, batch, cfg)
     _finite('_realsim_actor_critic_step', diag)
+    assert 'critic_mc_loss' in diag, sorted(diag)
+    assert 'critic_pred_target_r' in diag, sorted(diag)
+    assert 'critic_target_v_r' in diag, sorted(diag)
+    assert torch.isfinite(diag['critic_mc_loss']).all()
+    assert float(diag['critic_mc_loss']) >= 0.0
     # P26 RCA / P27: freeze return_scale — second call must not move ret_scale.
     s0 = float(model.ret_scale.reshape(-1)[0])
     _ = _realsim_actor_critic_step(model, batch, cfg, freeze_return_scale=True)
@@ -686,6 +691,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     diagC = _realsim_actor_critic_step(model, batch, cfg,
                                        critic_batch=critic_batch)
     _finite('_realsim_actor_critic_step[critic_split+MC]', diagC)
+    assert float(diagC['critic_mc_loss']) >= 0.0
     (diagC['actor_loss'] + diagC['critic_loss']).backward()
     print('[smoke] OK  _realsim_actor_critic_step critic_batch split + '
           'MC-grounding backward()')
@@ -1311,6 +1317,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_maybe_snapshot_prior_policy' in _src
     assert '_actor_uses_prior_policy' in _src
     assert 'actor_kl_coef: float' not in _src
+    assert "'critic_mc_loss'" in _src
+    assert 'def _pearson_r(' in _src
     assert 'reuse pinned host + GPU dest' in _src
     assert "slot: str = 'replay'" in _src
     assert "slot='iso'" in _src
@@ -2050,7 +2058,7 @@ def _test_require_realsim_actor() -> None:
     """Imagination actor_train_source is a false A/B (p01 off-policy chatter).
 
     ``DREAMER_ACTOR_LOSS=pmpo`` is the same class: P3 always inlines
-    REINFORCE + μ-ratio (``pmpo_loss`` is never called).
+    REINFORCE + μ-ratio (``pmpo_loss`` REMOVED; never had a P3 call site).
     """
     ok = TrainConfig()
     _require_realsim_actor(ok)
@@ -2072,6 +2080,14 @@ def _test_require_realsim_actor() -> None:
         assert 'false a/b' in str(exc).lower()
     else:
         raise AssertionError('actor_loss_type=pmpo was allowed')
+    import models.dreamer_v4 as _dv4
+    assert not hasattr(_dv4, 'pmpo_loss'), 'dead PMPO actor loss still exported'
+    assert not hasattr(_dv4, 'reinforce_actor_loss'), (
+        'dead imagination REINFORCE actor loss still exported')
+    from models.dreamer_v4 import ContinuousPolicyHead, PolicyHead
+    assert not hasattr(PolicyHead, 'kl_to'), 'dead PMPO PolicyHead.kl_to'
+    assert not hasattr(ContinuousPolicyHead, 'kl_to'), (
+        'dead PMPO ContinuousPolicyHead.kl_to')
     print('[smoke] OK  non-realsim actor_train_source / pmpo actor_loss refused')
 
 

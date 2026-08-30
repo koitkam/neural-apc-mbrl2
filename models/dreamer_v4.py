@@ -925,20 +925,12 @@ class PolicyHead(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         return log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1)
 
-    # -- shared interface (used by pmpo_loss + early-stop entropy threshold) --
-
-    def kl_to(self, other: 'PolicyHead', latent: torch.Tensor) -> torch.Tensor:
-        """KL(self || other) at ``latent``.  Analytic for categoricals."""
-        cur_logp = F.log_softmax(self.logits(latent), dim=-1)     # (B,A,K)
-        with torch.no_grad():
-            prior_logp = F.log_softmax(other.logits(latent), dim=-1)
-        cur_p = cur_logp.exp()
-        return (cur_p * (cur_logp - prior_logp)).sum(-1).sum(-1)  # (B,)
+    # -- shared interface (entropy for real-sim P3 / early-stop) --
 
     def entropy(self, latent: torch.Tensor) -> torch.Tensor:
         """Per-state entropy H[π(·|latent)] summed over action dims.
 
-        Used by the PMPO entropy bonus (DreamerV3 §3, η = 3e-4).
+        Real-sim P3 entropy bonus + entropy-collapse early-stop.
         """
         logits = self.logits(latent)                              # (B,A,K)
         log_p = F.log_softmax(logits, dim=-1)
@@ -962,8 +954,8 @@ class ContinuousPolicyHead(nn.Module):
     ``a = tanh(mu + sigma * eps)`` with ``eps ~ N(0, I)``.  This is the
     standard continuous-control distribution (SAC, DreamerV3-continuous):
     bounded to ``[-1, 1]`` by construction with no boundary singularity, and
-    the underlying Gaussian gives well-behaved gradients & analytic KL for
-    PMPO.
+    the underlying Gaussian gives well-behaved entropy for the real-sim
+    P3 bonus / collapse trip.
 
     Replaces the discrete-bin ``PolicyHead`` for chemistry / process control
     where 6%-of-range bin steps (n_bins=21 over [-1,1] → 0.1) are too coarse
@@ -971,8 +963,8 @@ class ContinuousPolicyHead(nn.Module):
     test_sim diagnosed 2026-05-05.
 
     Interface mirrors ``PolicyHead`` (forward / log_prob_of /
-    log_prob_of_mtp / kl_to / reference_entropy) so the trainer + PMPO loss
-    code is policy-type agnostic.
+    log_prob_of_mtp / entropy / reference_entropy) so the trainer is
+    policy-type agnostic.  ``kl_to`` died with ``pmpo_loss``.
     """
 
     # Default log‐std bounds follow DreamerV3 §3 (σ ∈ [0.1, 1.0]).
@@ -1151,23 +1143,6 @@ class ContinuousPolicyHead(nn.Module):
         return torch.tanh(mu)
 
     # ---- shared interface (matches PolicyHead) ------------------------
-
-    def kl_to(self, other: 'ContinuousPolicyHead',
-               latent: torch.Tensor) -> torch.Tensor:
-        """Analytic KL(self || other) using the underlying Gaussians.
-
-        The tanh squash is identical for both, so the KL of the
-        squashed distributions equals the KL of the underlying Gaussians.
-        """
-        mu1, log_std1 = self.dist_params(latent)
-        with torch.no_grad():
-            mu2, log_std2 = other.dist_params(latent)
-        var1 = (2.0 * log_std1).exp()
-        var2 = (2.0 * log_std2).exp()
-        kl_per_dim = (log_std2 - log_std1
-                       + (var1 + (mu1 - mu2) ** 2) / (2.0 * var2)
-                       - 0.5)
-        return kl_per_dim.sum(-1)                                # (B,)
 
     def entropy(self, latent: torch.Tensor, *,
                  stop_grad_log_std: bool = False) -> torch.Tensor:
@@ -1917,123 +1892,6 @@ class DreamerV4(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# PMPO loss (paper eq. 11)
-# ---------------------------------------------------------------------------
-
-def pmpo_loss(policy, prior_policy,
-              latent: torch.Tensor, raw_action: torch.Tensor,
-              advantage: torch.Tensor,
-              alpha: float = 0.5, beta: float = 0.1,
-              entropy_coef: float = 0.0
-              ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Policy Maximum Likelihood Optimization loss (Dreamer 4 eq. 11).
-
-    Splits states by sign of advantage:
-      - D⁺ = {s | A ≥ 0} → upweight chosen action
-      - D⁻ = {s | A < 0} → downweight chosen action
-    Plus a KL term to a frozen prior policy and (optionally) an entropy
-    bonus following DreamerV3 §3 (``η = 3e-4`` by default in V3).  The
-    entropy bonus acts as a soft σ-floor for the continuous TanhNormal
-    head and a uniform-prior pull for the discrete categorical head;
-    both are essential for stability when the advantage signal is
-    heavy-tailed (e.g. process-control violation penalties).
-
-    All tensors are flat ``(N, …)``.  ``raw_action`` is the canonical
-    sample representation produced by ``policy.sample_with_raw`` (bin
-    index for discrete, pre-tanh ``u`` for continuous) — see those
-    methods for why this is required for numerical correctness in
-    bfloat16 training.  Polymorphic in policy class — both
-    ``PolicyHead`` and ``ContinuousPolicyHead`` expose
-    ``log_prob_of_raw`` / ``kl_to`` / ``entropy``.
-    """
-    log_prob = policy.log_prob_of_raw(latent, raw_action)        # (N,)
-    kl = policy.kl_to(prior_policy, latent)                      # (N,)
-
-    pos_mask = (advantage >= 0).float()
-    neg_mask = 1.0 - pos_mask
-    n_pos = pos_mask.sum().clamp_min(1.0)
-    n_neg = neg_mask.sum().clamp_min(1.0)
-    loss_pos = -(alpha * (log_prob * pos_mask).sum() / n_pos)
-    loss_neg = -((1.0 - alpha) * (-(log_prob) * neg_mask).sum() / n_neg)
-    loss_kl = beta * kl.mean()
-    if entropy_coef and entropy_coef > 0.0:
-        ent = policy.entropy(latent)                            # (N,)
-        loss_ent = -float(entropy_coef) * ent.mean()
-        ent_mean_diag = ent.mean().detach()
-    else:
-        loss_ent = torch.zeros((), device=log_prob.device,
-                                dtype=log_prob.dtype)
-        ent_mean_diag = torch.zeros((), device=log_prob.device,
-                                     dtype=log_prob.dtype)
-    total = loss_pos + loss_neg + loss_kl + loss_ent
-    diag = {
-        'pmpo_loss': total.detach(),
-        'pmpo_pos_frac': (n_pos / (n_pos + n_neg)).detach(),
-        'pmpo_kl': kl.mean().detach(),
-        'pmpo_logp_mean': log_prob.mean().detach(),
-        'pmpo_entropy_bonus': ent_mean_diag,
-    }
-    return total, diag
-
-
-# ---------------------------------------------------------------------------
-# DreamerV3 REINFORCE actor loss (V3 §3, eq. 3) — robust alternative
-# ---------------------------------------------------------------------------
-
-def reinforce_actor_loss(policy, prior_policy,
-                          latent: torch.Tensor, raw_action: torch.Tensor,
-                          advantage: torch.Tensor,
-                          entropy_coef: float = 3e-4,
-                          kl_coef: float = 0.0,
-                          ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """DreamerV3-style REINFORCE actor loss.
-
-    Replaces V4's PMPO advantage-sign-split (eq. 11) with the V3 surrogate:
-
-        L = -E[A · log π(a|s)] - η · H[π] + β · KL(π || π_prior)
-
-    ``raw_action`` is the canonical sample produced by
-    ``policy.sample_with_raw`` (pre-tanh ``u`` for continuous, bin
-    index for discrete).  Using ``raw_action`` instead of the
-    post-squash action is **required** for numerically-correct log_prob
-    recomputation under bfloat16 autocast — at moderate ``|u|``,
-    ``tanh(u)`` rounds to ±1 in bfloat16 and ``atanh`` returns the wrong
-    pre-image (manifests as ``log_prob`` ~ -1500 with std ~ 2750).
-    """
-    log_prob = policy.log_prob_of_raw(latent, raw_action)       # (N,)
-    entropy = policy.entropy(latent)                            # (N,)
-
-    # Reinforce surrogate. ``advantage`` is detached so the actor only
-    # backprops through the policy, not the critic baseline.
-    pg_loss = -(advantage.detach() * log_prob).mean()
-    ent_loss = -float(entropy_coef) * entropy.mean()
-    if kl_coef and kl_coef > 0.0:
-        kl = policy.kl_to(prior_policy, latent)                 # (N,)
-        kl_loss = float(kl_coef) * kl.mean()
-        kl_diag = kl.mean().detach()
-    else:
-        kl_loss = torch.zeros((), device=log_prob.device,
-                                dtype=log_prob.dtype)
-        kl_diag = torch.zeros((), device=log_prob.device,
-                                dtype=log_prob.dtype)
-    total = pg_loss + ent_loss + kl_loss
-    diag = {
-        'actor_pg_loss': pg_loss.detach(),
-        'actor_entropy_bonus': entropy.mean().detach(),
-        'actor_kl_pen': kl_diag,
-        'actor_logp_mean': log_prob.mean().detach(),
-        'actor_logp_std': log_prob.std().detach(),
-        # Mirror PMPO diag keys so existing logging / plotting works.
-        'pmpo_loss': total.detach(),
-        'pmpo_pos_frac': (advantage >= 0).float().mean().detach(),
-        'pmpo_kl': kl_diag,
-        'pmpo_logp_mean': log_prob.mean().detach(),
-        'pmpo_entropy_bonus': entropy.mean().detach(),
-    }
-    return total, diag
-
-
-# ---------------------------------------------------------------------------
 # Shortcut forcing world-model loss (paper eq. 7)
 # ---------------------------------------------------------------------------
 
@@ -2141,5 +1999,5 @@ __all__ = [
     'TwohotHead', 'PolicyHead', 'ContinuousPolicyHead',
     'DreamerV4Config', 'DreamerV4',
     'sample_tau_d', 'shortcut_corrupt', 'ramp_weight',
-    'shortcut_forcing_loss', 'pmpo_loss', 'reinforce_actor_loss',
+    'shortcut_forcing_loss',
 ]
