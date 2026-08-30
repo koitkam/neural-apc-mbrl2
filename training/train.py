@@ -2122,14 +2122,15 @@ class TrainConfig:
     compile_mode: str = ''
     # GPU-calib WM-only probe overhead (actor/critic/opt + P3 headroom).
     # Was leftover ``DREAMER_WM_OVERHEAD`` in ``single_run`` (worked,
-    # missing from ``run_plan``).  Identity 1.30.  Probe still reads env
-    # before TrainConfig exists (dual-read).
+    # missing from ``run_plan``).  Identity 1.30.  ``gpu_probe_knobs()``
+    # reads this default (plus leftover env) so changing it sizes B.
     wm_overhead: float = 1.30
     # GPU-calib VRAM budget + hard ceiling.  Were leftover
     # ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS`` in gpu_calibrate
     # (worked, missing from ``run_plan``).  Identity 0.80 / 512.
-    # ``DREAMER_BATCH_SIZE`` pins ``batch_size`` and skips the probe
-    # (leftover ``OBJ_BATCH_SIZE`` still wins when DREAMER is unset).
+    # ``gpu_probe_knobs()`` is the probe source of truth.  ``DREAMER_BATCH_SIZE``
+    # pins ``batch_size`` and skips the probe (leftover ``OBJ_BATCH_SIZE``
+    # still wins when DREAMER is unset).
     gpu_target_util: float = 0.80
     gpu_max_bs: int = 512
 

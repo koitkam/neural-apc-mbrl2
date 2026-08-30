@@ -32,12 +32,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > (first since P45); seed kpi **−74**. ES @286. μ-only KEEP as σ-open
 > + val beat; **FALSIFIED as yank lever**. P51 default
 > `p3_stop_grad_log_std=True` (REINFORCE trains μ only). P51 LIVE P1
-> (`run_p51_sglogstd`, `d6a4511`, pid **54815**, iter **32** recon 0.004
+> (`run_p51_sglogstd`, `d6a4511`, pid **54815**, iter **35** recon 0.0025
 > skip 0): env-free `p3_sglogstd=True`. Do **not** launch. Do **not**
 > promote `p3_reset_log_std`. Remaining `derive_auto_weights`
 > `OBJ_AUTO_*` / `OBJ_USE_NORMALIZED` / APCEnv jitter **0.15 / 0.20**
 > are TrainConfig identity (`95f64c6`, not in pid; do **not**
-> `RuntimeSetpointConfig.auto_derive`). Reward-engine
+> `RuntimeSetpointConfig.auto_derive`). GPU-calib probe now reads
+> TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
+> longer silently uses WM-only 1.0). Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
 > adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
 > until linear observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and

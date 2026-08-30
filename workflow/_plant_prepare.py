@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +222,45 @@ def explicit_batch_size() -> Optional[int]:
         except ValueError:
             continue
     return None
+
+
+def gpu_probe_knobs() -> Tuple[float, float, int]:
+    """WM-overhead / target util / max_bs for the GPU-calib probe.
+
+    The empirical probe runs before the plant-filled ``TrainConfig`` exists,
+    so it used to hard-code ``1.30 / 0.80 / 512`` (or, for BO, silently
+    fall through to ``wm_overhead_factor=1.0``).  Identity for env-free
+    ``single_run``: those numbers **are** the TrainConfig defaults.
+    Changing the dataclass now actually sizes B.  Leftover
+    ``DREAMER_WM_OVERHEAD`` / ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``
+    still win when set (same keys as ``ENV_OVERRIDES``).  Does **not**
+    call ``apply_dreamer_env_overrides`` (that would reprint
+    ``[env-override]`` at probe time and again at train start).
+    """
+    from training.train import TrainConfig
+    cfg = TrainConfig()
+    oh = float(getattr(cfg, 'wm_overhead', 1.30) or 1.30)
+    util = float(getattr(cfg, 'gpu_target_util', 0.80) or 0.80)
+    max_bs = int(getattr(cfg, 'gpu_max_bs', 512) or 512)
+    raw = os.environ.get('DREAMER_WM_OVERHEAD', '').strip()
+    if raw:
+        try:
+            oh = float(raw)
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
+    if raw:
+        try:
+            util = float(raw)
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_MAX_BS', '').strip()
+    if raw:
+        try:
+            max_bs = int(raw)
+        except ValueError:
+            pass
+    return max(1.0, oh), max(0.1, min(0.95, util)), max(16, max_bs)
 
 
 ENV_OVERRIDES: Dict[str, tuple] = {

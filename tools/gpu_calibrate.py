@@ -27,6 +27,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -306,16 +307,35 @@ def _resolve_obs_action_dim(lookback: int, sample_rate: int,
 def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
                                horizon: int, k_max: int, sample_rate: int,
                                episode_length: int,
-                               paper_default: int = 16, max_bs: int = 512,
-                               target_util: float = 0.80,
+                               paper_default: int = 16,
+                               max_bs: Optional[int] = None,
+                               target_util: Optional[float] = None,
                                bs_probe: int = 4,
-                               wm_overhead_factor: float = 1.0) -> dict:
+                               wm_overhead_factor: Optional[float] = None
+                               ) -> dict:
     """High-level entry: discover ``(obs_dim, action_dim)`` from the
     current simulation env and pick a batch size empirically.  Result is
     cached on ``(model_size, seq_len, lookback, horizon)`` so repeated BO
     trials with identical shape skip the probe.  Returns the same
     ``bs_info`` dict as :func:`pick_batch_size_empirical`.
+
+    ``None`` overhead / util / max_bs resolve through
+    ``gpu_probe_knobs()`` (TrainConfig ``wm_overhead=1.30`` /
+    ``gpu_target_util=0.80`` / ``gpu_max_bs=512`` plus leftover env).
+    Env-free ``single_run`` is unchanged.  BO used to omit overhead and
+    silently size against WM-only 1.0.
     """
+    from workflow._plant_prepare import gpu_probe_knobs
+    _oh, _util, _cap = gpu_probe_knobs()
+    if wm_overhead_factor is None:
+        wm_overhead_factor = _oh
+    if target_util is None:
+        target_util = _util
+    if max_bs is None:
+        max_bs = _cap
+    wm_overhead_factor = max(1.0, float(wm_overhead_factor))
+    target_util = max(0.1, min(0.95, float(target_util)))
+    max_bs = max(int(paper_default), int(max_bs))
     cache_key = (model_size, int(seq_len), int(lookback), int(horizon),
                  int(k_max), os.environ.get('SIMULATION_DIR', ''),
                  os.environ.get('DREAMER_MAX_BS', ''),
@@ -327,7 +347,7 @@ def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
                  os.environ.get('DREAMER_WM_OVERSHOOT_COEF', ''),
                  os.environ.get('DREAMER_WM_OVERSHOOT_LEN', ''),
                  os.environ.get('DREAMER_WM_OVERSHOOT_MAX_STARTS', ''),
-                 float(wm_overhead_factor))
+                 float(wm_overhead_factor), float(target_util), int(max_bs))
     if cache_key in _PROBE_CACHE:
         info = dict(_PROBE_CACHE[cache_key])
         info['source'] = info.get('source', 'empirical:gpu_calibrate') + ':cached'

@@ -2487,30 +2487,48 @@ def _test_noise_hidden_cfg() -> None:
 def _test_gpu_calib_cfg() -> None:
     """GPU-calib budget + batch pin: TrainConfig default, leftover OBJ, DREAMER wins."""
     import os
-    from workflow._plant_prepare import ENV_OVERRIDES, explicit_batch_size
+    from workflow._plant_prepare import (
+        ENV_OVERRIDES, explicit_batch_size, gpu_probe_knobs,
+    )
     c = TrainConfig()
     assert abs(float(c.gpu_target_util) - 0.80) < 1e-12
     assert int(c.gpu_max_bs) == 512
+    assert abs(float(c.wm_overhead) - 1.30) < 1e-12
     assert 'DREAMER_TARGET_UTIL' in ENV_OVERRIDES
     assert 'DREAMER_MAX_BS' in ENV_OVERRIDES
     assert 'DREAMER_BATCH_SIZE' in ENV_OVERRIDES
-    keys = ('DREAMER_BATCH_SIZE', 'OBJ_BATCH_SIZE')
+    assert 'DREAMER_WM_OVERHEAD' in ENV_OVERRIDES
+    keys = (
+        'DREAMER_BATCH_SIZE', 'OBJ_BATCH_SIZE',
+        'DREAMER_WM_OVERHEAD', 'DREAMER_TARGET_UTIL', 'DREAMER_MAX_BS',
+    )
     prev = {k: os.environ.get(k) for k in keys}
     try:
         for k in keys:
             os.environ.pop(k, None)
         assert explicit_batch_size() is None
+        oh, util, cap = gpu_probe_knobs()
+        assert abs(oh - 1.30) < 1e-12
+        assert abs(util - 0.80) < 1e-12
+        assert cap == 512
         os.environ['OBJ_BATCH_SIZE'] = '24'
         assert explicit_batch_size() == 24
         os.environ['DREAMER_BATCH_SIZE'] = '48'
         assert explicit_batch_size() == 48
+        os.environ['DREAMER_WM_OVERHEAD'] = '1.5'
+        os.environ['DREAMER_TARGET_UTIL'] = '0.65'
+        os.environ['DREAMER_MAX_BS'] = '64'
+        oh, util, cap = gpu_probe_knobs()
+        assert abs(oh - 1.5) < 1e-12
+        assert abs(util - 0.65) < 1e-12
+        assert cap == 64
     finally:
         for k, old in prev.items():
             if old is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  GPU-calib TrainConfig + DREAMER_BATCH_SIZE beats leftover OBJ')
+    print('[smoke] OK  GPU-calib TrainConfig + gpu_probe_knobs leftover env')
 
 
 def _test_sim_snr_cfg() -> None:

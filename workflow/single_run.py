@@ -294,17 +294,12 @@ def main() -> int:
     #
     # ``wm_overhead_factor`` reserves headroom the WM-only probe does NOT
     # measure: the actor/critic/optimizer state and the Phase-3 imagination
-    # rollout (horizon-step latent unroll).  TrainConfig ``wm_overhead``
-    # (leftover ``DREAMER_WM_OVERHEAD``); identity 1.30.  Probe runs
-    # before TrainConfig exists, so this still reads env.  Same class:
-    # ``gpu_target_util`` / ``gpu_max_bs`` (leftover ``DREAMER_TARGET_UTIL``
-    # / ``DREAMER_MAX_BS``).  ``explicit_batch_size`` pins B and skips
-    # the probe (``DREAMER_BATCH_SIZE`` then leftover ``OBJ_BATCH_SIZE``).
-    try:
-        _wm_overhead = float(os.environ.get('DREAMER_WM_OVERHEAD', '1.30'))
-    except ValueError:
-        _wm_overhead = 1.30
-    _wm_overhead = max(1.0, _wm_overhead)
+    # rollout (horizon-step latent unroll).  ``gpu_probe_knobs()`` inside
+    # ``pick_batch_size_for_plant`` reads TrainConfig ``wm_overhead`` /
+    # ``gpu_target_util`` / ``gpu_max_bs`` (leftover ``DREAMER_WM_OVERHEAD``
+    # / ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``).  Identity 1.30 /
+    # 0.80 / 512.  ``explicit_batch_size`` pins B and skips the probe
+    # (``DREAMER_BATCH_SIZE`` then leftover ``OBJ_BATCH_SIZE``).
     # Probe the P1/P2 WM unroll T (max(seq_len, H+1)), not lookback-seq_len,
     # so a slow plant's DC-gain window is in the memory budget (follow-up 13).
     # test_sim seq_len=64, H≈55 → unchanged.
@@ -317,8 +312,7 @@ def main() -> int:
         bs_info = pick_batch_size_for_plant(
             model_size=model_size, seq_len=_probe_T, lookback=lookback,
             horizon=horizon, k_max=k_max, sample_rate=sample_rate,
-            episode_length=int(episode_length),
-            wm_overhead_factor=_wm_overhead)
+            episode_length=int(episode_length))
         batch_size = int(bs_info['batch_size'])
     if bs_info.get('source', '').startswith('empirical'):
         print(f"[gpu-calib] empirical probe: "
