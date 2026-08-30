@@ -47,7 +47,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
 > longer silently uses WM-only 1.0). Missing SysID keys do **not**
-> invent τ=50 s / θ=5 s. Reward-engine
+> invent τ=50 s / θ=5 s. APCEnv operator-limit schedule
+> (change counts 1–2, ramp/warmup 0.10, strata 3, inside-margin 0.05)
+> is TrainConfig + `ENV_OVERRIDES`; `auto_derive` jitter is **0.15 / 0.20**.
+> Do **not** switch APCEnv to `auto_derive`. Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
 > adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
 > until linear observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and

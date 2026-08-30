@@ -68,7 +68,8 @@ from training.train import (
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
-                            _step_test_mv_index, _sample_step_settle_params)
+                            _step_test_mv_index, _sample_step_settle_params,
+                            _runtime_setpoint_config_from_cfg)
 
 
 def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
@@ -808,6 +809,8 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_OBJ_USE_NORMALIZED': '0',
         'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC': '0.22',
         'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC': '0.31',
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX': '3',
+        'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC': '0.12',
         'DREAMER_EXPERT_MOVE_FRAC': '0.22',
         'DREAMER_PMPO_ALPHA': '0.55',
         'DREAMER_BASELINE_SEED_EPS': '12',
@@ -892,6 +895,8 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.objective_use_normalized is False
         assert abs(float(cfg.runtime_setpoint_bounds_jitter_frac) - 0.22) < 1e-12
         assert abs(float(cfg.runtime_setpoint_target_jitter_frac) - 0.31) < 1e-12
+        assert int(cfg.runtime_setpoint_bounds_changes_max) == 3
+        assert abs(float(cfg.runtime_setpoint_ramp_duration_frac) - 0.12) < 1e-12
         assert abs(float(cfg.expert_move_frac) - 0.22) < 1e-12
         assert abs(float(cfg.pmpo_alpha) - 0.55) < 1e-12
         assert int(cfg.baseline_seed_episodes) == 12
@@ -960,6 +965,8 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'objective_use_normalized' in explicit
         assert 'runtime_setpoint_bounds_jitter_frac' in explicit
         assert 'runtime_setpoint_target_jitter_frac' in explicit
+        assert 'runtime_setpoint_bounds_changes_max' in explicit
+        assert 'runtime_setpoint_ramp_duration_frac' in explicit
         assert 'expert_move_frac' in explicit
         assert 'pmpo_alpha' in explicit
         assert 'baseline_seed_episodes' in explicit
@@ -1372,6 +1379,10 @@ def _test_envfree_observer_recipe() -> None:
     assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
     assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
+    assert int(c.runtime_setpoint_bounds_changes_min) == 1
+    assert int(c.runtime_setpoint_bounds_changes_max) == 2
+    assert abs(float(c.runtime_setpoint_ramp_duration_frac) - 0.10) < 1e-12
+    assert int(c.runtime_setpoint_n_magnitude_strata) == 3
     assert c.objective_use_normalized is True
     assert abs(float(c.baseline_seed_op_band) - 0.6) < 1e-12
     assert abs(float(c.constant_action_seed_op_band) - 0.6) < 1e-12
@@ -1405,6 +1416,8 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_BC_MEAN_ONLY' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
     assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX' in ENV_OVERRIDES
+    assert 'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_USE_NORMALIZED' in ENV_OVERRIDES
     assert 'DREAMER_BASELINE_SEED_OP_BAND' in ENV_OVERRIDES
     assert 'DREAMER_CONST_ACTION_OP_BAND' in ENV_OVERRIDES
@@ -1701,12 +1714,14 @@ def _test_auto_weights_cfg() -> None:
     assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
     assert abs(float(c.runtime_setpoint_target_jitter_frac) - 0.20) < 1e-12
     assert c.objective_use_normalized is True
-    # APCEnv path uses dataclass jitter, not auto_derive 0.25.
+    # APCEnv path uses dataclass jitter / schedule, not τ-derived auto_derive.
     rs = RuntimeSetpointConfig()
     assert abs(float(rs.bounds_jitter_fraction) - 0.15) < 1e-12
     assert abs(float(rs.target_jitter_fraction) - 0.20) < 1e-12
+    assert rs.bounds_changes_per_episode == (1, 2)
     assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
     assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_USE_NORMALIZED' in ENV_OVERRIDES
     kw = dict(
         spec={}, n_mv=1, n_cv=1,
@@ -1743,6 +1758,62 @@ def _test_auto_weights_cfg() -> None:
             else:
                 os.environ[k] = old
     print('[smoke] OK  auto-weights TrainConfig + leftover OBJ_AUTO_* identity')
+
+
+def _test_runtime_setpoint_schedule_cfg() -> None:
+    """Operator-limit schedule: TrainConfig identity, DREAMER A/B, auto_derive jitter."""
+    import os
+    from utils.runtime_setpoints import RuntimeSetpointConfig
+    from workflow._plant_prepare import ENV_OVERRIDES
+
+    c = TrainConfig()
+    rs = _runtime_setpoint_config_from_cfg(c)
+    assert rs.bounds_changes_per_episode == (1, 2)
+    assert rs.target_changes_per_episode == (1, 2)
+    assert abs(float(rs.ramp_duration_fraction) - 0.10) < 1e-12
+    assert abs(float(rs.curriculum_warmup_fraction) - 0.10) < 1e-12
+    assert int(rs.n_magnitude_strata) == 3
+    assert abs(float(rs.target_inside_margin_frac) - 0.05) < 1e-12
+    assert abs(float(rs.bounds_jitter_fraction) - 0.15) < 1e-12
+    assert abs(float(rs.target_jitter_fraction) - 0.20) < 1e-12
+    assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX' in ENV_OVERRIDES
+    assert 'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC' in ENV_OVERRIDES
+    keys = (
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX',
+        'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC',
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC',
+        'RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION',
+        'RUNTIME_SETPOINT_TARGET_JITTER_FRACTION',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        ad = RuntimeSetpointConfig.auto_derive(
+            targets_enabled=False, episode_length=1220,
+            tau_dominant=53.0, dead_time=8.0, dt=1.0)
+        assert abs(float(ad.bounds_jitter_fraction) - 0.15) < 1e-12
+        assert abs(float(ad.target_jitter_fraction) - 0.20) < 1e-12
+        os.environ['RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION'] = '0.28'
+        ad2 = RuntimeSetpointConfig.auto_derive(
+            targets_enabled=False, episode_length=1220)
+        assert abs(float(ad2.bounds_jitter_fraction) - 0.28) < 1e-12
+        os.environ['DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC'] = '0.18'
+        ad3 = RuntimeSetpointConfig.auto_derive(
+            targets_enabled=False, episode_length=1220)
+        assert abs(float(ad3.bounds_jitter_fraction) - 0.18) < 1e-12
+        c_ex = TrainConfig()
+        c_ex.runtime_setpoint_bounds_changes_max = 4
+        c_ex._explicit_fields = {'runtime_setpoint_bounds_changes_max'}  # type: ignore[attr-defined]
+        rs_ex = _runtime_setpoint_config_from_cfg(c_ex)
+        assert rs_ex.bounds_changes_per_episode == (1, 4)
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  runtime-setpoint schedule TrainConfig + auto_derive jitter 0.15/0.20')
 
 
 def _test_expert_move_law_cfg() -> None:
@@ -3269,6 +3340,7 @@ if __name__ == '__main__':
     _test_identified_tau_cfg()
     _test_objective_runtime_cfg()
     _test_auto_weights_cfg()
+    _test_runtime_setpoint_schedule_cfg()
     _test_expert_move_law_cfg()
     _test_pin_eval_modules()
     _test_control_quality_gates()

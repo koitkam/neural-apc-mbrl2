@@ -635,12 +635,29 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_MV_HARD_CLAMP':              ('mv_hard_clamp',                  _as_bool),
     'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
     'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),
-    # APCEnv jitter (dataclass 0.15 / 0.20 — not auto_derive 0.25).
-    # Dual-read leftover ``RUNTIME_SETPOINT_*_JITTER_FRACTION``.
+    # APCEnv schedule (dataclass 0.15 / 0.20 / 1–2 / 0.10 / 3 / 0.05).
+    # Dual-read leftover ``RUNTIME_SETPOINT_*_JITTER_FRACTION``.  Do **not**
+    # switch APCEnv to ``auto_derive`` (τ-derived change-count / ramp).
     'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC': (
         'runtime_setpoint_bounds_jitter_frac', float),
     'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC': (
         'runtime_setpoint_target_jitter_frac', float),
+    'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MIN': (
+        'runtime_setpoint_bounds_changes_min', int),
+    'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX': (
+        'runtime_setpoint_bounds_changes_max', int),
+    'DREAMER_RUNTIME_SETPOINT_TARGET_CHANGES_MIN': (
+        'runtime_setpoint_target_changes_min', int),
+    'DREAMER_RUNTIME_SETPOINT_TARGET_CHANGES_MAX': (
+        'runtime_setpoint_target_changes_max', int),
+    'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC': (
+        'runtime_setpoint_ramp_duration_frac', float),
+    'DREAMER_RUNTIME_SETPOINT_CURRICULUM_WARMUP_FRAC': (
+        'runtime_setpoint_curriculum_warmup_frac', float),
+    'DREAMER_RUNTIME_SETPOINT_N_MAGNITUDE_STRATA': (
+        'runtime_setpoint_n_magnitude_strata', int),
+    'DREAMER_RUNTIME_SETPOINT_TARGET_INSIDE_MARGIN_FRAC': (
+        'runtime_setpoint_target_inside_margin_frac', float),
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``rssm`` (default) vs ``sf_transformer``; RSSM latent sizes and
     # KL-balance knobs.  See TrainConfig for paper rationale.

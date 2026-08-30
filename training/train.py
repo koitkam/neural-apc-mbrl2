@@ -705,11 +705,23 @@ class TrainConfig:
     runtime_setpoint_variation: bool = True
     # Operator-limit / target step size as a fraction of the base span.
     # APCEnv constructs ``RuntimeSetpointConfig`` with dataclass defaults
-    # **0.15 / 0.20** (do **not** switch to ``auto_derive``, whose leftover
-    # env default is 0.25).  Dual-read leftover
+    # **0.15 / 0.20** (do **not** switch to ``auto_derive``: τ-derived
+    # change counts / ramp are not test_sim identity).  Dual-read leftover
     # ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` when the field is not explicit.
     runtime_setpoint_bounds_jitter_frac: float = 0.15
     runtime_setpoint_target_jitter_frac: float = 0.20
+    # Remaining RuntimeSetpointConfig schedule knobs (identity 1/2, 0.10,
+    # 3, 0.05).  Were dataclass-only so env-free ``run_plan`` could not
+    # A/B them.  ``auto_derive`` still sizes change-count from τ — that
+    # is a later sim-adaptive A/B, not env-free identity (test_sim 1–2).
+    runtime_setpoint_bounds_changes_min: int = 1
+    runtime_setpoint_bounds_changes_max: int = 2
+    runtime_setpoint_target_changes_min: int = 1
+    runtime_setpoint_target_changes_max: int = 2
+    runtime_setpoint_ramp_duration_frac: float = 0.10
+    runtime_setpoint_curriculum_warmup_frac: float = 0.10
+    runtime_setpoint_n_magnitude_strata: int = 3
+    runtime_setpoint_target_inside_margin_frac: float = 0.05
     # Per-CV rolling int_err / Δcv / var appended to aug-obs (P37 ON).
     # Was leftover ``DREAMER_DERIVED_OBSERVABLES`` (worked, missing from
     # ``run_plan``).  ``=0`` restores the legacy obs layout (different
@@ -2207,6 +2219,65 @@ def _cfg_or_env_float(cfg, field: str, env_key: str, default: float
     return float(v), bool(user)
 
 
+def _runtime_setpoint_config_from_cfg(cfg) -> RuntimeSetpointConfig:
+    """APCEnv ``RuntimeSetpointConfig`` from TrainConfig (test_sim identity).
+
+    Do **not** call ``auto_derive`` (τ-derived change-count / ramp would
+    not be env-free identity).  Jitter dual-reads leftover
+    ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` when the field is not explicit.
+    """
+    def _i(field: str, env_key: str, default: int) -> int:
+        v, _ = _cfg_or_env(cfg, field, env_key, default, int)
+        return int(v)
+
+    def _f(field: str, env_key: str, default: float) -> float:
+        v, _ = _cfg_or_env_float(cfg, field, env_key, default)
+        return float(v)
+
+    bmin = max(0, _i(
+        'runtime_setpoint_bounds_changes_min',
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MIN', 1))
+    bmax = max(bmin, _i(
+        'runtime_setpoint_bounds_changes_max',
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX', 2))
+    tmin = max(0, _i(
+        'runtime_setpoint_target_changes_min',
+        'DREAMER_RUNTIME_SETPOINT_TARGET_CHANGES_MIN', 1))
+    tmax = max(tmin, _i(
+        'runtime_setpoint_target_changes_max',
+        'DREAMER_RUNTIME_SETPOINT_TARGET_CHANGES_MAX', 2))
+    ramp = float(np.clip(_f(
+        'runtime_setpoint_ramp_duration_frac',
+        'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC', 0.10), 0.0, 1.0))
+    warm = float(np.clip(_f(
+        'runtime_setpoint_curriculum_warmup_frac',
+        'DREAMER_RUNTIME_SETPOINT_CURRICULUM_WARMUP_FRAC', 0.10), 0.0, 1.0))
+    strata = max(0, _i(
+        'runtime_setpoint_n_magnitude_strata',
+        'DREAMER_RUNTIME_SETPOINT_N_MAGNITUDE_STRATA', 3))
+    inside = float(np.clip(_f(
+        'runtime_setpoint_target_inside_margin_frac',
+        'DREAMER_RUNTIME_SETPOINT_TARGET_INSIDE_MARGIN_FRAC', 0.05),
+        0.0, 0.45))
+    return RuntimeSetpointConfig(
+        bounds_enabled=bool(getattr(cfg, 'runtime_setpoint_variation', True)),
+        bounds_jitter_fraction=float(np.clip(_cfg_or_env_float(
+            cfg, 'runtime_setpoint_bounds_jitter_frac',
+            'RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION', 0.15)[0],
+            0.05, 0.45)),
+        target_jitter_fraction=float(np.clip(_cfg_or_env_float(
+            cfg, 'runtime_setpoint_target_jitter_frac',
+            'RUNTIME_SETPOINT_TARGET_JITTER_FRACTION', 0.20)[0],
+            0.05, 0.45)),
+        bounds_changes_per_episode=(bmin, bmax),
+        target_changes_per_episode=(tmin, tmax),
+        ramp_duration_fraction=ramp,
+        curriculum_warmup_fraction=warm,
+        n_magnitude_strata=strata,
+        target_inside_margin_frac=inside,
+    )
+
+
 class APCEnv:
     """Slim env wrapper around the carryover simulator.
 
@@ -2301,23 +2372,10 @@ class APCEnv:
             base_cv_bounds=cvb,
             base_cv_targets=cv_targets,
             cv_target_enabled=cv_target_enabled,
-            cfg=RuntimeSetpointConfig(
-                # P86: allow training/validation on a single consistent limit
-                # set (active ≡ base) by disabling mid-episode limit-step
-                # variation.  Default True preserves the legacy operator-limit
-                # tracking curriculum.  Do **not** call ``auto_derive``
-                # (change-count / ramp / 0.25 jitter would not be identity).
-                bounds_enabled=bool(getattr(
-                    self.cfg, 'runtime_setpoint_variation', True)),
-                bounds_jitter_fraction=float(np.clip(_cfg_or_env_float(
-                    self.cfg, 'runtime_setpoint_bounds_jitter_frac',
-                    'RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION', 0.15)[0],
-                    0.05, 0.45)),
-                target_jitter_fraction=float(np.clip(_cfg_or_env_float(
-                    self.cfg, 'runtime_setpoint_target_jitter_frac',
-                    'RUNTIME_SETPOINT_TARGET_JITTER_FRACTION', 0.20)[0],
-                    0.05, 0.45)),
-            ),
+            # P86: variation ON teaches operator-limit tracking.  Do **not**
+            # call ``auto_derive`` (τ-derived change-count / ramp are not
+            # env-free identity).  Schedule knobs are TrainConfig.
+            cfg=_runtime_setpoint_config_from_cfg(self.cfg),
             mv_norm_bounds=np.asarray(self.mv_norm_ranges, dtype='float32')
                 if self.mv_norm_ranges else np.zeros((0, 2), dtype='float32'),
             cv_norm_bounds=np.asarray(self.cv_norm_ranges, dtype='float32')
