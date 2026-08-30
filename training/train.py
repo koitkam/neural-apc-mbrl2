@@ -25,6 +25,7 @@ Phase budget: ``cfg.phaseN_frac`` of ``cfg.total_steps`` for N ∈ {1, 2, 3}.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -1893,6 +1894,18 @@ class TrainConfig:
     # Opt out ``DREAMER_P3_LOGP_CLIP=0``. Not
     # ``actor_kl_coef`` (p136 FALSIFIED as a σ-collapse TR; do not revive).
     p3_logp_clip: float = 8.0
+    # P53: PPO-style ratio clip vs a **frozen unfreeze-μ snapshot**
+    # (first ``_realsim_actor_critic_step``; critic warmup does not
+    # step the actor, so this is the P3-entry / unfreeze μ).
+    # ``ratio = exp(logp − logp_old)``; surrogate
+    # ``min(ratio·adv, clip(ratio, 1−ε, 1+ε)·adv)``. Stops in-support
+    # ``(u−μ)/σ²`` SGD once π has walked outside ε of the snapshot.
+    # Not a lag-copy of the collector (1 update/batch ⇒ ratio≡1).
+    # Not ``logp.detach()`` as old (same-forward ⇒ ratio≡1). Not
+    # ``actor_kl_coef`` (p136 σ-TR; not wired here). ε≤0 disables
+    # (identity REINFORCE + P52 logp clip). Default 0.2. Opt out
+    # ``DREAMER_P3_MU_RATIO_CLIP=0``.
+    p3_mu_ratio_clip: float = 0.2
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
     # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
@@ -4008,6 +4021,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"bc_mean={bool(getattr(cfg, 'bc_mean_only', True))} "
         f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
         f"p3_logpclip={float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0):g} "
+        f"p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0):g} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -7917,6 +7931,59 @@ def _p3_logp_clip_bound(clip: float, n_act: int) -> float:
     return c * float(max(1, int(n_act)))
 
 
+def _p3_policy_logp(policy, feat: torch.Tensor, act: torch.Tensor,
+                    stop_grad_log_std: bool) -> torch.Tensor:
+    """Gaussian ``log_prob_of`` honours stop-grad σ; discrete ignores it."""
+    if stop_grad_log_std and hasattr(policy, 'dist_params'):
+        return policy.log_prob_of(feat, act, stop_grad_log_std=True)
+    return policy.log_prob_of(feat, act)
+
+
+def _p3_frozen_unfreeze_policy(model) -> torch.nn.Module:
+    """Detached deepcopy of ``model.policy`` taken once (P3-entry μ).
+
+    Stored in a list so ``nn.Module.__setattr__`` does not register it
+    as a child (would leak into ``state_dict`` / ``parameters()``).
+    Critic warmup does not ``opt_actor.step``, so the first AC call is
+    the unfreeze snapshot. Never lag-copied after an AC step. Not
+    same-forward ``logp.detach()`` (that forces ratio≡1).
+    """
+    hold = getattr(model, '_p3_mu_ratio_hold', None)
+    if hold is None:
+        snap = copy.deepcopy(model.policy)
+        snap.eval()
+        for p in snap.parameters():
+            p.requires_grad_(False)
+        model._p3_mu_ratio_hold = [snap]
+        hold = model._p3_mu_ratio_hold
+    return hold[0]
+
+
+def _p3_mu_ratio_surrogate(
+        logp: torch.Tensor, logp_old: torch.Tensor, adv: torch.Tensor,
+        eps: float,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """PPO clip vs a frozen snapshot. ``eps<=0`` is identity REINFORCE.
+
+    Returns ``(surr, ratio, clip_mask)`` with ``surr`` the per-sample
+    term whose mean is negated for the actor loss (same sign as
+    ``adv * logp`` when disabled). ``ratio`` / ``clip_mask`` are
+    detached diagnostics.
+    """
+    e = float(eps or 0.0)
+    if e <= 0.0:
+        ones = torch.ones_like(logp)
+        zeros = torch.zeros_like(logp)
+        return adv * logp, ones, zeros
+    log_ratio = (logp - logp_old).clamp(-20.0, 20.0)
+    ratio = torch.exp(log_ratio)
+    surr1 = ratio * adv
+    surr2 = ratio.clamp(1.0 - e, 1.0 + e) * adv
+    surr = torch.min(surr1, surr2)
+    clipped = (ratio < (1.0 - e)) | (ratio > (1.0 + e))
+    return surr, ratio.detach(), clipped.float().detach()
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 — Imagination training (PMPO + TD-λ)
 # ---------------------------------------------------------------------------
@@ -8056,13 +8123,11 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # (P50 unfreeze 169: ent −0.107→−0.268). Discrete heads have no
     # ``dist_params`` and ignore the flag.
     _sg_logstd = bool(getattr(cfg, 'p3_stop_grad_log_std', True))
+    logp = _p3_policy_logp(model.policy, feat_flat, act_flat, _sg_logstd)
     if _sg_logstd and hasattr(model.policy, 'dist_params'):
-        logp = model.policy.log_prob_of(
-            feat_flat, act_flat, stop_grad_log_std=True)
         entropy = model.policy.entropy(
             feat_flat, stop_grad_log_std=True)
     else:
-        logp = model.policy.log_prob_of(feat_flat, act_flat)     # (B*T,)
         entropy = model.policy.entropy(feat_flat)                # (B*T,)
     ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
     # P51 EXIT / P52: clamp REINFORCE logp so frozen-σ (u−μ)/σ² cannot
@@ -8074,7 +8139,27 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0),
         int(act_flat.shape[-1]))
     logp_pg = logp.clamp(-_logp_clip, _logp_clip) if _logp_clip > 0.0 else logp
-    actor_loss = -(adv_flat * logp_pg).mean() - ent_coef * entropy.mean() + bc_term
+    # P52 EXIT / P53: in-support (|logp|<8) SGD still walks μ. PPO
+    # clip vs a frozen unfreeze snapshot zeros the PG once ratio is
+    # outside [1−ε, 1+ε]. ε≤0 keeps ``-(adv * logp_pg)``.
+    _mu_eps = float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0)
+    if _mu_eps > 0.0:
+        old_pol = _p3_frozen_unfreeze_policy(model)
+        with torch.no_grad():
+            logp_old = _p3_policy_logp(
+                old_pol, feat_flat, act_flat, _sg_logstd)
+            if _logp_clip > 0.0:
+                logp_old = logp_old.clamp(-_logp_clip, _logp_clip)
+        surr, ratio, clip_mask = _p3_mu_ratio_surrogate(
+            logp_pg, logp_old, adv_flat, _mu_eps)
+        actor_pg = -surr.mean()
+        _ratio_mean = ratio.mean()
+        _ratio_clip_frac = clip_mask.mean()
+    else:
+        actor_pg = -(adv_flat * logp_pg).mean()
+        _ratio_mean = torch.ones((), device=device)
+        _ratio_clip_frac = torch.zeros((), device=device)
+    actor_loss = actor_pg - ent_coef * entropy.mean() + bc_term
 
     # ----- diagnostics (mirror the imagination keys the P3 logger reads) -----
     with torch.no_grad():
@@ -8095,6 +8180,8 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'imag_adv_action_corr': adv_action_corr.detach(),
         'actor_logp_mean': logp.mean().detach(),
         'actor_logp_std': logp.std().detach(),
+        'actor_ratio_mean': _ratio_mean.detach(),
+        'actor_ratio_clip_frac': _ratio_clip_frac.detach(),
         'pmpo_pos_frac': (adv_flat >= 0).float().mean().detach(),
         'bc_loss': bc_loss_p3.detach(),
         'expert_bc_weight': torch.tensor(float(expert_bc_weight), device=device),

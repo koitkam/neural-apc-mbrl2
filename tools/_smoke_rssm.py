@@ -64,6 +64,7 @@ from training.train import (
                             collect_rest_lookback,
                             _wm_gain_match_loss, _require_realsim_actor,
                             _adv_action_corr, _p3_logp_clip_bound,
+                            _p3_mu_ratio_surrogate, _p3_frozen_unfreeze_policy,
                             _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
@@ -208,6 +209,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.bc_mean_only is True
     assert _tc.p3_stop_grad_log_std is True
     assert abs(float(_tc.p3_logp_clip) - 8.0) < 1e-12
+    assert abs(float(_tc.p3_mu_ratio_clip) - 0.2) < 1e-12
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
     print('[smoke] OK  gain-match defaults (abs Huber, per-input β, rest-IC, TBPTT=16)')
@@ -750,6 +752,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_P3_RESET_LOG_STD': '1',
         'DREAMER_P3_STOP_GRAD_LOG_STD': '0',
         'DREAMER_P3_LOGP_CLIP': '0',
+        'DREAMER_P3_MU_RATIO_CLIP': '0',
         'DREAMER_BC_MEAN_ONLY': '0',
         'DREAMER_BASELINE_SEED_OP_BAND': '0.4',
         'DREAMER_CONST_ACTION_OP_BAND': '0.55',
@@ -844,6 +847,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.p3_reset_log_std is True
         assert cfg.p3_stop_grad_log_std is False
         assert abs(float(cfg.p3_logp_clip)) < 1e-12
+        assert abs(float(cfg.p3_mu_ratio_clip)) < 1e-12
         assert cfg.bc_mean_only is False
         assert abs(float(cfg.baseline_seed_op_band) - 0.4) < 1e-12
         assert abs(float(cfg.constant_action_seed_op_band) - 0.55) < 1e-12
@@ -1233,7 +1237,10 @@ def _test_isolation_dcv_scales() -> None:
     assert "bc_mean={bool(getattr(cfg, 'bc_mean_only'" in _src
     assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
     assert "p3_logpclip={float(getattr(cfg, 'p3_logp_clip'" in _src
+    assert "p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip'" in _src
     assert '_p3_logp_clip_bound' in _src
+    assert '_p3_mu_ratio_surrogate' in _src
+    assert '_p3_frozen_unfreeze_policy' in _src
     assert "SIM_IDENTIFIED_TAU_DOMINANT', '50'" not in _src
     assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
@@ -1398,6 +1405,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.bc_mean_only is True
     assert c.p3_stop_grad_log_std is True
     assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
+    assert abs(float(c.p3_mu_ratio_clip) - 0.2) < 1e-12
     assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
     assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
     assert int(c.runtime_setpoint_bounds_changes_min) == 1
@@ -1434,6 +1442,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_P3_RESET_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_STOP_GRAD_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_LOGP_CLIP' in ENV_OVERRIDES
+    assert 'DREAMER_P3_MU_RATIO_CLIP' in ENV_OVERRIDES
     assert 'DREAMER_BC_MEAN_ONLY' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
     assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC' in ENV_OVERRIDES
@@ -2372,6 +2381,86 @@ def _test_p3_logp_clip() -> None:
     print('[smoke] OK  p3_logp_clip zeros μ grad on railed logp; keeps in-support')
 
 
+def _test_p3_mu_ratio_clip() -> None:
+    """P53: PPO ratio clip vs frozen snapshot bounds μ-grad; ε=0 is REINFORCE."""
+    from models.dreamer_v4 import ContinuousPolicyHead
+    torch.manual_seed(0)
+    assert abs(float(TrainConfig().p3_mu_ratio_clip) - 0.2) < 1e-12
+    kwargs = dict(
+        in_dim=8, hidden_dim=16, action_dim=1, n_layers=2, mtp_length=1,
+        init_log_std=-1.5, log_std_min=-2.3, log_std_max=0.0)
+    feat = torch.randn(8, 8)
+    pol = ContinuousPolicyHead(**kwargs)
+    with torch.no_grad():
+        mu, _ = pol.dist_params(feat)
+        act = torch.tanh(mu + 0.25)
+    adv = torch.ones(8)
+    logp = pol.log_prob_of(feat, act, stop_grad_log_std=True)
+    surr0, ratio0, clip0 = _p3_mu_ratio_surrogate(logp, logp.detach(), adv, 0.0)
+    assert torch.allclose(surr0, adv * logp)
+    assert abs(float(ratio0.mean()) - 1.0) < 1e-12
+    assert abs(float(clip0.mean())) < 1e-12
+    (-surr0.mean()).backward(retain_graph=True)
+    g0 = pol.head.net[-1].weight.grad[0].detach().clone()
+    pol.zero_grad(set_to_none=True)
+    (-(adv * logp).mean()).backward()
+    g_rf = pol.head.net[-1].weight.grad[0].detach().clone()
+    assert torch.allclose(g0, g_rf, atol=1e-6)
+
+    pol2 = ContinuousPolicyHead(**kwargs)
+    with torch.no_grad():
+        mu2, _ = pol2.dist_params(feat)
+        act2 = torch.tanh(mu2 + 0.25)
+    logp2 = pol2.log_prob_of(feat, act2, stop_grad_log_std=True)
+    surr_in, ratio_in, clip_in = _p3_mu_ratio_surrogate(
+        logp2, logp2.detach(), adv, 0.2)
+    assert float((ratio_in - 1.0).abs().max()) < 1e-5
+    assert abs(float(clip_in.mean())) < 1e-12
+    (-surr_in.mean()).backward()
+    assert float(pol2.head.net[-1].weight.grad[0].abs().max()) > 1e-6
+
+    torch.manual_seed(1)
+    pol_old = ContinuousPolicyHead(**kwargs)
+    torch.manual_seed(1)
+    pol_new = ContinuousPolicyHead(**kwargs)
+    torch.manual_seed(1)
+    pol_raw = ContinuousPolicyHead(**kwargs)
+    with torch.no_grad():
+        pol_new.head.net[-1].bias[0] = 0.4
+        pol_raw.head.net[-1].bias[0] = 0.4
+        mu_n, _ = pol_new.dist_params(feat)
+        act_n = torch.tanh(mu_n + 0.3)
+    adv_n = torch.ones(feat.shape[0]) * 8.0
+    logp_n = pol_new.log_prob_of(feat, act_n, stop_grad_log_std=True)
+    with torch.no_grad():
+        logp_o = pol_old.log_prob_of(feat, act_n, stop_grad_log_std=True)
+    surr_w, ratio_w, clip_w = _p3_mu_ratio_surrogate(
+        logp_n, logp_o, adv_n, 0.2)
+    assert float(ratio_w.mean()) > 1.2, float(ratio_w.mean())
+    assert float(clip_w.mean()) > 0.5, float(clip_w.mean())
+    (-surr_w.mean()).backward()
+    g_clip = float(pol_new.head.net[-1].weight.grad[0].abs().max())
+    logp_r = pol_raw.log_prob_of(feat, act_n.detach(), stop_grad_log_std=True)
+    ratio_u = torch.exp((logp_r - logp_o.detach()).clamp(-20.0, 20.0))
+    (-(ratio_u * adv_n).mean()).backward()
+    g_raw = float(pol_raw.head.net[-1].weight.grad[0].abs().max())
+    assert g_clip < 1e-6, g_clip
+    assert g_raw > 1e-4, g_raw
+
+    class _Hold(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy = ContinuousPolicyHead(**kwargs)
+
+    m = _Hold()
+    snap = _p3_frozen_unfreeze_policy(m)
+    assert _p3_frozen_unfreeze_policy(m) is snap
+    snap_ids = {id(p) for p in snap.parameters()}
+    live_ids = {id(p) for p in m.parameters()}
+    assert snap_ids.isdisjoint(live_ids)
+    print('[smoke] OK  p3_mu_ratio_clip bounds μ-grad vs frozen snapshot; ε=0 identity')
+
+
 def _test_id_tau_no_plant_sentinel() -> None:
     """Missing SysID keys must not invent τ=50 s / θ=5 s."""
     from pathlib import Path
@@ -3197,6 +3286,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'p3_sigreset=False' in banner, banner
     assert 'p3_sglogstd=True' in banner, banner
     assert 'p3_logpclip=8' in banner, banner
+    assert 'p3_muratio=0.2' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -3406,6 +3496,7 @@ if __name__ == '__main__':
     _test_bc_mean_only()
     _test_p3_stop_grad_log_std()
     _test_p3_logp_clip()
+    _test_p3_mu_ratio_clip()
     _test_id_tau_no_plant_sentinel()
     _test_resolve_baseline_seed_op_band()
     _test_cfg_or_env_float_identity()

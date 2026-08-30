@@ -607,6 +607,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_P3_STOP_GRAD_LOG_STD':       ('p3_stop_grad_log_std',           _as_bool),
     # P52: clamp P3 REINFORCE logp (default 8). Opt out ``=0``.
     'DREAMER_P3_LOGP_CLIP':               ('p3_logp_clip',                   float),
+    # P53: PPO ratio clip vs frozen unfreeze-μ (default 0.2). Opt out ``=0``.
+    'DREAMER_P3_MU_RATIO_CLIP':           ('p3_mu_ratio_clip',               float),
     'DREAMER_WM_GRAD_SKIP_NORM':          ('wm_grad_skip_norm',              float),
     # P27 RCA / P28: restore wm_best and continue to P2 on a P1 skip-storm
     # instead of aborting the run (default ON).

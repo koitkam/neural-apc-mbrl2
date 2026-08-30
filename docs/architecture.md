@@ -45,7 +45,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > and P51 **−72 vs −111**; best.pt **176** det **−634**).
 > Gate @82 last-ok **78** MV **0.95** DV **0.84**. Default
 > `p3_logp_clip=8` nats **per MV** (summed
-> logp clamp `8×n_mv`; 1-MV identity). Do **not**
+> logp clamp `8×n_mv`; 1-MV identity). **P53 LIVE**
+> (`run_p53_muratio`): PPO-style ratio clip vs a frozen
+> unfreeze-μ snapshot (`p3_mu_ratio_clip=0.2`; opt out
+> `DREAMER_P3_MU_RATIO_CLIP=0`). Not a tighter logp clip.
+> Not `logp.detach()` as old. Not `actor_kl_coef`. Do **not**
 > promote `p3_reset_log_std`. Do not stack critic knobs. Do not
 > revive `actor_kl_coef`. `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -457,7 +461,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > non-sticky floor; **FALSIFIED as cascade** (μ still rails). **P52 EXIT
 > KEEP** as delayed first-unfreeze bound (`p3_logp_clip=8`);
 > **FALSIFIED as cascade** (in-support μ-walk; val **−377 vs −87
-> FAIL**). Next GPU: PPO-style ratio clip vs frozen unfreeze-μ.
+> FAIL**). **P53 LIVE:** PPO-style ratio clip vs frozen
+> unfreeze-μ (`p3_mu_ratio_clip=0.2`; first AC call, critic
+> warmup does not step the actor). Opt out
+> `DREAMER_P3_MU_RATIO_CLIP=0`. Not a lag-copy (1 update/batch
+> ⇒ ratio≡1). Not same-forward `logp.detach()`.
 > Opt out `DREAMER_P3_LOGP_CLIP=0`. Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.
 > Opt out `DREAMER_BC_MEAN_ONLY=0`. Do not stack more critic knobs.
 > Do not promote `p3_reset_log_std`.
