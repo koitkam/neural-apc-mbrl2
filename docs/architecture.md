@@ -38,9 +38,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > (μ-rail logp_std 0.54→38 @147; val paired **−72 vs −111**, worse
 > than P50 **−56 vs −104**; best.pt **161** during cascade).
 > P52 LIVE P1 (`run_p52_logpclip`, `d910ee2`, pid **64705**,
-> iter **77**): recon **0.0029** (best **0.0017@71**) last_ok
-> **77 unlocked** skip 0; `wm_best` EMA **5.863@70**. Default
-> `p3_logp_clip=8` nats **per MV** (summed
+> iter **79**): **lock@79** last_ok **78** (recon **0.331** =
+> 196× best **0.0017@71**, skip 0). Wrap/wm-fid 80 then gate 82.
+> Default `p3_logp_clip=8` nats **per MV** (summed
 > logp clamp `8×n_mv`; 1-MV identity). Do **not**
 > promote `p3_reset_log_std`. Do not stack critic knobs. Do not
 > revive `actor_kl_coef`. `derive_horizon` / sim `reset()` now
