@@ -37,8 +37,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > wrap lock@66 unlock@69. P1→P2 @82 wm_best SKIPPED. P2→P3 @136.
 > First P3 ent **−0.125**; rscale freeze **2.17 KEEP**. Unfreeze 147:
 > entropy **HELD −0.141→−0.101** (no P50 −0.268 σ-yank) but μ railed
-> (`actor_logp_std` 0.54→38, actor −28, rtgt 0.046→0.0004, ret_w
-> −65→−590 @208; ent later −0.20 via tanh-rail, not σ_min).
+> (`actor_logp_std` 0.54→38; by 249 actor −43, mvv 749k, rtgt 0.0002,
+> ret_w −1470; ent min −0.226 then −0.15, not σ_min).
 > Env-free `p3_sglogstd=True`. Do **not** launch. Do **not**
 > promote `p3_reset_log_std`. Do not stack critic knobs.
 > `derive_horizon` / sim `reset()` now
