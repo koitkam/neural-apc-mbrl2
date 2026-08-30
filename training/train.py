@@ -1854,6 +1854,20 @@ class TrainConfig:
     # Discrete policy ignores this (no Gaussian). Opt out
     # ``DREAMER_P3_STOP_GRAD_LOG_STD=0``. Not ``p3_reset_log_std``.
     p3_stop_grad_log_std: bool = True
+    # P51 EXIT: stop-grad KEEP as unfreeze-yank + non-sticky floor
+    # (147 held; 315 −0.282 then recovered) but **FALSIFIED as cascade
+    # lever**. Frozen-σ REINFORCE still rails μ: unfreeze 147
+    # ``actor_logp_std`` 0.54→38 (mean −26), @315 mean −227; mvv 19k@161
+    # / 681k@361; rtgt 0.046→0.00015. ``advantage_clip=8`` and
+    # ``actor_grad_clip=10`` already saturate (147 gnorm 9.65) but each
+    # step still shoves μ toward the tanh rail via (u−μ)/σ². Clamp the
+    # REINFORCE logp used in ``-(adv * logp)`` so railed (u,μ) pairs
+    # contribute ~0 μ-grad (BC can still pull). Healthy P3 warmup logp
+    # is ~0.65±0.54, so 8 matches ``advantage_clip`` and does not bind
+    # in-support samples. 0 = unclipped (P51). Opt out
+    # ``DREAMER_P3_LOGP_CLIP=0``. Not ``actor_kl_coef`` (p136 FALSIFIED
+    # as a σ-collapse TR; do not revive).
+    p3_logp_clip: float = 8.0
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
     # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
@@ -3922,6 +3936,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std', False))} "
         f"bc_mean={bool(getattr(cfg, 'bc_mean_only', True))} "
         f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
+        f"p3_logpclip={float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0):g} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -7963,7 +7978,13 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         logp = model.policy.log_prob_of(feat_flat, act_flat)     # (B*T,)
         entropy = model.policy.entropy(feat_flat)                # (B*T,)
     ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
-    actor_loss = -(adv_flat * logp).mean() - ent_coef * entropy.mean() + bc_term
+    # P51 EXIT / P52: clamp REINFORCE logp so frozen-σ (u−μ)/σ² cannot
+    # explode μ (P51 147: logp mean −26 / std 38; @315 mean −227).
+    # Diagnostics below keep the unclipped logp so a remaining rail is
+    # still visible. 0 disables (P51 unclipped).
+    _logp_clip = float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0)
+    logp_pg = logp.clamp(-_logp_clip, _logp_clip) if _logp_clip > 0.0 else logp
+    actor_loss = -(adv_flat * logp_pg).mean() - ent_coef * entropy.mean() + bc_term
 
     # ----- diagnostics (mirror the imagination keys the P3 logger reads) -----
     with torch.no_grad():

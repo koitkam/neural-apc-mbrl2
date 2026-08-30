@@ -30,18 +30,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > **0.90@DV**. First P3 ent **−0.107** (μ-only opened σ). Unfreeze 169
 > still yanked **−0.107→−0.268**. Val paired **−56 vs −104 BEATS**
 > (first since P45); seed kpi **−74**. ES @286. μ-only KEEP as σ-open
-> + val beat; **FALSIFIED as yank lever**. P51 default
-> `p3_stop_grad_log_std=True` (REINFORCE trains μ only). P51 LIVE **P3**
-> (`run_p51_sglogstd`, `d6a4511`, pid **54815**): gate **GAIN-READY**
-> 0.86@MV / 0.88@DV @82; last_ok **82 unlocked**; skip-storm 1/2 @52;
-> wrap lock@66 unlock@69. P1→P2 @82 wm_best SKIPPED. P2→P3 @136.
-> First P3 ent **−0.125**; rscale freeze **2.17 KEEP**. Unfreeze 147:
-> entropy **HELD −0.141→−0.101** (no P50 −0.268 σ-yank) but μ railed
-> (`actor_logp_std` 0.54→38; dip **−0.282** @315 then recovered
-> **−0.106** @348; actor −259, ret_w −2065; ES did not fire).
-> Env-free `p3_sglogstd=True`. Do **not** launch. Do **not**
-> promote `p3_reset_log_std`. Do not stack critic knobs.
-> `derive_horizon` / sim `reset()` now
+> + val beat; **FALSIFIED as yank lever**. P51 EXIT
+> (`run_p51_sglogstd`, `d6a4511`, 361 iters):
+> `p3_stop_grad_log_std=True` KEEP as unfreeze-yank + non-sticky
+> floor (147 ent HELD; dip −0.282 @315 recovered −0.106; ES
+> p3_plateau not entropy_collapse); **FALSIFIED as cascade lever**
+> (μ-rail logp_std 0.54→38 @147; val paired **−72 vs −111**, worse
+> than P50 **−56 vs −104**; best.pt **161** during cascade).
+> P52 default `p3_logp_clip=8` (clamp REINFORCE logp). Do **not**
+> promote `p3_reset_log_std`. Do not stack critic knobs. Do not
+> revive `actor_kl_coef`. `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
@@ -441,7 +439,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P50 EXIT:** P2 bc MSE **0.000–0.015** never NLL; first P3 ent
 > **−0.107**. Val paired **−56 vs −104 BEATS**. Unfreeze still yanked
 > σ. **P3 REINFORCE default stop-grad log_std** (`p3_stop_grad_log_std=True`)
-> so η+REINFORCE train μ only. Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.
+> so η+REINFORCE train μ only. **P51 EXIT KEEP** as unfreeze-yank +
+> non-sticky floor; **FALSIFIED as cascade** (μ still rails). **P52**
+> clamps the REINFORCE logp (`p3_logp_clip=8`; opt out
+> `DREAMER_P3_LOGP_CLIP=0`). Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.
 > Opt out `DREAMER_BC_MEAN_ONLY=0`. Do not stack more critic knobs.
 > Do not promote `p3_reset_log_std`.
 > Do not concat rest rows into the main `sample=True` WM rollout

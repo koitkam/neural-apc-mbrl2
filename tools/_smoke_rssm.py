@@ -205,6 +205,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.p3_reset_log_std is False
     assert _tc.bc_mean_only is True
     assert _tc.p3_stop_grad_log_std is True
+    assert abs(float(_tc.p3_logp_clip) - 8.0) < 1e-12
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
     print('[smoke] OK  gain-match defaults (abs Huber, per-input β, rest-IC, TBPTT=16)')
@@ -746,6 +747,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_GAIN_MATCH_REST_IC': '1',
         'DREAMER_P3_RESET_LOG_STD': '1',
         'DREAMER_P3_STOP_GRAD_LOG_STD': '0',
+        'DREAMER_P3_LOGP_CLIP': '0',
         'DREAMER_BC_MEAN_ONLY': '0',
         'DREAMER_BASELINE_SEED_OP_BAND': '0.4',
         'DREAMER_CONST_ACTION_OP_BAND': '0.55',
@@ -829,6 +831,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.gain_match_rest_ic is True
         assert cfg.p3_reset_log_std is True
         assert cfg.p3_stop_grad_log_std is False
+        assert abs(float(cfg.p3_logp_clip)) < 1e-12
         assert cfg.bc_mean_only is False
         assert abs(float(cfg.baseline_seed_op_band) - 0.4) < 1e-12
         assert abs(float(cfg.constant_action_seed_op_band) - 0.55) < 1e-12
@@ -1200,6 +1203,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std'" in _src
     assert "bc_mean={bool(getattr(cfg, 'bc_mean_only'" in _src
     assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
+    assert "p3_logpclip={float(getattr(cfg, 'p3_logp_clip'" in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
@@ -1361,6 +1365,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.p3_reset_log_std is False
     assert c.bc_mean_only is True
     assert c.p3_stop_grad_log_std is True
+    assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
     assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
     assert c.objective_use_normalized is True
@@ -1392,6 +1397,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
     assert 'DREAMER_P3_RESET_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_STOP_GRAD_LOG_STD' in ENV_OVERRIDES
+    assert 'DREAMER_P3_LOGP_CLIP' in ENV_OVERRIDES
     assert 'DREAMER_BC_MEAN_ONLY' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
     assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC' in ENV_OVERRIDES
@@ -2195,6 +2201,49 @@ def _test_p3_stop_grad_log_std() -> None:
     print('[smoke] OK  p3_stop_grad_log_std zeros log_std REINFORCE grad')
 
 
+def _test_p3_logp_clip() -> None:
+    """P52: clamp REINFORCE logp zeros μ-grad on railed (u,μ); keeps in-support."""
+    from models.dreamer_v4 import ContinuousPolicyHead
+    torch.manual_seed(0)
+    kwargs = dict(
+        in_dim=8, hidden_dim=16, action_dim=1, n_layers=2, mtp_length=1,
+        init_log_std=-1.5, log_std_min=-2.3, log_std_max=0.0)
+    feat = torch.zeros(4, 8)
+    act = torch.ones(4, 1) * 0.999
+    adv = torch.ones(4) * 8.0
+
+    def _railed_policy():
+        pol = ContinuousPolicyHead(**kwargs)
+        with torch.no_grad():
+            last = pol.head.net[-1]
+            last.bias[0] = -6.0
+            last.bias[1] = 0.0
+        return pol
+
+    pol_raw = _railed_policy()
+    logp = pol_raw.log_prob_of(feat, act, stop_grad_log_std=True)
+    assert float(logp.abs().mean()) > 16.0, float(logp.abs().mean())
+    (-(adv * logp).mean()).backward()
+    g_raw = float(pol_raw.head.net[-1].weight.grad[0].abs().max())
+    pol_c = _railed_policy()
+    logp_c = pol_c.log_prob_of(feat, act, stop_grad_log_std=True)
+    (-(adv * logp_c.clamp(-8.0, 8.0)).mean()).backward()
+    g_c = float(pol_c.head.net[-1].weight.grad[0].abs().max())
+    assert g_c < 1e-8, g_c
+    assert g_raw > 1e-3, g_raw
+    pol_h = ContinuousPolicyHead(**kwargs)
+    feat_h = torch.randn(6, 8)
+    with torch.no_grad():
+        mu_h, _ = pol_h.dist_params(feat_h)
+        act_h = torch.tanh(mu_h + 0.25)
+    adv_h = torch.ones(6)
+    logp_h = pol_h.log_prob_of(feat_h, act_h, stop_grad_log_std=True)
+    assert float(logp_h.abs().max()) < 8.0, float(logp_h.abs().max())
+    (-(adv_h * logp_h.clamp(-8.0, 8.0)).mean()).backward()
+    assert float(pol_h.head.net[-1].weight.grad[0].abs().max()) > 1e-6
+    print('[smoke] OK  p3_logp_clip zeros μ grad on railed logp; keeps in-support')
+
+
 def _test_resolve_baseline_seed_op_band() -> None:
     """Env-free min(0.6, PRBS); explicit override is not PRBS-capped."""
     c = TrainConfig()
@@ -2980,6 +3029,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'gmatch_rest=True' in banner, banner
     assert 'p3_sigreset=False' in banner, banner
     assert 'p3_sglogstd=True' in banner, banner
+    assert 'p3_logpclip=8' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
@@ -3186,6 +3236,7 @@ if __name__ == '__main__':
     _test_p3_reset_log_std()
     _test_bc_mean_only()
     _test_p3_stop_grad_log_std()
+    _test_p3_logp_clip()
     _test_resolve_baseline_seed_op_band()
     _test_cfg_or_env_float_identity()
     _test_auto_tune_formula_input_cfg_or_env()
