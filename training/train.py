@@ -1884,6 +1884,19 @@ class TrainConfig:
     # actor-KL TR **REMOVED**. ε≤0 disables (identity REINFORCE + P52
     # logp clip). Default 0.2. Opt out ``DREAMER_P3_MU_RATIO_CLIP=0``.
     p3_mu_ratio_clip: float = 0.2
+    # P54 EXIT / P55: recopy the μ-ratio snapshot every N P3 *iters*
+    # (window = N × ``phase3_train_steps_per_iter`` inner AC steps).
+    # P53 freeze-forever (N=0) KEEP as the walk limiter that stopped
+    # the P52 rail, but P54 extra P3 after best.pt 246 was a
+    # **ceiling**: ``actor_ratio_clip_frac`` 0.42→0.11, det_return
+    # plateaued 200 iters, val **−26 vs −101** lost to P53 **−13**.
+    # Mechanism: ε=0.2 vs P3-entry μ is a hard ball around BC; late
+    # P3 cannot leave it. N=1 is one PPO epoch per collect iter
+    # (unitless; inner count already plant-adaptive). First
+    # unfreeze epoch still clips vs unfreeze-μ (warmup AC calls
+    # do not step the actor). 0 = P53 freeze-forever.
+    # Opt out ``DREAMER_P3_MU_RATIO_REFRESH=0``.
+    p3_mu_ratio_refresh_iters: int = 1
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
     # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
@@ -4083,6 +4096,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
         f"p3_logpclip={float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0):g} "
         f"p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0):g} "
+        f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 1) or 0)} "
         f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
@@ -8202,24 +8216,51 @@ def _p3_policy_logp(policy, feat: torch.Tensor, act: torch.Tensor,
     return policy.log_prob_of(feat, act)
 
 
-def _p3_frozen_unfreeze_policy(model) -> torch.nn.Module:
-    """Detached deepcopy of ``model.policy`` taken once (P3-entry μ).
+def _p3_copy_policy_snapshot(policy) -> torch.nn.Module:
+    """Detached deepcopy used as PPO ``logp_old``. Not a registered child."""
+    snap = copy.deepcopy(policy)
+    snap.eval()
+    for p in snap.parameters():
+        p.requires_grad_(False)
+    return snap
+
+
+def _p3_frozen_unfreeze_policy(model, cfg=None) -> torch.nn.Module:
+    """Detached deepcopy of ``model.policy`` for PPO ``logp_old``.
+
+    P53 (``p3_mu_ratio_refresh_iters=0`` / ``cfg is None``): taken once
+    at the first AC call (P3-entry μ). Critic warmup does not
+    ``opt_actor.step``, so that first call is the unfreeze snapshot.
+
+    P55 (default N=1): recopy live μ at the first AC call of every N
+    P3 iters. Window = N × ``phase3_train_steps_per_iter`` inner
+    steps so an epoch holds ``logp_old`` across the inner SGD, not
+    per-step (per-step recopy ⇒ ratio≈1). Warmup AC calls recopy
+    the same frozen actor (identity); the first unfreeze epoch still
+    clips vs unfreeze-μ.
 
     Stored in a list so ``nn.Module.__setattr__`` does not register it
     as a child (would leak into ``state_dict`` / ``parameters()``).
-    Critic warmup does not ``opt_actor.step``, so the first AC call is
-    the unfreeze snapshot. Never lag-copied after an AC step. Not
-    same-forward ``logp.detach()`` (that forces ratio≡1).
+    Never lag-copied *inside* an AC step. Not same-forward
+    ``logp.detach()`` (that forces ratio≡1).
     """
+    refresh = 0
+    inner = 1
+    if cfg is not None:
+        refresh = int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)
+        inner = max(1, int(getattr(
+            cfg, 'phase3_train_steps_per_iter', 8) or 1))
     hold = getattr(model, '_p3_mu_ratio_hold', None)
+    age = int(getattr(model, '_p3_mu_ratio_ac_calls', 0) or 0)
     if hold is None:
-        snap = copy.deepcopy(model.policy)
-        snap.eval()
-        for p in snap.parameters():
-            p.requires_grad_(False)
-        model._p3_mu_ratio_hold = [snap]
-        hold = model._p3_mu_ratio_hold
-    return hold[0]
+        model._p3_mu_ratio_hold = [_p3_copy_policy_snapshot(model.policy)]
+        model._p3_mu_ratio_ac_calls = 1
+        return model._p3_mu_ratio_hold[0]
+    period = refresh * inner
+    if refresh > 0 and age > 0 and period > 0 and (age % period) == 0:
+        model._p3_mu_ratio_hold = [_p3_copy_policy_snapshot(model.policy)]
+    model._p3_mu_ratio_ac_calls = age + 1
+    return model._p3_mu_ratio_hold[0]
 
 
 def _p3_mu_ratio_surrogate(
@@ -8410,7 +8451,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # outside [1−ε, 1+ε]. ε≤0 keeps ``-(adv * logp_pg)``.
     _mu_eps = float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0)
     if _mu_eps > 0.0:
-        old_pol = _p3_frozen_unfreeze_policy(model)
+        old_pol = _p3_frozen_unfreeze_policy(model, cfg)
         with torch.no_grad():
             logp_old = _p3_policy_logp(
                 old_pol, feat_flat, act_flat, _sg_logstd)

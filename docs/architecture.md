@@ -51,16 +51,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`p3_mu_ratio_clip=0.2`) KEEP as μ-walk limiter **and**
 > cascade (paired **−13 vs −98 BEATS 9/9**; actor champion).
 > ES @262 was H(σ_init) below a 0.20-nat floor margin
-> (thr −0.083). **P54 LIVE P3** (`run_p54_esentband`, pid **95956**,
-> ~iter 400): `early_stop_entropy_collapse_floor_frac=0.25`. Gate **82 PASS
-> GAIN-READY 0.91@DV / 0.93@MV** (@H 0.96/0.93); last_ok **82
-> unlocked**; no storm. P2→P3 **136 PASS**. Open-σ **−0.101**; **0/264**
-> P3 iters below new trip **−0.238** (all 264 were below old **−0.083**).
-> Passed P53 ES death @262. Do **not** Step-5 PROMOTE until EXIT+val.
+> (thr −0.083). **P54 EXIT** (`run_p54_esentband`, `f6739ac`, 446
+> iters): ES floor **KEEP** as false-trip fix (`p3_plateau`; 0/310
+> below −0.238) and **FALSIFIED as actor-econ lever** (paired **−26 vs
+> −101** 9/9, worse than P53 −13/−98). Freeze-forever μ-ratio is a
+> late-P3 ceiling (`clip_frac` 0.42→0.11). **P55** recopy snapshot
+> each P3 iter (`p3_mu_ratio_refresh_iters=1`).
 > p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
 > dead `pmpo_loss`/`kl_to` **REMOVED**). `_realsim` now logs
-> `critic_mc_loss` (not in this pid). Do **not** promote
+> `critic_mc_loss`. Do **not** promote
 > `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
 > reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
 > canary restores in-flight grads.

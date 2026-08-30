@@ -220,6 +220,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.p3_stop_grad_log_std is True
     assert abs(float(_tc.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(_tc.p3_mu_ratio_clip) - 0.2) < 1e-12
+    assert int(_tc.p3_mu_ratio_refresh_iters) == 1
     assert abs(float(_tc.early_stop_entropy_collapse_floor_frac) - 0.25) < 1e-12
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
@@ -767,6 +768,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_P3_STOP_GRAD_LOG_STD': '0',
         'DREAMER_P3_LOGP_CLIP': '0',
         'DREAMER_P3_MU_RATIO_CLIP': '0',
+        'DREAMER_P3_MU_RATIO_REFRESH': '0',
         'DREAMER_ES_ENT_FLOOR_FRAC': '0.1',
         'DREAMER_BC_MEAN_ONLY': '0',
         'DREAMER_BASELINE_SEED_OP_BAND': '0.4',
@@ -864,6 +866,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.p3_stop_grad_log_std is False
         assert abs(float(cfg.p3_logp_clip)) < 1e-12
         assert abs(float(cfg.p3_mu_ratio_clip)) < 1e-12
+        assert int(cfg.p3_mu_ratio_refresh_iters) == 0
         assert abs(float(cfg.early_stop_entropy_collapse_floor_frac) - 0.1) < 1e-12
         assert cfg.bc_mean_only is False
         assert abs(float(cfg.baseline_seed_op_band) - 0.4) < 1e-12
@@ -1309,6 +1312,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
     assert "p3_logpclip={float(getattr(cfg, 'p3_logp_clip'" in _src
     assert "p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip'" in _src
+    assert "p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters'" in _src
+    assert '_p3_copy_policy_snapshot' in _src
     assert "es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac'" in _src
     assert '_p3_logp_clip_bound' in _src
     assert '_entropy_collapse_threshold' in _src
@@ -1495,6 +1500,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.p3_stop_grad_log_std is True
     assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(c.p3_mu_ratio_clip) - 0.2) < 1e-12
+    assert int(c.p3_mu_ratio_refresh_iters) == 1
     assert abs(float(c.early_stop_entropy_collapse_floor_frac) - 0.25) < 1e-12
     assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
     assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
@@ -1533,6 +1539,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_P3_STOP_GRAD_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_LOGP_CLIP' in ENV_OVERRIDES
     assert 'DREAMER_P3_MU_RATIO_CLIP' in ENV_OVERRIDES
+    assert 'DREAMER_P3_MU_RATIO_REFRESH' in ENV_OVERRIDES
     assert 'DREAMER_ES_ENT_FLOOR_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_BC_MEAN_ONLY' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
@@ -2596,6 +2603,56 @@ def _test_p3_mu_ratio_clip() -> None:
     print('[smoke] OK  p3_mu_ratio_clip bounds μ-grad vs frozen snapshot; ε=0 identity')
 
 
+def _test_p3_mu_ratio_refresh() -> None:
+    """P55: recopy snapshot every N P3 iters; 0 stays freeze-forever."""
+    from models.dreamer_v4 import ContinuousPolicyHead
+    torch.manual_seed(0)
+    assert int(TrainConfig().p3_mu_ratio_refresh_iters) == 1
+    kwargs = dict(
+        in_dim=8, hidden_dim=16, action_dim=1, n_layers=2, mtp_length=1,
+        init_log_std=-1.5, log_std_min=-2.3, log_std_max=0.0)
+
+    class _Hold(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy = ContinuousPolicyHead(**kwargs)
+
+    m0 = _Hold()
+    snap0 = _p3_frozen_unfreeze_policy(m0)
+    with torch.no_grad():
+        m0.policy.head.net[-1].bias[0] = 0.5
+    assert _p3_frozen_unfreeze_policy(m0) is snap0
+
+    cfg0 = TrainConfig()
+    cfg0.p3_mu_ratio_refresh_iters = 0
+    cfg0.phase3_train_steps_per_iter = 2
+    m1 = _Hold()
+    snap_a = _p3_frozen_unfreeze_policy(m1, cfg0)
+    with torch.no_grad():
+        m1.policy.head.net[-1].bias[0] = 0.5
+    assert _p3_frozen_unfreeze_policy(m1, cfg0) is snap_a
+    assert _p3_frozen_unfreeze_policy(m1, cfg0) is snap_a
+
+    cfg = TrainConfig()
+    cfg.p3_mu_ratio_refresh_iters = 1
+    cfg.phase3_train_steps_per_iter = 2
+    m = _Hold()
+    s1 = _p3_frozen_unfreeze_policy(m, cfg)
+    s2 = _p3_frozen_unfreeze_policy(m, cfg)
+    assert s2 is s1
+    with torch.no_grad():
+        m.policy.head.net[-1].bias[0] = 0.4
+    s3 = _p3_frozen_unfreeze_policy(m, cfg)
+    assert s3 is not s1
+    live_ids = {id(p) for p in m.parameters()}
+    assert {id(p) for p in s3.parameters()}.isdisjoint(live_ids)
+    with torch.no_grad():
+        b_live = float(m.policy.head.net[-1].bias[0])
+        b_snap = float(s3.head.net[-1].bias[0])
+    assert abs(b_live - b_snap) < 1e-6
+    print('[smoke] OK  p3_mu_ratio_refresh recopies each P3-iter epoch; 0 freeze')
+
+
 def _test_entropy_collapse_threshold() -> None:
     """P53: 0.20-nat floor margin false-trips open-σ; band frac does not."""
     import math
@@ -3466,6 +3523,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'p3_sglogstd=True' in banner, banner
     assert 'p3_logpclip=8' in banner, banner
     assert 'p3_muratio=0.2' in banner, banner
+    assert 'p3_murefresh=1' in banner, banner
     assert 'es_ent_floor=0.25' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
@@ -3679,6 +3737,7 @@ if __name__ == '__main__':
     _test_p3_stop_grad_log_std()
     _test_p3_logp_clip()
     _test_p3_mu_ratio_clip()
+    _test_p3_mu_ratio_refresh()
     _test_entropy_collapse_threshold()
     _test_id_tau_no_plant_sentinel()
     _test_resolve_baseline_seed_op_band()
