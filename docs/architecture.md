@@ -31,13 +31,20 @@ env-gated off · **[planned]** = designed, not yet built.
 > still yanked **−0.107→−0.268**. Val paired **−56 vs −104 BEATS**
 > (first since P45); seed kpi **−74**. ES @286. μ-only KEEP as σ-open
 > + val beat; **FALSIFIED as yank lever**. P51 default
-> `p3_stop_grad_log_std=True` (REINFORCE trains μ only). P51 LIVE P1
-> (`run_p51_sglogstd`, `d6a4511`, pid **54815**, iter **74** recon 0.007
-> last_ok **74 unlocked** after wrap@66–69): env-free
-> `p3_sglogstd=True`. Do **not** launch. Do **not**
-> promote `p3_reset_log_std`. `derive_horizon` / sim `reset()` now
+> `p3_stop_grad_log_std=True` (REINFORCE trains μ only). P51 LIVE **P3**
+> (`run_p51_sglogstd`, `d6a4511`, pid **54815**): gate **GAIN-READY**
+> 0.86@MV / 0.88@DV @82; last_ok **82 unlocked**; skip-storm 1/2 @52;
+> wrap lock@66 unlock@69. P1→P2 @82 wm_best SKIPPED. P2→P3 @136.
+> First P3 ent **−0.125**; rscale freeze **2.17 KEEP**. Unfreeze 147:
+> entropy stayed **~−0.10** (no P50 −0.268 σ-yank) but μ railed
+> (logp_std 0.54→38, bc 0.002→0.87, mvv 18→19k, rtgt 0.058→0.006).
+> Env-free `p3_sglogstd=True`. Do **not** launch. Do **not**
+> promote `p3_reset_log_std`. Do not stack critic knobs.
+> `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
-> 4.0/120 / ON/0.6; not in pid). GPU-calib probe reads
+> 4.0/120 / ON/0.6). `derive_episode_length` now
+> `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
+> GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
 > longer silently uses WM-only 1.0). Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =

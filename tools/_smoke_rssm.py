@@ -767,6 +767,9 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_VAL_WM_TRANSFER': '0',
         'DREAMER_HORIZON_SETTLE_NTAU': '3.5',
         'DREAMER_HORIZON_MAX': '80',
+        'DREAMER_EPISODE_SETTLE_MULTIPLE': '10',
+        'DREAMER_EPISODE_MIN_LENGTH': '700',
+        'DREAMER_EPISODE_MAX_LENGTH': '2000',
         'DREAMER_INIT_RANDOMIZATION': '0',
         'DREAMER_INIT_RANDOMIZATION_FRAC': '0.4',
         'DREAMER_WM_OVERHEAD': '1.5',
@@ -847,6 +850,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.val_wm_transfer is False
         assert abs(float(cfg.horizon_settle_n_tau) - 3.5) < 1e-12
         assert int(cfg.horizon_max) == 80
+        assert abs(float(cfg.episode_settle_multiple) - 10.0) < 1e-12
+        assert int(cfg.episode_min_length) == 700
+        assert int(cfg.episode_max_length) == 2000
         assert cfg.init_randomization is False
         assert abs(float(cfg.init_randomization_frac) - 0.4) < 1e-12
         assert abs(float(cfg.wm_overhead) - 1.5) < 1e-12
@@ -912,6 +918,9 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'val_wm_transfer' in explicit
         assert 'horizon_settle_n_tau' in explicit
         assert 'horizon_max' in explicit
+        assert 'episode_settle_multiple' in explicit
+        assert 'episode_min_length' in explicit
+        assert 'episode_max_length' in explicit
         assert 'init_randomization' in explicit
         assert 'init_randomization_frac' in explicit
         assert 'wm_overhead' in explicit
@@ -1434,6 +1443,9 @@ def _test_envfree_observer_recipe() -> None:
     assert c.val_wm_distpred is True
     assert abs(float(c.horizon_settle_n_tau) - 4.0) < 1e-12
     assert int(c.horizon_max) == 120
+    assert abs(float(c.episode_settle_multiple) - 20.0) < 1e-12
+    assert int(c.episode_min_length) == 500
+    assert int(c.episode_max_length) == 4000
     assert c.init_randomization is True
     assert abs(float(c.init_randomization_frac) - 0.6) < 1e-12
     assert abs(float(c.wm_overhead) - 1.30) < 1e-12
@@ -1441,6 +1453,9 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.gpu_max_bs) == 512
     assert 'DREAMER_HORIZON_SETTLE_NTAU' in ENV_OVERRIDES
     assert 'DREAMER_HORIZON_MAX' in ENV_OVERRIDES
+    assert 'DREAMER_EPISODE_SETTLE_MULTIPLE' in ENV_OVERRIDES
+    assert 'DREAMER_EPISODE_MIN_LENGTH' in ENV_OVERRIDES
+    assert 'DREAMER_EPISODE_MAX_LENGTH' in ENV_OVERRIDES
     assert 'DREAMER_INIT_RANDOMIZATION' in ENV_OVERRIDES
     assert 'DREAMER_INIT_RANDOMIZATION_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_WM_OVERHEAD' in ENV_OVERRIDES
@@ -2338,12 +2353,17 @@ def _test_wm_tf_knobs_cfg_or_env() -> None:
 
 
 def _test_horizon_ic_overhead_cfg_or_env() -> None:
-    """Horizon formula + IC DR + WM overhead: TrainConfig default, leftover env."""
+    """Horizon / episode formula + IC DR: TrainConfig default, leftover env."""
     import os
-    from utils.auto_episode_length import derive_horizon, horizon_formula_knobs
+    from utils.auto_episode_length import (
+        derive_episode_length, derive_horizon, episode_formula_knobs,
+        horizon_formula_knobs)
     from utils.initial_conditions import _enabled, _frac, ic_randomization_knobs
     keys = (
         'DREAMER_HORIZON_MAX', 'DREAMER_HORIZON_SETTLE_NTAU',
+        'DREAMER_EPISODE_SETTLE_MULTIPLE', 'DREAMER_EPISODE_MIN_LENGTH',
+        'DREAMER_EPISODE_MAX_LENGTH', 'SIM_EPISODE_LENGTH',
+        'IDENTIFIED_TAU_DOMINANT', 'IDENTIFIED_DEAD_TIME',
         'DREAMER_INIT_RANDOMIZATION', 'DREAMER_INIT_RANDOMIZATION_FRAC',
     )
     prev = {k: os.environ.get(k) for k in keys}
@@ -2353,6 +2373,9 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
         c = TrainConfig()
         assert abs(float(c.horizon_settle_n_tau) - 4.0) < 1e-12
         assert int(c.horizon_max) == 120
+        assert abs(float(c.episode_settle_multiple) - 20.0) < 1e-12
+        assert int(c.episode_min_length) == 500
+        assert int(c.episode_max_length) == 4000
         assert c.init_randomization is True
         assert abs(float(c.init_randomization_frac) - 0.6) < 1e-12
         assert abs(float(c.wm_overhead) - 1.30) < 1e-12
@@ -2361,6 +2384,10 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
         n_tau, hmax = horizon_formula_knobs()
         assert abs(n_tau - 4.0) < 1e-12
         assert hmax == 120
+        k_ep, emin, emax = episode_formula_knobs()
+        assert abs(k_ep - 20.0) < 1e-12
+        assert emin == 500
+        assert emax == 4000
         en, fr = ic_randomization_knobs()
         assert en is True
         assert abs(fr - 0.6) < 1e-12
@@ -2381,13 +2408,36 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
         os.environ['DREAMER_INIT_RANDOMIZATION_FRAC'] = '0.4'
         assert _enabled() is False
         assert abs(_frac() - 0.4) < 1e-12
+        os.environ['IDENTIFIED_TAU_DOMINANT'] = '53'
+        os.environ['IDENTIFIED_DEAD_TIME'] = '8'
+        L, lsrc = derive_episode_length()
+        assert L == 1220, (L, lsrc)
+        assert '20x_tau_plus_dt' in lsrc
+        os.environ['DREAMER_EPISODE_SETTLE_MULTIPLE'] = '10'
+        L2, lsrc2 = derive_episode_length()
+        assert L2 == 610, (L2, lsrc2)
+        assert abs(episode_formula_knobs()[0] - 10.0) < 1e-12
+        # MIN floors: 10*(53+8)=610 < 800 → leftover MIN binds.
+        os.environ['DREAMER_EPISODE_MIN_LENGTH'] = '800'
+        L2b, _ = derive_episode_length()
+        assert L2b == 800, L2b
+        os.environ.pop('DREAMER_EPISODE_MIN_LENGTH', None)
+        os.environ.pop('DREAMER_EPISODE_SETTLE_MULTIPLE', None)
+        # MAX caps: 20*(53+8)=1220 > 800 → leftover MAX binds.
+        os.environ['DREAMER_EPISODE_MAX_LENGTH'] = '800'
+        L3, _ = derive_episode_length()
+        assert L3 == 800, L3
+        os.environ.pop('DREAMER_EPISODE_MAX_LENGTH', None)
+        os.environ['SIM_EPISODE_LENGTH'] = '900'
+        L4, lsrc4 = derive_episode_length()
+        assert L4 == 900 and lsrc4 == 'env', (L4, lsrc4)
     finally:
         for k, old in prev.items():
             if old is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  horizon/IC/overhead cfg-or-env identity')
+    print('[smoke] OK  horizon/episode/IC/overhead cfg-or-env identity')
 
 
 def _test_derived_observables_cfg() -> None:

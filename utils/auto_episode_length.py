@@ -10,7 +10,10 @@ wasting training time on padded tails.  Resolution order:
 
 All numbers come from :mod:`utils.dynamics_identifier` via the
 ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME`` environment variables
-that :mod:`workflow.bo_runner` sets after identification.
+that :mod:`workflow.bo_runner` sets after identification.  Formula knobs
+(``k``, min, max) are TrainConfig ``episode_settle_multiple`` /
+``episode_min_length`` / ``episode_max_length`` (identity 20 / 500 / 4000)
+via ``episode_formula_knobs()``.
 """
 
 from __future__ import annotations
@@ -28,17 +31,68 @@ def _safe_float(x, default=0.0):
         return float(default)
 
 
+def episode_formula_knobs() -> Tuple[float, int, int]:
+    """``k`` / ``min_length`` / ``max_length`` for ``derive_episode_length``.
+
+    ``single_run`` / BO call ``derive_episode_length`` before a plant-filled
+    ``TrainConfig`` exists, so the formula used to hard-code ``20 / 500 /
+    4000``.  Identity for env-free: those numbers **are** the TrainConfig
+    defaults.  Changing the dataclass now actually sizes L.  Leftover
+    ``DREAMER_EPISODE_SETTLE_MULTIPLE`` / ``DREAMER_EPISODE_MIN_LENGTH`` /
+    ``DREAMER_EPISODE_MAX_LENGTH`` still win when set (same keys as
+    ``ENV_OVERRIDES``).  Does **not** call ``apply_dreamer_env_overrides``.
+    Explicit ``SIM_EPISODE_LENGTH`` still hard-overrides the derived length.
+    """
+    k = 20.0
+    min_len = 500
+    max_len = 4000
+    try:
+        from training.train import TrainConfig
+        cfg = TrainConfig()
+        k = float(getattr(cfg, 'episode_settle_multiple', k) or k)
+        min_len = int(getattr(cfg, 'episode_min_length', min_len) or min_len)
+        max_len = int(getattr(cfg, 'episode_max_length', max_len) or max_len)
+    except Exception:
+        pass
+    raw = os.environ.get('DREAMER_EPISODE_SETTLE_MULTIPLE', '').strip()
+    if raw:
+        try:
+            k = float(raw)
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_EPISODE_MIN_LENGTH', '').strip()
+    if raw:
+        try:
+            min_len = int(float(raw))
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_EPISODE_MAX_LENGTH', '').strip()
+    if raw:
+        try:
+            max_len = int(float(raw))
+        except ValueError:
+            pass
+    min_len = max(2, int(min_len))
+    max_len = max(min_len, int(max_len))
+    return float(k), min_len, max_len
+
+
 def derive_episode_length(
     default_fallback: int = 1000,
-    settle_multiple: float = 20.0,
-    min_length: int = 500,
-    max_length: int = 4000,
+    settle_multiple: Optional[float] = None,
+    min_length: Optional[int] = None,
+    max_length: Optional[int] = None,
 ) -> Tuple[int, str]:
     """Return ``(episode_length, source)``.
 
     - ``source='env'``: user-set SIM_EPISODE_LENGTH.
     - ``source='auto:{k}x_tau_plus_dt'``: derived from identified dynamics.
     - ``source='default'``: fallback (no identification available).
+
+    Formula inputs come from ``episode_formula_knobs()`` (TrainConfig
+    then leftover ``DREAMER_EPISODE_*``).  Explicit args override the
+    dataclass; leftover env still wins over an explicit arg (same
+    historical A/B as ``derive_horizon``).
     """
     env_raw = os.environ.get('SIM_EPISODE_LENGTH', '').strip()
     if env_raw:
@@ -49,13 +103,39 @@ def derive_episode_length(
         except Exception:
             pass
 
+    kn_k, kn_min, kn_max = episode_formula_knobs()
+    k = kn_k if settle_multiple is None else float(settle_multiple)
+    min_len = kn_min if min_length is None else int(min_length)
+    max_len = kn_max if max_length is None else int(max_length)
+    # Leftover env still wins over an explicit arg (historical A/B).
+    raw = os.environ.get('DREAMER_EPISODE_SETTLE_MULTIPLE', '').strip()
+    if raw:
+        try:
+            k = float(raw)
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_EPISODE_MIN_LENGTH', '').strip()
+    if raw:
+        try:
+            min_len = int(float(raw))
+        except ValueError:
+            pass
+    raw = os.environ.get('DREAMER_EPISODE_MAX_LENGTH', '').strip()
+    if raw:
+        try:
+            max_len = int(float(raw))
+        except ValueError:
+            pass
+    min_len = max(2, int(min_len))
+    max_len = max(min_len, int(max_len))
+
     tau = _safe_float(os.environ.get('IDENTIFIED_TAU_DOMINANT', '0'), 0.0)
     dt = _safe_float(os.environ.get('IDENTIFIED_DEAD_TIME', '0'), 0.0)
     dyn_horizon = max(0.0, tau + dt)
     if dyn_horizon > 1e-6:
-        v = int(round(settle_multiple * dyn_horizon))
-        v = max(int(min_length), min(int(max_length), v))
-        return v, f'auto:{settle_multiple:g}x_tau_plus_dt'
+        v = int(round(k * dyn_horizon))
+        v = max(int(min_len), min(int(max_len), v))
+        return v, f'auto:{k:g}x_tau_plus_dt'
 
     return int(default_fallback), 'default'
 

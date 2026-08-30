@@ -13,7 +13,9 @@ What is auto-derived (in order):
   3. ``sample_rate`` from setup file (key ``sample_rate``) or env / default 5.
   4. ``tau``, ``dead_time``         <- ``dynamics_identifier``.
   5. ``lookback``                   <- ``lookback_identifier`` (centred on tau).
-  6. ``episode_length``             <- ``auto_episode_length.derive_episode_length``.
+  6. ``episode_length``             <- ``auto_episode_length.derive_episode_length``
+     (``k·(τ+θ)`` via ``episode_formula_knobs()``; identity 20 / 500 / 4000;
+     explicit ``SIM_EPISODE_LENGTH`` still hard-overrides).
   7. ``horizon``                    <- ``auto_episode_length.derive_horizon``
      (identified time-to-steady-state = dead_time + 4*tau, in agent steps;
      floored at the paper default 15, capped by DREAMER_HORIZON_MAX).
@@ -235,6 +237,8 @@ def main() -> int:
     # Episode length & horizon from plant.
     from utils.auto_episode_length import derive_episode_length, derive_horizon
     from workflow.bo_runner import MODEL_SIZE_PRESETS
+    # ``episode_formula_knobs()`` (TrainConfig 20 / 500 / 4000 then leftover
+    # ``DREAMER_EPISODE_*``).  Explicit ``SIM_EPISODE_LENGTH`` still wins.
     episode_length, ep_source = derive_episode_length()
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
     # Imagination horizon: sized to the identified time-to-steady-state

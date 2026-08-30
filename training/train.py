@@ -198,6 +198,16 @@ class TrainConfig:
     lookback: int = 32        # transformer context length T_ctx
     sample_rate: int = 5
     episode_length: int = 600
+    # Formula inputs for ``derive_episode_length``:
+    # ``L = clip(round(k·(τ+θ)), min, max)``.  ``episode_formula_knobs()``
+    # reads these then leftover ``DREAMER_EPISODE_SETTLE_MULTIPLE`` /
+    # ``DREAMER_EPISODE_MIN_LENGTH`` / ``DREAMER_EPISODE_MAX_LENGTH``.
+    # Identity: 20 / 500 / 4000 (test_sim τ=53 θ=8 → 1220).  Changing
+    # the dataclass sizes L.  Explicit ``SIM_EPISODE_LENGTH`` still
+    # hard-overrides the derived length.
+    episode_settle_multiple: float = 20.0
+    episode_min_length: int = 500
+    episode_max_length: int = 4000
     # Identified plant timing (seconds).  Sentinel 0 = fall back to
     # leftover ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME``
     # env (CLI / old paths).  ``single_run`` / ``bo_runner`` write the
@@ -1839,7 +1849,8 @@ class TrainConfig:
     # P50 EXIT: μ-only opened σ (first P3 ent −0.107) then unfreeze
     # REINFORCE still yanked log_std (169: −0.107→−0.268, logp_std
     # 0.56→54). Detach log_std in P3 ``log_prob_of`` / entropy so
-    # REINFORCE + η train μ only; σ stays at ``policy_init_log_std``.
+    # REINFORCE + η train μ only; σ stays at the P3-entry value
+    # (P51 live: ent ~−0.10, no −0.268 yank; μ still rails).
     # Discrete policy ignores this (no Gaussian). Opt out
     # ``DREAMER_P3_STOP_GRAD_LOG_STD=0``. Not ``p3_reset_log_std``.
     p3_stop_grad_log_std: bool = True

@@ -696,7 +696,9 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     print(f"[BO] lookback={plant['lookback']} (=seq_len; "
           f"identified={identified_lookback}, sr={sr})", flush=True)
 
-    # Episode length: env override > auto-derived from settling time > paper.
+    # Episode length: SIM_EPISODE_LENGTH > auto-derived k·(τ+θ) >
+    # paper fallback.  ``episode_formula_knobs()`` reads TrainConfig
+    # then leftover ``DREAMER_EPISODE_*`` (identity 20 / 500 / 4000).
     from utils.auto_episode_length import derive_episode_length
     ep_len, ep_source = derive_episode_length()
     base.episode_length = int(ep_len)

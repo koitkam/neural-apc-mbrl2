@@ -316,6 +316,13 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # (called before a plant-filled cfg exists).
     'DREAMER_HORIZON_SETTLE_NTAU': ('horizon_settle_n_tau',       float),
     'DREAMER_HORIZON_MAX':         ('horizon_max',                int),
+    # Formula inputs for ``derive_episode_length``.  Identity 20 / 500 / 4000.
+    # ``episode_formula_knobs()`` reads TrainConfig then leftover env
+    # (called before a plant-filled cfg exists).  Explicit
+    # ``SIM_EPISODE_LENGTH`` still hard-overrides the derived length.
+    'DREAMER_EPISODE_SETTLE_MULTIPLE': ('episode_settle_multiple', float),
+    'DREAMER_EPISODE_MIN_LENGTH':       ('episode_min_length',     int),
+    'DREAMER_EPISODE_MAX_LENGTH':      ('episode_max_length',      int),
     # IC domain-randomization + GPU-calib overhead.  ``ic_randomization_knobs()``
     # / ``gpu_probe_knobs()`` read TrainConfig then leftover env (no plant-filled
     # cfg at those call sites).
