@@ -963,7 +963,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_MAE_PMAX':                   ('mae_p_max',                      float),
     'DREAMER_POLICY_TYPE':                ('policy_type',                    str),
     'DREAMER_POLICY_INIT_LOG_STD':        ('policy_init_log_std',            float),
-    'DREAMER_ACTOR_LOSS':                 ('actor_loss_type',                str),
+    'DREAMER_ACTOR_LOSS':                 ('actor_loss_type',                str),  # train() refuses ≠reinforce (false A/B)
     'DREAMER_GRAD_CLIP':                  ('grad_clip',                      float),
     'DREAMER_BASELINE_SEED_EPS':          ('baseline_seed_episodes',         int),
     'DREAMER_BASELINE_SEED_STD':          ('baseline_seed_action_std',       float),

@@ -51,14 +51,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`p3_mu_ratio_clip=0.2`) KEEP as μ-walk limiter **and**
 > cascade (paired **−13 vs −98 BEATS 9/9**; actor champion).
 > ES @262 was H(σ_init) below a 0.20-nat floor margin
-> (thr −0.083). **P54 LIVE** (`run_p54_esentband`):
-> `early_stop_entropy_collapse_floor_frac=0.25` (unitless
-> fraction of the σ band; opt out `DREAMER_ES_ENT_FLOOR_FRAC=0`).
-> Not a stacked actor knob. Not `logp.detach()` as old. p136
-> `actor_kl_coef` **REMOVED** (false A/B; never wired in
-> `_realsim_actor_critic_step`). Do **not** promote `p3_reset_log_std`. Do not
-> stack critic knobs. CUDA replay H2D reuses pinned host + GPU dest
-> per slot (`replay` / `iso` / `critic`).
+> (thr −0.083). **P54 LIVE** (`run_p54_esentband`, pid **95956**):
+> `early_stop_entropy_collapse_floor_frac=0.25`. Gate **82 PASS
+> GAIN-READY 0.91@DV / 0.93@MV** (@H 0.96/0.93); last_ok **82
+> unlocked**; no storm. P2 dobg live, g frozen. ES A/B not yet
+> scored (still P2). p136 `actor_kl_coef` **REMOVED**.
+> `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
+> P3 always REINFORCE + μ-ratio). Do **not** promote
+> `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
+> reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
+> canary restores in-flight grads.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now

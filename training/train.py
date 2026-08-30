@@ -158,22 +158,19 @@ class TrainConfig:
     pmpo_entropy_coef: float = 1e-4
     pmpo_entropy_eta_v3: float = 3e-4
     pmpo_entropy_sigma_ref: float = 1.0
-    # Actor loss type. ``'reinforce'`` (DreamerV3 §3) is robust across
-    # simulators — V3 used this single recipe across 150+ tasks. The
-    # ``'pmpo'`` option uses V4's eq. 11 advantage-sign-split loss; this
-    # is the paper-faithful V4 actor for **discrete** actions, but it is
-    # numerically unstable for continuous TanhNormal actors because its
-    # negative-advantage branch is unbounded below.  We default to V3
-    # REINFORCE which has bounded gradients and proven cross-task
-    # robustness; switch to PMPO only for discrete-action sims if
-    # desired (env: DREAMER_ACTOR_LOSS=pmpo).
+    # Actor loss type. P3 always inlines DreamerV3 REINFORCE + μ-ratio
+    # (``_realsim_actor_critic_step``).  ``'pmpo'`` is a **false A/B**
+    # — ``train()`` refuses it.  V4 PMPO remains unwired for continuous
+    # TanhNormal (unbounded negative-advantage branch).
     actor_loss_type: str = 'reinforce'
     # PMPO prior-refresh cadence (iters).  Real-sim default is V3 REINFORCE
     # (``_realsim_actor_critic_step``); π_prior is unused there so snapshots
-    # are skipped.  Opt-in ``DREAMER_ACTOR_LOSS=pmpo`` still snapshots at
-    # P3 entry and every N P3 iters.  0 = snapshot once at P3 start.
-    # The p136 ``actor_kl_coef`` TR was FALSIFIED and **REMOVED** (never
-    # wired into real-sim P3; whitelist was a false A/B).
+    # are skipped.  ``DREAMER_ACTOR_LOSS=pmpo`` is a **false A/B** (P3
+    # always inlines REINFORCE + μ-ratio; ``pmpo_loss`` is never called)
+    # — ``train()`` refuses it, same class as leftover imagination
+    # ``actor_train_source``.  Discrete-PMPO remains a future wiring, not
+    # a silent run_plan bit.  The p136 ``actor_kl_coef`` TR was FALSIFIED
+    # and **REMOVED** (never wired into real-sim P3).
     # ``DREAMER_P3_PRIOR_REFRESH_ITERS``.
     p3_prior_refresh_iters: int = 5
 
@@ -4628,7 +4625,9 @@ def _require_realsim_actor(cfg: 'TrainConfig') -> None:
 
     A leftover ``DREAMER_ACTOR_SOURCE=imagination`` used to skip
     ``onpol_buf`` and train the actor on shared replay (p01 MV-chatter).
-    Fail loud instead of a false A/B.
+    Fail loud instead of a false A/B.  ``DREAMER_ACTOR_LOSS=pmpo`` is
+    the same class: ``run_plan`` would change while
+    ``_realsim_actor_critic_step`` still inlines REINFORCE + μ-ratio.
     """
     src = str(getattr(cfg, 'actor_train_source', 'realsim') or 'realsim')
     src = src.strip().lower()
@@ -4636,6 +4635,13 @@ def _require_realsim_actor(cfg: 'TrainConfig') -> None:
         raise RuntimeError(
             f'actor_train_source={src!r} is not supported; '
             'imagination actor is deleted (P3 is _realsim_actor_critic_step)')
+    kind = str(getattr(cfg, 'actor_loss_type', 'reinforce') or 'reinforce')
+    kind = kind.strip().lower()
+    if kind not in ('reinforce', ''):
+        raise RuntimeError(
+            f'actor_loss_type={kind!r} is not wired in '
+            '_realsim_actor_critic_step (always REINFORCE + μ-ratio); '
+            'DREAMER_ACTOR_LOSS would be a false A/B')
 
 
 def _isolation_seq_is_mv(act: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -6765,6 +6771,25 @@ def _rest_ic_graph_key(rssm, obs: torch.Tensor, act: torch.Tensor):
     )
 
 
+def _rssm_param_grad_snapshot(rssm):
+    """Clone in-flight ``.grad`` so a CUDA-graph canary cannot wipe them.
+
+    Capture is normally the first rest-IC forward (grads are None).  If
+    capture is ever moved later in a WM step, ``zero_grad`` would drop
+    the live graph.  Restore is identity when every grad was None.
+    """
+    out = []
+    for p in rssm.parameters():
+        g = p.grad
+        out.append((p, None if g is None else g.detach().clone()))
+    return out
+
+
+def _rssm_param_grad_restore(snap) -> None:
+    for p, g in snap:
+        p.grad = g
+
+
 def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
     """Capture full-BPTT rest-IC; None → eager.  Do not use raw CUDAGraph."""
     try:
@@ -6788,6 +6813,8 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
         return None
     # Canary: P25 class if the graph dropped BPTT through the GRU.
+    # Save/restore any in-flight grads (identity when all None).
+    saved = _rssm_param_grad_snapshot(rssm)
     try:
         rssm.zero_grad(set_to_none=True)
         h, z, c = graphed(obs, act)
@@ -6808,6 +6835,8 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
         print('[gain-match] rest-ic CUDA graph canary failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
         return None
+    finally:
+        _rssm_param_grad_restore(saved)
     print(f'[gain-match] rest-ic CUDA graph captured N={int(obs.shape[0])} '
           f'T={int(obs.shape[1])} (full-BPTT; opt out '
           'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0)', flush=True)

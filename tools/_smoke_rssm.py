@@ -62,6 +62,8 @@ from training.train import (
                             _gain_match_pred_over_tgt,
                             _gain_match_rest_window, _held_rollout_win,
                             _rest_ic_can_cuda_graph,
+                            _rssm_param_grad_snapshot,
+                            _rssm_param_grad_restore,
                             collect_rest_lookback,
                             _wm_gain_match_loss, _require_realsim_actor,
                             _adv_action_corr, _p3_logp_clip_bound,
@@ -1327,6 +1329,9 @@ def _test_isolation_dcv_scales() -> None:
     assert '[p3] on-policy collect streams measured DV + Kalman' in _src
     assert "setdefault('jemb_loss'" in _src
     assert '_require_realsim_actor' in _src
+    assert 'DREAMER_ACTOR_LOSS would be a false A/B' in _src
+    assert '_rssm_param_grad_snapshot' in _src
+    assert '_rssm_param_grad_restore' in _src
     assert 'store_aux=False, last_only=True' in _src
     assert 'return_feats=False' in _src
     assert '_posterior_step' in _src
@@ -2042,7 +2047,11 @@ def _test_control_quality_gates() -> None:
 
 
 def _test_require_realsim_actor() -> None:
-    """Imagination actor_train_source is a false A/B (p01 off-policy chatter)."""
+    """Imagination actor_train_source is a false A/B (p01 off-policy chatter).
+
+    ``DREAMER_ACTOR_LOSS=pmpo`` is the same class: P3 always inlines
+    REINFORCE + μ-ratio (``pmpo_loss`` is never called).
+    """
     ok = TrainConfig()
     _require_realsim_actor(ok)
     bad = TrainConfig()
@@ -2054,7 +2063,34 @@ def _test_require_realsim_actor() -> None:
         assert '_realsim_actor_critic_step' in str(exc)
     else:
         raise AssertionError('imagination actor_train_source was allowed')
-    print('[smoke] OK  non-realsim actor_train_source is refused')
+    pmpo = TrainConfig()
+    pmpo.actor_loss_type = 'pmpo'
+    try:
+        _require_realsim_actor(pmpo)
+    except RuntimeError as exc:
+        assert 'pmpo' in str(exc).lower()
+        assert 'false a/b' in str(exc).lower()
+    else:
+        raise AssertionError('actor_loss_type=pmpo was allowed')
+    print('[smoke] OK  non-realsim actor_train_source / pmpo actor_loss refused')
+
+
+def _test_rssm_param_grad_snapshot() -> None:
+    """CUDA-graph canary must restore in-flight grads (identity when None)."""
+    import torch.nn as nn
+    m = nn.Linear(2, 2, bias=False)
+    snap0 = _rssm_param_grad_snapshot(m)
+    assert all(g is None for _, g in snap0)
+    (m(torch.ones(1, 2)).sum()).backward()
+    g0 = m.weight.grad.detach().clone()
+    snap = _rssm_param_grad_snapshot(m)
+    m.zero_grad(set_to_none=True)
+    assert m.weight.grad is None
+    _rssm_param_grad_restore(snap)
+    assert torch.equal(m.weight.grad, g0)
+    _rssm_param_grad_restore(snap0)
+    assert m.weight.grad is None
+    print('[smoke] OK  rest-IC CUDA-graph canary grad snapshot restore')
 
 
 def _test_gain_match_per_input_huber() -> None:
@@ -3613,6 +3649,7 @@ if __name__ == '__main__':
     _test_pin_eval_modules()
     _test_control_quality_gates()
     _test_require_realsim_actor()
+    _test_rssm_param_grad_snapshot()
     _test_gain_match_per_input_huber()
     _test_gain_match_pred_over_tgt()
     _test_gain_match_fd_held()
