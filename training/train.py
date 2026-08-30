@@ -483,16 +483,19 @@ class TrainConfig:
     diag_disable_reward_mtp_in_p1: bool = False
     diag_reward_mtp_stop_grad_in_p1: bool = False
     # End-of-training WM steady-state diagnostic (default ON).  Horizon
-    # 0 = auto ``max(200, 8·H)``.
+    # 0 = auto ``max(200, 8·H)``.  Device: ``cuda`` (identity with the
+    # previous train()-injected env — nvidia-smi would see *this* process
+    # as busy and fall back to CPU).  ``auto`` restores the picker;
+    # ``cpu`` forces host.  ``DREAMER_WM_DIAG_DEVICE``.
     run_wm_diagnostic: bool = True
     wm_diag_n_starts: int = 8
     wm_diag_horizon: int = 0
+    wm_diag_device: str = 'cuda'
     # Eval TM protocol + val-suite gates.  Were ``os.environ.get`` in
     # ``evaluation/wm_transfer_matrix.py`` / ``validate.py`` (worked,
     # missing from ``run_plan``).  Identity defaults.  Horizon/settle
     # 0 = auto ``wm_tf_horizon(H)=max(80, 4·H)`` (already sim-adaptive).
-    # Levels / span / step_frac are unitless.  ``DREAMER_WM_DIAG_DEVICE``
-    # stays env-only (device picker).
+    # Levels / span / step_frac are unitless.
     wm_tf_levels: int = 5
     wm_tf_span: float = 0.6
     wm_tf_step_frac: float = 0.4
@@ -1733,12 +1736,8 @@ class TrainConfig:
     # MTP compute.  Override via DREAMER_MTP_LENGTH.
     mtp_length: int = 8               # paper default (P41 RCA)
 
-    # ----- PMPO (unused; ``pmpo_loss`` REMOVED) -----
-    # Kept so ``DREAMER_PMPO_ALPHA`` / ``DREAMER_PMPO_BETA`` stay in
-    # ``run_plan`` and ``train()`` still refuses ``actor_loss_type=pmpo``
-    # as a false A/B.  Not read by ``_realsim_actor_critic_step``.
-    pmpo_alpha: float = 0.7
-    pmpo_beta: float = 0.01
+    # ``pmpo_alpha`` / ``pmpo_beta`` REMOVED (unused after ``pmpo_loss``).
+    # ``train()`` still refuses ``actor_loss_type≠reinforce``.
 
     # ----- Returns -----
     # 2026-05-24 (P48 RCA): structural γ/H mismatch caused the recurring
@@ -13893,14 +13892,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _diag_h_default = max(200, 8 * _H_train)
             _h_cfg = int(getattr(cfg, 'wm_diag_horizon', 0) or 0)
             horizon = _h_cfg if _h_cfg > 0 else _diag_h_default
-            # Force CUDA for inline diagnostics: the auto-picker reads
+            # Inline diagnostic device.  Default ``wm_diag_device=cuda``
+            # matches the previous env injection: the auto-picker reads
             # nvidia-smi util, which sees *our own* training process as
-            # "GPU busy" and falls back to CPU — making the WM rollout
-            # very slow.  A manual override still wins (set
-            # DREAMER_WM_DIAG_DEVICE=cpu/cuda explicitly).
-            if (torch.cuda.is_available() and
-                    not os.environ.get('DREAMER_WM_DIAG_DEVICE')):
-                os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
+            # busy and would fall back to CPU.  Explicit env still wins.
+            # ``auto`` leaves the picker; ``cpu`` forces host.
+            if not os.environ.get('DREAMER_WM_DIAG_DEVICE'):
+                _diag_dev = str(
+                    getattr(cfg, 'wm_diag_device', 'cuda') or 'cuda'
+                    ).strip().lower()
+                if _diag_dev in ('cpu',):
+                    os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cpu'
+                elif (_diag_dev not in ('auto', 'off', '0', 'none')
+                      and torch.cuda.is_available()):
+                    os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
             run_wm_steady_state_diagnostic(
                 out_dir, ckpt_name='final.pt',
                 n_starts=n_starts, horizon=horizon,
@@ -13975,8 +13980,6 @@ _CLI_ONLY_ENV = (
     ('DREAMER_K_MAX', 'k_max', int),
     ('DREAMER_LOOKBACK', 'lookback', int),
     ('DREAMER_BATCH_SIZE', 'batch_size', int),
-    ('DREAMER_PMPO_BETA', 'pmpo_beta', float),
-    ('DREAMER_PMPO_ALPHA', 'pmpo_alpha', float),
     ('DREAMER_MAE_PMAX', 'mae_p_max', float),
     ('DREAMER_POLICY_TYPE', 'policy_type', str),
     ('DREAMER_POLICY_INIT_LOG_STD', 'policy_init_log_std', float),

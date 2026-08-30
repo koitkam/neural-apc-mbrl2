@@ -103,7 +103,12 @@ def _gpu_busy(util_threshold_pct: float = 50.0,
 
 
 def _pick_device() -> Tuple[torch.device, str]:
-    """Honour ``DREAMER_WM_DIAG_DEVICE`` override; else auto-detect."""
+    """Honour ``DREAMER_WM_DIAG_DEVICE`` / TrainConfig ``wm_diag_device``.
+
+    ``train()`` writes the env from cfg (default ``cuda``) before calling
+    so nvidia-smi does not treat the training process as "GPU busy" and
+    fall back to CPU.  CLI without the env still auto-detects.
+    """
     forced = os.environ.get('DREAMER_WM_DIAG_DEVICE', '').strip().lower()
     if forced in ('cpu',):
         return torch.device('cpu'), 'forced_cpu'

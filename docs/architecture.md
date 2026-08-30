@@ -59,7 +59,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > each P3 iter (`p3_mu_ratio_refresh_iters=1`).
 > p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
-> dead `pmpo_loss`/`kl_to` **REMOVED**). `_realsim` now logs
+> dead `pmpo_loss`/`kl_to`/`pmpo_alpha`/`pmpo_beta` **REMOVED**). `_realsim` now logs
 > `critic_mc_loss`. Do **not** promote
 > `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
 > reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
@@ -95,7 +95,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > `disturbance_recovery_frac` / `disturbance_settle_steps` /
 > `disturbance_quiet_frac`; leftover `AGENT_DISTURBANCE_*`)
 > plus expert move-law (`expert_move_frac` / `backoff_frac` / …)
-> and CLI extras (`DREAMER_PMPO_{ALPHA,BETA}` / `POLICY_*` /
+> and CLI extras (`POLICY_*` /
 > `GRAD_CLIP` / seed counts / plant-derived arch) that `single_run`
 > used to drop are TrainConfig + `ENV_OVERRIDES`.
 

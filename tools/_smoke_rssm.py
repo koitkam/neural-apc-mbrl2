@@ -779,6 +779,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_REWARD_CAL_PCT': '90',
         'DREAMER_DIAG_PERHEAD_GRADS_EVERY': '10',
         'DREAMER_RUN_WM_DIAGNOSTIC': '0',
+        'DREAMER_WM_DIAG_DEVICE': 'cpu',
         'DREAMER_SEED_TARGET_CV_FRAC': '0.25',
         'DREAMER_PMPO_ENTROPY_ETA_V3': '2e-4',
         'DREAMER_PRBS_SEG_MIN': '6',
@@ -841,7 +842,6 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_PRBS_SEED_SEGMENT_STEPS_MIN': '6',
         'DREAMER_WM_SS_MATCH_WINDOW_FRAC': '0.40',
         'DREAMER_EXPERT_MOVE_FRAC': '0.22',
-        'DREAMER_PMPO_ALPHA': '0.55',
         'DREAMER_BASELINE_SEED_EPS': '12',
         'DREAMER_EXPLORATION_SEED_EPS': '4',
         'DREAMER_DV_PRBS_SEEDS': '18',
@@ -877,6 +877,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.reward_cal_pct) - 90.0) < 1e-12
         assert int(cfg.diag_perhead_grads_every) == 10
         assert cfg.run_wm_diagnostic is False
+        assert cfg.wm_diag_device == 'cpu'
         assert abs(float(cfg.seed_target_cv_frac) - 0.25) < 1e-12
         assert abs(float(cfg.pmpo_entropy_eta_v3) - 2e-4) < 1e-12
         assert int(cfg.prbs_seg_min) == 6
@@ -939,7 +940,6 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.prbs_seed_segment_steps_min) == 6
         assert abs(float(cfg.wm_ss_match_window_frac) - 0.40) < 1e-12
         assert abs(float(cfg.expert_move_frac) - 0.22) < 1e-12
-        assert abs(float(cfg.pmpo_alpha) - 0.55) < 1e-12
         assert int(cfg.baseline_seed_episodes) == 12
         assert int(cfg.exploration_seed_episodes) == 4
         assert int(cfg.dv_prbs_seed_episodes) == 18
@@ -1014,7 +1014,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'prbs_seed_segment_steps' in explicit
         assert 'wm_ss_match_window_frac' in explicit
         assert 'expert_move_frac' in explicit
-        assert 'pmpo_alpha' in explicit
+        assert 'wm_diag_device' in explicit
         assert 'baseline_seed_episodes' in explicit
         assert 'exploration_seed_episodes' in explicit
         assert 'dv_prbs_seed_episodes' in explicit
@@ -1323,6 +1323,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_maybe_snapshot_prior_policy' in _src
     assert '_actor_uses_prior_policy' in _src
     assert 'actor_kl_coef: float' not in _src
+    assert 'pmpo_alpha: float' not in _src
+    assert 'pmpo_beta: float' not in _src
     assert "'critic_mc_loss'" in _src
     assert 'def _pearson_r(' in _src
     assert 'reuse pinned host + GPU dest' in _src
@@ -1500,6 +1502,9 @@ def _test_envfree_observer_recipe() -> None:
     assert c.gain_match_rest_ic_cuda_graph is True
     assert c.p3_reset_log_std is False
     assert not hasattr(c, 'actor_kl_coef')
+    assert not hasattr(c, 'pmpo_alpha')
+    assert not hasattr(c, 'pmpo_beta')
+    assert c.wm_diag_device == 'cuda'
     assert c.bc_mean_only is True
     assert c.p3_stop_grad_log_std is True
     assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
@@ -1568,6 +1573,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_RUN_WM_DIAGNOSTIC' in ENV_OVERRIDES
     assert 'DREAMER_WM_DIAG_N_STARTS' in ENV_OVERRIDES
     assert 'DREAMER_WM_DIAG_HORIZON' in ENV_OVERRIDES
+    assert 'DREAMER_WM_DIAG_DEVICE' in ENV_OVERRIDES
     assert 'DREAMER_SEED_TARGET_CV_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_SEED_SIGMA_CAP' in ENV_OVERRIDES
     assert 'DREAMER_PMPO_ENTROPY_ETA_V3' in ENV_OVERRIDES
@@ -1664,12 +1670,14 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_DISTURBANCE_QUIET_FRAC' in ENV_OVERRIDES
     assert abs(float(c.expert_move_frac) - 0.30) < 1e-12
     assert abs(float(c.expert_backoff_frac) - 0.12) < 1e-12
-    assert abs(float(c.pmpo_alpha) - 0.7) < 1e-12
-    assert abs(float(c.pmpo_beta) - 0.01) < 1e-12
+    assert not hasattr(c, 'pmpo_alpha')
+    assert not hasattr(c, 'pmpo_beta')
+    assert c.wm_diag_device == 'cuda'
     assert int(c.dv_prbs_seed_episodes) == 24
     assert 'DREAMER_EXPERT_MOVE_FRAC' in ENV_OVERRIDES
-    assert 'DREAMER_PMPO_ALPHA' in ENV_OVERRIDES
-    assert 'DREAMER_PMPO_BETA' in ENV_OVERRIDES
+    assert 'DREAMER_PMPO_ALPHA' not in ENV_OVERRIDES
+    assert 'DREAMER_PMPO_BETA' not in ENV_OVERRIDES
+    assert 'DREAMER_WM_DIAG_DEVICE' in ENV_OVERRIDES
     assert 'DREAMER_BASELINE_SEED_EPS' in ENV_OVERRIDES
     assert 'DREAMER_EXPLORATION_SEED_EPS' in ENV_OVERRIDES
     assert 'DREAMER_DV_PRBS_SEEDS' in ENV_OVERRIDES

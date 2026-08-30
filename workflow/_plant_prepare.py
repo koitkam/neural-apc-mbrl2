@@ -578,10 +578,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RUN_WM_DIAGNOSTIC':           ('run_wm_diagnostic',            _as_bool),
     'DREAMER_WM_DIAG_N_STARTS':          ('wm_diag_n_starts',             int),
     'DREAMER_WM_DIAG_HORIZON':           ('wm_diag_horizon',              int),
+    'DREAMER_WM_DIAG_DEVICE':            ('wm_diag_device',               str),
     # Eval TM protocol + val-suite gates.  Were ``os.environ.get`` in
     # ``evaluation/`` (worked, missing from ``run_plan``).  Identity
     # defaults (levels=5, span=0.6, step_frac=0.4, horizon/settle 0=auto,
-    # all three val gates ON).  ``DREAMER_WM_DIAG_DEVICE`` stays env-only.
+    # all three val gates ON).  Device default ``cuda`` (train() used
+    # to inject the env so nvidia-smi would not pick CPU).
     'DREAMER_WM_TF_LEVELS':              ('wm_tf_levels',                 int),
     'DREAMER_WM_TF_SPAN':                ('wm_tf_span',                   float),
     'DREAMER_WM_TF_STEP_FRAC':           ('wm_tf_step_frac',              float),
@@ -961,8 +963,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # ``python -m training.train`` honored them via ``_CLI_ONLY_ENV``).
     # Identity defaults.  Architecture / lookback are plant-derived in
     # ``single_run``; an explicit env now wins after that construction.
-    'DREAMER_PMPO_ALPHA':                 ('pmpo_alpha',                     float),
-    'DREAMER_PMPO_BETA':                  ('pmpo_beta',                      float),
+    # ``DREAMER_PMPO_{ALPHA,BETA}`` REMOVED (unused after ``pmpo_loss``).
     'DREAMER_MAE_PMAX':                   ('mae_p_max',                      float),
     'DREAMER_POLICY_TYPE':                ('policy_type',                    str),
     'DREAMER_POLICY_INIT_LOG_STD':        ('policy_init_log_std',            float),
