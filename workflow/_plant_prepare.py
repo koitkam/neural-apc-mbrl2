@@ -921,6 +921,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # P45 EXIT PROMOTE: TM-protocol rest-IC teacher (env-free True).
     # Isolation loss stays 0.  ``=0`` reverts to PRBS-posterior FD.
     'DREAMER_GAIN_MATCH_REST_IC':         ('gain_match_rest_ic',             _as_bool),
+    # Identity speed: CUDA-graph rest-IC T-loop (RSSM, sample=False, full
+    # BPTT).  ``=0`` keeps the eager Python loop.
+    'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH': ('gain_match_rest_ic_cuda_graph', _as_bool),
     'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
     # per-input isolation trajectory match + the steady-state DC-gain match (the

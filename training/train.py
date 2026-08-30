@@ -964,6 +964,11 @@ class TrainConfig:
     # reverts to PRBS-posterior FD.  Collect settle = max(H, lookback)
     # — **not** ``wm_tf_horizon`` (that 4H window is a later A/B).
     gain_match_rest_ic: bool = True
+    # Identity speed: CUDA-graph the rest-IC ``last_only`` T-loop (static
+    # cached obs/act, ``sample=False``, full BPTT).  RSSM only (TSSM
+    # kv-cache grows).  Capture-fail / CPU / low VRAM → eager Python loop.
+    # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
+    gain_match_rest_ic_cuda_graph: bool = True
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
@@ -2667,8 +2672,12 @@ class APCEnv:
         return vec
 
     def _dv_lowpass_alpha(self) -> float:
-        """EMA coefficient for the measured-DV low-pass (0 = OFF).  Auto-derived
-        once from the plant τ (tau_dom/sr/4, clip [2,12] samples)."""
+        """EMA coefficient for the measured-DV low-pass.
+
+        ``dv_lowpass_tau``: ``0`` = AUTO (plant τ/sr/4, clip [2, 12]
+        samples); ``<0`` turns it off; ``>0`` is an explicit τ in
+        samples.  Cached after the first call.
+        """
         a = getattr(self, '_dv_lp_alpha_cached', -1.0)
         if a >= 0.0:
             return a
@@ -4075,6 +4084,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
+        f"gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph', True))} "
         f"p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std', False))} "
         f"bc_mean={bool(getattr(cfg, 'bc_mean_only', True))} "
         f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
@@ -6716,6 +6726,111 @@ def _gain_match_rest_ic_tensors(
     return cache[1], cache[2]
 
 
+def _rest_ic_last_tensors(rssm, obs: torch.Tensor, act: torch.Tensor):
+    """Last ``h/z/c_mean`` of a rest-IC ``last_only`` encode (eager)."""
+    _, _, _, state, *_ = rssm.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True,
+        return_feats=False)
+    c = state.c_mean if getattr(state, 'c_mean', None) is not None else state.c
+    if c is None:
+        c = obs.new_zeros(obs.shape[0], 0)
+    return state.h, state.z, c
+
+
+def _rest_ic_can_cuda_graph(rssm, obs: torch.Tensor, cfg: 'TrainConfig') -> bool:
+    """CUDA-graph rest-IC is RSSM + CUDA + static T≥8.  TSSM kv-cache grows."""
+    if not _cfg_on(cfg, 'gain_match_rest_ic_cuda_graph', True):
+        return False
+    if getattr(getattr(obs, 'device', None), 'type', '') != 'cuda':
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if not hasattr(torch.cuda, 'make_graphed_callables'):
+        return False
+    if type(rssm).__name__ != 'RSSMDynamics':
+        return False
+    if bool(getattr(rssm, '_rest_ic_cg_fail', False)):
+        return False
+    if int(obs.shape[1]) < 8:
+        return False
+    return True
+
+
+def _rest_ic_graph_key(rssm, obs: torch.Tensor, act: torch.Tensor):
+    return (
+        tuple(obs.shape), tuple(act.shape), str(obs.dtype), str(act.dtype),
+        str(obs.device), bool(getattr(rssm, 'dob_active', False)),
+        bool(getattr(rssm, 'dob_enabled', False)),
+        bool(getattr(rssm, '_cont_post_uses_innov', False)),
+    )
+
+
+def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
+    """Capture full-BPTT rest-IC; None → eager.  Do not use raw CUDAGraph."""
+    try:
+        free, _total = torch.cuda.mem_get_info(obs.device)
+        if int(free) < 512 * 1024 * 1024:
+            print('[gain-match] rest-ic CUDA graph skipped '
+                  f'(free VRAM {free / 1024 ** 2:.0f} MiB < 512)',
+                  flush=True)
+            return None
+    except Exception:
+        pass
+
+    def _fn(o, a):
+        return _rest_ic_last_tensors(rssm, o, a)
+
+    try:
+        graphed = torch.cuda.make_graphed_callables(
+            _fn, (obs, act), num_warmup_iters=2)
+    except Exception as e:
+        print('[gain-match] rest-ic CUDA graph capture failed '
+              f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+        return None
+    # Canary: P25 class if the graph dropped BPTT through the GRU.
+    try:
+        rssm.zero_grad(set_to_none=True)
+        h, z, c = graphed(obs, act)
+        (h.float().square().mean()
+         + z.float().square().mean()
+         + c.float().square().mean()).backward()
+        gru_g = 0.0
+        for n, p in rssm.named_parameters():
+            if p.grad is not None and 'gru' in n:
+                gru_g += float(p.grad.abs().sum())
+        rssm.zero_grad(set_to_none=True)
+        if gru_g <= 0.0:
+            print('[gain-match] rest-ic CUDA graph dropped GRU grad; '
+                  'eager T-loop', flush=True)
+            return None
+    except Exception as e:
+        rssm.zero_grad(set_to_none=True)
+        print('[gain-match] rest-ic CUDA graph canary failed '
+              f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+        return None
+    print(f'[gain-match] rest-ic CUDA graph captured N={int(obs.shape[0])} '
+          f'T={int(obs.shape[1])} (full-BPTT; opt out '
+          'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0)', flush=True)
+    return graphed
+
+
+def _rest_ic_encode_hzc(rssm, obs: torch.Tensor, act: torch.Tensor,
+                        cfg: 'TrainConfig'):
+    """Last ``h/z/c``; CUDA-graph when eligible, else eager T-loop."""
+    if not _rest_ic_can_cuda_graph(rssm, obs, cfg):
+        return _rest_ic_last_tensors(rssm, obs, act)
+    key = _rest_ic_graph_key(rssm, obs, act)
+    cache = getattr(rssm, '_rest_ic_cg', None)
+    if cache is not None and cache[0] == key:
+        return cache[1](obs, act)
+    graphed = _capture_rest_ic_cuda_graph(rssm, obs, act)
+    if graphed is None:
+        rssm._rest_ic_cg_fail = True  # type: ignore[attr-defined]
+        return _rest_ic_last_tensors(rssm, obs, act)
+    rssm._rest_ic_cg = (key, graphed)  # type: ignore[attr-defined]
+    return graphed(obs, act)
+
+
 def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     """Encode cached rest lookbacks → ``(h0, z0, c0, a_base, dv0)``.
 
@@ -6728,6 +6843,11 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     ``cont_prior_net``; next GRU input is the posterior).  None if the
     cache is empty.
 
+    CUDA: ``make_graphed_callables`` on the T-loop when
+    ``gain_match_rest_ic_cuda_graph`` (default True), RSSM, T≥8, and
+    capture+GRU-grad canary succeed.  Raw ``CUDAGraph`` has no backward
+    (P25).  TSSM / CPU / capture-fail stay on the Python loop.
+
     Do **not** concat rest rows into the main WM ``rollout_observed``
     (``sample=True``): the GRU would see sampled ``c``, so ``h`` ≠ this
     mean-c IC.  The extra cost is a second T-loop of skinny N=6 kernels
@@ -6736,12 +6856,7 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     o, a = _gain_match_rest_ic_tensors(cfg, device, dtype)
     if o is None or a is None:
         return None
-    _, _, _, state, *_ = rssm.rollout_observed(
-        o, a, sample=False, store_aux=False, last_only=True,
-        return_feats=False)
-    h0 = state.h
-    z0 = state.z
-    c0 = state.c_mean if getattr(state, 'c_mean', None) is not None else state.c
+    h0, z0, c0 = _rest_ic_encode_hzc(rssm, o, a, cfg)
     a_base = a[:, -1].contiguous()
     dv0 = None
     if int(getattr(rssm, 'dv_dim', 0) or 0) > 0:

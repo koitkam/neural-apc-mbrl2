@@ -61,6 +61,7 @@ from training.train import (
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt,
                             _gain_match_rest_window, _held_rollout_win,
+                            _rest_ic_can_cuda_graph,
                             collect_rest_lookback,
                             _wm_gain_match_loss, _require_realsim_actor,
                             _adv_action_corr, _p3_logp_clip_bound,
@@ -206,6 +207,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.gain_match_huber_per_input is True
     assert int(_tc.gain_match_settle_len) == -1
     assert _tc.gain_match_rest_ic is True
+    assert _tc.gain_match_rest_ic_cuda_graph is True
     assert _tc.p3_reset_log_std is False
     assert _tc.bc_mean_only is True
     assert _tc.p3_stop_grad_log_std is True
@@ -752,6 +754,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': '0',
         'DREAMER_GAIN_MATCH_SETTLE_LEN': '55',
         'DREAMER_GAIN_MATCH_REST_IC': '1',
+        'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH': '0',
         'DREAMER_P3_RESET_LOG_STD': '1',
         'DREAMER_P3_STOP_GRAD_LOG_STD': '0',
         'DREAMER_P3_LOGP_CLIP': '0',
@@ -848,6 +851,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert cfg.gain_match_huber_per_input is False
         assert int(cfg.gain_match_settle_len) == 55
         assert cfg.gain_match_rest_ic is True
+        assert cfg.gain_match_rest_ic_cuda_graph is False
         assert cfg.p3_reset_log_std is True
         assert cfg.p3_stop_grad_log_std is False
         assert abs(float(cfg.p3_logp_clip)) < 1e-12
@@ -1002,6 +1006,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'baseline_seed_episodes' in explicit
         assert 'exploration_seed_episodes' in explicit
         assert 'dv_prbs_seed_episodes' in explicit
+        assert 'gain_match_rest_ic_cuda_graph' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1290,6 +1295,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic'" in _src
+    assert "gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph'" in _src
     assert "p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std'" in _src
     assert "bc_mean={bool(getattr(cfg, 'bc_mean_only'" in _src
     assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
@@ -1312,6 +1318,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
+    assert '_rest_ic_can_cuda_graph' in _src
+    assert 'make_graphed_callables' in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
@@ -1467,6 +1475,7 @@ def _test_envfree_observer_recipe() -> None:
     assert float(c.gain_match_huber_beta) == 1.0
     assert int(c.gain_match_settle_len) == -1
     assert c.gain_match_rest_ic is True
+    assert c.gain_match_rest_ic_cuda_graph is True
     assert c.p3_reset_log_std is False
     assert not hasattr(c, 'actor_kl_coef')
     assert c.bc_mean_only is True
@@ -2301,6 +2310,9 @@ def _test_gain_match_rest_ic() -> None:
     assert torch.isfinite(gm3).all() and float(gm3) > 0.0
     print(f'[smoke] OK  rest-ic encode is the FD IC '
           f'(Δloss={abs(float(gm1) - float(gm2)):.4g})')
+    # CUDA graph is skipped on CPU (and while a GPU job occupies the A10).
+    assert not _rest_ic_can_cuda_graph(model.dynamics, rest_o, cfg)
+    print('[smoke] OK  rest-ic CUDA graph skipped on CPU')
 
 
 def _test_p3_reset_log_std() -> None:
@@ -3397,6 +3409,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
+    assert 'gmatch_rest_cg=True' in banner, banner
     assert 'p3_sigreset=False' in banner, banner
     assert 'p3_sglogstd=True' in banner, banner
     assert 'p3_logpclip=8' in banner, banner
