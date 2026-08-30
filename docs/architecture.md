@@ -37,12 +37,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > p3_plateau not entropy_collapse); **FALSIFIED as cascade lever**
 > (μ-rail logp_std 0.54→38 @147; val paired **−72 vs −111**, worse
 > than P50 **−56 vs −104**; best.pt **161** during cascade).
-> P52 LIVE P3 (`run_p52_logpclip`, `d910ee2`, pid **64705**,
-> iter **201**): unfreeze 147 ent HELD; delayed μ-rail @165
-> std **80.8** / actor **−5.80**; later std **0.88@196** with
-> actor **−9.81** mvv **813k**; rtgt **0.00012**; best.pt
-> **176**; rscale **2.83**. Gate @82 last-ok **78** MV **0.95**
-> DV **0.84**. Default `p3_logp_clip=8` nats **per MV** (summed
+> P52 EXIT (`run_p52_logpclip`, `d910ee2`, 209 iters):
+> `p3_logp_clip=8` KEEP as delayed first-unfreeze bound
+> (147 std **6.11** / actor **−0.77** vs P51 38 / −4.66);
+> **FALSIFIED as cascade** (in-support μ-walk; val paired
+> **−377 vs −87 FAIL**, 0/9; worse than P50 **−56 vs −104**
+> and P51 **−72 vs −111**; best.pt **176** det **−634**).
+> Gate @82 last-ok **78** MV **0.95** DV **0.84**. Default
+> `p3_logp_clip=8` nats **per MV** (summed
 > logp clamp `8×n_mv`; 1-MV identity). Do **not**
 > promote `p3_reset_log_std`. Do not stack critic knobs. Do not
 > revive `actor_kl_coef`. `derive_horizon` / sim `reset()` now
@@ -452,10 +454,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > **−0.107**. Val paired **−56 vs −104 BEATS**. Unfreeze still yanked
 > σ. **P3 REINFORCE default stop-grad log_std** (`p3_stop_grad_log_std=True`)
 > so η+REINFORCE train μ only. **P51 EXIT KEEP** as unfreeze-yank +
-> non-sticky floor; **FALSIFIED as cascade** (μ still rails). **P52**
-> clamps the REINFORCE logp (`p3_logp_clip=8` nats per MV,
-> summed clamp `8×n_mv`; opt out
-> `DREAMER_P3_LOGP_CLIP=0`). Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.
+> non-sticky floor; **FALSIFIED as cascade** (μ still rails). **P52 EXIT
+> KEEP** as delayed first-unfreeze bound (`p3_logp_clip=8`);
+> **FALSIFIED as cascade** (in-support μ-walk; val **−377 vs −87
+> FAIL**). Next GPU: PPO-style ratio clip vs frozen unfreeze-μ.
+> Opt out `DREAMER_P3_LOGP_CLIP=0`. Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.
 > Opt out `DREAMER_BC_MEAN_ONLY=0`. Do not stack more critic knobs.
 > Do not promote `p3_reset_log_std`.
 > Do not concat rest rows into the main `sample=True` WM rollout

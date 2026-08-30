@@ -1885,7 +1885,12 @@ class TrainConfig:
     # ``clip * n_mv`` (``_p3_logp_clip_bound``). 1-MV test_sim is
     # identity with a scalar 8. Healthy 1-MV warmup logp is ~0.65±0.54,
     # so 8 matches ``advantage_clip`` and does not bind in-support.
-    # 0 = unclipped (P51). Opt out ``DREAMER_P3_LOGP_CLIP=0``. Not
+    # P52 EXIT: clamp KEEP as delayed first-unfreeze bound (147
+    # unclipped std 6.11 / actor −0.77 vs P51 38 / −4.66) but
+    # **FALSIFIED as cascade lever**. In-support (|logp|<8) SGD still
+    # walks μ (~18 iters → std 80.8@165); val −377 vs −87 FAIL.
+    # Next is a μ-walk limiter, not a tighter clip. 0 = unclipped (P51).
+    # Opt out ``DREAMER_P3_LOGP_CLIP=0``. Not
     # ``actor_kl_coef`` (p136 FALSIFIED as a σ-collapse TR; do not revive).
     p3_logp_clip: float = 8.0
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
