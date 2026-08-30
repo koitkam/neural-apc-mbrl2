@@ -1206,6 +1206,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
     assert "p3_logpclip={float(getattr(cfg, 'p3_logp_clip'" in _src
     assert '_p3_logp_clip_bound' in _src
+    assert "SIM_IDENTIFIED_TAU_DOMINANT', '50'" not in _src
+    assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
@@ -2251,6 +2253,45 @@ def _test_p3_logp_clip() -> None:
     print('[smoke] OK  p3_logp_clip zeros μ grad on railed logp; keeps in-support')
 
 
+def _test_id_tau_no_plant_sentinel() -> None:
+    """Missing SysID keys must not invent τ=50 s / θ=5 s."""
+    from pathlib import Path
+    from utils.noise_config import _theta_from_tau, build_noise_config
+    root = Path(__file__).resolve().parents[1]
+    pp = (root / 'workflow' / '_plant_prepare.py').read_text()
+    nc = (root / 'utils' / 'noise_config.py').read_text()
+    assert "dyn.get('tau_dominant', 50.0)" not in pp
+    assert "dyn.get('dead_time', 5.0)" not in pp
+    assert "tau_dominant_identified', 50.0" not in nc
+    assert "dead_time_identified', 5.0" not in nc
+    assert abs(_theta_from_tau(0.0, 4) - 0.02) < 1e-12
+    tau, sr = 53.0, 4
+    expected = max(float(sr) / (0.10 * max(1.0, tau)), 0.02)
+    assert abs(_theta_from_tau(tau, sr) - expected) < 1e-12
+    baked = build_noise_config(
+        state_variables=['CV', 'x', 'y', 'DV'],
+        cv_indices=[0], dv_indices=[3], mv_indices=[1],
+        cv_normalization_ranges=[[68.0, 96.0]],
+        dv_normalization_ranges=[[60.0, 140.0]],
+        sample_rate=4, noise_stdv=0.03,
+        dynamics_json={},
+    )
+    thetas = [float(row['theta']) for row in baked['ou_noise']]
+    assert thetas and all(abs(t - 0.02) < 1e-9 for t in thetas), thetas
+    ident = build_noise_config(
+        state_variables=['CV', 'x', 'y', 'DV'],
+        cv_indices=[0], dv_indices=[3], mv_indices=[1],
+        cv_normalization_ranges=[[68.0, 96.0]],
+        dv_normalization_ranges=[[60.0, 140.0]],
+        sample_rate=4, noise_stdv=0.03,
+        dynamics_json={'tau_dominant_identified': 53.0,
+                       'dead_time_identified': 8.0},
+    )
+    ident_th = [float(row['theta']) for row in ident['ou_noise']]
+    assert ident_th and all(abs(t - expected) < 5e-4 for t in ident_th), ident_th
+    print('[smoke] OK  missing SysID τ does not invent 50 s; identified τ identity')
+
+
 def _test_resolve_baseline_seed_op_band() -> None:
     """Env-free min(0.6, PRBS); explicit override is not PRBS-capped."""
     c = TrainConfig()
@@ -3244,6 +3285,7 @@ if __name__ == '__main__':
     _test_bc_mean_only()
     _test_p3_stop_grad_log_std()
     _test_p3_logp_clip()
+    _test_id_tau_no_plant_sentinel()
     _test_resolve_baseline_seed_op_band()
     _test_cfg_or_env_float_identity()
     _test_auto_tune_formula_input_cfg_or_env()

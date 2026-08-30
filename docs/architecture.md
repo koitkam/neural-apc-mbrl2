@@ -46,7 +46,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
 > GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
-> longer silently uses WM-only 1.0). Reward-engine
+> longer silently uses WM-only 1.0). Missing SysID keys do **not**
+> invent τ=50 s / θ=5 s. Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
 > adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
 > until linear observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and

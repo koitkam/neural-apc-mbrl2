@@ -357,7 +357,11 @@ def _theta_from_tau(tau_dominant: float, sample_rate: int = 1) -> float:
     returns.  Only a small positive floor is kept for numerical safety
     (``theta = 0`` would turn the OU into a random walk).
     """
-    tau = max(1.0, float(tau_dominant))
+    tau = float(tau_dominant or 0.0)
+    if tau <= 0.0:
+        # No identified τ: numerical OU floor only. Do not invent 50 s.
+        return 0.02
+    tau = max(1.0, tau)
     characteristic = 0.10 * tau
     dt = max(1e-3, float(sample_rate))
     ratio = dt / characteristic
@@ -463,8 +467,8 @@ def build_noise_config(
     cv_ranges = list(cv_normalization_ranges or [])
     dv_ranges = list(dv_normalization_ranges or [])
 
-    tau_dom = float(dyn.get('tau_dominant_identified', 50.0) or 50.0)
-    dead_time = float(dyn.get('dead_time_identified', 5.0) or 5.0)
+    tau_dom = float(dyn.get('tau_dominant_identified', 0.0) or 0.0)
+    dead_time = float(dyn.get('dead_time_identified', 0.0) or 0.0)
     per_mv = dyn.get('per_mv_dynamics', {}) or {}
     per_cv = dyn.get('per_cv_dynamics', {}) or {}
     per_pair = dyn.get('per_pair_estimates', []) or []

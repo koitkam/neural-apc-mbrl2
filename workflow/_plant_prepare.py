@@ -43,10 +43,13 @@ def identify_dynamics(out_dir: Path) -> Dict:
     dyn = identify_and_save_dynamics(output_path=str(dyn_path))
     os.environ['DYNAMICS_IDENTIFICATION_JSON'] = str(dyn_path)
 
+    # Missing keys → 0, not a fake 50 s / 5 s plant. Downstream
+    # formulas already treat τ≤0 as "use unitless floors"
+    # (``derive_sample_rate`` default, ``derive_episode_length`` 1000).
     tau = float(dyn.get('tau_dominant_identified',
-                         dyn.get('tau_dominant', 50.0)) or 50.0)
+                         dyn.get('tau_dominant', 0.0)) or 0.0)
     dead = float(dyn.get('dead_time_identified',
-                          dyn.get('dead_time', 5.0)) or 5.0)
+                          dyn.get('dead_time', 0.0)) or 0.0)
     tau_fast = dyn.get('tau_fastest_identified', tau)
     dt_fast = dyn.get('dead_time_fastest_identified', dead)
 
