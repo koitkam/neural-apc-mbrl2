@@ -62,6 +62,7 @@ from training.train import (
                             _gain_match_pred_over_tgt,
                             _gain_match_rest_window, _held_rollout_win,
                             _rest_ic_can_cuda_graph,
+                            _warmup_rest_ic_cuda_graph,
                             _rssm_param_grad_snapshot,
                             _rssm_param_grad_restore,
                             collect_rest_lookback,
@@ -1336,6 +1337,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_rest_ic_can_cuda_graph' in _src
     assert 'make_graphed_callables' in _src
     assert 'cache_enabled=False' in _src
+    assert 'enabled=False' in _src
+    assert '_warmup_rest_ic_cuda_graph' in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
@@ -2372,6 +2375,8 @@ def _test_gain_match_rest_ic() -> None:
           f'(Δloss={abs(float(gm1) - float(gm2)):.4g})')
     # CUDA graph is skipped on CPU (and while a GPU job occupies the A10).
     assert not _rest_ic_can_cuda_graph(model.dynamics, rest_o, cfg)
+    _warmup_rest_ic_cuda_graph(model.dynamics, cfg, torch.device('cpu'))
+    assert not hasattr(model.dynamics, '_rest_ic_cg')
     print('[smoke] OK  rest-ic CUDA graph skipped on CPU')
 
 

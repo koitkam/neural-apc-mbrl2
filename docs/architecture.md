@@ -64,7 +64,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
 > reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
 > canary restores in-flight grads. P55 pid capture failed (autocast
-> cache) → eager T-loop; HEAD `cache_enabled=False`.
+> cache) → eager T-loop. HEAD captures **before** the WM autocast loop
+> and exits the parent autocast (`cache_enabled=False`) so the next
+> launch can actually fuse the T-loop.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
@@ -797,8 +799,10 @@ fixes BOTH:
   `rollout_observed(..., last_only=True, return_feats=False)` via
   Stage-1 `_posterior_step`. CUDA: `make_graphed_callables` on that
   T-loop when `gain_match_rest_ic_cuda_graph` (default True; RSSM
-  only; GRU-grad canary; CPU/TSSM/capture-fail stay eager). When the
-  rest cache is present, P44 WM-held settle is skipped. Isolation loss
+  only; GRU-grad canary; CPU/TSSM/capture-fail stay eager). Capture is
+  warmed at train start **outside** the P1 WM autocast loop (P55
+  in-loop capture hit autocast cache → eager for the whole run). When
+  the rest cache is present, P44 WM-held settle is skipped. Isolation loss
   stays 0. jsonl `*_ratio` =
   mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE
   (default False). Residual is last Linear (ent −0.101); opening σ

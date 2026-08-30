@@ -964,7 +964,9 @@ class TrainConfig:
     gain_match_rest_ic: bool = True
     # Identity speed: CUDA-graph the rest-IC ``last_only`` T-loop (static
     # cached obs/act, ``sample=False``, full BPTT).  RSSM only (TSSM
-    # kv-cache grows).  Capture-fail / CPU / low VRAM → eager Python loop.
+    # kv-cache grows).  Capture is warmed **outside** the P1 WM autocast
+    # loop (P55: in-loop capture hit autocast cache → eager T-loop for
+    # the whole run).  Capture-fail / CPU / low VRAM → eager Python loop.
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
     gain_match_rest_ic_cuda_graph: bool = True
     gain_match_max_starts: int = 6
@@ -6816,16 +6818,20 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
         return _rest_ic_last_tensors(rssm, o, a)
 
     try:
-        # Eager WM steps run inside bf16 autocast.
+        # Eager WM steps run inside bf16 autocast (cache_enabled=True).
         # ``make_graphed_callables`` rejects autocast cache (P55 first
-        # GPU capture: RuntimeError … set cache_enabled=False). Nested
-        # cache_enabled=False records the same bf16 kernels. Fail still
+        # GPU capture inside ``world_model_loss``: RuntimeError … set
+        # cache_enabled=False).  Exit the parent region first — a nested
+        # cache_enabled=False alone still sees the parent's cache flag
+        # on some PyTorch builds — then re-enter bf16 with cache off so
+        # the recorded kernels match the training WM step.  Fail still
         # falls back to the eager T-loop.
-        with torch.amp.autocast(
-                device_type=obs.device.type, dtype=torch.bfloat16,
-                enabled=True, cache_enabled=False):
-            graphed = torch.cuda.make_graphed_callables(
-                _fn, (obs, act), num_warmup_iters=2)
+        with torch.amp.autocast(device_type=obs.device.type, enabled=False):
+            with torch.amp.autocast(
+                    device_type=obs.device.type, dtype=torch.bfloat16,
+                    enabled=True, cache_enabled=False):
+                graphed = torch.cuda.make_graphed_callables(
+                    _fn, (obs, act), num_warmup_iters=2)
     except Exception as e:
         print('[gain-match] rest-ic CUDA graph capture failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
@@ -6878,6 +6884,37 @@ def _rest_ic_encode_hzc(rssm, obs: torch.Tensor, act: torch.Tensor,
     return graphed(obs, act)
 
 
+def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
+    """Capture rest-IC CUDA graph outside the P1 WM autocast loop.
+
+    P55 pid **103504** captured on the first ``world_model_loss`` step
+    (parent autocast ``cache_enabled=True``).  ``make_graphed_callables``
+    rejected it and ``_rest_ic_cg_fail`` pinned the eager T-loop for the
+    whole run (``t_wm`` ~127 s).  Call after the rest cache exists and
+    Stage-1 ``dob_active`` is already False.  Replay during inner WM
+    steps never re-enters capture.  CPU / opt-out / non-RSSM: no-op.
+    """
+    if rssm is None:
+        return
+    if not _cfg_on(cfg, 'gain_match_rest_ic', False):
+        return
+    if not _cfg_on(cfg, 'gain_match_rest_ic_cuda_graph', True):
+        return
+    if getattr(device, 'type', '') != 'cuda':
+        return
+    if getattr(cfg, '_gain_match_rest_obs', None) is None:
+        return
+    if hasattr(rssm, '_rest_ic_cg_fail'):
+        delattr(rssm, '_rest_ic_cg_fail')
+    if hasattr(rssm, '_rest_ic_cg'):
+        delattr(rssm, '_rest_ic_cg')
+    try:
+        _gain_match_rest_ic_state(rssm, cfg, device, torch.float32)
+    except Exception as e:
+        print('[gain-match] rest-ic CUDA graph warmup failed '
+              f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+
+
 def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     """Encode cached rest lookbacks → ``(h0, z0, c0, a_base, dv0)``.
 
@@ -6892,8 +6929,10 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
 
     CUDA: ``make_graphed_callables`` on the T-loop when
     ``gain_match_rest_ic_cuda_graph`` (default True), RSSM, T≥8, and
-    capture+GRU-grad canary succeed.  Raw ``CUDAGraph`` has no backward
-    (P25).  TSSM / CPU / capture-fail stay on the Python loop.
+    capture+GRU-grad canary succeed.  Capture is warmed at train start
+    outside the WM autocast loop (P55 in-loop capture hit autocast
+    cache).  Raw ``CUDAGraph`` has no backward (P25).  TSSM / CPU /
+    capture-fail stay on the Python loop.
 
     Do **not** concat rest rows into the main WM ``rollout_observed``
     (``sample=True``): the GRU would see sampled ``c``, so ``h`` ≠ this
@@ -11587,6 +11626,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         raise RuntimeError(
             'gain_match_rest_ic=True but rest cache is empty; '
             'refusing PRBS-posterior fallback (would confound P45)')
+    _warmup_rest_ic_cuda_graph(getattr(model, 'dynamics', None), cfg, device)
     _resolve_aux_tbptt_steps(cfg)
     _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:
