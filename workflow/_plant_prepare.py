@@ -877,9 +877,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # + DOB identification (clean nominal-plant gain), back ON for the Stage-3
     # actor.  =0 to keep DR on throughout (the old, gain-biasing behaviour).
     'DREAMER_CURRICULUM_WM_ID_DR_OFF':    ('curriculum_wm_id_dr_off',        _as_bool),
-    # p136: actor KL trust region (damps policy hunting) + phased-P3 prior
-    # refresh cadence.  actor_kl_coef=0 disables (legacy); see TrainConfig.
-    'DREAMER_ACTOR_KL_COEF':              ('actor_kl_coef',                  float),
+    # PMPO prior-refresh cadence (unused for env-free real-sim REINFORCE).
+    # p136 ``DREAMER_ACTOR_KL_COEF`` REMOVED (FALSIFIED; never wired in
+    # ``_realsim_actor_critic_step``).
     'DREAMER_P3_PRIOR_REFRESH_ITERS':     ('p3_prior_refresh_iters',         int),
     # #2 (P88): multi-step latent overshooting (open-loop prior rollout
     # accuracy; RSSM backbone).  coef=0 = OFF (paper-faithful default).

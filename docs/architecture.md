@@ -54,9 +54,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > (thr −0.083). **P54 LIVE** (`run_p54_esentband`):
 > `early_stop_entropy_collapse_floor_frac=0.25` (unitless
 > fraction of the σ band; opt out `DREAMER_ES_ENT_FLOOR_FRAC=0`).
-> Not a stacked actor knob. Not `logp.detach()` as old. Not
-> `actor_kl_coef`. Do **not** promote `p3_reset_log_std`. Do not
-> stack critic knobs. Do not revive `actor_kl_coef`. `derive_horizon` / sim `reset()` now
+> Not a stacked actor knob. Not `logp.detach()` as old. p136
+> `actor_kl_coef` **REMOVED** (false A/B; never wired in
+> `_realsim_actor_critic_step`). Do **not** promote `p3_reset_log_std`. Do not
+> stack critic knobs. CUDA replay H2D reuses pinned host + GPU dest
+> per slot (`replay` / `iso` / `critic`).
+> `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
@@ -618,7 +621,8 @@ GRU and Kalman `d_t` when `dob_active`, so served `feat` matches
 training `_realsim_actor_critic_step` / `rollout_observed`. P47 EXIT
 falsified Adam log_std-row zero as the entropy-yank lever. RSSM
 collect/val reuse a persistent GPU obs row; CUDA H2D stages through a
-pinned host buffer (identity values). Stage-1 (`dob_active=False`)
+pinned host buffer (identity values). Replay WM batches reuse pinned
+host + GPU dest per slot (`replay` / `iso` / `critic`). Stage-1 (`dob_active=False`)
 skips unused `sigmoid·d` decay (`d` is not a GRU input; `d_t≡0` is
 forced after the loop). Rest-IC `last_only` slices `act/embed/dv`
 (`[:, t]`) instead of `unbind`. Per-CV derived observables (`int_err` /

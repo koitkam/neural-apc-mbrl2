@@ -168,31 +168,13 @@ class TrainConfig:
     # robustness; switch to PMPO only for discrete-action sims if
     # desired (env: DREAMER_ACTOR_LOSS=pmpo).
     actor_loss_type: str = 'reinforce'
-    # ----- Actor KL trust region (p136, 2026-06-21) -----
-    # The REINFORCE surrogate above already NORMALISES the advantage
-    # (adv/return_scale + disturbance-baseline + clip) — that IS the paper's
-    # "normalized_advantage", and on its own it lets the policy HUNT (p135:
-    # actor_logp_mean swung 0.35↔10.7; the actor underperformed the static
-    # expert).  ``reinforce_actor_loss`` carries a built-in KL-to-prior term
-    # (a trust region) that was hard-disabled (kl_coef=0).  ``actor_kl_coef``>0
-    # enables it: a GENTLE penalty on KL(π ‖ π_prior) toward a periodically
-    # refreshed snapshot of the recent policy, damping the per-update policy
-    # swing WITHOUT PMPO's continuous-action-unstable advantage-sign split.
-    # Sim-agnostic (unitless KL nats).  0.0 = legacy (no trust region); PMPO
-    # remains the stronger fallback.  ``DREAMER_ACTOR_KL_COEF``.
-    # REVERTED 0.3→0.0 (p136 verdict 2026-06-22): the KL trust region did NOT
-    # prevent the entropy collapse (actor_kl_pen faded to 0.001 — a refreshed-
-    # prior TR follows a SLOW σ-collapse, the wrong mechanism) and only added a
-    # confound.  The p136 collapse was DOWNSTREAM of the missing disturbance in
-    # imagination (DOB removed); the continuous-latent disturbance restores the
-    # objective.  Re-enable only if the policy HUNTS once the objective is fixed.
-    actor_kl_coef: float = 0.0
-    # Phased-P3 trust-region prior refresh cadence (iters).  The phased run
-    # snapshots π_prior ONCE at P3 start (near-uniform) — a static KL anchor is
-    # an entropy pull, NOT a trust region.  Refreshing every N P3 iters makes
-    # KL(π‖π_prior) a MOVING trust region (penalises rapid change from the
-    # recent policy → anti-hunting).  0 = keep the once-at-start snapshot.
-    # Sim-agnostic.  ``DREAMER_P3_PRIOR_REFRESH_ITERS``.
+    # PMPO prior-refresh cadence (iters).  Real-sim default is V3 REINFORCE
+    # (``_realsim_actor_critic_step``); π_prior is unused there so snapshots
+    # are skipped.  Opt-in ``DREAMER_ACTOR_LOSS=pmpo`` still snapshots at
+    # P3 entry and every N P3 iters.  0 = snapshot once at P3 start.
+    # The p136 ``actor_kl_coef`` TR was FALSIFIED and **REMOVED** (never
+    # wired into real-sim P3; whitelist was a false A/B).
+    # ``DREAMER_P3_PRIOR_REFRESH_ITERS``.
     p3_prior_refresh_iters: int = 5
 
     # ----- Plant / windowing -----
@@ -1891,8 +1873,7 @@ class TrainConfig:
     # **FALSIFIED as cascade lever**. In-support (|logp|<8) SGD still
     # walks μ (~18 iters → std 80.8@165); val −377 vs −87 FAIL.
     # Next is a μ-walk limiter, not a tighter clip. 0 = unclipped (P51).
-    # Opt out ``DREAMER_P3_LOGP_CLIP=0``. Not
-    # ``actor_kl_coef`` (p136 FALSIFIED as a σ-collapse TR; do not revive).
+    # Opt out ``DREAMER_P3_LOGP_CLIP=0``. p136 actor-KL TR **REMOVED**.
     p3_logp_clip: float = 8.0
     # P53: PPO-style ratio clip vs a **frozen unfreeze-μ snapshot**
     # (first ``_realsim_actor_critic_step``; critic warmup does not
@@ -1901,10 +1882,9 @@ class TrainConfig:
     # ``min(ratio·adv, clip(ratio, 1−ε, 1+ε)·adv)``. Stops in-support
     # ``(u−μ)/σ²`` SGD once π has walked outside ε of the snapshot.
     # Not a lag-copy of the collector (1 update/batch ⇒ ratio≡1).
-    # Not ``logp.detach()`` as old (same-forward ⇒ ratio≡1). Not
-    # ``actor_kl_coef`` (p136 σ-TR; not wired here). ε≤0 disables
-    # (identity REINFORCE + P52 logp clip). Default 0.2. Opt out
-    # ``DREAMER_P3_MU_RATIO_CLIP=0``.
+    # Not ``logp.detach()`` as old (same-forward ⇒ ratio≡1). p136
+    # actor-KL TR **REMOVED**. ε≤0 disables (identity REINFORCE + P52
+    # logp clip). Default 0.2. Opt out ``DREAMER_P3_MU_RATIO_CLIP=0``.
     p3_mu_ratio_clip: float = 0.2
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
@@ -3825,19 +3805,90 @@ def _configure_runtime_threads(device: torch.device) -> Tuple[int, str]:
     return nth, blas
 
 
-def _batch_np_to_device(batch_np: Dict, device: torch.device
+def _numpy_dtype_to_torch(dt) -> torch.dtype:
+    """Map a numpy dtype to torch without constructing a tensor."""
+    dt = np.dtype(dt)
+    if dt == np.float32:
+        return torch.float32
+    if dt == np.float64:
+        return torch.float64
+    if dt == np.int64:
+        return torch.int64
+    if dt == np.int32:
+        return torch.int32
+    if dt == np.bool_ or dt == np.dtype(bool):
+        return torch.bool
+    return torch.from_numpy(np.zeros((), dtype=dt)).dtype
+
+
+def _batch_np_to_device(batch_np: Dict, device: torch.device,
+                        slot: str = 'replay'
                        ) -> Dict[str, torch.Tensor]:
-    """Host→device for a numpy replay sample. Pin + non_blocking on CUDA."""
+    """Host→device for a numpy replay sample.
+
+    CUDA: reuse pinned host + GPU dest **per slot**.  The previous path
+    called ``pin_memory()`` on a fresh CPU tensor every inner step
+    (~100×/iter at P1) then discarded it.  Same-slot dest reuse is after
+    the previous step's backward.  Distinct slots (``replay`` / ``iso`` /
+    ``critic``) keep live graphs from aliasing: P3 actor on-policy and
+    critic replay would otherwise share ``obs`` dest.  Host buffers are
+    also per-slot so a non-blocking H2D cannot race a later copy into the
+    same pinned page.  Host-adaptive: CPU path is a contiguous copy
+    (no pin).  Identity values.
+    """
     out: Dict[str, torch.Tensor] = {}
     cuda = device.type == 'cuda'
+    host_cache = getattr(_batch_np_to_device, '_host', None)
+    gpu_cache = getattr(_batch_np_to_device, '_gpu', None)
+    if host_cache is None:
+        host_cache = {}
+    if gpu_cache is None:
+        gpu_cache = {}
+    if cuda:
+        _batch_np_to_device._host = host_cache  # type: ignore[attr-defined]
+        _batch_np_to_device._gpu = gpu_cache  # type: ignore[attr-defined]
+    slot_s = str(slot or 'replay')
     for k, v in batch_np.items():
-        t = torch.from_numpy(v)
-        if cuda:
-            t = t.pin_memory().to(device, non_blocking=True)
-        else:
-            t = t.to(device)
-        out[k] = t
+        arr = np.ascontiguousarray(v)
+        if not cuda:
+            out[k] = torch.from_numpy(arr.copy())
+            continue
+        tdt = _numpy_dtype_to_torch(arr.dtype)
+        shape = tuple(int(x) for x in arr.shape)
+        hkey = (slot_s, k, shape, str(tdt))
+        gkey = (slot_s, k, shape, str(tdt), str(device))
+        host = host_cache.get(hkey)
+        if (host is None or tuple(host.shape) != shape
+                or host.dtype != tdt):
+            try:
+                host = torch.empty(shape, dtype=tdt, pin_memory=True)
+            except Exception:
+                host = None
+            if host is None:
+                t = torch.from_numpy(arr)
+                out[k] = t.to(device, non_blocking=True)
+                continue
+            host_cache[hkey] = host
+        np.copyto(host.numpy(), arr, casting='no')
+        gpu = gpu_cache.get(gkey)
+        if (gpu is None or tuple(gpu.shape) != shape
+                or gpu.dtype != tdt or gpu.device != device):
+            gpu = torch.empty(shape, dtype=tdt, device=device)
+            gpu_cache[gkey] = gpu
+        gpu.copy_(host, non_blocking=True)
+        out[k] = gpu
     return out
+
+
+def _actor_uses_prior_policy(cfg: 'TrainConfig') -> bool:
+    """π_prior is only consumed by PMPO.  Real-sim REINFORCE does not."""
+    return str(getattr(cfg, 'actor_loss_type', 'reinforce')).lower() == 'pmpo'
+
+
+def _maybe_snapshot_prior_policy(model, cfg: 'TrainConfig') -> None:
+    """Skip the policy deepcopy when env-free real-sim REINFORCE is on."""
+    if _actor_uses_prior_policy(cfg):
+        model.snapshot_prior_policy()
 
 
 def _is_rssm_interface(model) -> bool:
@@ -6650,8 +6701,14 @@ def _gain_match_rest_ic_tensors(
     key = (id(obs), id(act), str(device), str(dtype))
     cache = getattr(cfg, '_gain_match_rest_dev', None)
     if cache is None or cache[0] != key:
-        o = torch.as_tensor(obs, device=device, dtype=dtype)
-        a = torch.as_tensor(act, device=device, dtype=dtype)
+        o = torch.as_tensor(np.ascontiguousarray(obs), dtype=dtype)
+        a = torch.as_tensor(np.ascontiguousarray(act), dtype=dtype)
+        if getattr(device, 'type', '') == 'cuda':
+            o = o.pin_memory().to(device, non_blocking=True)
+            a = a.pin_memory().to(device, non_blocking=True)
+        else:
+            o = o.to(device=device)
+            a = a.to(device=device)
         if o.ndim != 3 or a.ndim != 3 or o.shape[0] != a.shape[0]:
             return None, None
         cfg._gain_match_rest_dev = (key, o, a)  # type: ignore[attr-defined]
@@ -11263,7 +11320,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         print('[p3] on-policy collect streams measured DV + Kalman '
               '(train/serve match with rollout_observed)',
               flush=True)
-        model.snapshot_prior_policy()
+        _maybe_snapshot_prior_policy(model, cfg)
         p3_start_steps = total_env_steps
         try:
             _rs0 = float(model.ret_scale.detach().item())
@@ -11885,8 +11942,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 print('[p3] on-policy collect streams measured DV + Kalman '
                       '(train/serve match with rollout_observed)',
                       flush=True)
-                # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
-                model.snapshot_prior_policy()
+                # PMPO behavioural prior (eq. 11).  Env-free REINFORCE skips.
+                _maybe_snapshot_prior_policy(model, cfg)
                 # 2026-05-23 (P41 RCA): snapshot return_scale at P3 start
                 # so the bootstrap-cascade canary can detect runaway growth.
                 # ``model.ret_scale`` is the EMA buffer used by the critic
@@ -12346,7 +12403,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _iso_np = isolation_buf.sample(
                         cfg.batch_size, _isolation_sample_seq_len(cfg), rng)
                     _iso = _batch_np_to_device(
-                        {'obs': _iso_np['obs'], 'act': _iso_np['act']}, device)
+                        {'obs': _iso_np['obs'], 'act': _iso_np['act']},
+                        device, slot='iso')
                     _iso_obs, _iso_act = _iso['obs'], _iso['act']
                     with torch.amp.autocast(device_type=device.type,
                                               dtype=torch.bfloat16,
@@ -12514,7 +12572,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _cb_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
                     # NB: do NOT reuse ``_t`` here — it is the AC-step
                     # wall-clock timer (``_t = time.time()`` above).
-                    _critic_batch = _batch_np_to_device(_cb_np, device)
+                    _critic_batch = _batch_np_to_device(
+                        _cb_np, device, slot='critic')
                 # P83 FIX (p19 RCA): P3 expert-BC anchor weight — decay
                 # expert_bc_scale·(1→floor) across P3 so the actor starts pinned to
                 # the good BC-seeded policy and is progressively released to let
@@ -12578,16 +12637,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
 
-        # Periodically refresh the KL trust-region prior so KL(π‖π_prior) tracks
-        # a slowly-moving target (a MOVING trust region, anti-hunting) instead of
-        # a static once-at-start snapshot.  JOINT: joint_prior_refresh_iters.
-        # PHASED P3 (p136): p3_prior_refresh_iters (the actor_kl_coef trust
-        # region needs a recent prior to BE a trust region, not an entropy pull).
+        # Periodically refresh the PMPO prior.  Env-free real-sim REINFORCE
+        # does not read π_prior (p136 actor-KL TR REMOVED) — skip the
+        # deepcopy.  JOINT: joint_prior_refresh_iters.  PHASED P3: p3_prior_refresh_iters.
         _refresh_n = (joint_prior_refresh_iters if joint_mode
                       else p3_prior_refresh_iters)
         if (current_phase == 3 and p3_iters > 0 and _refresh_n > 0
                 and (p3_iters % _refresh_n) == 0):
-            model.snapshot_prior_policy()
+            _maybe_snapshot_prior_policy(model, cfg)
 
         total_iters += 1
         if current_phase == 3:

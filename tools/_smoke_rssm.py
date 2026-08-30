@@ -214,6 +214,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert abs(float(_tc.early_stop_entropy_collapse_floor_frac) - 0.25) < 1e-12
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
+    assert not hasattr(_tc, 'actor_kl_coef')
     print('[smoke] OK  gain-match defaults (abs Huber, per-input β, rest-IC, TBPTT=16)')
 
     # Isolation TBPTT is sim-adaptive: 16 of K≈55 (test_sim) scales as K/3.5.
@@ -1010,6 +1011,58 @@ def _test_cfg_from_env_whitelist() -> None:
                 os.environ[k] = old
 
 
+def _test_batch_np_to_device_identity() -> None:
+    """Pinned replay H2D reuse must copy values (CPU always; CUDA if visible)."""
+    import numpy as np
+    from training.train import (
+        _actor_uses_prior_policy, _batch_np_to_device, TrainConfig)
+
+    c = TrainConfig()
+    assert _actor_uses_prior_policy(c) is False
+    c.actor_loss_type = 'pmpo'
+    assert _actor_uses_prior_policy(c) is True
+
+    batch = {
+        'obs': np.linspace(0, 1, 2 * 4 * 3, dtype='float32').reshape(2, 4, 3),
+        'act': np.linspace(-1, 1, 2 * 4 * 1, dtype='float32').reshape(2, 4, 1),
+        'rew': np.linspace(-2, 0, 2 * 4, dtype='float32').reshape(2, 4),
+    }
+    cpu = torch.device('cpu')
+    out = _batch_np_to_device(batch, cpu)
+    for k, v in batch.items():
+        np.testing.assert_allclose(out[k].numpy(), v, rtol=0, atol=0)
+    out2 = _batch_np_to_device(
+        {k: np.zeros_like(v) for k, v in batch.items()}, cpu)
+    np.testing.assert_allclose(out['obs'].numpy(), batch['obs'], rtol=0, atol=0)
+    np.testing.assert_allclose(out2['obs'].numpy(), 0.0, rtol=0, atol=0)
+
+    zeros = {k: np.zeros_like(v) for k, v in batch.items()}
+    replay = _batch_np_to_device(batch, cpu, slot='replay')
+    critic = _batch_np_to_device(zeros, cpu, slot='critic')
+    np.testing.assert_allclose(replay['obs'].numpy(), batch['obs'], rtol=0, atol=0)
+    np.testing.assert_allclose(critic['obs'].numpy(), 0.0, rtol=0, atol=0)
+
+    if torch.cuda.is_available():
+        _batch_np_to_device._host = {}  # type: ignore[attr-defined]
+        _batch_np_to_device._gpu = {}  # type: ignore[attr-defined]
+        dev = torch.device('cuda')
+        g_rep = _batch_np_to_device(batch, dev, slot='replay')
+        g_crit = _batch_np_to_device(zeros, dev, slot='critic')
+        for k, v in batch.items():
+            np.testing.assert_allclose(
+                g_rep[k].detach().cpu().numpy(), v, rtol=0, atol=1e-6)
+            np.testing.assert_allclose(
+                g_crit[k].detach().cpu().numpy(), 0.0, rtol=0, atol=1e-6)
+        g_rep2 = _batch_np_to_device(zeros, dev, slot='replay')
+        np.testing.assert_allclose(
+            g_rep2['obs'].detach().cpu().numpy(), 0.0, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(
+            g_crit['obs'].detach().cpu().numpy(), 0.0, rtol=0, atol=1e-6)
+        _batch_np_to_device._host = {}  # type: ignore[attr-defined]
+        _batch_np_to_device._gpu = {}  # type: ignore[attr-defined]
+    print('[smoke] OK  replay H2D identity + prior-policy snapshot skip')
+
+
 def _test_store_aux_feats_identity() -> None:
     """Isolation encode may drop logit stacks; feats must match the full pass."""
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics, _dob_scan_mix_budget_bytes
@@ -1247,6 +1300,13 @@ def _test_isolation_dcv_scales() -> None:
     assert '_entropy_collapse_threshold' in _src
     assert '_p3_mu_ratio_surrogate' in _src
     assert '_p3_frozen_unfreeze_policy' in _src
+    assert '_maybe_snapshot_prior_policy' in _src
+    assert '_actor_uses_prior_policy' in _src
+    assert 'actor_kl_coef: float' not in _src
+    assert 'reuse pinned host + GPU dest' in _src
+    assert "slot: str = 'replay'" in _src
+    assert "slot='iso'" in _src
+    assert "slot='critic'" in _src
     assert "SIM_IDENTIFIED_TAU_DOMINANT', '50'" not in _src
     assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
@@ -1408,6 +1468,7 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.gain_match_settle_len) == -1
     assert c.gain_match_rest_ic is True
     assert c.p3_reset_log_std is False
+    assert not hasattr(c, 'actor_kl_coef')
     assert c.bc_mean_only is True
     assert c.p3_stop_grad_log_std is True
     assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
@@ -1585,6 +1646,8 @@ def _test_envfree_observer_recipe() -> None:
     assert c.attn_impl == 'auto'
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
     assert 'DREAMER_GAIN_MATCH_RELATIVE' not in ENV_OVERRIDES
+    assert 'DREAMER_ACTOR_KL_COEF' not in ENV_OVERRIDES
+    assert not hasattr(c, 'actor_kl_coef')
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
     assert not hasattr(c, 'wm_isolation_var_norm')
@@ -3522,6 +3585,7 @@ if __name__ == '__main__':
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None
     _test_cfg_from_env_whitelist()
+    _test_batch_np_to_device_identity()
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()
