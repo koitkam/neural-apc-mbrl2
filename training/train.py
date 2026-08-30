@@ -1862,11 +1862,13 @@ class TrainConfig:
     # ``actor_grad_clip=10`` already saturate (147 gnorm 9.65) but each
     # step still shoves μ toward the tanh rail via (u−μ)/σ². Clamp the
     # REINFORCE logp used in ``-(adv * logp)`` so railed (u,μ) pairs
-    # contribute ~0 μ-grad (BC can still pull). Healthy P3 warmup logp
-    # is ~0.65±0.54, so 8 matches ``advantage_clip`` and does not bind
-    # in-support samples. 0 = unclipped (P51). Opt out
-    # ``DREAMER_P3_LOGP_CLIP=0``. Not ``actor_kl_coef`` (p136 FALSIFIED
-    # as a σ-collapse TR; do not revive).
+    # contribute ~0 μ-grad (BC can still pull). Value is **nats per
+    # action dim** (unitless); summed ``log_prob_of`` is clamped at
+    # ``clip * n_mv`` (``_p3_logp_clip_bound``). 1-MV test_sim is
+    # identity with a scalar 8. Healthy 1-MV warmup logp is ~0.65±0.54,
+    # so 8 matches ``advantage_clip`` and does not bind in-support.
+    # 0 = unclipped (P51). Opt out ``DREAMER_P3_LOGP_CLIP=0``. Not
+    # ``actor_kl_coef`` (p136 FALSIFIED as a σ-collapse TR; do not revive).
     p3_logp_clip: float = 8.0
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
@@ -7830,6 +7832,22 @@ def _adv_action_corr(adv_raw: torch.Tensor, act_flat: torch.Tensor
     return ((adv_c * a_c).sum(dim=0) / den).abs().mean()
 
 
+def _p3_logp_clip_bound(clip: float, n_act: int) -> float:
+    """Per-action-dim nats → clamp on the summed Gaussian logp.
+
+    ``p3_logp_clip`` is unitless nats **per MV** (P52 1-MV test_sim
+    default 8 matches ``advantage_clip``). Summed ``log_prob_of``
+    scales with ``action_dim``; clamp the sum at ``clip * n_act`` so
+    MIMO has the same in-support / rail split as 1-MV. ``n_act<=1`` is
+    identity with ``logp.clamp(-clip, clip)``. ``clip<=0`` disables
+    (returns 0).
+    """
+    c = float(clip or 0.0)
+    if c <= 0.0:
+        return 0.0
+    return c * float(max(1, int(n_act)))
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 — Imagination training (PMPO + TD-λ)
 # ---------------------------------------------------------------------------
@@ -7980,9 +7998,12 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
     # P51 EXIT / P52: clamp REINFORCE logp so frozen-σ (u−μ)/σ² cannot
     # explode μ (P51 147: logp mean −26 / std 38; @315 mean −227).
-    # Diagnostics below keep the unclipped logp so a remaining rail is
-    # still visible. 0 disables (P51 unclipped).
-    _logp_clip = float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0)
+    # Bound is per-action-dim nats × n_mv (1-MV identity). Diagnostics
+    # below keep the unclipped logp so a remaining rail is still
+    # visible. 0 disables (P51 unclipped).
+    _logp_clip = _p3_logp_clip_bound(
+        float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0),
+        int(act_flat.shape[-1]))
     logp_pg = logp.clamp(-_logp_clip, _logp_clip) if _logp_clip > 0.0 else logp
     actor_loss = -(adv_flat * logp_pg).mean() - ent_coef * entropy.mean() + bc_term
 
@@ -9970,8 +9991,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     tau_dom = 0.0
             if tau_dom <= 0:
                 tau_dom = float(os.environ.get(
-                    'SIM_IDENTIFIED_TAU_DOMINANT', '50') or 50)
-            window = max(3, int(round(float(tau_dom) / sr)))
+                    'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
+            if tau_dom <= 0:
+                tau_dom = float(os.environ.get(
+                    'IDENTIFIED_TAU_DOMINANT', '0') or 0)
+            if tau_dom > 0:
+                window = max(3, int(round(float(tau_dom) / sr)))
+            else:
+                # No identified τ: unitless lookback/4 frames, not a
+                # 50-second plant default.
+                lb = int(getattr(cfg, 'lookback', 0) or 0)
+                window = max(3, (lb // 4) if lb > 0 else 8)
+                tau_dom = float(window * sr)
             if arr.shape[0] > window + 2:
                 # Summary/WARN = measured CV+DV only.  Constant setpoint /
                 # bound channels used to show −120 dB and pollute min/median.

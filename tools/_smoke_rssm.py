@@ -63,7 +63,8 @@ from training.train import (
                             _gain_match_rest_window, _held_rollout_win,
                             collect_rest_lookback,
                             _wm_gain_match_loss, _require_realsim_actor,
-                            _adv_action_corr, _format_gain_probe_line,
+                            _adv_action_corr, _p3_logp_clip_bound,
+                            _format_gain_probe_line,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
@@ -1204,6 +1205,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "bc_mean={bool(getattr(cfg, 'bc_mean_only'" in _src
     assert "p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std'" in _src
     assert "p3_logpclip={float(getattr(cfg, 'p3_logp_clip'" in _src
+    assert '_p3_logp_clip_bound' in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
     assert '_gain_match_rest_ic_state' in _src
@@ -2205,6 +2207,10 @@ def _test_p3_logp_clip() -> None:
     """P52: clamp REINFORCE logp zeros μ-grad on railed (u,μ); keeps in-support."""
     from models.dreamer_v4 import ContinuousPolicyHead
     torch.manual_seed(0)
+    assert abs(_p3_logp_clip_bound(8.0, 1) - 8.0) < 1e-12
+    assert abs(_p3_logp_clip_bound(8.0, 2) - 16.0) < 1e-12
+    assert abs(_p3_logp_clip_bound(0.0, 4)) < 1e-12
+    assert abs(_p3_logp_clip_bound(8.0, 0) - 8.0) < 1e-12
     kwargs = dict(
         in_dim=8, hidden_dim=16, action_dim=1, n_layers=2, mtp_length=1,
         init_log_std=-1.5, log_std_min=-2.3, log_std_max=0.0)
@@ -2222,12 +2228,13 @@ def _test_p3_logp_clip() -> None:
 
     pol_raw = _railed_policy()
     logp = pol_raw.log_prob_of(feat, act, stop_grad_log_std=True)
-    assert float(logp.abs().mean()) > 16.0, float(logp.abs().mean())
+    assert float(logp.abs().mean().detach()) > 16.0, float(logp.abs().mean().detach())
     (-(adv * logp).mean()).backward()
     g_raw = float(pol_raw.head.net[-1].weight.grad[0].abs().max())
     pol_c = _railed_policy()
     logp_c = pol_c.log_prob_of(feat, act, stop_grad_log_std=True)
-    (-(adv * logp_c.clamp(-8.0, 8.0)).mean()).backward()
+    bound = _p3_logp_clip_bound(8.0, 1)
+    (-(adv * logp_c.clamp(-bound, bound)).mean()).backward()
     g_c = float(pol_c.head.net[-1].weight.grad[0].abs().max())
     assert g_c < 1e-8, g_c
     assert g_raw > 1e-3, g_raw
@@ -2238,8 +2245,8 @@ def _test_p3_logp_clip() -> None:
         act_h = torch.tanh(mu_h + 0.25)
     adv_h = torch.ones(6)
     logp_h = pol_h.log_prob_of(feat_h, act_h, stop_grad_log_std=True)
-    assert float(logp_h.abs().max()) < 8.0, float(logp_h.abs().max())
-    (-(adv_h * logp_h.clamp(-8.0, 8.0)).mean()).backward()
+    assert float(logp_h.abs().max().detach()) < bound, float(logp_h.abs().max().detach())
+    (-(adv_h * logp_h.clamp(-bound, bound)).mean()).backward()
     assert float(pol_h.head.net[-1].weight.grad[0].abs().max()) > 1e-6
     print('[smoke] OK  p3_logp_clip zeros μ grad on railed logp; keeps in-support')
 

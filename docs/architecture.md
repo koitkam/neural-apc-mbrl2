@@ -37,7 +37,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > p3_plateau not entropy_collapse); **FALSIFIED as cascade lever**
 > (μ-rail logp_std 0.54→38 @147; val paired **−72 vs −111**, worse
 > than P50 **−56 vs −104**; best.pt **161** during cascade).
-> P52 default `p3_logp_clip=8` (clamp REINFORCE logp). Do **not**
+> P52 default `p3_logp_clip=8` nats **per MV** (summed
+> logp clamp `8×n_mv`; 1-MV identity). Do **not**
 > promote `p3_reset_log_std`. Do not stack critic knobs. Do not
 > revive `actor_kl_coef`. `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -441,7 +442,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > σ. **P3 REINFORCE default stop-grad log_std** (`p3_stop_grad_log_std=True`)
 > so η+REINFORCE train μ only. **P51 EXIT KEEP** as unfreeze-yank +
 > non-sticky floor; **FALSIFIED as cascade** (μ still rails). **P52**
-> clamps the REINFORCE logp (`p3_logp_clip=8`; opt out
+> clamps the REINFORCE logp (`p3_logp_clip=8` nats per MV,
+> summed clamp `8×n_mv`; opt out
 > `DREAMER_P3_LOGP_CLIP=0`). Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.
 > Opt out `DREAMER_BC_MEAN_ONLY=0`. Do not stack more critic knobs.
 > Do not promote `p3_reset_log_std`.
