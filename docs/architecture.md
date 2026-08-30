@@ -25,11 +25,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > wrap-unlock KEEP as lock hygiene; **FALSIFIED as cascade lever**
 > (last_ok **82**; first P3 ent −0.283; val MV ×0.816/×0.830 DV
 > ×0.867/×0.924 det_r 0.632 amp-dead; seed kpi **−714**; 0-vs-0 false
-> all_pass from skipped scripted dist). P50 LIVE (`run_p50_bcmean`,
-> `9cbf771`): `bc_mean_only=True`. Gate 82 FAIL **1.37@MV** wrap-adjacent
-> (recon 0.0283); extra-P1 detonated iter 89; gate 94 FAIL **0.69@DV**
-> on exploded g. Do **not** score BC until GAIN-READY. HEAD (not P50
-> pid): gain-probe last-ok when recon >5× best. Reward-engine
+> all_pass from skipped scripted dist). P50 LIVE P3 (`run_p50_bcmean`,
+> `9cbf771`, pid **49389**): `bc_mean_only=True`. Freeze last_ok **88**
+> GAIN-READY **0.90@DV**. First P3 ent **−0.107** (μ-only opened σ; P2
+> bc MSE never NLL). Unfreeze 169 still yanked **−0.107→−0.268** —
+> μ-only **not sufficient** as cascade lever (same class as P46/P47).
+> rscale **2.33 KEEP**. Do **not** launch. HEAD (not P50 pid):
+> gain-probe last-ok when recon >5× best. Reward-engine
 > leftovers (`objective_integral_*` / `obj_auto_*` / clip sentinel `<0` =
 > adaptive) are TrainConfig + `ENV_OVERRIDES`. Do not promote other plants
 > until linear observer+actor are healthy. Eval TM protocol (`wm_tf_*`) and
@@ -420,7 +422,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P1/P2 BC default is MSE-on-μ** (`bc_mean_only=True`; same form as
 > P3 `expert_bc_p3_loss`) so cloning does not train log_std. P45–P49
 > Gaussian NLL pinned σ_min (P49 first P3 ent −0.283; P2 `bc_loss` ≈ −1).
-> Opt out `DREAMER_BC_MEAN_ONLY=0`. Do not stack more critic knobs.
+> **P50 LIVE canary:** P2 bc MSE **0.000–0.015** never NLL; first P3
+> ent **−0.107** ≈ H(σ_init). Opening σ this way still yanks at first
+> unfreeze REINFORCE (169: logp_std 0.56→54). Do not score val econ
+> until EXIT. Opt out `DREAMER_BC_MEAN_ONLY=0`. Do not stack more
+> critic knobs. Do not promote `p3_reset_log_std`.
 > Do not concat rest rows into the main `sample=True` WM rollout
 > (GRU would see sampled `c`). `actor_train_source` other than
 > `realsim` is refused at `train()` start.
