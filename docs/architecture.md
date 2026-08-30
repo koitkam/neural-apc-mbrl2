@@ -32,9 +32,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > (first since P45); seed kpi **−74**. ES @286. μ-only KEEP as σ-open
 > + val beat; **FALSIFIED as yank lever**. P51 default
 > `p3_stop_grad_log_std=True` (REINFORCE trains μ only). P51 LIVE P1
-> (`run_p51_sglogstd`, `d6a4511`, pid **54815**, iter **43** recon 0.0028
-> skip 0 last_ok **43 unlocked** teacher FD ~×0.99/×1.00): env-free
-> `p3_sglogstd=True`. Do **not** launch. Do **not**
+> (`run_p51_sglogstd`, `d6a4511`, pid **54815**, iter **59** recon 0.0018
+> last_ok **59 unlocked** after skip-storm **1/2** restore of lock@47):
+> env-free `p3_sglogstd=True`. Do **not** launch. Do **not**
 > promote `p3_reset_log_std`. `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6; not in pid). GPU-calib probe reads
