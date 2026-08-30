@@ -798,6 +798,10 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_DISTURBANCE_QUIET_FRAC': '0.20',
         'DREAMER_OBJECTIVE_INTEGRAL_COEF': '0.08',
         'DREAMER_OBJECTIVE_PENALTY_CLIP': '40',
+        'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO': '3.0',
+        'DREAMER_OBJ_USE_NORMALIZED': '0',
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC': '0.22',
+        'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC': '0.31',
         'DREAMER_EXPERT_MOVE_FRAC': '0.22',
         'DREAMER_PMPO_ALPHA': '0.55',
         'DREAMER_BASELINE_SEED_EPS': '12',
@@ -874,6 +878,10 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.disturbance_quiet_frac) - 0.20) < 1e-12
         assert abs(float(cfg.objective_integral_coef) - 0.08) < 1e-12
         assert abs(float(cfg.objective_penalty_clip) - 40.0) < 1e-12
+        assert abs(float(cfg.obj_auto_mv_over_cv_ratio) - 3.0) < 1e-12
+        assert cfg.objective_use_normalized is False
+        assert abs(float(cfg.runtime_setpoint_bounds_jitter_frac) - 0.22) < 1e-12
+        assert abs(float(cfg.runtime_setpoint_target_jitter_frac) - 0.31) < 1e-12
         assert abs(float(cfg.expert_move_frac) - 0.22) < 1e-12
         assert abs(float(cfg.pmpo_alpha) - 0.55) < 1e-12
         assert int(cfg.baseline_seed_episodes) == 12
@@ -935,6 +943,10 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'disturbance_quiet_frac' in explicit
         assert 'objective_integral_coef' in explicit
         assert 'objective_penalty_clip' in explicit
+        assert 'obj_auto_mv_over_cv_ratio' in explicit
+        assert 'objective_use_normalized' in explicit
+        assert 'runtime_setpoint_bounds_jitter_frac' in explicit
+        assert 'runtime_setpoint_target_jitter_frac' in explicit
         assert 'expert_move_frac' in explicit
         assert 'pmpo_alpha' in explicit
         assert 'baseline_seed_episodes' in explicit
@@ -1340,6 +1352,9 @@ def _test_envfree_observer_recipe() -> None:
     assert c.p3_reset_log_std is False
     assert c.bc_mean_only is True
     assert c.p3_stop_grad_log_std is True
+    assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
+    assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
+    assert c.objective_use_normalized is True
     assert abs(float(c.baseline_seed_op_band) - 0.6) < 1e-12
     assert abs(float(c.constant_action_seed_op_band) - 0.6) < 1e-12
     assert abs(float(c.prbs_seed_op_band) - 0.95) < 1e-12
@@ -1369,6 +1384,9 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_P3_RESET_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_STOP_GRAD_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_BC_MEAN_ONLY' in ENV_OVERRIDES
+    assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
+    assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_OBJ_USE_NORMALIZED' in ENV_OVERRIDES
     assert 'DREAMER_BASELINE_SEED_OP_BAND' in ENV_OVERRIDES
     assert 'DREAMER_CONST_ACTION_OP_BAND' in ENV_OVERRIDES
     assert 'DREAMER_PRBS_SEED_OP_BAND' in ENV_OVERRIDES
@@ -1642,6 +1660,64 @@ def _test_objective_runtime_cfg() -> None:
                 os.environ[k] = old
         _AUTO_W_CACHE.clear()
     print('[smoke] OK  objective leftover TrainConfig + DREAMER beats OBJECTIVE_*')
+
+
+def _test_auto_weights_cfg() -> None:
+    """Auto-weights leftover OBJ_AUTO_*: TrainConfig default, leftover, DREAMER, explicit."""
+    import os
+    from utils.auto_weights import derive_auto_weights
+    from utils.runtime_setpoints import RuntimeSetpointConfig
+    from workflow._plant_prepare import ENV_OVERRIDES
+
+    c = TrainConfig()
+    assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
+    assert abs(float(c.obj_auto_typical_cv_violation) - 0.10) < 1e-12
+    assert abs(float(c.obj_auto_differentiable_depth) - 0.20) < 1e-12
+    assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
+    assert abs(float(c.runtime_setpoint_target_jitter_frac) - 0.20) < 1e-12
+    assert c.objective_use_normalized is True
+    # APCEnv path uses dataclass jitter, not auto_derive 0.25.
+    rs = RuntimeSetpointConfig()
+    assert abs(float(rs.bounds_jitter_fraction) - 0.15) < 1e-12
+    assert abs(float(rs.target_jitter_fraction) - 0.20) < 1e-12
+    assert 'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO' in ENV_OVERRIDES
+    assert 'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC' in ENV_OVERRIDES
+    assert 'DREAMER_OBJ_USE_NORMALIZED' in ENV_OVERRIDES
+    kw = dict(
+        spec={}, n_mv=1, n_cv=1,
+        mv_bounds=[[20.0, 80.0]], cv_bounds=[[78.5, 85.5]],
+        mv_norm_ranges=[[20.0, 80.0]], cv_norm_ranges=[[78.5, 85.5]])
+    keys = (
+        'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO', 'OBJ_AUTO_MV_OVER_CV_RATIO',
+        'DREAMER_OBJ_USE_NORMALIZED', 'OBJ_USE_NORMALIZED',
+        'RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        w0 = derive_auto_weights(**kw)
+        w1 = derive_auto_weights(cfg=c, **kw)
+        assert w0['mv_violation_weights'] == w1['mv_violation_weights']
+        os.environ['OBJ_AUTO_MV_OVER_CV_RATIO'] = '4.0'
+        w_l = derive_auto_weights(cfg=c, **kw)
+        assert float(w_l['mv_violation_weights'][0]) > float(w0['mv_violation_weights'][0])
+        os.environ['DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO'] = '2.0'
+        w_d = derive_auto_weights(cfg=c, **kw)
+        assert abs(float(w_d['mv_violation_weights'][0])
+                   - float(w0['mv_violation_weights'][0])) < 1e-6
+        c_ex = TrainConfig()
+        c_ex.obj_auto_mv_over_cv_ratio = 1.0
+        c_ex._explicit_fields = {'obj_auto_mv_over_cv_ratio'}  # type: ignore
+        w_e = derive_auto_weights(cfg=c_ex, **kw)
+        assert float(w_e['mv_violation_weights'][0]) < float(w0['mv_violation_weights'][0])
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  auto-weights TrainConfig + leftover OBJ_AUTO_* identity')
 
 
 def _test_expert_move_law_cfg() -> None:
@@ -3020,6 +3096,7 @@ if __name__ == '__main__':
     _test_envfree_observer_recipe()
     _test_identified_tau_cfg()
     _test_objective_runtime_cfg()
+    _test_auto_weights_cfg()
     _test_expert_move_law_cfg()
     _test_pin_eval_modules()
     _test_control_quality_gates()

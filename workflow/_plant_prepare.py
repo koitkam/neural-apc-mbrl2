@@ -465,6 +465,39 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO': ('obj_auto_cv_over_econ_ratio',  float),
     'DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE': (
         'obj_auto_violation_tolerance', float),
+    # Auto-weights leftover formula knobs.  Identity.  Dual-read leftover
+    # ``OBJ_AUTO_*`` inside ``derive_auto_weights``.
+    'DREAMER_OBJ_AUTO_MV_VIOLATION_BASE': (
+        'obj_auto_mv_violation_base', float),
+    'DREAMER_OBJ_AUTO_CV_VIOLATION_BASE': (
+        'obj_auto_cv_violation_base', float),
+    'DREAMER_OBJ_AUTO_CV_RANK_DECAY':      ('obj_auto_cv_rank_decay',       float),
+    'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO':   ('obj_auto_mv_over_cv_ratio',    float),
+    'DREAMER_OBJ_AUTO_ECON_OVER_TARGET_RATIO': (
+        'obj_auto_econ_over_target_ratio', float),
+    'DREAMER_OBJ_AUTO_TARGET_BASE':        ('obj_auto_target_base',         float),
+    'DREAMER_OBJ_AUTO_CV_PENALTY_CAP_FRAC': (
+        'obj_auto_cv_penalty_cap_frac', float),
+    'DREAMER_OBJ_AUTO_TYPICAL_CV_VIOLATION': (
+        'obj_auto_typical_cv_violation', float),
+    'DREAMER_OBJ_AUTO_MOVE_OVER_CV_K':     ('obj_auto_move_over_cv_k',      float),
+    'DREAMER_OBJ_AUTO_MOVE_BASE':          ('obj_auto_move_base',           float),
+    'DREAMER_OBJ_AUTO_MOVE_TARGET_COST_FRAC': (
+        'obj_auto_move_target_cost_frac', float),
+    'DREAMER_OBJ_AUTO_MOVE_SIGMA_REF':     ('obj_auto_move_sigma_ref',      float),
+    'DREAMER_OBJ_AUTO_ECON_OVER_MOVE_RATIO': (
+        'obj_auto_econ_over_move_ratio', float),
+    'DREAMER_OBJ_AUTO_REVERSAL_GAIN':      ('obj_auto_reversal_gain',       float),
+    'DREAMER_OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR': (
+        'obj_auto_violation_rate_coef_divisor', float),
+    'DREAMER_OBJ_AUTO_VIOLATION_RATE_COEF_MIN': (
+        'obj_auto_violation_rate_coef_min', float),
+    'DREAMER_OBJ_AUTO_VIOLATION_RATE_COEF_MAX': (
+        'obj_auto_violation_rate_coef_max', float),
+    'DREAMER_OBJ_AUTO_DIFFERENTIABLE_DEPTH': (
+        'obj_auto_differentiable_depth', float),
+    'DREAMER_OBJ_AUTO_REWARD_CLIP_FLOOR':  ('obj_auto_reward_clip_floor',   float),
+    'DREAMER_OBJ_USE_NORMALIZED':          ('objective_use_normalized',     _as_bool),
     'DREAMER_OBJECTIVE_VIOLATION_RATE_COEF': (
         'objective_violation_rate_coef', str),
     'DREAMER_OBJECTIVE_PENALTY_SAT_MODE':  ('objective_penalty_sat_mode',   str),
@@ -550,6 +583,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_MV_HARD_CLAMP':              ('mv_hard_clamp',                  _as_bool),
     'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
     'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),
+    # APCEnv jitter (dataclass 0.15 / 0.20 — not auto_derive 0.25).
+    # Dual-read leftover ``RUNTIME_SETPOINT_*_JITTER_FRACTION``.
+    'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC': (
+        'runtime_setpoint_bounds_jitter_frac', float),
+    'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC': (
+        'runtime_setpoint_target_jitter_frac', float),
     # ---- World-model backbone (P68, 2026-05-30) ----
     # ``rssm`` (default) vs ``sf_transformer``; RSSM latent sizes and
     # KL-balance knobs.  See TrainConfig for paper rationale.

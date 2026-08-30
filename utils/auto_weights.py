@@ -44,7 +44,8 @@ base weights so each tier dominates the one below it at the configured
 - Move penalty per MV: ``MOVE_BASE * max(0.2, tau_i/median_tau) * speed_factor``.
   Slow MVs get more penalty; fast MVs less.
 
-All magnitudes can be overridden via env vars:
+All magnitudes can be overridden via TrainConfig / ``DREAMER_OBJ_AUTO_*``
+(ENV_OVERRIDES) or leftover ``OBJ_AUTO_*`` env vars:
 - ``OBJ_AUTO_MV_VIOLATION_BASE``      (default 25.0; linear-equivalent floor)
 - ``OBJ_AUTO_CV_VIOLATION_BASE``      (default 25.0; linear-equivalent floor)
 - ``OBJ_AUTO_CV_RANK_DECAY``          (default 0.5)
@@ -53,7 +54,7 @@ All magnitudes can be overridden via env vars:
 - ``OBJ_AUTO_VIOLATION_TOLERANCE``    (default 0.02, i.e. 2% of normalised range)
 - ``OBJ_AUTO_VIOLATION_MARGIN``       (default 2.0)
 - ``OBJ_AUTO_CV_PENALTY_CAP_FRAC``    (default 0.5; cv_base cap vs reward_clip)
-- ``OBJ_AUTO_TYPICAL_CV_VIOLATION``   (default 0.05; typical normalised violation)
+- ``OBJ_AUTO_TYPICAL_CV_VIOLATION``   (default 0.10; typical normalised violation)
 - ``OBJ_AUTO_MOVE_OVER_CV_K``         (default 20.0; move_base ≤ cv_base / K legacy cap)
 - ``OBJ_AUTO_ECON_OVER_MOVE_RATIO``   (default 2.0; econ_budget ≥ ratio × per-step move pen at typical jitter)
 - ``OBJ_AUTO_ECON_OVER_TARGET_RATIO`` (default 2.0; econ budget vs target budget)
@@ -80,10 +81,44 @@ _ADVISORY_WARNED: Dict[str, bool] = {
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except Exception:
-        return float(default)
+    """Leftover-env-only path (no TrainConfig)."""
+    return _knob_float(None, '', '', name, default)
+
+
+def _explicit(cfg, field: str) -> bool:
+    if cfg is None:
+        return False
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _knob_float(cfg, field: str, dreamer_key: str, leftover_key: str,
+                default: float) -> float:
+    """Explicit TrainConfig, else DREAMER_*, else leftover, else cfg, else default."""
+    if field and _explicit(cfg, field):
+        try:
+            return float(getattr(cfg, field))
+        except Exception:
+            return float(default)
+    if dreamer_key:
+        d_raw = os.environ.get(dreamer_key)
+        if d_raw not in (None, ''):
+            try:
+                return float(d_raw)
+            except Exception:
+                pass
+    if leftover_key:
+        l_raw = os.environ.get(leftover_key)
+        if l_raw not in (None, ''):
+            try:
+                return float(l_raw)
+            except Exception:
+                pass
+    if cfg is not None and field:
+        try:
+            return float(getattr(cfg, field, default))
+        except Exception:
+            pass
+    return float(default)
 
 
 # --- Reward-shape / weight-magnitude reconciliation -----------------------
@@ -113,22 +148,29 @@ def _env_float(name: str, default: float) -> float:
 # violations. ``d_diff`` is a reward-shape design constant (NOT plant-
 # dependent); only the clip is adaptive, and only through ``base`` which
 # must vary because it encodes the user's economic weights.
-def _differentiable_depth() -> float:
+def _differentiable_depth(cfg=None) -> float:
     """Constant normalised violation depth that must stay below the
     penalty-saturation cliff (gradient preserved). Design constant, not
     plant-dependent."""
-    return max(1e-3, _env_float('OBJ_AUTO_DIFFERENTIABLE_DEPTH', 0.20))
+    return max(1e-3, _knob_float(
+        cfg, 'obj_auto_differentiable_depth',
+        'DREAMER_OBJ_AUTO_DIFFERENTIABLE_DEPTH',
+        'OBJ_AUTO_DIFFERENTIABLE_DEPTH', 0.20))
 
 
-def _reward_clip_floor() -> float:
+def _reward_clip_floor(cfg=None) -> float:
     """Lower bound for the adaptive clip. Equals the historical fixed
     default so small-weight simulators behave exactly as before."""
-    return max(1e-6, _env_float('OBJ_AUTO_REWARD_CLIP_FLOOR', 50.0))
+    return max(1e-6, _knob_float(
+        cfg, 'obj_auto_reward_clip_floor',
+        'DREAMER_OBJ_AUTO_REWARD_CLIP_FLOOR',
+        'OBJ_AUTO_REWARD_CLIP_FLOOR', 50.0))
 
 
 def adaptive_penalty_clip(max_violation_weight: float,
                           d_diff: Optional[float] = None,
-                          floor: Optional[float] = None) -> float:
+                          floor: Optional[float] = None,
+                          cfg=None) -> float:
     """Clip that keeps the quadratic violation penalty differentiable up to
     a violation depth of ``d_diff`` for the largest active violation
     weight.
@@ -139,9 +181,9 @@ def adaptive_penalty_clip(max_violation_weight: float,
     low-budget simulators keep the historical scale.
     """
     if d_diff is None:
-        d_diff = _differentiable_depth()
+        d_diff = _differentiable_depth(cfg)
     if floor is None:
-        floor = _reward_clip_floor()
+        floor = _reward_clip_floor(cfg)
     w = max(0.0, float(max_violation_weight))
     return float(max(floor, w * d_diff * d_diff))
 
@@ -406,7 +448,8 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
                         mv_bounds: Optional[List] = None,
                         cv_bounds: Optional[List] = None,
                         mv_norm_ranges: Optional[List] = None,
-                        cv_norm_ranges: Optional[List] = None) -> Dict:
+                        cv_norm_ranges: Optional[List] = None,
+                        cfg=None) -> Dict:
     """Return a dict of auto-derived weight vectors.
 
     The returned weights are **adaptive** to (a) the user-supplied
@@ -425,12 +468,25 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
         violation_rate_coef: float (auto-derived DMC sliding-mode gain)
         econ_budget / target_budget / priority_budget: diagnostic scalars
     """
-    mv_base_env = _env_float('OBJ_AUTO_MV_VIOLATION_BASE', 25.0)
-    cv_base_env = _env_float('OBJ_AUTO_CV_VIOLATION_BASE', 25.0)
-    rank_decay = _env_float('OBJ_AUTO_CV_RANK_DECAY', 0.5)
-    mv_over_cv_ratio = max(1.0, _env_float('OBJ_AUTO_MV_OVER_CV_RATIO', 2.0))
-    tolerance = max(1e-4, _env_float('OBJ_AUTO_VIOLATION_TOLERANCE', 0.02))
-    margin = max(0.0, _env_float('OBJ_AUTO_VIOLATION_MARGIN', 2.0))
+    mv_base_env = _knob_float(
+        cfg, 'obj_auto_mv_violation_base',
+        'DREAMER_OBJ_AUTO_MV_VIOLATION_BASE', 'OBJ_AUTO_MV_VIOLATION_BASE', 25.0)
+    cv_base_env = _knob_float(
+        cfg, 'obj_auto_cv_violation_base',
+        'DREAMER_OBJ_AUTO_CV_VIOLATION_BASE', 'OBJ_AUTO_CV_VIOLATION_BASE', 25.0)
+    rank_decay = _knob_float(
+        cfg, 'obj_auto_cv_rank_decay',
+        'DREAMER_OBJ_AUTO_CV_RANK_DECAY', 'OBJ_AUTO_CV_RANK_DECAY', 0.5)
+    mv_over_cv_ratio = max(1.0, _knob_float(
+        cfg, 'obj_auto_mv_over_cv_ratio',
+        'DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO', 'OBJ_AUTO_MV_OVER_CV_RATIO', 2.0))
+    tolerance = max(1e-4, _knob_float(
+        cfg, 'obj_auto_violation_tolerance',
+        'DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE', 'OBJ_AUTO_VIOLATION_TOLERANCE',
+        0.02))
+    margin = max(0.0, _knob_float(
+        cfg, 'obj_auto_violation_margin',
+        'DREAMER_OBJ_AUTO_VIOLATION_MARGIN', 'OBJ_AUTO_VIOLATION_MARGIN', 2.0))
     # CV-violation vs economics ratio (2026-06-09).  Sizes the INSTANTANEOUS
     # CV bound-violation penalty relative to the economic budget.  Default ==
     # ``margin`` so the historical hierarchy (CV strictly dominates economics)
@@ -446,18 +502,54 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     #     violations remain strictly dominated regardless of this knob.
     # The user sets ONLY the economic weights; this ratio + the integral
     # compensation auto-derive the rest.
-    cv_over_econ_ratio = max(1e-3, _env_float('OBJ_AUTO_CV_OVER_ECON_RATIO', margin))
-    econ_over_target_ratio = max(1.0, _env_float('OBJ_AUTO_ECON_OVER_TARGET_RATIO', 2.0))
-    target_base_floor = _env_float('OBJ_AUTO_TARGET_BASE', 0.5)
+    # TrainConfig sentinel 0 = follow margin (objective_runtime identity).
+    # Leftover / DREAMER still win when set (historical ``get(..., margin)``
+    # when unset).
+    if _explicit(cfg, 'obj_auto_cv_over_econ_ratio'):
+        _ratio_raw = float(getattr(cfg, 'obj_auto_cv_over_econ_ratio'))
+        cv_over_econ_ratio = max(1e-3, _ratio_raw if _ratio_raw > 0.0 else margin)
+    else:
+        _d_ratio = os.environ.get('DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO')
+        _l_ratio = os.environ.get('OBJ_AUTO_CV_OVER_ECON_RATIO')
+        if _d_ratio not in (None, ''):
+            try:
+                cv_over_econ_ratio = max(1e-3, float(_d_ratio))
+            except Exception:
+                cv_over_econ_ratio = max(1e-3, margin)
+        elif _l_ratio not in (None, ''):
+            try:
+                cv_over_econ_ratio = max(1e-3, float(_l_ratio))
+            except Exception:
+                cv_over_econ_ratio = max(1e-3, margin)
+        else:
+            cv_over_econ_ratio = max(1e-3, margin)
+    econ_over_target_ratio = max(1.0, _knob_float(
+        cfg, 'obj_auto_econ_over_target_ratio',
+        'DREAMER_OBJ_AUTO_ECON_OVER_TARGET_RATIO',
+        'OBJ_AUTO_ECON_OVER_TARGET_RATIO', 2.0))
+    target_base_floor = _knob_float(
+        cfg, 'obj_auto_target_base',
+        'DREAMER_OBJ_AUTO_TARGET_BASE', 'OBJ_AUTO_TARGET_BASE', 0.5)
     # Reward clip used to size the violation cap. Quadratic formulation
     # caps cv_base so the expected penalty at the *typical* violation
     # magnitude stays inside cap_frac of the reward clip, preventing the
     # adaptive formula from producing reward magnitudes that saturate.
     # Default must agree with ``objective_runtime.OBJECTIVE_REWARD_CLIP``
     # (both read the same env var). Tightened 250 → 50 in P57 to match.
-    reward_clip = _env_float('OBJECTIVE_REWARD_CLIP', 50.0)
-    cap_frac = max(0.01, _env_float('OBJ_AUTO_CV_PENALTY_CAP_FRAC', 0.5))
-    typical_cv_viol_frac = max(1e-3, _env_float('OBJ_AUTO_TYPICAL_CV_VIOLATION', 0.10))
+    # TrainConfig ``objective_reward_clip < 0`` is the adaptive sentinel.
+    # Auto-weights cap sizing historically defaulted to 50 when unset.
+    _rew_clip = _knob_float(
+        cfg, 'objective_reward_clip',
+        'DREAMER_OBJECTIVE_REWARD_CLIP', 'OBJECTIVE_REWARD_CLIP', -1.0)
+    reward_clip = 50.0 if _rew_clip < 0.0 else float(_rew_clip)
+    cap_frac = max(0.01, _knob_float(
+        cfg, 'obj_auto_cv_penalty_cap_frac',
+        'DREAMER_OBJ_AUTO_CV_PENALTY_CAP_FRAC', 'OBJ_AUTO_CV_PENALTY_CAP_FRAC',
+        0.5))
+    typical_cv_viol_frac = max(1e-3, _knob_float(
+        cfg, 'obj_auto_typical_cv_violation',
+        'DREAMER_OBJ_AUTO_TYPICAL_CV_VIOLATION',
+        'OBJ_AUTO_TYPICAL_CV_VIOLATION', 0.10))
     # Soft saturation advisory threshold (no longer a hard cap).
     # The reward signal uses tanh saturation in objective_runtime.py, so
     # oversized cv_base values no longer create a flat-gradient cliff —
@@ -488,12 +580,19 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # The legacy ``OBJ_AUTO_MOVE_OVER_CV_K`` env var is retained as a
     # fallback floor (so users with overrides keep their behaviour) and
     # ``OBJ_AUTO_MOVE_BASE`` becomes a hard absolute floor.
-    move_cv_ratio_k = max(1.0, _env_float('OBJ_AUTO_MOVE_OVER_CV_K', 20.0))
-    move_base_floor = _env_float('OBJ_AUTO_MOVE_BASE', 0.1)
-    move_target_cost_frac = max(
-        0.0, _env_float('OBJ_AUTO_MOVE_TARGET_COST_FRAC', 0.005)
-    )
-    move_sigma_ref = max(0.05, _env_float('OBJ_AUTO_MOVE_SIGMA_REF', 0.3))
+    move_cv_ratio_k = max(1.0, _knob_float(
+        cfg, 'obj_auto_move_over_cv_k',
+        'DREAMER_OBJ_AUTO_MOVE_OVER_CV_K', 'OBJ_AUTO_MOVE_OVER_CV_K', 20.0))
+    move_base_floor = _knob_float(
+        cfg, 'obj_auto_move_base',
+        'DREAMER_OBJ_AUTO_MOVE_BASE', 'OBJ_AUTO_MOVE_BASE', 0.1)
+    move_target_cost_frac = max(0.0, _knob_float(
+        cfg, 'obj_auto_move_target_cost_frac',
+        'DREAMER_OBJ_AUTO_MOVE_TARGET_COST_FRAC',
+        'OBJ_AUTO_MOVE_TARGET_COST_FRAC', 0.005))
+    move_sigma_ref = max(0.05, _knob_float(
+        cfg, 'obj_auto_move_sigma_ref',
+        'DREAMER_OBJ_AUTO_MOVE_SIGMA_REF', 'OBJ_AUTO_MOVE_SIGMA_REF', 0.3))
     # E[|x|] for x ~ N(0, sigma) is sigma * sqrt(2/pi). The relevant
     # quantity is |a_t - a_{t-1}| where each is a noisy sample around the
     # actor mean; if exploration is i.i.d. across steps the difference is
@@ -625,9 +724,10 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # the clip now tracks the weights automatically (single source of
     # truth: ``adaptive_penalty_clip``). objective_runtime consumes the
     # same formula so the reward shape and the weights stay aligned.
-    d_diff = _differentiable_depth()
+    d_diff = _differentiable_depth(cfg)
     max_violation_base = float(max(mv_base, cv_base))
-    adaptive_clip = adaptive_penalty_clip(max_violation_base, d_diff=d_diff)
+    adaptive_clip = adaptive_penalty_clip(
+        max_violation_base, d_diff=d_diff, cfg=cfg)
     if cv_base_above_advisory and not _ADVISORY_WARNED['cv_base_exceeds']:
         # One-shot guard: ``derive_auto_weights`` runs on every reward step
         # when obj_w lacks pre-computed weight vectors, so an unconditional
@@ -710,7 +810,10 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # baseline pressure toward narrowing actor sigma at convergence).
     move_base_legacy_cap = float(cv_base / move_cv_ratio_k)
     econ_over_move_ratio = max(1.0,
-        _env_float('OBJ_AUTO_ECON_OVER_MOVE_RATIO', 2.0))
+        _knob_float(
+            cfg, 'obj_auto_econ_over_move_ratio',
+            'DREAMER_OBJ_AUTO_ECON_OVER_MOVE_RATIO',
+            'OBJ_AUTO_ECON_OVER_MOVE_RATIO', 2.0))
     if econ_budget > 0.0 and expected_step_jitter > 1e-6:
         move_base_econ_cap = float(econ_budget / (
             econ_over_move_ratio * expected_step_jitter * max(1, n_mv)
@@ -737,7 +840,9 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # a CV excursion, so the agent stays a fast controller ("not too strong").
     # Per-MV τ scaling mirrors move_weights.  ``OBJ_AUTO_REVERSAL_GAIN`` (0
     # disables); a full-rate bang-bang then costs ~gain*cv_base*rate² per step.
-    reversal_gain = max(0.0, _env_float('OBJ_AUTO_REVERSAL_GAIN', 0.3))
+    reversal_gain = max(0.0, _knob_float(
+        cfg, 'obj_auto_reversal_gain',
+        'DREAMER_OBJ_AUTO_REVERSAL_GAIN', 'OBJ_AUTO_REVERSAL_GAIN', 0.3))
     reversal_base = float(min(reversal_gain * cv_base, cv_base))
     reversal_weights = [
         float(reversal_base * max(0.2, tau / median_tau))
@@ -761,9 +866,18 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # or spec key ``violation_rate_coef`` (consumed in
     # objective_runtime.py). This auto value is the default and is used
     # whenever that knob is unset or set to ``"auto"``.
-    rate_div = max(0.5, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR', 4.0))
-    rate_min = max(0.0, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_MIN', 0.3))
-    rate_max = max(rate_min, _env_float('OBJ_AUTO_VIOLATION_RATE_COEF_MAX', 1.5))
+    rate_div = max(0.5, _knob_float(
+        cfg, 'obj_auto_violation_rate_coef_divisor',
+        'DREAMER_OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR',
+        'OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR', 4.0))
+    rate_min = max(0.0, _knob_float(
+        cfg, 'obj_auto_violation_rate_coef_min',
+        'DREAMER_OBJ_AUTO_VIOLATION_RATE_COEF_MIN',
+        'OBJ_AUTO_VIOLATION_RATE_COEF_MIN', 0.3))
+    rate_max = max(rate_min, _knob_float(
+        cfg, 'obj_auto_violation_rate_coef_max',
+        'DREAMER_OBJ_AUTO_VIOLATION_RATE_COEF_MAX',
+        'OBJ_AUTO_VIOLATION_RATE_COEF_MAX', 1.5))
     violation_rate_coef = float(
         max(rate_min, min(rate_max, median_tau / rate_div))
     )

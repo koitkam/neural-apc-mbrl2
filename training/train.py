@@ -452,6 +452,34 @@ class TrainConfig:
     obj_auto_violation_margin: float = 2.0
     obj_auto_cv_over_econ_ratio: float = 0.0
     obj_auto_violation_tolerance: float = 0.02
+    # Auto-weights leftover formula knobs (``utils/auto_weights.py``).
+    # Were ``_env_float('OBJ_AUTO_*')`` (worked, missing from
+    # ``run_plan``).  Identity defaults.  Dual-read leftover when the
+    # DREAMER field is not explicit.  ``obj_auto_typical_cv_violation``
+    # code default is **0.10** (module docstring said 0.05 — stale).
+    obj_auto_mv_violation_base: float = 25.0
+    obj_auto_cv_violation_base: float = 25.0
+    obj_auto_cv_rank_decay: float = 0.5
+    obj_auto_mv_over_cv_ratio: float = 2.0
+    obj_auto_econ_over_target_ratio: float = 2.0
+    obj_auto_target_base: float = 0.5
+    obj_auto_cv_penalty_cap_frac: float = 0.5
+    obj_auto_typical_cv_violation: float = 0.10
+    obj_auto_move_over_cv_k: float = 20.0
+    obj_auto_move_base: float = 0.1
+    obj_auto_move_target_cost_frac: float = 0.005
+    obj_auto_move_sigma_ref: float = 0.3
+    obj_auto_econ_over_move_ratio: float = 2.0
+    obj_auto_reversal_gain: float = 0.3
+    obj_auto_violation_rate_coef_divisor: float = 4.0
+    obj_auto_violation_rate_coef_min: float = 0.3
+    obj_auto_violation_rate_coef_max: float = 1.5
+    obj_auto_differentiable_depth: float = 0.20
+    obj_auto_reward_clip_floor: float = 50.0
+    # Leftover ``OBJ_USE_NORMALIZED`` (``load_objective_spec``).  Identity
+    # ON.  Dual-read leftover; explicit cfg / ``DREAMER_OBJ_USE_NORMALIZED``
+    # wins.
+    objective_use_normalized: bool = True
     objective_violation_rate_coef: str = 'auto'
     objective_penalty_sat_mode: str = 'tanh'
     objective_penalty_clip: float = -1.0
@@ -666,6 +694,13 @@ class TrainConfig:
     # only their nominal starting value.  Set False (``DREAMER_RUNTIME_SETPOINT
     # _VARIATION=0``) only to freeze active≡base for a no-limit-step ablation.
     runtime_setpoint_variation: bool = True
+    # Operator-limit / target step size as a fraction of the base span.
+    # APCEnv constructs ``RuntimeSetpointConfig`` with dataclass defaults
+    # **0.15 / 0.20** (do **not** switch to ``auto_derive``, whose leftover
+    # env default is 0.25).  Dual-read leftover
+    # ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` when the field is not explicit.
+    runtime_setpoint_bounds_jitter_frac: float = 0.15
+    runtime_setpoint_target_jitter_frac: float = 0.20
     # Per-CV rolling int_err / Δcv / var appended to aug-obs (P37 ON).
     # Was leftover ``DREAMER_DERIVED_OBSERVABLES`` (worked, missing from
     # ``run_plan``).  ``=0`` restores the legacy obs layout (different
@@ -2243,9 +2278,18 @@ class APCEnv:
                 # P86: allow training/validation on a single consistent limit
                 # set (active ≡ base) by disabling mid-episode limit-step
                 # variation.  Default True preserves the legacy operator-limit
-                # tracking curriculum.
+                # tracking curriculum.  Do **not** call ``auto_derive``
+                # (change-count / ramp / 0.25 jitter would not be identity).
                 bounds_enabled=bool(getattr(
                     self.cfg, 'runtime_setpoint_variation', True)),
+                bounds_jitter_fraction=float(np.clip(_cfg_or_env_float(
+                    self.cfg, 'runtime_setpoint_bounds_jitter_frac',
+                    'RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION', 0.15)[0],
+                    0.05, 0.45)),
+                target_jitter_fraction=float(np.clip(_cfg_or_env_float(
+                    self.cfg, 'runtime_setpoint_target_jitter_frac',
+                    'RUNTIME_SETPOINT_TARGET_JITTER_FRACTION', 0.20)[0],
+                    0.05, 0.45)),
             ),
             mv_norm_bounds=np.asarray(self.mv_norm_ranges, dtype='float32')
                 if self.mv_norm_ranges else np.zeros((0, 2), dtype='float32'),

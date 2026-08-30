@@ -155,9 +155,19 @@ def _normalized_bounds(lo: float, hi: float, r_lo: float, r_hi: float) -> Tuple[
     return _normalize(lo, r_lo, r_hi), _normalize(hi, r_lo, r_hi)
 
 
-def _objective_uses_normalized(obj_w: Dict, terms: Dict) -> bool:
+def _objective_uses_normalized(obj_w: Dict, terms: Dict, cfg=None) -> bool:
+    if _obj_explicit(cfg, 'objective_use_normalized'):
+        return bool(getattr(cfg, 'objective_use_normalized'))
+    d_raw = os.environ.get('DREAMER_OBJ_USE_NORMALIZED')
+    if d_raw not in (None, ''):
+        return str(d_raw).strip().lower() not in ('0', 'false', 'off', 'no', 'n', 'f')
+    l_raw = os.environ.get('OBJ_USE_NORMALIZED')
+    if l_raw not in (None, ''):
+        return str(l_raw).strip().lower() not in ('0', 'false', 'off', 'no', 'n', 'f')
     if isinstance(terms, dict) and 'objective_use_normalized' in terms:
         return bool(int(_safe_float(terms.get('objective_use_normalized', 1), 1)))
+    if cfg is not None:
+        return bool(getattr(cfg, 'objective_use_normalized', True))
     return bool(int(_safe_float(obj_w.get('objective_use_normalized', 1), 1)))
 
 
@@ -181,7 +191,8 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
                         mv_bounds: Optional[list] = None,
                         cv_bounds: Optional[list] = None,
                         mv_norm_ranges: Optional[list] = None,
-                        cv_norm_ranges: Optional[list] = None) -> Dict:
+                        cv_norm_ranges: Optional[list] = None,
+                        cfg=None) -> Dict:
     """Fill in violation/move/target weight vectors if absent, using auto-derivation.
 
     ``control_objective.json`` often omits the vectors (test_sim), so the
@@ -201,6 +212,7 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
         return obj_w
     key = (
         id(obj_w), int(n_mv), int(n_cv),
+        id(cfg) if cfg is not None else 0,
         _bounds_fp(mv_bounds), _bounds_fp(cv_bounds),
         _bounds_fp(mv_norm_ranges), _bounds_fp(cv_norm_ranges),
     )
@@ -209,13 +221,13 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
         return cached
     try:
         from utils.auto_weights import derive_auto_weights
-    except Exception:
+    except ImportError:
         return obj_w
     spec_local = spec if isinstance(spec, dict) else {}
     auto = derive_auto_weights(spec_local, n_mv=n_mv, n_cv=n_cv,
                                mv_bounds=mv_bounds, cv_bounds=cv_bounds,
                                mv_norm_ranges=mv_norm_ranges,
-                               cv_norm_ranges=cv_norm_ranges)
+                               cv_norm_ranges=cv_norm_ranges, cfg=cfg)
     merged = dict(obj_w)
     for k in ('mv_violation_weights', 'cv_violation_weights', 'mv_move_weights',
               'mv_reversal_weights',
@@ -524,9 +536,9 @@ def compute_objective_components(
     obj_w = _maybe_auto_weights(obj_w, n_mv=mv_dim, n_cv=cv_dim, spec=objective_spec,
                                 mv_bounds=mv_bounds, cv_bounds=cv_bounds,
                                 mv_norm_ranges=mv_norm_ranges,
-                                cv_norm_ranges=cv_norm_ranges)
+                                cv_norm_ranges=cv_norm_ranges, cfg=cfg)
 
-    use_normalized = _objective_uses_normalized(obj_w, terms)
+    use_normalized = _objective_uses_normalized(obj_w, terms, cfg=cfg)
     if not isinstance(terms, dict):
         terms = {}
 
@@ -783,7 +795,7 @@ def compute_objective_components(
         _cv_vw = [abs(float(w)) for w in cv_violation_weights]
         _max_vw = max(_mv_vw + _cv_vw + [0.0])
         _clip_auto = (
-            float(_adaptive_clip_fn(_max_vw)) if _adaptive_clip_fn is not None
+            float(_adaptive_clip_fn(_max_vw, cfg=cfg)) if _adaptive_clip_fn is not None
             else 50.0)
     except Exception:
         _clip_auto = 50.0
