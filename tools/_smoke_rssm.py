@@ -66,10 +66,12 @@ from training.train import (
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_fd_action_seq,
                             _gain_match_realized_du, _cube_step_held,
+                            _cube_plus_would_clip, _gain_match_clip_frac_t,
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
-                            _gain_match_rest_window, _held_rollout_win,
+                            _gain_match_rest_window, _gain_match_rest_ic_state,
+                            _held_rollout_win,
                             _rest_ic_can_cuda_graph,
                             _RestICGraphModule, _rest_ic_last_tensors,
                             _rest_ic_note_capture_miss,
@@ -1715,6 +1717,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_realized_du' in _src
     assert 'gain_match_du_frac' in _src
     assert 'wm_gain_match_du_frac' in _src
+    assert 'gain_match_clip_frac' in _src
+    assert 'wm_gain_match_clip_frac' in _src
+    assert 'def _cube_plus_would_clip' in _src
+    assert 'def _gain_match_clip_frac_t' in _src
     assert "gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic'" in _src
     assert 'gmatch_rest_L=' in _src
     assert "gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph'" in _src
@@ -2745,6 +2751,20 @@ def _test_gain_match_clip_realized() -> None:
     rows = _cube_step_held(a_rail, 1, step)
     assert rows.shape == (1, Bm, 1)
     assert torch.allclose(rows[0, :, 0], torch.full((Bm,), 0.5))
+    # Reverse predicate ≡ held reverse; du_frac cannot see this.
+    mask_int = _cube_plus_would_clip(a_int, 1, step)
+    assert not bool(mask_int.any())
+    mask_rail = _cube_plus_would_clip(a_rail, 1, step)
+    assert bool(mask_rail.all())
+    cf_int = _gain_match_clip_frac_t(
+        a_int, dv_int, n_mv, n_dv, step, clip_realized=True)
+    cf_off = _gain_match_clip_frac_t(
+        a_rail, dv_rail, n_mv, n_dv, step, clip_realized=False)
+    cf_rail = _gain_match_clip_frac_t(
+        a_rail, dv_rail, n_mv, n_dv, step, clip_realized=True)
+    assert float(cf_int) == 0.0
+    assert float(cf_off) == 0.0
+    assert abs(float(cf_rail) - 1.0) < 1e-6
     print('[smoke] OK  gain-match clip+realized (interior identity; rail reverse)')
 
 
@@ -2766,19 +2786,25 @@ def _test_gain_match_fd_action_seq() -> None:
 
     own = _Own()
     key = ('rest', n_mv, n_dv, step, K, Bm)
-    a1, d1 = _gain_match_fd_action_seq(
+    a1, d1, du1, cf1 = _gain_match_fd_action_seq(
         a_base, dv0, n_mv, n_dv, step, K, Bm,
         cache_owner=own, cache_key=key)
-    a2, d2 = _gain_match_fd_action_seq(
+    a2, d2, du2, cf2 = _gain_match_fd_action_seq(
         a_base, dv0, n_mv, n_dv, step, K, Bm,
         cache_owner=own, cache_key=key)
-    assert a1 is a2 and d1 is d2
+    assert a1 is a2 and d1 is d2 and du1 is du2 and cf1 is cf2
     assert torch.allclose(a1, ref_a)
     assert torch.allclose(d1, ref_dv)
-    a3, d3 = _gain_match_fd_action_seq(a_base, dv0, n_mv, n_dv, step, K, Bm)
-    a4, d4 = _gain_match_fd_action_seq(a_base, dv0, n_mv, n_dv, step, K, Bm)
+    du_ref = _gain_match_realized_du(a_held, dv_held, n_mv, n_dv)
+    assert torch.allclose(du1, du_ref)
+    a3, d3, du3, cf3 = _gain_match_fd_action_seq(
+        a_base, dv0, n_mv, n_dv, step, K, Bm)
+    a4, d4, du4, cf4 = _gain_match_fd_action_seq(
+        a_base, dv0, n_mv, n_dv, step, K, Bm)
     assert a3 is not a4
     assert torch.allclose(a3, ref_a) and torch.allclose(d3, ref_dv)
+    assert torch.allclose(du3, du_ref) and torch.allclose(du4, du_ref)
+    assert float(cf1) == 0.0 and float(cf3) == 0.0
     print('[smoke] OK  gain-match FD action seq cache (rest-IC identity)')
 
 
@@ -2975,8 +3001,18 @@ def _test_gain_match_rest_ic() -> None:
                 if p.grad is not None and 'gru' in n)
     assert cont_g > 0.0, 'rest-ic FD did not reach cont-gain'
     assert gru_g > 0.0, 'rest-ic encode/FD did not reach GRU'
+    st1 = _gain_match_rest_ic_state(
+        model.dynamics, cfg, obs.device, obs.dtype)
+    st2 = _gain_match_rest_ic_state(
+        model.dynamics, cfg, obs.device, obs.dtype)
+    assert st1 is not None and st2 is not None
+    assert st1[3] is st2[3] and st1[4] is st2[4]
     cfg._gain_match_rest_obs = (rest_o + 1.5).numpy()
     cfg._gain_match_rest_dev = None
+    # Leave `_gain_match_rest_adv` stale: new device tensors must bust it.
+    st3 = _gain_match_rest_ic_state(
+        model.dynamics, cfg, obs.device, obs.dtype)
+    assert st3 is not None and st3[3] is not st1[3]
     model.zero_grad(set_to_none=True)
     gm2, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert abs(float(gm1) - float(gm2)) > 1e-6, (

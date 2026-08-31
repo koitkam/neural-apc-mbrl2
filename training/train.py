@@ -6978,6 +6978,41 @@ def _gain_match_pred_over_tgt(
     return torch.where(ok, g_wm / den, torch.zeros_like(g_wm)).sum() / n
 
 
+def _cube_plus_would_clip(
+        base: torch.Tensor, n_ch: int, step: float,
+        lo: float = -1.0, hi: float = 1.0) -> torch.Tensor:
+    """``(n_ch, Bm)`` True where ``+step`` on channel ``j`` shrinks ``|Δ|``.
+
+    Same predicate ``_cube_step_held`` uses for reverse.  ``du_frac≈1``
+    does **not** mean clip is a no-op: reverse restores ``|Δu|``.  jsonl
+    ``gain_match_clip_frac`` is the mean of this mask (P61 observability).
+    """
+    Bm = int(base.shape[0])
+    n_ch = int(n_ch)
+    if n_ch <= 0:
+        return base.new_zeros(0, Bm, dtype=torch.bool)
+    idx = torch.arange(n_ch, device=base.device)
+    r_plus = (base[:, idx] + float(step)).clamp(lo, hi) - base[:, idx]
+    return (r_plus.abs() + 1e-6 < abs(float(step))).transpose(0, 1)
+
+
+def _gain_match_clip_frac_t(
+        a_base: torch.Tensor, dv0: Optional[torch.Tensor],
+        n_mv: int, n_dv: int, step: float, *,
+        clip_realized: bool) -> torch.Tensor:
+    """Mean reverse-mask over MV+DV FD starts.  0 when clip is off."""
+    if not clip_realized:
+        return a_base.new_zeros(())
+    parts = []
+    if int(n_mv) > 0:
+        parts.append(_cube_plus_would_clip(a_base, n_mv, step).reshape(-1))
+    if int(n_dv) > 0 and dv0 is not None:
+        parts.append(_cube_plus_would_clip(dv0, n_dv, step).reshape(-1))
+    if not parts:
+        return a_base.new_zeros(())
+    return torch.cat(parts).to(dtype=a_base.dtype).mean()
+
+
 def _cube_step_held(
         base: torch.Tensor, n_ch: int, step: float,
         lo: float = -1.0, hi: float = 1.0) -> torch.Tensor:
@@ -6998,8 +7033,7 @@ def _cube_step_held(
     delta = float(step) * eye
     plus = (base.unsqueeze(0) + delta.unsqueeze(1)).clamp(lo, hi)
     minus = (base.unsqueeze(0) - delta.unsqueeze(1)).clamp(lo, hi)
-    r_plus = plus[idx, :, idx] - base[:, idx].transpose(0, 1)
-    use_minus = r_plus.abs() + 1e-6 < abs(float(step))
+    use_minus = _cube_plus_would_clip(base, n_ch, step, lo, hi)
     return torch.where(use_minus.unsqueeze(-1), minus, plus)
 
 
@@ -7084,18 +7118,23 @@ def _gain_match_fd_action_seq(
         n_mv: int, n_dv: int, step: float, K: int, Bm: int,
         *, cache_owner=None, cache_key=None,
         clip_realized: bool = False,
-        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+                   torch.Tensor, torch.Tensor]:
     """Held FD actions expanded to ``(n_rolls·Bm, K, *)``.
 
     Rest-IC ``a_base``/``dv0`` are the last rest frame (static).  Cache
     when ``cache_key`` is set.  PRBS-posterior starts change every
     batch — leave ``cache_key=None``.  Dropped with the rest-IC graph
     at g freeze.  ``clip_realized`` is part of the cache key (caller).
+
+    Also returns realized ``du`` ``(n_in, Bm)`` and ``clip_frac`` (mean
+    reverse-mask).  Both are functions of the held rest — cache them
+    with ``a_seq`` (100×/iter identity vs recomputing on a cache hit).
     """
     if cache_owner is not None and cache_key is not None:
         cached = getattr(cache_owner, '_gain_match_fd_seq', None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1], cached[2]
+            return cached[1], cached[2], cached[3], cached[4]
     a_held, dv_held = _gain_match_fd_held(
         a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized)
     n_rolls = int(a_held.shape[0])
@@ -7109,10 +7148,13 @@ def _gain_match_fd_action_seq(
                   .expand(n_rolls, Bm, K, dv_held.shape[-1])
                   .reshape(n_rolls * Bm, K, dv_held.shape[-1])
                   .contiguous())
+    du = _gain_match_realized_du(a_held, dv_held, n_mv, n_dv)
+    clip_frac = _gain_match_clip_frac_t(
+        a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized)
     if cache_owner is not None and cache_key is not None:
         cache_owner._gain_match_fd_seq = (  # type: ignore[attr-defined]
-            cache_key, a_seq, dv_seq)
-    return a_seq, dv_seq
+            cache_key, a_seq, dv_seq, du, clip_frac)
+    return a_seq, dv_seq, du, clip_frac
 
 
 def _gain_match_state_from_feat(rssm, feat: torch.Tensor):
@@ -7695,10 +7737,19 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     if o is None or a is None:
         return None
     h0, z0, c0 = _rest_ic_encode_hzc(rssm, o, a, cfg)
-    a_base = a[:, -1].contiguous()
-    dv0 = None
-    if int(getattr(rssm, 'dv_dim', 0) or 0) > 0:
-        dv0 = o[:, -1].index_select(-1, rssm.dv_index_t).contiguous()
+    # Last rest frame is static (encode weights are not).  Cache a_base /
+    # dv0 next to the device lookbacks — 100×/iter index_select identity.
+    adv_key = (id(o), id(a), int(getattr(rssm, 'dv_dim', 0) or 0))
+    adv = getattr(cfg, '_gain_match_rest_adv', None)
+    if adv is not None and adv[0] == adv_key:
+        a_base, dv0 = adv[1], adv[2]
+    else:
+        a_base = a[:, -1].contiguous()
+        dv0 = None
+        if int(getattr(rssm, 'dv_dim', 0) or 0) > 0:
+            dv0 = o[:, -1].index_select(-1, rssm.dv_index_t).contiguous()
+        cfg._gain_match_rest_adv = (  # type: ignore[attr-defined]
+            adv_key, a_base, dv0)
     return h0, z0, c0, a_base, dv0
 
 
@@ -7771,6 +7822,7 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     cfg._gain_match_rest_obs = np.stack(obs_l, axis=0)  # type: ignore[attr-defined]
     cfg._gain_match_rest_act = np.stack(act_l, axis=0)  # type: ignore[attr-defined]
     cfg._gain_match_rest_dev = None  # type: ignore[attr-defined]
+    cfg._gain_match_rest_adv = None  # type: ignore[attr-defined]
     from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
     _len_cfg = int(getattr(cfg, 'gain_match_rest_ic_len', 0))
     print(f'[gain-match] rest-ic N={n} L={L} settle={settle} '
@@ -7965,14 +8017,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                 0 if dv0 is None else int(dv0.shape[-1]),
                 int(bool(_clip)),
             )
-    a_seq, dv_seq = _gain_match_fd_action_seq(
+    a_seq, dv_seq, du, clip_frac_t = _gain_match_fd_action_seq(
         a_base, dv0, n_mv_t, n_dv_t, step, K, Bm,
         cache_owner=cache_owner, cache_key=cache_key,
         clip_realized=_clip)
-    du = _gain_match_realized_du(
-        a_seq[:, 0].view(n_rolls, Bm, -1),
-        None if dv_seq is None else dv_seq[:, 0].view(n_rolls, Bm, -1),
-        n_mv_t, n_dv_t)
 
     def _repeat_starts(t):
         return (t.unsqueeze(0).expand(n_rolls, *t.shape)
@@ -8008,6 +8056,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                 ok, den, torch.ones_like(den))
             diag['gain_match_du_frac'] = (
                 du.abs().mean() / max(abs(float(step)), 1e-6))
+            # Reverse restores |Δu|, so du_frac≈1 cannot tell whether
+            # the cube fired.  Mean of +step-would-clip (P61).
+            diag['gain_match_clip_frac'] = clip_frac_t.detach()
             if n_mv_t:
                 diag['gain_match_mv_loss'] = _huber_from_cv(
                     cv_base, cv_steps[:n_mv_t], mv_tgts, du[:n_mv_t])
@@ -13971,6 +14022,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_du_frac' in row:
                 row.setdefault('wm_gain_match_du_frac',
                             row['gain_match_du_frac'])
+            if 'gain_match_clip_frac' in row:
+                row.setdefault('wm_gain_match_clip_frac',
+                            row['gain_match_clip_frac'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)

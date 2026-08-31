@@ -75,9 +75,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P58 EXIT** lookback KEEP; paired **−6.24 vs −102** 9/9 **actor champion**.
 > **P59 EXIT** collect/val CUDA-graph KEEP as speed / FALSIFIED as TM/econ
 > (val MV ×0.876 DV ×0.840; paired −28 vs −117).
-> **P60 LIVE P3** teacher Δu auto = `wm_tf_step_frac` (0.4). Gate PASS last_ok
-> **77** 0.86@DV / 1.10@MV. P3 @136 unfreeze 147 rscale **2.73 KEEP**. jsonl
-> teacher ×1 at 0.4; freeze TM still 0.86@DV.
+> **P60 EXIT** teacher Δu auto = `wm_tf_step_frac` KEEP as protocol /
+> FALSIFIED as TM-closer-to-P26 (val MV ×0.849 DV ×0.767 det_r **−0.095**;
+> paired −27 vs −112, loses to P58).
+> **P61 LIVE** (`run_p61_clipdu`, pid **155682**): cube-clip + realized Δu.
+> CONFIRMED `gmatch_clip=True` `gmatch_step=0.4` `device=cuda`. P1 ~iter 24:
+> recon ~0.0025, teacher ×1.00/×1.00, `du_frac=1.0` (`clip_frac` lands on
+> HEAD, not this pid — reverse restores `|Δu|` so du_frac cannot see the
+> cube). Isolation off. μ-ratio 0.2. Serve graph KEEP. **No second GPU job.**
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -128,12 +133,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > compounding ×0.675. **P59 EXIT** (`run_p59_headserve`): collect/val
 > CUDA-graph **KEEP as speed** / **FALSIFIED as TM/econ**. Val MV
 > ×0.876/×0.874 DV ×0.840/×0.890. Paired **−28 vs −117**, loses to
-> P58. Teacher Δu=1 vs TM 0.4. **P60 LIVE P3** (`run_p60_tmstep`, pid
-> **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. Gate last_ok
-> **77** 0.86@DV. P3 @136 unfreeze 147 rscale **2.73 KEEP**. jsonl teacher
-> ×1 at 0.4; freeze TM still 0.86@DV. HEAD (not in pid): `initial_state`
-> cache; KL `clamp_min(float)`; TD-λ `α^t` cache. Do **not** launch a
-> second GPU job.
+> P58. Teacher Δu=1 vs TM 0.4. **P60 EXIT** (`run_p60_tmstep`, pid
+> **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. KEEP as protocol /
+> FALSIFIED as TM. Val MV ×0.849 DV ×0.767 det_r **−0.095**. Paired
+> **−27 vs −112**. **P61 LIVE** (`run_p61_clipdu`, pid **155682**):
+> cube-clip + realized Δu. CONFIRMED cuda / clip / step 0.4. P1 ~iter 24
+> teacher ×1 / `du_frac=1`. HEAD (not in pid): `clip_frac` jsonl + rest-IC
+> `a_base`/`du` cache. Do **not** launch a second GPU job.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
