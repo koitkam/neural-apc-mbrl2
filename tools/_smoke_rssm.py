@@ -1524,7 +1524,13 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _fn(o, a):' not in _src
     assert '_warmup_rest_ic_cuda_graph' in _src
     assert '_amp_parent_autocast_on' in _src
+    assert 'def _suppress_accumulate_grad_stream_warn' in _src
     assert 'set_warn_on_accumulate_grad_stream_mismatch' in _src
+    _cap = _src[_src.index('def _capture_rest_ic_cuda_graph'):
+                _src.index('\ndef _rest_ic_encode_hzc')]
+    assert 'with _suppress_accumulate_grad_stream_warn()' in _cap
+    assert (_cap.find('with _suppress_accumulate_grad_stream_warn()')
+            < _cap.find('.backward()'))
     assert '_gain_match_fd_action_seq' in _src
     assert 'def _wm_need_logged_aux' in _src
     assert '_wm_need_enc_diag' in _src

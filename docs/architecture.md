@@ -95,8 +95,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`allow_unused_input=True`; overriding only `parameters()` left
 > `named_parameters()` / `buffers()` empty). Transient VRAM skip
 > does **not** pin `_rest_ic_cg_fail` (warmup retries once after
-> `empty_cache`). Capture also zeros+syncs and suppresses the
-> one-shot AccumulateGrad stream-mismatch warn. Rest-IC FD `a_seq` is
+> `empty_cache`). Capture also zeros+syncs+gc and suppresses the
+> AccumulateGrad stream-mismatch warn across capture **and** the
+> GRU-grad canary (P58: P57 restored the flag before canary
+> ``backward``). Rest-IC FD `a_seq` is
 > cached; encoder-var / Huber MV–DV jsonl run on the last logged
 > inner only; P1 H2D is `obs`/`act` (and `dist` only if
 > `_wm_need_dist_target`) except MTP last. P2/P3 skip leftover
@@ -870,7 +872,8 @@ fixes BOTH:
   the RSSM (overriding only `parameters()` left `named_parameters()`/
   `buffers()` empty). Transient VRAM skip does **not** pin
   `_rest_ic_cg_fail` (warmup retries once after `empty_cache`).
-  When the rest cache is present, P44 WM-held settle is skipped. Isolation loss
+  Suppress leftover AccumulateGrad stream-mismatch across capture
+  **and** the GRU-grad canary (P58). When the rest cache is present, P44 WM-held settle is skipped. Isolation loss
   stays 0. jsonl `*_ratio` =
   mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE
   (default False). Residual is last Linear (ent −0.101); opening σ

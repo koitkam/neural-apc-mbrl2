@@ -31,7 +31,9 @@ import math
 import os
 import shutil
 import time
+import warnings
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -970,7 +972,10 @@ class TrainConfig:
     # ``named_parameters()`` / ``buffers()`` empty).  Capture-fail /
     # CPU stay eager.  VRAM <512 MiB skip does **not** pin
     # ``_rest_ic_cg_fail`` (warmup retries once after ``empty_cache``).
-    # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
+    # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.  Capture
+    # suppresses leftover AccumulateGrad stream-mismatch across
+    # ``make_graphed_callables`` **and** the GRU-grad canary (P58:
+    # P57 restored the flag before canary ``backward``).
     gain_match_rest_ic_cuda_graph: bool = True
     # Encode length of the rest lookback.  Collect settle stays
     # ``max(H, lookback)`` so the plant reaches SS; ``L`` is the **last**
@@ -7033,6 +7038,44 @@ def _rest_ic_note_capture_miss(rssm, pin_fail: bool) -> None:
         rssm._rest_ic_cg_fail = True  # type: ignore[attr-defined]
 
 
+@contextmanager
+def _suppress_accumulate_grad_stream_warn():
+    """Hide leftover-AccumulateGrad stream mismatch around rest-IC capture.
+
+    P57 wrapped only ``make_graphed_callables``; P58 still printed the
+    one-shot UserWarning on the GRU-grad canary ``backward`` after that
+    ``finally`` restored the flag.  Cover capture **and** canary.
+    Training identity.  Host-adaptive (missing API → warnings filter).
+    """
+    warn_fn = getattr(
+        torch.autograd.graph,
+        'set_warn_on_accumulate_grad_stream_mismatch', None)
+    prev = True
+    if warn_fn is not None:
+        try:
+            prev = warn_fn(False)
+        except TypeError:
+            warn_fn(False)
+            prev = True
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='The AccumulateGrad node',
+            category=UserWarning,
+        )
+        try:
+            yield
+        finally:
+            if warn_fn is not None:
+                try:
+                    if prev is None:
+                        warn_fn(True)
+                    else:
+                        warn_fn(bool(prev))
+                except TypeError:
+                    warn_fn(True)
+
+
 def _capture_rest_ic_cuda_graph(
         rssm, obs: torch.Tensor, act: torch.Tensor
         ) -> Tuple[Optional[object], bool]:
@@ -7069,41 +7112,37 @@ def _capture_rest_ic_cuda_graph(
               '(trainable buffer on capture surface); eager T-loop',
               flush=True)
         return None, True
+    # Eager WM steps run inside bf16 autocast (cache_enabled=True).
+    # ``make_graphed_callables`` rejects autocast cache (P55 first
+    # GPU capture inside ``world_model_loss``: RuntimeError … set
+    # cache_enabled=False).  Exit the parent region first — a nested
+    # cache_enabled=False alone still sees the parent's cache flag
+    # on some PyTorch builds — then re-enter bf16 with cache off so
+    # the recorded kernels match the training WM step.  Fail still
+    # falls back to the eager T-loop.
+    #
+    # Do **not** force ``requires_grad`` on obs/act copies: live
+    # rest-IC cache tensors do not require grad, and PyTorch
+    # requires sample_args to match the training loop.  GRU params
+    # come from ``named_parameters()``, not from the obs/act leaves.
+    #
+    # P58: leftover AccumulateGrad stream-mismatch UserWarning is the
+    # GRU-grad canary ``backward`` after capture warmup (P57 restored
+    # the flag in the capture ``finally``).  Drop in-flight grads +
+    # sync + gc before recording; suppress across capture **and**
+    # canary (identity for training; host-adaptive).
+    o_s = obs.detach()
+    a_s = act.detach()
+    saved_pre = _rssm_param_grad_snapshot(rssm)
+    rssm.zero_grad(set_to_none=True)
+    if obs.device.type == 'cuda':
+        torch.cuda.synchronize()
     try:
-        # Eager WM steps run inside bf16 autocast (cache_enabled=True).
-        # ``make_graphed_callables`` rejects autocast cache (P55 first
-        # GPU capture inside ``world_model_loss``: RuntimeError … set
-        # cache_enabled=False).  Exit the parent region first — a nested
-        # cache_enabled=False alone still sees the parent's cache flag
-        # on some PyTorch builds — then re-enter bf16 with cache off so
-        # the recorded kernels match the training WM step.  Fail still
-        # falls back to the eager T-loop.
-        #
-        # Do **not** force ``requires_grad`` on obs/act copies: live
-        # rest-IC cache tensors do not require grad, and PyTorch
-        # requires sample_args to match the training loop.  GRU params
-        # come from ``named_parameters()``, not from the obs/act leaves.
-        #
-        # P57 capture: leftover AccumulateGrad (prior warmup / init)
-        # on the default stream vs capture stream printed a one-shot
-        # mismatch warning.  Drop in-flight grads + sync before
-        # recording; suppress the warn around capture only (identity
-        # for training; host-adaptive).
-        o_s = obs.detach()
-        a_s = act.detach()
-        saved_pre = _rssm_param_grad_snapshot(rssm)
-        rssm.zero_grad(set_to_none=True)
-        if obs.device.type == 'cuda':
-            torch.cuda.synchronize()
-        _warn_fn = getattr(
-            torch.autograd.graph,
-            'set_warn_on_accumulate_grad_stream_mismatch', None)
-        _warn_prev = True
-        if _warn_fn is not None:
-            try:
-                _warn_prev = _warn_fn(False)
-            except TypeError:
-                _warn_fn(False)
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
+    with _suppress_accumulate_grad_stream_warn():
         try:
             with torch.amp.autocast(device_type=obs.device.type, enabled=False):
                 with torch.amp.autocast(
@@ -7112,45 +7151,37 @@ def _capture_rest_ic_cuda_graph(
                     graphed = torch.cuda.make_graphed_callables(
                         wrapper, (o_s, a_s), num_warmup_iters=2,
                         allow_unused_input=True)
-        finally:
-            if _warn_fn is not None:
-                try:
-                    if _warn_prev is None:
-                        _warn_fn(True)
-                    else:
-                        _warn_fn(bool(_warn_prev))
-                except TypeError:
-                    _warn_fn(True)
+        except Exception as e:
             _rssm_param_grad_restore(saved_pre)
-    except Exception as e:
-        print('[gain-match] rest-ic CUDA graph capture failed '
-              f'({type(e).__name__}: {e}); eager T-loop', flush=True)
-        return None, True
-    # Canary: P25 class if the graph dropped BPTT through the GRU.
-    # Save/restore any in-flight grads (identity when all None).
-    saved = _rssm_param_grad_snapshot(rssm)
-    try:
-        rssm.zero_grad(set_to_none=True)
-        h, z, c = graphed(obs, act)
-        (h.float().square().mean()
-         + z.float().square().mean()
-         + c.float().square().mean()).backward()
-        gru_g = 0.0
-        for n, p in rssm.named_parameters():
-            if p.grad is not None and 'gru' in n:
-                gru_g += float(p.grad.abs().sum())
-        rssm.zero_grad(set_to_none=True)
-        if gru_g <= 0.0:
-            print('[gain-match] rest-ic CUDA graph dropped GRU grad; '
-                  'eager T-loop', flush=True)
+            print('[gain-match] rest-ic CUDA graph capture failed '
+                  f'({type(e).__name__}: {e}); eager T-loop', flush=True)
             return None, True
-    except Exception as e:
-        rssm.zero_grad(set_to_none=True)
-        print('[gain-match] rest-ic CUDA graph canary failed '
-              f'({type(e).__name__}: {e}); eager T-loop', flush=True)
-        return None, True
-    finally:
-        _rssm_param_grad_restore(saved)
+        _rssm_param_grad_restore(saved_pre)
+        # Canary: P25 class if the graph dropped BPTT through the GRU.
+        # Save/restore any in-flight grads (identity when all None).
+        saved = _rssm_param_grad_snapshot(rssm)
+        try:
+            rssm.zero_grad(set_to_none=True)
+            h, z, c = graphed(obs, act)
+            (h.float().square().mean()
+             + z.float().square().mean()
+             + c.float().square().mean()).backward()
+            gru_g = 0.0
+            for n, p in rssm.named_parameters():
+                if p.grad is not None and 'gru' in n:
+                    gru_g += float(p.grad.abs().sum())
+            rssm.zero_grad(set_to_none=True)
+            if gru_g <= 0.0:
+                print('[gain-match] rest-ic CUDA graph dropped GRU grad; '
+                      'eager T-loop', flush=True)
+                return None, True
+        except Exception as e:
+            rssm.zero_grad(set_to_none=True)
+            print('[gain-match] rest-ic CUDA graph canary failed '
+                  f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+            return None, True
+        finally:
+            _rssm_param_grad_restore(saved)
     print(f'[gain-match] rest-ic CUDA graph captured N={int(obs.shape[0])} '
           f'T={int(obs.shape[1])} (full-BPTT; opt out '
           'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0)', flush=True)
