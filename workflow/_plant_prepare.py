@@ -924,6 +924,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Identity speed: CUDA-graph rest-IC T-loop (RSSM, sample=False, full
     # BPTT).  ``=0`` keeps the eager Python loop.
     'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH': ('gain_match_rest_ic_cuda_graph', _as_bool),
+    # Rest-IC encode length (last L of settle).  ``-1`` = last
+    # ``max(K, 2τ/sr)`` when τ is identified; ``0`` = lookback;
+    # ``>0`` = exact.  Collect settle stays ``max(H, lookback)``.
+    'DREAMER_GAIN_MATCH_REST_IC_LEN':      ('gain_match_rest_ic_len',        int),
     'DREAMER_AUX_TBPTT_STEPS':            ('aux_tbptt_steps',                int),
     # Self-supervised WM gain supervisors (auto-on with the cont gain channel):
     # per-input isolation trajectory match + the steady-state DC-gain match (the

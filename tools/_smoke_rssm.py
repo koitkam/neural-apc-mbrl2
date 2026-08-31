@@ -229,6 +229,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.gain_match_huber_per_input is True
     assert int(_tc.gain_match_settle_len) == -1
     assert _tc.gain_match_rest_ic is True
+    assert int(_tc.gain_match_rest_ic_len) == -1
     assert _tc.gain_match_rest_ic_cuda_graph is True
     assert _tc.p3_reset_log_std is False
     assert _tc.bc_mean_only is True
@@ -779,6 +780,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_GAIN_MATCH_SETTLE_LEN': '55',
         'DREAMER_GAIN_MATCH_REST_IC': '1',
         'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH': '0',
+        'DREAMER_GAIN_MATCH_REST_IC_LEN': '16',
         'DREAMER_P3_RESET_LOG_STD': '1',
         'DREAMER_P3_STOP_GRAD_LOG_STD': '0',
         'DREAMER_P3_LOGP_CLIP': '0',
@@ -877,6 +879,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.gain_match_settle_len) == 55
         assert cfg.gain_match_rest_ic is True
         assert cfg.gain_match_rest_ic_cuda_graph is False
+        assert int(cfg.gain_match_rest_ic_len) == 16
         assert cfg.p3_reset_log_std is True
         assert cfg.p3_stop_grad_log_std is False
         assert abs(float(cfg.p3_logp_clip)) < 1e-12
@@ -1033,6 +1036,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'exploration_seed_episodes' in explicit
         assert 'dv_prbs_seed_episodes' in explicit
         assert 'gain_match_rest_ic_cuda_graph' in explicit
+        assert 'gain_match_rest_ic_len' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1320,6 +1324,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic'" in _src
+    assert 'gmatch_rest_L=' in _src
     assert "gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph'" in _src
     assert "p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std'" in _src
     assert "bc_mean={bool(getattr(cfg, 'bc_mean_only'" in _src
@@ -1361,6 +1366,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
+    assert 'gain_match_rest_ic_len: int = -1' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert '_rest_ic_can_cuda_graph' in _src
     assert 'make_graphed_callables' in _src
@@ -1541,6 +1547,7 @@ def _test_envfree_observer_recipe() -> None:
     assert float(c.gain_match_huber_beta) == 1.0
     assert int(c.gain_match_settle_len) == -1
     assert c.gain_match_rest_ic is True
+    assert int(c.gain_match_rest_ic_len) == -1
     assert c.gain_match_rest_ic_cuda_graph is True
     assert c.p3_reset_log_std is False
     assert not hasattr(c, 'actor_kl_coef')
@@ -1588,6 +1595,7 @@ def _test_envfree_observer_recipe() -> None:
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
+    assert 'DREAMER_GAIN_MATCH_REST_IC_LEN' in ENV_OVERRIDES
     assert 'DREAMER_P3_RESET_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_STOP_GRAD_LOG_STD' in ENV_OVERRIDES
     assert 'DREAMER_P3_LOGP_CLIP' in ENV_OVERRIDES
@@ -2292,11 +2300,12 @@ def _test_gain_match_held_settle() -> None:
 
 
 def _test_gain_match_rest_window() -> None:
-    """P45 collect window is max(H, lookback), not TM 4H."""
+    """Collect settle is max(H, lookback); encode L is last max(K, 2τ/sr)."""
     from evaluation.wm_transfer_matrix import wm_tf_horizon
     c = TrainConfig()
     c.horizon = 55
     c.lookback = 128
+    # tau=0 → legacy L=lookback (no fake 50 s).
     s, L = _gain_match_rest_window(c)
     assert (s, L) == (128, 128), (s, L)
     assert s != wm_tf_horizon(55)
@@ -2305,7 +2314,19 @@ def _test_gain_match_rest_window() -> None:
     c.horizon = 15
     c.lookback = 8
     assert _gain_match_rest_window(c) == (15, 8)
-    print('[smoke] OK  rest-ic window = max(H, lookback) not wm_tf_horizon')
+    # test_sim: τ=53, sr=4, K=55 → L=max(55, round(2*53/4)=27)=55.
+    c.horizon = 55
+    c.lookback = 128
+    c.gain_match_len = 55
+    c.sample_rate = 4
+    c.identified_tau_dominant = 53.0
+    c.gain_match_rest_ic_len = -1
+    assert _gain_match_rest_window(c) == (128, 55), _gain_match_rest_window(c)
+    c.gain_match_rest_ic_len = 0
+    assert _gain_match_rest_window(c) == (128, 128)
+    c.gain_match_rest_ic_len = 16
+    assert _gain_match_rest_window(c) == (128, 16)
+    print('[smoke] OK  rest-ic settle=max(H,lookback); L=max(K,2τ/sr) not wm_tf_horizon')
 
 
 def _test_held_rollout_win_fits_k() -> None:
@@ -3691,6 +3712,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
+    assert 'gmatch_rest_L=' in banner, banner
     assert 'gmatch_rest_cg=True' in banner, banner
     assert 'p3_sigreset=False' in banner, banner
     assert 'p3_sglogstd=True' in banner, banner

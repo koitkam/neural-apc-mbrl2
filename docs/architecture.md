@@ -62,17 +62,19 @@ env-gated off · **[planned]** = designed, not yet built.
 > / **64@366**; ema −170→−2163; rscale 1.91 KEEP. Val paired **−87 vs
 > −78 FAIL 5/9**. **REVERT** env-free default **1→0**. Keep ε=0.2.
 > Next GPU: P56 `DREAMER_P3_MU_RATIO_REFRESH=50` (A/B; not a default).
-> **P56 LIVE** (`run_p56_muslow`, pid **110246**, sha `9d05866`): GAIN-READY
-> @82 **0.83@DV**; last_ok **82**; P3 @136; unfreeze **147** ent **−0.101
-> HELD**; logp_std ~**0.50–0.59 through 236** (not P55 18); rscale **2.26 KEEP**;
-> rtgt 0.058→**0.002**; N=50 first recopy ~**197** was a near-no-op (`clip`
-> ~0.10, P54 ceiling). Rest-IC graph
-> failed this pid (`t_wm` 124 s). HEAD: `_RestICGraphModule` +
-> `wrapper.train(rssm.training)`; snapshot refresh is in-place `load_state_dict`;
-> rest-IC CUDA graph released at g freeze. jsonl `adv_action_corr`
+> **P56 EXIT** (`run_p56_muslow`, pid **110246**, sha `9d05866`, 476
+> iters): N=50 **FALSIFIED as actor-econ lever**. No P55 walk
+> (logp_std ~0.50–0.59 after recopy ~197; clip ~0.10). Extra P3 +
+> recopy-inside-freeze-forever-ball is a no-op vs N=0 and **P54-class**
+> val **−26 vs −112** (9/9; worse than P53 **−13 vs −98**). Gate
+> **0.83@DV**; val MV ss/@H **×0.765 / ×0.754**, DV **×0.762 / ×0.790**,
+> det_r **0.352**. rscale **2.26 KEEP**. Default refresh stays **0**.
+> Rest-IC graph failed this pid (`t_wm` 124 s). Champion stays **P53**.
+> Encode ``L`` is now last ``max(K, 2τ/sr)`` of settle (P57; not
+> lookback=128). Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
-> `skip this/cum` (`n_grad_skip_iter`; not in this pid).
+> `skip this/cum` (`n_grad_skip_iter`).
 > p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
 > dead `pmpo_loss`/`kl_to`/`pmpo_alpha`/`pmpo_beta` / prior-refresh knobs
@@ -480,6 +482,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > via Stage-1 `_posterior_step` → FD (TM rest-then-step IC; obs after
 > step like `_settle_capture`; skips P44 WM-held settle). Isolation loss
 > stays 0. Collect settle = max(H, lookback), not `wm_tf_horizon`.
+> Encode `L` is last `max(K, 2τ/sr)` of that settle when τ is
+> identified (`gain_match_rest_ic_len=-1`; test_sim 55 not lookback
+> 128). `0` = P45 lookback. Do not set settle=`wm_tf_horizon`.
 > Cache miss aborts. `DREAMER_GAIN_MATCH_REST_IC=0` reverts to
 > PRBS-posterior FD. Do not set settle=`wm_tf_horizon` (P45 was
 > GAIN-READY without it). Remaining observer hole: DOB amp-dead
@@ -513,7 +518,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > 0.02–0.80 (P53 held ~0.47 / clip 0.61→0.14); ema **−170→−2163**;
 > rtgt 0.060→**0.0001**; rscale **1.91 KEEP**. Val paired **−87 vs −78
 > FAIL 5/9**. **REVERT** default **1→0**. Do not treat best.pt@166 as
-> KEEP of N=1. Slow recopy is A/B (`DREAMER_P3_MU_RATIO_REFRESH`).
+> KEEP of N=1. **P56 EXIT FALSIFIED** slow recopy N=50
+> (`DREAMER_P3_MU_RATIO_REFRESH=50`): no P55 walk; recopy inside the
+> freeze-forever ball is a no-op; val **−26 vs −112** P54-class.
+> Default refresh stays **0**. Champion **P53**. Encode L is last
+> `max(K, 2τ/sr)` of settle (P57). Slow recopy is closed.
 > `critic_mc_loss` is now in the
 > P3 jsonl. Opt out
 > `DREAMER_P3_MU_RATIO_CLIP=0`. Not a lag-copy (1 update/batch
@@ -829,7 +838,9 @@ fixes BOTH:
   A/B only. **Rest-IC** (`gain_match_rest_ic`, default **True**; P45
   EXIT PROMOTE): encode real held-OP lookbacks then FD (TM protocol IC).
   `DREAMER_GAIN_MATCH_REST_IC=0` reverts to PRBS-posterior FD. Collect
-  pairing = TM `_settle_capture` (obs after step). Encode is
+  pairing = TM `_settle_capture` (obs after step). Encode `L` is last
+  `max(K, 2τ/sr)` of settle (`gain_match_rest_ic_len=-1`; `0` =
+  lookback). Encode is
   `rollout_observed(..., last_only=True, return_feats=False)` via
   Stage-1 `_posterior_step`. CUDA: `make_graphed_callables` on
   `_RestICGraphModule` wrapping that T-loop when

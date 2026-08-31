@@ -953,7 +953,9 @@ class TrainConfig:
     # GAIN-READY freeze since P40–P44 0.75@DV (gate 0.86@DV; val MV
     # ss/@H ×0.877/×0.887, DV ×0.815/×0.875).  ``DREAMER_GAIN_MATCH_REST_IC=0``
     # reverts to PRBS-posterior FD.  Collect settle = max(H, lookback)
-    # — **not** ``wm_tf_horizon`` (that 4H window is a later A/B).
+    # — **not** ``wm_tf_horizon``.  Encode ``L`` is
+    # ``gain_match_rest_ic_len`` (default last ``max(K, 2τ/sr)`` of
+    # that settle; ``0`` = lookback).
     gain_match_rest_ic: bool = True
     # Identity speed: CUDA-graph the rest-IC ``last_only`` T-loop (static
     # cached obs/act, ``sample=False``, full BPTT).  RSSM only (TSSM
@@ -970,6 +972,16 @@ class TrainConfig:
     # ``_rest_ic_cg_fail`` (warmup retries once after ``empty_cache``).
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
     gain_match_rest_ic_cuda_graph: bool = True
+    # Encode length of the rest lookback (P57).  Collect settle stays
+    # ``max(H, lookback)`` so the plant reaches SS; ``L`` is the **last**
+    # frames fed to the GRU.  P45–P56 used ``L=lookback`` (test_sim 128),
+    # so the encode included the reset→SS transient.  Sentinel ``-1`` =
+    # last ``max(K, round(2·τ/sr))`` of that settle when identifier τ is
+    # present (test_sim L=55); missing τ keeps lookback (no 50 s fake).
+    # ``0`` = P45 lookback.  ``>0`` = exact.  Do **not** set settle to
+    # ``wm_tf_horizon`` (P44 S=H was a different knob).
+    # ``DREAMER_GAIN_MATCH_REST_IC_LEN``.
+    gain_match_rest_ic_len: int = -1
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
@@ -4081,6 +4093,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
+        f"gmatch_rest_L={_gain_match_rest_window(cfg)[1]} "
         f"gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph', True))} "
         f"p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std', False))} "
         f"bc_mean={bool(getattr(cfg, 'bc_mean_only', True))} "
@@ -6695,17 +6708,37 @@ def _gain_match_held_settle(
 
 
 def _gain_match_rest_window(cfg: 'TrainConfig') -> Tuple[int, int]:
-    """Real-rest collect settle + encode lookback (not ``wm_tf_horizon``).
+    """Real-rest collect settle + encode length (not ``wm_tf_horizon``).
 
     ``settle = max(H, lookback)`` so the captured window is already at
-    SS and fills the RSSM encode.  TM default settle is
-    ``wm_tf_horizon(H)=max(80,4H)`` — matching that is a *later* A/B.
+    SS.  Encode ``L`` is the **last** frames of that settle (TM-style
+    tail), not the reset transient.  Sentinel
+    ``gain_match_rest_ic_len=-1``: ``L = min(lookback, max(K, 2τ/sr))``
+    when identifier τ is present; missing τ keeps lookback (no 50 s
+    fake).  ``0`` = P45–P56 ``L=lookback``.  ``>0`` = exact.
+    TM default settle is ``wm_tf_horizon(H)=max(80,4H)`` — matching
+    that is a *later* A/B, not this knob.
     """
     h = max(1, int(getattr(cfg, 'horizon', 15) or 15))
     l_cap = max(2, int(getattr(cfg, 'lookback', 0)
                        or getattr(cfg, 'seq_len', 8) or 8))
     settle = max(h, l_cap)
-    return settle, min(l_cap, settle)
+    k = max(1, int(getattr(cfg, 'gain_match_len', 0) or 0) or h)
+    cfg_len = int(getattr(cfg, 'gain_match_rest_ic_len', -1))
+    if cfg_len > 0:
+        L = min(l_cap, cfg_len)
+    elif cfg_len == 0:
+        L = min(l_cap, settle)
+    else:
+        tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+        sr = max(float(getattr(cfg, 'sample_rate', 1) or 1), 1e-6)
+        if tau > 0.0:
+            two_tau = max(2, int(round(2.0 * tau / sr)))
+            L = min(l_cap, max(k, two_tau))
+        else:
+            L = min(l_cap, settle)
+    L = max(2, min(int(L), settle, l_cap))
+    return settle, L
 
 
 def _gain_match_rest_ic_tensors(
@@ -7171,8 +7204,10 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     cfg._gain_match_rest_act = np.stack(act_l, axis=0)  # type: ignore[attr-defined]
     cfg._gain_match_rest_dev = None  # type: ignore[attr-defined]
     from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
+    _len_cfg = int(getattr(cfg, 'gain_match_rest_ic_len', -1))
     print(f'[gain-match] rest-ic N={n} L={L} settle={settle} '
-          f'(TM-protocol real-rest encode; isolation loss stays 0; '
+          f'rest_ic_len={_len_cfg} '
+          f'(TM-protocol real-rest tail encode; isolation loss stays 0; '
           f'not wm_tf_horizon={_wm_tf_h(int(getattr(cfg, "horizon", 15) or 15))})',
           flush=True)
 
