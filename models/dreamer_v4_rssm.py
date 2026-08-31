@@ -647,9 +647,16 @@ class RSSMDynamics(nn.Module):
              if self.dob_enabled else None)
         dv = (torch.zeros(batch_size, self.dv_dim, device=device)
               if self.dv_feedforward else None)
-        c = (torch.zeros(batch_size, self.cont_dim, device=device)
-             if self.cont_dim > 0 else None)
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c)
+        # ``c_mean`` / ``c_std`` must match serve/obs_step layout so a
+        # CUDA-graph ``copy_`` of the recurrent state is well-typed
+        # (collect capture used to raise ``c_mean None mismatch``).
+        c = c_mean = c_std = None
+        if self.cont_dim > 0:
+            c = torch.zeros(batch_size, self.cont_dim, device=device)
+            c_mean = torch.zeros_like(c)
+            c_std = torch.zeros_like(c)
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c,
+                         c_mean=c_mean, c_std=c_std)
 
     # ----- DOB helpers --------------------------------------------------
     def dob_decay(self) -> torch.Tensor:
@@ -1321,6 +1328,24 @@ def get_collect_serve_cuda_graph(dyn, example_state, device, obs_dim: int,
         return None
     dyn._collect_serve_cg = captured  # type: ignore[attr-defined]
     return captured
+
+
+def warmup_collect_serve_cuda_graph(dyn, device, obs_dim: int, act_dim: int):
+    """Capture under the same bf16 autocast + inference_mode as collect/val.
+
+    Replay of a CUDA graph ignores the surrounding autocast, so capture
+    dtype must match ``collect_episode`` / ``_run_episode_with_window``
+    (bf16 on CUDA). CPU / TSSM / fail stay ``None``.
+    """
+    if getattr(device, 'type', '') != 'cuda':
+        return None
+    if not torch.cuda.is_available():
+        return None
+    with torch.inference_mode(), torch.amp.autocast(
+            device_type='cuda', dtype=torch.bfloat16, enabled=True):
+        st = dyn.initial_state(1, device)
+        return get_collect_serve_cuda_graph(
+            dyn, st, device, int(obs_dim), int(act_dim))
 
 
 # ---------------------------------------------------------------------------

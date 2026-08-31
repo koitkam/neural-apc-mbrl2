@@ -3933,6 +3933,26 @@ def _is_rssm_interface(model) -> bool:
     return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
 
 
+def _warmup_p3_collect_serve_graph(model, device, cfg) -> None:
+    """Capture frozen-RSSM B=1 serve graph after DOB is live.
+
+    Lazy capture on the first ``collect_episode`` is identity, but the
+    8-episode on-policy prefill then pays capture latency. Warm at P3
+    entry (phased + joint) so ``dob_live`` matches P3 serve. TSSM/CPU
+    no-op. Recapture if ``dob_live`` flips.
+    """
+    if not _is_rssm_interface(model):
+        return
+    if getattr(device, 'type', '') != 'cuda':
+        return
+    from models.dreamer_v4_rssm import warmup_collect_serve_cuda_graph
+    cg = warmup_collect_serve_cuda_graph(
+        model.dynamics, device, int(cfg.obs_dim), int(cfg.action_dim))
+    if cg is not None:
+        print('[p3] collect serve CUDA graph warmed '
+              '(B=1 frozen RSSM stream_serve_step)', flush=True)
+
+
 def _cv_obs_std_tensor(cfg: 'TrainConfig', ds: torch.Tensor
                        ) -> Optional[torch.Tensor]:
     """Cached device tensor of running CV obs-norm std (DOB-ground units).
@@ -12113,6 +12133,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         print('[p3] on-policy collect streams measured DV + Kalman '
               '(train/serve match with rollout_observed)',
               flush=True)
+        _warmup_p3_collect_serve_graph(model, device, cfg)
         p3_start_steps = total_env_steps
         try:
             _rs0 = float(model.ret_scale.detach().item())
@@ -12731,6 +12752,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 print('[p3] on-policy collect streams measured DV + Kalman '
                       '(train/serve match with rollout_observed)',
                       flush=True)
+                _warmup_p3_collect_serve_graph(model, device, cfg)
                 # 2026-05-23 (P41 RCA): snapshot return_scale at P3 start
                 # so the bootstrap-cascade canary can detect runaway growth.
                 # ``model.ret_scale`` is the EMA buffer used by the critic

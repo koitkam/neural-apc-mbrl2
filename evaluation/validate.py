@@ -495,9 +495,12 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     _serve_step = None
     _o = None
     _o_host = None
+    _get_serve_cg = None
     if _is_rssm:
         from models.dreamer_v4_rssm import (
-            alloc_pinned_obs_host, copy_obs_row, stream_serve_step as _serve_step)
+            alloc_pinned_obs_host, copy_obs_row,
+            stream_serve_step as _serve_step,
+            get_collect_serve_cuda_graph as _get_serve_cg)
         _o = torch.empty(1, int(obs_window.shape[-1]), device=device,
                          dtype=torch.float32)
         _o_host = alloc_pinned_obs_host(device, int(obs_window.shape[-1]))
@@ -506,15 +509,29 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
     with torch.inference_mode(), torch.amp.autocast(
             device_type=device.type, dtype=torch.bfloat16,
             enabled=_use_cuda_amp):
+        # Reuse the P3 collect graph when present (same bf16 autocast).
+        # CPU / TSSM / capture-fail stay eager. ``copy_`` into static
+        # prev_a (no per-step rebind).
+        _serve_cg = None
+        if _is_rssm and _rssm_state is not None and _get_serve_cg is not None:
+            _serve_cg = _get_serve_cg(
+                model.dynamics, _rssm_state, device,
+                int(obs_window.shape[-1]), int(action_dim))
+            if _serve_cg is not None:
+                _serve_cg.reset(_rssm_state)
         for t in range(T):
             if _is_rssm:
-                copy_obs_row(_o, obs_window[-1], _o_host)
                 # Certainty-equivalent belief + the same DV/Kalman feat
                 # ``collect_episode`` / ``_realsim_actor_critic_step`` use.
-                _rssm_state = _serve_step(
-                    model.dynamics, _rssm_state, _rssm_prev_a, _o,
-                    sample=False)
-                agent_hid = _rssm_state.feat
+                if _serve_cg is not None:
+                    copy_obs_row(_serve_cg.obs, obs_window[-1], _o_host)
+                    agent_hid = _serve_cg.replay()
+                else:
+                    copy_obs_row(_o, obs_window[-1], _o_host)
+                    _rssm_state = _serve_step(
+                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                        sample=False)
+                    agent_hid = _rssm_state.feat
             else:
                 ow = torch.from_numpy(obs_window).to(device)
                 a_ctx = torch.from_numpy(a_history).to(device)
@@ -529,7 +546,10 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                                             deterministic=deterministic)
             a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
             if _is_rssm:
-                _rssm_prev_a = action_t.detach().float().reshape(1, -1)
+                _prev = (_serve_cg.prev_a if _serve_cg is not None
+                         else _rssm_prev_a)
+                _prev.copy_(
+                    action_t.detach().to(dtype=_prev.dtype).reshape(1, -1))
             next_window, scaled_r, done, info = env.step(a_np)
             comps = info.get('reward_components', {}) or {}
             # Record the *raw* (physical-units) state so plots/npz read true

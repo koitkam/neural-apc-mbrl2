@@ -4197,12 +4197,33 @@ def _test_collect_serve_cuda_graph_cpu() -> None:
     assert get_collect_serve_cuda_graph(
         model.dynamics, st, torch.device('cpu'), cfg.obs_dim,
         cfg.action_dim) is None
+    from models.dreamer_v4_rssm import (
+        RSSMConfig as _RSSMConfig, RSSMDynamics as _RSSMDynamics,
+        _copy_rssm_state, stream_serve_step)
+    cfg_c = _RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                        n_categoricals=4, n_classes=4, embed_dim=16,
+                        hidden_dim=16, latent_type='deterministic',
+                        cont_gain_dim=2, dob_enabled=True, cv_indices=(0,))
+    m_c = _RSSMDynamics(cfg_c).eval()
+    st_c = m_c.initial_state(1, torch.device('cpu'))
+    assert st_c.c is not None and st_c.c_mean is not None and st_c.c_std is not None
+    with torch.no_grad():
+        st_n = stream_serve_step(
+            m_c, st_c, torch.zeros(1, 2), torch.zeros(1, 6), sample=False)
+    _copy_rssm_state(st_c, st_n)
     _rsrc = open(_rssm_mod.__file__).read()
     assert 'def get_collect_serve_cuda_graph' in _rsrc
     assert 'class CollectServeCudaGraph' in _rsrc
     _tsrc = open(_train_mod.__file__).read()
     assert 'get_collect_serve_cuda_graph' in _tsrc
     assert '_rssm_prev_a.copy_' in _tsrc
+    assert 'def warmup_collect_serve_cuda_graph' in _rsrc
+    assert '_warmup_p3_collect_serve_graph' in _tsrc
+    import evaluation.validate as _val_mod
+    _vsrc = open(_val_mod.__file__).read()
+    assert 'get_collect_serve_cuda_graph' in _vsrc
+    assert '_prev.copy_' in _vsrc
+    assert '_rssm_prev_a = action_t.detach().float()' not in _vsrc
     print('[smoke] OK  collect serve CUDA graph skipped on CPU; eager copy_')
 
 
