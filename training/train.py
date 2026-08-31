@@ -3851,7 +3851,8 @@ def _numpy_dtype_to_torch(dt) -> torch.dtype:
 
 
 def _batch_np_to_device(batch_np: Dict, device: torch.device,
-                        slot: str = 'replay'
+                        slot: str = 'replay',
+                        keys: Optional[Tuple[str, ...]] = None,
                        ) -> Dict[str, torch.Tensor]:
     """Host→device for a numpy replay sample.
 
@@ -3864,6 +3865,10 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device,
     also per-slot so a non-blocking H2D cannot race a later copy into the
     same pinned page.  Host-adaptive: CPU path is a contiguous copy
     (no pin).  Identity values.
+
+    ``keys`` copies only those names that exist in ``batch_np`` (P1 WM
+    needs ``obs``/``act``/``dist``; skip ``rew``/``expert`` except the
+    last logged inner when MTP is in the graph).  ``None`` = all keys.
     """
     out: Dict[str, torch.Tensor] = {}
     cuda = device.type == 'cuda'
@@ -3877,7 +3882,10 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device,
         _batch_np_to_device._host = host_cache  # type: ignore[attr-defined]
         _batch_np_to_device._gpu = gpu_cache  # type: ignore[attr-defined]
     slot_s = str(slot or 'replay')
+    want = None if keys is None else set(keys)
     for k, v in batch_np.items():
+        if want is not None and k not in want:
+            continue
         arr = np.ascontiguousarray(v)
         if not cuda:
             out[k] = torch.from_numpy(arr.copy())
@@ -4015,6 +4023,15 @@ def _persist_last_ok_ckpt(
         return False
 
 
+def _wm_need_logged_aux(will_log: bool, step_i: int, n_inner: int) -> bool:
+    """True on the last inner step of a logged iter (jsonl / BC diag).
+
+    ``will_log`` is ``(total_iters+1) % log_every == 0`` so it lines up
+    with the post-increment ``total_iters % log_every`` jsonl write.
+    """
+    return bool(will_log) and int(step_i) + 1 == int(n_inner)
+
+
 def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
                             step_i: int, n_inner: int) -> bool:
     """P1 MTP is in ``total_loss`` only when ``reward_scale_loss_p1>0``.
@@ -4026,7 +4043,7 @@ def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
     """
     if float(rmtp_weight or 0.0) != 0.0:
         return True
-    return bool(will_log) and int(step_i) + 1 == int(n_inner)
+    return _wm_need_logged_aux(will_log, step_i, n_inner)
 
 
 def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
@@ -6663,6 +6680,40 @@ def _gain_match_fd_held(
     return a_held, dv0.unsqueeze(0) + dd.unsqueeze(1)
 
 
+def _gain_match_fd_action_seq(
+        a_base: torch.Tensor, dv0: Optional[torch.Tensor],
+        n_mv: int, n_dv: int, step: float, K: int, Bm: int,
+        *, cache_owner=None, cache_key=None,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Held FD actions expanded to ``(n_rolls·Bm, K, *)``.
+
+    Rest-IC ``a_base``/``dv0`` are the last rest frame (static).  Cache
+    when ``cache_key`` is set.  PRBS-posterior starts change every
+    batch — leave ``cache_key=None``.  Dropped with the rest-IC graph
+    at g freeze.
+    """
+    if cache_owner is not None and cache_key is not None:
+        cached = getattr(cache_owner, '_gain_match_fd_seq', None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1], cached[2]
+    a_held, dv_held = _gain_match_fd_held(a_base, dv0, n_mv, n_dv, step)
+    n_rolls = int(a_held.shape[0])
+    a_seq = (a_held.unsqueeze(2)
+             .expand(n_rolls, Bm, K, a_held.shape[-1])
+             .reshape(n_rolls * Bm, K, a_held.shape[-1])
+             .contiguous())
+    dv_seq = None
+    if dv_held is not None:
+        dv_seq = (dv_held.unsqueeze(2)
+                  .expand(n_rolls, Bm, K, dv_held.shape[-1])
+                  .reshape(n_rolls * Bm, K, dv_held.shape[-1])
+                  .contiguous())
+    if cache_owner is not None and cache_key is not None:
+        cache_owner._gain_match_fd_seq = (  # type: ignore[attr-defined]
+            cache_key, a_seq, dv_seq)
+    return a_seq, dv_seq
+
+
 def _gain_match_state_from_feat(rssm, feat: torch.Tensor):
     """Unpack ``img_rollout`` last feat into ``(h, z, c)`` for a follow-on roll.
 
@@ -6943,15 +6994,45 @@ def _capture_rest_ic_cuda_graph(
         # rest-IC cache tensors do not require grad, and PyTorch
         # requires sample_args to match the training loop.  GRU params
         # come from ``named_parameters()``, not from the obs/act leaves.
+        #
+        # P57 capture: leftover AccumulateGrad (prior warmup / init)
+        # on the default stream vs capture stream printed a one-shot
+        # mismatch warning.  Drop in-flight grads + sync before
+        # recording; suppress the warn around capture only (identity
+        # for training; host-adaptive).
         o_s = obs.detach()
         a_s = act.detach()
-        with torch.amp.autocast(device_type=obs.device.type, enabled=False):
-            with torch.amp.autocast(
-                    device_type=obs.device.type, dtype=torch.bfloat16,
-                    enabled=True, cache_enabled=False):
-                graphed = torch.cuda.make_graphed_callables(
-                    wrapper, (o_s, a_s), num_warmup_iters=2,
-                    allow_unused_input=True)
+        saved_pre = _rssm_param_grad_snapshot(rssm)
+        rssm.zero_grad(set_to_none=True)
+        if obs.device.type == 'cuda':
+            torch.cuda.synchronize()
+        _warn_fn = getattr(
+            torch.autograd.graph,
+            'set_warn_on_accumulate_grad_stream_mismatch', None)
+        _warn_prev = True
+        if _warn_fn is not None:
+            try:
+                _warn_prev = _warn_fn(False)
+            except TypeError:
+                _warn_fn(False)
+        try:
+            with torch.amp.autocast(device_type=obs.device.type, enabled=False):
+                with torch.amp.autocast(
+                        device_type=obs.device.type, dtype=torch.bfloat16,
+                        enabled=True, cache_enabled=False):
+                    graphed = torch.cuda.make_graphed_callables(
+                        wrapper, (o_s, a_s), num_warmup_iters=2,
+                        allow_unused_input=True)
+        finally:
+            if _warn_fn is not None:
+                try:
+                    if _warn_prev is None:
+                        _warn_fn(True)
+                    else:
+                        _warn_fn(bool(_warn_prev))
+                except TypeError:
+                    _warn_fn(True)
+            _rssm_param_grad_restore(saved_pre)
     except Exception as e:
         print('[gain-match] rest-ic CUDA graph capture failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
@@ -7077,6 +7158,9 @@ def _release_rest_ic_cuda_graph(rssm) -> bool:
         delattr(rssm, '_rest_ic_cg')
     if hasattr(rssm, '_rest_ic_cg_fail'):
         delattr(rssm, '_rest_ic_cg_fail')
+    # Rest-IC FD a_seq cache (static rest act/dv; not the graph).
+    if hasattr(rssm, '_gain_match_fd_seq'):
+        delattr(rssm, '_gain_match_fd_seq')
     return bool(released)
 
 
@@ -7388,9 +7472,22 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # K-loops (linear in n_mv+n_dv) were dead after P32 TSSM wiring.
     n_mv_t = len(mv_tgts)
     n_dv_t = len(dv_tgts)
-    a_held, dv_held = _gain_match_fd_held(
-        a_base, dv0, n_mv_t, n_dv_t, step)
-    n_rolls = int(a_held.shape[0])
+    n_rolls = 1 + int(n_mv_t) + int(n_dv_t)
+    cache_owner = None
+    cache_key = None
+    if rest is not None:
+        rest_act = getattr(cfg, '_gain_match_rest_act', None)
+        if rest_act is not None:
+            cache_owner = rssm
+            cache_key = (
+                id(rest_act), int(n_mv_t), int(n_dv_t), float(step),
+                int(K), int(Bm), str(a_base.device), str(a_base.dtype),
+                int(a_base.shape[-1]),
+                0 if dv0 is None else int(dv0.shape[-1]),
+            )
+    a_seq, dv_seq = _gain_match_fd_action_seq(
+        a_base, dv0, n_mv_t, n_dv_t, step, K, Bm,
+        cache_owner=cache_owner, cache_key=cache_key)
 
     def _repeat_starts(t):
         return (t.unsqueeze(0).expand(n_rolls, *t.shape)
@@ -7399,16 +7496,6 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     h_b = _repeat_starts(h0)
     z_b = _repeat_starts(z0)
     c_b = _repeat_starts(c0) if c0 is not None else None
-    a_seq = (a_held.unsqueeze(2)
-             .expand(n_rolls, Bm, K, a_held.shape[-1])
-             .reshape(n_rolls * Bm, K, a_held.shape[-1])
-             .contiguous())
-    dv_seq = None
-    if dv_held is not None:
-        dv_seq = (dv_held.unsqueeze(2)
-                  .expand(n_rolls, Bm, K, dv_held.shape[-1])
-                  .reshape(n_rolls * Bm, K, dv_held.shape[-1])
-                  .contiguous())
     # Last-step Huber only: skip the unused (Bm, K, F) stack.
     # ``out='obs'`` decodes once after the K-loop (same as
     # ``decode(last feat)``; no extra last-feat tensor).
@@ -7429,17 +7516,18 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # ``*_ratio`` = mean G_pred/G_tgt so Huber~0 cannot hide a 0.75@DV
     # rest-step miss the way P43 jsonl did.
     with torch.no_grad():
-        g_all = (cv_steps - cv_base) / step
-        if n_mv_t:
-            diag['gain_match_mv_loss'] = _huber_from_cv(
-                cv_base, cv_steps[:n_mv_t], mv_tgts)
-            diag['gain_match_mv_ratio'] = _gain_match_pred_over_tgt(
-                g_all[:n_mv_t], mv_tgts)
-        if dv_tgts:
-            diag['gain_match_dv_loss'] = _huber_from_cv(
-                cv_base, cv_steps[n_mv_t:], dv_tgts)
-            diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
-                g_all[n_mv_t:], dv_tgts)
+        if bool(getattr(cfg, '_wm_need_logged_aux', True)):
+            g_all = (cv_steps - cv_base) / step
+            if n_mv_t:
+                diag['gain_match_mv_loss'] = _huber_from_cv(
+                    cv_base, cv_steps[:n_mv_t], mv_tgts)
+                diag['gain_match_mv_ratio'] = _gain_match_pred_over_tgt(
+                    g_all[:n_mv_t], mv_tgts)
+            if dv_tgts:
+                diag['gain_match_dv_loss'] = _huber_from_cv(
+                    cv_base, cv_steps[n_mv_t:], dv_tgts)
+                diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
+                    g_all[n_mv_t:], dv_tgts)
     return loss, diag
 
 
@@ -8042,21 +8130,25 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     losses.update(kl_diag)
     losses.update(gain_match_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
-    with torch.no_grad():
-        # Scope 2: stochastic block only (exclude any DOB d-tail).
-        _ze = rssm.deter_dim + rssm.stoch_flat_dim
-        z_flat = feats[..., rssm.deter_dim:_ze]
-        obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
-        z_var_per_dim = z_flat.float().var(dim=(0, 1))
-        losses['encoder_var_ratio'] = (z_var_per_dim.mean() / obs_var).detach()
-        s_var = z_var_per_dim.sum().clamp_min(1e-12)
-        s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
-        losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
-        losses['z_dim'] = torch.tensor(float(z_flat.shape[-1]),
-                                        device=feats.device)
-        v_max = z_var_per_dim.max().clamp_min(1e-12)
-        losses['z_alive_dims'] = (
-            (z_var_per_dim > 0.01 * v_max).float().sum().detach())
+    # jsonl uses the last inner of a logged iter; skip the rest (var over
+    # B=128,T=128,1024 every WM step).  Default True so probes / direct
+    # callers still get the keys.
+    if bool(getattr(cfg, '_wm_need_enc_diag', True)):
+        with torch.no_grad():
+            # Scope 2: stochastic block only (exclude any DOB d-tail).
+            _ze = rssm.deter_dim + rssm.stoch_flat_dim
+            z_flat = feats[..., rssm.deter_dim:_ze]
+            obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
+            z_var_per_dim = z_flat.float().var(dim=(0, 1))
+            losses['encoder_var_ratio'] = (z_var_per_dim.mean() / obs_var).detach()
+            s_var = z_var_per_dim.sum().clamp_min(1e-12)
+            s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
+            losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
+            losses['z_dim'] = torch.tensor(float(z_flat.shape[-1]),
+                                            device=feats.device)
+            v_max = z_var_per_dim.max().clamp_min(1e-12)
+            losses['z_alive_dims'] = (
+                (z_var_per_dim > 0.01 * v_max).float().sum().detach())
     # z_clean here = posterior stochastic features (detached).
     # Scope 2: stochastic block only (exclude any DOB d-tail).
     return losses, feats[..., rssm.deter_dim:rssm.deter_dim
@@ -8180,25 +8272,26 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     #   - var_ratio ≪ 0.1 → encoder is collapsing (low-rank latent)
     #   - var_ratio ≈ 0.5–2.0 → healthy bottleneck
     #   - var_ratio ≫ 5     → encoder is over-amplifying (rare)
-    with torch.no_grad():
-        obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
-        z_var_per_dim = z_clean.float().var(dim=(0, 1))           # (Z,)
-        z_var = z_var_per_dim.mean()
-        losses['encoder_var_ratio'] = (z_var / obs_var).detach()
-        # Latent participation ratio (effective rank) — codebook health.
-        # If a handful of z-dims carry all the variance, the latent has
-        # collapsed and the dynamics module cannot express plant modes.
-        # PR = (sum var)^2 / sum(var^2);  PR == Z means all dims equal;
-        # PR == 1 means a single dim dominates.
-        s_var = z_var_per_dim.sum().clamp_min(1e-12)
-        s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
-        losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
-        losses['z_dim'] = torch.tensor(float(z_clean.shape[-1]),
-                                          device=z_clean.device)
-        # Count "alive" dims: variance > 1% of max-dim variance.
-        v_max = z_var_per_dim.max().clamp_min(1e-12)
-        losses['z_alive_dims'] = (
-            (z_var_per_dim > 0.01 * v_max).float().sum().detach())
+    if bool(getattr(cfg, '_wm_need_enc_diag', True)):
+        with torch.no_grad():
+            obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
+            z_var_per_dim = z_clean.float().var(dim=(0, 1))           # (Z,)
+            z_var = z_var_per_dim.mean()
+            losses['encoder_var_ratio'] = (z_var / obs_var).detach()
+            # Latent participation ratio (effective rank) — codebook health.
+            # If a handful of z-dims carry all the variance, the latent has
+            # collapsed and the dynamics module cannot express plant modes.
+            # PR = (sum var)^2 / sum(var^2);  PR == Z means all dims equal;
+            # PR == 1 means a single dim dominates.
+            s_var = z_var_per_dim.sum().clamp_min(1e-12)
+            s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
+            losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
+            losses['z_dim'] = torch.tensor(float(z_clean.shape[-1]),
+                                              device=z_clean.device)
+            # Count "alive" dims: variance > 1% of max-dim variance.
+            v_max = z_var_per_dim.max().clamp_min(1e-12)
+            losses['z_alive_dims'] = (
+                (z_var_per_dim > 0.01 * v_max).float().sum().detach())
     losses.update({k: v for k, v in sf_diag.items()})
     return losses, z_clean.detach(), agent_hid
 
@@ -12825,7 +12918,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _sample_T = (int(cfg.seq_len) if current_phase == 3
                          else _wm_train_seq_len(cfg))
             batch_np = _src_buf.sample(cfg.batch_size, _sample_T, rng)
-            batch = _batch_np_to_device(batch_np, device)
+            # jsonl / banner use the last inner of a logged iter.  Skip
+            # encoder-var / Huber MV-DV splits / unused P1 H2D on the
+            # other 99 inner steps (objective unchanged).
+            _need_aux = _wm_need_logged_aux(_will_log, _i, n_inner)
+            cfg._wm_need_logged_aux = _need_aux  # type: ignore[attr-defined]
+            cfg._wm_need_enc_diag = _need_aux  # type: ignore[attr-defined]
+            _p1_mtp = (current_phase == 1 and _p1_need_agent_finetune(
+                p1_rmtp_weight, _will_log, _i, n_inner))
+            _h2d_keys = None
+            if current_phase == 1 and not _p1_mtp:
+                _h2d_keys = ('obs', 'act', 'dist')
+            batch = _batch_np_to_device(batch_np, device, keys=_h2d_keys)
             t_sample_acc += time.time() - _t
 
             if current_phase in (1, 2):
@@ -12850,8 +12954,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # collapse the prior).  Skip the unused MTP forward
                     # except the last inner step of a logged iter.
                     if (current_phase == 1
-                            and _p1_need_agent_finetune(
-                                p1_rmtp_weight, _will_log, _i, n_inner)):
+                            and _p1_mtp):
                         # P39 diag C: optional stop-gradient on agent_hid
                         # before reward-MTP head, to isolate whether
                         # reward-MTP gradients distort the encoder/dynamics

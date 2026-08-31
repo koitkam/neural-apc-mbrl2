@@ -56,7 +56,9 @@ from training.train import (
                             _clone_module_state, _refresh_module_state,
                             _load_module_state,
                             _p1_need_agent_finetune,
+                            _wm_need_logged_aux,
                             _smooth_l1_gain_match, _gain_match_fd_held,
+                            _gain_match_fd_action_seq,
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt,
@@ -209,6 +211,9 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _p1_need_agent_finetune(0.0, True, 98, 100) is False
     assert _p1_need_agent_finetune(0.0, True, 99, 100) is True
     assert _p1_need_agent_finetune(1.0, False, 0, 100) is True
+    assert _wm_need_logged_aux(False, 0, 100) is False
+    assert _wm_need_logged_aux(True, 98, 100) is False
+    assert _wm_need_logged_aux(True, 99, 100) is True
     print('[smoke] OK  P1 MTP skip when reward_scale_loss_p1=0 (log last only)')
 
     class _Snap(torch.nn.Module):
@@ -1094,6 +1099,11 @@ def _test_batch_np_to_device_identity() -> None:
             g_crit['obs'].detach().cpu().numpy(), 0.0, rtol=0, atol=1e-6)
         _batch_np_to_device._host = {}  # type: ignore[attr-defined]
         _batch_np_to_device._gpu = {}  # type: ignore[attr-defined]
+    slim = _batch_np_to_device(batch, cpu, keys=('obs', 'act'))
+    assert set(slim.keys()) == {'obs', 'act'}
+    np.testing.assert_allclose(slim['obs'].numpy(), batch['obs'], rtol=0, atol=0)
+    np.testing.assert_allclose(slim['act'].numpy(), batch['act'], rtol=0, atol=0)
+    assert 'rew' not in slim
     print('[smoke] OK  replay H2D identity + PMPO prior-refresh REMOVED')
 
 
@@ -1389,6 +1399,11 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _fn(o, a):' not in _src
     assert '_warmup_rest_ic_cuda_graph' in _src
     assert '_amp_parent_autocast_on' in _src
+    assert 'set_warn_on_accumulate_grad_stream_mismatch' in _src
+    assert '_gain_match_fd_action_seq' in _src
+    assert 'def _wm_need_logged_aux' in _src
+    assert '_wm_need_enc_diag' in _src
+    assert "_h2d_keys = ('obs', 'act', 'dist')" in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
@@ -2244,6 +2259,40 @@ def _test_gain_match_fd_held() -> None:
     print('[smoke] OK  gain-match FD held stack (broadcast ≡ clone-loop)')
 
 
+def _test_gain_match_fd_action_seq() -> None:
+    """Rest-IC FD a_seq cache is identity with the uncached expand."""
+    torch.manual_seed(0)
+    Bm, n_mv, n_dv, step, K = 4, 2, 1, 1.0, 5
+    a_base = torch.randn(Bm, n_mv)
+    dv0 = torch.randn(Bm, n_dv)
+    a_held, dv_held = _gain_match_fd_held(a_base, dv0, n_mv, n_dv, step)
+    n_rolls = int(a_held.shape[0])
+    ref_a = (a_held.unsqueeze(2).expand(n_rolls, Bm, K, n_mv)
+             .reshape(n_rolls * Bm, K, n_mv).contiguous())
+    ref_dv = (dv_held.unsqueeze(2).expand(n_rolls, Bm, K, n_dv)
+              .reshape(n_rolls * Bm, K, n_dv).contiguous())
+
+    class _Own:
+        pass
+
+    own = _Own()
+    key = ('rest', n_mv, n_dv, step, K, Bm)
+    a1, d1 = _gain_match_fd_action_seq(
+        a_base, dv0, n_mv, n_dv, step, K, Bm,
+        cache_owner=own, cache_key=key)
+    a2, d2 = _gain_match_fd_action_seq(
+        a_base, dv0, n_mv, n_dv, step, K, Bm,
+        cache_owner=own, cache_key=key)
+    assert a1 is a2 and d1 is d2
+    assert torch.allclose(a1, ref_a)
+    assert torch.allclose(d1, ref_dv)
+    a3, d3 = _gain_match_fd_action_seq(a_base, dv0, n_mv, n_dv, step, K, Bm)
+    a4, d4 = _gain_match_fd_action_seq(a_base, dv0, n_mv, n_dv, step, K, Bm)
+    assert a3 is not a4
+    assert torch.allclose(a3, ref_a) and torch.allclose(d3, ref_dv)
+    print('[smoke] OK  gain-match FD action seq cache (rest-IC identity)')
+
+
 def _test_gain_match_held_settle() -> None:
     """P44: held settle unpacks last feat; <2 is identity; grad reaches GRU."""
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
@@ -2494,9 +2543,11 @@ def _test_gain_match_rest_ic() -> None:
     r = type('R', (), {})()
     r._rest_ic_cg = ('k', None)
     r._rest_ic_cg_fail = True
+    r._gain_match_fd_seq = ('seq', None, None)
     assert _release_rest_ic_cuda_graph(r) is True
     assert not hasattr(r, '_rest_ic_cg')
     assert not hasattr(r, '_rest_ic_cg_fail')
+    assert not hasattr(r, '_gain_match_fd_seq')
     assert _release_rest_ic_cuda_graph(r) is False
     assert _release_rest_ic_cuda_graph(None) is False
     print('[smoke] OK  rest-ic CUDA graph release is identity on CPU')
@@ -3922,6 +3973,7 @@ if __name__ == '__main__':
     _test_gain_match_per_input_huber()
     _test_gain_match_pred_over_tgt()
     _test_gain_match_fd_held()
+    _test_gain_match_fd_action_seq()
     _test_gain_match_held_settle()
     _test_gain_match_rest_window()
     _test_held_rollout_win_fits_k()

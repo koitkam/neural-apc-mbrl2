@@ -85,7 +85,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > P55 pid capture failed (autocast
 > cache) → eager T-loop. **P56 pid** warmup failed
 > (`grad requires non-empty inputs` on a nested function with empty
-> ``parameters()``). HEAD captures **before** the WM autocast loop
+> ``parameters()``). **P57 pid 116788 captured** ``N=6 T=55``
+> (``t_wm`` median **99 s** vs P56 124 s). HEAD captures **before** the WM autocast loop
 > (exit parent autocast, `cache_enabled=False`), **never captures
 > in-loop**, and graphs `_RestICGraphModule` so RSSM
 > `parameters` / `named_parameters` / `buffers` /
@@ -93,7 +94,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`allow_unused_input=True`; overriding only `parameters()` left
 > `named_parameters()` / `buffers()` empty). Transient VRAM skip
 > does **not** pin `_rest_ic_cg_fail` (warmup retries once after
-> `empty_cache`). HEAD
+> `empty_cache`). Capture also zeros+syncs and suppresses the
+> one-shot AccumulateGrad stream-mismatch warn. Rest-IC FD `a_seq` is
+> cached; encoder-var / Huber MV–DV jsonl run on the last logged
+> inner only; P1 H2D is `obs`/`act`/`dist` except MTP last. HEAD
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
