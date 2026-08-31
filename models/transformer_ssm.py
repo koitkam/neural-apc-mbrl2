@@ -126,8 +126,9 @@ import torch.nn.functional as F
 # Reuse the proven RSSM building blocks so the categorical latent + KL are
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
 from models.dreamer_v4_rssm import (
-    _CategoricalLatent, _ContinuousLatent, _time_unbind, cached_zeros_btd,
-    dob_kalman_scan, _append_decode_core, _stack_decode_core)
+    _CategoricalLatent, _ContinuousLatent, _prior_c_from_net, _time_unbind,
+    cached_zeros_bd, cached_zeros_btd, dob_kalman_scan, _append_decode_core,
+    _stack_decode_core)
 
 
 @dataclass
@@ -532,14 +533,16 @@ class TransformerSSMDynamics(nn.Module):
         parts = [z.flatten(start_dim=-2)]
         if self.cont_dim > 0:
             if c is None:
-                c = torch.zeros(action.shape[0], self.cont_dim,
-                                device=action.device, dtype=action.dtype)
+                c = cached_zeros_bd(
+                    self, int(action.shape[0]), self.cont_dim,
+                    action.dtype, action.device)
             parts.append(c)
         parts.append(action)
         if self.dv_dim > 0:
             if dv is None:
-                dv = torch.zeros(action.shape[0], self.dv_dim,
-                                 device=action.device, dtype=action.dtype)
+                dv = cached_zeros_bd(
+                    self, int(action.shape[0]), self.dv_dim,
+                    action.dtype, action.device)
             parts.append(dv)
         return self.token_proj(torch.cat(parts, dim=-1))
 
@@ -583,8 +586,9 @@ class TransformerSSMDynamics(nn.Module):
         Returns ``(h, d_new, dv_new, new_cache, new_pos)``.
         """
         if self.dv_feedforward and dv is None:
-            dv = torch.zeros(prev_action.shape[0], self.dv_dim,
-                             device=prev_action.device, dtype=prev_action.dtype)
+            dv = cached_zeros_bd(
+                self, int(prev_action.shape[0]), self.dv_dim,
+                prev_action.dtype, prev_action.device)
         token = self._build_token(prev.z, prev_action, dv, getattr(prev, 'c', None))
         cache = getattr(prev, 'kv_cache', None)
         pos = int(getattr(prev, 'pos', 0) or 0)
@@ -609,28 +613,9 @@ class TransformerSSMDynamics(nn.Module):
         h, d_new, dv_new, new_cache, new_pos = self._core_transition(
             prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
-        # Continuous-latent prior p(c'|h') (gain persists, disturbance OU-rolls).
-        c_new = c_mean = c_std = None
-        if self.cont_dim > 0:
-            c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
-            # Deterministic block rolls (prior MEAN) in imagination — mirror of
-            # RSSM.  DISTURBANCE (p140): clean feedforward, no sampling noise in
-            # the imagined reward.  GAIN (p20 observer-bias RCA): roll at the mean
-            # so the strong sample=True gain supervisor trains the actor's
-            # sample=False belief (E[f(c_sampled)] ≠ f(mean) under the nonlinear
-            # rollout) and the gain stops varying run-to-run.
-            if sample and self.cont_dim > 0 and (
-                    self.cont_gain_deterministic_roll
-                    or self.cont_dist_deterministic_roll):
-                gain_part = (
-                    c_mean[..., :self.cont_gain_dim]
-                    if self.cont_gain_deterministic_roll
-                    else c_new[..., :self.cont_gain_dim])
-                dist_part = (
-                    c_mean[..., self.cont_gain_dim:]
-                    if self.cont_dist_deterministic_roll
-                    else c_new[..., self.cont_gain_dim:])
-                c_new = torch.cat([gain_part, dist_part], dim=-1)
+        # Continuous-latent prior (RSSM mirror).  Skip discarded randn when
+        # det-roll replaces the whole sample with the prior MEAN.
+        c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
         return TSSMState(h=h, z_logits=z_logits, z=z,
                          kv_cache=new_cache, pos=new_pos, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
@@ -678,8 +663,8 @@ class TransformerSSMDynamics(nn.Module):
         K = actions.shape[1]
         c = None
         if self.cont_dim > 0:
-            c = (c0 if c0 is not None else torch.zeros(
-                Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
+            c = (c0 if c0 is not None else cached_zeros_bd(
+                self, int(Bm), self.cont_dim, h0.dtype, h0.device))
         if out not in ('feat', 'h', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
         z_logits = cached_zeros_btd(

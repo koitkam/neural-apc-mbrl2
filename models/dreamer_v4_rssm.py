@@ -195,6 +195,59 @@ def cached_zeros_btd(mod, B: int, T: int, D: int, dtype, device,
     return z
 
 
+def cached_zeros_bd(mod, B: int, D: int, dtype, device,
+                    attr: str = '_zeros_bd_cache') -> torch.Tensor:
+    """Reuse a ``(B, D)`` zero row. Identity vs ``torch.zeros``; do not write.
+
+    GRU / token ``c is None`` / ``dv is None`` fills on the T/K loop.
+    Own shape dict (not a ``[:,0]`` view of the 3-D cache — that view
+    is a new object every call).
+    """
+    key = (int(B), int(D), str(dtype), str(device))
+    store = getattr(mod, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(mod, attr, store)
+    z = store.get(key)
+    if z is None:
+        z = torch.zeros(int(B), int(D), device=device, dtype=dtype)
+        store[key] = z
+    return z
+
+
+def _prior_c_from_net(mod, h: torch.Tensor, sample: bool):
+    """Prior continuous latent for ``img_step``.
+
+    Deterministic-roll flags replace the sampled ``c`` with the prior
+    MEAN.  Skip ``randn`` + the splice ``cat`` when the whole ``c`` is
+    that mean (env-free: gain-only + ``cont_gain_deterministic_roll``).
+    Identity vs sample-then-overwrite.  Overshoot/held call this once
+    per K per WM inner.
+    """
+    if int(getattr(mod, 'cont_dim', 0) or 0) <= 0:
+        return None, None, None
+    gain_m = bool(getattr(mod, 'cont_gain_deterministic_roll', False))
+    dist_m = bool(getattr(mod, 'cont_dist_deterministic_roll', False))
+    gdim = int(getattr(mod, 'cont_gain_dim', 0) or 0)
+    cdim = int(mod.cont_dim)
+    whole_mean = (
+        (gain_m and dist_m)
+        or (gain_m and gdim >= cdim)
+        or (dist_m and gdim <= 0)
+    )
+    take_mean = (not sample) or whole_mean
+    c_new, c_mean, c_std = mod.cont_prior_net(h, sample=not take_mean)
+    if take_mean:
+        return c_mean, c_mean, c_std
+    if gain_m or dist_m:
+        gain_part = (
+            c_mean[..., :gdim] if gain_m else c_new[..., :gdim])
+        dist_part = (
+            c_mean[..., gdim:] if dist_m else c_new[..., gdim:])
+        c_new = torch.cat([gain_part, dist_part], dim=-1)
+    return c_new, c_mean, c_std
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -706,16 +759,16 @@ class RSSMDynamics(nn.Module):
         if self.cont_dim > 0:
             c_prev = prev.c
             if c_prev is None:
-                c_prev = torch.zeros(prev_action.shape[0], self.cont_dim,
-                                     device=prev_action.device,
-                                     dtype=prev_action.dtype)
+                c_prev = cached_zeros_bd(
+                    self, int(prev_action.shape[0]), self.cont_dim,
+                    prev_action.dtype, prev_action.device)
             parts.append(c_prev)
         parts.append(prev_action)
         if self.dv_dim > 0:
             if dv is None:
-                dv = torch.zeros(prev_action.shape[0], self.dv_dim,
-                                 device=prev_action.device,
-                                 dtype=prev_action.dtype)
+                dv = cached_zeros_bd(
+                    self, int(prev_action.shape[0]), self.dv_dim,
+                    prev_action.dtype, prev_action.device)
             parts.append(dv)
         h = self.gru(self.pre_gru(torch.cat(parts, dim=-1)), prev.h)
         # Stage-1 (``dob_active=False``) forces ``d_t≡0`` after the loop
@@ -741,31 +794,9 @@ class RSSMDynamics(nn.Module):
         z_logits, z = self.prior_net(h, sample=sample)
         # Continuous-latent prior p(c'|h'): gain persists (carried via h) and
         # the disturbance OU-rolls; both inferred from the recurrent state.
-        c_new = c_mean = c_std = None
-        if self.cont_dim > 0:
-            c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
-            # Roll selected blocks DETERMINISTICALLY (prior MEAN) in imagination.
-            # DISTURBANCE block (p140 RCA): the actor needs the PREDICTED load as
-            # a clean feedforward, not a per-rollout sample that buries the action
-            # signal in the imagined reward.  GAIN block (p20 observer-bias RCA):
-            # the open-loop gain enters nonlinearly through the multi-step
-            # rollout, so E[f(c_sampled)] (what the sample=True supervisor trains)
-            # ≠ f(mean) (what the sample=False actor/transfer-matrix use) — roll
-            # the gain at its mean so the strong supervisor trains the actor's
-            # belief and the gain stops varying run-to-run.  No-op when
-            # sample=False (c_new == c_mean already) or the block is absent.
-            if sample and self.cont_dim > 0 and (
-                    self.cont_gain_deterministic_roll
-                    or self.cont_dist_deterministic_roll):
-                gain_part = (
-                    c_mean[..., :self.cont_gain_dim]
-                    if self.cont_gain_deterministic_roll
-                    else c_new[..., :self.cont_gain_dim])
-                dist_part = (
-                    c_mean[..., self.cont_gain_dim:]
-                    if self.cont_dist_deterministic_roll
-                    else c_new[..., self.cont_gain_dim:])
-                c_new = torch.cat([gain_part, dist_part], dim=-1)
+        # Deterministic-roll blocks use the prior MEAN (p20 / p140).  Skip
+        # discarded ``randn`` when the whole ``c`` is that mean.
+        c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
         return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
 
@@ -1087,8 +1118,8 @@ class RSSMDynamics(nn.Module):
         K = actions.shape[1]
         c = None
         if self.cont_dim > 0:
-            c = (c0 if c0 is not None else torch.zeros(
-                Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
+            c = (c0 if c0 is not None else cached_zeros_bd(
+                self, int(Bm), self.cont_dim, h0.dtype, h0.device))
         if out not in ('feat', 'h', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
         # Layout-only IC: ``img_step`` replaces ``z_logits`` (no in-place

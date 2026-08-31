@@ -6891,8 +6891,37 @@ def _smooth_l1_gain_match(
     return torch.where(abs_e < b, quadratic, linear).mean()
 
 
+def _gain_match_tgt_tensor(g_wm: torch.Tensor, tgts, owner=None):
+    """``(n_in, n_cv)`` teacher G. Identity vs rebuild; do not write.
+
+    Huber + jsonl ``*_ratio`` rebuilt this from Python lists every
+    logged WM inner (and Huber three times: total/MV/DV).  Shape dict
+    on ``owner`` (cfg) or on this function.
+    """
+    if not tgts:
+        return None
+    key = (tuple(tuple(float(x) for x in row) for row in tgts),
+           str(g_wm.device), str(g_wm.dtype))
+    if owner is not None:
+        store = getattr(owner, '_gain_match_tgt_t', None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(owner, '_gain_match_tgt_t', store)
+    else:
+        store = getattr(_gain_match_tgt_tensor, '_store', None)
+        if not isinstance(store, dict):
+            store = {}
+            _gain_match_tgt_tensor._store = store  # type: ignore[attr-defined]
+    t = store.get(key)
+    if t is None:
+        t = torch.tensor([list(row) for row in tgts],
+                         device=g_wm.device, dtype=g_wm.dtype)
+        store[key] = t
+    return t
+
+
 def _gain_match_pred_over_tgt(
-        g_wm: torch.Tensor, tgts) -> torch.Tensor:
+        g_wm: torch.Tensor, tgts, owner=None) -> torch.Tensor:
     """Mean ``G_pred / G_tgt`` over finite targets (no extra FD).
 
     P43 Huber ~1e-4 while TM DV stayed ×0.74 — jsonl Huber is 0 at a
@@ -6901,8 +6930,7 @@ def _gain_match_pred_over_tgt(
     """
     if not tgts:
         return g_wm.new_zeros(())
-    tgt = torch.as_tensor([list(t) for t in tgts],
-                         device=g_wm.device, dtype=g_wm.dtype)
+    tgt = _gain_match_tgt_tensor(g_wm, tgts, owner)
     tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
                       g_wm.shape[-1]).expand_as(g_wm)
     ok = tgt_b.abs() >= 1e-6
@@ -7786,21 +7814,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         if not tgts:
             return zero
         g_wm = (cv_step_stack - cv_base) / step
-        # Cache the (n_in, n_cv) target — same every WM step; rebuilding
-        # it from Python lists was a host→device sync on the 100-step P1
-        # inner loop.  Identity values.  Key includes the tgt numbers so a
-        # mid-run target rewrite cannot reuse a stale tensor of the same
-        # shape.
-        _tgt_key = (tuple(tuple(float(x) for x in t) for t in tgts),
-                    str(g_wm.device), str(g_wm.dtype),
-                    int(g_wm.shape[0]), int(g_wm.shape[-1]))
-        _cached = getattr(cfg, '_gain_match_tgt_cache', None)
-        if _cached is None or _cached[0] != _tgt_key:
-            tgt = torch.tensor([list(t) for t in tgts],
-                               device=g_wm.device, dtype=g_wm.dtype)
-            cfg._gain_match_tgt_cache = (_tgt_key, tgt)  # type: ignore[attr-defined]
-        else:
-            tgt = _cached[1]
+        tgt = _gain_match_tgt_tensor(g_wm, tgts, cfg)
         tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
                          g_wm.shape[-1]).expand_as(g_wm)
         return _smooth_l1_gain_match(g_wm, tgt_b, beta=_hb, per_input=_per)
@@ -7864,12 +7878,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                 diag['gain_match_mv_loss'] = _huber_from_cv(
                     cv_base, cv_steps[:n_mv_t], mv_tgts)
                 diag['gain_match_mv_ratio'] = _gain_match_pred_over_tgt(
-                    g_all[:n_mv_t], mv_tgts)
+                    g_all[:n_mv_t], mv_tgts, cfg)
             if dv_tgts:
                 diag['gain_match_dv_loss'] = _huber_from_cv(
                     cv_base, cv_steps[n_mv_t:], dv_tgts)
                 diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
-                    g_all[n_mv_t:], dv_tgts)
+                    g_all[n_mv_t:], dv_tgts, cfg)
     return loss, diag
 
 

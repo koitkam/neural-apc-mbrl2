@@ -67,7 +67,7 @@ from training.train import (
                             _gain_match_fd_action_seq,
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
-                            _gain_match_pred_over_tgt,
+                            _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
                             _gain_match_rest_window, _held_rollout_win,
                             _rest_ic_can_cuda_graph,
                             _RestICGraphModule, _rest_ic_last_tensors,
@@ -1538,6 +1538,43 @@ def _test_img_rollout_last_only() -> None:
           f'z_logits cache identity max_err={cache_err:.2e}')
 
 
+def _test_img_step_det_roll_skips_sample() -> None:
+    """Gain det-roll: sample=True prior c is the mean; skip discarded randn."""
+    from models.dreamer_v4_rssm import (
+        RSSMConfig, RSSMDynamics, cached_zeros_bd)
+    torch.manual_seed(0)
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     cont_gain_dim=2, latent_noise=0.0)
+    m = RSSMDynamics(cfg)
+    assert m.cont_gain_deterministic_roll is True
+    assert int(m.cont_gain_dim) >= int(m.cont_dim)
+    B = 4
+    state = m.initial_state(B, torch.device('cpu'))
+    a = torch.zeros(B, cfg.action_dim)
+    samples = []
+    orig = m.cont_prior_net.forward
+
+    def _spy(x, sample=True):
+        samples.append(bool(sample))
+        return orig(x, sample=sample)
+
+    m.cont_prior_net.forward = _spy
+    s_true = m.img_step(state, a, sample=True)
+    s_false = m.img_step(state, a, sample=False)
+    assert samples == [False, False], samples
+    assert s_true.c is not None and s_true.c_mean is not None
+    assert torch.allclose(s_true.c, s_true.c_mean)
+    assert torch.allclose(s_true.c, s_false.c)
+    assert torch.allclose(s_true.z, s_false.z)
+    assert torch.allclose(s_true.h, s_false.h)
+    z1 = cached_zeros_bd(m, B, m.cont_dim, a.dtype, a.device)
+    z2 = cached_zeros_bd(m, B, m.cont_dim, a.dtype, a.device)
+    assert z1 is z2
+    print('[smoke] OK  img_step det-roll skips discarded prior-c sample')
+
+
 def _test_isolation_dcv_scales() -> None:
     """|ΔCV| excitation: Δu ∝ 1/|G| floored at op-band (not a loss reweight)."""
     import numpy as _np
@@ -1601,6 +1638,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_mv_ratio' in _src
     assert 'gain_match_dv_ratio' in _src
     assert '_gain_match_pred_over_tgt' in _src
+    assert '_gain_match_tgt_tensor' in _src
     assert '_should_lock_last_ok' in _src
     assert '_should_probe_gain_on_last_ok' in _src
     assert '_probe_observer_gain_ready_maybe_last_ok' in _src
@@ -1704,6 +1742,10 @@ def _test_isolation_dcv_scales() -> None:
     _cz = _rssm_src[_rssm_src.index('def cached_zeros_btd'):
                     _rssm_src.index('class RSSMConfig')]
     assert 'isinstance(store, dict)' in _cz
+    assert 'def cached_zeros_bd' in _cz
+    assert 'def _prior_c_from_net' in _cz
+    assert 'sample=not take_mean' in _cz
+    assert 'c0 if c0 is not None else cached_zeros_bd' in _rssm_src
     assert '_img_zlogits_zeros' in _rssm_src
     assert 'def _cached_arange_1k' in _src
     assert 'def _cached_strided_arange' in _src
@@ -2552,6 +2594,13 @@ def _test_gain_match_pred_over_tgt() -> None:
     assert abs(float(_gain_match_pred_over_tgt(dv, ((0.51,),))) - 0.75) < 1e-6
     z = _gain_match_pred_over_tgt(mv, ())
     assert float(z) == 0.0
+    owner = TrainConfig()
+    r1 = _gain_match_pred_over_tgt(mv, ((-2.624,),), owner)
+    r2 = _gain_match_pred_over_tgt(mv, ((-2.624,),), owner)
+    assert abs(float(r1) - 1.0) < 1e-6 and abs(float(r2) - 1.0) < 1e-6
+    t1 = _gain_match_tgt_tensor(mv, ((-2.624,),), owner)
+    t2 = _gain_match_tgt_tensor(mv, ((-2.624,),), owner)
+    assert t1 is t2
     print('[smoke] OK  gain-match pred/tgt ratio (P43 Huber-blind miss)')
 
 
@@ -4399,6 +4448,7 @@ if __name__ == '__main__':
     _test_buffer_sample_keys()
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
+    _test_img_step_det_roll_skips_sample()
     _test_stage1_dob_ground_skip()
     _test_stream_serve_matches_rollout()
     _test_collect_serve_cuda_graph_cpu()

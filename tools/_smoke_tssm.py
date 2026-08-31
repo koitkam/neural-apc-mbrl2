@@ -134,6 +134,32 @@ def test_img_rollout_equals_img_step():
           f"last_h={last_h_err:.2e} last_obs={last_obs_err:.2e})")
 
 
+def test_img_step_det_roll_skips_sample():
+    """Gain det-roll: sample=True prior c is the mean; skip discarded randn."""
+    torch.manual_seed(0)
+    cfg = TransformerSSMConfig(
+        obs_dim=6, action_dim=2, deter_dim=32, n_categoricals=4, n_classes=4,
+        embed_dim=16, n_layers=2, n_heads=4, max_seq_len=64,
+        cont_gain_dim=2)
+    m = TransformerSSMDynamics(cfg).eval()
+    B = 3
+    state = m.initial_state(B, torch.device('cpu'))
+    a = torch.zeros(B, cfg.action_dim)
+    samples = []
+    orig = m.cont_prior_net.forward
+
+    def _spy(x, sample=True):
+        samples.append(bool(sample))
+        return orig(x, sample=sample)
+
+    m.cont_prior_net.forward = _spy
+    s1 = m.img_step(state, a, sample=True)
+    s0 = m.img_step(state, a, sample=False)
+    assert samples == [False, False], samples
+    assert torch.allclose(s1.c, s0.c)
+    print("[smoke] OK TSSM img_step det-roll skips discarded prior-c sample")
+
+
 def test_store_aux_feats_identity():
     """Isolation encode may drop logit stacks; feats must match the full pass."""
     cfg, m = _mk()
@@ -310,6 +336,7 @@ if __name__ == '__main__':
     test_st_grad_reaches_prior_and_transformer()
     test_determinism_mode()
     test_img_rollout_equals_img_step()
+    test_img_step_det_roll_skips_sample()
     test_store_aux_feats_identity()
     test_stepwise_equals_full_sequence()
     test_end_to_end_dreamer_tssm()

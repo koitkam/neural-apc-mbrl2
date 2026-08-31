@@ -123,10 +123,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > CUDA-graph **KEEP as speed** / **FALSIFIED as TM/econ**. Val MV
 > ×0.876/×0.874 DV ×0.840/×0.890. Paired **−28 vs −117**, loses to
 > P58. Teacher Δu=1 vs TM 0.4. **P60 LIVE** (`run_p60_tmstep`, pid
-> **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. P1 ~iter 25
-> jsonl MV/DV **×0.95 / ×0.98** at Δu=0.4. Graph captured T=128. HEAD
-> (not in pid): overshoot/isolation gather idx cache + one `obs_win`.
-> Do **not** launch a second GPU job.
+> **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. P1 ~iter 65
+> jsonl MV/DV **×0.99 / ×1.00** at Δu=0.4. skip 0/0. Graph captured T=128.
+> HEAD (not in pid): det-roll skips discarded prior-c `randn`;
+> `cached_zeros_bd`; teacher-G dict-cache. Do **not** launch a second
+> GPU job.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
