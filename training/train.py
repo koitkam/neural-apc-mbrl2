@@ -4917,8 +4917,12 @@ class TrajectoryBuffer:
         self.act[i] = act
         self.rew[i] = rew
         self.cont[i] = cont
-        self.expert[i] = (expert if expert is not None
-                          else np.zeros(self.T, dtype='float32'))
+        # In-place fill: leftover ``np.zeros(T)`` every non-expert
+        # episode was a host alloc the inner graph never needed.
+        if expert is not None:
+            self.expert[i] = expert
+        else:
+            self.expert[i] = 0.0
         if self.dist is not None:
             if dist is None and self._dist_source is not None:
                 try:

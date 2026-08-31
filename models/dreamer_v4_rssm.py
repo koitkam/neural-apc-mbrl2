@@ -140,6 +140,35 @@ def _time_unbind(x: Optional[torch.Tensor]):
     return x.unbind(1)
 
 
+def _append_decode_core(h_l, z_l, c_l, dv_l, st) -> None:
+    """Collect ``[h, z_flat, (c), (dv)]`` views for ``_stack_decode_core``.
+
+    Same parts as ``state.feat[..., :dec_in]`` (d-tail is sliced off
+    ``feat`` / appended later as ``ds``).  Identity vs per-step ``cat``.
+    """
+    h_l.append(st.h)
+    z_l.append(st.stoch_flat)
+    if st.c is not None:
+        c_l.append(st.c)
+    if st.dv is not None:
+        dv_l.append(st.dv)
+
+
+def _stack_decode_core(h_l, z_l, c_l, dv_l) -> torch.Tensor:
+    """``(B, T, dec_in)`` ≡ ``stack(state.feat[..., :dec_in], dim=1)``.
+
+    Main WM encode used to ``cat`` 2–4 views every t then stack T
+    cores (100 inner × T=128 on test_sim).  One cat after T stacks.
+    Host-adaptive (no extra threads).
+    """
+    parts = [torch.stack(h_l, 1), torch.stack(z_l, 1)]
+    if c_l:
+        parts.append(torch.stack(c_l, 1))
+    if dv_l:
+        parts.append(torch.stack(dv_l, 1))
+    return torch.cat(parts, dim=-1)
+
+
 def cached_zeros_btd(mod, B: int, T: int, D: int, dtype, device,
                      attr: str = '_zeros_btd_cache') -> torch.Tensor:
     """Reuse a ``(B,T,D)`` zero buffer. Identity vs ``torch.zeros`` each call
@@ -869,16 +898,19 @@ class RSSMDynamics(nn.Module):
         # ``dob_active``) or the cont-dist two-pass.  Stage-1 P1 forces
         # ``d_t≡0`` and discarded the T-list — skip the append.
         _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
-        feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+        post_l, prior_l = [], []
+        h_l, z_l, c_l, dv_l = [], [], [], []
+        ph_l, pz_l, pc_l, pdv_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         keep_aux = bool(store_aux) and not last_only
         # last_only rest-IC only needs the last RSSMState.  Building
         # post.feat every t was T concatenations of [h,z,c,dv,d] then
         # discarding all but the last.  Kalman / two-pass still need
-        # per-step prior.feat.  Materialize the last post.feat once.
+        # per-step prior core.  Materialize the last post.feat once.
+        # Full-T encode stacks h/z/(c)/(dv) then one cat (not T cats).
         _stack_post = not last_only
         # Stage-1 rest-IC: posterior-only (prior heads unused).  P2 DOB /
-        # cont-dist two-pass still need obs_step + prior.feat.
+        # cont-dist two-pass still need obs_step + prior core.
         use_post_only = bool(last_only) and not two_pass and not _need_prior_core
         act_t = _time_unbind(act)
         emb_t = _time_unbind(embeds)
@@ -903,7 +935,7 @@ class RSSMDynamics(nn.Module):
                                             dv=dv_t, sample=sample, obs=None)
                 state = post
                 if _stack_post:
-                    feats_l.append(post.feat[..., :dec_in])
+                    _append_decode_core(h_l, z_l, c_l, dv_l, post)
                 if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
@@ -911,16 +943,18 @@ class RSSMDynamics(nn.Module):
                         c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                         c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if _need_prior_core:
-                    prior_core_l.append(prior.feat[..., :dec_in])
+                    _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if two_pass:
             # ONE batched prior decode → CV forecast → innovation ν, then
             # re-roll with the innovation-driven cont posterior.
-            prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+            prior_core1 = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
             base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
             nu_seq = obs.index_select(-1, self.cv_index_t) - base  # (B, T, n_cv)
             nu_t = _time_unbind(nu_seq)
             state = self.initial_state(B, device)
-            feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+            post_l, prior_l = [], []
+            h_l, z_l, c_l, dv_l = [], [], [], []
+            ph_l, pz_l, pc_l, pdv_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
             for t in range(T):
                 dv_t = None if dv_seq is None else dv_seq[t]
@@ -929,20 +963,20 @@ class RSSMDynamics(nn.Module):
                                             cont_innov=nu_t[t])
                 state = post
                 if _stack_post:
-                    feats_l.append(post.feat[..., :dec_in])
+                    _append_decode_core(h_l, z_l, c_l, dv_l, post)
                 if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
                     c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
-                    prior_core_l.append(prior.feat[..., :dec_in])
+                    _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if last_only and not return_feats:
             return None, None, None, state, None, None
         if last_only:
             post_core = state.feat[..., :dec_in].unsqueeze(1)  # (B, 1, dec_in)
         else:
-            post_core = torch.stack(feats_l, dim=1)    # (B, T, dec_in)=[h,z,(c),(dv)]
+            post_core = _stack_decode_core(h_l, z_l, c_l, dv_l)
         post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)
         prior_logits = (torch.stack(prior_l, dim=1) if keep_aux else None)
         ds = None
@@ -951,7 +985,7 @@ class RSSMDynamics(nn.Module):
                 # ONE batched prior decode → CV forecast base (d-free), then the
                 # scalar per-CV Kalman filter.  d_t = A·d_{t-1} + K·ν with
                 # ν = CV_obs − (base + A·d_{t-1}) ⇒ d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+                prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
@@ -1010,8 +1044,8 @@ class RSSMDynamics(nn.Module):
           * ``'feat'`` (default) — full ``state.feat``
           * ``'h'`` — ``state.h`` only (held-rollout drift; no F-stack)
           * ``'obs'`` — ``decode(feat)`` per step.  Pointwise MLP ⇒
-            ``stack(decode(feat_k))`` ≡ ``decode(stack(feat))`` (overshoot
-            does not need the unused F-stack).
+            ``stack(decode(feat_k))`` ≡ ``decode(stack(core))`` (overshoot
+            does not need the unused F-stack; one decode after K).
         ``last_only`` materializes ``out`` once after the K-loop (no
         intermediate decode / feat copies).
 
@@ -1045,6 +1079,9 @@ class RSSMDynamics(nn.Module):
                                  device=h0.device, dtype=h0.dtype),
             z=z0, c=c)
         feats = None if last_only else []
+        h_l = z_l = c_l = dv_l = None
+        if not last_only and out != 'h':
+            h_l, z_l, c_l, dv_l = [], [], [], []
         img_step = self.img_step
         out_h = out == 'h'
         out_obs = out == 'obs'
@@ -1057,17 +1094,20 @@ class RSSMDynamics(nn.Module):
                 continue
             if out_h:
                 feats.append(state.h)
-            elif out_obs:
-                feats.append(self.decode(state.feat))
             else:
-                feats.append(state.feat)
+                _append_decode_core(h_l, z_l, c_l, dv_l, state)
         if last_only:
             if out_h:
                 return state.h
             if out_obs:
                 return self.decode(state.feat)
             return state.feat                                 # (Bm, *)
-        return torch.stack(feats, dim=1)                      # (Bm, K, *)
+        if out_h:
+            return torch.stack(feats, dim=1)                  # (Bm, K, H)
+        core = _stack_decode_core(h_l, z_l, c_l, dv_l)
+        if out_obs:
+            return self.decode(core)                          # (Bm, K, obs)
+        return core                                           # (Bm, K, F)
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the

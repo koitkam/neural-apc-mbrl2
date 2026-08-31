@@ -105,7 +105,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > `cont`; P3 also skips `dist` (`_replay_h2d_keys`; frozen observer
 > re-encodes from `obs`; P2 still copies `dist` for dob-ground).
 > RSSM/TSSM T/K loops `_time_unbind` once; Stage-1 `d_t≡0` reuses
-> `cached_zeros_btd`. **P57 EXIT:** GAIN-READY **0.89@DV** @82;
+> `cached_zeros_btd`. Full-T encode stacks `h/z/(c)/(dv)` then one
+> cat (not T cats); overshoot `out='obs'` is one `decode` after K.
+> **P57 EXIT:** GAIN-READY **0.89@DV** @82;
 > last_ok **82**; graph **captured** then **released**; `t_wm` P1
 > **99 s** / P2 **22.6 s**. Unfreeze 147 ent **−0.101 HELD**. rscale
 > **2.35 KEEP**. Val MV **×0.715 / ×0.712** DV **×0.780 / ×0.836**
@@ -859,9 +861,12 @@ fixes BOTH:
   `DREAMER_GAIN_MATCH_REST_IC=0` reverts to PRBS-posterior FD. Collect
   pairing = TM `_settle_capture` (obs after step). Encode `L` default
   is lookback (`gain_match_rest_ic_len=0`; P57 EXIT **REVERT**; `-1`
-  A/B last `max(K, 2τ/sr)`). Encode is
+  A/B last `max(K, 2τ/sr)`).   Encode is
   `rollout_observed(..., last_only=True, return_feats=False)` via
-  Stage-1 `_posterior_step`. CUDA: `make_graphed_callables` on
+  Stage-1 `_posterior_step`. Full-T main WM encode stacks
+  `h/z/(c)/(dv)` then one cat (`_stack_decode_core`; identity vs
+  `feat[..., :dec_in]`). Overshoot `out='obs'` is one `decode` after K.
+  CUDA: `make_graphed_callables` on
   `_RestICGraphModule` wrapping that T-loop when
   `gain_match_rest_ic_cuda_graph` (default True; RSSM
   only; GRU-grad canary; CPU/TSSM/capture-fail stay eager). Capture is

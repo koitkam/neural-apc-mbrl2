@@ -1229,6 +1229,12 @@ def _test_buffer_sample_keys() -> None:
     for k in slim:
         assert np.array_equal(slim[k], full[k])
     assert 'cont' not in slim and 'expert' not in slim and 'dist' not in slim
+    buf2 = TrajectoryBuffer(2, T, D, A, n_dist=1)
+    buf2.add_episode(obs, act, rew, cont, expert=None, dist=dist)
+    assert np.all(buf2.expert[0] == 0.0)
+    expert_row = (np.arange(T) == 1).astype('float32')
+    buf2.add_episode(obs, act, rew, cont, expert=expert_row, dist=dist)
+    assert np.array_equal(buf2.expert[1], expert_row)
     print('[smoke] OK  buffer sample keys subset identity')
 
 
@@ -1269,6 +1275,23 @@ def _test_store_aux_feats_identity() -> None:
     if ds_full is not None:
         ds_err = float((ds_last[:, 0] - ds_full[:, -1]).abs().max())
         assert ds_err < 1e-6, ds_err
+    from models.dreamer_v4_rssm import _append_decode_core, _stack_decode_core
+    dec_in = (m.deter_dim + m.stoch_flat_dim + m.cont_dim + m._dv_feed_dim)
+    emb = m.embed(obs)
+    dvs = (obs.index_select(-1, m.dv_index_t) if m.dv_dim > 0 else None)
+    st = m.initial_state(B, obs.device)
+    feat_l, hh, zz, cc, ddv = [], [], [], [], []
+    for t in range(T):
+        dv_t = None if dvs is None else dvs[:, t]
+        post, _ = m.obs_step(
+            st, act[:, t], emb[:, t], dv=dv_t, sample=False, obs=None)
+        feat_l.append(post.feat[..., :dec_in])
+        _append_decode_core(hh, zz, cc, ddv, post)
+        st = post
+    stack_err = float(
+        (_stack_decode_core(hh, zz, cc, ddv) - torch.stack(feat_l, 1)
+         ).detach().abs().max())
+    assert stack_err < 1e-6, f'_stack_decode_core != feat[..., :dec_in] ({stack_err})'
     m.train()
     m.zero_grad(set_to_none=True)
     f_b, *_ = m.rollout_observed(
@@ -1337,6 +1360,7 @@ def _test_store_aux_feats_identity() -> None:
           f'h={h_err:.2e} z={z_err:.2e}); gru |g|={gru_g:.3f}; '
           f'return_feats=False h={nf_h:.2e} z={nf_z:.2e} gru |g|={gru_g_nf:.3f}; '
           f'Stage-1 last_only ≡ full h={s1_h:.2e} gru |g|={gru_g_s1:.3f}; '
+          f'stack-core ≡ feat slice ({stack_err:.2e}); '
           f'kalman mix budget={bud}')
 
 
@@ -1542,6 +1566,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_h2d_keys = None' not in _src
     assert '_replay_h2d_keys(False, True)' in _src
     assert '_replay_h2d_keys(False, True, False)' in _src
+    assert 'self.expert[i] = 0.0' in _src
+    assert "else np.zeros(self.T, dtype='float32')" not in _src
     assert 'keys=_h2d_keys' in _src
     assert "keys=('obs', 'act')" in _src
     assert '_cache_gain_match_rest_ic' in _src

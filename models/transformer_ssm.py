@@ -127,7 +127,7 @@ import torch.nn.functional as F
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
 from models.dreamer_v4_rssm import (
     _CategoricalLatent, _ContinuousLatent, _time_unbind, cached_zeros_btd,
-    dob_kalman_scan)
+    dob_kalman_scan, _append_decode_core, _stack_decode_core)
 
 
 @dataclass
@@ -688,6 +688,9 @@ class TransformerSSMDynamics(nn.Module):
                                  device=h0.device, dtype=h0.dtype),
             z=z0, c=c, kv_cache=None, pos=0)
         feats = None if last_only else []
+        h_l = z_l = c_l = dv_l = None
+        if not last_only and out != 'h':
+            h_l, z_l, c_l, dv_l = [], [], [], []
         img_step = self.img_step
         out_h = out == 'h'
         out_obs = out == 'obs'
@@ -700,17 +703,20 @@ class TransformerSSMDynamics(nn.Module):
                 continue
             if out_h:
                 feats.append(state.h)
-            elif out_obs:
-                feats.append(self.decode(state.feat))
             else:
-                feats.append(state.feat)
+                _append_decode_core(h_l, z_l, c_l, dv_l, state)
         if last_only:
             if out_h:
                 return state.h
             if out_obs:
                 return self.decode(state.feat)
             return state.feat
-        return torch.stack(feats, dim=1)
+        if out_h:
+            return torch.stack(feats, dim=1)
+        core = _stack_decode_core(h_l, z_l, c_l, dv_l)
+        if out_obs:
+            return self.decode(core)
+        return core
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -799,10 +805,13 @@ class TransformerSSMDynamics(nn.Module):
         # pass when off (DOB path unchanged).
         two_pass = bool(getattr(self, '_cont_post_uses_innov', False))
         _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
-        feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+        post_l, prior_l = [], []
+        h_l, z_l, c_l, dv_l = [], [], [], []
+        ph_l, pz_l, pc_l, pdv_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         keep_aux = bool(store_aux) and not last_only
         # last_only: materialize post.feat once after the loop (rest-IC).
+        # Full-T encode stacks h/z/(c)/(dv) then one cat (not T cats).
         _stack_post = not last_only
         use_post_only = bool(last_only) and not two_pass and not _need_prior_core
         act_t = _time_unbind(act)
@@ -824,7 +833,7 @@ class TransformerSSMDynamics(nn.Module):
                                             dv=dv_t, sample=sample, obs=None)
                 state = post
                 if _stack_post:
-                    feats_l.append(post.feat[..., :dec_in])
+                    _append_decode_core(h_l, z_l, c_l, dv_l, post)
                 if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
@@ -832,14 +841,16 @@ class TransformerSSMDynamics(nn.Module):
                         c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                         c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if _need_prior_core:
-                    prior_core_l.append(prior.feat[..., :dec_in])
+                    _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if two_pass:
-            prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+            prior_core1 = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
             base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
             nu_seq = obs.index_select(-1, self.cv_index_t) - base  # (B, T, n_cv)
             nu_t = _time_unbind(nu_seq)
             state = self.initial_state(B, device)
-            feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+            post_l, prior_l = [], []
+            h_l, z_l, c_l, dv_l = [], [], [], []
+            ph_l, pz_l, pc_l, pdv_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
             for t in range(T):
                 dv_t = None if dv_seq is None else dv_seq[t]
@@ -848,20 +859,20 @@ class TransformerSSMDynamics(nn.Module):
                                             cont_innov=nu_t[t])
                 state = post
                 if _stack_post:
-                    feats_l.append(post.feat[..., :dec_in])
+                    _append_decode_core(h_l, z_l, c_l, dv_l, post)
                 if keep_aux:
                     post_l.append(post.z_logits)
                     prior_l.append(prior.z_logits)
                     c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
                 if self.dob_enabled and self.dob_active:
-                    prior_core_l.append(prior.feat[..., :dec_in])
+                    _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if last_only and not return_feats:
             return None, None, None, state, None, None
         if last_only:
             post_core = state.feat[..., :dec_in].unsqueeze(1)  # (B, 1, dec_in)
         else:
-            post_core = torch.stack(feats_l, dim=1)      # (B, T, dec_in) = [h,z,(dv)]
+            post_core = _stack_decode_core(h_l, z_l, c_l, dv_l)
         post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)
         prior_logits = (torch.stack(prior_l, dim=1) if keep_aux else None)
         ds = None
@@ -869,7 +880,7 @@ class TransformerSSMDynamics(nn.Module):
             if self.dob_active:
                 # ONE batched prior decode → CV forecast base, then the scalar per-CV
                 # Kalman filter: d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+                prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)

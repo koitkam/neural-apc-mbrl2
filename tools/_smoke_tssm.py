@@ -155,6 +155,23 @@ def test_store_aux_feats_identity():
             obs, act, sample=False, store_aux=False)
     last_err = float((f_last[:, 0] - f_full[:, -1]).abs().max())
     assert last_err < 1e-6, f'last_only feats != stack[:, -1] (max_err={last_err})'
+    from models.dreamer_v4_rssm import _append_decode_core, _stack_decode_core
+    dec_in = (m.deter_dim + m.stoch_flat_dim + m.cont_dim + m._dv_feed_dim)
+    emb = m.embed(obs)
+    dvs = (obs.index_select(-1, m.dv_index_t) if m.dv_dim > 0 else None)
+    st = m.initial_state(B, obs.device)
+    feat_l, hh, zz, cc, ddv = [], [], [], [], []
+    for t in range(T):
+        dv_t = None if dvs is None else dvs[:, t]
+        post, _ = m.obs_step(
+            st, act[:, t], emb[:, t], dv=dv_t, sample=False, obs=None)
+        feat_l.append(post.feat[..., :dec_in])
+        _append_decode_core(hh, zz, cc, ddv, post)
+        st = post
+    stack_err = float(
+        (_stack_decode_core(hh, zz, cc, ddv) - torch.stack(feat_l, 1)
+         ).detach().abs().max())
+    assert stack_err < 1e-6, f'_stack_decode_core != feat[..., :dec_in] ({stack_err})'
     h_err = float((st_last.h - st_full.h).abs().max())
     assert h_err < 1e-6, h_err
     _, _, _, st_nf, *_ = m.rollout_observed(
@@ -178,6 +195,7 @@ def test_store_aux_feats_identity():
     assert post_g > 0.0, 'TSSM last_only lost post_net gradient'
     print(f"[smoke] OK store_aux=False feats identity (max_err={err:.2e}); "
           f"observed last_only ≡ stack[:, -1] (feat={last_err:.2e} h={h_err:.2e}); "
+          f"stack-core ≡ feat slice ({stack_err:.2e}); "
           f"return_feats=False h={nf_h:.2e}; Stage-1 prior_net |g|={prior_g:.1f} "
           f"post_net |g|={post_g:.3f}")
 
