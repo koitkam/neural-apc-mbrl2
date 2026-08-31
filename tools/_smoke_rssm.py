@@ -63,6 +63,7 @@ from training.train import (
                             _gain_match_rest_window, _held_rollout_win,
                             _rest_ic_can_cuda_graph,
                             _warmup_rest_ic_cuda_graph,
+                            _release_rest_ic_cuda_graph,
                             _amp_parent_autocast_on,
                             _rssm_param_grad_snapshot,
                             _rssm_param_grad_restore,
@@ -164,6 +165,10 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert 'critic_mc_loss' in diag, sorted(diag)
     assert 'critic_pred_target_r' in diag, sorted(diag)
     assert 'critic_target_v_r' in diag, sorted(diag)
+    assert 'actor_pos_adv_frac' in diag, sorted(diag)
+    assert 'pmpo_pos_frac' in diag, sorted(diag)
+    assert abs(float(diag['actor_pos_adv_frac'])
+               - float(diag['pmpo_pos_frac'])) < 1e-12
     assert torch.isfinite(diag['critic_mc_loss']).all()
     assert float(diag['critic_mc_loss']) >= 0.0
     # P26 RCA / P27: freeze return_scale — second call must not move ret_scale.
@@ -1315,6 +1320,9 @@ def _test_isolation_dcv_scales() -> None:
     assert "p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip'" in _src
     assert "p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters'" in _src
     assert '_p3_copy_policy_snapshot' in _src
+    assert '_p3_load_policy_snapshot' in _src
+    assert '_release_rest_ic_cuda_graph' in _src
+    assert "'actor_pos_adv_frac'" in _src
     assert "es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac'" in _src
     assert '_p3_logp_clip_bound' in _src
     assert '_entropy_collapse_threshold' in _src
@@ -2394,6 +2402,15 @@ def _test_gain_match_rest_ic() -> None:
     assert not hasattr(model.dynamics, '_rest_ic_cg')
     assert _amp_parent_autocast_on('cpu') is False
     print('[smoke] OK  rest-ic CUDA graph skipped on CPU')
+    r = type('R', (), {})()
+    r._rest_ic_cg = ('k', None)
+    r._rest_ic_cg_fail = True
+    assert _release_rest_ic_cuda_graph(r) is True
+    assert not hasattr(r, '_rest_ic_cg')
+    assert not hasattr(r, '_rest_ic_cg_fail')
+    assert _release_rest_ic_cuda_graph(r) is False
+    assert _release_rest_ic_cuda_graph(None) is False
+    print('[smoke] OK  rest-ic CUDA graph release is identity on CPU')
 
 
 def _test_p3_reset_log_std() -> None:
@@ -2665,7 +2682,7 @@ def _test_p3_mu_ratio_refresh() -> None:
     with torch.no_grad():
         m.policy.head.net[-1].bias[0] = 0.4
     s3 = _p3_frozen_unfreeze_policy(m, cfg)
-    assert s3 is not s1
+    assert s3 is s1
     live_ids = {id(p) for p in m.parameters()}
     assert {id(p) for p in s3.parameters()}.isdisjoint(live_ids)
     with torch.no_grad():

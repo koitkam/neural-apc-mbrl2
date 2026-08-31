@@ -6927,6 +6927,38 @@ def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
 
 
+def _release_rest_ic_cuda_graph(rssm) -> bool:
+    """Drop the rest-IC CUDA graph after g freeze.
+
+    P2/P3 skip gain-match (``_g_live``).  The captured graph holds a
+    static lookback-T replay for the whole run; releasing it is
+    identity for training and host-adaptive (P3 needs the VRAM).
+    No-op when the pid never captured (P55 eager-fail pin).  Returns
+    True iff a graph object was dropped (caller may ``empty_cache``).
+    """
+    if rssm is None:
+        return False
+    released = hasattr(rssm, '_rest_ic_cg')
+    if released:
+        delattr(rssm, '_rest_ic_cg')
+    if hasattr(rssm, '_rest_ic_cg_fail'):
+        delattr(rssm, '_rest_ic_cg_fail')
+    return bool(released)
+
+
+def _release_rest_ic_after_g_freeze(rssm) -> None:
+    """Release + ``empty_cache`` once when the WM core stops training."""
+    if not _release_rest_ic_cuda_graph(rssm):
+        return
+    print('[gain-match] rest-ic CUDA graph released (g frozen)',
+          flush=True)
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     """Encode cached rest lookbacks → ``(h0, z0, c0, a_base, dv0)``.
 
@@ -8284,6 +8316,17 @@ def _p3_copy_policy_snapshot(policy) -> torch.nn.Module:
     return snap
 
 
+def _p3_load_policy_snapshot(snap: torch.nn.Module, policy) -> None:
+    """In-place weight copy into an existing snapshot.
+
+    Identity vs a fresh deepcopy for ``logp_old``.  Refresh-every-iter
+    (P55) used to allocate a new module each collect; ``load_state_dict``
+    reuses the first snapshot's storage.  Host-adaptive (no extra CUDA
+    alloc).  Snapshot stays eval / frozen.
+    """
+    snap.load_state_dict(policy.state_dict())
+
+
 def _p3_frozen_unfreeze_policy(model, cfg=None) -> torch.nn.Module:
     """Detached deepcopy of ``model.policy`` for PPO ``logp_old``.
 
@@ -8292,9 +8335,10 @@ def _p3_frozen_unfreeze_policy(model, cfg=None) -> torch.nn.Module:
     ``opt_actor.step``, so that first call is the unfreeze snapshot.
 
     P55 (default N=1): recopy live μ at the first AC call of every N
-    P3 iters. Window = N × ``phase3_train_steps_per_iter`` inner
-    steps so an epoch holds ``logp_old`` across the inner SGD, not
-    per-step (per-step recopy ⇒ ratio≈1). Warmup AC calls recopy
+    P3 iters via ``_p3_load_policy_snapshot`` (in-place; identity vs
+    a fresh deepcopy). Window = N × ``phase3_train_steps_per_iter``
+    inner steps so an epoch holds ``logp_old`` across the inner SGD,
+    not per-step (per-step recopy ⇒ ratio≈1). Warmup AC calls recopy
     the same frozen actor (identity); the first unfreeze epoch still
     clips vs unfreeze-μ.
 
@@ -8317,7 +8361,7 @@ def _p3_frozen_unfreeze_policy(model, cfg=None) -> torch.nn.Module:
         return model._p3_mu_ratio_hold[0]
     period = refresh * inner
     if refresh > 0 and age > 0 and period > 0 and (age % period) == 0:
-        model._p3_mu_ratio_hold = [_p3_copy_policy_snapshot(model.policy)]
+        _p3_load_policy_snapshot(model._p3_mu_ratio_hold[0], model.policy)
     model._p3_mu_ratio_ac_calls = age + 1
     return model._p3_mu_ratio_hold[0]
 
@@ -8540,6 +8584,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                 critic_mc_loss = critic_mc_loss + _mc
         else:
             critic_mc_loss = torch.zeros((), device=device)
+        pos_adv_frac = (adv_flat >= 0).float().mean()
     return {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
@@ -8559,7 +8604,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'actor_logp_std': logp.std().detach(),
         'actor_ratio_mean': _ratio_mean.detach(),
         'actor_ratio_clip_frac': _ratio_clip_frac.detach(),
-        'pmpo_pos_frac': (adv_flat >= 0).float().mean().detach(),
+        'actor_pos_adv_frac': pos_adv_frac.detach(),
+        # leftover jsonl key (PMPO era); same tensor as ``actor_pos_adv_frac``
+        'pmpo_pos_frac': pos_adv_frac.detach(),
         'bc_loss': bc_loss_p3.detach(),
         'expert_bc_weight': torch.tensor(float(expert_bc_weight), device=device),
     }
@@ -11184,6 +11231,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                       f"steps{total_env_steps}: {_desc} "
                       f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']}]",
                       flush=True)
+                if not _dynamics_g_trainable(model):
+                    _release_rest_ic_after_g_freeze(
+                        getattr(model, 'dynamics', None))
             return
         if phase == 1:
             env._disturbance_prob_override = 0.0
@@ -11226,6 +11276,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"steps{total_env_steps}: {_desc} "
               f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
               f"trainable-flags set]", flush=True)
+        if not _dynamics_g_trainable(model):
+            _release_rest_ic_after_g_freeze(
+                getattr(model, 'dynamics', None))
 
     # Seed buffer.  P0 (2026-05-05): instead of two uniform-random episodes
     # — which on cliff-shaped reward landscapes (this plant: raw_min=-250,
@@ -12514,6 +12567,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"({_nfz} param tensors) after pretrain — reward/actor/"
                   f"critic keep training on the static WM "
                   f"(wm_freeze_after_iters={wm_freeze_after_iters})", flush=True)
+            _release_rest_ic_after_g_freeze(
+                getattr(model, 'dynamics', None))
 
         # ----- Train -----
         wm_grad_norm = torch.tensor(0.0)

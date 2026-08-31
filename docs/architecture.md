@@ -55,8 +55,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > iters): ES floor **KEEP** as false-trip fix (`p3_plateau`; 0/310
 > below −0.238) and **FALSIFIED as actor-econ lever** (paired **−26 vs
 > −101** 9/9, worse than P53 −13/−98). Freeze-forever μ-ratio is a
-> late-P3 ceiling (`clip_frac` 0.42→0.11). **P55** recopy snapshot
-> each P3 iter (`p3_mu_ratio_refresh_iters=1`).
+> late-P3 ceiling (`clip_frac` 0.42→0.11). **P55 LIVE P3** recopy
+> snapshot each P3 iter (`p3_mu_ratio_refresh_iters=1`): compounding
+> μ-walk vs last-iter μ (not P3-entry). Unfreeze 147 logp_std
+> 0.67→18.8@175; ema −170→−2000; rscale 1.91 KEEP. Not KEEP until
+> EXIT+val. HEAD: snapshot refresh is in-place `load_state_dict`;
+> rest-IC CUDA graph released at g freeze.
 > p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
 > dead `pmpo_loss`/`kl_to`/`pmpo_alpha`/`pmpo_beta` / prior-refresh knobs
@@ -67,7 +71,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > canary restores in-flight grads. P55 pid capture failed (autocast
 > cache) → eager T-loop. HEAD captures **before** the WM autocast loop
 > (exit parent autocast, `cache_enabled=False`) and **never captures
-> in-loop** (autocast miss is eager that step, not a fail pin).
+> in-loop** (autocast miss is eager that step, not a fail pin). HEAD
+> also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
@@ -479,15 +484,22 @@ env-gated off · **[planned]** = designed, not yet built.
 > KEEP** as delayed first-unfreeze bound (`p3_logp_clip=8`);
 > **FALSIFIED as cascade** (in-support μ-walk; val **−377 vs −87
 > FAIL**). **P53 EXIT KEEP** as μ-walk limiter **and** cascade
-> (`p3_mu_ratio_clip=0.2`; val **−13 vs −98** 9/9). **P54 LIVE P3:**
-> entropy ES vs open-σ (`early_stop_entropy_collapse_floor_frac=0.25`;
-> trip at `H(σ_min)+frac·(H(σ_max)−H(σ_min))`; ~iter 400 still
-> H≈−0.101, 0 trips at −0.238). `critic_mc_loss` is now in the
-> P3 jsonl (HEAD; not this pid). Opt out
+> (`p3_mu_ratio_clip=0.2`; val **−13 vs −98** 9/9). **P54 EXIT KEEP**
+> as ES false-trip (`early_stop_entropy_collapse_floor_frac=0.25`;
+> **FALSIFIED as actor-econ**; paired **−26 vs −101**). **P55 LIVE P3**
+> recopy snapshot each P3 iter (`p3_mu_ratio_refresh_iters=1`):
+> compounding μ-walk (clip vs last-iter μ, not P3-entry). Unfreeze 147
+> logp_std 0.67→**18.8@175** still **~9–10@245**; `clip_frac` stays
+> 0.02–0.80 (P53 held ~0.47 / clip 0.61→0.14); ema **−170→−2000**;
+> vs_expert **−2200**; rtgt 0.060→**0.0001**; rscale **1.91 KEEP**.
+> Not Step-5 until EXIT+val (best.pt ~166 may still be P53-class).
+> `critic_mc_loss` is now in the
+> P3 jsonl. Opt out
 > `DREAMER_P3_MU_RATIO_CLIP=0`. Not a lag-copy (1 update/batch
 > ⇒ ratio≡1). Not same-forward `logp.detach()`.
 > Opt out `DREAMER_P3_LOGP_CLIP=0`. Opt out `DREAMER_P3_STOP_GRAD_LOG_STD=0`.
 > Opt out `DREAMER_BC_MEAN_ONLY=0`. Opt out `DREAMER_ES_ENT_FLOOR_FRAC=0`.
+> Opt out `DREAMER_P3_MU_RATIO_REFRESH=0` (P53 freeze-forever).
 > Do not stack more critic knobs.
 > Do not promote `p3_reset_log_std`.
 > Do not concat rest rows into the main `sample=True` WM rollout
