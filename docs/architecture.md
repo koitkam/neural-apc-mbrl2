@@ -72,11 +72,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > **REMOVED**). `_realsim` now logs
 > `critic_mc_loss`. Do **not** promote
 > `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
-> reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
-> canary restores in-flight grads. P55 pid capture failed (autocast
-> cache) → eager T-loop. HEAD captures **before** the WM autocast loop
-> (exit parent autocast, `cache_enabled=False`) and **never captures
-> in-loop** (autocast miss is eager that step, not a fail pin). HEAD
+> reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph:
+> P55 pid capture failed (autocast
+> cache) → eager T-loop. **P56 pid** warmup failed
+> (`grad requires non-empty inputs` on function sample_args). HEAD
+> captures **before** the WM autocast loop (exit parent autocast,
+> `cache_enabled=False`), **never captures in-loop**, and capture
+> copies use `requires_grad_(True)`. HEAD
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig

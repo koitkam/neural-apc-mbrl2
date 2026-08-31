@@ -6823,12 +6823,21 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
         # on some PyTorch builds — then re-enter bf16 with cache off so
         # the recorded kernels match the training WM step.  Fail still
         # falls back to the eager T-loop.
+        #
+        # P56 warmup (autocast-exit already on): a nested function's
+        # sample_args (obs/act) do not ``requires_grad``, so capture
+        # called ``autograd.grad(..., inputs=())`` → ValueError
+        # ``grad requires non-empty inputs``.  Detach+requires_grad
+        # on *copies* so capture has grad inputs; replay still copies
+        # live rest-IC tensors into the static buffers.
+        o_s = obs.detach().requires_grad_(True)
+        a_s = act.detach().requires_grad_(True)
         with torch.amp.autocast(device_type=obs.device.type, enabled=False):
             with torch.amp.autocast(
                     device_type=obs.device.type, dtype=torch.bfloat16,
                     enabled=True, cache_enabled=False):
                 graphed = torch.cuda.make_graphed_callables(
-                    _fn, (obs, act), num_warmup_iters=2)
+                    _fn, (o_s, a_s), num_warmup_iters=2)
     except Exception as e:
         print('[gain-match] rest-ic CUDA graph capture failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)

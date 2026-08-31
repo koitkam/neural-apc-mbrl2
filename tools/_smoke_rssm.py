@@ -1361,6 +1361,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'make_graphed_callables' in _src
     assert 'cache_enabled=False' in _src
     assert 'enabled=False' in _src
+    assert "o_s = obs.detach().requires_grad_(True)" in _src
     assert '_warmup_rest_ic_cuda_graph' in _src
     assert '_amp_parent_autocast_on' in _src
     assert '_cache_gain_match_rest_ic' in _src
