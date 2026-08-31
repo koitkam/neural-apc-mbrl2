@@ -1332,6 +1332,9 @@ def _test_isolation_dcv_scales() -> None:
     assert '_release_rest_ic_cuda_graph' in _src
     assert "'actor_pos_adv_frac'" in _src
     assert "'adv_action_corr'" in _src
+    assert "'n_grad_skip_iter'" in _src
+    assert 'logp {_logp:.2f}' in _src
+    assert 'clip {_clip:.2f}' in _src
     assert 'def _row_adv_action_corr(' in _src
     assert 'plt.subplots(3, 3' in _src
     assert '_row_adv_action_corr(row)' in _src
@@ -3548,7 +3551,8 @@ def _test_training_diagnostics_cascade_axes() -> None:
         header = open(csvp).readline()
         for col in ('actor_logp_std', 'actor_ratio_clip_frac',
                     'critic_rew_to_tgt_var', 'agent_minus_expert_return',
-                    'actor_pos_adv_frac', 'adv_action_corr'):
+                    'actor_pos_adv_frac', 'adv_action_corr',
+                    'n_grad_skip', 'n_grad_skip_iter'):
             assert col in header, header
         _, summary = _parse_train_log(logp)
         p3 = summary['p3']

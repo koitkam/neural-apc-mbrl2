@@ -64,13 +64,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > Next GPU: P56 `DREAMER_P3_MU_RATIO_REFRESH=50` (A/B; not a default).
 > **P56 LIVE** (`run_p56_muslow`, pid **110246**, sha `9d05866`): GAIN-READY
 > @82 **0.83@DV**; last_ok **82**; P3 @136; unfreeze **147** ent **−0.101
-> HELD**; logp_std ~**0.50** (not P55 18); rscale **2.26 KEEP**; rtgt
-> collapsing 0.058→0.004; N=50 recopy not before ~**197**. Rest-IC graph
+> HELD**; logp_std ~**0.50–0.59 through 236** (not P55 18); rscale **2.26 KEEP**;
+> rtgt 0.058→**0.002**; N=50 first recopy ~**197** was a near-no-op (`clip`
+> ~0.10, P54 ceiling). Rest-IC graph
 > failed this pid (`t_wm` 124 s). HEAD: `_RestICGraphModule` +
 > `wrapper.train(rssm.training)`; snapshot refresh is in-place `load_state_dict`;
 > rest-IC CUDA graph released at g freeze. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
-> 3×3 (logp_std / clip_frac / rtgt).
+> 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
+> `skip this/cum` (`n_grad_skip_iter`; not in this pid).
 > p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
 > dead `pmpo_loss`/`kl_to`/`pmpo_alpha`/`pmpo_beta` / prior-refresh knobs

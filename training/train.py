@@ -10236,6 +10236,7 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
             'bc_loss', 'reward_mtp_loss', 'actor_loss', 'critic_loss',  # panel 3
             'entropy_mean', 'adv_std_mean',                         # panel 4
             'wm_grad_norm', 'actor_grad_norm', 'critic_grad_norm',  # panel 5
+            'n_grad_skip', 'n_grad_skip_iter',
             'iter_cv_violation_mean', 'iter_mv_violation_mean',     # panel 6
             'actor_logp_std', 'actor_ratio_clip_frac', 'actor_ratio_mean',
             'critic_rew_to_tgt_var', 'critic_pred_target_r',
@@ -13245,7 +13246,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                             if iter_cv_violations else None),
                 'iter_mv_violation_mean': (float(np.mean(iter_mv_violations))
                                             if iter_mv_violations else None),
+                # Cumulative inner-step skips (P1 storm left 65 on P56
+                # P3 banners). Skip-storm already uses the per-log
+                # delta; emit it so P3 does not look like a live storm.
                 'n_grad_skip': int(n_grad_skip),
+                'n_grad_skip_iter': max(
+                    0, int(n_grad_skip) - int(grad_skip_prev_total)),
                 'buf_fill_pct': float(buf.filled) / max(1, buf.capacity_eps),
                 'wm_frozen': bool(_wm_frozen_now),
                 'expert_det_return': last_expert_det_return,
@@ -13393,10 +13399,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 f"bc {row.get('bc_loss', 0.0):.3f} "
             )
             if current_phase >= 3 or joint_mode:
+                _logp = float(row.get('actor_logp_std') or 0.0)
+                _clip = float(row.get('actor_ratio_clip_frac') or 0.0)
                 _ac = (
                     f"actor {row.get('actor_loss', 0.0):+.3f} "
                     f"critic {row.get('critic_loss', 0.0):.3f} "
                     f"ent {row.get('entropy_mean', 0.0):.3f} "
+                    f"logp {_logp:.2f} "
+                    f"clip {_clip:.2f} "
                     f"rscale {row.get('return_scale', 0.0):.2f} "
                     f"rtgt {row.get('critic_rew_to_tgt_var', 0.0):.4f} "
                 )
@@ -13406,7 +13416,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"steps {total_env_steps:6d} sps {sps:5.1f} "
                   f"ret_ema {ema_str} ret_w {rwm_str} "
                   f"{_obs}{_enc}{_ac}"
-                  f"skip {row.get('n_grad_skip', 0)}",
+                  f"skip {int(row.get('n_grad_skip_iter', 0) or 0)}/"
+                  f"{int(row.get('n_grad_skip', 0) or 0)}",
                   flush=True)
             last_log_time = now
             last_log_steps = total_env_steps

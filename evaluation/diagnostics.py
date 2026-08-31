@@ -133,7 +133,7 @@ def _parse_train_log(jsonl_path: Path,
             'actor_logp_std', 'actor_ratio_clip_frac', 'actor_ratio_mean',
             'critic_rew_to_tgt_var', 'return_scale',
             'agent_minus_expert_return', 'adv_action_corr',
-            'imag_adv_action_corr', 'n_grad_skip',
+            'imag_adv_action_corr', 'n_grad_skip', 'n_grad_skip_iter',
             'ema_return', 'return_window_mean']
     for ph_id, ph_key in ((1, 'p1'), (2, 'p2'), (3, 'p3')):
         rs = by_phase[ph_id]
