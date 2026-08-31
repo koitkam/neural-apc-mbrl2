@@ -1655,11 +1655,11 @@ Targets: gain ratios →1.0, disturbance **detrended** r→1 / R²→+1, critic
 - **HEAD (this pid did not have):** capture hygiene; `sample(keys=)` + P3 on-policy skip `expert`; TD-λ reverse-`cumsum`. Identity. CVD="" smokes green.
 - **Next GPU: P58** env-free lookback (`gain_match_rest_ic_len=0`) + HEAD `_RestICGraphModule` at T=128. Judge capture T=128 + val TM vs P53 ×0.90 / P56 ×0.76.
 
-### p58 (`run_p58_resticlb`, branch `cursor/p28`) — LAUNCH: lookback rest-IC + HEAD graph T=128
-- **One attributed GPU change vs P57 pid:** TrainConfig default `gain_match_rest_ic_len=0` (lookback; P57 EXIT **REVERT**). Actor freeze-forever (refresh=0). HEAD `_RestICGraphModule` + `sample(keys=)` + TD-λ reverse-cumsum (not in P57 pid). tmux `mbrl2_p58`, `CUDA_VISIBLE_DEVICES=0`.
-- **Not:** leftover `DREAMER_*`, μ-refresh N, critic knobs, S=H, settle=`wm_tf_horizon`, fuse encode+FD graph.
-- **Step 4:** vs P57 `run_plan` the only observer delta is `gain_match_rest_ic_len` **-1 → 0**. All other recipe knobs match (`rest_ic=True`, settle=-1, muratio=0.2, murefresh=0, n_critics=2, isolation=0, dob on, det RSSM, eager). Env-free: no `DREAMER_*`.
-- **Watch:** `[gain-match] rest-ic N=6 L=128`; graph captured T=128 (or fail→eager like P56 `t_wm`~124 s); val TM vs P53 ×0.90 / P56 ×0.76; paired −13/−98. Do not attack compounding on this pid.
+### p58 (`run_p58_resticlb`, branch `cursor/p28`) — LIVE: lookback rest-IC + HEAD graph T=128
+- **One attributed GPU change vs P57 pid:** TrainConfig default `gain_match_rest_ic_len=0` (lookback; P57 EXIT **REVERT**). Actor freeze-forever (refresh=0). HEAD `_RestICGraphModule` + `sample(keys=)` + TD-λ reverse-cumsum (not in P57 pid). tmux `mbrl2_p58`, pid **126332**, sha **`774021c`**, `CUDA_VISIBLE_DEVICES=0`. Started ~05:25 CDT 2026-08-31.
+- **Not:** leftover `DREAMER_*` (proc environ: CVD=0 + PYTORCH_CUDA_ALLOC_CONF only), μ-refresh N, critic knobs, S=H, settle=`wm_tf_horizon`, fuse encode+FD graph.
+- **Step 4 CONFIRMED:** `[gain-match] rest-ic N=6 L=128 settle=128 rest_ic_len=0`. **`[gain-match] rest-ic CUDA graph captured N=6 T=128`**. `[resolved-cfg] … gmatch_rest_L=128 gmatch_rest_cg=True p3_murefresh=0 compile=eager`. One-shot AccumulateGrad stream-mismatch warn still printed before capture (suppress did not hide it).
+- **Watch:** val TM vs P53 ×0.90 / P56 ×0.76; paired −13/−98; `t_wm` vs P57 99 s (T=55) / P56 124 s (eager T=128). Do not attack compounding on this pid. Do not launch a second GPU job.
 
 ### Sim-adaptive leftovers (env-free multi-sim; do not promote plants yet)
 
