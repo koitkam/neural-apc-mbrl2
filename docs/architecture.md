@@ -59,14 +59,15 @@ env-gated off · **[planned]** = designed, not yet built.
 > each P3 iter (`p3_mu_ratio_refresh_iters=1`).
 > p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
-> dead `pmpo_loss`/`kl_to`/`pmpo_alpha`/`pmpo_beta` **REMOVED**). `_realsim` now logs
+> dead `pmpo_loss`/`kl_to`/`pmpo_alpha`/`pmpo_beta` / prior-refresh knobs
+> **REMOVED**). `_realsim` now logs
 > `critic_mc_loss`. Do **not** promote
 > `p3_reset_log_std`. Do not stack critic knobs. CUDA replay H2D
 > reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph
 > canary restores in-flight grads. P55 pid capture failed (autocast
 > cache) → eager T-loop. HEAD captures **before** the WM autocast loop
-> and exits the parent autocast (`cache_enabled=False`) so the next
-> launch can actually fuse the T-loop.
+> (exit parent autocast, `cache_enabled=False`) and **never captures
+> in-loop** (autocast miss is eager that step, not a fail pin).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now

@@ -628,6 +628,22 @@ class SimNoiseWrapper:
                 else:
                     randomizer.enabled = False
 
+    def apply_runtime_knobs(self, cfg=None) -> None:
+        """Re-apply TrainConfig runtime knobs after wrap (factory has no cfg).
+
+        Identity when ``cfg`` defaults match wrap-time env (jitter 0.20,
+        noise on).  Does not re-seed the RNG (would change episode noise
+        draws).  Domain randomization stays under APCEnv phase gating.
+        """
+        from utils.noise_config import resolve_sim_runtime_knobs
+        runtime = resolve_sim_runtime_knobs(cfg)
+        self._noise_jitter_pct = float(np.clip(
+            float(runtime.get('jitter_pct', 0.20)), 0.0, 0.5))
+        if bool(runtime.get('noise_enabled', True)):
+            self._has_noise = bool(self._ou_sources or self._meas_noise)
+        else:
+            self._has_noise = False
+
     # -- Intercepted methods -----------------------------------------------
 
     def set_noise_scale(self, scale: float) -> None:

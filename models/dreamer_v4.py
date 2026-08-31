@@ -1659,7 +1659,12 @@ class DreamerV4(nn.Module):
         return torch.stack([h.loss(h(feat), t) for h in self.values]).mean()
 
     def snapshot_prior_policy(self) -> None:
-        """Capture the current policy as the frozen PMPO prior (start of Phase 3)."""
+        """No-op leftover: PMPO π_prior is unused (real-sim REINFORCE).
+
+        ``prior_policy`` stays in the module for checkpoint load / frozen
+        param partition.  Prior-refresh knobs were a false A/B and are
+        **REMOVED**.
+        """
         self.prior_policy.load_state_dict(self.policy.state_dict())
         for p in self.prior_policy.parameters():
             p.requires_grad_(False)

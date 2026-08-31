@@ -103,8 +103,6 @@ def test_teacher_forcing(mk, name):
 
 def test_end_to_end_rssm():
     """Build DreamerV4(rssm, dv_dim>0) + WM loss + imagination run."""
-    import os
-    os.environ.setdefault('DREAMER_COMPILE', '0')
     from models.dreamer_v4 import DreamerV4, DreamerV4Config
     torch.manual_seed(0)
     cfg = DreamerV4Config(

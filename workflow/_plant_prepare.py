@@ -837,7 +837,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Imagination actor is deleted.  Override is fail-loud in train()
     # (``_require_realsim_actor``) so a leftover env is not a false A/B.
     'DREAMER_ACTOR_SOURCE':               ('actor_train_source',             str),
-    'DREAMER_JOINT_PRIOR_REFRESH_ITERS':  ('joint_prior_refresh_iters',      int),
     # Early-stop knobs (mirror train.py _cfg_from_env names) so single_run/bo
     # runs can relax/disable the stops for diagnostic runs (e.g. let a run
     # continue PAST the entropy-collapse stop to observe the cascade trajectory).
@@ -882,10 +881,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # + DOB identification (clean nominal-plant gain), back ON for the Stage-3
     # actor.  =0 to keep DR on throughout (the old, gain-biasing behaviour).
     'DREAMER_CURRICULUM_WM_ID_DR_OFF':    ('curriculum_wm_id_dr_off',        _as_bool),
-    # PMPO prior-refresh cadence (unused for env-free real-sim REINFORCE).
-    # p136 ``DREAMER_ACTOR_KL_COEF`` REMOVED (FALSIFIED; never wired in
-    # ``_realsim_actor_critic_step``).
-    'DREAMER_P3_PRIOR_REFRESH_ITERS':     ('p3_prior_refresh_iters',         int),
     # #2 (P88): multi-step latent overshooting (open-loop prior rollout
     # accuracy; RSSM backbone).  coef=0 = OFF (paper-faithful default).
     'DREAMER_WM_OVERSHOOT_COEF':          ('wm_overshoot_coef',              float),

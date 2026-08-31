@@ -55,8 +55,8 @@ plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
   checkpoint-discard) because all three components co-adapt. Recommended for
   the cheap RSSM backbone. The critic warmup (`DREAMER_P3_CRITIC_WARMUP_ITERS`)
   still runs at the very start so the value head calibrates before actor
-  coupling; `DREAMER_JOINT_PRIOR_REFRESH_ITERS` periodically refreshes the
-  PMPO prior.
+  coupling. PMPO prior-refresh is **REMOVED** (false A/B; real-sim P3 is
+  REINFORCE).
 
 ## Architecture (paper-faithful, adapted to vector APC observations)
 

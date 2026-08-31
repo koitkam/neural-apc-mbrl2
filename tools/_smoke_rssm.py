@@ -63,6 +63,7 @@ from training.train import (
                             _gain_match_rest_window, _held_rollout_win,
                             _rest_ic_can_cuda_graph,
                             _warmup_rest_ic_cuda_graph,
+                            _amp_parent_autocast_on,
                             _rssm_param_grad_snapshot,
                             _rssm_param_grad_restore,
                             collect_rest_lookback,
@@ -1032,12 +1033,11 @@ def _test_batch_np_to_device_identity() -> None:
     """Pinned replay H2D reuse must copy values (CPU always; CUDA if visible)."""
     import numpy as np
     from training.train import (
-        _actor_uses_prior_policy, _batch_np_to_device, TrainConfig)
+        _batch_np_to_device, TrainConfig)
 
     c = TrainConfig()
-    assert _actor_uses_prior_policy(c) is False
-    c.actor_loss_type = 'pmpo'
-    assert _actor_uses_prior_policy(c) is True
+    assert not hasattr(c, 'p3_prior_refresh_iters')
+    assert not hasattr(c, 'joint_prior_refresh_iters')
 
     batch = {
         'obs': np.linspace(0, 1, 2 * 4 * 3, dtype='float32').reshape(2, 4, 3),
@@ -1077,7 +1077,7 @@ def _test_batch_np_to_device_identity() -> None:
             g_crit['obs'].detach().cpu().numpy(), 0.0, rtol=0, atol=1e-6)
         _batch_np_to_device._host = {}  # type: ignore[attr-defined]
         _batch_np_to_device._gpu = {}  # type: ignore[attr-defined]
-    print('[smoke] OK  replay H2D identity + prior-policy snapshot skip')
+    print('[smoke] OK  replay H2D identity + PMPO prior-refresh REMOVED')
 
 
 def _test_store_aux_feats_identity() -> None:
@@ -1320,8 +1320,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_entropy_collapse_threshold' in _src
     assert '_p3_mu_ratio_surrogate' in _src
     assert '_p3_frozen_unfreeze_policy' in _src
-    assert '_maybe_snapshot_prior_policy' in _src
-    assert '_actor_uses_prior_policy' in _src
+    assert '_maybe_snapshot_prior_policy' not in _src
+    assert '_actor_uses_prior_policy' not in _src
+    assert 'p3_prior_refresh_iters: int' not in _src
+    assert 'joint_prior_refresh_iters: int' not in _src
     assert 'actor_kl_coef: float' not in _src
     assert 'pmpo_alpha: float' not in _src
     assert 'pmpo_beta: float' not in _src
@@ -1341,6 +1343,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'cache_enabled=False' in _src
     assert 'enabled=False' in _src
     assert '_warmup_rest_ic_cuda_graph' in _src
+    assert '_amp_parent_autocast_on' in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
@@ -1504,6 +1507,8 @@ def _test_envfree_observer_recipe() -> None:
     assert not hasattr(c, 'actor_kl_coef')
     assert not hasattr(c, 'pmpo_alpha')
     assert not hasattr(c, 'pmpo_beta')
+    assert not hasattr(c, 'p3_prior_refresh_iters')
+    assert not hasattr(c, 'joint_prior_refresh_iters')
     assert c.wm_diag_device == 'cuda'
     assert c.bc_mean_only is True
     assert c.p3_stop_grad_log_std is True
@@ -1677,6 +1682,8 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_EXPERT_MOVE_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_PMPO_ALPHA' not in ENV_OVERRIDES
     assert 'DREAMER_PMPO_BETA' not in ENV_OVERRIDES
+    assert 'DREAMER_P3_PRIOR_REFRESH_ITERS' not in ENV_OVERRIDES
+    assert 'DREAMER_JOINT_PRIOR_REFRESH_ITERS' not in ENV_OVERRIDES
     assert 'DREAMER_WM_DIAG_DEVICE' in ENV_OVERRIDES
     assert 'DREAMER_BASELINE_SEED_EPS' in ENV_OVERRIDES
     assert 'DREAMER_EXPLORATION_SEED_EPS' in ENV_OVERRIDES
@@ -2385,6 +2392,7 @@ def _test_gain_match_rest_ic() -> None:
     assert not _rest_ic_can_cuda_graph(model.dynamics, rest_o, cfg)
     _warmup_rest_ic_cuda_graph(model.dynamics, cfg, torch.device('cpu'))
     assert not hasattr(model.dynamics, '_rest_ic_cg')
+    assert _amp_parent_autocast_on('cpu') is False
     print('[smoke] OK  rest-ic CUDA graph skipped on CPU')
 
 
@@ -3376,6 +3384,15 @@ def _test_sim_runtime_cfg() -> None:
         c_ex.sim_noise_jitter_pct = 0.33
         c_ex._explicit_fields = {'sim_noise_jitter_pct'}  # type: ignore
         assert abs(float(resolve_sim_runtime_knobs(c_ex)['jitter_pct']) - 0.33) < 1e-12
+        wrap.apply_runtime_knobs(c_ex)
+        assert abs(float(wrap._noise_jitter_pct) - 0.33) < 1e-12
+        c_off = TrainConfig()
+        c_off.sim_noise_enabled = False
+        c_off._explicit_fields = {'sim_noise_enabled'}  # type: ignore
+        wrap.apply_runtime_knobs(c_off)
+        assert wrap._has_noise is False
+        wrap.apply_runtime_knobs(TrainConfig())
+        assert wrap._has_noise is True
     finally:
         for k, old in prev.items():
             if old is None:

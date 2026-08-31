@@ -163,17 +163,11 @@ class TrainConfig:
     # — ``train()`` refuses it.  V4 PMPO remains unwired for continuous
     # TanhNormal (unbounded negative-advantage branch).
     actor_loss_type: str = 'reinforce'
-    # PMPO prior-refresh cadence (iters).  Real-sim default is V3 REINFORCE
-    # (``_realsim_actor_critic_step``); π_prior is unused there so snapshots
-    # are skipped.  ``DREAMER_ACTOR_LOSS=pmpo`` is a **false A/B** (P3
-    # always inlines REINFORCE + μ-ratio; ``pmpo_loss`` was never called
-    # and is **REMOVED** from ``models/dreamer_v4.py``).
-    # ``train()`` refuses it, same class as leftover imagination
-    # ``actor_train_source``.  Discrete-PMPO remains a future wiring, not
-    # a silent run_plan bit.  The p136 ``actor_kl_coef`` TR was FALSIFIED
-    # and **REMOVED** (never wired into real-sim P3).
-    # ``DREAMER_P3_PRIOR_REFRESH_ITERS``.
-    p3_prior_refresh_iters: int = 5
+    # ``DREAMER_ACTOR_LOSS=pmpo`` is a **false A/B** (P3 always inlines
+    # REINFORCE + μ-ratio; ``pmpo_loss`` / ``pmpo_alpha`` / ``pmpo_beta``
+    # / prior-refresh knobs **REMOVED**).  ``train()`` refuses ≠reinforce,
+    # same class as leftover imagination ``actor_train_source``.  The
+    # p136 ``actor_kl_coef`` TR was FALSIFIED and **REMOVED**.
 
     # ----- Plant / windowing -----
     lookback: int = 32        # transformer context length T_ctx
@@ -240,10 +234,6 @@ class TrainConfig:
     # DREAMER_ACTOR_SOURCE stays in ENV_OVERRIDES so a bad A/B is visible
     # then aborted, not silently ignored.
     actor_train_source: str = 'realsim'
-    # joint mode: re-snapshot the PMPO prior policy every N iters (0 = once at
-    # start, like phased P3).  A slowly-refreshed prior keeps the KL anchor
-    # from going stale over a long single-phase run.
-    joint_prior_refresh_iters: int = 0
 
     # ----- Optimizers -----
     lr_world: float = 1e-4
@@ -968,8 +958,9 @@ class TrainConfig:
     # Identity speed: CUDA-graph the rest-IC ``last_only`` T-loop (static
     # cached obs/act, ``sample=False``, full BPTT).  RSSM only (TSSM
     # kv-cache grows).  Capture is warmed **outside** the P1 WM autocast
-    # loop (P55: in-loop capture hit autocast cache → eager T-loop for
-    # the whole run).  Capture-fail / CPU / low VRAM → eager Python loop.
+    # loop; in-loop never captures (P55: parent autocast cache rejected
+    # ``make_graphed_callables`` and ``_rest_ic_cg_fail`` pinned eager
+    # ``t_wm`` ~127 s).  Capture-fail / CPU / low VRAM → eager Python loop.
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
     gain_match_rest_ic_cuda_graph: bool = True
     gain_match_max_starts: int = 6
@@ -2315,6 +2306,13 @@ class APCEnv:
         self.rng = rng
         self.sim = create_sim(episode_length=cfg.episode_length,
                               sample_rate=cfg.sample_rate)
+        # Factory wrap has no TrainConfig (phase 1a).  Re-apply runtime
+        # knobs here so dataclass defaults / ENV_OVERRIDES actually
+        # reach jitter / enable.  Identity when they match wrap-time
+        # env (0.20 / on).  Does not re-seed.
+        _apply = getattr(self.sim, 'apply_runtime_knobs', None)
+        if callable(_apply):
+            _apply(cfg)
         self.meta = resolve_sim_metadata(self.sim)
         self.action_dim = int(self.meta['action_dim'])
         self.state_dim = int(self.meta['state_dim'] or 0)
@@ -3896,17 +3894,6 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device,
     return out
 
 
-def _actor_uses_prior_policy(cfg: 'TrainConfig') -> bool:
-    """π_prior is only consumed by PMPO.  Real-sim REINFORCE does not."""
-    return str(getattr(cfg, 'actor_loss_type', 'reinforce')).lower() == 'pmpo'
-
-
-def _maybe_snapshot_prior_policy(model, cfg: 'TrainConfig') -> None:
-    """Skip the policy deepcopy when env-free real-sim REINFORCE is on."""
-    if _actor_uses_prior_policy(cfg):
-        model.snapshot_prior_policy()
-
-
 def _is_rssm_interface(model) -> bool:
     """RSSM and TSSM share ``rollout_observed`` / ``img_rollout`` / ``decode``."""
     return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
@@ -4639,6 +4626,7 @@ def _require_realsim_actor(cfg: 'TrainConfig') -> None:
     Fail loud instead of a false A/B.  ``DREAMER_ACTOR_LOSS=pmpo`` is
     the same class: ``run_plan`` would change while
     ``_realsim_actor_critic_step`` still inlines REINFORCE + μ-ratio.
+    PMPO prior-refresh knobs are **REMOVED** (same false A/B).
     """
     src = str(getattr(cfg, 'actor_train_source', 'realsim') or 'realsim')
     src = src.strip().lower()
@@ -6754,6 +6742,20 @@ def _rest_ic_last_tensors(rssm, obs: torch.Tensor, act: torch.Tensor):
     return state.h, state.z, c
 
 
+def _amp_parent_autocast_on(device_type: str = 'cuda') -> bool:
+    """True when a live autocast region would reject CUDA-graph capture.
+
+    P55: ``make_graphed_callables`` inside ``world_model_loss`` bf16
+    autocast (``cache_enabled=True``) raised and ``_rest_ic_cg_fail``
+    pinned the eager T-loop for the whole run.  In-loop must replay a
+    warmed graph or stay eager — never capture, never pin fail.
+    """
+    try:
+        return bool(torch.is_autocast_enabled(device_type))
+    except TypeError:
+        return bool(torch.is_autocast_enabled())
+
+
 def _rest_ic_can_cuda_graph(rssm, obs: torch.Tensor, cfg: 'TrainConfig') -> bool:
     """CUDA-graph rest-IC is RSSM + CUDA + static T≥8.  TSSM kv-cache grows."""
     if not _cfg_on(cfg, 'gain_match_rest_ic_cuda_graph', True):
@@ -6875,6 +6877,10 @@ def _rest_ic_encode_hzc(rssm, obs: torch.Tensor, act: torch.Tensor,
     cache = getattr(rssm, '_rest_ic_cg', None)
     if cache is not None and cache[0] == key:
         return cache[1](obs, act)
+    # Never capture under a parent autocast (P55 pin).  Replay-miss
+    # here is eager for this step only — warmup captures outside.
+    if _amp_parent_autocast_on(str(getattr(obs.device, 'type', 'cuda'))):
+        return _rest_ic_last_tensors(rssm, obs, act)
     graphed = _capture_rest_ic_cuda_graph(rssm, obs, act)
     if graphed is None:
         rssm._rest_ic_cg_fail = True  # type: ignore[attr-defined]
@@ -6890,8 +6896,10 @@ def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
     (parent autocast ``cache_enabled=True``).  ``make_graphed_callables``
     rejected it and ``_rest_ic_cg_fail`` pinned the eager T-loop for the
     whole run (``t_wm`` ~127 s).  Call after the rest cache exists and
-    Stage-1 ``dob_active`` is already False.  Replay during inner WM
-    steps never re-enters capture.  CPU / opt-out / non-RSSM: no-op.
+    Stage-1 ``dob_active`` is already False.  In-loop encode never
+    recaptures under autocast (eager that step, do not pin fail).
+    Warmup dtype matches the rest-cache numpy (replay batches are
+    float32).  CPU / opt-out / non-RSSM: no-op.
     """
     if rssm is None:
         return
@@ -6901,14 +6909,19 @@ def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
         return
     if getattr(device, 'type', '') != 'cuda':
         return
-    if getattr(cfg, '_gain_match_rest_obs', None) is None:
+    rest_np = getattr(cfg, '_gain_match_rest_obs', None)
+    if rest_np is None:
         return
     if hasattr(rssm, '_rest_ic_cg_fail'):
         delattr(rssm, '_rest_ic_cg_fail')
     if hasattr(rssm, '_rest_ic_cg'):
         delattr(rssm, '_rest_ic_cg')
     try:
-        _gain_match_rest_ic_state(rssm, cfg, device, torch.float32)
+        dt = _numpy_dtype_to_torch(np.asarray(rest_np).dtype)
+    except Exception:
+        dt = torch.float32
+    try:
+        _gain_match_rest_ic_state(rssm, cfg, device, dt)
     except Exception as e:
         print('[gain-match] rest-ic CUDA graph warmup failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
@@ -10986,10 +10999,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_trunk_stopgrad_in_p2 = bool(getattr(cfg, 'wm_trunk_stopgrad_in_p2', False))
     # neural-apc-mbrl JOINT training mode (DreamerV1/V2/V3 style).
     joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
-    joint_prior_refresh_iters = int(
-        getattr(cfg, 'joint_prior_refresh_iters', 0) or 0)
-    p3_prior_refresh_iters = int(
-        getattr(cfg, 'p3_prior_refresh_iters', 0) or 0)
     # ----- Staged clean->disturbance curriculum (2026-06-12) -----
     # Precondition: needs phased mode (it IS the phased curriculum) + the DOB.
     # If misconfigured, hard-disable with a loud warning rather than running a
@@ -11562,8 +11571,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # neural-apc-mbrl JOINT mode: skip the P1/P2 curriculum entirely.  The
     # seed-buffer fill above is the random PREFILL (DreamerV3 prefill);
     # from here co-train WM + actor + critic every step via the P3 path.
-    # Run the P3-entry setup ONCE (snapshot the PMPO prior, anchor the BC
-    # decay + cascade canary) since we never hit the phase-transition block.
+    # Run the P3-entry setup ONCE (anchor the BC decay + cascade canary)
+    # since we never hit the phase-transition block.
     if joint_mode:
         current_phase = 3
         if _cfg_on(cfg, 'p3_reset_log_std', False):
@@ -11572,7 +11581,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         print('[p3] on-policy collect streams measured DV + Kalman '
               '(train/serve match with rollout_observed)',
               flush=True)
-        _maybe_snapshot_prior_policy(model, cfg)
         p3_start_steps = total_env_steps
         try:
             _rs0 = float(model.ret_scale.detach().item())
@@ -11588,8 +11596,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             print('[realsim] domain randomization ENABLED (joint P3)', flush=True)
         print(f"[joint] DreamerV3-style joint training: WM+actor+critic "
               f"co-trained every step from prefill "
-              f"(critic_warmup={p3_critic_warmup_iters} iters, "
-              f"prior_refresh={joint_prior_refresh_iters})", flush=True)
+              f"(critic_warmup={p3_critic_warmup_iters} iters)", flush=True)
 
     # p08 RCA: resolve the gain-match targets from the identified gains now that
     # obs-norm is fitted (seed buffer collected above) → re-anchor the WM
@@ -12181,9 +12188,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # also leaked one extra gain-match step onto the freeze).
             _apply_curriculum_stage(int(current_phase))
             if current_phase == 3:
-                # P45 RCA / P46: restore σ BEFORE the PMPO prior snapshot
-                # so warmup collect + KL prior see the exploring policy,
-                # not the P1/P2 BC-pinned σ_min.  μ (expert mean) stays.
                 if _cfg_on(cfg, 'p3_reset_log_std', False):
                     model.reset_policy_exploration(opt_actor)
                     _init = float(getattr(cfg, 'policy_init_log_std', -1.5))
@@ -12195,8 +12199,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 print('[p3] on-policy collect streams measured DV + Kalman '
                       '(train/serve match with rollout_observed)',
                       flush=True)
-                # PMPO behavioural prior (eq. 11).  Env-free REINFORCE skips.
-                _maybe_snapshot_prior_policy(model, cfg)
                 # 2026-05-23 (P41 RCA): snapshot return_scale at P3 start
                 # so the bootstrap-cascade canary can detect runaway growth.
                 # ``model.ret_scale`` is the EMA buffer used by the critic
@@ -12889,15 +12891,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         opt_critic.step()
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
-
-        # Periodically refresh the PMPO prior.  Env-free real-sim REINFORCE
-        # does not read π_prior (p136 actor-KL TR REMOVED) — skip the
-        # deepcopy.  JOINT: joint_prior_refresh_iters.  PHASED P3: p3_prior_refresh_iters.
-        _refresh_n = (joint_prior_refresh_iters if joint_mode
-                      else p3_prior_refresh_iters)
-        if (current_phase == 3 and p3_iters > 0 and _refresh_n > 0
-                and (p3_iters % _refresh_n) == 0):
-            _maybe_snapshot_prior_policy(model, cfg)
 
         total_iters += 1
         if current_phase == 3:
