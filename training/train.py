@@ -6880,6 +6880,11 @@ def _capture_rest_ic_cuda_graph(
         pass
 
     wrapper = _RestICGraphModule(rssm)
+    # Graphed ``forward`` replays only while ``wrapper.training`` matches
+    # capture (torch 2.12).  RSSM is not a child, so Module default
+    # ``train()`` would not follow ``rssm.training``.  Capture during P1
+    # train; identity with RSSM.
+    wrapper.train(bool(rssm.training))
     trainable = tuple(p for p in wrapper.parameters() if p.requires_grad)
     if not trainable:
         print('[gain-match] rest-ic CUDA graph skipped '
@@ -7782,7 +7787,8 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     cont_kl = torch.zeros((), device=feats.device)
     cont_gain_persist = torch.zeros((), device=feats.device)
     dist_match_loss = torch.zeros((), device=feats.device)
-    if cont is not None:
+    ck_scale = float(getattr(cfg, 'cont_kl_scale', 1.0) or 0.0)
+    if cont is not None and ck_scale > 0.0:
         from models.dreamer_v4_rssm import rssm_cont_kl_loss
         cont_kl, _cont_kl_diag = rssm_cont_kl_loss(
             cont['post_mean'], cont['post_std'],
@@ -7790,7 +7796,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             free_bits=float(getattr(cfg, 'cont_free_bits', 0.5)),
             dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
             repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
-        wm_total = wm_total + float(getattr(cfg, 'cont_kl_scale', 1.0)) * cont_kl
+        wm_total = wm_total + ck_scale * cont_kl
         # Gain-channel persistence: the gain block (first cont_gain_dim dims) is
         # a per-episode CONSTANT → penalise its step-to-step drift so the channel
         # holds a stable gain (separates it from the time-varying disturbance).

@@ -62,7 +62,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > / **64@366**; ema −170→−2163; rscale 1.91 KEEP. Val paired **−87 vs
 > −78 FAIL 5/9**. **REVERT** env-free default **1→0**. Keep ε=0.2.
 > Next GPU: P56 `DREAMER_P3_MU_RATIO_REFRESH=50` (A/B; not a default).
-> HEAD: snapshot refresh is in-place `load_state_dict`;
+> **P56 LIVE** (`run_p56_muslow`, pid **110246**, sha `9d05866`): GAIN-READY
+> @82 **0.83@DV**; last_ok **82**; P3 @136; unfreeze **147** ent **−0.101
+> HELD**; logp_std ~**0.50** (not P55 18); rscale **2.26 KEEP**; rtgt
+> collapsing 0.058→0.004; N=50 recopy not before ~**197**. Rest-IC graph
+> failed this pid (`t_wm` 124 s). HEAD: `_RestICGraphModule` +
+> `wrapper.train(rssm.training)`; snapshot refresh is in-place `load_state_dict`;
 > rest-IC CUDA graph released at g freeze. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt).

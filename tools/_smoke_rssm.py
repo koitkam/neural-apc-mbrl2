@@ -1364,6 +1364,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'cache_enabled=False' in _src
     assert 'enabled=False' in _src
     assert 'class _RestICGraphModule' in _src
+    assert 'wrapper.train(bool(rssm.training))' in _src
+    assert 'ck_scale > 0.0' in _src
     _ric = _src[_src.index('class _RestICGraphModule'):
                 _src.index('def _rest_ic_note_capture_miss')]
     assert 'def parameters(self' in _ric
@@ -2423,6 +2425,8 @@ def _test_gain_match_rest_ic() -> None:
     print(f'[smoke] OK  rest-ic encode is the FD IC '
           f'(Δloss={abs(float(gm1) - float(gm2)):.4g})')
     wrap = _RestICGraphModule(model.dynamics)
+    wrap.train(bool(model.dynamics.training))
+    assert wrap.training == model.dynamics.training
     rp = list(model.dynamics.parameters())
     wp = list(wrap.parameters())
     assert rp and len(wp) == len(rp)
