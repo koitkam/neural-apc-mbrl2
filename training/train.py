@@ -6332,7 +6332,7 @@ def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
     mask = _steady_held_mask(obs, act, cfg)
     if mask is None or float(mask.sum()) <= 0.0:
         return zero, {'wm_steady_held_frac': 0.0}
-    from models.dreamer_v4_rssm import RSSMState
+    from models.dreamer_v4_rssm import RSSMState, cached_zeros_btd
     rssm = model.dynamics
     B, T = obs.shape[:2]
     f = feats[:, :-1]                                  # (B, T-1, F)
@@ -6350,11 +6350,11 @@ def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
     c = _openloop_c0(rssm, f, c_mean=c_mean, starts=t_idx)
     dv_next = (obs[:, 1:].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
                if getattr(rssm, 'dv_dim', 0) > 0 else None)
+    z_logits = cached_zeros_btd(
+        rssm, Bm, rssm.n_categoricals, rssm.n_classes,
+        f.dtype, device, attr='_img_zlogits_zeros')
     state = RSSMState(
-        h=h,
-        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                             device=device, dtype=f.dtype),
-        z=z, c=c)
+        h=h, z_logits=z_logits, z=z, c=c)
     a_next = act[:, 1:].reshape(Bm, -1)                # action driving t+1
     nxt = rssm.img_step(state, a_next, dv=dv_next, sample=False)
     pred_obs = rssm.decode(nxt.feat).reshape(B, T - 1, -1)

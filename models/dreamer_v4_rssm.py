@@ -178,14 +178,21 @@ def cached_zeros_btd(mod, B: int, T: int, D: int, dtype, device,
     """Reuse a ``(B,T,D)`` zero buffer. Identity vs ``torch.zeros`` each call
     as long as callers do not write the buffer in-place (``cat`` / ``detach``
     do not).  Stage-1 DOB ``d_t≡0`` tail is this class.
+
+    Store is a **shape dict** (not a single slot): overshoot / held /
+    gain-match ``img_rollout`` IC ``z_logits`` reuse distinct ``Bm`` in
+    one WM step.  A one-key cache would reallocate every call.
     """
     key = (int(B), int(T), int(D), str(dtype), str(device))
-    cached = getattr(mod, attr, None)
-    if cached is None or cached[0] != key:
+    store = getattr(mod, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(mod, attr, store)
+    z = store.get(key)
+    if z is None:
         z = torch.zeros(B, T, D, device=device, dtype=dtype)
-        setattr(mod, attr, (key, z))
-        return z
-    return cached[1]
+        store[key] = z
+    return z
 
 
 # ---------------------------------------------------------------------------
@@ -1084,11 +1091,13 @@ class RSSMDynamics(nn.Module):
                 Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
         if out not in ('feat', 'h', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
+        # Layout-only IC: ``img_step`` replaces ``z_logits`` (no in-place
+        # write).  Deterministic latent never reads this softmax slot.
+        z_logits = cached_zeros_btd(
+            self, Bm, self.n_categoricals, self.n_classes,
+            h0.dtype, h0.device, attr='_img_zlogits_zeros')
         state = RSSMState(
-            h=h0,
-            z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
-                                 device=h0.device, dtype=h0.dtype),
-            z=z0, c=c)
+            h=h0, z_logits=z_logits, z=z0, c=c)
         feats = None if last_only else []
         h_l = z_l = c_l = dv_l = None
         if not last_only and out != 'h':

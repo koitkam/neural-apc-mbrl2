@@ -682,11 +682,11 @@ class TransformerSSMDynamics(nn.Module):
                 Bm, self.cont_dim, device=h0.device, dtype=h0.dtype))
         if out not in ('feat', 'h', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
+        z_logits = cached_zeros_btd(
+            self, Bm, self.n_categoricals, self.n_classes,
+            h0.dtype, h0.device, attr='_img_zlogits_zeros')
         state = TSSMState(
-            h=h0,
-            z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
-                                 device=h0.device, dtype=h0.dtype),
-            z=z0, c=c, kv_cache=None, pos=0)
+            h=h0, z_logits=z_logits, z=z0, c=c, kv_cache=None, pos=0)
         feats = None if last_only else []
         h_l = z_l = c_l = dv_l = None
         if not last_only and out != 'h':

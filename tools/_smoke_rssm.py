@@ -1196,6 +1196,8 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     z3 = cached_zeros_btd(mod, 2, 5, 3, torch.float32, torch.device('cpu'))
     assert z3 is not z1
     assert z3.shape == (2, 5, 3)
+    assert z1 is cached_zeros_btd(mod, 2, 4, 3, torch.float32, torch.device('cpu'))
+    assert float(z1.abs().sum()) == 0.0
 
     class _M:
         pass
@@ -1461,6 +1463,11 @@ def _test_img_rollout_last_only() -> None:
     last_obs = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='obs')
     last_obs_err = float((last_obs - obs_roll[:, -1]).detach().abs().max())
     assert last_obs_err < 1e-5, f"last_only out='obs' != stack[:, -1] (max_err={last_obs_err})"
+    store = getattr(m, '_img_zlogits_zeros', None)
+    assert isinstance(store, dict) and store, 'img_rollout z_logits zeros not cached'
+    roll2 = m.img_rollout(h0, z0, acts, sample=False)
+    cache_err = float((roll2 - roll).detach().abs().max())
+    assert cache_err < 1e-6, f'cached z_logits zeros changed rollout (max_err={cache_err})'
     m.zero_grad(set_to_none=True)
     last.sum().backward()
     gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
@@ -1469,7 +1476,8 @@ def _test_img_rollout_last_only() -> None:
     print(f'[smoke] OK  img_rollout last_only ≡ stack[:, -1] '
           f'(max_err={err:.2e}); out=h/obs identity '
           f'(h={h_err:.2e} obs={obs_err:.2e} last_h={last_h_err:.2e} '
-          f'last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}')
+          f'last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}; '
+          f'z_logits cache identity max_err={cache_err:.2e}')
 
 
 def _test_isolation_dcv_scales() -> None:
@@ -1635,6 +1643,10 @@ def _test_isolation_dcv_scales() -> None:
     _stk = _rssm_src[_rssm_src.index('def _stack_decode_core'):
                      _rssm_src.index('def cached_zeros_btd')]
     assert '.flatten(start_dim=-2)' in _stk
+    _cz = _rssm_src[_rssm_src.index('def cached_zeros_btd'):
+                    _rssm_src.index('class RSSMConfig')]
+    assert 'isinstance(store, dict)' in _cz
+    assert '_img_zlogits_zeros' in _rssm_src
     assert '_gain_match_fd_action_seq' in _src
     assert 'def _wm_need_logged_aux' in _src
     assert '_wm_need_enc_diag' in _src
