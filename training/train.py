@@ -1876,19 +1876,15 @@ class TrainConfig:
     # actor-KL TR **REMOVED**. ε≤0 disables (identity REINFORCE + P52
     # logp clip). Default 0.2. Opt out ``DREAMER_P3_MU_RATIO_CLIP=0``.
     p3_mu_ratio_clip: float = 0.2
-    # P54 EXIT / P55: recopy the μ-ratio snapshot every N P3 *iters*
-    # (window = N × ``phase3_train_steps_per_iter`` inner AC steps).
-    # P53 freeze-forever (N=0) KEEP as the walk limiter that stopped
-    # the P52 rail, but P54 extra P3 after best.pt 246 was a
-    # **ceiling**: ``actor_ratio_clip_frac`` 0.42→0.11, det_return
-    # plateaued 200 iters, val **−26 vs −101** lost to P53 **−13**.
-    # Mechanism: ε=0.2 vs P3-entry μ is a hard ball around BC; late
-    # P3 cannot leave it. N=1 is one PPO epoch per collect iter
-    # (unitless; inner count already plant-adaptive). First
-    # unfreeze epoch still clips vs unfreeze-μ (warmup AC calls
-    # do not step the actor). 0 = P53 freeze-forever.
-    # Opt out ``DREAMER_P3_MU_RATIO_REFRESH=0``.
-    p3_mu_ratio_refresh_iters: int = 1
+    # P53 freeze-forever (N=0). Window = N ×
+    # ``phase3_train_steps_per_iter`` inner AC steps. P54 extra P3
+    # with freeze-forever was a **ceiling** (``clip_frac`` 0.42→0.11,
+    # val **−26 vs −101** lost to P53 **−13**). **P55 EXIT FALSIFIED
+    # N=1**: recopying the ε=0.2 ball onto last-iter μ each collect is
+    # a 20%/iter compounding walk (logp_std 0.67→18.8, val **−87 vs
+    # −78 FAIL 5/9**). Keep ε=0.2. Slow recopy is A/B-only via
+    # ``DREAMER_P3_MU_RATIO_REFRESH`` (do not promote N>0).
+    p3_mu_ratio_refresh_iters: int = 0
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
     # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
     # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
@@ -4084,7 +4080,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
         f"p3_logpclip={float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0):g} "
         f"p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0):g} "
-        f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 1) or 0)} "
+        f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)} "
         f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
@@ -8327,10 +8323,10 @@ def _p3_copy_policy_snapshot(policy) -> torch.nn.Module:
 def _p3_load_policy_snapshot(snap: torch.nn.Module, policy) -> None:
     """In-place weight copy into an existing snapshot.
 
-    Identity vs a fresh deepcopy for ``logp_old``.  Refresh-every-iter
-    (P55) used to allocate a new module each collect; ``load_state_dict``
-    reuses the first snapshot's storage.  Host-adaptive (no extra CUDA
-    alloc).  Snapshot stays eval / frozen.
+    Identity vs a fresh deepcopy for ``logp_old``.  P55 N=1 used to
+    allocate a new module each collect; ``load_state_dict`` reuses the
+    first snapshot's storage.  Host-adaptive (no extra CUDA alloc).
+    Snapshot stays eval / frozen.
     """
     snap.load_state_dict(policy.state_dict())
 
@@ -8338,15 +8334,16 @@ def _p3_load_policy_snapshot(snap: torch.nn.Module, policy) -> None:
 def _p3_frozen_unfreeze_policy(model, cfg=None) -> torch.nn.Module:
     """Detached deepcopy of ``model.policy`` for PPO ``logp_old``.
 
-    P53 (``p3_mu_ratio_refresh_iters=0`` / ``cfg is None``): taken once
+    Default N=0 / ``cfg is None`` (P53 freeze-forever): taken once
     at the first AC call (P3-entry μ). Critic warmup does not
     ``opt_actor.step``, so that first call is the unfreeze snapshot.
 
-    P55 (default N=1): recopy live μ at the first AC call of every N
-    P3 iters via ``_p3_load_policy_snapshot`` (in-place; identity vs
-    a fresh deepcopy). Window = N × ``phase3_train_steps_per_iter``
-    inner steps so an epoch holds ``logp_old`` across the inner SGD,
-    not per-step (per-step recopy ⇒ ratio≈1). Warmup AC calls recopy
+    N>0 (P55 FALSIFIED N=1; slow recopy is A/B): recopy live μ at
+    the first AC call of every N P3 iters via
+    ``_p3_load_policy_snapshot`` (in-place; identity vs a fresh
+    deepcopy). Window = N × ``phase3_train_steps_per_iter`` inner
+    steps so an epoch holds ``logp_old`` across the inner SGD, not
+    per-step (per-step recopy ⇒ ratio≈1). Warmup AC calls recopy
     the same frozen actor (identity); the first unfreeze epoch still
     clips vs unfreeze-μ.
 

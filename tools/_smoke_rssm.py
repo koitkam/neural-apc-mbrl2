@@ -233,7 +233,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.p3_stop_grad_log_std is True
     assert abs(float(_tc.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(_tc.p3_mu_ratio_clip) - 0.2) < 1e-12
-    assert int(_tc.p3_mu_ratio_refresh_iters) == 1
+    assert int(_tc.p3_mu_ratio_refresh_iters) == 0
     assert abs(float(_tc.early_stop_entropy_collapse_floor_frac) - 0.25) < 1e-12
     assert int(_tc.aux_tbptt_steps) == 16
     assert not hasattr(_tc, 'gain_match_relative')
@@ -1533,7 +1533,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.p3_stop_grad_log_std is True
     assert abs(float(c.p3_logp_clip) - 8.0) < 1e-12
     assert abs(float(c.p3_mu_ratio_clip) - 0.2) < 1e-12
-    assert int(c.p3_mu_ratio_refresh_iters) == 1
+    assert int(c.p3_mu_ratio_refresh_iters) == 0
     assert abs(float(c.early_stop_entropy_collapse_floor_frac) - 0.25) < 1e-12
     assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
     assert abs(float(c.runtime_setpoint_bounds_jitter_frac) - 0.15) < 1e-12
@@ -2657,7 +2657,7 @@ def _test_p3_mu_ratio_refresh() -> None:
     """P55: recopy snapshot every N P3 iters; 0 stays freeze-forever."""
     from models.dreamer_v4 import ContinuousPolicyHead
     torch.manual_seed(0)
-    assert int(TrainConfig().p3_mu_ratio_refresh_iters) == 1
+    assert int(TrainConfig().p3_mu_ratio_refresh_iters) == 0
     kwargs = dict(
         in_dim=8, hidden_dim=16, action_dim=1, n_layers=2, mtp_length=1,
         init_log_std=-1.5, log_std_min=-2.3, log_std_max=0.0)
@@ -3638,7 +3638,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'p3_sglogstd=True' in banner, banner
     assert 'p3_logpclip=8' in banner, banner
     assert 'p3_muratio=0.2' in banner, banner
-    assert 'p3_murefresh=1' in banner, banner
+    assert 'p3_murefresh=0' in banner, banner
     assert 'es_ent_floor=0.25' in banner, banner
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'

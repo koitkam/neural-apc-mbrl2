@@ -611,8 +611,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_P3_LOGP_CLIP':               ('p3_logp_clip',                   float),
     # P53: PPO ratio clip vs frozen unfreeze-μ (default 0.2). Opt out ``=0``.
     'DREAMER_P3_MU_RATIO_CLIP':           ('p3_mu_ratio_clip',               float),
-    # P55: recopy μ-ratio snapshot every N P3 iters (default 1 = PPO
-    # epoch per collect). 0 = P53 freeze-forever. Opt out ``=0``.
+    # P53 freeze-forever (default 0). P55 EXIT FALSIFIED N=1.
+    # Slow recopy is A/B-only (do not promote N>0).
     'DREAMER_P3_MU_RATIO_REFRESH':       ('p3_mu_ratio_refresh_iters',    int),
     'DREAMER_WM_GRAD_SKIP_NORM':          ('wm_grad_skip_norm',              float),
     # P27 RCA / P28: restore wm_best and continue to P2 on a P1 skip-storm

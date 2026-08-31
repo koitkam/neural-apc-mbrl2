@@ -55,12 +55,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > iters): ES floor **KEEP** as false-trip fix (`p3_plateau`; 0/310
 > below −0.238) and **FALSIFIED as actor-econ lever** (paired **−26 vs
 > −101** 9/9, worse than P53 −13/−98). Freeze-forever μ-ratio is a
-> late-P3 ceiling (`clip_frac` 0.42→0.11). **P55 LIVE P3** recopy
-> snapshot each P3 iter (`p3_mu_ratio_refresh_iters=1`): compounding
-> μ-walk vs last-iter μ (not P3-entry). Unfreeze 147 logp_std
-> 0.67→18.8@175 still 19.4@320; ema −170→−2163; rscale 1.91 KEEP.
-> best.pt **166** det −28.8 then walk detonates @169. Not KEEP until
-> EXIT+val. HEAD: snapshot refresh is in-place `load_state_dict`;
+> late-P3 ceiling (`clip_frac` 0.42→0.11). **P55 EXIT**
+> (`run_p55_murefresh`, `b321d89`, 366 iters) **FALSIFIED**
+> `p3_mu_ratio_refresh_iters=1`: recopy vs last-iter μ is a 20%/iter
+> compounding walk. Unfreeze 147 logp_std 0.67→18.8@175 still 19.4@320
+> / **64@366**; ema −170→−2163; rscale 1.91 KEEP. Val paired **−87 vs
+> −78 FAIL 5/9**. **REVERT** env-free default **1→0**. Keep ε=0.2.
+> Next GPU: P56 `DREAMER_P3_MU_RATIO_REFRESH=50` (A/B; not a default).
+> HEAD: snapshot refresh is in-place `load_state_dict`;
 > rest-IC CUDA graph released at g freeze. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt).
@@ -489,13 +491,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > FAIL**). **P53 EXIT KEEP** as μ-walk limiter **and** cascade
 > (`p3_mu_ratio_clip=0.2`; val **−13 vs −98** 9/9). **P54 EXIT KEEP**
 > as ES false-trip (`early_stop_entropy_collapse_floor_frac=0.25`;
-> **FALSIFIED as actor-econ**; paired **−26 vs −101**). **P55 LIVE P3**
-> recopy snapshot each P3 iter (`p3_mu_ratio_refresh_iters=1`):
+> **FALSIFIED as actor-econ**; paired **−26 vs −101**). **P55 EXIT
+> FALSIFIED** recopy every P3 iter (`p3_mu_ratio_refresh_iters=1`):
 > compounding μ-walk (clip vs last-iter μ, not P3-entry). Unfreeze 147
-> logp_std 0.67→**18.8@175** still **~9–10@245**; `clip_frac` stays
-> 0.02–0.80 (P53 held ~0.47 / clip 0.61→0.14); ema **−170→−2000**;
-> vs_expert **−2200**; rtgt 0.060→**0.0001**; rscale **1.91 KEEP**.
-> Not Step-5 until EXIT+val (best.pt ~166 may still be P53-class).
+> logp_std 0.67→**18.8@175** still **19.4@320** / **64@366**; `clip_frac`
+> 0.02–0.80 (P53 held ~0.47 / clip 0.61→0.14); ema **−170→−2163**;
+> rtgt 0.060→**0.0001**; rscale **1.91 KEEP**. Val paired **−87 vs −78
+> FAIL 5/9**. **REVERT** default **1→0**. Do not treat best.pt@166 as
+> KEEP of N=1. Slow recopy is A/B (`DREAMER_P3_MU_RATIO_REFRESH`).
 > `critic_mc_loss` is now in the
 > P3 jsonl. Opt out
 > `DREAMER_P3_MU_RATIO_CLIP=0`. Not a lag-copy (1 update/batch
