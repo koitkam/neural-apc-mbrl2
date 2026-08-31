@@ -1111,14 +1111,27 @@ class ContinuousPolicyHead(nn.Module):
         ``stop_grad_log_std`` detaches σ so REINFORCE trains μ only
         (P51; P50 unfreeze yanked log_std).
         """
+        logp, _ent = self.log_prob_and_entropy(
+            latent, action, stop_grad_log_std=stop_grad_log_std)
+        return logp
+
+    def log_prob_and_entropy(self, latent: torch.Tensor, action: torch.Tensor,
+                              *, stop_grad_log_std: bool = False
+                              ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One ``dist_params`` forward → ``(logp, entropy)``.
+
+        Identity vs ``log_prob_of`` + ``entropy`` (dropout-free MLP).
+        P3 REINFORCE used two MLP passes per inner step.
+        """
         mu, log_std = self.dist_params(latent)
         if stop_grad_log_std:
             log_std = log_std.detach()
-        # Invert tanh: u = atanh(action), clamped for numerical stability
-        # near ±1 (atanh(±1) is ±inf).
         a_clamped = action.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
         u = 0.5 * torch.log1p(2.0 * a_clamped / (1.0 - a_clamped))
-        return self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
+        logp = self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
+        entropy = (0.5 * (math.log(2.0 * math.pi * math.e)
+                           + 2.0 * log_std)).sum(-1)
+        return logp, entropy
 
     def log_prob_of_mtp(self, latent: torch.Tensor,
                          actions: torch.Tensor) -> torch.Tensor:
@@ -1157,7 +1170,7 @@ class ContinuousPolicyHead(nn.Module):
 
         ``stop_grad_log_std`` makes η a constant w.r.t. σ (P51).
         """
-        _, log_std = self.dist_params(latent)
+        _mu, log_std = self.dist_params(latent)
         if stop_grad_log_std:
             log_std = log_std.detach()
         return (0.5 * (math.log(2.0 * math.pi * math.e)
@@ -1657,6 +1670,31 @@ class DreamerV4(nn.Module):
         """Mean twohot-CE across ensemble heads vs the same target."""
         t = target_returns.reshape(-1)
         return torch.stack([h.loss(h(feat), t) for h in self.values]).mean()
+
+    def critic_online_ce_and_min_v(
+            self, feat: torch.Tensor, target_returns: torch.Tensor,
+            mc_returns: Optional[torch.Tensor] = None
+            ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """One online-ensemble MLP pass → λ CE, min-of-N V, optional MC CE.
+
+        Identity vs ``critic_ensemble_ce`` + ``critic_min_v(target=False)``
+        (+ a second CE for MC) on the dropout-free twohot MLP.  P3 used
+        three online forwards per on-policy inner step.
+        """
+        logits = [h(feat) for h in self.values]
+        t = target_returns.reshape(-1)
+        ce = torch.stack(
+            [h.loss(lg, t) for h, lg in zip(self.values, logits)]).mean()
+        v = torch.stack(
+            [h.expectation(lg) for h, lg in zip(self.values, logits)],
+            dim=0).min(dim=0).values
+        mc: Optional[torch.Tensor] = None
+        if mc_returns is not None:
+            tm = mc_returns.reshape(-1)
+            mc = torch.stack(
+                [h.loss(lg, tm) for h, lg in zip(self.values, logits)]
+            ).mean()
+        return ce, v, mc
 
     def snapshot_prior_policy(self) -> None:
         """No-op leftover: PMPO π_prior is unused (real-sim REINFORCE).

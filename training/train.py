@@ -8675,6 +8675,23 @@ def _p3_policy_logp(policy, feat: torch.Tensor, act: torch.Tensor,
     return policy.log_prob_of(feat, act)
 
 
+def _p3_policy_logp_and_entropy(policy, feat: torch.Tensor, act: torch.Tensor,
+                                stop_grad_log_std: bool
+                                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One policy MLP pass → ``(logp, entropy)`` when the head supports it."""
+    fn = getattr(policy, 'log_prob_and_entropy', None)
+    if callable(fn):
+        if stop_grad_log_std and hasattr(policy, 'dist_params'):
+            return fn(feat, act, stop_grad_log_std=True)
+        return fn(feat, act)
+    logp = _p3_policy_logp(policy, feat, act, stop_grad_log_std)
+    if stop_grad_log_std and hasattr(policy, 'dist_params'):
+        entropy = policy.entropy(feat, stop_grad_log_std=True)
+    else:
+        entropy = policy.entropy(feat)
+    return logp, entropy
+
+
 def _p3_copy_policy_snapshot(policy) -> torch.nn.Module:
     """Detached deepcopy used as PPO ``logp_old``. Not a registered child."""
     snap = copy.deepcopy(policy)
@@ -8805,9 +8822,25 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # sample=False = the posterior MODE (certainty-equivalent belief), which is
     # deterministic + reproducible so the critic value and the actor log-prob
     # are evaluated on the SAME belief the control acts on.
+    # When the critic replay window matches (B,T,D/A), cat the batch dim
+    # and run ONE teacher-forced unroll (rows are independent).
+    _fc = None
+    _fuse_cb = (
+        critic_batch is not None
+        and critic_batch['obs'].shape[1] == T
+        and critic_batch['obs'].shape[-1] == obs.shape[-1]
+        and critic_batch['act'].shape[-1] == act.shape[-1])
     with torch.no_grad():
-        feats, *_ = rssm.rollout_observed(
-            obs, act, sample=False, store_aux=False)     # (B, T, F)
+        if _fuse_cb:
+            feats_all, *_ = rssm.rollout_observed(
+                torch.cat([obs, critic_batch['obs']], 0),
+                torch.cat([act, critic_batch['act']], 0),
+                sample=False, store_aux=False)
+            feats = feats_all[:B]
+            _fc = feats_all[B:]
+        else:
+            feats, *_ = rssm.rollout_observed(
+                obs, act, sample=False, store_aux=False)
     feats = feats.detach()
     feat_flat = feats.reshape(B * T, -1)
 
@@ -8839,18 +8872,20 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
     mc_parts: List[torch.Tensor] = []
 
-    def _critic_ce(feat, vslow, rew_b, lam_ret):
-        """Ensemble twohot-CE to the λ-return + optional PURE-MC (λ=1)."""
-        loss = model.critic_ensemble_ce(feat, lam_ret)
+    def _critic_pack(feat, vslow, rew_b, lam_ret):
+        """One online-ensemble forward: λ CE + optional MC CE + min-of-N V."""
+        rmc = None
         if _mc_coef > 0.0:
             rmc = _lambda_returns(rew_b, vslow, gamma, 1.0, _ret_cap)
-            mc = model.critic_ensemble_ce(feat, rmc)
+        ce, v, mc = model.critic_online_ce_and_min_v(feat, lam_ret, rmc)
+        if mc is not None:
             mc_parts.append(mc.detach())
-            loss = loss + _mc_coef * mc
-        return loss
+            ce = ce + _mc_coef * mc
+        return ce, v
 
     # (a) ON-POLICY term — the distribution the advantage is evaluated on.
-    critic_loss = _critic_ce(feat_flat, v_slow, rew, target_returns)
+    critic_loss, v_pred_flat = _critic_pack(
+        feat_flat, v_slow, rew, target_returns)
 
     # P83 expert-BC anchor accumulator (wired below on the seed-buffer batch,
     # which retains expert-flagged steps via the every-20-iter P3 expert inject).
@@ -8859,18 +8894,19 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # (b) DIVERSE replay term — anti-starvation diversity (skipped if no split).
     if critic_batch is not None:
-        with torch.no_grad():
-            _fc, *_ = rssm.rollout_observed(
-                critic_batch['obs'], critic_batch['act'],
-                sample=False, store_aux=False)
+        if _fc is None:
+            with torch.no_grad():
+                _fc, *_ = rssm.rollout_observed(
+                    critic_batch['obs'], critic_batch['act'],
+                    sample=False, store_aux=False)
         Bc, Tc = critic_batch['obs'].shape[:2]
         feat_c = _fc.detach().reshape(Bc * Tc, -1)
         rew_c = critic_batch['rew'].float()
         with torch.no_grad():
             v_slow_c = model.critic_min_v(feat_c, target=True).reshape(Bc, Tc)
         ret_c = _lambda_returns(rew_c, v_slow_c, gamma, lam, _ret_cap)
-        critic_loss = critic_loss + _critic_ce(
-            feat_c, v_slow_c, rew_c, ret_c)
+        _ce_c, _ = _critic_pack(feat_c, v_slow_c, rew_c, ret_c)
+        critic_loss = critic_loss + _ce_c
         # P83: P3 expert-BC is MSE-on-μ (does not fight σ). Grad reaches
         # ONLY the policy (feat is detached inside expert_bc_p3_loss).
         # P1/P2 ``agent_finetune_loss`` uses the same form when
@@ -8882,8 +8918,10 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # ----- advantage + percentile return-scale normalisation — REUSED -----
     # P26 RCA / P27: advantage baseline is min-of-N (same as the λ bootstrap)
     # so an optimistic head cannot inflate A.  Freeze the EMA after warmup.
+    # ``v_pred`` is the online min-of-N from the CE logits (same MLP as
+    # ``critic_min_v(target=False)``; expectation is already ``no_grad``).
     with torch.no_grad():
-        v_pred = model.critic_min_v(feat_flat, target=False).reshape(B, T)
+        v_pred = v_pred_flat.reshape(B, T)
         adv_raw = target_returns - v_pred
         scale = model.update_return_scale(
             target_returns,
@@ -8902,12 +8940,8 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # (P50 unfreeze 169: ent −0.107→−0.268). Discrete heads have no
     # ``dist_params`` and ignore the flag.
     _sg_logstd = bool(getattr(cfg, 'p3_stop_grad_log_std', True))
-    logp = _p3_policy_logp(model.policy, feat_flat, act_flat, _sg_logstd)
-    if _sg_logstd and hasattr(model.policy, 'dist_params'):
-        entropy = model.policy.entropy(
-            feat_flat, stop_grad_log_std=True)
-    else:
-        entropy = model.policy.entropy(feat_flat)                # (B*T,)
+    logp, entropy = _p3_policy_logp_and_entropy(
+        model.policy, feat_flat, act_flat, _sg_logstd)
     ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
     # P51 EXIT / P52: clamp REINFORCE logp so frozen-σ (u−μ)/σ² cannot
     # explode μ (P51 147: logp mean −26 / std 38; @315 mean −227).

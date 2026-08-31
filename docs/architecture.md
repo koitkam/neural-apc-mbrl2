@@ -721,7 +721,11 @@ the same leftover-env class (identity defaults; dual-read at
   **diverse shared replay** (a value baseline is action-independent ⇒ off-policy
   replay is unbiased and keeps the head conditioned when the actor sits in a
   corner), while the **actor** stays on-policy (`_realsim_actor_critic_step(…,
-  critic_batch=<replay sample>)`).
+  critic_batch=<replay sample>)`). Matching-shape on-policy + replay windows
+  share one frozen `rollout_observed` (batch-cat; rows independent). Online
+  critic λ-CE, MC-CE, and min-of-N V share one ensemble MLP pass
+  (`critic_online_ce_and_min_v`). REINFORCE `logp` + entropy share one
+  `dist_params` (`log_prob_and_entropy`). Identity vs the split forwards.
 - **Actor** `π(a|feat)` [`opt_actor`] is trained on the **advantage**
   `return − V(feat)` (÷ the percentile return-scale) via REINFORCE on the REAL
   taken action (`policy.log_prob_of`) from the **on-policy** buffer. It is the

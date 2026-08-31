@@ -715,8 +715,21 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         'rew': torch.randn(B, T),
         'cont': torch.ones(B, T),
     }
-    diagC = _realsim_actor_critic_step(model, batch, cfg,
-                                       critic_batch=critic_batch)
+    _n_roll = {'n': 0}
+    _orig_roll = model.dynamics.rollout_observed
+
+    def _count_roll(*a, **k):
+        _n_roll['n'] += 1
+        return _orig_roll(*a, **k)
+
+    model.dynamics.rollout_observed = _count_roll
+    try:
+        diagC = _realsim_actor_critic_step(model, batch, cfg,
+                                           critic_batch=critic_batch)
+        assert _n_roll['n'] == 1, (
+            f'fused observer encode expected 1 rollout, got {_n_roll["n"]}')
+    finally:
+        model.dynamics.rollout_observed = _orig_roll
     _finite('_realsim_actor_critic_step[critic_split+MC]', diagC)
     assert float(diagC['critic_mc_loss']) >= 0.0
     (diagC['actor_loss'] + diagC['critic_loss']).backward()
@@ -2819,7 +2832,55 @@ def _test_p3_stop_grad_log_std() -> None:
     loss2.backward()
     assert float(last2.weight.grad[idx].abs().max()) > 1e-4, (
         float(last2.weight.grad[idx].abs().max()))
+    pol3 = ContinuousPolicyHead(**kwargs)
+    logp3, ent3 = pol3.log_prob_and_entropy(
+        feat, act, stop_grad_log_std=True)
+    logp4 = pol3.log_prob_of(feat, act, stop_grad_log_std=True)
+    ent4 = pol3.entropy(feat, stop_grad_log_std=True)
+    assert torch.allclose(logp3, logp4, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(ent3, ent4, atol=1e-6, rtol=1e-6)
     print('[smoke] OK  p3_stop_grad_log_std zeros log_std REINFORCE grad')
+
+
+def _test_p3_shared_ac_forwards() -> None:
+    """P58 GPU-occupied: one critic MLP pass ≡ CE+min_v+MC; fused encode."""
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim = 4
+    cfg.action_dim = 1
+    cfg.lookback = 8
+    cfg.world_model_type = 'rssm'
+    cfg.n_critics = 2
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.head_hidden = 16
+    cfg.head_n_layers = 2
+    cfg.mtp_length = 1
+    cfg.horizon = 4
+    cfg.seq_len = 8
+    cfg.d_model = 32
+    cfg.rssm_latent_type = 'deterministic'
+    cfg.dob_enabled = False
+    cfg.dv_as_input = False
+    model = build_model(cfg)
+    feat = torch.randn(10, model.dynamics.feat_dim)
+    ret = torch.randn(10)
+    rmc = torch.randn(10)
+    ce_ref = model.critic_ensemble_ce(feat, ret)
+    v_ref = model.critic_min_v(feat, target=False)
+    mc_ref = model.critic_ensemble_ce(feat, rmc)
+    ce, v, mc = model.critic_online_ce_and_min_v(feat, ret, rmc)
+    assert mc is not None
+    assert torch.allclose(ce, ce_ref, atol=1e-5, rtol=1e-5), float(
+        (ce - ce_ref).abs().max())
+    assert torch.allclose(v, v_ref, atol=1e-5, rtol=1e-5), float(
+        (v - v_ref).abs().max())
+    assert torch.allclose(mc, mc_ref, atol=1e-5, rtol=1e-5), float(
+        (mc - mc_ref).abs().max())
+    print('[smoke] OK  critic_online_ce_and_min_v ≡ CE + min_v + MC')
 
 
 def _test_p3_logp_clip() -> None:
@@ -4153,6 +4214,7 @@ if __name__ == '__main__':
     _test_p3_reset_log_std()
     _test_bc_mean_only()
     _test_p3_stop_grad_log_std()
+    _test_p3_shared_ac_forwards()
     _test_p3_logp_clip()
     _test_p3_mu_ratio_clip()
     _test_p3_mu_ratio_refresh()
