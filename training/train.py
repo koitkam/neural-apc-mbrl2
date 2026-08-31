@@ -961,10 +961,11 @@ class TrainConfig:
     # loop; in-loop never captures (P55: parent autocast cache rejected
     # ``make_graphed_callables`` and ``_rest_ic_cg_fail`` pinned eager
     # ``t_wm`` ~127 s).  The graphed callable is ``_RestICGraphModule``
-    # so RSSM params are on the backward surface (P56: a nested function
-    # had empty ``parameters()`` → ``grad requires non-empty inputs``,
-    # then ``requires_grad`` copies would still drop GRU grads).
-    # Capture-fail / CPU / low VRAM → eager Python loop.
+    # so RSSM ``named_parameters`` / ``named_buffers`` are the capture
+    # surface (P56: a nested function had empty ``parameters()`` →
+    # ``grad requires non-empty inputs``; overriding only
+    # ``parameters()`` left ``named_parameters()`` / ``buffers()``
+    # empty).  Capture-fail / CPU / low VRAM → eager Python loop.
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
     gain_match_rest_ic_cuda_graph: bool = True
     gain_match_max_starts: int = 6
@@ -6813,18 +6814,26 @@ class _RestICGraphModule(torch.nn.Module):
     ``_rest_ic_cg_fail`` pinned the eager T-loop (``t_wm`` ~123 s).
     Marking copies ``requires_grad_(True)`` would un-empty that list
     but still omit GRU params from the recorded backward (canary
-    ``gru_g==0`` → eager).  This Module surfaces
-    ``rssm.parameters()`` without re-parenting ``model.dynamics``.
-    Last-only encode skips prior/decoder; capture uses
-    ``allow_unused_input=True``.
+    ``gru_g==0`` → eager).  This Module yields
+    ``rssm.named_parameters()`` / ``named_buffers()`` without
+    re-parenting ``model.dynamics`` (``object.__setattr__``).  Torch
+    2.12 capture uses ``tuple(c.parameters())`` **and** asserts every
+    ``c.buffers()`` item has ``requires_grad=False``.  Overriding only
+    ``parameters()`` left the default ``named_parameters()`` /
+    ``buffers()`` empty (they walk ``_parameters`` / ``_modules``,
+    which stay empty).  Last-only encode skips prior/decoder; capture
+    uses ``allow_unused_input=True``.
     """
 
     def __init__(self, rssm):
         super().__init__()
         object.__setattr__(self, '_rssm', rssm)
 
-    def parameters(self, recurse: bool = True):
-        return self._rssm.parameters(recurse=recurse)
+    def named_parameters(self, *args, **kwargs):
+        yield from self._rssm.named_parameters(*args, **kwargs)
+
+    def named_buffers(self, *args, **kwargs):
+        yield from self._rssm.named_buffers(*args, **kwargs)
 
     def forward(self, obs: torch.Tensor, act: torch.Tensor):
         return _rest_ic_last_tensors(self._rssm, obs, act)
@@ -6856,7 +6865,7 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
         # Do **not** force ``requires_grad`` on obs/act copies: live
         # rest-IC cache tensors do not require grad, and PyTorch
         # requires sample_args to match the training loop.  GRU params
-        # come from the Module surface, not from the obs/act leaves.
+        # come from ``named_parameters()``, not from the obs/act leaves.
         o_s = obs.detach()
         a_s = act.detach()
         with torch.amp.autocast(device_type=obs.device.type, enabled=False):
@@ -7009,8 +7018,11 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     RSSM, T≥8, and capture+GRU-grad canary succeed.  Capture is warmed
     at train start outside the WM autocast loop (P55 in-loop capture
     hit autocast cache).  A nested function is not a graph surface
-    (P56: empty ``parameters()``).  Raw ``CUDAGraph`` has no backward
-    (P25).  TSSM / CPU / capture-fail stay on the Python loop.
+    (P56: empty ``parameters()``).  ``named_parameters`` /
+    ``named_buffers`` must yield the RSSM (overriding only
+    ``parameters()`` left ``buffers()`` empty).  Raw ``CUDAGraph``
+    has no backward (P25).  TSSM / CPU / capture-fail stay on the
+    Python loop.
 
     Do **not** concat rest rows into the main WM ``rollout_observed``
     (``sample=True``): the GRU would see sampled ``c``, so ``h`` ≠ this

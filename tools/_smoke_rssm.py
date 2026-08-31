@@ -1363,6 +1363,11 @@ def _test_isolation_dcv_scales() -> None:
     assert 'cache_enabled=False' in _src
     assert 'enabled=False' in _src
     assert 'class _RestICGraphModule' in _src
+    _ric = _src[_src.index('class _RestICGraphModule'):
+                _src.index('def _capture_rest_ic_cuda_graph')]
+    assert 'def named_parameters' in _ric
+    assert 'def named_buffers' in _ric
+    assert 'return self._rssm.parameters' not in _ric
     assert 'allow_unused_input=True' in _src
     assert "o_s = obs.detach().requires_grad_(True)" not in _src
     assert 'def _fn(o, a):' not in _src
@@ -2417,12 +2422,27 @@ def _test_gain_match_rest_ic() -> None:
     wp = list(wrap.parameters())
     assert rp and len(wp) == len(rp)
     assert all(a is b for a, b in zip(wp, rp))
+    rnp = list(model.dynamics.named_parameters())
+    wnp = list(wrap.named_parameters())
+    assert [n for n, _ in wnp] == [n for n, _ in rnp]
+    assert all(a is b for (_, a), (_, b) in zip(wnp, rnp))
+    rnb = list(model.dynamics.named_buffers())
+    wnb = list(wrap.named_buffers())
+    assert [n for n, _ in wnb] == [n for n, _ in rnb]
+    assert all(not b.requires_grad for _, b in wnb)
     assert wrap is not model.dynamics
+    assert model.dynamics not in list(wrap.children())
+    # P56: capture autograd.grad inputs = sample_args (no grad) + params.
+    o_s, a_s = rest_o.detach(), rest_a.detach()
+    surface = (o_s, a_s) + tuple(wrap.parameters())
+    req = tuple(t for t in surface if t.requires_grad)
+    assert req, 'P56: capture autograd.grad inputs would be empty'
+    assert any('gru' in n for n, p in wrap.named_parameters() if p.requires_grad)
     h, z, c = wrap(rest_o, rest_a)
     h2, z2, c2 = _rest_ic_last_tensors(model.dynamics, rest_o, rest_a)
     assert torch.allclose(h, h2) and torch.allclose(z, z2)
     assert torch.allclose(c, c2)
-    print('[smoke] OK  rest-ic graph module shares RSSM params (no re-parent)')
+    print('[smoke] OK  rest-ic graph module shares RSSM params/buffers (no re-parent)')
     # CUDA graph is skipped on CPU (and while a GPU job occupies the A10).
     assert not _rest_ic_can_cuda_graph(model.dynamics, rest_o, cfg)
     _warmup_rest_ic_cuda_graph(model.dynamics, cfg, torch.device('cpu'))
