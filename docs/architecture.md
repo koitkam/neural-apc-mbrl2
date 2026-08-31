@@ -119,17 +119,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > **P58 EXIT** (`run_p58_resticlb`): lookback KEEP; **actor champion**
 > paired **−6.24 vs −102** 9/9. Val MV ×0.806/×0.816 DV ×0.669/×0.720
-> compounding ×0.675. **P59 LIVE** (`run_p59_headserve`, pid **134383**):
-> collect/val CUDA-graph identity vs P58. Storm 2/2 @76 CAPPED original
-> P1; GAIN-READY last_ok **76 0.88@DV / 0.97@MV**. Serve graph
-> **captured + warmed**. Steady P3 `t_collect` **1.87 s** vs P58 **4.18 s**;
-> `t_ac` **1.83 s** vs **3.52 s**. Unfreeze **143** ent **−0.123 HELD**
-> (opened −0.147). rscale **2.35 FREEZE KEEP**. rtgt collapsing
-> (P58-class). HEAD (not in pid): `img_rollout` IC `z_logits` zeros are
-> a shape-dict cache; overshoot `arange(1,K)` / tail `wk` reused
-> (overshoot/held/gain-match `Bm`; not collect graph).
-> Do **not** launch a second GPU job. Next GPU after EXIT: compounding
-> (MV) / prior-DV.
+> compounding ×0.675. **P59 EXIT** (`run_p59_headserve`): collect/val
+> CUDA-graph **KEEP as speed** / **FALSIFIED as TM/econ**. Val MV
+> ×0.876/×0.874 DV ×0.840/×0.890. Paired **−28 vs −117**, loses to
+> P58. Teacher Δu=1 vs TM 0.4. **P60 LIVE** (`run_p60_tmstep`, pid
+> **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. P1 ~iter 25
+> jsonl MV/DV **×0.95 / ×0.98** at Δu=0.4. Graph captured T=128. HEAD
+> (not in pid): overshoot/isolation gather idx cache + one `obs_win`.
+> Do **not** launch a second GPU job.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now

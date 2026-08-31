@@ -6573,7 +6573,7 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
         return zero, 0.0
     max_starts = max(1, int(getattr(cfg, 'wm_overshoot_max_starts', 24) or 24))
     stride = max(1, n_valid // max_starts)
-    starts = torch.arange(0, n_valid, stride, device=device)      # (S,)
+    starts, idx = _cached_time_gather_idx(cfg, n_valid, stride, K, device)
     S = int(starts.numel())
     f0 = feats[:, starts]                                         # (B, S, F)
     Bm = B * S
@@ -6588,10 +6588,11 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # isolation / actor / transfer-matrix (sample=False), not E[f(c_sampled)].
     c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     # Per-step REAL action + DV sequences for k=1..K (gathered ONCE).
-    k_off = _cached_arange_1k(cfg, K, device)                     # (K,)
-    idx = starts.view(S, 1) + k_off.view(1, K)                    # (S, K) time idx
+    # Advanced-index obs once (B,S,K,D) — reuse for DV slice and MSE target
+    # (was two gathers per WM inner).
     a_all = act[:, idx].reshape(Bm, K, -1)                        # (Bm, K, A)
-    dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
+    obs_win = obs[:, idx]                                         # (B, S, K, D)
+    dv_all = (obs_win.index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
               if getattr(rssm, 'dv_dim', 0) > 0 else None)         # (Bm,K,dv)|None
     # Decoder is a pointwise MLP, so per-step ``decode(feat_k)`` ≡ batched
     # ``decode(stack(feat))``.  ``out='obs'`` skips the unused (Bm, K, F)
@@ -6599,7 +6600,7 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # B=128 / starts=24 / K=55).  GRU recurrence is identical.
     preds = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True,
                              c0=c0, out='obs').reshape(B, S, K, -1)  # (B,S,K,D)
-    tgt = obs[:, idx].detach()                                    # (B, S, K, D)
+    tgt = obs_win.detach()                                        # (B, S, K, D)
     # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
     # contraction (decomp 1step→openloop ×0.876; probe: sampled open-loop gain
     # 0.79 vs real, and sample=False is WORSE 0.32 → the gain lives in the
@@ -6657,6 +6658,47 @@ def _cached_arange_1k(owner, K: int, device, dtype=None,
             t = torch.arange(1, int(K) + 1, device=device, dtype=dtype)
         store[key] = t
     return t
+
+
+def _cached_strided_arange(owner, stop: int, stride: int, device,
+                           attr: str = '_strided_arange') -> torch.Tensor:
+    """Reuse ``torch.arange(0, stop, stride)``. Identity; do not write in-place.
+
+    Overshoot / isolation / held start indices are static after auto-tune
+    (T, K, max_starts) but were rebuilt every WM inner (100×/iter).
+    """
+    key = (int(stop), int(stride), str(device))
+    store = getattr(owner, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(owner, attr, store)
+    t = store.get(key)
+    if t is None:
+        t = torch.arange(0, int(stop), int(stride), device=device)
+        store[key] = t
+    return t
+
+
+def _cached_time_gather_idx(owner, n_valid: int, stride: int, K: int, device,
+                            attr: str = '_time_gather_idx'):
+    """``starts`` and ``starts[:,None] + arange(1, K+1)`` for obs/act gather.
+
+    Overshoot + isolation rebuild this every WM inner.  Shape dict: the
+    two losses can differ in ``K`` / stride.  Do not write ``idx`` in-place.
+    """
+    key = (int(n_valid), int(stride), int(K), str(device))
+    store = getattr(owner, attr, None)
+    if not isinstance(store, dict):
+        store = {}
+        setattr(owner, attr, store)
+    hit = store.get(key)
+    if hit is not None:
+        return hit
+    starts = _cached_strided_arange(owner, n_valid, stride, device)
+    k_off = _cached_arange_1k(owner, K, device)
+    idx = starts.view(-1, 1) + k_off.view(1, -1)
+    store[key] = (starts, idx)
+    return starts, idx
 
 
 def _overshoot_tail_wk(cfg: 'TrainConfig', K: int, device,
@@ -6728,7 +6770,8 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
         return zero, 0.0
     max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 8) or 8))
     stride = max(1, T // max_starts)
-    starts = torch.arange(0, T, stride, device=device)            # (S,)
+    starts = _cached_strided_arange(
+        cfg, T, stride, device, attr='_held_starts')              # (S,)
     S = int(starts.numel())
     f0 = feats[:, starts]                                         # (B, S, F)
     Bm = B * S
@@ -7687,7 +7730,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         if n_valid < 1:
             return zero, diag
         stride = max(1, n_valid // max_starts)
-        starts = torch.arange(0, n_valid, stride, device=obs.device)
+        starts = _cached_strided_arange(
+            cfg, n_valid, stride, obs.device, attr='_gmatch_starts')
         S = int(starts.numel())
         f0 = feats[:, starts]                                   # (B, S, F)
         Bm = B * S
@@ -7935,7 +7979,7 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     feats = feats.detach()
     max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
     stride = max(1, n_valid // max_starts)
-    starts = torch.arange(0, n_valid, stride, device=obs.device)
+    starts, idx = _cached_time_gather_idx(cfg, n_valid, stride, K, obs.device)
     S = int(starts.numel())
     f0 = feats[:, starts]                                     # (B, S, F)
     Bm = B * S
@@ -7946,12 +7990,11 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
           if rssm.cont_dim > 0 else None)
     cv_idx = rssm.cv_index_t
-    k_off = _cached_arange_1k(cfg, K, obs.device)
-    idx = starts.view(S, 1) + k_off.view(1, K)                # (S, K) time idx
     a_all = act[:, idx].reshape(Bm, K, -1)                     # (Bm, K, A)
-    dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
+    obs_win = obs[:, idx]
+    dv_all = (obs_win.index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
               if getattr(rssm, 'dv_dim', 0) > 0 else None)
-    cv_real = obs[:, idx].index_select(-1, cv_idx).reshape(Bm, K, -1).detach()
+    cv_real = obs_win.index_select(-1, cv_idx).reshape(Bm, K, -1).detach()
     # Self-supervised STEADY-STATE (DC-gain) match: accumulate the terminal
     # settled window so we can match MEAN(pred) vs MEAN(real) — timing-insensitive
     # → pins the DC gain the transient-dominated per-step MSE under-shoots.

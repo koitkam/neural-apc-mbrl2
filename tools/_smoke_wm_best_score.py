@@ -18,7 +18,7 @@ Run (CPU; does not disturb a live GPU run):
 import numpy as np
 import torch
 
-from tools._smoke_overshoot_critic import _mk
+from tools._smoke_wm_fixes import _mk
 from training.train import _probe_wm_held_convergence, world_model_loss
 
 

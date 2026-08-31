@@ -29,7 +29,8 @@ from training.train import (
                             _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
                             _CLI_ONLY_ENV, _recon_channel_weights,
-                            _cached_arange_1k, _overshoot_tail_wk,
+                            _cached_arange_1k, _cached_strided_arange,
+                            _cached_time_gather_idx, _overshoot_tail_wk,
                             _resolve_baseline_seed_op_band, _cfg_or_env,
                             _cfg_or_env_float, _resolve_policy_sigma_bounds,
                             collect_episode, collect_prbs_episode,
@@ -1128,6 +1129,26 @@ def _test_recon_channel_weights_cache() -> None:
     assert torch.equal(k1, torch.arange(1, 9))
     k3 = _cached_arange_1k(cfg_idx, 5, torch.device('cpu'))
     assert k3 is not k1 and k3.numel() == 5
+    s1 = _cached_strided_arange(cfg_idx, 73, 3, torch.device('cpu'))
+    s2 = _cached_strided_arange(cfg_idx, 73, 3, torch.device('cpu'))
+    assert s1 is s2
+    assert torch.equal(s1, torch.arange(0, 73, 3))
+    st, idx = _cached_time_gather_idx(cfg_idx, 73, 3, 8, torch.device('cpu'))
+    st2, idx2 = _cached_time_gather_idx(cfg_idx, 73, 3, 8, torch.device('cpu'))
+    assert st is st2 and idx is idx2
+    k_off = torch.arange(1, 9)
+    expect = s1.view(-1, 1) + k_off.view(1, -1)
+    assert torch.equal(idx, expect)
+    st3, idx3 = _cached_time_gather_idx(cfg_idx, 73, 3, 5, torch.device('cpu'))
+    assert idx3 is not idx and idx3.shape[-1] == 5
+    ov = text[text.index('def _wm_latent_overshoot_loss'):
+              text.index('def _cached_arange_1k')]
+    assert 'obs_win = obs[:, idx]' in ov
+    assert ov.count('obs[:, idx]') == 1
+    iso = text[text.index('def _wm_input_isolation_loss'):
+               text.index('def _auto_gain_match_settle_len')]
+    assert 'obs_win = obs[:, idx]' in iso
+    assert 'obs[:, idx].index_select' not in iso
     cfg_idx.wm_overshoot_tail_power = 2.0
     wk1 = _overshoot_tail_wk(cfg_idx, 8, torch.device('cpu'), torch.float32)
     wk2 = _overshoot_tail_wk(cfg_idx, 8, torch.device('cpu'), torch.float32)
@@ -1139,7 +1160,7 @@ def _test_recon_channel_weights_cache() -> None:
     cfg_idx._overshoot_wk = None
     wk0 = _overshoot_tail_wk(cfg_idx, 8, torch.device('cpu'), torch.float32)
     assert torch.allclose(wk0, torch.ones(8))
-    print('[smoke] OK  recon channel weights cache identity; tail_power fallback 2.0; overshoot arange/wk cache')
+    print('[smoke] OK  recon channel weights cache identity; tail_power fallback 2.0; overshoot arange/wk/gather-idx cache')
 
 
 def _test_cli_only_env_disjoint() -> None:
@@ -1685,8 +1706,13 @@ def _test_isolation_dcv_scales() -> None:
     assert 'isinstance(store, dict)' in _cz
     assert '_img_zlogits_zeros' in _rssm_src
     assert 'def _cached_arange_1k' in _src
+    assert 'def _cached_strided_arange' in _src
+    assert 'def _cached_time_gather_idx' in _src
+    assert "attr='_gmatch_starts'" in _src
+    assert 'starts = torch.arange(0, n_valid, stride, device=obs.device)' not in _src
     assert 'def _overshoot_tail_wk' in _src
     assert 'k_off = torch.arange(1, K + 1' not in _src
+    assert 'obs_win = obs[:, idx]' in _src
     assert '_gain_match_fd_action_seq' in _src
     assert 'def _wm_need_logged_aux' in _src
     assert '_wm_need_enc_diag' in _src
