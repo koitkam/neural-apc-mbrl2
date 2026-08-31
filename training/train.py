@@ -6253,6 +6253,28 @@ def _adaptive_return_cap(cfg: TrainConfig) -> Optional[float]:
     return k * B / denom
 
 
+def _lambda_discount_weights(t_len: int, alpha: float, device, dtype
+                             ) -> torch.Tensor:
+    """Reuse ``α^{0..T-1}`` for the TD-λ reverse-cumsum. Identity; do not write.
+
+    P3 calls ``_lambda_returns`` 2–4× per inner step (on-policy λ, MC λ=1,
+    optional replay λ+MC) with a static ``seq_len`` after auto-tune.
+    ``arange`` + ``pow`` were rebuilt every call.  Shape dict on this
+    function (no Module owner).  Host-adaptive.
+    """
+    key = (int(t_len), float(alpha), str(device), str(dtype))
+    store = getattr(_lambda_discount_weights, '_cache', None)
+    if not isinstance(store, dict):
+        store = {}
+        _lambda_discount_weights._cache = store  # type: ignore[attr-defined]
+    w = store.get(key)
+    if w is None:
+        expo = torch.arange(int(t_len), device=device, dtype=dtype)
+        w = float(alpha) ** expo
+        store[key] = w
+    return w
+
+
 def _lambda_returns(rew: torch.Tensor, v: torch.Tensor,
                     gamma: float, lam: float,
                     ret_cap: Optional[float] = None) -> torch.Tensor:
@@ -6283,8 +6305,7 @@ def _lambda_returns(rew: torch.Tensor, v: torch.Tensor,
     if abs(alpha) < 1e-12:
         out = u.detach()
     else:
-        expo = torch.arange(t_len, device=v.device, dtype=v.dtype)
-        w = alpha ** expo
+        w = _lambda_discount_weights(t_len, alpha, v.device, v.dtype)
         c = (u * w).flip(1).cumsum(dim=1).flip(1)
         out = (c / w).detach()
     if ret_cap is not None:

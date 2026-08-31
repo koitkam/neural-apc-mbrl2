@@ -1295,7 +1295,7 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
 
 def _test_lambda_returns_scan() -> None:
     """Weighted reverse-cumsum ≡ sequential TD-λ (incl. MC / λ=0 / T=1)."""
-    from training.train import _lambda_returns
+    from training.train import _lambda_discount_weights, _lambda_returns
 
     def _ref(rew, v, gamma, lam, cap=None):
         if cap is not None:
@@ -1325,6 +1325,16 @@ def _test_lambda_returns_scan() -> None:
         assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5), (
             f'λ-scan mismatch T={T} lam={lam} max='
             f'{float((got - ref).abs().max())}')
+        got2 = _lambda_returns(rew, v, gamma, lam, cap)
+        assert torch.allclose(got, got2, atol=0.0, rtol=0.0)
+    w1 = _lambda_discount_weights(8, 0.99 * 0.90, torch.device('cpu'),
+                                  torch.float32)
+    w2 = _lambda_discount_weights(8, 0.99 * 0.90, torch.device('cpu'),
+                                  torch.float32)
+    assert w1 is w2
+    w8 = _lambda_discount_weights(16, 0.99 * 0.90, torch.device('cpu'),
+                                  torch.float32)
+    assert w8 is not w1
     print('[smoke] OK  TD-λ reverse-cumsum ≡ sequential recurrence')
 
 
@@ -1575,6 +1585,51 @@ def _test_img_step_det_roll_skips_sample() -> None:
     print('[smoke] OK  img_step det-roll skips discarded prior-c sample')
 
 
+def _test_initial_state_zeros_cache() -> None:
+    """``initial_state`` reuses zero/one-hot ICs; GRU does not write them."""
+    from models.dreamer_v4_rssm import (
+        RSSMConfig, RSSMDynamics, cached_onehot_z)
+    torch.manual_seed(0)
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     cont_gain_dim=2, dob_enabled=True, cv_indices=(0,))
+    m = RSSMDynamics(cfg)
+    B = 4
+    device = torch.device('cpu')
+    s1 = m.initial_state(B, device)
+    s2 = m.initial_state(B, device)
+    assert s1.h is s2.h
+    assert s1.z is s2.z
+    assert s1.z_logits is s2.z_logits
+    assert s1.d is s2.d
+    assert s1.c is s2.c
+    assert s1.c_mean is s2.c_mean and s1.c_mean is not s1.c
+    assert s1.c_std is not s1.c
+    assert float(s1.h.abs().sum()) == 0.0
+    assert float(s1.z[..., 0].min()) == 1.0
+    assert float(s1.z[..., 1:].abs().sum()) == 0.0
+    z_oh = cached_onehot_z(
+        m, B, m.n_categoricals, m.n_classes, s1.z.dtype, device)
+    assert z_oh is s1.z
+    s8 = m.initial_state(8, device)
+    assert s8.h is not s1.h
+    assert s8.h.shape[0] == 8
+    assert m.initial_state(B, device).h is s1.h
+    h_before = s1.h.clone()
+    z_before = s1.z.clone()
+    a = torch.zeros(B, cfg.action_dim)
+    _ = m.img_step(s1, a, sample=False)
+    assert torch.equal(s1.h, h_before)
+    assert torch.equal(s1.z, z_before)
+    obs = torch.randn(B, 6, cfg.obs_dim)
+    act = torch.zeros(B, 6, cfg.action_dim)
+    f1, *_ = m.rollout_observed(obs, act, sample=False, store_aux=False)
+    f2, *_ = m.rollout_observed(obs, act, sample=False, store_aux=False)
+    assert torch.allclose(f1, f2)
+    print('[smoke] OK  initial_state zero/one-hot cache (RSSM)')
+
+
 def _test_isolation_dcv_scales() -> None:
     """|ΔCV| excitation: Δu ∝ 1/|G| floored at op-band (not a loss reweight)."""
     import numpy as _np
@@ -1743,6 +1798,7 @@ def _test_isolation_dcv_scales() -> None:
                     _rssm_src.index('class RSSMConfig')]
     assert 'isinstance(store, dict)' in _cz
     assert 'def cached_zeros_bd' in _cz
+    assert 'def cached_onehot_z' in _cz
     assert 'def _prior_c_from_net' in _cz
     assert 'sample=not take_mean' in _cz
     assert 'c0 if c0 is not None else cached_zeros_bd' in _rssm_src
@@ -1750,6 +1806,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _cached_arange_1k' in _src
     assert 'def _cached_strided_arange' in _src
     assert 'def _cached_time_gather_idx' in _src
+    assert 'def _lambda_discount_weights' in _src
+    assert 'expo = torch.arange(t_len, device=v.device, dtype=v.dtype)' not in _src
     assert "attr='_gmatch_starts'" in _src
     assert 'starts = torch.arange(0, n_valid, stride, device=obs.device)' not in _src
     assert 'def _overshoot_tail_wk' in _src
@@ -4449,6 +4507,7 @@ if __name__ == '__main__':
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
     _test_img_step_det_roll_skips_sample()
+    _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()
     _test_stream_serve_matches_rollout()
     _test_collect_serve_cuda_graph_cpu()

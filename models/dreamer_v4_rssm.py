@@ -215,6 +215,29 @@ def cached_zeros_bd(mod, B: int, D: int, dtype, device,
     return z
 
 
+def cached_onehot_z(mod, B: int, n_cat: int, n_classes: int, dtype, device,
+                    attr: str = '_onehot_z_cache') -> torch.Tensor:
+    """Reuse a valid one-hot ``z`` IC. Identity vs ``zeros`` + ``z[...,0]=1``.
+
+    ``initial_state`` used to allocate this every ``rollout_observed``
+    (P1/P2: 100 inner × main B=128 plus rest-IC N=6).  Callers must
+    not write it: GRU / ``img_step`` / ``obs_step`` return new ``z``;
+    collect CUDA-graph ``copy_`` targets a clone.  Own shape dict.
+    """
+    key = (int(B), int(n_cat), int(n_classes), str(dtype), str(device))
+    store = getattr(mod, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(mod, attr, store)
+    z = store.get(key)
+    if z is None:
+        z = torch.zeros(int(B), int(n_cat), int(n_classes),
+                        device=device, dtype=dtype)
+        z[..., 0] = 1.0
+        store[key] = z
+    return z
+
+
 def _prior_c_from_net(mod, h: torch.Tensor, sample: bool):
     """Prior continuous latent for ``img_step``.
 
@@ -702,23 +725,36 @@ class RSSMDynamics(nn.Module):
 
     def initial_state(self, batch_size: int,
                       device: torch.device) -> RSSMState:
-        h = torch.zeros(batch_size, self.deter_dim, device=device)
-        z_logits = torch.zeros(batch_size, self.n_categoricals,
-                               self.n_classes, device=device)
-        z = torch.zeros_like(z_logits)
-        z[..., 0] = 1.0  # arbitrary valid one-hot
-        d = (torch.zeros(batch_size, self.n_cv, device=device)
+        B = int(batch_size)
+        dtype = torch.get_default_dtype()
+        # Dedicated attrs: do not alias ``img_rollout`` / token zero fills
+        # (same ``(B, D)`` could otherwise share a live graph input).
+        h = cached_zeros_bd(
+            self, B, self.deter_dim, dtype, device, attr='_init_h_zeros')
+        z_logits = cached_zeros_btd(
+            self, B, self.n_categoricals, self.n_classes, dtype, device,
+            attr='_init_zlogits_zeros')
+        z = cached_onehot_z(
+            self, B, self.n_categoricals, self.n_classes, dtype, device)
+        d = (cached_zeros_bd(
+                self, B, self.n_cv, dtype, device, attr='_init_d_zeros')
              if self.dob_enabled else None)
-        dv = (torch.zeros(batch_size, self.dv_dim, device=device)
+        dv = (cached_zeros_bd(
+                self, B, self.dv_dim, dtype, device, attr='_init_dv_zeros')
               if self.dv_feedforward else None)
         # ``c_mean`` / ``c_std`` must match serve/obs_step layout so a
         # CUDA-graph ``copy_`` of the recurrent state is well-typed
         # (collect capture used to raise ``c_mean None mismatch``).
         c = c_mean = c_std = None
         if self.cont_dim > 0:
-            c = torch.zeros(batch_size, self.cont_dim, device=device)
-            c_mean = torch.zeros_like(c)
-            c_std = torch.zeros_like(c)
+            c = cached_zeros_bd(
+                self, B, self.cont_dim, dtype, device, attr='_init_c_zeros')
+            c_mean = cached_zeros_bd(
+                self, B, self.cont_dim, dtype, device,
+                attr='_init_cmean_zeros')
+            c_std = cached_zeros_bd(
+                self, B, self.cont_dim, dtype, device,
+                attr='_init_cstd_zeros')
         return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c,
                          c_mean=c_mean, c_std=c_std)
 
@@ -1419,10 +1455,9 @@ def rssm_kl_loss(post_logits: torch.Tensor, prior_logits: torch.Tensor,
 
     kl_dyn_raw = _kl_cat_summed(post_logits.detach(), prior_logits)
     kl_repr_raw = _kl_cat_summed(post_logits, prior_logits.detach())
-    fb = torch.tensor(float(free_bits), device=post_logits.device,
-                      dtype=kl_dyn_raw.dtype)
-    kl_dyn = torch.maximum(kl_dyn_raw.mean(), fb)
-    kl_repr = torch.maximum(kl_repr_raw.mean(), fb)
+    fb = float(free_bits)
+    kl_dyn = kl_dyn_raw.mean().clamp_min(fb)
+    kl_repr = kl_repr_raw.mean().clamp_min(fb)
     kl_loss = dyn_w * kl_dyn + repr_w * kl_repr
     diag = {
         'kl_dyn': kl_dyn.detach(),
@@ -1457,10 +1492,9 @@ def rssm_cont_kl_loss(post_mean: torch.Tensor, post_std: torch.Tensor,
                            prior_mean, prior_std)
     kl_repr_raw = _kl_gauss(post_mean, post_std,
                             prior_mean.detach(), prior_std.detach())
-    fb = torch.tensor(float(free_bits), device=post_mean.device,
-                      dtype=kl_dyn_raw.dtype)
-    kl_dyn = torch.maximum(kl_dyn_raw.mean(), fb)
-    kl_repr = torch.maximum(kl_repr_raw.mean(), fb)
+    fb = float(free_bits)
+    kl_dyn = kl_dyn_raw.mean().clamp_min(fb)
+    kl_repr = kl_repr_raw.mean().clamp_min(fb)
     kl_loss = dyn_w * kl_dyn + repr_w * kl_repr
     diag = {
         'cont_kl_dyn': kl_dyn.detach(),

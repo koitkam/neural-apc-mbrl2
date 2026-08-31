@@ -160,6 +160,25 @@ def test_img_step_det_roll_skips_sample():
     print("[smoke] OK TSSM img_step det-roll skips discarded prior-c sample")
 
 
+def test_initial_state_zeros_cache():
+    """``initial_state`` reuses zero/one-hot ICs; img_step does not write them."""
+    cfg, m = _mk()
+    B = 3
+    device = torch.device('cpu')
+    s1 = m.initial_state(B, device)
+    s2 = m.initial_state(B, device)
+    assert s1.h is s2.h
+    assert s1.z is s2.z
+    assert s1.z_logits is s2.z_logits
+    assert float(s1.z[..., 0].min()) == 1.0
+    h_before = s1.h.clone()
+    a = torch.zeros(B, cfg.action_dim)
+    _ = m.img_step(s1, a, sample=False)
+    assert torch.equal(s1.h, h_before)
+    assert m.initial_state(B, device).h is s1.h
+    print("[smoke] OK TSSM initial_state zero/one-hot cache")
+
+
 def test_store_aux_feats_identity():
     """Isolation encode may drop logit stacks; feats must match the full pass."""
     cfg, m = _mk()
@@ -337,6 +356,7 @@ if __name__ == '__main__':
     test_determinism_mode()
     test_img_rollout_equals_img_step()
     test_img_step_det_roll_skips_sample()
+    test_initial_state_zeros_cache()
     test_store_aux_feats_identity()
     test_stepwise_equals_full_sequence()
     test_end_to_end_dreamer_tssm()

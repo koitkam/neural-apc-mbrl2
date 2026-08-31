@@ -72,6 +72,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > Rest-IC graph failed this pid (`t_wm` 124 s). Champion stays **P53**.
 > Encode ``L`` default is lookback (P57 EXIT **REVERT**
 > ``gain_match_rest_ic_len=0``; ``-1`` A/B last ``max(K, 2τ/sr)``).
+> **P58 EXIT** lookback KEEP; paired **−6.24 vs −102** 9/9 **actor champion**.
+> **P59 EXIT** collect/val CUDA-graph KEEP as speed / FALSIFIED as TM/econ
+> (val MV ×0.876 DV ×0.840; paired −28 vs −117).
+> **P60 LIVE P3** teacher Δu auto = `wm_tf_step_frac` (0.4). Gate PASS last_ok
+> **77** 0.86@DV / 1.10@MV. P3 @136 unfreeze 147 rscale **2.73 KEEP**. jsonl
+> teacher ×1 at 0.4; freeze TM still 0.86@DV.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -122,12 +128,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > compounding ×0.675. **P59 EXIT** (`run_p59_headserve`): collect/val
 > CUDA-graph **KEEP as speed** / **FALSIFIED as TM/econ**. Val MV
 > ×0.876/×0.874 DV ×0.840/×0.890. Paired **−28 vs −117**, loses to
-> P58. Teacher Δu=1 vs TM 0.4. **P60 LIVE** (`run_p60_tmstep`, pid
-> **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. P1 ~iter 65
-> jsonl MV/DV **×0.99 / ×1.00** at Δu=0.4. skip 0/0. Graph captured T=128.
-> HEAD (not in pid): det-roll skips discarded prior-c `randn`;
-> `cached_zeros_bd`; teacher-G dict-cache. Do **not** launch a second
-> GPU job.
+> P58. Teacher Δu=1 vs TM 0.4. **P60 LIVE P3** (`run_p60_tmstep`, pid
+> **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. Gate last_ok
+> **77** 0.86@DV. P3 @136 unfreeze 147 rscale **2.73 KEEP**. jsonl teacher
+> ×1 at 0.4; freeze TM still 0.86@DV. HEAD (not in pid): `initial_state`
+> cache; KL `clamp_min(float)`; TD-λ `α^t` cache. Do **not** launch a
+> second GPU job.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now

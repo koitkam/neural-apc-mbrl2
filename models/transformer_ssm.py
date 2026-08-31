@@ -127,8 +127,8 @@ import torch.nn.functional as F
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
 from models.dreamer_v4_rssm import (
     _CategoricalLatent, _ContinuousLatent, _prior_c_from_net, _time_unbind,
-    cached_zeros_bd, cached_zeros_btd, dob_kalman_scan, _append_decode_core,
-    _stack_decode_core)
+    cached_zeros_bd, cached_zeros_btd, cached_onehot_z, dob_kalman_scan,
+    _append_decode_core, _stack_decode_core)
 
 
 @dataclass
@@ -510,16 +510,23 @@ class TransformerSSMDynamics(nn.Module):
 
     def initial_state(self, batch_size: int,
                       device: torch.device) -> TSSMState:
-        h = torch.zeros(batch_size, self.deter_dim, device=device)
-        z_logits = torch.zeros(batch_size, self.n_categoricals,
-                               self.n_classes, device=device)
-        z = torch.zeros_like(z_logits)
-        z[..., 0] = 1.0
-        d = (torch.zeros(batch_size, self.n_cv, device=device)
+        B = int(batch_size)
+        dtype = torch.get_default_dtype()
+        h = cached_zeros_bd(
+            self, B, self.deter_dim, dtype, device, attr='_init_h_zeros')
+        z_logits = cached_zeros_btd(
+            self, B, self.n_categoricals, self.n_classes, dtype, device,
+            attr='_init_zlogits_zeros')
+        z = cached_onehot_z(
+            self, B, self.n_categoricals, self.n_classes, dtype, device)
+        d = (cached_zeros_bd(
+                self, B, self.n_cv, dtype, device, attr='_init_d_zeros')
              if self.dob_enabled else None)
-        dv = (torch.zeros(batch_size, self.dv_dim, device=device)
+        dv = (cached_zeros_bd(
+                self, B, self.dv_dim, dtype, device, attr='_init_dv_zeros')
               if self.dv_feedforward else None)
-        c = (torch.zeros(batch_size, self.cont_dim, device=device)
+        c = (cached_zeros_bd(
+                self, B, self.cont_dim, dtype, device, attr='_init_c_zeros')
              if self.cont_dim > 0 else None)
         return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0, d=d,
                          dv=dv, c=c)
