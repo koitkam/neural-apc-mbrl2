@@ -79,9 +79,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > ``parameters()``). HEAD captures **before** the WM autocast loop
 > (exit parent autocast, `cache_enabled=False`), **never captures
 > in-loop**, and graphs `_RestICGraphModule` so RSSM
-> `named_parameters` / `named_buffers` are the capture surface
+> `parameters` / `named_parameters` / `buffers` /
+> `named_buffers` are the capture surface
 > (`allow_unused_input=True`; overriding only `parameters()` left
-> `buffers()` empty). HEAD
+> `named_parameters()` / `buffers()` empty). Transient VRAM skip
+> does **not** pin `_rest_ic_cg_fail` (warmup retries once after
+> `empty_cache`). HEAD
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -828,8 +831,10 @@ fixes BOTH:
   warmed at train start **outside** the P1 WM autocast loop (P55
   in-loop capture hit autocast cache → eager for the whole run). A
   nested function is not a graph surface (P56: empty `parameters()`).
-  `named_parameters`/`named_buffers` must yield the RSSM (overriding
-  only `parameters()` left `buffers()` empty).
+  `parameters`/`named_parameters`/`buffers`/`named_buffers` must yield
+  the RSSM (overriding only `parameters()` left `named_parameters()`/
+  `buffers()` empty). Transient VRAM skip does **not** pin
+  `_rest_ic_cg_fail` (warmup retries once after `empty_cache`).
   When the rest cache is present, P44 WM-held settle is skipped. Isolation loss
   stays 0. jsonl `*_ratio` =
   mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE

@@ -63,6 +63,7 @@ from training.train import (
                             _gain_match_rest_window, _held_rollout_win,
                             _rest_ic_can_cuda_graph,
                             _RestICGraphModule, _rest_ic_last_tensors,
+                            _rest_ic_note_capture_miss,
                             _warmup_rest_ic_cuda_graph,
                             _release_rest_ic_cuda_graph,
                             _amp_parent_autocast_on,
@@ -1364,10 +1365,14 @@ def _test_isolation_dcv_scales() -> None:
     assert 'enabled=False' in _src
     assert 'class _RestICGraphModule' in _src
     _ric = _src[_src.index('class _RestICGraphModule'):
-                _src.index('def _capture_rest_ic_cuda_graph')]
+                _src.index('def _rest_ic_note_capture_miss')]
+    assert 'def parameters(self' in _ric
     assert 'def named_parameters' in _ric
+    assert 'def buffers(self' in _ric
     assert 'def named_buffers' in _ric
     assert 'return self._rssm.parameters' not in _ric
+    assert '_rest_ic_note_capture_miss' in _src
+    assert 'warmup retry after empty_cache' in _src
     assert 'allow_unused_input=True' in _src
     assert "o_s = obs.detach().requires_grad_(True)" not in _src
     assert 'def _fn(o, a):' not in _src
@@ -2430,6 +2435,9 @@ def _test_gain_match_rest_ic() -> None:
     wnb = list(wrap.named_buffers())
     assert [n for n, _ in wnb] == [n for n, _ in rnb]
     assert all(not b.requires_grad for _, b in wnb)
+    rb = list(model.dynamics.buffers())
+    wb = list(wrap.buffers())
+    assert len(wb) == len(rb) and all(a is b for a, b in zip(wb, rb))
     assert wrap is not model.dynamics
     assert model.dynamics not in list(wrap.children())
     # P56: capture autograd.grad inputs = sample_args (no grad) + params.
@@ -2449,6 +2457,12 @@ def _test_gain_match_rest_ic() -> None:
     assert not hasattr(model.dynamics, '_rest_ic_cg')
     assert _amp_parent_autocast_on('cpu') is False
     print('[smoke] OK  rest-ic CUDA graph skipped on CPU')
+    r_miss = type('R', (), {})()
+    _rest_ic_note_capture_miss(r_miss, False)
+    assert not hasattr(r_miss, '_rest_ic_cg_fail')
+    _rest_ic_note_capture_miss(r_miss, True)
+    assert r_miss._rest_ic_cg_fail is True
+    print('[smoke] OK  rest-ic VRAM skip does not pin eager-fail')
     r = type('R', (), {})()
     r._rest_ic_cg = ('k', None)
     r._rest_ic_cg_fail = True

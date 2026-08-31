@@ -961,11 +961,13 @@ class TrainConfig:
     # loop; in-loop never captures (P55: parent autocast cache rejected
     # ``make_graphed_callables`` and ``_rest_ic_cg_fail`` pinned eager
     # ``t_wm`` ~127 s).  The graphed callable is ``_RestICGraphModule``
-    # so RSSM ``named_parameters`` / ``named_buffers`` are the capture
-    # surface (P56: a nested function had empty ``parameters()`` →
-    # ``grad requires non-empty inputs``; overriding only
-    # ``parameters()`` left ``named_parameters()`` / ``buffers()``
-    # empty).  Capture-fail / CPU / low VRAM → eager Python loop.
+    # so RSSM ``parameters`` / ``named_parameters`` / ``buffers`` /
+    # ``named_buffers`` are the capture surface (P56: a nested
+    # function had empty ``parameters()`` → ``grad requires non-empty
+    # inputs``; overriding only ``parameters()`` left
+    # ``named_parameters()`` / ``buffers()`` empty).  Capture-fail /
+    # CPU stay eager.  VRAM <512 MiB skip does **not** pin
+    # ``_rest_ic_cg_fail`` (warmup retries once after ``empty_cache``).
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
     gain_match_rest_ic_cuda_graph: bool = True
     gain_match_max_starts: int = 6
@@ -6814,11 +6816,12 @@ class _RestICGraphModule(torch.nn.Module):
     ``_rest_ic_cg_fail`` pinned the eager T-loop (``t_wm`` ~123 s).
     Marking copies ``requires_grad_(True)`` would un-empty that list
     but still omit GRU params from the recorded backward (canary
-    ``gru_g==0`` → eager).  This Module yields
-    ``rssm.named_parameters()`` / ``named_buffers()`` without
-    re-parenting ``model.dynamics`` (``object.__setattr__``).  Torch
-    2.12 capture uses ``tuple(c.parameters())`` **and** asserts every
-    ``c.buffers()`` item has ``requires_grad=False``.  Overriding only
+    ``gru_g==0`` → eager).  This Module yields RSSM
+    ``parameters`` / ``named_parameters`` / ``buffers`` /
+    ``named_buffers`` without re-parenting ``model.dynamics``
+    (``object.__setattr__``).  Torch 2.12 capture uses
+    ``tuple(c.parameters())`` **and** asserts every ``c.buffers()``
+    item has ``requires_grad=False``.  Overriding only
     ``parameters()`` left the default ``named_parameters()`` /
     ``buffers()`` empty (they walk ``_parameters`` / ``_modules``,
     which stay empty).  Last-only encode skips prior/decoder; capture
@@ -6829,8 +6832,14 @@ class _RestICGraphModule(torch.nn.Module):
         super().__init__()
         object.__setattr__(self, '_rssm', rssm)
 
+    def parameters(self, recurse: bool = True):
+        yield from self._rssm.parameters(recurse=recurse)
+
     def named_parameters(self, *args, **kwargs):
         yield from self._rssm.named_parameters(*args, **kwargs)
+
+    def buffers(self, recurse: bool = True):
+        yield from self._rssm.buffers(recurse=recurse)
 
     def named_buffers(self, *args, **kwargs):
         yield from self._rssm.named_buffers(*args, **kwargs)
@@ -6839,19 +6848,49 @@ class _RestICGraphModule(torch.nn.Module):
         return _rest_ic_last_tensors(self._rssm, obs, act)
 
 
-def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
-    """Capture full-BPTT rest-IC; None → eager.  Do not use raw CUDAGraph."""
+def _rest_ic_note_capture_miss(rssm, pin_fail: bool) -> None:
+    """Pin eager only on structural capture fail, not transient VRAM skip.
+
+    ``_rest_ic_cg_fail`` disables CUDA-graph for the whole run.  A
+    <512 MiB free skip at warmup is host-adaptive (empty_cache retry);
+    pinning it would freeze the 124 s T-loop even after P3-bound VRAM
+    is free.  Capture exceptions / empty surface / GRU-canary still pin.
+    """
+    if pin_fail:
+        rssm._rest_ic_cg_fail = True  # type: ignore[attr-defined]
+
+
+def _capture_rest_ic_cuda_graph(
+        rssm, obs: torch.Tensor, act: torch.Tensor
+        ) -> Tuple[Optional[object], bool]:
+    """Capture full-BPTT rest-IC.  ``(graphed, pin_fail)``.
+
+    ``graphed`` is the callable on success.  ``pin_fail`` True means
+    do not retry this pid (structural).  VRAM skip is
+    ``(None, False)``.  Do not use raw CUDAGraph (no backward).
+    """
     try:
         free, _total = torch.cuda.mem_get_info(obs.device)
         if int(free) < 512 * 1024 * 1024:
             print('[gain-match] rest-ic CUDA graph skipped '
                   f'(free VRAM {free / 1024 ** 2:.0f} MiB < 512)',
                   flush=True)
-            return None
+            return None, False
     except Exception:
         pass
 
     wrapper = _RestICGraphModule(rssm)
+    trainable = tuple(p for p in wrapper.parameters() if p.requires_grad)
+    if not trainable:
+        print('[gain-match] rest-ic CUDA graph skipped '
+              '(empty trainable capture surface); eager T-loop',
+              flush=True)
+        return None, True
+    if not all(b.requires_grad is False for b in wrapper.buffers()):
+        print('[gain-match] rest-ic CUDA graph skipped '
+              '(trainable buffer on capture surface); eager T-loop',
+              flush=True)
+        return None, True
     try:
         # Eager WM steps run inside bf16 autocast (cache_enabled=True).
         # ``make_graphed_callables`` rejects autocast cache (P55 first
@@ -6878,7 +6917,7 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
     except Exception as e:
         print('[gain-match] rest-ic CUDA graph capture failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
-        return None
+        return None, True
     # Canary: P25 class if the graph dropped BPTT through the GRU.
     # Save/restore any in-flight grads (identity when all None).
     saved = _rssm_param_grad_snapshot(rssm)
@@ -6896,18 +6935,18 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
         if gru_g <= 0.0:
             print('[gain-match] rest-ic CUDA graph dropped GRU grad; '
                   'eager T-loop', flush=True)
-            return None
+            return None, True
     except Exception as e:
         rssm.zero_grad(set_to_none=True)
         print('[gain-match] rest-ic CUDA graph canary failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
-        return None
+        return None, True
     finally:
         _rssm_param_grad_restore(saved)
     print(f'[gain-match] rest-ic CUDA graph captured N={int(obs.shape[0])} '
           f'T={int(obs.shape[1])} (full-BPTT; opt out '
           'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0)', flush=True)
-    return graphed
+    return graphed, False
 
 
 def _rest_ic_encode_hzc(rssm, obs: torch.Tensor, act: torch.Tensor,
@@ -6923,9 +6962,9 @@ def _rest_ic_encode_hzc(rssm, obs: torch.Tensor, act: torch.Tensor,
     # here is eager for this step only — warmup captures outside.
     if _amp_parent_autocast_on(str(getattr(obs.device, 'type', 'cuda'))):
         return _rest_ic_last_tensors(rssm, obs, act)
-    graphed = _capture_rest_ic_cuda_graph(rssm, obs, act)
+    graphed, pin_fail = _capture_rest_ic_cuda_graph(rssm, obs, act)
     if graphed is None:
-        rssm._rest_ic_cg_fail = True  # type: ignore[attr-defined]
+        _rest_ic_note_capture_miss(rssm, pin_fail)
         return _rest_ic_last_tensors(rssm, obs, act)
     rssm._rest_ic_cg = (key, graphed)  # type: ignore[attr-defined]
     return graphed(obs, act)
@@ -6941,7 +6980,8 @@ def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
     Stage-1 ``dob_active`` is already False.  In-loop encode never
     recaptures under autocast (eager that step, do not pin fail).
     Warmup dtype matches the rest-cache numpy (replay batches are
-    float32).  CPU / opt-out / non-RSSM: no-op.
+    float32).  CPU / opt-out / non-RSSM: no-op.  Transient VRAM skip
+    retries once after ``empty_cache`` (do not pin fail).
     """
     if rssm is None:
         return
@@ -6962,11 +7002,25 @@ def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
         dt = _numpy_dtype_to_torch(np.asarray(rest_np).dtype)
     except Exception:
         dt = torch.float32
+
+    def _try_warmup() -> None:
+        try:
+            _gain_match_rest_ic_state(rssm, cfg, device, dt)
+        except Exception as e:
+            print('[gain-match] rest-ic CUDA graph warmup failed '
+                  f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+
+    _try_warmup()
+    if (hasattr(rssm, '_rest_ic_cg')
+            or bool(getattr(rssm, '_rest_ic_cg_fail', False))):
+        return
     try:
-        _gain_match_rest_ic_state(rssm, cfg, device, dt)
-    except Exception as e:
-        print('[gain-match] rest-ic CUDA graph warmup failed '
-              f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print('[gain-match] rest-ic CUDA graph warmup retry after empty_cache',
+          flush=True)
+    _try_warmup()
 
 
 def _release_rest_ic_cuda_graph(rssm) -> bool:
@@ -7018,9 +7072,11 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     RSSM, T≥8, and capture+GRU-grad canary succeed.  Capture is warmed
     at train start outside the WM autocast loop (P55 in-loop capture
     hit autocast cache).  A nested function is not a graph surface
-    (P56: empty ``parameters()``).  ``named_parameters`` /
-    ``named_buffers`` must yield the RSSM (overriding only
-    ``parameters()`` left ``buffers()`` empty).  Raw ``CUDAGraph``
+    (P56: empty ``parameters()``).  ``parameters`` / ``named_parameters``
+    / ``buffers`` / ``named_buffers`` must yield the RSSM (overriding
+    only ``parameters()`` left ``named_parameters()``/``buffers()``
+    empty).  Transient VRAM skip does **not** pin ``_rest_ic_cg_fail``
+    (warmup retries once after ``empty_cache``).  Raw ``CUDAGraph``
     has no backward (P25).  TSSM / CPU / capture-fail stay on the
     Python loop.
 
