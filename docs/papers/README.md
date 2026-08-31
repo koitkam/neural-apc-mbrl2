@@ -43,8 +43,8 @@ curl -fL -o dreamerV3_2301.04104.pdf https://arxiv.org/pdf/2301.04104
 
 ### From DreamerV4 (Phase 3 / PMPO specifics)
 
-1. **Three-phase trainer** (WM pretrain / BC + MTP / PMPO actor) —
-   already implemented.
+1. **Three-phase trainer** (WM pretrain / BC + MTP / real-sim REINFORCE
+   actor) — already implemented (`_realsim_actor_critic_step`).
 2. **PMPO loss** (paper eq. 11): advantage-sign-split surrogate plus
    `β · KL(π ‖ π_prior)` to a frozen behavioural prior.  **REMOVED**
    in neural-APC-mbrl2 — real-sim P3 inlines REINFORCE + PPO μ-ratio
