@@ -692,7 +692,9 @@ flowchart TB
 
 P3 **collect** and val stream `stream_serve_step`: measured DV into the
 GRU and Kalman `d_t` when `dob_active`, so served `feat` matches
-training `_realsim_actor_critic_step` / `rollout_observed`. P47 EXIT
+training `_realsim_actor_critic_step` / `rollout_observed`. Frozen-RSSM
+P3 collect CUDA-graphs that B=1 serve (policy stays eager — σ sample +
+live Adam). CPU / TSSM / capture-fail stay eager. P47 EXIT
 falsified Adam log_std-row zero as the entropy-yank lever. RSSM
 collect/val reuse a persistent GPU obs row; CUDA H2D stages through a
 pinned host buffer (identity values). Replay WM batches reuse pinned
@@ -726,6 +728,8 @@ the same leftover-env class (identity defaults; dual-read at
   critic λ-CE, MC-CE, and min-of-N V share one ensemble MLP pass
   (`critic_online_ce_and_min_v`). REINFORCE `logp` + entropy share one
   `dist_params` (`log_prob_and_entropy`). Identity vs the split forwards.
+  P3 collect CUDA-graphs the frozen RSSM `stream_serve_step` (B=1);
+  policy sampling stays eager.
 - **Actor** `π(a|feat)` [`opt_actor`] is trained on the **advantage**
   `return − V(feat)` (÷ the percentile return-scale) via REINFORCE on the REAL
   taken action (`policy.log_prob_of`) from the **on-policy** buffer. It is the

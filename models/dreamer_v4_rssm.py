@@ -1185,6 +1185,145 @@ def copy_obs_row(dst: torch.Tensor, row, host: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
+# P3 collect: CUDA-graph one frozen-RSSM stream_serve_step (B=1)
+# ---------------------------------------------------------------------------
+
+_RSSM_STATE_TENSORS = (
+    'h', 'z_logits', 'z', 'd', 'dv', 'c', 'c_mean', 'c_std')
+
+
+def _rssm_dob_live(dyn) -> bool:
+    return (bool(getattr(dyn, 'dob_enabled', False))
+            and bool(getattr(dyn, 'dob_active', True)))
+
+
+def _clone_rssm_state(state) -> RSSMState:
+    kw = {}
+    for name in _RSSM_STATE_TENSORS:
+        t = getattr(state, name, None)
+        kw[name] = None if t is None else t.detach().clone()
+    return RSSMState(**kw)
+
+
+def _copy_rssm_state(dst: RSSMState, src: RSSMState) -> None:
+    for name in _RSSM_STATE_TENSORS:
+        a = getattr(dst, name)
+        b = getattr(src, name)
+        if a is None and b is None:
+            continue
+        if a is None or b is None:
+            raise RuntimeError(
+                f'collect-serve CUDA graph state {name!r} None mismatch')
+        if a.dtype != b.dtype or a.device != b.device:
+            a.copy_(b.to(device=a.device, dtype=a.dtype))
+        else:
+            a.copy_(b)
+
+
+class CollectServeCudaGraph:
+    """Replay one frozen-RSSM ``stream_serve_step`` (B=1 collect/val).
+
+    Policy stays eager (σ sampling + in-place Adam writes). Observer
+    weights are frozen in P3; replay reads those parameter addresses.
+    Host-adaptive: CPU / TSSM / capture-fail stay on eager
+    ``stream_serve_step``. Transient VRAM skip does not pin fail.
+    """
+
+    __slots__ = (
+        'graph', 'in_state', 'out_state', 'feat', 'obs', 'prev_a',
+        'dob_live')
+
+    def __init__(self, graph, in_state, out_state, feat, obs, prev_a,
+                 dob_live: bool):
+        self.graph = graph
+        self.in_state = in_state
+        self.out_state = out_state
+        self.feat = feat
+        self.obs = obs
+        self.prev_a = prev_a
+        self.dob_live = bool(dob_live)
+
+    def reset(self, state) -> None:
+        _copy_rssm_state(self.in_state, state)
+        self.prev_a.zero_()
+
+    def replay(self) -> torch.Tensor:
+        self.graph.replay()
+        _copy_rssm_state(self.in_state, self.out_state)
+        return self.feat
+
+
+def _capture_collect_serve_cuda_graph(
+        dyn, example_state, device, obs_dim: int, act_dim: int,
+        dob_live: bool):
+    """Capture or ``(None, pin_fail)``. VRAM skip is ``(None, False)``."""
+    if not hasattr(torch.cuda, 'CUDAGraph'):
+        return None, True
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+        if int(free) < 128 * 1024 * 1024:
+            print('[collect] serve CUDA graph skipped '
+                  f'(free VRAM {free / 1024 ** 2:.0f} MiB < 128); eager',
+                  flush=True)
+            return None, False
+    except Exception:
+        pass
+    try:
+        static_obs = torch.empty(
+            1, int(obs_dim), device=device, dtype=torch.float32)
+        static_prev_a = torch.zeros(
+            1, int(act_dim), device=device, dtype=torch.float32)
+        in_state = _clone_rssm_state(example_state)
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                tmp = stream_serve_step(
+                    dyn, in_state, static_prev_a, static_obs, sample=False)
+                _copy_rssm_state(in_state, tmp)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out_state = stream_serve_step(
+                dyn, in_state, static_prev_a, static_obs, sample=False)
+            feat = out_state.feat
+        print('[collect] serve CUDA graph captured '
+              '(B=1 stream_serve_step)', flush=True)
+        return CollectServeCudaGraph(
+            g, in_state, out_state, feat, static_obs, static_prev_a,
+            dob_live), False
+    except Exception as exc:
+        print(f'[collect] serve CUDA graph skipped ({exc!r}); eager '
+              'stream_serve_step', flush=True)
+        return None, True
+
+
+def get_collect_serve_cuda_graph(dyn, example_state, device, obs_dim: int,
+                                  act_dim: int):
+    """Lazy B=1 collect graph. ``None`` → eager ``stream_serve_step``."""
+    if getattr(device, 'type', '') != 'cuda':
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if type(example_state).__name__ != 'RSSMState':
+        return None
+    if getattr(dyn, '_collect_serve_cg_fail', False):
+        return None
+    dob_live = _rssm_dob_live(dyn)
+    existing = getattr(dyn, '_collect_serve_cg', None)
+    if existing is not None and existing.dob_live == dob_live:
+        return existing
+    captured, pin_fail = _capture_collect_serve_cuda_graph(
+        dyn, example_state, device, obs_dim, act_dim, dob_live)
+    if pin_fail:
+        dyn._collect_serve_cg_fail = True  # type: ignore[attr-defined]
+    if captured is None:
+        return None
+    dyn._collect_serve_cg = captured  # type: ignore[attr-defined]
+    return captured
+
+
+# ---------------------------------------------------------------------------
 # KL-balanced free-bits loss
 # ---------------------------------------------------------------------------
 

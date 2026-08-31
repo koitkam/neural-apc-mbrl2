@@ -1587,6 +1587,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
     assert 'stream_serve_step' in _src
+    assert 'get_collect_serve_cuda_graph' in _src
+    assert '_rssm_prev_a.copy_' in _src
     assert '[p3] on-policy collect streams measured DV + Kalman' in _src
     assert "setdefault('jemb_loss'" in _src
     assert '_require_realsim_actor' in _src
@@ -4171,6 +4173,39 @@ def _test_stream_serve_matches_rollout() -> None:
           'P3 collect uses obs_step')
 
 
+def _test_collect_serve_cuda_graph_cpu() -> None:
+    """GPU-occupied identity: collect graph is CUDA-only; CPU stays eager."""
+    from models.dreamer_v4_rssm import get_collect_serve_cuda_graph
+    from models import dreamer_v4_rssm as _rssm_mod
+    import training.train as _train_mod
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 4, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 8, 4
+    cfg.mtp_length = 1
+    cfg.rssm_deter_dim = 16
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 8
+    cfg.rssm_hidden_dim = 8
+    cfg.head_hidden = 8
+    cfg.compile_mode = 'off'
+    cfg.dob_enabled = False
+    cfg.dv_as_input = False
+    model = build_model(cfg)
+    st = model.dynamics.initial_state(1, torch.device('cpu'))
+    assert get_collect_serve_cuda_graph(
+        model.dynamics, st, torch.device('cpu'), cfg.obs_dim,
+        cfg.action_dim) is None
+    _rsrc = open(_rssm_mod.__file__).read()
+    assert 'def get_collect_serve_cuda_graph' in _rsrc
+    assert 'class CollectServeCudaGraph' in _rsrc
+    _tsrc = open(_train_mod.__file__).read()
+    assert 'get_collect_serve_cuda_graph' in _tsrc
+    assert '_rssm_prev_a.copy_' in _tsrc
+    print('[smoke] OK  collect serve CUDA graph skipped on CPU; eager copy_')
+
+
 if __name__ == '__main__':
     import os
     import sys
@@ -4191,6 +4226,7 @@ if __name__ == '__main__':
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()
     _test_stream_serve_matches_rollout()
+    _test_collect_serve_cuda_graph_cpu()
     _test_envfree_observer_recipe()
     _test_identified_tau_cfg()
     _test_objective_runtime_cfg()

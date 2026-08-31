@@ -5086,8 +5086,10 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # P1/P2 ``random_action=True`` is handled above (numpy-only).  P3
     # on-policy streams the posterior with measured DV + Kalman so the
     # served ``feat`` matches ``_realsim_actor_critic_step`` re-encode.
+    # Frozen-RSSM CUDA-graphs that B=1 serve (policy stays eager).
     from models.dreamer_v4_rssm import (
-        alloc_pinned_obs_host, copy_obs_row, stream_serve_step)
+        alloc_pinned_obs_host, copy_obs_row, stream_serve_step,
+        get_collect_serve_cuda_graph)
     # One autocast region for the episode (not per step).  RSSM obs is a
     # persistent GPU row — no per-step ``from_numpy().to().unsqueeze``.
     # Pinned host staging makes the H2D non-blocking (identity values).
@@ -5102,11 +5104,18 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
         _o = (torch.empty(1, D, device=device, dtype=torch.float32)
               if _is_rssm else None)
         _o_host = (alloc_pinned_obs_host(device, D) if _is_rssm else None)
+        # Frozen-RSSM P3 collect is B=1 kernel-launch bound (~3 ms/step).
+        # CUDA-graph the observer serve; policy stays eager (σ sample).
+        _serve_cg = None
+        if _is_rssm and _rssm_state is not None:
+            _serve_cg = get_collect_serve_cuda_graph(
+                model.dynamics, _rssm_state, device, D, env.action_dim)
+            if _serve_cg is not None:
+                _serve_cg.reset(_rssm_state)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
             if _is_rssm:
-                copy_obs_row(_o, obs_window[-1], _o_host)
                 # Certainty-equivalent (sample=False) belief: the actor
                 # trains on the mode (``_realsim_actor_critic_step``) and
                 # LQG control acts on the optimal state estimate.  A
@@ -5114,16 +5123,28 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                 # chatter).  ``stream_serve_step`` threads measured DV
                 # into the GRU and Kalman ``d_t`` when DOB is live —
                 # same feat the frozen observer uses at train time.
-                _rssm_state = stream_serve_step(
-                    model.dynamics, _rssm_state, _rssm_prev_a, _o,
-                    sample=False)
-                action_t, _, _ = model.policy(_rssm_state.feat,
-                                               deterministic=deterministic)
+                if _serve_cg is not None:
+                    copy_obs_row(_serve_cg.obs, obs_window[-1], _o_host)
+                    feat = _serve_cg.replay()
+                    action_t, _, _ = model.policy(
+                        feat, deterministic=deterministic)
+                    _serve_cg.prev_a.copy_(
+                        action_t.detach().to(
+                            dtype=_serve_cg.prev_a.dtype).reshape(1, -1))
+                else:
+                    copy_obs_row(_o, obs_window[-1], _o_host)
+                    _rssm_state = stream_serve_step(
+                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                        sample=False)
+                    action_t, _, _ = model.policy(_rssm_state.feat,
+                                                   deterministic=deterministic)
+                    # Reuse the on-device action for the next GRU step —
+                    # ``copy_`` into the static prev-action (no rebind;
+                    # the .cpu() below already paid the env.step sync).
+                    _rssm_prev_a.copy_(
+                        action_t.detach().to(
+                            dtype=_rssm_prev_a.dtype).reshape(1, -1))
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-                # Reuse the on-device action for the next GRU step — no
-                # host→device round-trip (the .cpu() above already paid the
-                # only unavoidable sync for env.step).
-                _rssm_prev_a = action_t.detach().float().reshape(1, -1)
             else:
                 ow = torch.from_numpy(obs_window).to(device)            # (L, D)
                 a_ctx = torch.from_numpy(a_history).to(device)           # (L, A)
