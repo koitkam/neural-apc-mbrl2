@@ -910,6 +910,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_MATCH_COEF':            ('gain_match_coef',                float),
     'DREAMER_GAIN_MATCH_LEN':             ('gain_match_len',                 int),
     'DREAMER_GAIN_MATCH_MAX_STARTS':      ('gain_match_max_starts',          int),
+    # ``<=0`` auto = ``wm_tf_step_frac`` (P60; P59 teacher Δu=1 vs TM 0.4).
+    # Explicit ``=1.0`` A/B's the old teacher.
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
     'DREAMER_GAIN_MATCH_HUBER_BETA':      ('gain_match_huber_beta',          float),
     # P43: per-element Huber β = |tgt_ij| (L1 sat ±1; not relative Huber).

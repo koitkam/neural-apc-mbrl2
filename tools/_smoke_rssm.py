@@ -25,7 +25,8 @@ from training.train import (
                             _skip_storm_should_continue_p1,
                             _wm_fidelity_es_suppressed_frozen_g,
                             _p1_fidelity_local_plateau,
-                            _resolve_aux_tbptt_steps, _buffer_lap_iters,
+                            _resolve_aux_tbptt_steps, _resolve_gain_match_step,
+                            _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
                             _CLI_ONLY_ENV, _recon_channel_weights,
                             _cached_arange_1k, _overshoot_tail_wk,
@@ -241,6 +242,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert float(_tc.gain_match_huber_beta) == 1.0
     assert _tc.gain_match_huber_per_input is True
     assert int(_tc.gain_match_settle_len) == -1
+    assert abs(float(_tc.gain_match_step) - 0.0) < 1e-12
     assert _tc.gain_match_rest_ic is True
     assert int(_tc.gain_match_rest_ic_len) == 0
     assert _tc.gain_match_rest_ic_cuda_graph is True
@@ -277,6 +279,20 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _tb_ex._explicit_fields = {'aux_tbptt_steps'}
     assert _resolve_aux_tbptt_steps(_tb_ex) == 16
     print('[smoke] OK  aux_tbptt_steps sim-adaptive (16-of-55; explicit wins)')
+
+    _gs = TrainConfig()
+    assert abs(_resolve_gain_match_step(_gs) - 0.4) < 1e-12, _gs.gain_match_step
+    assert abs(float(_gs.gain_match_step) - 0.4) < 1e-12
+    _gs1 = TrainConfig()
+    _gs1.gain_match_step = 1.0
+    assert abs(_resolve_gain_match_step(_gs1) - 1.0) < 1e-12
+    _gs_tf = TrainConfig()
+    _gs_tf.wm_tf_step_frac = 0.25
+    assert abs(_resolve_gain_match_step(_gs_tf) - 0.25) < 1e-12
+    _src = open('training/train.py').read()
+    assert 'gain_match_step: float = 0.0' in _src
+    assert 'def _resolve_gain_match_step' in _src
+    print('[smoke] OK  gain_match_step sentinel 0 auto=wm_tf_step_frac; explicit 1.0 kept')
 
     # P28 follow-up 3: skip-storm restores last healthy P1 step, not wm_best.
     import tempfile
@@ -4101,6 +4117,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'iso_dcv=off' in banner, banner
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
+    assert 'gmatch_step=0.4' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
     assert 'gmatch_rest_L=' in banner, banner
     assert 'gmatch_rest_cg=True' in banner, banner
@@ -4113,6 +4130,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     plan = json.loads(plan_path.read_text())
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
+    assert abs(float(plan['config']['gain_match_step']) - 0.4) < 1e-12
     assert float(plan['config']['dob_ground_coef']) == 2.0
     dcv = plan['isolation_dcv_scales']
     assert dcv['on'] is True

@@ -993,7 +993,12 @@ class TrainConfig:
     # ``DREAMER_GAIN_MATCH_REST_IC_LEN``.
     gain_match_rest_ic_len: int = 0
     gain_match_max_starts: int = 6
-    gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
+    # Δinput (normalized) for the FD probe.  ``<=0`` auto =
+    # ``wm_tf_step_frac`` (P59 RCA / P60): teacher Huber at Δu=1.0 pinned
+    # jsonl ``*_ratio`` ~×1 while live/val TM measures G(Δu=0.4).  GRU is
+    # nonlinear ⇒ G(1) ≠ G(0.4).  Explicit
+    # ``DREAMER_GAIN_MATCH_STEP=1.0`` A/B's the old teacher.
+    gain_match_step: float = 0.0
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
     # (``(g-tgt)/|tgt|``) gave the subdominant DV ~5× the MV gradient and
     # exploded full-BPTT at P1 iter 50 — the A/B path was removed, not
@@ -3638,6 +3643,25 @@ def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
     return int(auto)
 
 
+def _resolve_gain_match_step(cfg: 'TrainConfig') -> float:
+    """P60: sentinel ``<=0`` → ``wm_tf_step_frac`` so teacher Δu matches val TM.
+
+    P59: rest-IC + last_only K already shared the TM IC/path, but the
+    teacher still stepped Δu=1.0 while ``compute_transfer_matrix`` uses
+    ``wm_tf_step_frac=0.4``.  jsonl Huber ``*_ratio`` ~×1 at freeze was
+    G(1.0); live gate 0.88@DV / val MV ×0.876 were G(0.4).  Writes the
+    resolved value back onto ``cfg`` (idempotent).  Clamp ``(1e-3, 1.0)``.
+    """
+    raw = float(getattr(cfg, 'gain_match_step', 0.0) or 0.0)
+    if raw > 0.0:
+        step = float(np.clip(raw, 1e-3, 1.0))
+    else:
+        tf = float(getattr(cfg, 'wm_tf_step_frac', 0.4) or 0.4)
+        step = float(np.clip(tf, 1e-3, 1.0))
+    cfg.gain_match_step = step
+    return step
+
+
 def _held_rollout_win(K: int, win: int = 8) -> int:
     """Held-rollout drift-window length that fits inside a K-step prior roll.
 
@@ -4146,7 +4170,9 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     ``rssm_latent_type=categorical`` and ``gain_match_coef=0`` while training
     used the auto-enabled recipe — the same class of silent-drop that missed
     the latent-type default.  Call after the last promotion (gain-match).
+    P60: resolve ``gain_match_step`` sentinel so the dump stores 0.4 not 0.0.
     """
+    _resolve_gain_match_step(cfg)
     out = Path(getattr(cfg, 'out_dir', None) or '.')
     plan_path = out / 'run_plan.json'
     if not plan_path.exists():
@@ -4201,6 +4227,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
+        f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
         f"gmatch_rest_L={_gain_match_rest_window(cfg)[1]} "
         f"gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph', True))} "
@@ -7635,7 +7662,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # roll holds a/dv from the start — no future obs needed.  When
     # T > K keep the historical start restriction (test_sim T=64,
     # K=55 → n_valid=9).  When T <= K roll the full K from every start.
-    step = float(getattr(cfg, 'gain_match_step', 1.0) or 1.0)
+    # P60: do NOT ``or 1.0`` — dataclass sentinel 0.0 would silently
+    # become the P59 teacher (Δu=1) that disagrees with val TM 0.4.
+    step = _resolve_gain_match_step(cfg)
     cv_idx = rssm.cv_index_t
     rest = None
     if _cfg_on(cfg, 'gain_match_rest_ic', False):
@@ -8107,11 +8136,13 @@ def _resolve_gain_match_targets(
     # 0 = auto TM settle (S=H).  Negative = off (P43 FD-from-posterior).
     _auto_gain_match_settle_len(cfg)
     _resolve_aux_tbptt_steps(cfg)
+    _resolve_gain_match_step(cfg)
     _beta_mv = _gain_col_rms(cfg.gain_match_mv_target)
     _beta_dv = _gain_col_rms(cfg.gain_match_dv_target)
     print(f'[gain-match] {log_label} (WM-norm) mv={cfg.gain_match_mv_target} '
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
           f'len={cfg.gain_match_len} settle={cfg.gain_match_settle_len} '
+          f'step={cfg.gain_match_step:g} '
           f'huber_beta={cfg.gain_match_huber_beta} '
           f'huber_per_input={_per} '
           f'huber_beta_mv={["%.3g" % x for x in _beta_mv]} '
@@ -12291,6 +12322,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             'refusing PRBS-posterior fallback (would confound P45)')
     _warmup_rest_ic_cuda_graph(getattr(model, 'dynamics', None), cfg, device)
     _resolve_aux_tbptt_steps(cfg)
+    _resolve_gain_match_step(cfg)
     _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude
