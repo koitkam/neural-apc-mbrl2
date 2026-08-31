@@ -97,8 +97,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > does **not** pin `_rest_ic_cg_fail` (warmup retries once after
 > `empty_cache`). Capture also zeros+syncs+gc and suppresses the
 > AccumulateGrad stream-mismatch warn across capture **and** the
-> GRU-grad canary (P58: P57 restored the flag before canary
-> ``backward``). Rest-IC FD `a_seq` is
+> GRU-grad canary; **P59:** keep the flag off until graph release so
+> the first live WM backward does not print the leftover UserWarning
+> (P58 restored after canary). Rest-IC FD `a_seq` is
 > cached; encoder-var / Huber MV–DV jsonl run on the last logged
 > inner only; P1 H2D is `obs`/`act` (and `dist` only if
 > `_wm_need_dist_target`) except MTP last. P2/P3 skip leftover
@@ -106,7 +107,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > re-encodes from `obs`; P2 still copies `dist` for dob-ground).
 > RSSM/TSSM T/K loops `_time_unbind` once; Stage-1 `d_t≡0` reuses
 > `cached_zeros_btd`. Full-T encode stacks `h/z/(c)/(dv)` then one
-> cat (not T cats); overshoot `out='obs'` is one `decode` after K.
+> cat (not T cats; `z` flatten-after-stack); overshoot `out='obs'` is one `decode` after K.
 > **P57 EXIT:** GAIN-READY **0.89@DV** @82;
 > last_ok **82**; graph **captured** then **released**; `t_wm` P1
 > **99 s** / P2 **22.6 s**. Unfreeze 147 ent **−0.101 HELD**. rscale
@@ -889,7 +890,8 @@ fixes BOTH:
   `buffers()` empty). Transient VRAM skip does **not** pin
   `_rest_ic_cg_fail` (warmup retries once after `empty_cache`).
   Suppress leftover AccumulateGrad stream-mismatch across capture
-  **and** the GRU-grad canary (P58). When the rest cache is present, P44 WM-held settle is skipped. Isolation loss
+  **and** the GRU-grad canary (P58) **and** live WM backward until
+  graph release (P59). When the rest cache is present, P44 WM-held settle is skipped. Isolation loss
   stays 0. jsonl `*_ratio` =
   mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE
   (default False). Residual is last Linear (ent −0.101); opening σ

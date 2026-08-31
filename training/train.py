@@ -974,8 +974,10 @@ class TrainConfig:
     # ``_rest_ic_cg_fail`` (warmup retries once after ``empty_cache``).
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.  Capture
     # suppresses leftover AccumulateGrad stream-mismatch across
-    # ``make_graphed_callables`` **and** the GRU-grad canary (P58:
-    # P57 restored the flag before canary ``backward``).
+    # ``make_graphed_callables``, the GRU-grad canary, **and** every
+    # live WM backward while the graph is held (P59: P58 restored
+    # the flag after canary; first ``world_model_loss`` backward
+    # still printed the one-shot UserWarning).  Release restores it.
     gain_match_rest_ic_cuda_graph: bool = True
     # Encode length of the rest lookback.  Collect settle stays
     # ``max(H, lookback)`` so the plant reaches SS; ``L`` is the **last**
@@ -7083,6 +7085,53 @@ def _rest_ic_note_capture_miss(rssm, pin_fail: bool) -> None:
         rssm._rest_ic_cg_fail = True  # type: ignore[attr-defined]
 
 
+_REST_IC_STREAM_WARN = {
+    'fn': None,
+    'prev': True,
+    'armed': False,
+}
+
+
+def _arm_rest_ic_stream_mismatch_warn(suppress: bool) -> None:
+    """Keep capture-stream AccumulateGrad quiet while rest-IC graph is live.
+
+    ``make_graphed_callables`` warms up on a side stream.  Those
+    AccumulateGrad nodes stay alive on the graphed backward, so the
+    **first live WM backward** (P59 STAGE-1 iter 1) still printed the
+    one-shot UserWarning after P58 restored the flag at canary end.
+    Training identity.  Host-adaptive (missing API is a no-op).
+    Idempotent.  Release (g freeze) restores the previous flag.
+    """
+    warn_fn = getattr(
+        torch.autograd.graph,
+        'set_warn_on_accumulate_grad_stream_mismatch', None)
+    if suppress:
+        if _REST_IC_STREAM_WARN['armed']:
+            return
+        prev = True
+        if warn_fn is not None:
+            try:
+                prev = warn_fn(False)
+            except TypeError:
+                warn_fn(False)
+                prev = True
+        _REST_IC_STREAM_WARN.update(fn=warn_fn, prev=prev, armed=True)
+        return
+    if not _REST_IC_STREAM_WARN['armed']:
+        return
+    fn = _REST_IC_STREAM_WARN['fn']
+    prev = _REST_IC_STREAM_WARN['prev']
+    if fn is not None:
+        try:
+            if prev is None:
+                fn(True)
+            else:
+                fn(bool(prev))
+        except TypeError:
+            fn(True)
+    _REST_IC_STREAM_WARN['armed'] = False
+
+
 @contextmanager
 def _suppress_accumulate_grad_stream_warn():
     """Hide leftover-AccumulateGrad stream mismatch around rest-IC capture.
@@ -7090,7 +7139,9 @@ def _suppress_accumulate_grad_stream_warn():
     P57 wrapped only ``make_graphed_callables``; P58 still printed the
     one-shot UserWarning on the GRU-grad canary ``backward`` after that
     ``finally`` restored the flag.  Cover capture **and** canary.
-    Training identity.  Host-adaptive (missing API → warnings filter).
+    The live WM loop is covered by ``_arm_rest_ic_stream_mismatch_warn``
+    until graph release (P59).  Training identity.  Host-adaptive
+    (missing API → warnings filter).
     """
     warn_fn = getattr(
         torch.autograd.graph,
@@ -7175,7 +7226,8 @@ def _capture_rest_ic_cuda_graph(
     # GRU-grad canary ``backward`` after capture warmup (P57 restored
     # the flag in the capture ``finally``).  Drop in-flight grads +
     # sync + gc before recording; suppress across capture **and**
-    # canary (identity for training; host-adaptive).
+    # canary.  P59: first live WM backward still warned after that
+    # restore — arm the flag until graph release.
     o_s = obs.detach()
     a_s = act.detach()
     saved_pre = _rssm_param_grad_snapshot(rssm)
@@ -7205,6 +7257,7 @@ def _capture_rest_ic_cuda_graph(
         # Canary: P25 class if the graph dropped BPTT through the GRU.
         # Save/restore any in-flight grads (identity when all None).
         saved = _rssm_param_grad_snapshot(rssm)
+        h = z = c = None
         try:
             rssm.zero_grad(set_to_none=True)
             h, z, c = graphed(obs, act)
@@ -7226,7 +7279,11 @@ def _capture_rest_ic_cuda_graph(
                   f'({type(e).__name__}: {e}); eager T-loop', flush=True)
             return None, True
         finally:
+            del h, z, c
             _rssm_param_grad_restore(saved)
+    # Capture-stream AccumulateGrad nodes stay on the graphed backward.
+    # Keep the mismatch warn off until g-freeze release (P59).
+    _arm_rest_ic_stream_mismatch_warn(True)
     print(f'[gain-match] rest-ic CUDA graph captured N={int(obs.shape[0])} '
           f'T={int(obs.shape[1])} (full-BPTT; opt out '
           'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0)', flush=True)
@@ -7315,7 +7372,9 @@ def _release_rest_ic_cuda_graph(rssm) -> bool:
     identity for training and host-adaptive (P3 needs the VRAM).
     No-op when the pid never captured (P55 eager-fail pin).  Returns
     True iff a graph object was dropped (caller may ``empty_cache``).
+    Restores the AccumulateGrad stream-mismatch warn (P59).
     """
+    _arm_rest_ic_stream_mismatch_warn(False)
     if rssm is None:
         return False
     released = hasattr(rssm, '_rest_ic_cg')

@@ -70,6 +70,7 @@ from training.train import (
                             _rest_ic_note_capture_miss,
                             _warmup_rest_ic_cuda_graph,
                             _release_rest_ic_cuda_graph,
+                            _arm_rest_ic_stream_mismatch_warn,
                             _amp_parent_autocast_on,
                             _rssm_param_grad_snapshot,
                             _rssm_param_grad_restore,
@@ -1562,12 +1563,30 @@ def _test_isolation_dcv_scales() -> None:
     assert '_warmup_rest_ic_cuda_graph' in _src
     assert '_amp_parent_autocast_on' in _src
     assert 'def _suppress_accumulate_grad_stream_warn' in _src
+    assert 'def _arm_rest_ic_stream_mismatch_warn' in _src
     assert 'set_warn_on_accumulate_grad_stream_mismatch' in _src
     _cap = _src[_src.index('def _capture_rest_ic_cuda_graph'):
                 _src.index('\ndef _rest_ic_encode_hzc')]
     assert 'with _suppress_accumulate_grad_stream_warn()' in _cap
     assert (_cap.find('with _suppress_accumulate_grad_stream_warn()')
             < _cap.find('.backward()'))
+    assert '_arm_rest_ic_stream_mismatch_warn(True)' in _cap
+    # Arm after the suppress context (canary `del`) so restore cannot
+    # clobber the live-WM flag.
+    assert _cap.find('del h, z, c') < _cap.find(
+        '_arm_rest_ic_stream_mismatch_warn(True)')
+    _rel = _src[_src.index('def _release_rest_ic_cuda_graph'):
+                _src.index('def _release_rest_ic_after_g_freeze')]
+    assert '_arm_rest_ic_stream_mismatch_warn(False)' in _rel
+    _rssm_src = _P(_tr.__file__).resolve().parents[1].joinpath(
+        'models/dreamer_v4_rssm.py').read_text()
+    _app = _rssm_src[_rssm_src.index('def _append_decode_core'):
+                     _rssm_src.index('def _stack_decode_core')]
+    assert 'z_l.append(st.z)' in _app
+    assert 'st.stoch_flat' not in _app
+    _stk = _rssm_src[_rssm_src.index('def _stack_decode_core'):
+                     _rssm_src.index('def cached_zeros_btd')]
+    assert '.flatten(start_dim=-2)' in _stk
     assert '_gain_match_fd_action_seq' in _src
     assert 'def _wm_need_logged_aux' in _src
     assert '_wm_need_enc_diag' in _src
@@ -2734,6 +2753,11 @@ def _test_gain_match_rest_ic() -> None:
     assert _release_rest_ic_cuda_graph(r) is False
     assert _release_rest_ic_cuda_graph(None) is False
     print('[smoke] OK  rest-ic CUDA graph release is identity on CPU')
+    _arm_rest_ic_stream_mismatch_warn(True)
+    _arm_rest_ic_stream_mismatch_warn(True)
+    _arm_rest_ic_stream_mismatch_warn(False)
+    _arm_rest_ic_stream_mismatch_warn(False)
+    print('[smoke] OK  rest-ic AccumulateGrad warn arm/disarm is idempotent')
 
 
 def _test_p3_reset_log_std() -> None:

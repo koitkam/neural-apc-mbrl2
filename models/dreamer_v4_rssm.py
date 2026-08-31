@@ -141,13 +141,15 @@ def _time_unbind(x: Optional[torch.Tensor]):
 
 
 def _append_decode_core(h_l, z_l, c_l, dv_l, st) -> None:
-    """Collect ``[h, z_flat, (c), (dv)]`` views for ``_stack_decode_core``.
+    """Collect ``[h, z, (c), (dv)]`` views for ``_stack_decode_core``.
 
     Same parts as ``state.feat[..., :dec_in]`` (d-tail is sliced off
     ``feat`` / appended later as ``ds``).  Identity vs per-step ``cat``.
+    ``z`` stays ``(B, K, C)`` — flatten after the T-stack (one
+    ``flatten`` vs T ``stoch_flat`` views on the WM hot path).
     """
     h_l.append(st.h)
-    z_l.append(st.stoch_flat)
+    z_l.append(st.z)
     if st.c is not None:
         c_l.append(st.c)
     if st.dv is not None:
@@ -159,9 +161,11 @@ def _stack_decode_core(h_l, z_l, c_l, dv_l) -> torch.Tensor:
 
     Main WM encode used to ``cat`` 2–4 views every t then stack T
     cores (100 inner × T=128 on test_sim).  One cat after T stacks.
-    Host-adaptive (no extra threads).
+    ``z`` is stacked ``(B, T, K, C)`` then flattened to ``K*C``
+    (identity vs stacking ``stoch_flat``).  Host-adaptive.
     """
-    parts = [torch.stack(h_l, 1), torch.stack(z_l, 1)]
+    z_flat = torch.stack(z_l, 1).flatten(start_dim=-2)
+    parts = [torch.stack(h_l, 1), z_flat]
     if c_l:
         parts.append(torch.stack(c_l, 1))
     if dv_l:
