@@ -69,7 +69,9 @@ from training.train import (
                             _rssm_param_grad_restore,
                             collect_rest_lookback,
                             _wm_gain_match_loss, _require_realsim_actor,
-                            _adv_action_corr, _p3_logp_clip_bound,
+                            _adv_action_corr, _row_adv_action_corr,
+                            _save_training_diagnostics_plot,
+                            _p3_logp_clip_bound,
                             _gaussian_entropy_nats, _entropy_collapse_threshold,
                             _p3_mu_ratio_surrogate, _p3_frozen_unfreeze_policy,
                             _format_gain_probe_line,
@@ -167,8 +169,12 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert 'critic_target_v_r' in diag, sorted(diag)
     assert 'actor_pos_adv_frac' in diag, sorted(diag)
     assert 'pmpo_pos_frac' in diag, sorted(diag)
+    assert 'adv_action_corr' in diag, sorted(diag)
+    assert 'imag_adv_action_corr' in diag, sorted(diag)
     assert abs(float(diag['actor_pos_adv_frac'])
                - float(diag['pmpo_pos_frac'])) < 1e-12
+    assert abs(float(diag['adv_action_corr'])
+               - float(diag['imag_adv_action_corr'])) < 1e-12
     assert torch.isfinite(diag['critic_mc_loss']).all()
     assert float(diag['critic_mc_loss']) >= 0.0
     # P26 RCA / P27: freeze return_scale — second call must not move ret_scale.
@@ -1323,6 +1329,11 @@ def _test_isolation_dcv_scales() -> None:
     assert '_p3_load_policy_snapshot' in _src
     assert '_release_rest_ic_cuda_graph' in _src
     assert "'actor_pos_adv_frac'" in _src
+    assert "'adv_action_corr'" in _src
+    assert 'def _row_adv_action_corr(' in _src
+    assert 'plt.subplots(3, 3' in _src
+    assert '_row_adv_action_corr(row)' in _src
+    assert 'out_path = Path(out_path)' in _src
     assert "es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac'" in _src
     assert '_p3_logp_clip_bound' in _src
     assert '_entropy_collapse_threshold' in _src
@@ -3437,6 +3448,62 @@ def _test_adv_action_corr_vectorized() -> None:
     z = _adv_action_corr(adv, act[:, :0])
     assert float(z) == 0.0
     print('[smoke] OK  vectorized adv-action corr (P3 diag identity)')
+    assert _row_adv_action_corr({'adv_action_corr': 0.4}) == 0.4
+    assert _row_adv_action_corr({'imag_adv_action_corr': 0.3}) == 0.3
+    assert _row_adv_action_corr(
+        {'adv_action_corr': 0.4, 'imag_adv_action_corr': 0.1}) == 0.4
+    assert _row_adv_action_corr({}) is None
+    print('[smoke] OK  _row_adv_action_corr prefers canonical jsonl key')
+
+
+def _test_training_diagnostics_cascade_axes() -> None:
+    """P55 GPU-occupied: plot/csv/parser surface real-sim cascade axes."""
+    import json
+    import os
+    import tempfile
+    from evaluation.diagnostics import _parse_train_log
+
+    rows = [
+        {'iter': 1, 'phase': 1, 'env_steps': 100,
+         'ema_return': -200.0, 'recon_loss': 0.01},
+        {'iter': 147, 'phase': 3, 'env_steps': 1000,
+         'ema_return': -170.0, 'entropy_mean': -0.101,
+         'actor_logp_std': 0.67, 'actor_ratio_clip_frac': 0.47,
+         'actor_ratio_mean': 1.02, 'critic_rew_to_tgt_var': 0.06,
+         'agent_minus_expert_return': 19.0, 'actor_pos_adv_frac': 0.55,
+         'pmpo_pos_frac': 0.55, 'adv_action_corr': 0.12,
+         'imag_adv_action_corr': 0.12, 'return_scale': 1.91},
+        {'iter': 175, 'phase': 3, 'env_steps': 2000,
+         'ema_return': -418.0, 'entropy_mean': -0.136,
+         'actor_logp_std': 18.8, 'actor_ratio_clip_frac': 0.46,
+         'actor_ratio_mean': 0.98, 'critic_rew_to_tgt_var': 0.0001,
+         'agent_minus_expert_return': -1237.0, 'actor_pos_adv_frac': 0.62,
+         'pmpo_pos_frac': 0.62, 'adv_action_corr': 0.08,
+         'imag_adv_action_corr': 0.12, 'return_scale': 1.91},
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        logp = os.path.join(td, 'train_log.jsonl')
+        with open(logp, 'w') as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + '\n')
+        out = os.path.join(td, 'training_diagnostics.png')
+        _save_training_diagnostics_plot(logp, out)
+        assert os.path.isfile(out)
+        csvp = os.path.join(td, 'training_diagnostics.csv')
+        assert os.path.isfile(csvp)
+        header = open(csvp).readline()
+        for col in ('actor_logp_std', 'actor_ratio_clip_frac',
+                    'critic_rew_to_tgt_var', 'agent_minus_expert_return',
+                    'actor_pos_adv_frac', 'adv_action_corr'):
+            assert col in header, header
+        _, summary = _parse_train_log(logp)
+        p3 = summary['p3']
+        assert 'actor_pos_adv_frac' in p3
+        assert 'actor_logp_std' in p3
+        assert abs(float(p3['actor_logp_std']['last']) - 18.8) < 1e-9
+        flags = ' '.join(summary['flags'])
+        assert 'imagined returns' not in flags
+    print('[smoke] OK  training_diagnostics cascade axes + leftover jsonl names')
 
 
 def _test_format_gain_probe_line() -> None:
@@ -3802,6 +3869,7 @@ if __name__ == '__main__':
     _test_agent_disturbance_cfg()
     _test_sim_runtime_cfg()
     _test_adv_action_corr_vectorized()
+    _test_training_diagnostics_cascade_axes()
     _test_format_gain_probe_line()
     _test_load_module_state_roundtrip()
     _test_p1_fidelity_local_plateau()

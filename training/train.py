@@ -8235,6 +8235,14 @@ def _adv_action_corr(adv_raw: torch.Tensor, act_flat: torch.Tensor
     return ((adv_c * a_c).sum(dim=0) / den).abs().mean()
 
 
+def _row_adv_action_corr(row: Dict):
+    """Real-sim |corr(adv, action)|. Leftover jsonl key is ``imag_adv_action_corr``."""
+    v = row.get('adv_action_corr')
+    if v is None:
+        v = row.get('imag_adv_action_corr')
+    return v
+
+
 def _p3_logp_clip_bound(clip: float, n_act: int) -> float:
     """Per-action-dim nats → clamp on the summed Gaussian logp.
 
@@ -8571,7 +8579,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         _ratio_clip_frac = torch.zeros((), device=device)
     actor_loss = actor_pg - ent_coef * entropy.mean() + bc_term
 
-    # ----- diagnostics (mirror the imagination keys the P3 logger reads) -----
+    # ----- diagnostics (real-sim; leftover imag/PMPO jsonl keys kept as aliases) -----
     with torch.no_grad():
         rew_var = rew.var().clamp_min(1e-8)
         tgt_var = target_returns.float().var().clamp_min(1e-8)
@@ -8599,6 +8607,8 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_pred_target_r': pred_target_r.detach(),
         'critic_target_v_r': target_v_r.detach(),
         'critic_mc_loss': critic_mc_loss.detach(),
+        'adv_action_corr': adv_action_corr.detach(),
+        # leftover jsonl key (imagination-actor era); same tensor
         'imag_adv_action_corr': adv_action_corr.detach(),
         'actor_logp_mean': logp.mean().detach(),
         'actor_logp_std': logp.std().detach(),
@@ -9959,11 +9969,13 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
 # ---------------------------------------------------------------------------
 
 def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
-    """Plot a 2x3 diagnostic grid from train_log.jsonl.
+    """Plot a 3x3 diagnostic grid from train_log.jsonl.
 
-    Panels: (1) ema_return + return_window_mean, (2) WM losses (recon/sf),
-    (3) phase 2/3 losses (bc/reward_mtp/actor/critic), (4) entropy & adv_std,
-    (5) grad norms (w/a/c) + skip count, (6) violations.
+    Row 1: returns, WM losses, agent/RL losses.
+    Row 2: entropy/adv_std, grad norms, violations.
+    Row 3: P3 cascade axes (logp_std, μ-ratio clip, rew/tgt + vs-expert).
+    Imagination-only canaries do not apply; logp_std / clip_frac are
+    the real-sim μ-walk readouts (P52/P55).
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -9978,8 +9990,10 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
                 continue
     if not rows:
         return
+    log_path = Path(log_path)
+    out_path = Path(out_path)
     steps = [r.get('env_steps', 0) for r in rows]
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
+    fig, axes = plt.subplots(3, 3, figsize=(15, 11), sharex=True)
 
     ax = axes[0, 0]
     ax.plot(steps, [r.get('ema_return') for r in rows], label='ema_return', lw=1.0)
@@ -10006,21 +10020,31 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
     ax.set_title('World model losses')
 
     ax = axes[0, 2]
+    _agent_any = False
     for k, c in [('bc_loss', 'C0'), ('reward_mtp_loss', 'C1'),
                   ('actor_loss', 'C2'), ('critic_loss', 'C3')]:
         vals = [r.get(k) for r in rows]
         if any(v is not None for v in vals):
             ax.plot(steps, vals, label=k, lw=1.0, color=c)
-    ax.set_ylabel('Phase 2/3 losses'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            _agent_any = True
+    ax.set_ylabel('Phase 2/3 losses')
+    if _agent_any:
+        ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
     ax.set_title('Agent / RL losses')
 
     ax = axes[1, 0]
-    ax.plot(steps, [r.get('entropy_mean') for r in rows], label='entropy', lw=1.0)
+    ent = [r.get('entropy_mean') for r in rows]
+    advs = [r.get('adv_std_mean') for r in rows]
+    if any(v is not None for v in ent):
+        ax.plot(steps, ent, label='entropy', lw=1.0)
     ax2 = ax.twinx()
-    ax2.plot(steps, [r.get('adv_std_mean') for r in rows], color='C3',
-              label='adv_std', lw=1.0)
+    if any(v is not None for v in advs):
+        ax2.plot(steps, advs, color='C3', label='adv_std', lw=1.0)
     ax.set_ylabel('entropy'); ax2.set_ylabel('adv_std', color='C3')
-    ax.legend(loc='upper left', fontsize=8); ax.grid(alpha=0.3)
+    if any(v is not None for v in ent):
+        ax.legend(loc='upper left', fontsize=8)
+    ax.grid(alpha=0.3)
     ax.set_title('Policy entropy / advantage std')
 
     ax = axes[1, 1]
@@ -10047,7 +10071,43 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
     ax.grid(alpha=0.3)
     ax.set_title('Violations (per-iter mean)')
 
-    for ax in axes[1, :]:
+    ax = axes[2, 0]
+    logp = [r.get('actor_logp_std') for r in rows]
+    if any(v is not None for v in logp):
+        ax.plot(steps, logp, label='logp_std', lw=1.0, color='C1')
+        ax.legend(fontsize=8)
+    ax.set_ylabel('logp std'); ax.grid(alpha=0.3)
+    ax.set_title('μ-walk (actor_logp_std)')
+
+    ax = axes[2, 1]
+    clip = [r.get('actor_ratio_clip_frac') for r in rows]
+    rmean = [r.get('actor_ratio_mean') for r in rows]
+    if any(v is not None for v in clip):
+        ax.plot(steps, clip, label='clip_frac', lw=1.0, color='C2')
+    if any(v is not None for v in rmean):
+        ax.plot(steps, rmean, label='ratio_mean', lw=1.0, color='C0')
+    if any(v is not None for v in clip) or any(v is not None for v in rmean):
+        ax.legend(fontsize=8)
+    ax.set_ylabel('PPO ratio'); ax.grid(alpha=0.3)
+    ax.set_title('μ-ratio clip (P53/P55)')
+
+    ax = axes[2, 2]
+    rtgt = [r.get('critic_rew_to_tgt_var') for r in rows]
+    vsx = [r.get('agent_minus_expert_return') for r in rows]
+    if any(v is not None for v in rtgt):
+        ax.plot(steps, rtgt, label='rtgt', lw=1.0, color='C3')
+    ax.set_yscale('symlog', linthresh=1e-4)
+    ax.set_ylabel('rew/tgt var')
+    if any(v is not None for v in vsx):
+        ax2 = ax.twinx()
+        ax2.plot(steps, vsx, color='C0', label='vs_expert', lw=1.0)
+        ax2.set_ylabel('vs expert', color='C0')
+    if any(v is not None for v in rtgt):
+        ax.legend(loc='upper left', fontsize=8)
+    ax.grid(alpha=0.3)
+    ax.set_title('Cascade / vs expert')
+
+    for ax in axes[2, :]:
         ax.set_xlabel('env_steps')
     fig.tight_layout()
     fig.savefig(out_path, dpi=110)
@@ -10055,8 +10115,8 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
 
     # Companion CSV with the same series (one row per train_log row).
     # Lets downstream analysis (and humans without image vision) recover the
-    # panel data without re-parsing train_log.jsonl.  Columns mirror the six
-    # panels above + iter/phase for context.
+    # panel data without re-parsing train_log.jsonl.  Columns mirror the
+    # panels above + P3 cascade canaries.
     try:
         import csv
         csv_path = out_path.with_suffix('.csv')
@@ -10068,9 +10128,11 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
             'entropy_mean', 'adv_std_mean',                         # panel 4
             'wm_grad_norm', 'actor_grad_norm', 'critic_grad_norm',  # panel 5
             'iter_cv_violation_mean', 'iter_mv_violation_mean',     # panel 6
-            # Critic-cascade canary (not plotted; essential for triage).
+            'actor_logp_std', 'actor_ratio_clip_frac', 'actor_ratio_mean',
             'critic_rew_to_tgt_var', 'critic_pred_target_r',
             'critic_target_v_r', 'critic_mc_loss',
+            'agent_minus_expert_return', 'actor_pos_adv_frac',
+            'adv_action_corr', 'imag_adv_action_corr',
             'imagined_return_mean', 'return_scale',
         ]
         with open(csv_path, 'w', newline='') as fh:
@@ -13659,7 +13721,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             # is also low (genuine degeneracy), never on a
                             # performing low-σ policy.  ``adv_corr`` None (pre-corr
                             # logging) ⇒ fall back to the entropy-only trip.
-                            _ac = row.get('imag_adv_action_corr')
+                            # Canonical jsonl key is ``adv_action_corr`` (real-sim);
+                            # leftover ``imag_adv_action_corr`` is the same tensor.
+                            _ac = _row_adv_action_corr(row)
                             if _ac is not None:
                                 adv_corr_window.append(abs(float(_ac)))
                                 if len(adv_corr_window) > win_n:

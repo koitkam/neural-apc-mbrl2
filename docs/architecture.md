@@ -58,9 +58,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > late-P3 ceiling (`clip_frac` 0.42→0.11). **P55 LIVE P3** recopy
 > snapshot each P3 iter (`p3_mu_ratio_refresh_iters=1`): compounding
 > μ-walk vs last-iter μ (not P3-entry). Unfreeze 147 logp_std
-> 0.67→18.8@175; ema −170→−2000; rscale 1.91 KEEP. Not KEEP until
+> 0.67→18.8@175 still 19.4@320; ema −170→−2163; rscale 1.91 KEEP.
+> best.pt **166** det −28.8 then walk detonates @169. Not KEEP until
 > EXIT+val. HEAD: snapshot refresh is in-place `load_state_dict`;
-> rest-IC CUDA graph released at g freeze.
+> rest-IC CUDA graph released at g freeze. jsonl `adv_action_corr`
+> aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
+> 3×3 (logp_std / clip_frac / rtgt).
 > p136 `actor_kl_coef` **REMOVED**.
 > `DREAMER_ACTOR_LOSS=pmpo` is a **false A/B** (`train()` refuses;
 > dead `pmpo_loss`/`kl_to`/`pmpo_alpha`/`pmpo_beta` / prior-refresh knobs
