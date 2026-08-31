@@ -958,11 +958,12 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # p09 RCA: tight SEPARATE actor grad clip (the tanh-squashed REINFORCE actor
     # explodes in P3; the shared grad_clip=100 is too loose for it).
     'DREAMER_ACTOR_GRAD_CLIP':            ('actor_grad_clip',                float),
-    # CLI-only extras that ``single_run`` previously dropped (only
-    # ``python -m training.train`` honored them via ``_CLI_ONLY_ENV``).
-    # Identity defaults.  Architecture / lookback are plant-derived in
-    # ``single_run``; an explicit env now wins after that construction.
-    # ``DREAMER_PMPO_{ALPHA,BETA}`` REMOVED (unused after ``pmpo_loss``).
+    # Architecture / policy / seed-count extras that ``single_run``
+    # previously dropped (only ``python -m training.train`` honored them
+    # via ``_CLI_ONLY_ENV``).  Identity defaults.  ``_CLI_ONLY_ENV`` no
+    # longer duplicates these keys.  Architecture / lookback are
+    # plant-derived in ``single_run``; an explicit env now wins after
+    # that construction.  ``DREAMER_PMPO_{ALPHA,BETA}`` REMOVED.
     'DREAMER_MAE_PMAX':                   ('mae_p_max',                      float),
     'DREAMER_POLICY_TYPE':                ('policy_type',                    str),
     'DREAMER_POLICY_INIT_LOG_STD':        ('policy_init_log_std',            float),
@@ -1004,8 +1005,8 @@ def apply_dreamer_env_overrides(cfg) -> Iterable[str]:
     Returns the iterable of field names that were overridden.
 
     NOTE: ``training/train.py``'s ``_cfg_from_env()`` (CLI) now also
-    calls this function after architecture extras, so both entry-points
-    share one ``DREAMER_*`` contract.
+    calls this function after non-``DREAMER_*`` CLI leftovers, so both
+    entry-points share one ``DREAMER_*`` contract.
     """
     overridden = []
     for env_k, (field, cast) in ENV_OVERRIDES.items():

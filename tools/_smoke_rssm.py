@@ -27,6 +27,7 @@ from training.train import (
                             _p1_fidelity_local_plateau,
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
+                            _CLI_ONLY_ENV, _recon_channel_weights,
                             _resolve_baseline_seed_op_band, _cfg_or_env,
                             _cfg_or_env_float, _resolve_policy_sigma_bounds,
                             collect_episode, collect_prbs_episode,
@@ -1068,6 +1069,53 @@ def _test_cfg_from_env_whitelist() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
+
+
+def _test_recon_channel_weights_cache() -> None:
+    """Mean-1 recon weights cache on cfg (identity vs rebuild)."""
+    from types import SimpleNamespace
+    from pathlib import Path
+    n_ch, cv_idx = 4, (1,)
+    cfg = SimpleNamespace(
+        wm_recon_cv_weight=6.0,
+        wm_recon_dv_weight=1.0,
+        cv_obs_indices=cv_idx,
+        dv_indices=(),
+        _recon_ch_w=None,
+    )
+    w1 = _recon_channel_weights(cfg, n_ch, 'cpu', torch.float32)
+    w2 = _recon_channel_weights(cfg, n_ch, 'cpu', torch.float32)
+    assert w1 is not None and w1 is w2, 'recon channel weights must cache'
+    assert abs(float(w1.mean().item()) - 1.0) < 1e-6
+    raw = torch.ones(n_ch, dtype=torch.float32)
+    raw[cv_idx[0]] = 6.0
+    expected = raw * (float(raw.numel()) / raw.sum().clamp_min(1e-8))
+    assert torch.allclose(w1.cpu(), expected)
+    cfg._recon_ch_w = None
+    w3 = _recon_channel_weights(cfg, n_ch, 'cpu', torch.float32)
+    assert torch.allclose(w1, w3)
+    cfg_off = SimpleNamespace(
+        wm_recon_cv_weight=1.0, wm_recon_dv_weight=1.0,
+        cv_obs_indices=(), dv_indices=(), _recon_ch_w=None,
+    )
+    assert _recon_channel_weights(cfg_off, n_ch, 'cpu', torch.float32) is None
+    src = Path(__file__).resolve().parents[1].joinpath('training', 'train.py')
+    text = src.read_text()
+    assert "getattr(cfg, 'wm_overshoot_tail_power', 2.0)" in text
+    print('[smoke] OK  recon channel weights cache identity; tail_power fallback 2.0')
+
+
+def _test_cli_only_env_disjoint() -> None:
+    """CLI leftovers must not double-setattr ENV_OVERRIDES DREAMER keys."""
+    from workflow._plant_prepare import ENV_OVERRIDES
+    overlap = {k for k, _, _ in _CLI_ONLY_ENV if k in ENV_OVERRIDES}
+    assert not overlap, overlap
+    kept = {k for k, _, _ in _CLI_ONLY_ENV}
+    assert kept == {
+        'AGENT_TOTAL_STEPS', 'SIM_EPISODE_LENGTH', 'SIM_SAMPLE_RATE',
+        'CONTROLLER_OUT_DIR',
+    }
+    print('[smoke] OK  _CLI_ONLY_ENV disjoint from ENV_OVERRIDES')
 
 
 def _test_batch_np_to_device_identity() -> None:
@@ -4263,6 +4311,8 @@ if __name__ == '__main__':
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None
     _test_cfg_from_env_whitelist()
+    _test_recon_channel_weights_cache()
+    _test_cli_only_env_disjoint()
     _test_batch_np_to_device_identity()
     _test_time_unbind_and_p1_h2d_keys()
     _test_lambda_returns_scan()

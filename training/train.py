@@ -6591,7 +6591,7 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # Vectorized over K (same as the old per-step ``_weighted_recon_mse``
     # loop: mean_{B,S,D} then weighted mean_k).  Eager P30: this was 55
     # Python MSE calls per WM step.
-    tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 0.0) or 0.0)
+    tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 2.0) or 0.0)
     se = (preds.float() - tgt.float()).pow(2)
     ch_w = _recon_channel_weights(cfg, int(preds.shape[-1]),
                                   preds.device, torch.float32)
@@ -6713,22 +6713,33 @@ def _recon_channel_weights(cfg: TrainConfig, n_ch: int, device,
 
     CV (and optional DV) up-weighting is renormalised to mean 1.0 so the
     overall recon magnitude is unchanged.  ``None`` ⇔ identity path.
+
+    Env-free ``wm_recon_cv_weight=6`` rebuilt ``ones(D)`` + index H2D +
+    ``sum`` on every recon and overshoot inner (100×/iter).  Cache the
+    mean-1 vector on ``cfg`` (same class as ``_cv_obs_std_t``).
     """
     cv_w = float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0)
-    cv_idx = tuple(getattr(cfg, 'cv_obs_indices', ()) or ())
+    cv_idx = tuple(int(i) for i in (getattr(cfg, 'cv_obs_indices', ()) or ()))
     dv_w = float(getattr(cfg, 'wm_recon_dv_weight', 1.0))
-    dv_idx = tuple(getattr(cfg, 'dv_indices', ()) or ())
+    dv_idx = tuple(int(i) for i in (getattr(cfg, 'dv_indices', ()) or ()))
     dv_active = (dv_w != 1.0 and len(dv_idx) > 0)
     if (cv_w == 1.0 or not cv_idx) and not dv_active:
         return None
+    key = (int(n_ch), str(device), str(dtype), float(cv_w), cv_idx,
+           float(dv_w), dv_idx)
+    cached = getattr(cfg, '_recon_ch_w', None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
     w = torch.ones(int(n_ch), device=device, dtype=dtype)
-    valid_cv = [int(i) for i in cv_idx if 0 <= int(i) < n_ch]
+    valid_cv = [i for i in cv_idx if 0 <= i < n_ch]
     if cv_w != 1.0 and valid_cv:
         w[torch.tensor(valid_cv, device=device, dtype=torch.long)] = cv_w
-    valid_dv = [int(i) for i in dv_idx if 0 <= int(i) < n_ch]
+    valid_dv = [i for i in dv_idx if 0 <= i < n_ch]
     if dv_active and valid_dv:
         w[torch.tensor(valid_dv, device=device, dtype=torch.long)] = dv_w
-    return w * (float(w.numel()) / w.sum().clamp_min(1e-8))
+    w = w * (float(w.numel()) / w.sum().clamp_min(1e-8))
+    cfg._recon_ch_w = (key, w)  # type: ignore[attr-defined]
+    return w
 
 
 def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
@@ -14607,30 +14618,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 # CLI
 # ---------------------------------------------------------------------------
 
-# Architecture / runtime keys that ``workflow._plant_prepare.ENV_OVERRIDES``
-# also owns for ``single_run`` (P50 GPU-occupied: CLI-only extras used to
-# silently drop).  ``_cfg_from_env`` applies these first, then the shared
-# whitelist.  Non-DREAMER keys stay CLI-only.
+# Non-``DREAMER_*`` CLI leftovers.  P50 promoted architecture / policy /
+# seed-count / ``DREAMER_BATCH_SIZE`` into ``ENV_OVERRIDES``; applying
+# them here first then again in the whitelist was a double-setattr.
+# ``_cfg_from_env`` still calls ``apply_dreamer_env_overrides`` after
+# this loop.  ``SIM_EPISODE_LENGTH`` is also read at
+# ``derive_episode_length`` (explicit leftover still wins).
 _CLI_ONLY_ENV = (
-    ('DREAMER_D_MODEL', 'd_model', int),
-    ('DREAMER_N_LAYERS', 'n_layers', int),
-    ('DREAMER_N_HEADS', 'n_heads', int),
-    ('DREAMER_FF_MULT', 'ff_mult', int),
-    ('DREAMER_N_REGISTER', 'n_register', int),
-    ('DREAMER_Z_DIM', 'z_dim', int),
-    ('DREAMER_TOK_HIDDEN', 'tok_hidden', int),
-    ('DREAMER_HEAD_HIDDEN', 'head_hidden', int),
-    ('DREAMER_K_MAX', 'k_max', int),
-    ('DREAMER_LOOKBACK', 'lookback', int),
-    ('DREAMER_BATCH_SIZE', 'batch_size', int),
-    ('DREAMER_MAE_PMAX', 'mae_p_max', float),
-    ('DREAMER_POLICY_TYPE', 'policy_type', str),
-    ('DREAMER_POLICY_INIT_LOG_STD', 'policy_init_log_std', float),
-    ('DREAMER_ACTOR_LOSS', 'actor_loss_type', str),
-    ('DREAMER_GRAD_CLIP', 'grad_clip', float),
-    ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
-    ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
-    ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
     ('AGENT_TOTAL_STEPS', 'total_steps', int),
     ('SIM_EPISODE_LENGTH', 'episode_length', int),
     ('SIM_SAMPLE_RATE', 'sample_rate', int),
@@ -14639,12 +14633,13 @@ _CLI_ONLY_ENV = (
 
 
 def _cfg_from_env() -> TrainConfig:
-    """CLI entry: architecture extras + shared ``ENV_OVERRIDES`` whitelist.
+    """CLI entry: non-``DREAMER_*`` leftovers + shared ``ENV_OVERRIDES``.
 
     P28 follow-up 6: the duplicate loop here silently dropped 130+ knobs
     that ``single_run`` already honors (aux TBPTT, skip-storm, n_critics,
     grad-skip max, …).  Apply the shared whitelist so both entry points
-    share one contract.
+    share one contract.  Architecture / policy / seed-count ``DREAMER_*``
+    keys live only in the whitelist (P50 double-setattr).
     """
     cfg = TrainConfig()
     explicit: set = set()

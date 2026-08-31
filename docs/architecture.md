@@ -711,12 +711,15 @@ the same leftover-env class (identity defaults; dual-read at
 `noise_curriculum_scale` / `HiddenDisturbance`).
 
 ### Reading the diagram
-- **World model** learns the plant from `obs`: `encoder → posterior z` (sees obs),
-  `prior z_hat` (predicts z without obs — the imagination engine), deterministic
+- **World model** is the **observer**: `encoder → posterior z` (sees obs),
+  `prior z_hat` (open-loop / overshoot roll — observer compounding, not an
+  actor imagination engine; actor imagination is deleted), deterministic
   core `h`, and `decoder g(feat) → obs_hat`. Trained by `opt_world`
-  (recon + KL + overshoot/held-rollout). The **disturbance head** [opt-in] is a
-  gradient-isolated read-out probe today; the **DOB `d_t`** [planned] replaces
-  it with a real state (Section 3).
+  (recon + KL + overshoot/held-rollout + gain-match). **DOB `d_t` is
+  default ON** (neural Kalman; unmeasured load only; MV and DV are both
+  measured inputs to `f()`). The leftover **disturbance head** is opt-in
+  and superseded when DOB is on (`disturbance_head_dim=0`; replay `n_dist`
+  keys off `_replay_n_dist`).
 - **Critic** `V(feat)` [`opt_critic`] is trained on **λ-returns** (TD-λ,
   bootstrapped by the EMA `target_value`) computed from the **REAL** environment
   rewards, **plus a Monte-Carlo grounding term** — `critic_mc_grounding_coef ×`
