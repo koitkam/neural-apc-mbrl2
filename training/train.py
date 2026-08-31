@@ -954,8 +954,8 @@ class TrainConfig:
     # ss/@H ×0.877/×0.887, DV ×0.815/×0.875).  ``DREAMER_GAIN_MATCH_REST_IC=0``
     # reverts to PRBS-posterior FD.  Collect settle = max(H, lookback)
     # — **not** ``wm_tf_horizon``.  Encode ``L`` is
-    # ``gain_match_rest_ic_len`` (default last ``max(K, 2τ/sr)`` of
-    # that settle; ``0`` = lookback).
+    # ``gain_match_rest_ic_len`` (P57 EXIT **REVERT** default ``0`` =
+    # lookback; ``-1`` A/B last ``max(K, 2τ/sr)`` of settle).
     gain_match_rest_ic: bool = True
     # Identity speed: CUDA-graph the rest-IC ``last_only`` T-loop (static
     # cached obs/act, ``sample=False``, full BPTT).  RSSM only (TSSM
@@ -972,16 +972,19 @@ class TrainConfig:
     # ``_rest_ic_cg_fail`` (warmup retries once after ``empty_cache``).
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
     gain_match_rest_ic_cuda_graph: bool = True
-    # Encode length of the rest lookback (P57).  Collect settle stays
+    # Encode length of the rest lookback.  Collect settle stays
     # ``max(H, lookback)`` so the plant reaches SS; ``L`` is the **last**
-    # frames fed to the GRU.  P45–P56 used ``L=lookback`` (test_sim 128),
-    # so the encode included the reset→SS transient.  Sentinel ``-1`` =
-    # last ``max(K, round(2·τ/sr))`` of that settle when identifier τ is
-    # present (test_sim L=55); missing τ keeps lookback (no 50 s fake).
-    # ``0`` = P45 lookback.  ``>0`` = exact.  Do **not** set settle to
-    # ``wm_tf_horizon`` (P44 S=H was a different knob).
+    # frames fed to the GRU.  **P57 EXIT REVERT** default ``0`` =
+    # lookback (test_sim 128, reset→SS in the IC): val MV ss/@H
+    # **×0.715 / ×0.712** vs P56 lookback **×0.765 / ×0.760** vs P53
+    # **×0.900 / ×0.898**.  Live gate 0.93@MV did not survive val TM
+    # (compounding open-loop ×0.632).  Actor still P53-class
+    # (−14 vs −97 9/9) — not an observer win.  Sentinel ``-1`` A/B =
+    # last ``max(K, round(2·τ/sr))`` when identifier τ is present
+    # (test_sim L=55); missing τ keeps lookback (no 50 s fake).
+    # ``>0`` = exact.  Do **not** set settle to ``wm_tf_horizon``.
     # ``DREAMER_GAIN_MATCH_REST_IC_LEN``.
-    gain_match_rest_ic_len: int = -1
+    gain_match_rest_ic_len: int = 0
     gain_match_max_starts: int = 6
     gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
@@ -3869,8 +3872,9 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device,
     ``keys`` copies only those names that exist in ``batch_np``.
     ``_replay_h2d_keys`` / ``_p1_wm_h2d_keys`` pick the inner-graph
     subset (never leftover ``cont``; ``dist`` only when the WM indexes
-    it; ``rew``/``expert`` when MTP / P3 AC is in the graph).
-    ``None`` = all keys.
+    it; ``rew`` when MTP / P3 AC is in the graph; P3 on-policy skips
+    ``expert``).  ``TrajectoryBuffer.sample(..., keys=)`` skips the
+    same leftover host fancy-index.  ``None`` = all keys.
     """
     out: Dict[str, torch.Tensor] = {}
     cuda = device.type == 'cuda'
@@ -4073,23 +4077,28 @@ def _wm_need_dist_target(model, cfg: 'TrainConfig') -> bool:
     return False
 
 
-def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool
+def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
+                     need_expert: Optional[bool] = None
                      ) -> Tuple[str, ...]:
-    """Replay H2D names the inner graph actually indexes.
+    """Replay sample/H2D names the inner graph actually indexes.
 
-    ``TrajectoryBuffer.sample`` still returns leftover ``cont`` (Dreamer
-    continuation flag).  ``world_model_loss`` / ``agent_finetune_loss`` /
-    ``_realsim_actor_critic_step`` never read it (λ-returns ignore
-    terminals inside a window).  Skip it every phase.  ``dist`` only when
-    ``_wm_need_dist_target`` (P2 dob-ground).  P3 observer re-encodes
-    from ``obs`` so ``dist`` stays off.  ``rew``/``expert`` when MTP or
-    P3 AC is in the graph.
+    Leftover Dreamer ``cont`` is never copied (λ-returns ignore terminals
+    inside a window).  ``dist`` only when ``_wm_need_dist_target`` (P2
+    dob-ground).  P3 observer re-encodes from ``obs`` so ``dist`` stays
+    off.  ``rew`` when MTP or P3 AC is in the graph.  ``expert`` follows
+    ``need_rew_expert`` unless ``need_expert`` overrides: P3 on-policy
+    actor uses ``obs/act/rew`` only (``expert_bc_p3_loss`` reads the
+    critic replay slot).
     """
     keys: List[str] = ['obs', 'act']
     if need_dist:
         keys.append('dist')
     if need_rew_expert:
-        keys.extend(('rew', 'expert'))
+        keys.append('rew')
+        if need_expert is None or need_expert:
+            keys.append('expert')
+    elif need_expert:
+        keys.append('expert')
     return tuple(keys)
 
 
@@ -4922,7 +4931,8 @@ class TrajectoryBuffer:
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
-    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator
+    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator,
+               keys: Optional[Tuple[str, ...]] = None
                ) -> Dict[str, np.ndarray]:
         if self.filled == 0:
             raise ValueError("empty buffer")
@@ -4934,16 +4944,25 @@ class TrajectoryBuffer:
             starts = rng.integers(0, max_start + 1, size=batch_size)
         # Fancy-index the (episode, time) windows.  Same slices as the
         # old Python ``for b`` copy; host-adaptive (no extra threads).
+        # ``keys`` skips leftover channels the inner graph never reads
+        # (``cont`` every phase; P1 ``dist``/``rew``/``expert``; P3 actor
+        # ``expert``).  RNG draws happen first so a subset is identity
+        # vs a full sample at the same seed.
         t_idx = starts[:, None] + np.arange(int(seq_len), dtype=np.int64)
         ep = ep_idx[:, None]
-        out = {
-            'obs': self.obs[ep, t_idx],
-            'act': self.act[ep, t_idx],
-            'rew': self.rew[ep, t_idx],
-            'cont': self.cont[ep, t_idx],
-            'expert': self.expert[ep, t_idx],
-        }
-        if self.dist is not None:
+        want = None if keys is None else set(keys)
+        out: Dict[str, np.ndarray] = {}
+        if want is None or 'obs' in want:
+            out['obs'] = self.obs[ep, t_idx]
+        if want is None or 'act' in want:
+            out['act'] = self.act[ep, t_idx]
+        if want is None or 'rew' in want:
+            out['rew'] = self.rew[ep, t_idx]
+        if want is None or 'cont' in want:
+            out['cont'] = self.cont[ep, t_idx]
+        if want is None or 'expert' in want:
+            out['expert'] = self.expert[ep, t_idx]
+        if self.dist is not None and (want is None or 'dist' in want):
             out['dist'] = self.dist[ep, t_idx]
         return out
 
@@ -6160,21 +6179,35 @@ def _lambda_returns(rew: torch.Tensor, v: torch.Tensor,
                     ret_cap: Optional[float] = None) -> torch.Tensor:
     """Truncated TD-λ returns. Last step is V (no ``r_T``).
 
-    ``lam=1`` is pure Monte-Carlo (``r_t + γ r_{t+1}`` … ``V_T``).  Same
-    recurrence as the three Python reverse loops this replaced — T is
-    seq_len (≪ GRU unroll), so the loop is not the hot path; the helper
-    keeps the actor/critic/MC sites identical.
+    ``lam=1`` is pure Monte-Carlo (``r_t + γ r_{t+1}`` … ``V_T``).
+    Reverse scan is one weighted ``cumsum`` (T sequential kernel
+    launches → 1).  Identity vs the sequential recurrence
+    ``R_t = r_t + γ[(1-λ)V_{t+1} + λ R_{t+1}]``, ``R_{T-1}=V_{T-1}``.
+    Host-adaptive: no extra threads / plant units.
     """
     if ret_cap is not None:
         v = v.clamp(-float(ret_cap), float(ret_cap))
-    returns = torch.zeros_like(v)
-    returns[:, -1] = v[:, -1]
     g = float(gamma)
     l = float(lam)
-    for t in reversed(range(int(v.shape[1]) - 1)):
-        boot = (1.0 - l) * v[:, t + 1] + l * returns[:, t + 1]
-        returns[:, t] = rew[:, t] + g * boot
-    out = returns.detach()
+    t_len = int(v.shape[1])
+    if t_len <= 1:
+        out = v.detach()
+        if ret_cap is not None:
+            out = out.clamp(-float(ret_cap), float(ret_cap))
+        return out
+    # R_t = u_t + (γλ) R_{t+1} with u_t = r_t + γ(1-λ) V_{t+1},
+    # u_{T-1} = V_{T-1}.  Weighted reverse-cumsum: R_t = Σ_k α^{k-t} u_k.
+    u = torch.empty_like(v)
+    u[:, :-1] = rew[:, :-1] + (g * (1.0 - l)) * v[:, 1:]
+    u[:, -1] = v[:, -1]
+    alpha = g * l
+    if abs(alpha) < 1e-12:
+        out = u.detach()
+    else:
+        expo = torch.arange(t_len, device=v.device, dtype=v.dtype)
+        w = alpha ** expo
+        c = (u * w).flip(1).cumsum(dim=1).flip(1)
+        out = (c / w).detach()
     if ret_cap is not None:
         out = out.clamp(-float(ret_cap), float(ret_cap))
     return out
@@ -6818,11 +6851,11 @@ def _gain_match_rest_window(cfg: 'TrainConfig') -> Tuple[int, int]:
     """Real-rest collect settle + encode length (not ``wm_tf_horizon``).
 
     ``settle = max(H, lookback)`` so the captured window is already at
-    SS.  Encode ``L`` is the **last** frames of that settle (TM-style
-    tail), not the reset transient.  Sentinel
-    ``gain_match_rest_ic_len=-1``: ``L = min(lookback, max(K, 2τ/sr))``
+    SS.  Encode ``L`` is the **last** frames of that settle.  Default
+    ``gain_match_rest_ic_len=0``: ``L=lookback`` (P57 EXIT REVERT;
+    P45–P56).  Sentinel ``-1`` A/B: ``L = min(lookback, max(K, 2τ/sr))``
     when identifier τ is present; missing τ keeps lookback (no 50 s
-    fake).  ``0`` = P45–P56 ``L=lookback``.  ``>0`` = exact.
+    fake).  ``>0`` = exact.
     TM default settle is ``wm_tf_horizon(H)=max(80,4H)`` — matching
     that is a *later* A/B, not this knob.
     """
@@ -6831,7 +6864,7 @@ def _gain_match_rest_window(cfg: 'TrainConfig') -> Tuple[int, int]:
                        or getattr(cfg, 'seq_len', 8) or 8))
     settle = max(h, l_cap)
     k = max(1, int(getattr(cfg, 'gain_match_len', 0) or 0) or h)
-    cfg_len = int(getattr(cfg, 'gain_match_rest_ic_len', -1))
+    cfg_len = int(getattr(cfg, 'gain_match_rest_ic_len', 0))
     if cfg_len > 0:
         L = min(l_cap, cfg_len)
     elif cfg_len == 0:
@@ -7344,7 +7377,7 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     cfg._gain_match_rest_act = np.stack(act_l, axis=0)  # type: ignore[attr-defined]
     cfg._gain_match_rest_dev = None  # type: ignore[attr-defined]
     from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
-    _len_cfg = int(getattr(cfg, 'gain_match_rest_ic_len', -1))
+    _len_cfg = int(getattr(cfg, 'gain_match_rest_ic_len', 0))
     print(f'[gain-match] rest-ic N={n} L={L} settle={settle} '
           f'rest_ic_len={_len_cfg} '
           f'(TM-protocol real-rest tail encode; isolation loss stays 0; '
@@ -12975,11 +13008,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # P3 on-policy stays seq_len (actor λ-returns, not DC-gain).
             _sample_T = (int(cfg.seq_len) if current_phase == 3
                          else _wm_train_seq_len(cfg))
-            batch_np = _src_buf.sample(cfg.batch_size, _sample_T, rng)
             # jsonl / banner use the last inner of a logged iter.  Skip
-            # encoder-var / Huber MV-DV splits / unused replay H2D on the
-            # other inner steps (objective unchanged).  Leftover ``cont``
-            # is never indexed; P3 also skips ``dist``.
+            # encoder-var / Huber MV-DV splits / unused replay sample+H2D
+            # on the other inner steps (objective unchanged).  Leftover
+            # ``cont`` is never indexed; P3 on-policy also skips
+            # ``dist`` / ``expert`` (BC reads the critic slot).
             _need_aux = _wm_need_logged_aux(_will_log, _i, n_inner)
             cfg._wm_need_logged_aux = _need_aux  # type: ignore[attr-defined]
             cfg._wm_need_enc_diag = _need_aux  # type: ignore[attr-defined]
@@ -12988,12 +13021,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if current_phase == 1 and not _p1_mtp:
                 _h2d_keys = _p1_wm_h2d_keys(_p1_need_dist)
             elif current_phase == 3:
-                _h2d_keys = _replay_h2d_keys(False, True)
+                _h2d_keys = _replay_h2d_keys(False, True, False)
             else:
                 # P1 last logged inner (MTP) and all P2 inners.
                 _h2d_keys = _replay_h2d_keys(
                     _p1_need_dist if current_phase == 1 else _need_dist,
                     True)
+            batch_np = _src_buf.sample(
+                cfg.batch_size, _sample_T, rng, keys=_h2d_keys)
             batch = _batch_np_to_device(batch_np, device, keys=_h2d_keys)
             t_sample_acc += time.time() - _t
 
@@ -13086,10 +13121,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         and float(getattr(cfg, 'wm_input_isolation_coef', 0.0)
                                   or 0.0) > 0.0):
                     _iso_np = isolation_buf.sample(
-                        cfg.batch_size, _isolation_sample_seq_len(cfg), rng)
+                        cfg.batch_size, _isolation_sample_seq_len(cfg), rng,
+                        keys=('obs', 'act'))
                     _iso = _batch_np_to_device(
-                        {'obs': _iso_np['obs'], 'act': _iso_np['act']},
-                        device, slot='iso')
+                        _iso_np, device, slot='iso')
                     _iso_obs, _iso_act = _iso['obs'], _iso['act']
                     with torch.amp.autocast(device_type=device.type,
                                               dtype=torch.bfloat16,
@@ -13254,12 +13289,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 _critic_batch = None
                 if (onpol_buf is not None and onpol_buf.filled > 0
                         and buf.filled > 0):
-                    _cb_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
+                    _cb_keys = _replay_h2d_keys(False, True)
+                    _cb_np = buf.sample(
+                        cfg.batch_size, cfg.seq_len, rng, keys=_cb_keys)
                     # NB: do NOT reuse ``_t`` here — it is the AC-step
                     # wall-clock timer (``_t = time.time()`` above).
                     _critic_batch = _batch_np_to_device(
-                        _cb_np, device, slot='critic',
-                        keys=_replay_h2d_keys(False, True))
+                        _cb_np, device, slot='critic', keys=_cb_keys)
                 # P83 FIX (p19 RCA): P3 expert-BC anchor weight — decay
                 # expert_bc_scale·(1→floor) across P3 so the actor starts pinned to
                 # the good BC-seeded policy and is progressively released to let

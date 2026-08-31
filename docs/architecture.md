@@ -70,8 +70,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **0.83@DV**; val MV ss/@H **×0.765 / ×0.754**, DV **×0.762 / ×0.790**,
 > det_r **0.352**. rscale **2.26 KEEP**. Default refresh stays **0**.
 > Rest-IC graph failed this pid (`t_wm` 124 s). Champion stays **P53**.
-> Encode ``L`` is now last ``max(K, 2τ/sr)`` of settle (P57; not
-> lookback=128). Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
+> Encode ``L`` default is lookback (P57 EXIT **REVERT**
+> ``gain_match_rest_ic_len=0``; ``-1`` A/B last ``max(K, 2τ/sr)``).
+> Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
 > `skip this/cum` (`n_grad_skip_iter`).
@@ -102,10 +103,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > `cont`; P3 also skips `dist` (`_replay_h2d_keys`; frozen observer
 > re-encodes from `obs`; P2 still copies `dist` for dob-ground).
 > RSSM/TSSM T/K loops `_time_unbind` once; Stage-1 `d_t≡0` reuses
-> `cached_zeros_btd`. P57 LIVE **P3**: GAIN-READY **0.89@DV** @82;
+> `cached_zeros_btd`. **P57 EXIT:** GAIN-READY **0.89@DV** @82;
 > last_ok **82**; graph **captured** then **released**; `t_wm` P1
 > **99 s** / P2 **22.6 s**. Unfreeze 147 ent **−0.101 HELD**. rscale
-> **2.35 KEEP**. Encode L PARTIAL until EXIT+val TM. HEAD
+> **2.35 KEEP**. Val MV **×0.715 / ×0.712** DV **×0.780 / ×0.836**
+> det_r **0.285**. Paired **−14 vs −97** 9/9. Encode L **FALSIFIED**
+> as DC-gain; default **0** lookback. Replay `sample(keys=)` skips
+> leftover `cont`; P3 actor skips `dist`+`expert`; TD-λ is a
+> reverse-`cumsum`. HEAD
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -494,9 +499,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > via Stage-1 `_posterior_step` → FD (TM rest-then-step IC; obs after
 > step like `_settle_capture`; skips P44 WM-held settle). Isolation loss
 > stays 0. Collect settle = max(H, lookback), not `wm_tf_horizon`.
-> Encode `L` is last `max(K, 2τ/sr)` of that settle when τ is
-> identified (`gain_match_rest_ic_len=-1`; test_sim 55 not lookback
-> 128). `0` = P45 lookback. Do not set settle=`wm_tf_horizon`.
+> Encode `L` default is lookback (`gain_match_rest_ic_len=0`;
+> P57 EXIT **REVERT**). `-1` A/B last `max(K, 2τ/sr)` (test_sim 55).
+> Do not set settle=`wm_tf_horizon`.
 > Cache miss aborts. `DREAMER_GAIN_MATCH_REST_IC=0` reverts to
 > PRBS-posterior FD. Do not set settle=`wm_tf_horizon` (P45 was
 > GAIN-READY without it). Remaining observer hole: DOB amp-dead
@@ -533,8 +538,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > KEEP of N=1. **P56 EXIT FALSIFIED** slow recopy N=50
 > (`DREAMER_P3_MU_RATIO_REFRESH=50`): no P55 walk; recopy inside the
 > freeze-forever ball is a no-op; val **−26 vs −112** P54-class.
-> Default refresh stays **0**. Champion **P53**. Encode L is last
-> `max(K, 2τ/sr)` of settle (P57). Slow recopy is closed.
+> Default refresh stays **0**. Champion **P53**. Encode L default is
+> lookback (P57 EXIT **REVERT**). Slow recopy is closed.
 > `critic_mc_loss` is now in the
 > P3 jsonl. Opt out
 > `DREAMER_P3_MU_RATIO_CLIP=0`. Not a lag-copy (1 update/batch
@@ -850,9 +855,9 @@ fixes BOTH:
   A/B only. **Rest-IC** (`gain_match_rest_ic`, default **True**; P45
   EXIT PROMOTE): encode real held-OP lookbacks then FD (TM protocol IC).
   `DREAMER_GAIN_MATCH_REST_IC=0` reverts to PRBS-posterior FD. Collect
-  pairing = TM `_settle_capture` (obs after step). Encode `L` is last
-  `max(K, 2τ/sr)` of settle (`gain_match_rest_ic_len=-1`; `0` =
-  lookback). Encode is
+  pairing = TM `_settle_capture` (obs after step). Encode `L` default
+  is lookback (`gain_match_rest_ic_len=0`; P57 EXIT **REVERT**; `-1`
+  A/B last `max(K, 2τ/sr)`). Encode is
   `rollout_observed(..., last_only=True, return_feats=False)` via
   Stage-1 `_posterior_step`. CUDA: `make_graphed_callables` on
   `_RestICGraphModule` wrapping that T-loop when

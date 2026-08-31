@@ -239,7 +239,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.gain_match_huber_per_input is True
     assert int(_tc.gain_match_settle_len) == -1
     assert _tc.gain_match_rest_ic is True
-    assert int(_tc.gain_match_rest_ic_len) == -1
+    assert int(_tc.gain_match_rest_ic_len) == 0
     assert _tc.gain_match_rest_ic_cuda_graph is True
     assert _tc.p3_reset_log_std is False
     assert _tc.bc_mean_only is True
@@ -1154,6 +1154,7 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     assert _wm_need_dist_target(m, c) is False
     assert _p1_wm_h2d_keys(_wm_need_dist_target(m, c)) == ('obs', 'act')
     assert _replay_h2d_keys(False, True) == ('obs', 'act', 'rew', 'expert')
+    assert _replay_h2d_keys(False, True, False) == ('obs', 'act', 'rew')
     assert _replay_h2d_keys(True, True) == (
         'obs', 'act', 'dist', 'rew', 'expert')
     m.dynamics.dob_active = True
@@ -1168,6 +1169,67 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     m.disturbance = object()
     assert _wm_need_dist_target(m, c) is True
     print('[smoke] OK  time-unbind identity + Stage-1 zeros cache + P1 dist H2D')
+
+
+def _test_lambda_returns_scan() -> None:
+    """Weighted reverse-cumsum ≡ sequential TD-λ (incl. MC / λ=0 / T=1)."""
+    from training.train import _lambda_returns
+
+    def _ref(rew, v, gamma, lam, cap=None):
+        if cap is not None:
+            v = v.clamp(-cap, cap)
+        out = torch.zeros_like(v)
+        out[:, -1] = v[:, -1]
+        for t in reversed(range(int(v.shape[1]) - 1)):
+            boot = (1.0 - lam) * v[:, t + 1] + lam * out[:, t + 1]
+            out[:, t] = rew[:, t] + gamma * boot
+        out = out.detach()
+        if cap is not None:
+            out = out.clamp(-cap, cap)
+        return out
+
+    torch.manual_seed(0)
+    for T, gamma, lam, cap in (
+            (8, 0.99, 0.90, 50.0),
+            (1, 0.99, 0.90, 50.0),
+            (16, 0.983, 0.90, None),
+            (8, 0.99, 1.0, 50.0),
+            (8, 0.99, 0.0, None),
+    ):
+        rew = torch.randn(4, T)
+        v = torch.randn(4, T)
+        got = _lambda_returns(rew, v, gamma, lam, cap)
+        ref = _ref(rew, v, gamma, lam, cap)
+        assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5), (
+            f'λ-scan mismatch T={T} lam={lam} max='
+            f'{float((got - ref).abs().max())}')
+    print('[smoke] OK  TD-λ reverse-cumsum ≡ sequential recurrence')
+
+
+def _test_buffer_sample_keys() -> None:
+    """Subset sample skips leftover channels; RNG identity vs full sample."""
+    import numpy as np
+    from training.train import TrajectoryBuffer
+
+    T, D, A, N = 16, 3, 1, 5
+    buf = TrajectoryBuffer(N, T, D, A, n_dist=1)
+    for i in range(N):
+        obs = np.full((T, D), float(i), dtype='float32')
+        act = np.full((T, A), float(i) + 0.5, dtype='float32')
+        rew = np.arange(T, dtype='float32') + i
+        cont = np.ones(T, dtype='float32')
+        expert = (np.arange(T) == i).astype('float32')
+        dist = np.full((T, 1), float(i) + 0.25, dtype='float32')
+        buf.add_episode(obs, act, rew, cont, expert=expert, dist=dist)
+    B, S = 4, 6
+    full = buf.sample(B, S, np.random.default_rng(3))
+    slim = buf.sample(B, S, np.random.default_rng(3),
+                      keys=('obs', 'act', 'rew'))
+    assert set(slim) == {'obs', 'act', 'rew'}
+    for k in slim:
+        assert np.array_equal(slim[k], full[k])
+    assert 'cont' not in slim and 'expert' not in slim and 'dist' not in slim
+    print('[smoke] OK  buffer sample keys subset identity')
 
 
 def _test_store_aux_feats_identity() -> None:
@@ -1439,7 +1501,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
-    assert 'gain_match_rest_ic_len: int = -1' in _src
+    assert 'gain_match_rest_ic_len: int = 0' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert '_rest_ic_can_cuda_graph' in _src
     assert 'make_graphed_callables' in _src
@@ -1473,6 +1535,9 @@ def _test_isolation_dcv_scales() -> None:
     assert "_h2d_keys = ('obs', 'act', 'dist')" not in _src
     assert '_h2d_keys = None' not in _src
     assert '_replay_h2d_keys(False, True)' in _src
+    assert '_replay_h2d_keys(False, True, False)' in _src
+    assert 'keys=_h2d_keys' in _src
+    assert "keys=('obs', 'act')" in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
@@ -1631,7 +1696,7 @@ def _test_envfree_observer_recipe() -> None:
     assert float(c.gain_match_huber_beta) == 1.0
     assert int(c.gain_match_settle_len) == -1
     assert c.gain_match_rest_ic is True
-    assert int(c.gain_match_rest_ic_len) == -1
+    assert int(c.gain_match_rest_ic_len) == 0
     assert c.gain_match_rest_ic_cuda_graph is True
     assert c.p3_reset_log_std is False
     assert not hasattr(c, 'actor_kl_coef')
@@ -2418,7 +2483,7 @@ def _test_gain_match_held_settle() -> None:
 
 
 def _test_gain_match_rest_window() -> None:
-    """Collect settle is max(H, lookback); encode L is last max(K, 2τ/sr)."""
+    """Collect settle is max(H, lookback); default L=lookback (P57 REVERT)."""
     from evaluation.wm_transfer_matrix import wm_tf_horizon
     c = TrainConfig()
     c.horizon = 55
@@ -2438,13 +2503,15 @@ def _test_gain_match_rest_window() -> None:
     c.gain_match_len = 55
     c.sample_rate = 4
     c.identified_tau_dominant = 53.0
+    assert int(c.gain_match_rest_ic_len) == 0
+    assert _gain_match_rest_window(c) == (128, 128), _gain_match_rest_window(c)
     c.gain_match_rest_ic_len = -1
     assert _gain_match_rest_window(c) == (128, 55), _gain_match_rest_window(c)
     c.gain_match_rest_ic_len = 0
     assert _gain_match_rest_window(c) == (128, 128)
     c.gain_match_rest_ic_len = 16
     assert _gain_match_rest_window(c) == (128, 16)
-    print('[smoke] OK  rest-ic settle=max(H,lookback); L=max(K,2τ/sr) not wm_tf_horizon')
+    print('[smoke] OK  rest-ic settle=max(H,lookback); default L=lookback; -1 A/B max(K,2τ/sr)')
 
 
 def _test_held_rollout_win_fits_k() -> None:
@@ -4025,6 +4092,8 @@ if __name__ == '__main__':
     _test_cfg_from_env_whitelist()
     _test_batch_np_to_device_identity()
     _test_time_unbind_and_p1_h2d_keys()
+    _test_lambda_returns_scan()
+    _test_buffer_sample_keys()
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()

@@ -231,6 +231,11 @@ def _test_buffer_sample_identity():
     assert np.array_equal(got['cont'], want_cont)
     assert np.array_equal(got['expert'], want_exp)
     assert np.array_equal(got['dist'], want_dist)
+    slim = buf.sample(B, S, np.random.default_rng(7),
+                      keys=('obs', 'act', 'rew'))
+    assert set(slim) == {'obs', 'act', 'rew'}
+    assert np.array_equal(slim['obs'], got['obs'])
+    assert 'cont' not in slim
     print('[smoke] OK  buffer sample matches per-row slice copy')
 
 
