@@ -129,6 +129,32 @@ def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
     return torch.einsum('tsc,bsc->btc', pows, u)
 
 
+def _time_unbind(x: Optional[torch.Tensor]):
+    """Unbind time dim=1 once. ``None`` stays ``None``.
+
+    Identity vs ``x[:, t]`` inside a Python T/K loop (one tuple of views
+    instead of T advanced-index views per WM step).  Host-adaptive.
+    """
+    if x is None:
+        return None
+    return x.unbind(1)
+
+
+def cached_zeros_btd(mod, B: int, T: int, D: int, dtype, device,
+                     attr: str = '_zeros_btd_cache') -> torch.Tensor:
+    """Reuse a ``(B,T,D)`` zero buffer. Identity vs ``torch.zeros`` each call
+    as long as callers do not write the buffer in-place (``cat`` / ``detach``
+    do not).  Stage-1 DOB ``d_t≡0`` tail is this class.
+    """
+    key = (int(B), int(T), int(D), str(dtype), str(device))
+    cached = getattr(mod, attr, None)
+    if cached is None or cached[0] != key:
+        z = torch.zeros(B, T, D, device=device, dtype=dtype)
+        setattr(mod, attr, (key, z))
+        return z
+    return cached[1]
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -854,28 +880,26 @@ class RSSMDynamics(nn.Module):
         # Stage-1 rest-IC: posterior-only (prior heads unused).  P2 DOB /
         # cont-dist two-pass still need obs_step + prior.feat.
         use_post_only = bool(last_only) and not two_pass and not _need_prior_core
+        act_t = _time_unbind(act)
+        emb_t = _time_unbind(embeds)
+        dv_seq = _time_unbind(dvs)
         if use_post_only:
-            # Slice, don't unbind: T Python tensor objects on the rest-IC
-            # hot path (N=6, L=lookback, every WM inner step).
             pstep = self._posterior_step
-            if dvs is None:
-                for t in range(T):
-                    state = pstep(state, act[:, t], embeds[:, t], dv=None,
-                                  sample=sample)
-            else:
-                for t in range(T):
-                    state = pstep(state, act[:, t], embeds[:, t],
-                                  dv=dvs[:, t], sample=sample)
+            for t in range(T):
+                state = pstep(
+                    state, act_t[t], emb_t[t],
+                    dv=None if dv_seq is None else dv_seq[t],
+                    sample=sample)
         else:
             for t in range(T):
-                dv_t = dvs[:, t] if dvs is not None else None
+                dv_t = None if dv_seq is None else dv_seq[t]
                 # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z)
                 # recurrence with ``obs=None`` so neither the DOB d-update
                 # NOR the per-step prior decode enters the compiled loop —
                 # the EXPENSIVE decode is hoisted OUT and done ONCE, batched,
                 # below.  ``d`` does NOT affect h/z; cont innovation is
                 # fed in pass 2.
-                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                post, prior = self.obs_step(state, act_t[t], emb_t[t],
                                             dv=dv_t, sample=sample, obs=None)
                 state = post
                 if _stack_post:
@@ -894,14 +918,15 @@ class RSSMDynamics(nn.Module):
             prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
             base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
             nu_seq = obs.index_select(-1, self.cv_index_t) - base  # (B, T, n_cv)
+            nu_t = _time_unbind(nu_seq)
             state = self.initial_state(B, device)
             feats_l, post_l, prior_l, prior_core_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
             for t in range(T):
-                dv_t = dvs[:, t] if dvs is not None else None
-                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                dv_t = None if dv_seq is None else dv_seq[t]
+                post, prior = self.obs_step(state, act_t[t], emb_t[t],
                                             dv=dv_t, sample=sample, obs=None,
-                                            cont_innov=nu_seq[:, t])
+                                            cont_innov=nu_t[t])
                 state = post
                 if _stack_post:
                     feats_l.append(post.feat[..., :dec_in])
@@ -937,8 +962,10 @@ class RSSMDynamics(nn.Module):
                     ds = ds[:, -1:]
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
-                ds = torch.zeros(B, post_core.shape[1], self.n_cv,
-                                 device=device, dtype=post_core.dtype)
+                # Reuse a zeros buffer (identity; ``cat`` does not write it).
+                ds = cached_zeros_btd(
+                    self, B, int(post_core.shape[1]), self.n_cv,
+                    post_core.dtype, device)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               d=ds[:, -1], dv=state.dv, c=state.c,
@@ -1021,9 +1048,11 @@ class RSSMDynamics(nn.Module):
         img_step = self.img_step
         out_h = out == 'h'
         out_obs = out == 'obs'
+        act_k = _time_unbind(actions)
+        dv_seq = _time_unbind(dvs)
         for k in range(K):
-            dv_k = dvs[:, k] if dvs is not None else None
-            state = img_step(state, actions[:, k], dv=dv_k, sample=sample)
+            dv_k = None if dv_seq is None else dv_seq[k]
+            state = img_step(state, act_k[k], dv=dv_k, sample=sample)
             if last_only:
                 continue
             if out_h:

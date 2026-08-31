@@ -3867,8 +3867,9 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device,
     (no pin).  Identity values.
 
     ``keys`` copies only those names that exist in ``batch_np`` (P1 WM
-    needs ``obs``/``act``/``dist``; skip ``rew``/``expert`` except the
-    last logged inner when MTP is in the graph).  ``None`` = all keys.
+    needs ``obs``/``act`` and ``dist`` only when
+    ``_wm_need_dist_target``; skip ``rew``/``expert`` except the last
+    logged inner when MTP is in the graph).  ``None`` = all keys.
     """
     out: Dict[str, torch.Tensor] = {}
     cuda = device.type == 'cuda'
@@ -4044,6 +4045,42 @@ def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
     if float(rmtp_weight or 0.0) != 0.0:
         return True
     return _wm_need_logged_aux(will_log, step_i, n_inner)
+
+
+def _wm_need_dist_target(model, cfg: 'TrainConfig') -> bool:
+    """True when ``world_model_loss`` actually indexes ``batch['dist']``.
+
+    Env-free Stage-1: ``dob_active=False``, ``dist_match_coef=0``,
+    ``disturbance_head_dim=0`` (DOB retires the P87 head) → False.
+    P2 Kalman ground / A/B dist-match / live head still need the copy.
+    P25: do not key this off ``disturbance_head_dim`` alone.
+    """
+    dyn = getattr(model, 'dynamics', None)
+    dob_live = bool(getattr(dyn, 'dob_enabled', False)
+                    and getattr(dyn, 'dob_active', False))
+    dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
+    if dob_live and dgc > 0.0:
+        return True
+    dm = float(getattr(cfg, 'dist_match_coef', 0.0) or 0.0)
+    n_dist = int(getattr(dyn, 'cont_dist_dim', 0) or 0)
+    if dm > 0.0 and n_dist > 0:
+        return True
+    dist_head = getattr(model, 'disturbance', None)
+    dist_coef = float(getattr(cfg, 'disturbance_loss_scale', 0.0) or 0.0)
+    if dist_head is not None and dist_coef > 0.0:
+        return True
+    return False
+
+
+def _p1_wm_h2d_keys(need_dist: bool) -> Tuple[str, ...]:
+    """P1 WM H2D names when MTP is not in the graph.
+
+    ``rew``/``expert`` stay off (paper ``reward_scale_loss_p1=0``).
+    ``dist`` only when ``_wm_need_dist_target``.
+    """
+    if need_dist:
+        return ('obs', 'act', 'dist')
+    return ('obs', 'act')
 
 
 def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
@@ -12902,6 +12939,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _will_log = ((int(total_iters) + 1) % _log_every == 0)
         p1_rmtp_weight = (0.0 if diag_disable_reward_mtp_in_p1
                           else float(cfg.reward_scale_loss_p1))
+        _p1_need_dist = (current_phase == 1
+                         and _wm_need_dist_target(model, cfg))
         for _i in range(n_inner):
             _t = time.time()
             # mbrl2 real-sim: P3 actor-critic REINFORCE is ON-POLICY — sample the
@@ -12928,7 +12967,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 p1_rmtp_weight, _will_log, _i, n_inner))
             _h2d_keys = None
             if current_phase == 1 and not _p1_mtp:
-                _h2d_keys = ('obs', 'act', 'dist')
+                _h2d_keys = _p1_wm_h2d_keys(_p1_need_dist)
             batch = _batch_np_to_device(batch_np, device, keys=_h2d_keys)
             t_sample_acc += time.time() - _t
 

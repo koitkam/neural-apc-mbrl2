@@ -57,6 +57,7 @@ from training.train import (
                             _load_module_state,
                             _p1_need_agent_finetune,
                             _wm_need_logged_aux,
+                            _wm_need_dist_target, _p1_wm_h2d_keys,
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_fd_action_seq,
                             _gain_match_state_from_feat,
@@ -215,6 +216,9 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _wm_need_logged_aux(True, 98, 100) is False
     assert _wm_need_logged_aux(True, 99, 100) is True
     print('[smoke] OK  P1 MTP skip when reward_scale_loss_p1=0 (log last only)')
+    assert _p1_wm_h2d_keys(False) == ('obs', 'act')
+    assert _p1_wm_h2d_keys(True) == ('obs', 'act', 'dist')
+    print('[smoke] OK  P1 H2D keys skip dist when WM does not read it')
 
     class _Snap(torch.nn.Module):
         def __init__(self):
@@ -1107,6 +1111,61 @@ def _test_batch_np_to_device_identity() -> None:
     print('[smoke] OK  replay H2D identity + PMPO prior-refresh REMOVED')
 
 
+def _test_time_unbind_and_p1_h2d_keys() -> None:
+    """Unbind dim=1 ≡ ``x[:, t]``; Stage-1 zeros cache; P1 skip unused dist."""
+    from models.dreamer_v4_rssm import _time_unbind, cached_zeros_btd
+
+    assert _time_unbind(None) is None
+    x = torch.arange(2 * 5 * 3, dtype=torch.float32).reshape(2, 5, 3)
+    parts = _time_unbind(x)
+    assert parts is not None and len(parts) == 5
+    for t in range(5):
+        assert torch.equal(parts[t], x[:, t])
+
+    class _Mod:
+        pass
+
+    mod = _Mod()
+    z1 = cached_zeros_btd(mod, 2, 4, 3, torch.float32, torch.device('cpu'))
+    z2 = cached_zeros_btd(mod, 2, 4, 3, torch.float32, torch.device('cpu'))
+    assert z1 is z2
+    assert float(z1.abs().sum()) == 0.0
+    z3 = cached_zeros_btd(mod, 2, 5, 3, torch.float32, torch.device('cpu'))
+    assert z3 is not z1
+    assert z3.shape == (2, 5, 3)
+
+    class _M:
+        pass
+
+    class _D:
+        pass
+
+    m = _M()
+    m.dynamics = _D()
+    m.disturbance = None
+    m.dynamics.dob_enabled = True
+    m.dynamics.dob_active = False
+    m.dynamics.cont_dist_dim = 0
+    c = TrainConfig()
+    c.dob_ground_coef = 2.0
+    c.dist_match_coef = 0.0
+    c.disturbance_loss_scale = 1.0
+    assert _wm_need_dist_target(m, c) is False
+    assert _p1_wm_h2d_keys(_wm_need_dist_target(m, c)) == ('obs', 'act')
+    m.dynamics.dob_active = True
+    assert _wm_need_dist_target(m, c) is True
+    assert 'dist' in _p1_wm_h2d_keys(True)
+    m.dynamics.dob_active = False
+    c.dist_match_coef = 0.6
+    m.dynamics.cont_dist_dim = 1
+    assert _wm_need_dist_target(m, c) is True
+    c.dist_match_coef = 0.0
+    m.dynamics.cont_dist_dim = 0
+    m.disturbance = object()
+    assert _wm_need_dist_target(m, c) is True
+    print('[smoke] OK  time-unbind identity + Stage-1 zeros cache + P1 dist H2D')
+
+
 def _test_store_aux_feats_identity() -> None:
     """Isolation encode may drop logit stacks; feats must match the full pass."""
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics, _dob_scan_mix_budget_bytes
@@ -1403,7 +1462,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_fd_action_seq' in _src
     assert 'def _wm_need_logged_aux' in _src
     assert '_wm_need_enc_diag' in _src
-    assert "_h2d_keys = ('obs', 'act', 'dist')" in _src
+    assert 'def _wm_need_dist_target' in _src
+    assert 'def _p1_wm_h2d_keys' in _src
+    assert '_h2d_keys = _p1_wm_h2d_keys' in _src
+    assert "_h2d_keys = ('obs', 'act', 'dist')" not in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
@@ -3955,6 +4017,7 @@ if __name__ == '__main__':
     only = sys.argv[1] if len(sys.argv) > 1 else None
     _test_cfg_from_env_whitelist()
     _test_batch_np_to_device_identity()
+    _test_time_unbind_and_p1_h2d_keys()
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
     _test_stage1_dob_ground_skip()

@@ -97,7 +97,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > `empty_cache`). Capture also zeros+syncs and suppresses the
 > one-shot AccumulateGrad stream-mismatch warn. Rest-IC FD `a_seq` is
 > cached; encoder-var / Huber MV–DV jsonl run on the last logged
-> inner only; P1 H2D is `obs`/`act`/`dist` except MTP last. HEAD
+> inner only; P1 H2D is `obs`/`act` (and `dist` only if
+> `_wm_need_dist_target`) except MTP last. RSSM/TSSM T/K loops
+> `_time_unbind` once; Stage-1 `d_t≡0` reuses `cached_zeros_btd`.
+> P57 LIVE P1 iter **64**: skip-storm **1/2 @41** recovered; last_ok
+> **64** unlocked; `t_wm` median **99 s**. HEAD
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig

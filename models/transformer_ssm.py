@@ -126,7 +126,8 @@ import torch.nn.functional as F
 # Reuse the proven RSSM building blocks so the categorical latent + KL are
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
 from models.dreamer_v4_rssm import (
-    _CategoricalLatent, _ContinuousLatent, dob_kalman_scan)
+    _CategoricalLatent, _ContinuousLatent, _time_unbind, cached_zeros_btd,
+    dob_kalman_scan)
 
 
 @dataclass
@@ -690,9 +691,11 @@ class TransformerSSMDynamics(nn.Module):
         img_step = self.img_step
         out_h = out == 'h'
         out_obs = out == 'obs'
+        act_k = _time_unbind(actions)
+        dv_seq = _time_unbind(dvs)
         for k in range(K):
-            dv_k = dvs[:, k] if dvs is not None else None
-            state = img_step(state, actions[:, k], dv=dv_k, sample=sample)
+            dv_k = None if dv_seq is None else dv_seq[k]
+            state = img_step(state, act_k[k], dv=dv_k, sample=sample)
             if last_only:
                 continue
             if out_h:
@@ -802,22 +805,22 @@ class TransformerSSMDynamics(nn.Module):
         # last_only: materialize post.feat once after the loop (rest-IC).
         _stack_post = not last_only
         use_post_only = bool(last_only) and not two_pass and not _need_prior_core
+        act_t = _time_unbind(act)
+        emb_t = _time_unbind(embeds)
+        dv_seq = _time_unbind(dvs)
         if use_post_only:
             pstep = self._posterior_step
-            if dvs is None:
-                for t in range(T):
-                    state = pstep(state, act[:, t], embeds[:, t], dv=None,
-                                  sample=sample)
-            else:
-                for t in range(T):
-                    state = pstep(state, act[:, t], embeds[:, t],
-                                  dv=dvs[:, t], sample=sample)
+            for t in range(T):
+                state = pstep(
+                    state, act_t[t], emb_t[t],
+                    dv=None if dv_seq is None else dv_seq[t],
+                    sample=sample)
         else:
             for t in range(T):
-                dv_t = dvs[:, t] if dvs is not None else None
+                dv_t = None if dv_seq is None else dv_seq[t]
                 # COMPILE-EFFICIENT recurrence (2026-06-12, mirror of RSSM):
                 # ``obs=None`` keeps the per-step prior decode OUT of the loop.
-                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                post, prior = self.obs_step(state, act_t[t], emb_t[t],
                                             dv=dv_t, sample=sample, obs=None)
                 state = post
                 if _stack_post:
@@ -834,14 +837,15 @@ class TransformerSSMDynamics(nn.Module):
             prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
             base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
             nu_seq = obs.index_select(-1, self.cv_index_t) - base  # (B, T, n_cv)
+            nu_t = _time_unbind(nu_seq)
             state = self.initial_state(B, device)
             feats_l, post_l, prior_l, prior_core_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
             for t in range(T):
-                dv_t = dvs[:, t] if dvs is not None else None
-                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                dv_t = None if dv_seq is None else dv_seq[t]
+                post, prior = self.obs_step(state, act_t[t], emb_t[t],
                                             dv=dv_t, sample=sample, obs=None,
-                                            cont_innov=nu_seq[:, t])
+                                            cont_innov=nu_t[t])
                 state = post
                 if _stack_post:
                     feats_l.append(post.feat[..., :dec_in])
@@ -876,8 +880,10 @@ class TransformerSSMDynamics(nn.Module):
                     ds = ds[:, -1:]
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
-                ds = torch.zeros(B, post_core.shape[1], self.n_cv,
-                                 device=device, dtype=post_core.dtype)
+                # Reuse a zeros buffer (identity; ``cat`` does not write it).
+                ds = cached_zeros_btd(
+                    self, B, int(post_core.shape[1]), self.n_cv,
+                    post_core.dtype, device)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = TSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               kv_cache=state.kv_cache, pos=state.pos,
