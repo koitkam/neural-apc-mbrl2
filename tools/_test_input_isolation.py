@@ -392,6 +392,7 @@ def main():
     torch.manual_seed(5)
     cfg.gain_match_len = 6
     cfg.gain_match_step = 1.0
+    cfg.gain_match_clip_realized = False
     cfg.gain_match_huber_beta = 1.0
     cfg.gain_match_mv_target = ((0.4,),)
     cfg.gain_match_dv_target = ((-0.2,),)

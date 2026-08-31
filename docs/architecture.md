@@ -879,11 +879,20 @@ fixes BOTH:
   finite-difference step-response asymptote (optionally hold a/dv
   `gain_match_settle_len` steps — auto = control horizon; TM probe settle
   is `wm_tf_horizon` = max(80, 4×horizon) — then roll the prior K=`gain_match_len` steps, held baseline vs
-  +`gain_match_step` per MV/DV input, ΔCV/step. Sentinel `<=0`
+  +`gain_match_step` per MV/DV input, ΔCV/Δu. Sentinel `<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a
   nonlinear GRU). Explicit `DREAMER_GAIN_MATCH_STEP=1.0` A/B's
-  the old teacher. Matched to
+  the old teacher. **P61:** held a/dv are cube-clipped to
+  `[-1, 1]`; a per-start step that clip would shrink is
+  **reversed** (step-settle reverse-before-reclip; TM
+  `compute_transfer_matrix` skip-noop + realized ΔMV, p136).
+  Huber divides by the *applied* Δu (`_gain_match_realized_du`),
+  not the commanded step — identity when rest+step is interior.
+  `op_band+step>1` (test_sim rest 0.6+0.4 sits on the cube edge)
+  used to silently deflate G vs val TM. Opt out
+  `DREAMER_GAIN_MATCH_CLIP_REALIZED=0`. jsonl
+  `wm_gain_match_du_frac` = mean `|Δu|/|step|`. Matched to
   the identified steady-state gain in WM-normalized units
   (`gain_match_mv_target`/`gain_match_dv_target`, resolved by
   `_resolve_gain_match_targets` from `dynamics_identification.json` + obs-norm +

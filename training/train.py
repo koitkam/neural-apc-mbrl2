@@ -999,6 +999,14 @@ class TrainConfig:
     # nonlinear ⇒ G(1) ≠ G(0.4).  Explicit
     # ``DREAMER_GAIN_MATCH_STEP=1.0`` A/B's the old teacher.
     gain_match_step: float = 0.0
+    # P61: cube-clip held FD a/dv to ``[-1, 1]`` and reverse the per-start
+    # step if clip would shrink ``|Δu|`` (step-settle reverse-before-reclip;
+    # TM ``compute_transfer_matrix`` skip-noop + realized ΔMV).  Huber
+    # divides by the *applied* Δu, not the commanded step.  Identity when
+    # rest+step is interior (test_sim 0.6+0.4 sits on the cube edge;
+    # ``op_band+step>1`` on other plants used to silently deflate G).
+    # ``DREAMER_GAIN_MATCH_CLIP_REALIZED=0`` restores P60 commanded-step.
+    gain_match_clip_realized: bool = True
     # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
     # (``(g-tgt)/|tgt|``) gave the subdominant DV ~5× the MV gradient and
     # exploded full-BPTT at P1 iter 50 — the A/B path was removed, not
@@ -4228,6 +4236,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
+        f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
         f"gmatch_rest_L={_gain_match_rest_window(cfg)[1]} "
         f"gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph', True))} "
@@ -6892,7 +6901,8 @@ def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
 
 def _smooth_l1_gain_match(
         pred: torch.Tensor, tgt: torch.Tensor, beta: float = 1.0,
-        per_input: bool = False) -> torch.Tensor:
+        per_input: bool = False,
+        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Gain-match Huber on ``G = ΔCV/Δu``.
 
     ``per_input=False``: ``F.smooth_l1_loss`` with scalar ``beta`` (P26
@@ -6901,15 +6911,23 @@ def _smooth_l1_gain_match(
     ``|e|-0.5β``.  L1 saturation is still ±1 per element — **not**
     relative Huber (P27 divides the residual by |tgt| before Huber, so
     the L1 grad is 1/|tgt|).  Mean reduction matches ``smooth_l1_loss``.
+    ``mask`` (broadcast to ``pred``): drop no-op starts whose realized
+    ``|Δu|`` is ~0 after cube-clip (P61).  ``None`` = all valid.
     """
-    if not per_input:
-        return F.smooth_l1_loss(pred, tgt, beta=max(1e-6, float(beta)))
-    e = pred - tgt
-    b = tgt.abs().clamp_min(1e-6)
-    abs_e = e.abs()
-    quadratic = 0.5 * e.square() / b
-    linear = abs_e - 0.5 * b
-    return torch.where(abs_e < b, quadratic, linear).mean()
+    if per_input:
+        e = pred - tgt
+        b = tgt.abs().clamp_min(1e-6)
+        abs_e = e.abs()
+        quadratic = 0.5 * e.square() / b
+        linear = abs_e - 0.5 * b
+        el = torch.where(abs_e < b, quadratic, linear)
+    else:
+        el = F.smooth_l1_loss(
+            pred, tgt, beta=max(1e-6, float(beta)), reduction='none')
+    if mask is None:
+        return el.mean()
+    w = mask.to(dtype=el.dtype).expand_as(el)
+    return (el * w).sum() / w.sum().clamp_min(1.0)
 
 
 def _gain_match_tgt_tensor(g_wm: torch.Tensor, tgts, owner=None):
@@ -6960,17 +6978,65 @@ def _gain_match_pred_over_tgt(
     return torch.where(ok, g_wm / den, torch.zeros_like(g_wm)).sum() / n
 
 
+def _cube_step_held(
+        base: torch.Tensor, n_ch: int, step: float,
+        lo: float = -1.0, hi: float = 1.0) -> torch.Tensor:
+    """One cube-clipped (or reversed) unit step per channel.
+
+    ``base`` is ``(Bm, D)``.  Returns ``(n_ch, Bm, D)``.  Tries ``+step``
+    on channel ``j`` then ``clamp(lo, hi)``; if that shrinks ``|Δ|``
+    below the commanded ``|step|``, uses ``−step`` (step-settle
+    reverse-before-reclip; TM skip-noop).  ``n_ch==0`` → empty.
+    """
+    Bm, D = base.shape
+    n_ch = int(n_ch)
+    if n_ch <= 0:
+        return base.new_zeros(0, Bm, D)
+    idx = torch.arange(n_ch, device=base.device)
+    eye = base.new_zeros(n_ch, D)
+    eye[idx, idx] = 1.0
+    delta = float(step) * eye
+    plus = (base.unsqueeze(0) + delta.unsqueeze(1)).clamp(lo, hi)
+    minus = (base.unsqueeze(0) - delta.unsqueeze(1)).clamp(lo, hi)
+    r_plus = plus[idx, :, idx] - base[:, idx].transpose(0, 1)
+    use_minus = r_plus.abs() + 1e-6 < abs(float(step))
+    return torch.where(use_minus.unsqueeze(-1), minus, plus)
+
+
 def _gain_match_fd_held(
         a_base: torch.Tensor, dv0: Optional[torch.Tensor],
-        n_mv: int, n_dv: int, step: float
+        n_mv: int, n_dv: int, step: float,
+        *, clip_realized: bool = False,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Baseline + one unit step per MV then per DV (broadcast, no clone-loop).
 
     ``a_held`` is ``(1+n_mv+n_dv, Bm, A)``; ``dv_held`` is the same layout
     or ``None`` when the plant has no DV.  Identity with stacking
     ``[a_base, a_base+e_j, …]`` / ``[dv0, dv0, …, dv0+e_k]``.
+
+    ``clip_realized`` (P61): clamp held a/dv to ``[-1, 1]`` and reverse
+    a per-start step that the cube would shrink.  Off = P60 commanded
+    (no clamp; may leave the cube).
     """
-    n_rolls = 1 + int(n_mv) + int(n_dv)
+    n_mv = int(n_mv)
+    n_dv = int(n_dv)
+    if clip_realized:
+        a_parts = [a_base.unsqueeze(0)]
+        if n_mv:
+            a_parts.append(_cube_step_held(a_base, n_mv, step))
+        if n_dv:
+            a_parts.append(a_base.unsqueeze(0).expand(n_dv, -1, -1).contiguous())
+        a_held = torch.cat(a_parts, dim=0)
+        if dv0 is None:
+            return a_held, None
+        dv_parts = [dv0.unsqueeze(0)]
+        if n_mv:
+            dv_parts.append(
+                dv0.unsqueeze(0).expand(n_mv, -1, -1).contiguous())
+        if n_dv:
+            dv_parts.append(_cube_step_held(dv0, n_dv, step))
+        return a_held, torch.cat(dv_parts, dim=0)
+    n_rolls = 1 + n_mv + n_dv
     da = a_base.new_zeros(n_rolls, a_base.shape[-1])
     if n_mv:
         _i = torch.arange(n_mv, device=a_base.device)
@@ -6985,23 +7051,53 @@ def _gain_match_fd_held(
     return a_held, dv0.unsqueeze(0) + dd.unsqueeze(1)
 
 
+def _gain_match_realized_du(
+        a_held: torch.Tensor, dv_held: Optional[torch.Tensor],
+        n_mv: int, n_dv: int) -> torch.Tensor:
+    """Signed applied Δu of each FD roll vs baseline row 0.  ``(n_in, Bm)``.
+
+    TM ``compute_transfer_matrix`` divides ΔCV by realized ΔMV, not the
+    commanded step (p136).  Unclipped ``a_base+step`` → identity ``step``.
+    """
+    n_mv = int(n_mv)
+    n_dv = int(n_dv)
+    Bm = a_held.shape[1]
+    parts = []
+    if n_mv:
+        # roll ``1+j`` steps channel ``j``.  Diagonal (not ``stack`` of
+        # mismatched advanced-index shapes): ``n_mv=1`` used to
+        # broadcast ``(1,Bm)-(Bm,1)`` → ``(Bm,Bm)``.
+        stepped = a_held[1:1 + n_mv, :, :n_mv]
+        du_mv = stepped.diagonal(dim1=0, dim2=2).transpose(0, 1)
+        parts.append(du_mv - a_held[0, :, :n_mv].transpose(0, 1))
+    if n_dv and dv_held is not None:
+        stepped = dv_held[1 + n_mv:1 + n_mv + n_dv, :, :n_dv]
+        du_dv = stepped.diagonal(dim1=0, dim2=2).transpose(0, 1)
+        parts.append(du_dv - dv_held[0, :, :n_dv].transpose(0, 1))
+    if not parts:
+        return a_held.new_zeros(0, Bm)
+    return torch.cat(parts, dim=0)
+
+
 def _gain_match_fd_action_seq(
         a_base: torch.Tensor, dv0: Optional[torch.Tensor],
         n_mv: int, n_dv: int, step: float, K: int, Bm: int,
         *, cache_owner=None, cache_key=None,
+        clip_realized: bool = False,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Held FD actions expanded to ``(n_rolls·Bm, K, *)``.
 
     Rest-IC ``a_base``/``dv0`` are the last rest frame (static).  Cache
     when ``cache_key`` is set.  PRBS-posterior starts change every
     batch — leave ``cache_key=None``.  Dropped with the rest-IC graph
-    at g freeze.
+    at g freeze.  ``clip_realized`` is part of the cache key (caller).
     """
     if cache_owner is not None and cache_key is not None:
         cached = getattr(cache_owner, '_gain_match_fd_seq', None)
         if cached is not None and cached[0] == cache_key:
             return cached[1], cached[2]
-    a_held, dv_held = _gain_match_fd_held(a_base, dv0, n_mv, n_dv, step)
+    a_held, dv_held = _gain_match_fd_held(
+        a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized)
     n_rolls = int(a_held.shape[0])
     a_seq = (a_held.unsqueeze(2)
              .expand(n_rolls, Bm, K, a_held.shape[-1])
@@ -7828,17 +7924,23 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # into smooth_l1.  P43: per-input β = |tgt_ij| (L1 sat still ±1).
     _hb = max(1e-6, float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 1.0))
     _per = bool(getattr(cfg, 'gain_match_huber_per_input', False))
+    _clip = _cfg_on(cfg, 'gain_match_clip_realized', True)
 
-    def _huber_from_cv(cv_base, cv_step_stack, tgts):
+    def _huber_from_cv(cv_base, cv_step_stack, tgts, du_in):
         # ``cv_step_stack`` (n_in, Bm, n_cv).  One mean Huber ≡ mean of
         # per-input means (equal Bm×n_cv).  P27 relative scale is gone.
+        # P61: divide by realized Δu (TM p136), mask cube no-ops.
         if not tgts:
             return zero
-        g_wm = (cv_step_stack - cv_base) / step
+        den = du_in.unsqueeze(-1)
+        ok = den.abs() >= 1e-6
+        g_wm = (cv_step_stack - cv_base) / torch.where(
+            ok, den, torch.ones_like(den))
         tgt = _gain_match_tgt_tensor(g_wm, tgts, cfg)
         tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
                          g_wm.shape[-1]).expand_as(g_wm)
-        return _smooth_l1_gain_match(g_wm, tgt_b, beta=_hb, per_input=_per)
+        return _smooth_l1_gain_match(
+            g_wm, tgt_b, beta=_hb, per_input=_per, mask=ok)
 
     # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
     # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
@@ -7861,10 +7963,16 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                 int(K), int(Bm), str(a_base.device), str(a_base.dtype),
                 int(a_base.shape[-1]),
                 0 if dv0 is None else int(dv0.shape[-1]),
+                int(bool(_clip)),
             )
     a_seq, dv_seq = _gain_match_fd_action_seq(
         a_base, dv0, n_mv_t, n_dv_t, step, K, Bm,
-        cache_owner=cache_owner, cache_key=cache_key)
+        cache_owner=cache_owner, cache_key=cache_key,
+        clip_realized=_clip)
+    du = _gain_match_realized_du(
+        a_seq[:, 0].view(n_rolls, Bm, -1),
+        None if dv_seq is None else dv_seq[:, 0].view(n_rolls, Bm, -1),
+        n_mv_t, n_dv_t)
 
     def _repeat_starts(t):
         return (t.unsqueeze(0).expand(n_rolls, *t.shape)
@@ -7884,7 +7992,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     cv_base = cv_last[0]
     cv_steps = cv_last[1:]
     total = _huber_from_cv(
-        cv_base, cv_steps, list(mv_tgts) + list(dv_tgts))
+        cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
     loss = total
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
@@ -7894,15 +8002,20 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # rest-step miss the way P43 jsonl did.
     with torch.no_grad():
         if bool(getattr(cfg, '_wm_need_logged_aux', True)):
-            g_all = (cv_steps - cv_base) / step
+            den = du.unsqueeze(-1)
+            ok = den.abs() >= 1e-6
+            g_all = (cv_steps - cv_base) / torch.where(
+                ok, den, torch.ones_like(den))
+            diag['gain_match_du_frac'] = (
+                du.abs().mean() / max(abs(float(step)), 1e-6))
             if n_mv_t:
                 diag['gain_match_mv_loss'] = _huber_from_cv(
-                    cv_base, cv_steps[:n_mv_t], mv_tgts)
+                    cv_base, cv_steps[:n_mv_t], mv_tgts, du[:n_mv_t])
                 diag['gain_match_mv_ratio'] = _gain_match_pred_over_tgt(
                     g_all[:n_mv_t], mv_tgts, cfg)
             if dv_tgts:
                 diag['gain_match_dv_loss'] = _huber_from_cv(
-                    cv_base, cv_steps[n_mv_t:], dv_tgts)
+                    cv_base, cv_steps[n_mv_t:], dv_tgts, du[n_mv_t:])
                 diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
                     g_all[n_mv_t:], dv_tgts, cfg)
     return loss, diag
@@ -8221,6 +8334,7 @@ def _resolve_gain_match_targets(
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
           f'len={cfg.gain_match_len} settle={cfg.gain_match_settle_len} '
           f'step={cfg.gain_match_step:g} '
+          f'clip_realized={bool(getattr(cfg, "gain_match_clip_realized", True))} '
           f'huber_beta={cfg.gain_match_huber_beta} '
           f'huber_per_input={_per} '
           f'huber_beta_mv={["%.3g" % x for x in _beta_mv]} '
@@ -13854,6 +13968,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_dv_ratio' in row:
                 row.setdefault('wm_gain_match_dv_ratio',
                             row['gain_match_dv_ratio'])
+            if 'gain_match_du_frac' in row:
+                row.setdefault('wm_gain_match_du_frac',
+                            row['gain_match_du_frac'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)

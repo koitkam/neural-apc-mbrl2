@@ -913,6 +913,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # ``<=0`` auto = ``wm_tf_step_frac`` (P60; P59 teacher Δu=1 vs TM 0.4).
     # Explicit ``=1.0`` A/B's the old teacher.
     'DREAMER_GAIN_MATCH_STEP':            ('gain_match_step',                float),
+    # P61: cube-clip + reverse-if-shrunk; Huber uses realized Δu.
+    # ``=0`` restores P60 commanded-step (may leave the cube).
+    'DREAMER_GAIN_MATCH_CLIP_REALIZED':   ('gain_match_clip_realized',       _as_bool),
     'DREAMER_GAIN_MATCH_HUBER_BETA':      ('gain_match_huber_beta',          float),
     # P43: per-element Huber β = |tgt_ij| (L1 sat ±1; not relative Huber).
     'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': ('gain_match_huber_per_input',     _as_bool),

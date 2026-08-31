@@ -65,6 +65,7 @@ from training.train import (
                             _replay_h2d_keys,
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_fd_action_seq,
+                            _gain_match_realized_du, _cube_step_held,
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
@@ -244,6 +245,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _tc.gain_match_huber_per_input is True
     assert int(_tc.gain_match_settle_len) == -1
     assert abs(float(_tc.gain_match_step) - 0.0) < 1e-12
+    assert _tc.gain_match_clip_realized is True
     assert _tc.gain_match_rest_ic is True
     assert int(_tc.gain_match_rest_ic_len) == 0
     assert _tc.gain_match_rest_ic_cuda_graph is True
@@ -293,6 +295,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _src = open('training/train.py').read()
     assert 'gain_match_step: float = 0.0' in _src
     assert 'def _resolve_gain_match_step' in _src
+    assert 'gain_match_clip_realized: bool = True' in _src
     print('[smoke] OK  gain_match_step sentinel 0 auto=wm_tf_step_frac; explicit 1.0 kept')
 
     # P28 follow-up 3: skip-storm restores last healthy P1 step, not wm_best.
@@ -820,6 +823,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_STEP_TEST_INJECT_N': '7',
         'DREAMER_WM_ISOLATION_DCV_MATCH': '0',
         'DREAMER_GAIN_MATCH_HUBER_PER_INPUT': '0',
+        'DREAMER_GAIN_MATCH_CLIP_REALIZED': '0',
         'DREAMER_GAIN_MATCH_SETTLE_LEN': '55',
         'DREAMER_GAIN_MATCH_REST_IC': '1',
         'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH': '0',
@@ -919,6 +923,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert int(cfg.step_test_inject_n) == 7
         assert cfg.wm_isolation_dcv_match is False
         assert cfg.gain_match_huber_per_input is False
+        assert cfg.gain_match_clip_realized is False
         assert int(cfg.gain_match_settle_len) == 55
         assert cfg.gain_match_rest_ic is True
         assert cfg.gain_match_rest_ic_cuda_graph is False
@@ -1080,6 +1085,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'dv_prbs_seed_episodes' in explicit
         assert 'gain_match_rest_ic_cuda_graph' in explicit
         assert 'gain_match_rest_ic_len' in explicit
+        assert 'gain_match_clip_realized' in explicit
         print('[smoke] OK  _cfg_from_env applies ENV_OVERRIDES (aux TBPTT / skip-storm / N)')
     finally:
         for k, old in prev.items():
@@ -1703,6 +1709,12 @@ def _test_isolation_dcv_scales() -> None:
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
+    assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
+    assert "gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized'" in _src
+    assert '_cube_step_held' in _src
+    assert '_gain_match_realized_du' in _src
+    assert 'gain_match_du_frac' in _src
+    assert 'wm_gain_match_du_frac' in _src
     assert "gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic'" in _src
     assert 'gmatch_rest_L=' in _src
     assert "gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph'" in _src
@@ -1987,6 +1999,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.gain_match_huber_per_input is True
     assert float(c.gain_match_huber_beta) == 1.0
     assert int(c.gain_match_settle_len) == -1
+    assert c.gain_match_clip_realized is True
     assert c.gain_match_rest_ic is True
     assert int(c.gain_match_rest_ic_len) == 0
     assert c.gain_match_rest_ic_cuda_graph is True
@@ -2185,6 +2198,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_ACTOR_KL_COEF' not in ENV_OVERRIDES
     assert not hasattr(c, 'actor_kl_coef')
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
+    assert 'DREAMER_GAIN_MATCH_CLIP_REALIZED' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
     assert not hasattr(c, 'wm_isolation_var_norm')
     assert c.wm_isolation_dcv_match is True
@@ -2690,6 +2704,48 @@ def _test_gain_match_fd_held() -> None:
     assert torch.allclose(a1[0], a_base[:, :1])
     assert torch.allclose(a1[1, :, 0], a_base[:, 0] + step)
     print('[smoke] OK  gain-match FD held stack (broadcast ≡ clone-loop)')
+
+
+def _test_gain_match_clip_realized() -> None:
+    """P61: interior rest+step is identity; rail reverses; Huber uses |Δu|."""
+    torch.manual_seed(0)
+    Bm, n_mv, n_dv, step = 4, 1, 1, 0.4
+    a_int = torch.linspace(-0.5, 0.5, Bm).unsqueeze(-1)
+    dv_int = torch.linspace(-0.3, 0.3, Bm).unsqueeze(-1)
+    raw_a, raw_dv = _gain_match_fd_held(
+        a_int, dv_int, n_mv, n_dv, step, clip_realized=False)
+    clip_a, clip_dv = _gain_match_fd_held(
+        a_int, dv_int, n_mv, n_dv, step, clip_realized=True)
+    assert torch.allclose(raw_a, clip_a), (raw_a - clip_a).abs().max()
+    assert torch.allclose(raw_dv, clip_dv), (raw_dv - clip_dv).abs().max()
+    du = _gain_match_realized_du(clip_a, clip_dv, n_mv, n_dv)
+    assert du.shape == (n_mv + n_dv, Bm), du.shape
+    assert torch.allclose(du, torch.full_like(du, step)), du
+    # MIMO: cat (n_mv,Bm)+(n_dv,Bm), not stack (only works n_mv==n_dv).
+    a2 = torch.linspace(-0.4, 0.4, Bm).unsqueeze(-1).expand(Bm, 2).contiguous()
+    dv1 = torch.linspace(-0.2, 0.2, Bm).unsqueeze(-1)
+    held_m, held_d = _gain_match_fd_held(
+        a2, dv1, 2, 1, step, clip_realized=True)
+    du_m = _gain_match_realized_du(held_m, held_d, 2, 1)
+    assert du_m.shape == (3, Bm), du_m.shape
+    assert torch.allclose(du_m, torch.full_like(du_m, step)), du_m
+    a_rail = torch.full((Bm, 1), 0.9)
+    dv_rail = torch.full((Bm, 1), 0.85)
+    held_a, held_dv = _gain_match_fd_held(
+        a_rail, dv_rail, n_mv, n_dv, step, clip_realized=True)
+    # +0.4 from 0.9 would clip to 1.0 (Δ=0.1); reverse → 0.5 (Δ=-0.4).
+    assert torch.allclose(held_a[1, :, 0], torch.full((Bm,), 0.5))
+    assert torch.allclose(held_dv[2, :, 0], torch.full((Bm,), 0.45))
+    du_r = _gain_match_realized_du(held_a, held_dv, n_mv, n_dv)
+    assert torch.allclose(du_r.abs(), torch.full_like(du_r, step)), du_r
+    assert float((du_r < 0).all()) == 1.0
+    raw_rail_a, _ = _gain_match_fd_held(
+        a_rail, dv_rail, n_mv, n_dv, step, clip_realized=False)
+    assert float(raw_rail_a[1, :, 0].max()) > 1.0
+    rows = _cube_step_held(a_rail, 1, step)
+    assert rows.shape == (1, Bm, 1)
+    assert torch.allclose(rows[0, :, 0], torch.full((Bm,), 0.5))
+    print('[smoke] OK  gain-match clip+realized (interior identity; rail reverse)')
 
 
 def _test_gain_match_fd_action_seq() -> None:
@@ -4251,6 +4307,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
+    assert 'gmatch_clip=True' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
     assert 'gmatch_rest_L=' in banner, banner
     assert 'gmatch_rest_cg=True' in banner, banner
@@ -4525,6 +4582,7 @@ if __name__ == '__main__':
     _test_gain_match_per_input_huber()
     _test_gain_match_pred_over_tgt()
     _test_gain_match_fd_held()
+    _test_gain_match_clip_realized()
     _test_gain_match_fd_action_seq()
     _test_gain_match_held_settle()
     _test_gain_match_rest_window()
