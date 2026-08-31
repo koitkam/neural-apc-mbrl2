@@ -28,6 +28,7 @@ from training.train import (
                             _resolve_aux_tbptt_steps, _buffer_lap_iters,
                             _resolve_inject_cadence, _cfg_from_env,
                             _CLI_ONLY_ENV, _recon_channel_weights,
+                            _cached_arange_1k, _overshoot_tail_wk,
                             _resolve_baseline_seed_op_band, _cfg_or_env,
                             _cfg_or_env_float, _resolve_policy_sigma_bounds,
                             collect_episode, collect_prbs_episode,
@@ -1102,7 +1103,27 @@ def _test_recon_channel_weights_cache() -> None:
     src = Path(__file__).resolve().parents[1].joinpath('training', 'train.py')
     text = src.read_text()
     assert "getattr(cfg, 'wm_overshoot_tail_power', 2.0)" in text
-    print('[smoke] OK  recon channel weights cache identity; tail_power fallback 2.0')
+    assert 'def _cached_arange_1k' in text
+    assert 'k_off = torch.arange(1, K + 1' not in text
+    cfg_idx = TrainConfig()
+    k1 = _cached_arange_1k(cfg_idx, 8, torch.device('cpu'))
+    k2 = _cached_arange_1k(cfg_idx, 8, torch.device('cpu'))
+    assert k1 is k2
+    assert torch.equal(k1, torch.arange(1, 9))
+    k3 = _cached_arange_1k(cfg_idx, 5, torch.device('cpu'))
+    assert k3 is not k1 and k3.numel() == 5
+    cfg_idx.wm_overshoot_tail_power = 2.0
+    wk1 = _overshoot_tail_wk(cfg_idx, 8, torch.device('cpu'), torch.float32)
+    wk2 = _overshoot_tail_wk(cfg_idx, 8, torch.device('cpu'), torch.float32)
+    assert wk1 is wk2
+    k_idx = torch.arange(1, 9, dtype=torch.float32)
+    expected_wk = (k_idx / 8.0) ** 2.0
+    assert torch.allclose(wk1, expected_wk)
+    cfg_idx.wm_overshoot_tail_power = 0.0
+    cfg_idx._overshoot_wk = None
+    wk0 = _overshoot_tail_wk(cfg_idx, 8, torch.device('cpu'), torch.float32)
+    assert torch.allclose(wk0, torch.ones(8))
+    print('[smoke] OK  recon channel weights cache identity; tail_power fallback 2.0; overshoot arange/wk cache')
 
 
 def _test_cli_only_env_disjoint() -> None:
@@ -1647,6 +1668,9 @@ def _test_isolation_dcv_scales() -> None:
                     _rssm_src.index('class RSSMConfig')]
     assert 'isinstance(store, dict)' in _cz
     assert '_img_zlogits_zeros' in _rssm_src
+    assert 'def _cached_arange_1k' in _src
+    assert 'def _overshoot_tail_wk' in _src
+    assert 'k_off = torch.arange(1, K + 1' not in _src
     assert '_gain_match_fd_action_seq' in _src
     assert 'def _wm_need_logged_aux' in _src
     assert '_wm_need_enc_diag' in _src

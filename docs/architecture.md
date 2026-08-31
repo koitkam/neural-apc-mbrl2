@@ -126,7 +126,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > `t_ac` **1.83 s** vs **3.52 s**. Unfreeze **143** ent **−0.123 HELD**
 > (opened −0.147). rscale **2.35 FREEZE KEEP**. rtgt collapsing
 > (P58-class). HEAD (not in pid): `img_rollout` IC `z_logits` zeros are
-> a shape-dict cache (overshoot/held/gain-match `Bm`; not collect graph).
+> a shape-dict cache; overshoot `arange(1,K)` / tail `wk` reused
+> (overshoot/held/gain-match `Bm`; not collect graph).
 > Do **not** launch a second GPU job. Next GPU after EXIT: compounding
 > (MV) / prior-DV.
 > `derive_horizon` / sim `reset()` now

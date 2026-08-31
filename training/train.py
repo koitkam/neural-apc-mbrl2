@@ -6561,7 +6561,7 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # isolation / actor / transfer-matrix (sample=False), not E[f(c_sampled)].
     c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     # Per-step REAL action + DV sequences for k=1..K (gathered ONCE).
-    k_off = torch.arange(1, K + 1, device=device)                 # (K,)
+    k_off = _cached_arange_1k(cfg, K, device)                     # (K,)
     idx = starts.view(S, 1) + k_off.view(1, K)                    # (S, K) time idx
     a_all = act[:, idx].reshape(Bm, K, -1)                        # (Bm, K, A)
     dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
@@ -6590,20 +6590,15 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     # step fraction), backbone-agnostic.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
     # Vectorized over K (same as the old per-step ``_weighted_recon_mse``
     # loop: mean_{B,S,D} then weighted mean_k).  Eager P30: this was 55
-    # Python MSE calls per WM step.
-    tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 2.0) or 0.0)
+    # Python MSE calls per WM step.  ``k_off`` / ``wk`` are cached (K
+    # is static after auto-tune).
     se = (preds.float() - tgt.float()).pow(2)
     ch_w = _recon_channel_weights(cfg, int(preds.shape[-1]),
                                   preds.device, torch.float32)
     if ch_w is not None:
         se = se * ch_w.view(*([1] * (se.dim() - 1)), -1)
     mse_k = se.mean(dim=(0, 1, 3))                                # (K,)
-    if tail_power > 0.0:
-        k_idx = torch.arange(1, K + 1, device=mse_k.device,
-                             dtype=mse_k.dtype)
-        wk = (k_idx / float(K)) ** tail_power
-    else:
-        wk = torch.ones(K, device=mse_k.device, dtype=mse_k.dtype)
+    wk = _overshoot_tail_wk(cfg, K, mse_k.device, mse_k.dtype)
     loss = (mse_k * wk).sum() / wk.sum().clamp_min(1e-8)
     # Soft recon-fidelity gate: ramp the term in only as 1-step recon converges
     # (early P1 the WM can't predict multi-step; an ungated term would swamp the
@@ -6613,6 +6608,45 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
         gate = torch.clamp(thr / recon_loss.detach().clamp_min(1e-6), max=1.0)
         loss = gate * loss
     return loss, float(S)
+
+
+def _cached_arange_1k(owner, K: int, device, dtype=None,
+                      attr: str = '_arange_1k') -> torch.Tensor:
+    """Reuse ``torch.arange(1, K+1)``. Identity; do not write in-place.
+
+    Overshoot gather + tail weights rebuild this every WM inner (100×/iter).
+    Store is a shape dict: overshoot ``K`` vs isolation ``K`` can differ.
+    """
+    key = (int(K), str(device), 'long' if dtype is None else str(dtype))
+    store = getattr(owner, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(owner, attr, store)
+    t = store.get(key)
+    if t is None:
+        if dtype is None:
+            t = torch.arange(1, int(K) + 1, device=device)
+        else:
+            t = torch.arange(1, int(K) + 1, device=device, dtype=dtype)
+        store[key] = t
+    return t
+
+
+def _overshoot_tail_wk(cfg: 'TrainConfig', K: int, device,
+                       dtype) -> torch.Tensor:
+    """``(k/K)^p`` tail weights. Identity vs rebuild; do not write in-place."""
+    tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 2.0) or 0.0)
+    key = (int(K), float(tail_power), str(device), str(dtype))
+    cached = getattr(cfg, '_overshoot_wk', None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    if tail_power > 0.0:
+        k_idx = _cached_arange_1k(cfg, K, device, dtype)
+        wk = (k_idx / float(K)) ** tail_power
+    else:
+        wk = torch.ones(int(K), device=device, dtype=dtype)
+    cfg._overshoot_wk = (key, wk)  # type: ignore[attr-defined]
+    return wk
 
 
 def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
@@ -7883,7 +7917,7 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
           if rssm.cont_dim > 0 else None)
     cv_idx = rssm.cv_index_t
-    k_off = torch.arange(1, K + 1, device=obs.device)
+    k_off = _cached_arange_1k(cfg, K, obs.device)
     idx = starts.view(S, 1) + k_off.view(1, K)                # (S, K) time idx
     a_all = act[:, idx].reshape(Bm, K, -1)                     # (Bm, K, A)
     dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
