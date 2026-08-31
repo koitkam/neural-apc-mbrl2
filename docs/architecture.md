@@ -98,10 +98,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > one-shot AccumulateGrad stream-mismatch warn. Rest-IC FD `a_seq` is
 > cached; encoder-var / Huber MV–DV jsonl run on the last logged
 > inner only; P1 H2D is `obs`/`act` (and `dist` only if
-> `_wm_need_dist_target`) except MTP last. RSSM/TSSM T/K loops
-> `_time_unbind` once; Stage-1 `d_t≡0` reuses `cached_zeros_btd`.
-> P57 LIVE P1 iter **64**: skip-storm **1/2 @41** recovered; last_ok
-> **64** unlocked; `t_wm` median **99 s**. HEAD
+> `_wm_need_dist_target`) except MTP last. P2/P3 skip leftover
+> `cont`; P3 also skips `dist` (`_replay_h2d_keys`; frozen observer
+> re-encodes from `obs`; P2 still copies `dist` for dob-ground).
+> RSSM/TSSM T/K loops `_time_unbind` once; Stage-1 `d_t≡0` reuses
+> `cached_zeros_btd`. P57 LIVE **P3**: GAIN-READY **0.89@DV** @82;
+> last_ok **82**; graph **captured** then **released**; `t_wm` P1
+> **99 s** / P2 **22.6 s**. Unfreeze 147 ent **−0.101 HELD**. rscale
+> **2.35 KEEP**. Encode L PARTIAL until EXIT+val TM. HEAD
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig

@@ -3866,10 +3866,11 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device,
     same pinned page.  Host-adaptive: CPU path is a contiguous copy
     (no pin).  Identity values.
 
-    ``keys`` copies only those names that exist in ``batch_np`` (P1 WM
-    needs ``obs``/``act`` and ``dist`` only when
-    ``_wm_need_dist_target``; skip ``rew``/``expert`` except the last
-    logged inner when MTP is in the graph).  ``None`` = all keys.
+    ``keys`` copies only those names that exist in ``batch_np``.
+    ``_replay_h2d_keys`` / ``_p1_wm_h2d_keys`` pick the inner-graph
+    subset (never leftover ``cont``; ``dist`` only when the WM indexes
+    it; ``rew``/``expert`` when MTP / P3 AC is in the graph).
+    ``None`` = all keys.
     """
     out: Dict[str, torch.Tensor] = {}
     cuda = device.type == 'cuda'
@@ -4072,15 +4073,33 @@ def _wm_need_dist_target(model, cfg: 'TrainConfig') -> bool:
     return False
 
 
+def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool
+                     ) -> Tuple[str, ...]:
+    """Replay H2D names the inner graph actually indexes.
+
+    ``TrajectoryBuffer.sample`` still returns leftover ``cont`` (Dreamer
+    continuation flag).  ``world_model_loss`` / ``agent_finetune_loss`` /
+    ``_realsim_actor_critic_step`` never read it (λ-returns ignore
+    terminals inside a window).  Skip it every phase.  ``dist`` only when
+    ``_wm_need_dist_target`` (P2 dob-ground).  P3 observer re-encodes
+    from ``obs`` so ``dist`` stays off.  ``rew``/``expert`` when MTP or
+    P3 AC is in the graph.
+    """
+    keys: List[str] = ['obs', 'act']
+    if need_dist:
+        keys.append('dist')
+    if need_rew_expert:
+        keys.extend(('rew', 'expert'))
+    return tuple(keys)
+
+
 def _p1_wm_h2d_keys(need_dist: bool) -> Tuple[str, ...]:
     """P1 WM H2D names when MTP is not in the graph.
 
     ``rew``/``expert`` stay off (paper ``reward_scale_loss_p1=0``).
     ``dist`` only when ``_wm_need_dist_target``.
     """
-    if need_dist:
-        return ('obs', 'act', 'dist')
-    return ('obs', 'act')
+    return _replay_h2d_keys(need_dist, need_rew_expert=False)
 
 
 def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
@@ -12939,8 +12958,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _will_log = ((int(total_iters) + 1) % _log_every == 0)
         p1_rmtp_weight = (0.0 if diag_disable_reward_mtp_in_p1
                           else float(cfg.reward_scale_loss_p1))
-        _p1_need_dist = (current_phase == 1
-                         and _wm_need_dist_target(model, cfg))
+        _need_dist = _wm_need_dist_target(model, cfg)
+        _p1_need_dist = (current_phase == 1 and _need_dist)
         for _i in range(n_inner):
             _t = time.time()
             # mbrl2 real-sim: P3 actor-critic REINFORCE is ON-POLICY — sample the
@@ -12958,16 +12977,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                          else _wm_train_seq_len(cfg))
             batch_np = _src_buf.sample(cfg.batch_size, _sample_T, rng)
             # jsonl / banner use the last inner of a logged iter.  Skip
-            # encoder-var / Huber MV-DV splits / unused P1 H2D on the
-            # other 99 inner steps (objective unchanged).
+            # encoder-var / Huber MV-DV splits / unused replay H2D on the
+            # other inner steps (objective unchanged).  Leftover ``cont``
+            # is never indexed; P3 also skips ``dist``.
             _need_aux = _wm_need_logged_aux(_will_log, _i, n_inner)
             cfg._wm_need_logged_aux = _need_aux  # type: ignore[attr-defined]
             cfg._wm_need_enc_diag = _need_aux  # type: ignore[attr-defined]
             _p1_mtp = (current_phase == 1 and _p1_need_agent_finetune(
                 p1_rmtp_weight, _will_log, _i, n_inner))
-            _h2d_keys = None
             if current_phase == 1 and not _p1_mtp:
                 _h2d_keys = _p1_wm_h2d_keys(_p1_need_dist)
+            elif current_phase == 3:
+                _h2d_keys = _replay_h2d_keys(False, True)
+            else:
+                # P1 last logged inner (MTP) and all P2 inners.
+                _h2d_keys = _replay_h2d_keys(
+                    _p1_need_dist if current_phase == 1 else _need_dist,
+                    True)
             batch = _batch_np_to_device(batch_np, device, keys=_h2d_keys)
             t_sample_acc += time.time() - _t
 
@@ -13232,7 +13258,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # NB: do NOT reuse ``_t`` here — it is the AC-step
                     # wall-clock timer (``_t = time.time()`` above).
                     _critic_batch = _batch_np_to_device(
-                        _cb_np, device, slot='critic')
+                        _cb_np, device, slot='critic',
+                        keys=_replay_h2d_keys(False, True))
                 # P83 FIX (p19 RCA): P3 expert-BC anchor weight — decay
                 # expert_bc_scale·(1→floor) across P3 so the actor starts pinned to
                 # the good BC-seeded policy and is progressively released to let

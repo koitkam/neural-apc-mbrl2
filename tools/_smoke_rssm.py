@@ -58,6 +58,7 @@ from training.train import (
                             _p1_need_agent_finetune,
                             _wm_need_logged_aux,
                             _wm_need_dist_target, _p1_wm_h2d_keys,
+                            _replay_h2d_keys,
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_fd_action_seq,
                             _gain_match_state_from_feat,
@@ -1152,6 +1153,9 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     c.disturbance_loss_scale = 1.0
     assert _wm_need_dist_target(m, c) is False
     assert _p1_wm_h2d_keys(_wm_need_dist_target(m, c)) == ('obs', 'act')
+    assert _replay_h2d_keys(False, True) == ('obs', 'act', 'rew', 'expert')
+    assert _replay_h2d_keys(True, True) == (
+        'obs', 'act', 'dist', 'rew', 'expert')
     m.dynamics.dob_active = True
     assert _wm_need_dist_target(m, c) is True
     assert 'dist' in _p1_wm_h2d_keys(True)
@@ -1464,8 +1468,11 @@ def _test_isolation_dcv_scales() -> None:
     assert '_wm_need_enc_diag' in _src
     assert 'def _wm_need_dist_target' in _src
     assert 'def _p1_wm_h2d_keys' in _src
+    assert 'def _replay_h2d_keys' in _src
     assert '_h2d_keys = _p1_wm_h2d_keys' in _src
     assert "_h2d_keys = ('obs', 'act', 'dist')" not in _src
+    assert '_h2d_keys = None' not in _src
+    assert '_replay_h2d_keys(False, True)' in _src
     assert '_cache_gain_match_rest_ic' in _src
     assert 'reset_policy_exploration' in _src
     assert 'reset_policy_exploration(opt_actor)' in _src
