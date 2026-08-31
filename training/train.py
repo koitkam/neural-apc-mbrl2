@@ -960,7 +960,11 @@ class TrainConfig:
     # kv-cache grows).  Capture is warmed **outside** the P1 WM autocast
     # loop; in-loop never captures (P55: parent autocast cache rejected
     # ``make_graphed_callables`` and ``_rest_ic_cg_fail`` pinned eager
-    # ``t_wm`` ~127 s).  Capture-fail / CPU / low VRAM → eager Python loop.
+    # ``t_wm`` ~127 s).  The graphed callable is ``_RestICGraphModule``
+    # so RSSM params are on the backward surface (P56: a nested function
+    # had empty ``parameters()`` → ``grad requires non-empty inputs``,
+    # then ``requires_grad`` copies would still drop GRU grads).
+    # Capture-fail / CPU / low VRAM → eager Python loop.
     # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.
     gain_match_rest_ic_cuda_graph: bool = True
     gain_match_max_starts: int = 6
@@ -6799,6 +6803,33 @@ def _rssm_param_grad_restore(snap) -> None:
         p.grad = g
 
 
+class _RestICGraphModule(torch.nn.Module):
+    """Adapter so ``make_graphed_callables`` records RSSM param backward.
+
+    A nested function has empty ``parameters()``, so the capture
+    ``autograd.grad`` input surface is only ``sample_args``.  P56 warmup
+    (pid **110246**): those copies lacked ``requires_grad`` →
+    ``ValueError: grad requires non-empty inputs`` and
+    ``_rest_ic_cg_fail`` pinned the eager T-loop (``t_wm`` ~123 s).
+    Marking copies ``requires_grad_(True)`` would un-empty that list
+    but still omit GRU params from the recorded backward (canary
+    ``gru_g==0`` → eager).  This Module surfaces
+    ``rssm.parameters()`` without re-parenting ``model.dynamics``.
+    Last-only encode skips prior/decoder; capture uses
+    ``allow_unused_input=True``.
+    """
+
+    def __init__(self, rssm):
+        super().__init__()
+        object.__setattr__(self, '_rssm', rssm)
+
+    def parameters(self, recurse: bool = True):
+        return self._rssm.parameters(recurse=recurse)
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor):
+        return _rest_ic_last_tensors(self._rssm, obs, act)
+
+
 def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
     """Capture full-BPTT rest-IC; None → eager.  Do not use raw CUDAGraph."""
     try:
@@ -6811,9 +6842,7 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
     except Exception:
         pass
 
-    def _fn(o, a):
-        return _rest_ic_last_tensors(rssm, o, a)
-
+    wrapper = _RestICGraphModule(rssm)
     try:
         # Eager WM steps run inside bf16 autocast (cache_enabled=True).
         # ``make_graphed_callables`` rejects autocast cache (P55 first
@@ -6824,20 +6853,19 @@ def _capture_rest_ic_cuda_graph(rssm, obs: torch.Tensor, act: torch.Tensor):
         # the recorded kernels match the training WM step.  Fail still
         # falls back to the eager T-loop.
         #
-        # P56 warmup (autocast-exit already on): a nested function's
-        # sample_args (obs/act) do not ``requires_grad``, so capture
-        # called ``autograd.grad(..., inputs=())`` → ValueError
-        # ``grad requires non-empty inputs``.  Detach+requires_grad
-        # on *copies* so capture has grad inputs; replay still copies
-        # live rest-IC tensors into the static buffers.
-        o_s = obs.detach().requires_grad_(True)
-        a_s = act.detach().requires_grad_(True)
+        # Do **not** force ``requires_grad`` on obs/act copies: live
+        # rest-IC cache tensors do not require grad, and PyTorch
+        # requires sample_args to match the training loop.  GRU params
+        # come from the Module surface, not from the obs/act leaves.
+        o_s = obs.detach()
+        a_s = act.detach()
         with torch.amp.autocast(device_type=obs.device.type, enabled=False):
             with torch.amp.autocast(
                     device_type=obs.device.type, dtype=torch.bfloat16,
                     enabled=True, cache_enabled=False):
                 graphed = torch.cuda.make_graphed_callables(
-                    _fn, (o_s, a_s), num_warmup_iters=2)
+                    wrapper, (o_s, a_s), num_warmup_iters=2,
+                    allow_unused_input=True)
     except Exception as e:
         print('[gain-match] rest-ic CUDA graph capture failed '
               f'({type(e).__name__}: {e}); eager T-loop', flush=True)
@@ -6976,12 +7004,13 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     ``cont_prior_net``; next GRU input is the posterior).  None if the
     cache is empty.
 
-    CUDA: ``make_graphed_callables`` on the T-loop when
-    ``gain_match_rest_ic_cuda_graph`` (default True), RSSM, T≥8, and
-    capture+GRU-grad canary succeed.  Capture is warmed at train start
-    outside the WM autocast loop (P55 in-loop capture hit autocast
-    cache).  Raw ``CUDAGraph`` has no backward (P25).  TSSM / CPU /
-    capture-fail stay on the Python loop.
+    CUDA: ``make_graphed_callables`` on ``_RestICGraphModule`` wrapping
+    the T-loop when ``gain_match_rest_ic_cuda_graph`` (default True),
+    RSSM, T≥8, and capture+GRU-grad canary succeed.  Capture is warmed
+    at train start outside the WM autocast loop (P55 in-loop capture
+    hit autocast cache).  A nested function is not a graph surface
+    (P56: empty ``parameters()``).  Raw ``CUDAGraph`` has no backward
+    (P25).  TSSM / CPU / capture-fail stay on the Python loop.
 
     Do **not** concat rest rows into the main WM ``rollout_observed``
     (``sample=True``): the GRU would see sampled ``c``, so ``h`` ≠ this

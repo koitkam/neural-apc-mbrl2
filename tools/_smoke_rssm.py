@@ -62,6 +62,7 @@ from training.train import (
                             _gain_match_pred_over_tgt,
                             _gain_match_rest_window, _held_rollout_win,
                             _rest_ic_can_cuda_graph,
+                            _RestICGraphModule, _rest_ic_last_tensors,
                             _warmup_rest_ic_cuda_graph,
                             _release_rest_ic_cuda_graph,
                             _amp_parent_autocast_on,
@@ -1361,7 +1362,10 @@ def _test_isolation_dcv_scales() -> None:
     assert 'make_graphed_callables' in _src
     assert 'cache_enabled=False' in _src
     assert 'enabled=False' in _src
-    assert "o_s = obs.detach().requires_grad_(True)" in _src
+    assert 'class _RestICGraphModule' in _src
+    assert 'allow_unused_input=True' in _src
+    assert "o_s = obs.detach().requires_grad_(True)" not in _src
+    assert 'def _fn(o, a):' not in _src
     assert '_warmup_rest_ic_cuda_graph' in _src
     assert '_amp_parent_autocast_on' in _src
     assert '_cache_gain_match_rest_ic' in _src
@@ -2408,6 +2412,17 @@ def _test_gain_match_rest_ic() -> None:
     assert torch.isfinite(gm3).all() and float(gm3) > 0.0
     print(f'[smoke] OK  rest-ic encode is the FD IC '
           f'(Δloss={abs(float(gm1) - float(gm2)):.4g})')
+    wrap = _RestICGraphModule(model.dynamics)
+    rp = list(model.dynamics.parameters())
+    wp = list(wrap.parameters())
+    assert rp and len(wp) == len(rp)
+    assert all(a is b for a, b in zip(wp, rp))
+    assert wrap is not model.dynamics
+    h, z, c = wrap(rest_o, rest_a)
+    h2, z2, c2 = _rest_ic_last_tensors(model.dynamics, rest_o, rest_a)
+    assert torch.allclose(h, h2) and torch.allclose(z, z2)
+    assert torch.allclose(c, c2)
+    print('[smoke] OK  rest-ic graph module shares RSSM params (no re-parent)')
     # CUDA graph is skipped on CPU (and while a GPU job occupies the A10).
     assert not _rest_ic_can_cuda_graph(model.dynamics, rest_o, cfg)
     _warmup_rest_ic_cuda_graph(model.dynamics, cfg, torch.device('cpu'))

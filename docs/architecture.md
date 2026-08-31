@@ -75,10 +75,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > reuses pinned host + GPU dest per slot. Rest-IC CUDA-graph:
 > P55 pid capture failed (autocast
 > cache) → eager T-loop. **P56 pid** warmup failed
-> (`grad requires non-empty inputs` on function sample_args). HEAD
-> captures **before** the WM autocast loop (exit parent autocast,
-> `cache_enabled=False`), **never captures in-loop**, and capture
-> copies use `requires_grad_(True)`. HEAD
+> (`grad requires non-empty inputs` on a nested function with empty
+> ``parameters()``). HEAD captures **before** the WM autocast loop
+> (exit parent autocast, `cache_enabled=False`), **never captures
+> in-loop**, and graphs `_RestICGraphModule` so RSSM params are on the
+> backward surface (`allow_unused_input=True`). HEAD
 > also **releases** the graph at g freeze (P2/P3 skip gain-match).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -818,12 +819,14 @@ fixes BOTH:
   `DREAMER_GAIN_MATCH_REST_IC=0` reverts to PRBS-posterior FD. Collect
   pairing = TM `_settle_capture` (obs after step). Encode is
   `rollout_observed(..., last_only=True, return_feats=False)` via
-  Stage-1 `_posterior_step`. CUDA: `make_graphed_callables` on that
-  T-loop when `gain_match_rest_ic_cuda_graph` (default True; RSSM
+  Stage-1 `_posterior_step`. CUDA: `make_graphed_callables` on
+  `_RestICGraphModule` wrapping that T-loop when
+  `gain_match_rest_ic_cuda_graph` (default True; RSSM
   only; GRU-grad canary; CPU/TSSM/capture-fail stay eager). Capture is
   warmed at train start **outside** the P1 WM autocast loop (P55
-  in-loop capture hit autocast cache → eager for the whole run). When
-  the rest cache is present, P44 WM-held settle is skipped. Isolation loss
+  in-loop capture hit autocast cache → eager for the whole run). A
+  nested function is not a graph surface (P56: empty `parameters()`).
+  When the rest cache is present, P44 WM-held settle is skipped. Isolation loss
   stays 0. jsonl `*_ratio` =
   mean G_pred/G_tgt. **P46 EXIT:** `p3_reset_log_std` KEEP-AS-OVERRIDE
   (default False). Residual is last Linear (ent −0.101); opening σ
