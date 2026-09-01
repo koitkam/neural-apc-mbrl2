@@ -95,7 +95,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P64 LIVE** (`run_p64_p2amp`, pid **169231**, sha `9544451`): P2 Kalman amp =
 > P3/val cap. P1 **GAIN-READY 0.91@DV** last_ok **82**. P2 `dob_d` **0.063** vs
 > P62 **0.026** (~2.4×); `dobg` **~19×**. P3 @136 PASS; unfreeze 147 ent
-> **−0.101 HELD** rscale **2.02 KEEP**. Watch val pred_std vs 1.93. Dummy jsonl
+> **−0.101 HELD** rscale **2.02 KEEP**; logp_std held ~0.48 after spike.
+> Watch val pred_std vs 1.93. Dummy jsonl
 > `wm_held_ol_ratio` **REMOVED**. `DREAMER_ACT_HIST_REQUIRED` **REMOVED**.
 > Champion **P58** econ / **P53** μ-ratio / **P26** observer.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
