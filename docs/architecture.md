@@ -80,11 +80,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > paired −27 vs −112, loses to P58).
 > **P61 LIVE** (`run_p61_clipdu`, pid **155682**, sha `c4ed6f3`): cube-clip +
 > realized Δu. CONFIRMED `gmatch_clip=True` `gmatch_step=0.4` `device=cuda`.
-> P1 ~iter **50** (~88 min): recon **0.002**, teacher ×0.977/×0.979,
-> `du_frac=1.0`, skip **0/0**, last_ok **50**, `t_wm` ~98 s. Fidelity @50
-> gain_fid **0.794** (P60 0.767). Tracks P60; `clip_frac` is HEAD not this
-> pid. Isolation off. μ-ratio 0.2. Serve graph KEEP. **No second GPU job.**
-> Gate ETA ~19:43. Do not FALSIFY clip until val TM.
+> Storm **2/2 @56–57** CAPPED extra P1. Gate **GAIN-READY** last_ok **55**
+> freeze **0.86@DV** (P60 0.86@DV @77). Healthy P1 teacher ×1 through 55;
+> `du_frac=1.0`. P2 ~iter **88** recon **0.003** dobg **0.006**. Isolation off.
+> μ-ratio 0.2. Serve graph KEEP. **No second GPU job.** Do not FALSIFY clip
+> until val TM / det_r / paired. `clip_frac` is HEAD not this pid.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -139,10 +139,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. KEEP as protocol /
 > FALSIFIED as TM. Val MV ×0.849 DV ×0.767 det_r **−0.095**. Paired
 > **−27 vs −112**. **P61 LIVE** (`run_p61_clipdu`, pid **155682**):
-> cube-clip + realized Δu. CONFIRMED cuda / clip / step 0.4. P1 ~iter **50**
-> teacher ×0.977/×0.979 / `du_frac=1` / skip 0/0 / last_ok 50. Tracks P60.
-> HEAD (not in pid): `clip_frac` jsonl + rest-IC `a_base`/`du` cache.
-> Do **not** launch a second GPU job. Gate ETA ~19:43.
+> cube-clip + realized Δu. Storm **2/2 @56–57** CAPPED extra P1. Gate
+> **GAIN-READY** last_ok **55** freeze **0.86@DV**. P2 ~iter **88** recon
+> **0.003** dobg **0.006**. HEAD (not in pid): `clip_frac` jsonl + rest-IC
+> `a_base`/`du` cache. Do **not** launch a second GPU job. Do not FALSIFY
+> clip until val TM.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
