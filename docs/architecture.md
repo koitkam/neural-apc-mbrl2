@@ -78,13 +78,21 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P60 EXIT** teacher Δu auto = `wm_tf_step_frac` KEEP as protocol /
 > FALSIFIED as TM-closer-to-P26 (val MV ×0.849 DV ×0.767 det_r **−0.095**;
 > paired −27 vs −112, loses to P58).
-> **P61 LIVE** (`run_p61_clipdu`, pid **155682**, sha `c4ed6f3`): cube-clip +
-> realized Δu. CONFIRMED `gmatch_clip=True` `gmatch_step=0.4` `device=cuda`.
-> Storm **2/2 @56–57** CAPPED extra P1. Gate **GAIN-READY** last_ok **55**
-> freeze **0.86@DV** (P60 0.86@DV @77). Healthy P1 teacher ×1 through 55;
-> `du_frac=1.0`. P2 ~iter **88** recon **0.003** dobg **0.006**. Isolation off.
-> μ-ratio 0.2. Serve graph KEEP. **No second GPU job.** Do not FALSIFY clip
-> until val TM / det_r / paired. `clip_frac` is HEAD not this pid.
+> **P61 EXIT** (`run_p61_clipdu`, pid **155682**, sha `c4ed6f3`, 336 iters):
+> cube-clip **KEEP as protocol** / **FALSIFIED as TM-closer-to-P26 / actor-econ
+> / storm-preventer**. Val MV **×0.911 / ×0.920** DV **×0.772 / ×0.833**
+> det_r **0.153**. Paired **−23.53 vs −87.49** 9/9, loses to P58. Storm
+> **2/2 @56–57**. Do **not** revert clip.
+> **P62 LIVE** (`run_p62_heldcv`, pid **160203**, sha `6841f5c`): held
+> decode-CV stationarity (`out='obs'` + CV late−early; no new knob).
+> CONFIRMED `held_cv=True` `gmatch_clip=True` `gmatch_step=0.4`
+> `device=cuda`. P1 iter **60** skip **0** (passed P61's storm window;
+> do **not** call that a storm-preventer — P60 also 0 storms). Held
+> **~7e-5** vs overshoot **0.032** (still silent vs compounding). Teacher
+> ×1.03/×1.01 `clip_frac` **0.083**. HEAD (not this pid): jsonl
+> `wm_held_cv_drift`/`scale`; `img_rollout out='h'` **REMOVED**. **No
+> second GPU job.** Do not FALSIFY until val TM / 1step→openloop vs
+> ×0.772 / paired vs P58.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -138,12 +146,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > P58. Teacher Δu=1 vs TM 0.4. **P60 EXIT** (`run_p60_tmstep`, pid
 > **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. KEEP as protocol /
 > FALSIFIED as TM. Val MV ×0.849 DV ×0.767 det_r **−0.095**. Paired
-> **−27 vs −112**. **P61 LIVE** (`run_p61_clipdu`, pid **155682**):
-> cube-clip + realized Δu. Storm **2/2 @56–57** CAPPED extra P1. Gate
-> **GAIN-READY** last_ok **55** freeze **0.86@DV**. P2 ~iter **88** recon
-> **0.003** dobg **0.006**. HEAD (not in pid): `clip_frac` jsonl + rest-IC
-> `a_base`/`du` cache. Do **not** launch a second GPU job. Do not FALSIFY
-> clip until val TM.
+> **−27 vs −112**. **P61 EXIT** clip KEEP as protocol / FALSIFIED as TM
+> (val MV ×0.911 DV ×0.772; paired −24 vs −87). **P62 LIVE** held decode-CV
+> (pid **160203**): P1 iter 60 skip 0; passed P61 storm window; held still
+> silent vs overshoot. No second GPU job. Do not FALSIFY until val TM.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
