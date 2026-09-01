@@ -293,7 +293,7 @@ def _check_grounding():
     assert float(losses2['dob_ground']) == 0.0, 'missing dist must no-op'
     print('[smoke] OK  missing dist_target → dob_ground=0 (warned)')
 
-    # P66: per-sequence var skip (same 1e-3 gate as dist_match).
+    # P66: per-sequence var skip (same _DIST_TARGET_VAR_GATE as dist_match).
     cfg3, model3, batch3 = _mk('rssm', dob=True, cv_idx=(2,))
     cfg3.dob_ground_coef = 2.0
     cfg3.dob_reg_coef = 0.0

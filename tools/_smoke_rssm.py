@@ -759,10 +759,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     print('[smoke] OK  _realsim_actor_critic_step critic_batch split + '
           'MC-grounding backward()')
 
-    # ---- P3 expert-BC anchor (P83) + adaptive scaling (P84) ----
-    # Exercise the new train-loop P3 branch outside the full loop: build a
-    # masked expert batch, call expert_bc_p3_loss, and replay the exact
-    # adaptive-scale arithmetic against the imagination return_scale.
+    # ---- P3 expert-BC anchor (P83) ----
+    # Exercise the P3 branch outside the full loop: masked expert batch
+    # through ``expert_bc_p3_loss``.  Adaptive return-scale BC weight was
+    # a false A/B (never wired in ``_realsim_actor_critic_step``) and is
+    # REMOVED.
     _, _, agent_hid3 = world_model_loss(model, batch, cfg)
     em = (torch.rand(B, T) > 0.5).float()           # ~half steps are expert
     bc_batch = dict(batch)
@@ -776,23 +777,8 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     bc_batch0['expert'] = torch.zeros(B, T)
     bc_loss0, n0 = expert_bc_p3_loss(model, bc_batch0, agent_hid3)
     assert float(bc_loss0) == 0.0, f'empty-mask bc loss != 0: {float(bc_loss0)}'
-
-    # Adaptive-scale arithmetic (mirrors train.py P3 branch).
-    cfg.expert_bc_p3_adaptive_scale = True
-    base_w = float(cfg.expert_bc_scale) * 0.5       # decay placeholder
-    adv_ref = float(getattr(cfg, 'advantage_clip', 8.0) or 8.0)
-    for rs in (0.5, 1.0, 8.0, 102.0, 500.0):
-        w = base_w * (adv_ref / max(rs, 1.0))
-        assert w == w and w >= 0.0 and w != float('inf'), \
-            f'adaptive weight non-finite at return_scale={rs}: {w}'
-    # weight must shrink as return_scale grows (anchor not drowned check)
-    w_lo = base_w * (adv_ref / max(1.0, 1.0))
-    w_hi = base_w * (adv_ref / max(102.0, 1.0))
-    assert w_hi < w_lo, 'adaptive weight should shrink as return_scale grows'
     _finite('expert_bc_p3', {'bc_loss': bc_loss, 'n_expert': n_exp,
-                             'bc_loss_empty': bc_loss0,
-                             'w@rs1': torch.tensor(w_lo),
-                             'w@rs102': torch.tensor(w_hi)})
+                             'bc_loss_empty': bc_loss0})
 
     print(f'[smoke] ALL RSSM SMOKE CHECKS PASSED  ({label}: '
           f'obs={obs_dim} act={action_dim} wm={wm_type})')
@@ -1909,7 +1895,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'p2amp=' in _src
     assert 'p3amp=' in _src
     assert 'P2 replay flush' not in _src
-    assert 'seq_var > 1e-3' in _src
+    assert '_DIST_TARGET_VAR_GATE' in _src
+    assert 'seq_var > _DIST_TARGET_VAR_GATE' in _src
     assert 'wm_held_cv_drift' in _src
     assert "'wm_held_ol_ratio'" not in _src
     assert "'pmpo_pos_frac': pos_adv_frac" not in _src
@@ -2097,9 +2084,13 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.wm_diag_horizon) == 0
     assert c.actor_train_source == 'realsim'
     assert not hasattr(c, 'gain_match_relative')
+    assert not hasattr(c, 'expert_bc_p3_adaptive_scale')
+    assert not hasattr(c, 'early_stop_p1_min_sf_drop_frac')
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_WM_HELD_ROLLOUT_SETTLE_FRAC' not in ENV_OVERRIDES
     assert 'DREAMER_ACT_HIST_REQUIRED' not in ENV_OVERRIDES
+    assert 'DREAMER_EXPERT_BC_P3_ADAPTIVE_SCALE' not in ENV_OVERRIDES
+    assert 'DREAMER_ES_P1_MIN_SF_DROP' not in ENV_OVERRIDES
     _dv4 = open(__import__('models.dreamer_v4', fromlist=['dummy']).__file__).read()
     assert 'DREAMER_ACT_HIST_REQUIRED' not in _dv4
     assert 'action_history is None' in _dv4

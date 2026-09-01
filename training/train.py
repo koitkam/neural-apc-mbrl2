@@ -823,8 +823,8 @@ class TrainConfig:
     # P25 RCA: the replay buffer MUST store ``n_dist = n_cv`` whenever this
     # is >0 OR the DOB is on — do not key storage off ``disturbance_head_dim``
     # (that field is forced 0 when DOB replaces the head).
-    # P66: per-sequence skip when ``var(dist/cv_std) ≤ 1e-3`` (same gate
-    # as ``dist_match``).  P65 flush of the P1 ring is REVERTED.
+    # P66: per-sequence skip when ``var(dist/cv_std) ≤ _DIST_TARGET_VAR_GATE``
+    # (same gate as ``dist_match``).  P65 flush of the P1 ring is REVERTED.
     dob_ground_coef: float = 0.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
@@ -1497,13 +1497,6 @@ class TrainConfig:
     # the anchor evaporated).  Decay is 1→floor so the early warmstart is
     # unchanged; a 0.1 LATE-P3 floor re-anchors the policy to arrest the drift.
     expert_bc_p3_floor: float = 0.1
-    # TD3+BC return-scale normalisation (Fujimoto 2021).  OPT-IN (default
-    # off): REINFORCE already divides the advantage by return_scale, so the
-    # PG gradient on μ is already O(1) regardless of scale and a fixed-weight
-    # MSE-on-μ BC is already proportionate.  Enable only if the logged
-    # bc_p3/pg grad ratio shows the anchor being drowned as return_scale
-    # grows (then bc_weight_eff = w * advantage_clip / max(return_scale,1)).
-    expert_bc_p3_adaptive_scale: bool = False
     # ---- (BC learning-vs-crutch tracking, 2026-06-09) ----
     # Diagnostic: is the actor LEARNING beyond the expert, or just being held
     # at the expert by the permanent BC floor (expert_bc_p3_floor)?  When
@@ -2101,12 +2094,6 @@ class TrainConfig:
     # observer and validation still runs.  ``DREAMER_SKIP_INVALID_P3=0``
     # keeps the old warn-and-train-anyway path.
     skip_invalid_p3: bool = True
-    # P1 mid-check: at the P1→P2 transition, require ``sf_loss`` to have
-    # dropped at least ``min_drop_frac`` from its initial value.  If not,
-    # WM never learned dynamics; flag the trial so the BO score reflects
-    # this (we still let it run — P3 plateau will catch it).  Set to 0.0
-    # to disable.
-    early_stop_p1_min_sf_drop_frac: float = 0.10
     # P2 mid-check: at the P2→P3 transition, require ``reward_mtp_loss``
     # to be below this absolute value (random-baseline ≈ log(255) ≈ 5.5
     # for default twohot 255-bin head; 4.5 is "started learning").
@@ -4109,6 +4096,13 @@ def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
     if float(rmtp_weight or 0.0) != 0.0:
         return True
     return _wm_need_logged_aux(will_log, step_i, n_inner)
+
+
+# Unitless load-variance gate shared by dist_match (batch var) and
+# dob_ground (per-sequence var).  Below this the target is d≡0 / quiet
+# — grounding it is L2-on-d→0.  Same 1e-3 as the historical dist_match
+# skip; do not /dvar (would rescale the loss).
+_DIST_TARGET_VAR_GATE = 1e-3
 
 
 def _wm_need_dist_target(model, cfg: 'TrainConfig') -> bool:
@@ -8526,7 +8520,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 dt = dt[..., :n_dist]
                 dvar = dt.float().var().clamp_min(1e-4)
                 # supervise only when the load is actually present (var>0)
-                if float(dvar) > 1e-3:
+                if float(dvar) > _DIST_TARGET_VAR_GATE:
                     dist_match_loss = (F.mse_loss(c_dist.float(), dt.float())
                                        / dvar)
                     wm_total = wm_total + dm_coef * dist_match_loss
@@ -8583,11 +8577,11 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 # (p19 hole).  dist_match already skips low-var
                 # *batches*; a mixed batch still has load variance so
                 # zeros enter the mean MSE.  Skip per sequence at the
-                # same unitless 1e-3 gate.  Do not /dvar (would
-                # rescale the loss — a second change).
+                # same unitless ``_DIST_TARGET_VAR_GATE``.  Do not
+                # /dvar (would rescale the loss — a second change).
                 _red = (1, 2) if dtgt.dim() >= 3 else (1,)
                 seq_var = dtgt.float().var(dim=_red)
-                mask = seq_var > 1e-3
+                mask = seq_var > _DIST_TARGET_VAR_GATE
                 if mask.any():
                     err = (ds.float() - dtgt.float()).pow(2).mean(dim=_red)
                     dob_ground = err[mask].mean()

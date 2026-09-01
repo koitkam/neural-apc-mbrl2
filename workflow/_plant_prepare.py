@@ -750,11 +750,11 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_EXPERT_OPT_ITERS':           ('expert_opt_iters',               int),
     'DREAMER_EXPERT_OPT_LR':              ('expert_opt_lr',                  float),
     # P83: decaying P3 expert-BC anchor (default ON via TrainConfig; expose
-    # for ablation).  expert_bc_p3 toggles the anchor, _floor sets the decay
-    # floor, _adaptive_scale enables the TD3+BC return-scale normalisation.
+    # for ablation).  expert_bc_p3 toggles the anchor; _floor sets the decay
+    # floor.  ``DREAMER_EXPERT_BC_P3_ADAPTIVE_SCALE`` REMOVED (never read
+    # by ``_realsim_actor_critic_step`` — false A/B).
     'DREAMER_EXPERT_BC_P3':               ('expert_bc_p3',                   _as_bool),
     'DREAMER_EXPERT_BC_P3_FLOOR':         ('expert_bc_p3_floor',             float),
-    'DREAMER_EXPERT_BC_P3_ADAPTIVE_SCALE': ('expert_bc_p3_adaptive_scale',   _as_bool),
     # (a) adaptive bounded-return envelope (default ON; both backbones).
     'DREAMER_RETURN_VALUE_ADAPTIVE_CAP':  ('return_value_adaptive_cap',      _as_bool),
     'DREAMER_RETURN_VALUE_CAP_K':         ('return_value_cap_k',             float),
@@ -855,7 +855,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_ES_CASCADE_PATIENCE':        ('early_stop_cascade_patience_iters', int),
     'DREAMER_ES_GRADSKIP_WINDOW':         ('early_stop_grad_skip_window_iters', int),
     'DREAMER_ES_GRADSKIP_MAX':            ('early_stop_grad_skip_max', int),
-    'DREAMER_ES_P1_MIN_SF_DROP':          ('early_stop_p1_min_sf_drop_frac', float),
     'DREAMER_ES_P2_MAX_RMTP':             ('early_stop_p2_max_reward_mtp_loss', float),
     # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
