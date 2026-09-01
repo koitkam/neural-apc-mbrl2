@@ -97,15 +97,17 @@ env-gated off · **[planned]** = designed, not yet built.
 > **×0.927 / ×0.932** DV **×0.893 / ×0.962** (new DV champ). det_r **0.352**
 > pred_std **0.608 vs 1.93**. Paired **−4.54 vs −94 BEATS 9/9** (beats P58).
 > **PARTIAL as DOB-amp**. **FALSIFIED as det_r→P26**. P2 buffer stayed 100%
-> P1-clean at the latch. **P65 LIVE P3** (`run_p65_p2flush`, pid **173526**,
-> sha `b4ee586`): P1→P2 replay flush **ON** (dropped 327; P2 buf 5→276/327;
-> `dob_d` last 0.085 vs P64 0.063). GAIN-READY **0.86@DV** @82. Unfreeze
-> 147 ent **−0.101 HELD** rscale **1.88 KEEP**. Dummy jsonl
+> P1-clean at the latch. **P65 EXIT** (`run_p65_p2flush`, pid **173526**,
+> sha `b4ee586`, 515 iters): P1→P2 replay flush **REVERT / FALSIFIED**.
+> Val MV **×0.830 / ×0.814** DV **×0.794 / ×0.844**. det_r **0.191**
+> pred_std **0.518 vs 1.93**. Paired **−11.95 vs −139** 9/9, loses to P64.
+> P2 starvation (buf 5→276). Dummy jsonl
 > `wm_held_ol_ratio` **REMOVED**. `DREAMER_ACT_HIST_REQUIRED` **REMOVED**.
 > Leftover P3 jsonl alias **writes** **REMOVED**; parsers now summarize
 > `realsim_return_mean`. Stale `tools/run_nl_then_p09.sh` + p138/p136
 > one-off probes **DISCARDED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
+> **P66** per-seq `dob_ground` var-skip (mixed ring KEEP).
 > Do not settle=`wm_tf_horizon`. Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -164,8 +166,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > KEEP as space / FALSIFIED as compounding (val MV ×0.806 DV ×0.800
 > OL-vs-real ×0.785; paired −45 vs −113). **P63 EXIT** FO magnitude
 > **REVERT** (GAIN_NOT_READY; family closed). **P64 EXIT** P2 Kalman amp = P3
-> cap KEEP as protocol + actor-econ (paired **−4.54 vs −94**). **P65 LIVE P3**
-> P1→P2 replay flush ON (buf 5→276; `dob_d` 0.085). `derive_horizon` / sim `reset()` now
+> cap KEEP as protocol + actor-econ (paired **−4.54 vs −94**). **P65 EXIT**
+> P1→P2 replay flush **REVERT** (val pred_std 0.518 vs P64 0.608; paired
+> −12 vs −4.54). **P66** per-seq `dob_ground` var-skip. `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
@@ -1090,11 +1093,12 @@ P2's batched DOB decode consumes (`dob_active=False`).
   `d_t`: the observer `(A,K)` is identified on the fixed plant (identifiable by
   construction). Reuses the P2 loss (`wm_total + agent_total`); BC also warms the
   actor as a free bonus. The disturbance is at max density (prob 1.0) so the
-  observer sees plenty of residual. **P65:** at the discrete P1→P2 latch the
-  shared `TrajectoryBuffer` is **flushed** so Kalman / `dob_ground` ID is not
-  trained on a ring still full of Stage-1 `d≡0` rows (P64: 327/327 clean at
-  the latch; `dob_ground` on zeros is L2-on-`d`→0). Same-iter P2 collect
-  refills before the first P2 train step. No new knob.
+  observer sees plenty of residual. **P65 EXIT:** flushing the shared
+  `TrajectoryBuffer` at P1→P2 **starved** Kalman ID (5 eps at first P2
+  step) and **worsened** val amp/det_r — **REVERT**. **P66:** `dob_ground`
+  skips per-sequence `var(dist/cv_std) ≤ 1e-3` (same gate as
+  `dist_match`) so P1 `d≡0` rows in the mixed ring do not L2-on-`d`→0.
+  Do not `/dvar`. No new knob.
 - **Stage 3** — `g` and `(A,K)` are frozen (`_wm_frozen_now` drops `wm_total`);
   the actor/critic train on the static unbiased WM + working observer, **with
   disturbances + domain randomization on**, so the deployed controller is robust

@@ -823,6 +823,8 @@ class TrainConfig:
     # P25 RCA: the replay buffer MUST store ``n_dist = n_cv`` whenever this
     # is >0 OR the DOB is on — do not key storage off ``disturbance_head_dim``
     # (that field is forced 0 when DOB replaces the head).
+    # P66: per-sequence skip when ``var(dist/cv_std) ≤ 1e-3`` (same gate
+    # as ``dist_match``).  P65 flush of the P1 ring is REVERTED.
     dob_ground_coef: float = 0.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
@@ -5003,13 +5005,9 @@ class TrajectoryBuffer:
     def clear(self) -> None:
         """Drop stored episodes (keep allocated tensors).
 
-        Used at the discrete P1→P2 latch so Kalman / ``dob_ground`` ID is
-        not trained on a ring still full of Stage-1 ``d≡0`` rows.  Those
-        zeros make unnormalized grounding ≡ L2-on-``d``→0 (the p19
-        ``dob_reg`` hole through the front door) and mix SNR so K
-        under-gains at val/P3 amplitude.  ``sample`` still raises on an
-        empty buffer; the same-iter P2 collect writes load episodes
-        before the first P2 train step.
+        ``sample`` still raises on an empty buffer.  Not used at the
+        P1→P2 latch (P65 flush FALSIFIED: starving the ring for Kalman
+        ID).  Kept for tests / explicit resets.
         """
         self.filled = 0
         self.write = 0
@@ -8579,8 +8577,21 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 cv_std_t = _cv_obs_std_tensor(cfg, ds)
                 if cv_std_t is not None:
                     dtgt = dtgt / cv_std_t
-                dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
-                wm_total = wm_total + dgc * dob_ground
+                # P65 EXIT: flushing P1 d≡0 rows starved P2 Kalman ID
+                # and *worsened* val amp/det_r.  Keep the mixed ring.
+                # Grounding a zero-load *sequence* is still L2-on-d→0
+                # (p19 hole).  dist_match already skips low-var
+                # *batches*; a mixed batch still has load variance so
+                # zeros enter the mean MSE.  Skip per sequence at the
+                # same unitless 1e-3 gate.  Do not /dvar (would
+                # rescale the loss — a second change).
+                _red = (1, 2) if dtgt.dim() >= 3 else (1,)
+                seq_var = dtgt.float().var(dim=_red)
+                mask = seq_var > 1e-3
+                if mask.any():
+                    err = (ds.float() - dtgt.float()).pow(2).mean(dim=_red)
+                    dob_ground = err[mask].mean()
+                    wm_total = wm_total + dgc * dob_ground
             elif not getattr(cfg, '_dob_ground_shape_warned', False):
                 print(f'[dob-ground] WARNING: dist_target shape {tuple(dtgt.shape)} '
                       f'!= d_t shape {tuple(ds.shape)} — grounding skipped.',
@@ -12188,19 +12199,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"steps{total_env_steps}: {_desc} "
               f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
               f"trainable-flags set]", flush=True)
-        # P64 RCA: capacity ~327 is full of P1 d≡0 at the latch
-        # (test_sim 400k steps / 1220).  P2 collect cannot lap it in
-        # 54 iters.  Flush once here (discrete P1→P2 only; this
-        # branch is not the cont-latent curriculum).  Same-iter
-        # collect writes deployment-amp load before the first P2
-        # train step.
-        if _cur_stage == 2:
-            _n_drop = int(buf.filled)
-            buf.clear()
-            print(f"[curriculum] P2 replay flush: dropped {_n_drop} P1 "
-                  f"(d≡0) episodes so Kalman ID trains on "
-                  f"deployment-amp load",
-                  flush=True)
         if not _dynamics_g_trainable(model):
             _release_rest_ic_after_g_freeze(
                 getattr(model, 'dynamics', None))

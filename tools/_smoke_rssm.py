@@ -1377,7 +1377,7 @@ def _test_buffer_sample_keys() -> None:
 
 
 def _test_buffer_clear() -> None:
-    """P1→P2 flush drops filled/write; leftover slots are not sampled."""
+    """clear() drops filled/write; leftover slots are not sampled."""
     import numpy as np
     from training.train import TrajectoryBuffer
 
@@ -1908,6 +1908,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'p1amp=' in _src
     assert 'p2amp=' in _src
     assert 'p3amp=' in _src
+    assert 'P2 replay flush' not in _src
+    assert 'seq_var > 1e-3' in _src
     assert 'wm_held_cv_drift' in _src
     assert "'wm_held_ol_ratio'" not in _src
     assert "'pmpo_pos_frac': pos_adv_frac" not in _src

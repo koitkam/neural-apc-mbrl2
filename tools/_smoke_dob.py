@@ -293,6 +293,25 @@ def _check_grounding():
     assert float(losses2['dob_ground']) == 0.0, 'missing dist must no-op'
     print('[smoke] OK  missing dist_target → dob_ground=0 (warned)')
 
+    # P66: per-sequence var skip (same 1e-3 gate as dist_match).
+    cfg3, model3, batch3 = _mk('rssm', dob=True, cv_idx=(2,))
+    cfg3.dob_ground_coef = 2.0
+    cfg3.dob_reg_coef = 0.0
+    cfg3._cv_obs_std = [1.0]
+    batch_z = dict(batch3)
+    batch_z['dist'] = torch.zeros_like(batch3['dist'])
+    gz = float(world_model_loss(model3, batch_z, cfg3)[0]['dob_ground'])
+    assert gz == 0.0, f'zero-var dist must skip dob_ground, got {gz}'
+    print('[smoke] OK  zero-var dist → dob_ground=0 (per-seq skip)')
+
+    batch_m = dict(batch3)
+    dist_m = batch3['dist'].clone()
+    dist_m[0].zero_()
+    batch_m['dist'] = dist_m
+    gm = float(world_model_loss(model3, batch_m, cfg3)[0]['dob_ground'])
+    assert gm > 0.0 and np.isfinite(gm), f'mixed batch must ground on load seqs, got {gm}'
+    print(f'[smoke] OK  mixed zero+load seqs → dob_ground={gm:.4f} (zeros skipped)')
+
 
 if __name__ == '__main__':
     _check_kalman_scan()
