@@ -126,10 +126,10 @@ def _parse_train_log(jsonl_path: Path,
                 'p1': {}, 'p2': {}, 'p3': {}}
     keys = ['recon_loss', 'sf_loss', 'reward_mtp_loss', 'bc_loss',
             'actor_loss', 'critic_loss', 'entropy_mean',
-            'imagined_return_mean', 'imagined_reward_mean',
-            # Canonical P3 keys + leftover jsonl aliases from old logs
-            # (PMPO / imagination actor).  New runs no longer write the
-            # aliases.
+            # Canonical real-sim P3 keys.  ``imagined_*`` aliases remain
+            # for pre-P65 jsonl (P65-live dropped the identity writes).
+            'realsim_return_mean', 'imagined_return_mean',
+            'realsim_reward_mean', 'imagined_reward_mean',
             'actor_kl_pen', 'pmpo_kl', 'actor_pos_adv_frac', 'pmpo_pos_frac',
             'actor_logp_std', 'actor_ratio_clip_frac', 'actor_ratio_mean',
             'critic_rew_to_tgt_var', 'return_scale',

@@ -97,12 +97,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > **×0.927 / ×0.932** DV **×0.893 / ×0.962** (new DV champ). det_r **0.352**
 > pred_std **0.608 vs 1.93**. Paired **−4.54 vs −94 BEATS 9/9** (beats P58).
 > **PARTIAL as DOB-amp**. **FALSIFIED as det_r→P26**. P2 buffer stayed 100%
-> P1-clean at the latch. **P65 LIVE** (`run_p65_p2flush`, pid **173526**,
-> sha `b4ee586`): P1→P2 replay flush. Still P1 @iter **69** (recon 0.0012
-> after storm **1/2 @67** recovered). Dummy jsonl
+> P1-clean at the latch. **P65 LIVE P3** (`run_p65_p2flush`, pid **173526**,
+> sha `b4ee586`): P1→P2 replay flush **ON** (dropped 327; P2 buf 5→276/327;
+> `dob_d` last 0.085 vs P64 0.063). GAIN-READY **0.86@DV** @82. Unfreeze
+> 147 ent **−0.101 HELD** rscale **1.88 KEEP**. Dummy jsonl
 > `wm_held_ol_ratio` **REMOVED**. `DREAMER_ACT_HIST_REQUIRED` **REMOVED**.
-> Leftover P3 jsonl alias **writes** **REMOVED**. Stale
-> `tools/run_nl_then_p09.sh` **DISCARDED**.
+> Leftover P3 jsonl alias **writes** **REMOVED**; parsers now summarize
+> `realsim_return_mean`. Stale `tools/run_nl_then_p09.sh` + p138/p136
+> one-off probes **DISCARDED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
 > Do not settle=`wm_tf_horizon`. Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
@@ -161,10 +163,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > (val MV ×0.911 DV ×0.772; paired −24 vs −87). **P62 EXIT** held decode-CV
 > KEEP as space / FALSIFIED as compounding (val MV ×0.806 DV ×0.800
 > OL-vs-real ×0.785; paired −45 vs −113). **P63 EXIT** FO magnitude
-> **P63 EXIT** FO magnitude
 > **REVERT** (GAIN_NOT_READY; family closed). **P64 EXIT** P2 Kalman amp = P3
-> cap KEEP as protocol + actor-econ (paired **−4.54 vs −94**). **P65** P1→P2
-> replay flush. `derive_horizon` / sim `reset()` now
+> cap KEEP as protocol + actor-econ (paired **−4.54 vs −94**). **P65 LIVE P3**
+> P1→P2 replay flush ON (buf 5→276; `dob_d` 0.085). `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
@@ -949,7 +950,9 @@ fixes BOTH:
   `wm_held_cv_drift`. Dummy `wm_held_ol_ratio` **REMOVED** (P64-live).
   Leftover P3 jsonl alias writes (`imag_adv_action_corr` /
   `pmpo_pos_frac` / `imagined_return_mean`) **REMOVED** (P65-live;
-  parsers still read old logs).
+  parsers still read old logs). `_parse_train_log` /
+  `training_diagnostics.csv` now emit canonical `realsim_return_mean`
+  / `realsim_reward_mean`.
   SF `imagine_next_z` requires `action_history` (unwhitelisted
   `DREAMER_ACT_HIST_REQUIRED` zeros-fallback **REMOVED**; P64-live).
   `wm_held_rollout_settle_frac` is **removed**. `img_rollout out='h'` is removed

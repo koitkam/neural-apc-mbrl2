@@ -8500,14 +8500,14 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             wm_total = wm_total + gp_coef * cont_gain_persist
         # ----- C(2) disturbance-matching: supervise c_dist = true OU load -----
         # The SYMMETRIC analogue of C(1) gain-matching for the DISTURBANCE
-        # block.  p138 RCA (DECISIVE probe tools/_probe_disturbance_localize):
-        # the unmeasured load is OBSERVABLE (the prior-CV INNOVATION tracks the
-        # true OU at det_r~0.37 = the DOB residual) but the WM posterior NEVER
-        # WRITES it into the latent (held-out probe on the full [h,z,c]=0.027,
-        # c_dist=0.06) because nothing supervises it: under CLOSED-LOOP control
-        # the controlled CV hides the load so recon is satisfied by [h,z] alone
-        # and the stop-grad read-out head is passive.  So c_dist stays a FREE OU
-        # (std~2.3) the decoder uses to inject open-loop DRIFT (the over-gain).
+        # block.  p138 RCA: the unmeasured load is OBSERVABLE (the prior-CV
+        # INNOVATION tracks the true OU at det_r~0.37 = the DOB residual) but
+        # the WM posterior NEVER WRITES it into the latent (held-out probe on
+        # the full [h,z,c]=0.027, c_dist=0.06) because nothing supervises it:
+        # under CLOSED-LOOP control the controlled CV hides the load so recon
+        # is satisfied by [h,z] alone and the stop-grad read-out head is
+        # passive.  So c_dist stays a FREE OU (std~2.3) the decoder uses to
+        # inject open-loop DRIFT (the over-gain).
         # FIX: pin the posterior disturbance mean to the recorded true load
         # (known in training, in the same normalized-CV units the decoder
         # consumes) so the posterior LEARNS the innovation->load inference (the
@@ -10983,6 +10983,7 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
             'critic_target_v_r', 'critic_mc_loss',
             'agent_minus_expert_return', 'actor_pos_adv_frac',
             'adv_action_corr', 'return_scale',
+            'realsim_return_mean', 'realsim_reward_mean',
         ]
         with open(csv_path, 'w', newline='') as fh:
             w = csv.writer(fh)

@@ -4330,7 +4330,8 @@ def _test_training_diagnostics_cascade_axes() -> None:
          'actor_ratio_mean': 1.02, 'critic_rew_to_tgt_var': 0.06,
          'agent_minus_expert_return': 19.0, 'actor_pos_adv_frac': 0.55,
          'pmpo_pos_frac': 0.55, 'adv_action_corr': 0.12,
-         'imag_adv_action_corr': 0.12, 'return_scale': 1.91},
+         'imag_adv_action_corr': 0.12, 'return_scale': 1.91,
+         'realsim_return_mean': -7.3, 'realsim_reward_mean': -0.11},
         {'iter': 175, 'phase': 3, 'env_steps': 2000,
          'ema_return': -418.0, 'entropy_mean': -0.136,
          'actor_logp_std': 18.8, 'actor_ratio_clip_frac': 0.46,
@@ -4353,15 +4354,28 @@ def _test_training_diagnostics_cascade_axes() -> None:
         for col in ('actor_logp_std', 'actor_ratio_clip_frac',
                     'critic_rew_to_tgt_var', 'agent_minus_expert_return',
                     'actor_pos_adv_frac', 'adv_action_corr',
-                    'n_grad_skip', 'n_grad_skip_iter'):
+                    'n_grad_skip', 'n_grad_skip_iter',
+                    'realsim_return_mean', 'realsim_reward_mean'):
             assert col in header, header
         _, summary = _parse_train_log(logp)
         p3 = summary['p3']
         assert 'actor_pos_adv_frac' in p3
         assert 'actor_logp_std' in p3
+        assert 'realsim_return_mean' in p3
         assert abs(float(p3['actor_logp_std']['last']) - 18.8) < 1e-9
+        assert abs(float(p3['realsim_return_mean']['first']) + 7.3) < 1e-9
         flags = ' '.join(summary['flags'])
         assert 'imagined returns' not in flags
+        # Pre-P65 jsonl still surfaces the imagination alias.
+        oldp = os.path.join(td, 'old_train_log.jsonl')
+        with open(oldp, 'w') as fh:
+            fh.write(json.dumps({
+                'iter': 10, 'phase': 3, 'env_steps': 500,
+                'imagined_return_mean': -8.1, 'imagined_reward_mean': -0.2,
+            }) + '\n')
+        _, old_sum = _parse_train_log(oldp)
+        assert 'imagined_return_mean' in old_sum['p3']
+        assert 'realsim_return_mean' not in old_sum['p3']
     print('[smoke] OK  training_diagnostics cascade axes + old-log leftover names')
 
 
