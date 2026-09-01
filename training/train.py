@@ -1736,13 +1736,14 @@ class TrainConfig:
     # is stop-grad so a contracted K-step cannot drag the 1-step prior
     # down.  RSSM-only (SF uses sf_bootstrap + ``_sf_steady_consistency``).
     # ``coef=0`` = OFF.  Env
-    # DREAMER_WM_HELD_ROLLOUT_{COEF,LEN,SETTLE_FRAC,WIN,MAX_STARTS,GATE_RECON}.
-    # Default coef 0.5 / max_starts 8.  ``wm_held_rollout_len`` auto-tunes
-    # to H in ``auto_tune_seed_buffer``.  ``wm_held_rollout_win`` still
-    # clamps to ``(K-1)//4`` for the K-tail mean (identity 8 at K=55).
+    # DREAMER_WM_HELD_ROLLOUT_{COEF,LEN,WIN,MAX_STARTS,GATE_RECON}.
+    # ``wm_held_rollout_settle_frac`` REMOVED (P62 late−early early-window;
+    # P63 magnitude uses the K-tail only).  Default coef 0.5 / max_starts 8.
+    # ``wm_held_rollout_len`` auto-tunes to H in ``auto_tune_seed_buffer``.
+    # ``wm_held_rollout_win`` still clamps to ``(K-1)//4`` for the K-tail
+    # mean (identity 8 at K=55).
     wm_held_rollout_coef: float = 0.5
     wm_held_rollout_len: int = 64          # K prior steps under the HELD action
-    wm_held_rollout_settle_frac: float = 0.5   # early window starts at frac·K
     wm_held_rollout_win: int = 8           # window length; clamped to (K-1)/4 at use (identity 8 at K=55)
     wm_held_rollout_max_starts: int = 8    # cap start positions (stride) for cost
     wm_held_rollout_gate_recon: float = 0.1    # soft recon-fidelity ramp gate
@@ -3697,14 +3698,14 @@ def _held_rollout_win(K: int, win: int = 8) -> int:
     """Held-rollout K-tail window that fits inside a K-step prior roll.
 
     P62 stationarity needed two *non-overlapping* windows (``win < K/4``).
-    P63 still uses the cap for the K-tail mean (not a second early window).
-    Dataclass default 8 is identity at test_sim ``K=H=55`` (cap 13).  On a
-    fast plant ``K=15``, win=8 used to empty the loss; clamp to
-    ``(K-1)//4`` (unitless).  ``win<=0`` auto-picks ``max(2, round(K/7))``.
+    P63 still uses the same cap for the K-tail mean (not a second early
+    window; ``settle_frac`` is gone).  Dataclass default 8 is identity at
+    test_sim ``K=H=55`` (cap 13).  On a fast plant ``K=15``, win=8 used
+    to empty the loss; clamp to ``(K-1)//4`` (unitless).  ``win<=0``
+    auto-picks ``max(2, round(K/7))``.
     """
     K = max(4, int(K))
-    # Strict ``win < K/4`` so ``s≈K/2`` windows do not share an edge
-    # (loss treats ``K-win <= s+win`` as empty).  K=55 → cap 13.
+    # Keep the P62 ``(K-1)//4`` cap (identity at test_sim).  K=55 → cap 13.
     cap = max(1, (K - 1) // 4)
     w = int(win)
     if w <= 0:

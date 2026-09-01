@@ -765,7 +765,6 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_WM_STEADY_HELD_EPS':         ('wm_steady_held_eps',             float),
     'DREAMER_WM_HELD_ROLLOUT_COEF':       ('wm_held_rollout_coef',           float),
     'DREAMER_WM_HELD_ROLLOUT_LEN':        ('wm_held_rollout_len',            int),
-    'DREAMER_WM_HELD_ROLLOUT_SETTLE_FRAC':('wm_held_rollout_settle_frac',    float),
     'DREAMER_WM_HELD_ROLLOUT_WIN':        ('wm_held_rollout_win',            int),
     'DREAMER_WM_HELD_ROLLOUT_MAX_STARTS': ('wm_held_rollout_max_starts',     int),
     'DREAMER_WM_HELD_ROLLOUT_GATE_RECON': ('wm_held_rollout_gate_recon',     float),

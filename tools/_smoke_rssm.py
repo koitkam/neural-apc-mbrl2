@@ -2056,6 +2056,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.actor_train_source == 'realsim'
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
+    assert 'DREAMER_WM_HELD_ROLLOUT_SETTLE_FRAC' not in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC_LEN' in ENV_OVERRIDES
@@ -2905,12 +2906,12 @@ def _test_held_rollout_win_fits_k() -> None:
     assert _held_rollout_win(15, 8) == 3
     assert _held_rollout_win(15, 0) == 2
     assert _held_rollout_win(32, 8) == 7
-    # Two windows of win plus settle_frac=0.5 must fit in K (same test as loss).
+    # P63: one K-tail window must fit in K (late−early two-window gone).
     for k, w_req in ((55, 8), (15, 8), (15, 0), (32, 8)):
         w = _held_rollout_win(k, w_req)
-        s = int(0.5 * k)
-        s = max(w, min(s, k - 2 * w))
-        assert s >= w and (k - w) > (s + w), (k, w_req, w, s)
+        cap = max(1, (k - 1) // 4)
+        assert 1 <= w <= min(k, cap), (k, w_req, w, cap)
+    assert not hasattr(TrainConfig(), 'wm_held_rollout_settle_frac')
     print('[smoke] OK  held-rollout win clamps to (K-1)/4 (test_sim 8)')
 
 

@@ -929,7 +929,8 @@ fixes BOTH:
   (FO `τ/sr` scale; stop-grad Δ1). P62 late−early was silent (held
   ~1.5e-4 vs overshoot ~0.040) while val OL-vs-real stayed ×0.785.
   jsonl `wm_held_rollout_scale` / `wm_held_cv_drift` / `wm_held_ol_ratio`
-  (LS ΔK/target; 1=match). `img_rollout out='h'` is removed
+  (LS ΔK/target; 1=match). `wm_held_rollout_settle_frac` is **removed**
+  (P62 late−early early-window; unread after P63). `img_rollout out='h'` is removed
   (P61 held; isolation TBPTT still default-feat + `keep_c` on `h`).
   CUDA: `make_graphed_callables` on
   `_RestICGraphModule` wrapping that T-loop when
