@@ -83,16 +83,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > / storm-preventer**. Val MV **×0.911 / ×0.920** DV **×0.772 / ×0.833**
 > det_r **0.153**. Paired **−23.53 vs −87.49** 9/9, loses to P58. Storm
 > **2/2 @56–57**. Do **not** revert clip.
-> **P62 LIVE** (`run_p62_heldcv`, pid **160203**, sha `6841f5c`): held
-> decode-CV stationarity (`out='obs'` + CV late−early; no new knob).
-> CONFIRMED `held_cv=True` `gmatch_clip=True` `gmatch_step=0.4`
-> `device=cuda`. P1 iter **60** skip **0** (passed P61's storm window;
-> do **not** call that a storm-preventer — P60 also 0 storms). Held
-> **~7e-5** vs overshoot **0.032** (still silent vs compounding). Teacher
-> ×1.03/×1.01 `clip_frac` **0.083**. HEAD (not this pid): jsonl
-> `wm_held_cv_drift`/`scale`; `img_rollout out='h'` **REMOVED**. **No
-> second GPU job.** Do not FALSIFY until val TM / 1step→openloop vs
-> ×0.772 / paired vs P58.
+> **P62 EXIT** (`run_p62_heldcv`, pid **160203**, sha `6841f5c`, 441 iters):
+> decode-CV late−early **KEEP as space** / **FALSIFIED as compounding/TM/econ**.
+> Val MV **×0.806 / ×0.790** DV **×0.800 / ×0.815** det_r **0.364**.
+> 1step→OL ×0.828 OL-vs-real **×0.785** (P61 ×0.809). Paired **−44.58 vs
+> −112.66** 9/9, loses to P58/P61. P1 held **1.53e-4** vs overshoot **0.040**.
+> **P63 LAUNCH** (`run_p63_olmag`): 1step→K FO magnitude (stop-grad Δ1;
+> no new knob). `[resolved-cfg] held_mag=True`. Score OL-vs-real not just
+> 1step→OL ratio. Champion **P58** econ / **P53** μ-ratio / **P26** observer.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -147,9 +145,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **144896**): teacher Δu auto = `wm_tf_step_frac` **0.4**. KEEP as protocol /
 > FALSIFIED as TM. Val MV ×0.849 DV ×0.767 det_r **−0.095**. Paired
 > **−27 vs −112**. **P61 EXIT** clip KEEP as protocol / FALSIFIED as TM
-> (val MV ×0.911 DV ×0.772; paired −24 vs −87). **P62 LIVE** held decode-CV
-> (pid **160203**): P1 iter 60 skip 0; passed P61 storm window; held still
-> silent vs overshoot. No second GPU job. Do not FALSIFY until val TM.
+> (val MV ×0.911 DV ×0.772; paired −24 vs −87). **P62 EXIT** held decode-CV
+> KEEP as space / FALSIFIED as compounding (val MV ×0.806 DV ×0.800
+> OL-vs-real ×0.785; paired −45 vs −113). **P63** 1step→K FO magnitude.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
@@ -927,12 +925,11 @@ fixes BOTH:
   Stage-1 `_posterior_step`. Full-T main WM encode stacks
   `h/z/(c)/(dv)` then one cat (`_stack_decode_core`; identity vs
   `feat[..., :dec_in]`). Overshoot `out='obs'` is one `decode` after K.
-  Held-rollout (P62) is the same `out='obs'` then decoded-CV late−early
-  stationarity (P89 measured GRU `h`; P61 h-loss ~6e-4 while
-  1step→openloop stayed ×0.77). jsonl `wm_held_rollout_scale` /
-  `wm_held_cv_drift` are the loss denom and unnormalized |late−early|
-  (identity; P62 LIVE held was quieter than P61 at matched iters —
-  scale mismatch vs a quiet CV). `img_rollout out='h'` is removed
+  Held-rollout (P63) is `out='obs'` then 1-step→K decoded-CV **magnitude**
+  (FO `τ/sr` scale; stop-grad Δ1). P62 late−early was silent (held
+  ~1.5e-4 vs overshoot ~0.040) while val OL-vs-real stayed ×0.785.
+  jsonl `wm_held_rollout_scale` / `wm_held_cv_drift` / `wm_held_ol_ratio`
+  (LS ΔK/target; 1=match). `img_rollout out='h'` is removed
   (P61 held; isolation TBPTT still default-feat + `keep_c` on `h`).
   CUDA: `make_graphed_callables` on
   `_RestICGraphModule` wrapping that T-loop when

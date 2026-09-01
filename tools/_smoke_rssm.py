@@ -71,7 +71,7 @@ from training.train import (
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
                             _gain_match_rest_window, _gain_match_rest_ic_state,
-                            _held_rollout_win,
+                            _held_rollout_win, _held_ol_fo_scale,
                             _wm_held_rollout_stationarity_loss,
                             _rest_ic_can_cuda_graph,
                             _RestICGraphModule, _rest_ic_last_tensors,
@@ -1872,8 +1872,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "out='obs'" in _src
-    assert 'held_cv=True' in _src
+    assert 'held_mag=True' in _src
     assert 'wm_held_cv_drift' in _src
+    assert 'wm_held_ol_ratio' in _src
     assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
     assert "last_only=True, out='obs'" in _src
@@ -2914,7 +2915,7 @@ def _test_held_rollout_win_fits_k() -> None:
 
 
 def _test_held_rollout_cv_space() -> None:
-    """P62: held late−early is decode-CV, not GRU h (p139 compounding RCA)."""
+    """P63: held 1step→K is decode-CV magnitude, not late−early / GRU h."""
     import inspect
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
 
@@ -2922,6 +2923,8 @@ def _test_held_rollout_cv_space() -> None:
     assert "out='obs'" in src, 'held must roll decode, not out=h'
     assert 'cv_index_t' in src
     assert "out='h'" not in src
+    assert '_held_ol_fo_scale' in src
+    assert 'delta_1.detach()' in src
 
     class _Wrap:
         world_model_type = 'rssm'
@@ -2946,11 +2949,19 @@ def _test_held_rollout_cv_space() -> None:
     cfg.wm_held_rollout_len = 8
     cfg.wm_held_rollout_gate_recon = 0.0
     cfg.wm_held_rollout_max_starts = 2
+    cfg.identified_tau_dominant = 53.0
+    cfg.sample_rate = 4
+    cfg.horizon = 55
+    fo = _held_ol_fo_scale(cfg, 8)
+    assert 5.0 < fo < 8.01, fo
+    fo55 = _held_ol_fo_scale(cfg, 55)
+    assert 10.0 < fo55 < 55.01, fo55
     torch.manual_seed(0)
     hd0, n0, d0 = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
     assert torch.isfinite(hd0).all() and float(hd0) >= 0.0 and n0 > 0
     assert float(d0['wm_held_rollout_scale']) >= 1e-3
     assert float(d0['wm_held_cv_drift']) >= 0.0
+    assert torch.isfinite(d0['wm_held_ol_ratio']).all()
     snap = {n: p.detach().clone() for n, p in dyn.decoder.named_parameters()}
     with torch.no_grad():
         for p in dyn.decoder.parameters():
@@ -2963,10 +2974,10 @@ def _test_held_rollout_cv_space() -> None:
     assert abs(float(hd0) - float(hd1)) > 1e-8, (
         f'held ignored decoder ({float(hd0):.5f} vs {float(hd1):.5f})')
     assert abs(float(d0['wm_held_cv_drift']) - float(d1['wm_held_cv_drift'])) > 1e-8
-    print(f'[smoke] OK  held decode-CV stationarity '
+    print(f'[smoke] OK  held decode-CV 1step→K magnitude '
           f'(loss {float(hd0):.4f}→{float(hd1):.4f} on decoder noise; '
           f'drift {float(d0["wm_held_cv_drift"]):.4f}→'
-          f'{float(d1["wm_held_cv_drift"]):.4f})')
+          f'{float(d1["wm_held_cv_drift"]):.4f}; fo8={fo:.2f})')
 
 
 def _test_collect_rest_lookback_tm_pairing() -> None:
@@ -3549,6 +3560,11 @@ def _test_id_tau_no_plant_sentinel() -> None:
     )
     ident_th = [float(row['theta']) for row in ident['ou_noise']]
     assert ident_th and all(abs(t - expected) < 5e-4 for t in ident_th), ident_th
+    probe_src = (root / 'tools' / 'wm_posterior_prior_probe.py').read_text()
+    assert "IDENTIFIED_TAU_DOMINANT', '53'" not in probe_src
+    assert "IDENTIFIED_DEAD_TIME', '8'" not in probe_src
+    assert "REPO / 'simulation' / 'test_sim'" not in probe_src
+    assert 'def _wire_run_artifacts' in probe_src
     print('[smoke] OK  missing SysID τ does not invent 50 s; identified τ identity')
 
 

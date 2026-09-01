@@ -1726,22 +1726,20 @@ class TrainConfig:
     # convergence under a held action at H_train).  This term ACTIVELY CREATES
     # the held condition: from strided starts it rolls the PRIOR forward ``len``
     # steps under the action HELD CONSTANT (``sample=True`` straight-through so
-    # the stochastic prior is trained), then penalises decoded-CV late−early
-    # drift — "once you stop changing the action, decoded CV must stop moving".
-    # GAIN-NEUTRAL by construction (penalises tail DISPLACEMENT, not magnitude;
-    # the transient ``[0, settle)`` is unconstrained so overshoot/recon still set
-    # the gain) and RSSM-only (the SF backbone uses its native sf_bootstrap plus
-    # the ``_sf_steady_consistency`` anchor).  ``coef=0`` = OFF.  Env
+    # the stochastic prior is trained), then penalises open-loop **magnitude**:
+    # decoded-CV Δ(K) must match the first-order map of the 1-step Δ
+    # (``(1-e^{-K/τs})/(1-e^{-1/τs})``; τs from identified τ/sr or H/4).
+    # **P62 EXIT:** decode-CV late−early was still gain-neutral and silent
+    # (P1 held ~1.5e-4 vs overshoot ~0.040) while val 1step→OL ×0.828 /
+    # OL-vs-real ×0.785 — worse OL-vs-plant than P61 ×0.809.  **P63**
+    # replaces stationarity (same knobs, no new field).  1-step teacher
+    # is stop-grad so a contracted K-step cannot drag the 1-step prior
+    # down.  RSSM-only (SF uses sf_bootstrap + ``_sf_steady_consistency``).
+    # ``coef=0`` = OFF.  Env
     # DREAMER_WM_HELD_ROLLOUT_{COEF,LEN,SETTLE_FRAC,WIN,MAX_STARTS,GATE_RECON}.
-    # Default coef 0.5 / max_starts 8 = p117 recipe: the held-action steady-state
-    # lever that kills multi-step compounding drift (promoted 2026-06-14; were
-    # 0.0 / 12).  ``wm_held_rollout_len`` auto-tunes to H in
-    # ``auto_tune_seed_buffer``.  **P62:** the term measures decoded-CV
-    # late−early stationarity (still gain-neutral), not GRU ``h`` —
-    # p139/P61: h-loss ~6e-4 while 1step→openloop stayed ×0.77.
-    # ``wm_held_rollout_win`` is clamped to ``(K-1)//4`` at use (two
-    # non-overlapping windows; identity 8 at test_sim K=55).  ``<=0`` auto
-    # ``round(K/7)``.
+    # Default coef 0.5 / max_starts 8.  ``wm_held_rollout_len`` auto-tunes
+    # to H in ``auto_tune_seed_buffer``.  ``wm_held_rollout_win`` still
+    # clamps to ``(K-1)//4`` for the K-tail mean (identity 8 at K=55).
     wm_held_rollout_coef: float = 0.5
     wm_held_rollout_len: int = 64          # K prior steps under the HELD action
     wm_held_rollout_settle_frac: float = 0.5   # early window starts at frac·K
@@ -3673,16 +3671,36 @@ def _resolve_gain_match_step(cfg: 'TrainConfig') -> float:
     return step
 
 
-def _held_rollout_win(K: int, win: int = 8) -> int:
-    """Held-rollout drift-window length that fits inside a K-step prior roll.
+def _held_ol_fo_scale(cfg: 'TrainConfig', K: int) -> float:
+    """First-order Δ(K)/Δ(1) for a held step: ``(1-e^{-K/τs})/(1-e^{-1/τs})``.
 
-    ``_wm_held_rollout_stationarity_loss`` needs two *non-overlapping*
-    windows of length ``win`` in ``[0, K)`` with ``settle_frac=0.5``.
-    That requires ``win < K/4``.  Dataclass default 8 is identity at
-    test_sim ``K=H=55`` (cap 13).  On a fast plant ``K=15``, win=8 made
-    ``s+win`` overlap the late window and the loss returned **0** —
-    held-rollout was dead.  Clamp to ``(K-1)//4`` (unitless).  ``win<=0``
-    auto-picks ``max(2, round(K/7))`` (~8 at K=55).
+    ``τs`` is identified ``τ/sample_rate`` when SysID is present, else
+    ``H/4`` (horizon formula is already ``~4τ/sr``).  Clamped to
+    ``[1, K]`` so a missing/tiny τ cannot explode the teacher.
+    """
+    K = max(1, int(K))
+    tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+    sr = max(float(getattr(cfg, 'sample_rate', 1) or 1), 1e-6)
+    if tau > 0.0:
+        tau_s = tau / sr
+    else:
+        h = max(1.0, float(getattr(cfg, 'horizon', 15) or 15))
+        tau_s = h / 4.0
+    tau_s = max(float(tau_s), 1e-3)
+    num = 1.0 - math.exp(-float(K) / tau_s)
+    den = 1.0 - math.exp(-1.0 / tau_s)
+    scale = num / max(den, 1e-6)
+    return float(max(1.0, min(scale, float(K))))
+
+
+def _held_rollout_win(K: int, win: int = 8) -> int:
+    """Held-rollout K-tail window that fits inside a K-step prior roll.
+
+    P62 stationarity needed two *non-overlapping* windows (``win < K/4``).
+    P63 still uses the cap for the K-tail mean (not a second early window).
+    Dataclass default 8 is identity at test_sim ``K=H=55`` (cap 13).  On a
+    fast plant ``K=15``, win=8 used to empty the loss; clamp to
+    ``(K-1)//4`` (unitless).  ``win<=0`` auto-picks ``max(2, round(K/7))``.
     """
     K = max(4, int(K))
     # Strict ``win < K/4`` so ``s≈K/2`` windows do not share an edge
@@ -4250,7 +4268,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0):g} "
         f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)} "
         f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
-        f"held_cv=True "
+        f"held_mag=True "
         f"compile={_resolve_compile_mode(cfg) or 'eager'}",
         flush=True,
     )
@@ -6759,39 +6777,36 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
                                         c_mean: Optional[torch.Tensor] = None,
                                         ) -> Tuple[torch.Tensor, float,
                                                    Dict[str, torch.Tensor]]:
-    """Option (b2, P89 / P62): multi-step HELD-ACTION decode-CV stationarity.
+    """Option (b2, P89 / P63): multi-step HELD-ACTION 1-step→K CV magnitude.
 
     Complements the 1-step ``_rssm_steady_consistency`` (which only fires on the
     rare naturally held+settled replay steps — p88c held_frac≈0.84%) by ACTIVELY
     creating the held condition: from a strided set of start positions ``t`` we
     reconstruct the posterior RSSMState, hold the action at ``a_t`` CONSTANT and
     roll the PRIOR forward ``K`` steps (``sample=True`` straight-through so the
-    stochastic prior receives gradient), then penalise the NET DRIFT of the
-    **decoded CV** between an early post-transient window ``[s, s+win)``
-    (``s = settle_frac·K``) and the final window ``[K-win, K)``.
+    stochastic prior receives gradient), then penalise open-loop **magnitude**:
+    decoded-CV ``Δ(K)`` must match the first-order map of stop-grad ``Δ(1)``
+    (``(1-e^{-K/τs})/(1-e^{-1/τs})``).  Settled starts (``Δ(1)≈0``) reduce to
+    a |Δ(K)| stationarity penalty.
 
-    P62 vs P89: p139 RCA + P61 decomp — 1-step prior is faithful (~×1.05) while
-    open-loop TM contracts (1step→openloop ×0.77).  Measuring ``h`` was
-    gain-neutral *and silent* (P61 P1 held ~6e-4 vs overshoot ~0.04) because
-    categorical-z + cont-c can wander while GRU ``h`` sits still; that is the
-    decoded-gain compounding the transfer matrix scores.  Decode-CV late−early
-    is still GAIN-NEUTRAL (tail displacement, not magnitude; transient
-    ``[0, s)`` unconstrained so overshoot/gain-match still set G) and
-    scale-robust (normalised by the rollout's own CV std).  RSSM-interface
-    (rssm + tssm); returns ``(0, 0.0, {})`` for the SF backbone.  Cost ~ O(B·max_starts·K) GRU
-    steps, bounded by ``wm_held_rollout_max_starts``.  ``sample=True`` so the
-    straight-through categorical grad trains the PRIOR (the drift source).
-    jsonl extras (identity, no extra forward): ``wm_held_rollout_scale``
-    (CV std in the loss denom) and ``wm_held_cv_drift`` (unnormalized
-    |late−early| mean) so a quiet normalized loss is not mistaken for a
-    quiet CV (P62 vs P61 h-std).
+    P63 vs P62: P62 EXIT val 1-step prior was faithful (×0.950) while open-loop
+    vs plant was **×0.785** (P61 ×0.809) — late−early decode-CV was silent
+    (~260× quieter than overshoot).  The decomp lever is compounding of the
+    K-step *gain*, not tail displacement.  1-step teacher is detached so a
+    contracted rollout cannot drag the 1-step prior down.  RSSM-interface
+    (rssm + tssm); returns ``(0, 0.0, {})`` for the SF backbone.  Cost is the
+    same K-step ``img_rollout`` plus one start decode.  ``sample=True`` so the
+    straight-through categorical grad trains the PRIOR (the contraction
+    source).  jsonl extras (no extra forward): ``wm_held_rollout_scale``
+    (CV std in the loss denom), ``wm_held_cv_drift`` (|ΔK − FO·Δ1| mean),
+    ``wm_held_ol_ratio`` (LS ΔK/target; 1=match, <1=contraction).
     """
     coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
     K = int(getattr(cfg, 'wm_held_rollout_len', 0) or 0)
     device = obs.device
     zero = torch.zeros((), device=device, dtype=obs.dtype)
     empty: Dict[str, torch.Tensor] = {}
-    if coef <= 0.0 or K < 4:
+    if coef <= 0.0 or K < 2:
         return zero, 0.0, empty
     if not _is_rssm_interface(model):
         return zero, 0.0, empty
@@ -6799,16 +6814,12 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     B, T = obs.shape[:2]
     _win_req = int(getattr(cfg, 'wm_held_rollout_win', 8) or 8)
     win = _held_rollout_win(K, _win_req)
+    win_k = max(1, min(int(win), K))
     if (win != _win_req
             and not getattr(cfg, '_held_rollout_win_logged', False)):
         print(f'[held-rollout] win {_win_req}→{win} (K={K} cap (K-1)/4; '
               f'test_sim K=55 stays 8)', flush=True)
         cfg._held_rollout_win_logged = True  # type: ignore[attr-defined]
-    s = int(float(getattr(cfg, 'wm_held_rollout_settle_frac', 0.5) or 0.5) * K)
-    # keep the two averaging windows non-overlapping inside [0, K)
-    s = max(win, min(s, K - 2 * win))
-    if s < win or K - win <= s + win:
-        return zero, 0.0, empty
     max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 8) or 8))
     stride = max(1, T // max_starts)
     starts = _cached_strided_arange(
@@ -6824,20 +6835,17 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     a_hold = act[:, starts].reshape(Bm, -1).detach()              # HELD action a_t
     # DV-as-input: hold the measured DV CONSTANT at its start value across the
-    # rollout too — so this probes true held-(action+DV) stationarity and the
-    # WM no longer needs to hallucinate a drifting DV (the steady-state win).
+    # rollout too — so this probes true held-(action+DV) dynamics and the
+    # WM no longer needs to hallucinate a drifting DV.
     dv_hold = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
                .detach()
                if getattr(rssm, 'dv_dim', 0) > 0 else None)
-    # HELD action + DV constant across the rollout: broadcast to K so the whole
-    # loop runs through the COMPILED img_rollout (one graph, no per-step launch).
     a_hold_seq = a_hold.unsqueeze(1).expand(Bm, K, a_hold.shape[-1])   # (Bm,K,A)
     dv_hold_seq = (dv_hold.unsqueeze(1).expand(Bm, K, dv_hold.shape[-1])
                    if dv_hold is not None else None)
-    # P62: decode-CV late−early (p139 z/c wander that h-windows miss).
-    # ``out='obs'`` is one decode after K (same as overshoot); GRU identical.
     if not getattr(cfg, '_held_rollout_cv_logged', False):
-        print('[held-rollout] decode-CV stationarity (P62; not GRU h)',
+        print('[held-rollout] decode-CV 1step→K magnitude '
+              '(P63; FO τ-scale, not late−early)',
               flush=True)
         cfg._held_rollout_cv_logged = True  # type: ignore[attr-defined]
     Oroll = rssm.img_rollout(h, z, a_hold_seq, dvs=dv_hold_seq,
@@ -6848,14 +6856,33 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
         tail = Oroll.index_select(-1, cv_idx)                     # (Bm, K, n_cv)
     else:
         tail = Oroll
+    parts = [h, z.reshape(Bm, -1)]
+    if c0 is not None and int(c0.shape[-1] or 0) > 0:
+        parts.append(c0)
+    if dv_hold is not None:
+        parts.append(dv_hold)
+    start_obs = rssm.decode(torch.cat(parts, dim=-1))
+    if (cv_idx is not None and int(getattr(rssm, 'n_cv', 0) or 0) > 0
+            and int(cv_idx.numel()) > 0):
+        start_cv = start_obs.index_select(-1, cv_idx)
+    else:
+        start_cv = start_obs
+    cv_1 = tail[:, 0]
+    cv_K = tail[:, -win_k:].mean(dim=1)
+    delta_1 = cv_1 - start_cv
+    delta_K = cv_K - start_cv
+    fo = _held_ol_fo_scale(cfg, K)
+    target = delta_1.detach() * fo
     scale = tail.detach().std().clamp_min(1e-3)
-    early = tail[:, s:s + win].mean(dim=1)                       # (Bm, n_cv|D)
-    late = tail[:, K - win:].mean(dim=1)
-    delta = late - early
-    loss = (delta / scale).pow(2).mean()
+    err = delta_K - target
+    loss = (err / scale).pow(2).mean()
+    tgt_d = target.detach()
+    den = tgt_d.pow(2).sum().clamp_min(1e-8)
+    ol_ratio = (delta_K.detach() * tgt_d).sum() / den
     extras: Dict[str, torch.Tensor] = {
         'wm_held_rollout_scale': scale.detach(),
-        'wm_held_cv_drift': delta.detach().abs().mean(),
+        'wm_held_cv_drift': err.detach().abs().mean(),
+        'wm_held_ol_ratio': ol_ratio.detach(),
     }
     # Soft recon-fidelity gate (mirror overshoot): ramp the term in only as
     # 1-step recon converges so an untrained decoder/prior is not destabilised
@@ -8624,7 +8651,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # OVERSHOOT EVERY step now (``img_rollout`` is one K-loop; compile-on
     # fuses it, eager still avoids per-start Python).  Isolation TBPTT is
     # the same ``img_rollout`` in chunks (``h``-only ``keep_c``).  The
-    # HELD-rollout (decode-CV stationarity, P62) stays every-other.
+    # HELD-rollout (decode-CV 1step→K magnitude, P63) stays every-other.
     # Gain-match (full-BPTT FD) batches baseline+per-input into the same
     # ``img_rollout`` so MIMO width does not multiply sequential K-loops.
     # P28 follow-up 11: skip when g is frozen (DOB curriculum P2).  Same
@@ -8692,6 +8719,8 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             'wm_held_rollout_scale', torch.zeros((), device=feats.device)),
         'wm_held_cv_drift': held_diag.get(
             'wm_held_cv_drift', torch.zeros((), device=feats.device)),
+        'wm_held_ol_ratio': held_diag.get(
+            'wm_held_ol_ratio', torch.zeros((), device=feats.device)),
         'cont_kl': cont_kl.detach(),
         'cont_gain_persist': cont_gain_persist.detach(),
         'gain_match_loss': gain_match_loss.detach(),
@@ -8816,7 +8845,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
         model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
 
-    # ----- (b2, P89) held-action rollout stationarity — RSSM-ONLY (SF no-op) --
+    # ----- (b2, P89/P63) held-action 1step→K magnitude — RSSM-ONLY (SF no-op) --
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
     held_loss, _held_starts, held_diag = _wm_held_rollout_stationarity_loss(
         model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
@@ -8840,6 +8869,8 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
             'wm_held_rollout_scale', torch.zeros((), device=device)),
         'wm_held_cv_drift': held_diag.get(
             'wm_held_cv_drift', torch.zeros((), device=device)),
+        'wm_held_ol_ratio': held_diag.get(
+            'wm_held_ol_ratio', torch.zeros((), device=device)),
     }
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away

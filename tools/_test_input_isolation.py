@@ -325,10 +325,8 @@ def main():
     assert torch.isfinite(ov_a).all() and torch.isfinite(ov_b).all()
     assert abs(float(ov_a) - float(ov_b)) > 1e-8, \
         'overshoot must read posterior c (loss unchanged when only c shifted)'
-    # Held-rollout is GAIN-NEUTRAL (late−early decoded-CV). A constant c
-    # offset that persists can cancel in that difference — do not require
-    # the loss to move. Still require a finite term; decoder noise below
-    # proves the decode-CV path. img_rollout(c0) above already proves start-c.
+    # Held-rollout is 1step→K magnitude (P63). Decoder noise below
+    # proves the decode-CV path. Do not require a c-slice shift to move it.
     torch.manual_seed(2)
     hd_a, _, d_a = _wm_held_rollout_stationarity_loss(model, feats_c, obs, act, cfg)
     assert torch.isfinite(hd_a).all() and float(hd_a) >= 0.0
