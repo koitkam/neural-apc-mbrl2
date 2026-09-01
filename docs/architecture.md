@@ -110,10 +110,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P66 EXIT** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, 515 iters):
 > per-seq `dob_ground` var-skip **REVERT / FALSIFIED**. Val MV **×0.766 /
 > ×0.774** DV **×0.773 / ×0.814**. det_r **0.264** pred_std **0.252 vs 1.93**.
-> Paired **−19.85 vs −104**, loses to P64. Third DOB-amp A/B. **P67 LIVE
-> extra-P1 iter 94:** teacher K=220 jsonl ×1; gate **82 FAIL 0.80@DV**,
-> gate **94 FAIL 0.79@DV** (P64 PASS 0.91@DV). Extra-P1 overshot MV
-> **1.11/@H 1.22**. Do not settle=`wm_tf_horizon`. Do not teacher-K N+1.
+> Paired **−19.85 vs −104**, loses to P64. Third DOB-amp A/B. **P67 CAPPED
+> GAIN_NOT_READY 0.80@DV** (`run_p67_gmatch4h`, pid **187753**): teacher
+> K=220 jsonl ×1; gates 82/94/104 **0.80/0.79/0.80@DV** vs P64 PASS
+> **0.91@DV**. Extra-P1 MV **1.25/@H 1.39**. HEAD **REVERT** auto K to H.
+> Do not settle=`wm_tf_horizon`. Do not teacher-K N+1.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -176,11 +177,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > P1→P2 replay flush **REVERT** (val pred_std 0.518 vs P64 0.608; paired
 > −12 vs −4.54). **P66 EXIT** per-seq `dob_ground` var-skip **REVERT /
 > FALSIFIED** (pred_std 0.252 vs P64 0.608; paired −19.85 vs −4.54).
-> **P67 LIVE extra-P1 iter 94** (`run_p67_gmatch4h`, pid **187753**):
-> teacher K=220 jsonl **×1.006 / ×1.021**. Storm **1/2 @67** recovered.
-> Gate **82 FAIL 0.80@DV**; gate **94 FAIL 0.79@DV** vs P64 **PASS 0.91@DV**.
-> Extra-P1 MV **1.11/@H 1.22**. Encode T lookback. Cap 929884. Do not
-> score actor if GAIN_NOT_READY. Val OL-vs-real pending.
+> **P67 CAPPED GAIN_NOT_READY 0.80@DV** (`run_p67_gmatch4h`, pid **187753**):
+> teacher K=220 jsonl **×1.013 / ×1.022**. Storm **1/2 @67** recovered.
+> Gates 82/94/104 **0.80/0.79/0.80@DV** vs P64 **PASS 0.91@DV**.
+> Extra-P1 MV **1.25/@H 1.39**. Encode T lookback. Actor INVALID.
+> HEAD **REVERT** auto K to control H. Do not score actor if
+> GAIN_NOT_READY. Val TM/decomp/det_r pending EXIT.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
@@ -930,9 +932,10 @@ fixes BOTH:
   is `wm_tf_horizon` = max(80, 4×horizon) — then roll the prior
   K=`gain_match_len` steps, held baseline vs
   +`gain_match_step` per MV/DV input, ΔCV/Δu. Sentinel `gain_match_len<=0`
-  auto = `wm_tf_horizon(H)` (P67; test_sim 220) so last-only Huber pins G
-  at the same window val TM / decomp use. Explicit `DREAMER_GAIN_MATCH_LEN=H`
-  A/B's P26–P66. Sentinel `gain_match_step<=0`
+  auto = control `horizon` (P26–P66 / **P67 REVERT**; test_sim 55).
+  P67 auto=`wm_tf_horizon` (220) CAPPED GAIN_NOT_READY **0.80@DV** vs
+  P64 K=H PASS **0.91@DV** — jsonl ×1 ≠ TM DC. Explicit
+  `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a
   nonlinear GRU). Explicit `DREAMER_GAIN_MATCH_STEP=1.0` A/B's

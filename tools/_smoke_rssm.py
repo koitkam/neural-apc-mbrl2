@@ -2924,12 +2924,16 @@ def _test_gain_match_held_settle() -> None:
     c_k = TrainConfig()
     c_k.horizon = 55
     c_k.gain_match_len = 0
-    assert _auto_gain_match_len(c_k) == 220
-    assert int(c_k.gain_match_len) == 220
+    assert _auto_gain_match_len(c_k) == 55
+    assert int(c_k.gain_match_len) == 55
     c_k2 = TrainConfig()
     c_k2.horizon = 55
     c_k2.gain_match_len = 55
     assert _auto_gain_match_len(c_k2) == 55
+    c_k3 = TrainConfig()
+    c_k3.horizon = 55
+    c_k3.gain_match_len = 220
+    assert _auto_gain_match_len(c_k3) == 220
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 
@@ -4526,7 +4530,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'iso_dcv=off' in banner, banner
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
-    assert 'gmatch_len=220' in banner, banner
+    assert 'gmatch_len=55' in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
     assert 'gmatch_clip=True' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
@@ -4542,7 +4546,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
     assert abs(float(plan['config']['gain_match_step']) - 0.4) < 1e-12
-    assert int(plan['config']['gain_match_len']) == 220
+    assert int(plan['config']['gain_match_len']) == 55
     assert float(plan['config']['dob_ground_coef']) == 2.0
     dcv = plan['isolation_dcv_scales']
     assert dcv['on'] is True

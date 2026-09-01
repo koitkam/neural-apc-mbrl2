@@ -936,15 +936,16 @@ class TrainConfig:
     # supervisor that pins the subdominant DV gain).  Resolved >0 only when the
     # continuous gain channel is on AND the identified gains are available.
     gain_match_coef: float = 0.0
-    gain_match_len: int = 0            # K FD steps; <=0 auto = wm_tf_horizon(H)
+    gain_match_len: int = 0            # K FD steps; <=0 auto = control H
     # Held prior-roll BEFORE the FD (P44).  Dataclass ``-1`` = off
     # (P43 identity: FD from the replay posterior).  ``0`` = auto
     # ``horizon`` (A/B only).  P44 env-free auto=H storm **2/2 @iter 66**
     # (G_pred≈0, CAPPED 0.76@DV) → REVERT default off.  The TM probe's
     # default window is ``wm_tf_horizon(H) = max(80, 4·H)`` (test_sim
-    # 220).  **P67:** teacher FD K auto-resolves to that window
-    # (last-only Huber at the same settle val TM uses).  Matching 4H
-    # *settle* (S=H_tf) is still a later A/B, not a retry of S=H.
+    # 220).  **P67 CAPPED GAIN_NOT_READY 0.80@DV:** teacher K auto =
+    # 4H **REVERT** to control H (jsonl ×1 at 220 ≠ TM DC; P64 at K=H
+    # PASS 0.91@DV).  Explicit ``DREAMER_GAIN_MATCH_LEN=220`` A/B.
+    # Matching 4H *settle* (S=H_tf) is still not a retry of S=H.
     # P43 Huber ~1e-4 from PRBS
     # posteriors while the rest-then-step probe stays ~0.75@DV.  P43 DV
     # @H ×0.849 vs ss ×0.740 is a real 4H-asymptote gap (MV @H≈ss); do
@@ -3638,7 +3639,7 @@ def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
             'aux_tbptt_steps' in explicit or cur != 16):
         return cur
     # Isolation TBPTT follows isolation K (or control H).  Do not follow
-    # teacher FD ``gain_match_len`` (P67: that is ``wm_tf_horizon``, 4H).
+    # teacher FD ``gain_match_len`` (P67 4H CAPPED; TBPTT is not that A/B).
     k = int(getattr(cfg, 'wm_input_isolation_len', 0) or 0)
     if k <= 0:
         k = int(getattr(cfg, 'horizon', 15) or 15)
@@ -4179,8 +4180,8 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     used the auto-enabled recipe — the same class of silent-drop that missed
     the latent-type default.  Call after the last promotion (gain-match).
     P60: resolve ``gain_match_step`` sentinel so the dump stores 0.4 not 0.0.
-    P67: resolve ``gain_match_len`` sentinel so the dump stores ``wm_tf_horizon``
-    not 0.
+    P67 REVERT: resolve ``gain_match_len`` sentinel so the dump stores
+    control H (not 0, not ``wm_tf_horizon``).
     """
     _resolve_gain_match_step(cfg)
     _auto_gain_match_len(cfg)
@@ -4520,8 +4521,8 @@ def _wm_train_seq_len(cfg: 'TrainConfig') -> int:
     transfer-matrix DC dead).  Gain-match no longer truncates open-loop
     ``K`` to ``T-1`` (held a/dv from the start; rest-IC FD rolls from
     the rest cache).  Do **not** grow T to ``gain_match_len`` (P67
-    teacher ``K = wm_tf_horizon`` would stack a longer recon encode on
-    the compounding A/B; GPU probe sizes from ``horizon``).  P3
+    4H teacher CAPPED; encode T stays lookback; GPU probe sizes from
+    ``horizon``).  P3
     on-policy stays ``seq_len``.  test_sim (seq_len=128, H=55) is
     unchanged.
     """
@@ -7872,9 +7873,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     From a strided set of posterior start states, optionally hold a/dv for
     ``gain_match_settle_len`` steps (P44: auto = control horizon; TM
     probe settle is 4×horizon — see TrainConfig),
-    then roll the PRIOR forward ``K = gain_match_len`` steps (P67:
-    sentinel auto = ``wm_tf_horizon(H)`` so last-only Huber pins G at
-    the val TM window; explicit H A/B's P26–P66) under (a) a HELD baseline
+    then roll the PRIOR forward ``K = gain_match_len`` steps (P67
+    REVERT: sentinel auto = control H; 4H CAPPED GAIN_NOT_READY 0.80@DV
+    vs P64 K=H PASS 0.91@DV; explicit ``DREAMER_GAIN_MATCH_LEN=220`` A/B)
+    under (a) a HELD baseline
     action/DV and (b) a unit STEP in each input channel.
 
     ``gain_match_rest_ic`` (P45 EXIT default): replace PRBS-posterior starts
@@ -8292,8 +8294,8 @@ def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
     P44 env-free auto=H storm **2/2 @iter 66** (G_pred≈0, CAPPED 0.76@DV)
     → default is ``-1`` (P43 FD-from-posterior).  ``DREAMER_GAIN_MATCH_SETTLE_LEN=0``
     still means auto H.  The TM probe defaults to ``wm_tf_horizon(H)``
-    (test_sim 220).  P67 teacher FD K auto-resolves to that window;
-    matching 4H *settle* is still a later A/B, not a retry of S=H.
+    (test_sim 220).  P67 teacher FD K auto=4H CAPPED 0.80@DV → REVERT
+    to control H. Matching 4H *settle* is still not a retry of S=H.
     Do not use ``or 0`` — that would treat ``-1`` as auto.  Mutates
     ``cfg.gain_match_settle_len`` only when it was 0.
     """
@@ -8305,23 +8307,19 @@ def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
 
 
 def _auto_gain_match_len(cfg: TrainConfig) -> int:
-    """Sentinel ``<=0`` → ``wm_tf_horizon(H)`` (val TM / decomp window).
+    """Sentinel ``<=0`` → control ``horizon`` (P26–P66 / P67 REVERT).
 
-    P26–P66 auto was control H (test_sim 55).  Last-only Huber at K=H
-    pins G(H) while val OL-vs-real is at ``max(80,4H)`` (220).  P64
-    leftover compounding is 1-step-faithful / OL ×0.842.  This
-    lengthens FD K to the same settle the probe uses — not P44 S=H
-    (held settle before FD) and not a Huber reweight (P61 deferred
-    ``gain_match_len=4H`` as reweight).  Explicit
-    ``DREAMER_GAIN_MATCH_LEN=H`` A/B's the old teacher.  Mutates
+    P67 auto = ``wm_tf_horizon`` (test_sim 220) CAPPED GAIN_NOT_READY
+    **0.80@DV** (gates 82/94/104). jsonl teacher ×1 at K=220 did not
+    pin live TM DC (P64 at K=H PASS **0.91@DV**). Extra-P1 overshot
+    MV (1.25/@H 1.39). Not P44 S=H. Explicit
+    ``DREAMER_GAIN_MATCH_LEN=220`` A/B's 4H. Mutates
     ``cfg.gain_match_len``.
     """
     k = int(getattr(cfg, 'gain_match_len', 0) or 0)
     if k > 0:
         return k
-    from evaluation.wm_transfer_matrix import wm_tf_horizon
-    h = int(getattr(cfg, 'horizon', 15) or 15)
-    cfg.gain_match_len = int(wm_tf_horizon(h))
+    cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
     return int(cfg.gain_match_len)
 
 
