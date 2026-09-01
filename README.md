@@ -333,8 +333,8 @@ held-action seed episodes fully noise-free, and the **process-noise curriculum**
 | `DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH` | Fraction of P2 budget at which the P2 trigger probability reaches `DREAMER_DISTURBANCE_PROB_P2` (default 0.5 = midpoint of P2). |
 | `DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH` | Fraction of P3 budget at which the P3 trigger probability reaches `DREAMER_DISTURBANCE_PROB_AGENT` (default 0.5 = midpoint of P3). |
 | `DREAMER_HIDDEN_OU_AMP_RAMP` | `"<start>:<reach>"` (default `0.1:0.4`). Linear amplitude ramp from `start` at progress=0 to 1.0 at `progress=reach`, then capped by the phase-aware amplitude cap. |
-| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE` | Hard cap on `curriculum_amp_scale()` in **P1/P2** (default 0.2). With base `amp_frac=0.10`, peak disturbance ≈ 2% of MV authority during WM/critic learning. |
-| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3` | Hard cap on `curriculum_amp_scale()` in **P3** (default 1.0). The WM is frozen in P3 and the actor must learn realistic-magnitude rejection, so amplitude jumps to full nominal. |
+| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE` | Hard cap on `curriculum_amp_scale()` in **P1** (default 0.2). With base `amp_frac=0.10`, peak disturbance ≈ 2% of MV authority while `g` trains without DOB. |
+| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3` | Hard cap on `curriculum_amp_scale()` in **P2 and P3** (default 1.0). P64: P2 Kalman ID uses deployment amplitude (`g` frozen). P3 actor rejection stays full-scale. |
 | `DREAMER_HIDDEN_OU_AMP_JITTER` | `"<lo>:<hi>"` per-episode amplitude DR multiplier (default `0.6:1.6`). |
 | `DREAMER_HIDDEN_OU_DRIFT_FRAC` | Max constant per-episode mean offset as fraction of amp (default 0.4). |
 
@@ -345,14 +345,12 @@ least harm:
 | Phase | Trigger probability | Amplitude cap | Driving signal |
 |---|---|---|---|
 | P1 (WM) | 0.05 → 0.10 | 0.2 | `wm_best_score / TARGET_SCORE` |
-| P2 (critic) | 0.10 → 0.20 | 0.2 | `phase_progress / P2_RAMP_REACH` |
+| P2 (critic / DOB) | 0.10 → 0.20 | **1.0** (P64; was 0.2) | `phase_progress / P2_RAMP_REACH` |
 | P3 (actor) | 0.20 → 0.30 | 1.0 | `phase_progress / P3_RAMP_REACH` |
 
-This gives a continuous monotonic ramp across phases: trigger
-probability and amplitude both start small (clean signal for WM
-learning), broaden gradually as the critic needs broader state-space
-coverage, and reach full operational magnitude only in P3 when the
-actor is the one learning to reject.
+This keeps P1 amplitude small (clean signal for WM/`g` ID without DOB)
+and jumps to full operational magnitude in **P2** (Kalman ID; `g` frozen)
+and P3 (actor rejection). Trigger probability still ramps across phases.
 
 #### WM fidelity early-stop and `wm_best.pt`
 

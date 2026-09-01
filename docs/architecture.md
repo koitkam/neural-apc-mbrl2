@@ -88,9 +88,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > Val MV **×0.806 / ×0.790** DV **×0.800 / ×0.815** det_r **0.364**.
 > 1step→OL ×0.828 OL-vs-real **×0.785** (P61 ×0.809). Paired **−44.58 vs
 > −112.66** 9/9, loses to P58/P61. P1 held **1.53e-4** vs overshoot **0.040**.
-> **P63 LAUNCH** (`run_p63_olmag`): 1step→K FO magnitude (stop-grad Δ1;
-> no new knob). `[resolved-cfg] held_mag=True`. Score OL-vs-real not just
-> 1step→OL ratio. Champion **P58** econ / **P53** μ-ratio / **P26** observer.
+> **P63 EXIT** (`run_p63_olmag`, pid **165969**, sha `61cbdf9`, 79 iters):
+> 1step→K FO magnitude **DISCARDED / REVERT**. Storm **2/2**, recon stuck
+> ~0.5, GAIN_NOT_READY **9.75@MV**, P3 skipped. Do **not** score actor.
+> Held-magnitude family **closed**. KEEP `out='obs'` late−early.
+> **P64 LAUNCH** (`run_p64_p2amp`): P2 Kalman amp = P3/val cap (P1 stays
+> 0.2). `[resolved-cfg] held_cv=True p1amp=0.2 p2amp=1 p3amp=1`.
+> Champion **P58** econ / **P53** μ-ratio / **P26** observer.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -147,8 +151,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **−27 vs −112**. **P61 EXIT** clip KEEP as protocol / FALSIFIED as TM
 > (val MV ×0.911 DV ×0.772; paired −24 vs −87). **P62 EXIT** held decode-CV
 > KEEP as space / FALSIFIED as compounding (val MV ×0.806 DV ×0.800
-> OL-vs-real ×0.785; paired −45 vs −113). **P63** 1step→K FO magnitude.
-> `derive_horizon` / sim `reset()` now
+> OL-vs-real ×0.785; paired −45 vs −113). **P63 EXIT** FO magnitude
+> **REVERT** (GAIN_NOT_READY; family closed). **P64** P2 Kalman amp = P3
+> cap. `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
@@ -925,12 +930,11 @@ fixes BOTH:
   Stage-1 `_posterior_step`. Full-T main WM encode stacks
   `h/z/(c)/(dv)` then one cat (`_stack_decode_core`; identity vs
   `feat[..., :dec_in]`). Overshoot `out='obs'` is one `decode` after K.
-  Held-rollout (P63) is `out='obs'` then 1-step→K decoded-CV **magnitude**
-  (FO `τ/sr` scale; stop-grad Δ1). P62 late−early was silent (held
-  ~1.5e-4 vs overshoot ~0.040) while val OL-vs-real stayed ×0.785.
-  jsonl `wm_held_rollout_scale` / `wm_held_cv_drift` / `wm_held_ol_ratio`
-  (LS ΔK/target; 1=match). `wm_held_rollout_settle_frac` is **removed**
-  (P62 late−early early-window; unread after P63). `img_rollout out='h'` is removed
+  Held-rollout is `out='obs'` then decoded-CV **late−early** (P62 space
+  KEEP; P63 1step→K FO magnitude **REVERT** — FO~13 × sg(Δ1) detonated
+  P1). Early window `s=K//2`. jsonl `wm_held_rollout_scale` /
+  `wm_held_cv_drift` (`wm_held_ol_ratio` unused, emits 0).
+  `wm_held_rollout_settle_frac` is **removed**. `img_rollout out='h'` is removed
   (P61 held; isolation TBPTT still default-feat + `keep_c` on `h`).
   CUDA: `make_graphed_callables` on
   `_RestICGraphModule` wrapping that T-loop when

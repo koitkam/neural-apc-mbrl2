@@ -131,22 +131,36 @@ def hidden_disturbance_enabled(default: bool = True, cfg=None) -> bool:
                       'DREAMER_HIDDEN_DISTURBANCE', default)
 
 
+def _phase_amp_cap(phase: Optional[int], cfg=None) -> float:
+    """Hidden-OU amplitude cap for a curriculum phase.
+
+    P1 (and missing phase) uses ``hidden_ou_amp_max_scale`` (default 0.2)
+    so plant-ID of ``g`` without DOB is not the p112 omitted-variable
+    confound.  **P64:** phase ≥ 2 uses ``hidden_ou_amp_max_scale_p3``
+    (default 1.0) — P2 Kalman ID at val/P3 deployment amplitude while
+    ``g`` is frozen.  No new knob.
+    """
+    p = None if phase is None else int(phase)
+    if p is not None and p >= 2:
+        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale_p3',
+                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3', 1.0)
+    else:
+        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale',
+                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE', 0.2)
+    return float(np.clip(cap, 0.0, 1.0))
+
+
 def curriculum_amp_scale(progress: float, phase: Optional[int] = None,
                          cfg=None) -> float:
     """Amplitude curriculum scale (≤cap) as a function of training progress.
 
     Reads TrainConfig ``hidden_ou_amp_ramp`` /
     leftover ``DREAMER_HIDDEN_OU_AMP_RAMP="<start_frac>:<reach_full_at>"``.
-    Phase-aware cap: P1/P2 ``hidden_ou_amp_max_scale`` (0.2); P3
-    ``hidden_ou_amp_max_scale_p3`` (1.0).  Malformed/empty leftover → cap.
+    Phase-aware cap: P1 ``hidden_ou_amp_max_scale`` (0.2); P2/P3
+    ``hidden_ou_amp_max_scale_p3`` (1.0; P64 P2 Kalman at deployment
+    amp).  Malformed/empty leftover → cap.
     """
-    if phase is not None and int(phase) >= 3:
-        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale_p3',
-                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3', 1.0)
-    else:
-        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale',
-                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE', 0.2)
-    cap = float(np.clip(cap, 0.0, 1.0))
+    cap = _phase_amp_cap(phase, cfg)
     raw, leftover = _knob_raw(cfg, 'hidden_ou_amp_ramp',
                               'DREAMER_HIDDEN_OU_AMP_RAMP')
     if leftover and (raw is None or str(raw).strip() == ''):
@@ -664,7 +678,7 @@ def maybe_build_hidden_disturbance(
     the amplitude curriculum (see ``curriculum_amp_scale``) and the
     per-episode jitter / drift DR knobs to produce the effective
     ``amp_frac`` and ``drift_frac`` for this episode.  ``phase`` (optional)
-    selects the phase-aware amp cap (P1/P2 vs P3).
+    selects the phase-aware amp cap (P1 vs P2/P3).
     """
     if not hidden_disturbance_enabled(default=True, cfg=cfg):
         return None

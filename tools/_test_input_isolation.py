@@ -325,8 +325,8 @@ def main():
     assert torch.isfinite(ov_a).all() and torch.isfinite(ov_b).all()
     assert abs(float(ov_a) - float(ov_b)) > 1e-8, \
         'overshoot must read posterior c (loss unchanged when only c shifted)'
-    # Held-rollout is 1step→K magnitude (P63). Decoder noise below
-    # proves the decode-CV path. Do not require a c-slice shift to move it.
+    # Held-rollout is decode-CV late−early (P62; P63 magnitude REVERT).
+    # Decoder noise below proves the decode-CV path.
     torch.manual_seed(2)
     hd_a, _, d_a = _wm_held_rollout_stationarity_loss(model, feats_c, obs, act, cfg)
     assert torch.isfinite(hd_a).all() and float(hd_a) >= 0.0

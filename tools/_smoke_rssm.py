@@ -71,7 +71,7 @@ from training.train import (
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
                             _gain_match_rest_window, _gain_match_rest_ic_state,
-                            _held_rollout_win, _held_ol_fo_scale,
+                            _held_rollout_win,
                             _wm_held_rollout_stationarity_loss,
                             _rest_ic_can_cuda_graph,
                             _RestICGraphModule, _rest_ic_last_tensors,
@@ -1872,9 +1872,11 @@ def _test_isolation_dcv_scales() -> None:
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "out='obs'" in _src
-    assert 'held_mag=True' in _src
+    assert 'held_cv=True' in _src
+    assert 'p1amp=' in _src
+    assert 'p2amp=' in _src
+    assert 'p3amp=' in _src
     assert 'wm_held_cv_drift' in _src
-    assert 'wm_held_ol_ratio' in _src
     assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
     assert "last_only=True, out='obs'" in _src
@@ -2906,17 +2908,20 @@ def _test_held_rollout_win_fits_k() -> None:
     assert _held_rollout_win(15, 8) == 3
     assert _held_rollout_win(15, 0) == 2
     assert _held_rollout_win(32, 8) == 7
-    # P63: one K-tail window must fit in K (late−early two-window gone).
+    # Two windows [s, s+win) and [K-win, K) must not overlap.
     for k, w_req in ((55, 8), (15, 8), (15, 0), (32, 8)):
         w = _held_rollout_win(k, w_req)
         cap = max(1, (k - 1) // 4)
         assert 1 <= w <= min(k, cap), (k, w_req, w, cap)
+        s = k // 2
+        s = max(w, min(s, k - 2 * w))
+        assert s >= w and k - w > s + w, (k, w, s)
     assert not hasattr(TrainConfig(), 'wm_held_rollout_settle_frac')
     print('[smoke] OK  held-rollout win clamps to (K-1)/4 (test_sim 8)')
 
 
 def _test_held_rollout_cv_space() -> None:
-    """P63: held 1step→K is decode-CV magnitude, not late−early / GRU h."""
+    """P62: held is decode-CV late−early, not GRU h / P63 FO magnitude."""
     import inspect
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
 
@@ -2924,8 +2929,9 @@ def _test_held_rollout_cv_space() -> None:
     assert "out='obs'" in src, 'held must roll decode, not out=h'
     assert 'cv_index_t' in src
     assert "out='h'" not in src
-    assert '_held_ol_fo_scale' in src
-    assert 'delta_1.detach()' in src
+    assert 'K // 2' in src
+    assert '_held_ol_fo_scale' not in src
+    assert 'delta_1.detach()' not in src
 
     class _Wrap:
         world_model_type = 'rssm'
@@ -2950,20 +2956,13 @@ def _test_held_rollout_cv_space() -> None:
     cfg.wm_held_rollout_len = 8
     cfg.wm_held_rollout_gate_recon = 0.0
     cfg.wm_held_rollout_max_starts = 2
-    cfg.identified_tau_dominant = 53.0
-    cfg.sample_rate = 4
-    cfg.horizon = 55
-    fo = _held_ol_fo_scale(cfg, 8)
-    assert 5.0 < fo < 8.01, fo
-    fo55 = _held_ol_fo_scale(cfg, 55)
-    assert 10.0 < fo55 < 55.01, fo55
     torch.manual_seed(0)
     hd0, n0, d0 = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
     assert torch.isfinite(hd0).all() and float(hd0) >= 0.0 and n0 > 0
     assert float(d0['wm_held_rollout_scale']) >= 1e-3
     assert float(d0['wm_held_cv_drift']) >= 0.0
-    assert torch.isfinite(d0['wm_held_ol_ratio']).all()
-    assert float(hd0) < 50.0, f'held magnitude detonated at init ({float(hd0):.3f})'
+    assert 'wm_held_ol_ratio' not in d0
+    assert float(hd0) < 50.0, f'held detonated at init ({float(hd0):.3f})'
     snap = {n: p.detach().clone() for n, p in dyn.decoder.named_parameters()}
     with torch.no_grad():
         for p in dyn.decoder.parameters():
@@ -2976,10 +2975,10 @@ def _test_held_rollout_cv_space() -> None:
     assert abs(float(hd0) - float(hd1)) > 1e-8, (
         f'held ignored decoder ({float(hd0):.5f} vs {float(hd1):.5f})')
     assert abs(float(d0['wm_held_cv_drift']) - float(d1['wm_held_cv_drift'])) > 1e-8
-    print(f'[smoke] OK  held decode-CV 1step→K magnitude '
+    print(f'[smoke] OK  held decode-CV late−early '
           f'(loss {float(hd0):.4f}→{float(hd1):.4f} on decoder noise; '
           f'drift {float(d0["wm_held_cv_drift"]):.4f}→'
-          f'{float(d1["wm_held_cv_drift"]):.4f}; fo8={fo:.2f})')
+          f'{float(d1["wm_held_cv_drift"]):.4f})')
 
 
 def _test_collect_rest_lookback_tm_pairing() -> None:
@@ -3862,7 +3861,8 @@ def _test_noise_hidden_cfg() -> None:
     """Process-noise ramp + hidden-load: TrainConfig default, leftover, explicit."""
     import os
     from utils.hidden_disturbance import (
-        get_phase_disturbance_prob, hidden_disturbance_enabled)
+        get_phase_disturbance_prob, hidden_disturbance_enabled,
+        curriculum_amp_scale)
     from utils.noise_config import noise_curriculum_scale
     keys = (
         'DREAMER_PROCESS_NOISE_AMP_RAMP',
@@ -3876,6 +3876,12 @@ def _test_noise_hidden_cfg() -> None:
         c = TrainConfig()
         assert c.process_noise_amp_ramp == '0.0:0.4'
         assert c.hidden_disturbance is True
+        assert abs(float(c.hidden_ou_amp_max_scale) - 0.2) < 1e-12
+        assert abs(float(c.hidden_ou_amp_max_scale_p3) - 1.0) < 1e-12
+        assert abs(curriculum_amp_scale(1.0, phase=1, cfg=c) - 0.2) < 1e-12
+        assert abs(curriculum_amp_scale(1.0, phase=2, cfg=c) - 1.0) < 1e-12
+        assert abs(curriculum_amp_scale(1.0, phase=3, cfg=c) - 1.0) < 1e-12
+        assert abs(curriculum_amp_scale(1.0, phase=None, cfg=c) - 0.2) < 1e-12
         assert abs(float(c.hidden_dist_p_revert) - 0.7) < 1e-12
         assert c.hidden_dist_shape_weights == '0.5,0.3,0.2'
         s0 = noise_curriculum_scale(0.0, phase=1)
