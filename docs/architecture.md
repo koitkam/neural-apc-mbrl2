@@ -107,7 +107,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > `realsim_return_mean`. Stale `tools/run_nl_then_p09.sh` + p138/p136
 > one-off probes **DISCARDED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
-> **P66** per-seq `dob_ground` var-skip (mixed ring KEEP).
+> **P66 LIVE P1** (`run_p66_dobvar`, pid **181468**, sha `38880f9`): per-seq
+> `dob_ground` var-skip (1e-3; mixed ring KEEP). Flush **off**.
 > Do not settle=`wm_tf_horizon`. Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
