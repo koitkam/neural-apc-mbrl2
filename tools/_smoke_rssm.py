@@ -1379,6 +1379,41 @@ def _test_buffer_sample_keys() -> None:
     print('[smoke] OK  buffer sample keys subset identity')
 
 
+def _test_buffer_clear() -> None:
+    """P1→P2 flush drops filled/write; leftover slots are not sampled."""
+    import numpy as np
+    from training.train import TrajectoryBuffer
+
+    T, D, A = 8, 3, 1
+    buf = TrajectoryBuffer(4, T, D, A, n_dist=1)
+    for i in range(3):
+        obs = np.full((T, D), float(i), dtype='float32')
+        act = np.full((T, A), float(i), dtype='float32')
+        rew = np.zeros(T, dtype='float32')
+        cont = np.ones(T, dtype='float32')
+        dist = np.zeros((T, 1), dtype='float32')
+        buf.add_episode(obs, act, rew, cont, dist=dist)
+    assert buf.filled == 3 and buf.write == 3
+    buf.clear()
+    assert buf.filled == 0 and buf.write == 0
+    try:
+        buf.sample(2, 4, np.random.default_rng(0))
+        raise AssertionError('sample on empty buffer must raise')
+    except ValueError:
+        pass
+    obs = np.ones((T, D), dtype='float32')
+    act = np.ones((T, A), dtype='float32')
+    rew = np.ones(T, dtype='float32')
+    cont = np.ones(T, dtype='float32')
+    dist = np.full((T, 1), 7.0, dtype='float32')
+    buf.add_episode(obs, act, rew, cont, dist=dist)
+    assert buf.filled == 1 and buf.write == 1
+    got = buf.sample(8, 4, np.random.default_rng(1))
+    assert got['obs'].shape[0] == 8
+    assert np.allclose(got['dist'], 7.0)
+    print('[smoke] OK  buffer clear drops P1 rows; refill samples new')
+
+
 def _test_store_aux_feats_identity() -> None:
     """Isolation encode may drop logit stacks; feats must match the full pass."""
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics, _dob_scan_mix_budget_bytes
@@ -4685,6 +4720,7 @@ if __name__ == '__main__':
     _test_time_unbind_and_p1_h2d_keys()
     _test_lambda_returns_scan()
     _test_buffer_sample_keys()
+    _test_buffer_clear()
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
     _test_img_step_det_roll_skips_sample()

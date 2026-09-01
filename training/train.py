@@ -5000,6 +5000,20 @@ class TrajectoryBuffer:
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
+    def clear(self) -> None:
+        """Drop stored episodes (keep allocated tensors).
+
+        Used at the discrete P1→P2 latch so Kalman / ``dob_ground`` ID is
+        not trained on a ring still full of Stage-1 ``d≡0`` rows.  Those
+        zeros make unnormalized grounding ≡ L2-on-``d``→0 (the p19
+        ``dob_reg`` hole through the front door) and mix SNR so K
+        under-gains at val/P3 amplitude.  ``sample`` still raises on an
+        empty buffer; the same-iter P2 collect writes load episodes
+        before the first P2 train step.
+        """
+        self.filled = 0
+        self.write = 0
+
     def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator,
                keys: Optional[Tuple[str, ...]] = None
                ) -> Dict[str, np.ndarray]:
@@ -12175,6 +12189,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"steps{total_env_steps}: {_desc} "
               f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
               f"trainable-flags set]", flush=True)
+        # P64 RCA: capacity ~327 is full of P1 d≡0 at the latch
+        # (test_sim 400k steps / 1220).  P2 collect cannot lap it in
+        # 54 iters.  Flush once here (discrete P1→P2 only; this
+        # branch is not the cont-latent curriculum).  Same-iter
+        # collect writes deployment-amp load before the first P2
+        # train step.
+        if _cur_stage == 2:
+            _n_drop = int(buf.filled)
+            buf.clear()
+            print(f"[curriculum] P2 replay flush: dropped {_n_drop} P1 "
+                  f"(d≡0) episodes so Kalman ID trains on "
+                  f"deployment-amp load",
+                  flush=True)
         if not _dynamics_g_trainable(model):
             _release_rest_ic_after_g_freeze(
                 getattr(model, 'dynamics', None))
