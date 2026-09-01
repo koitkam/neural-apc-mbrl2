@@ -92,11 +92,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > 1step→K FO magnitude **DISCARDED / REVERT**. Storm **2/2**, recon stuck
 > ~0.5, GAIN_NOT_READY **9.75@MV**, P3 skipped. Do **not** score actor.
 > Held-magnitude family **closed**. KEEP `out='obs'` late−early.
-> **P64 LIVE** (`run_p64_p2amp`, pid **169231**): P2 Kalman amp = P3/val cap (P1 stays
-> 0.2). `[resolved-cfg] held_cv=True p1amp=0.2 p2amp=1 p3amp=1`. P1 iter **61**
-> recon **0.0023** skip **0** held **6.6e-5** (P62-class; passed storm windows
-> 56–57 and @61). P2 amp not on yet. Dummy jsonl `wm_held_ol_ratio` **REMOVED**.
-> `DREAMER_ACT_HIST_REQUIRED` **REMOVED** (`imagine_next_z` requires history).
+> **P64 LIVE** (`run_p64_p2amp`, pid **169231**, sha `9544451`): P2 Kalman amp =
+> P3/val cap. P1 **GAIN-READY 0.91@DV** last_ok **82**. P2 `dob_d` **0.063** vs
+> P62 **0.026** (~2.4×); `dobg` **~19×**. P3 @136 PASS; unfreeze 147 ent
+> **−0.101 HELD** rscale **2.02 KEEP**. Watch val pred_std vs 1.93. Dummy jsonl
+> `wm_held_ol_ratio` **REMOVED**. `DREAMER_ACT_HIST_REQUIRED` **REMOVED**.
 > Champion **P58** econ / **P53** μ-ratio / **P26** observer.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
