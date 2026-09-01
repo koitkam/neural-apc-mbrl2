@@ -183,13 +183,10 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert 'critic_pred_target_r' in diag, sorted(diag)
     assert 'critic_target_v_r' in diag, sorted(diag)
     assert 'actor_pos_adv_frac' in diag, sorted(diag)
-    assert 'pmpo_pos_frac' in diag, sorted(diag)
     assert 'adv_action_corr' in diag, sorted(diag)
-    assert 'imag_adv_action_corr' in diag, sorted(diag)
-    assert abs(float(diag['actor_pos_adv_frac'])
-               - float(diag['pmpo_pos_frac'])) < 1e-12
-    assert abs(float(diag['adv_action_corr'])
-               - float(diag['imag_adv_action_corr'])) < 1e-12
+    assert 'pmpo_pos_frac' not in diag, sorted(diag)
+    assert 'imag_adv_action_corr' not in diag, sorted(diag)
+    assert 'imagined_return_mean' not in diag, sorted(diag)
     assert torch.isfinite(diag['critic_mc_loss']).all()
     assert float(diag['critic_mc_loss']) >= 0.0
     # P26 RCA / P27: freeze return_scale — second call must not move ret_scale.
@@ -1913,6 +1910,11 @@ def _test_isolation_dcv_scales() -> None:
     assert 'p3amp=' in _src
     assert 'wm_held_cv_drift' in _src
     assert "'wm_held_ol_ratio'" not in _src
+    assert "'pmpo_pos_frac': pos_adv_frac" not in _src
+    assert "'imag_adv_action_corr': adv_action_corr" not in _src
+    assert "'imagined_return_mean': target_returns" not in _src
+    assert not (__import__('pathlib').Path(__file__).resolve().parent
+                / 'run_nl_then_p09.sh').exists()
     assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
     assert "last_only=True, out='obs'" in _src
@@ -4360,7 +4362,7 @@ def _test_training_diagnostics_cascade_axes() -> None:
         assert abs(float(p3['actor_logp_std']['last']) - 18.8) < 1e-9
         flags = ' '.join(summary['flags'])
         assert 'imagined returns' not in flags
-    print('[smoke] OK  training_diagnostics cascade axes + leftover jsonl names')
+    print('[smoke] OK  training_diagnostics cascade axes + old-log leftover names')
 
 
 def _test_format_gain_probe_line() -> None:

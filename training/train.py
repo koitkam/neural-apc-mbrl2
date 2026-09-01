@@ -9051,7 +9051,11 @@ def _adv_action_corr(adv_raw: torch.Tensor, act_flat: torch.Tensor
 
 
 def _row_adv_action_corr(row: Dict):
-    """Real-sim |corr(adv, action)|. Leftover jsonl key is ``imag_adv_action_corr``."""
+    """Real-sim |corr(adv, action)|.
+
+    New logs write ``adv_action_corr`` only.  ``imag_adv_action_corr`` is
+    still read from pre-P65 jsonl (imagination-era alias).
+    """
     v = row.get('adv_action_corr')
     if v is None:
         v = row.get('imag_adv_action_corr')
@@ -9448,7 +9452,6 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_loss': critic_loss,
         'entropy_mean': entropy.mean().detach(),
         'realsim_return_mean': target_returns.mean().detach(),
-        'imagined_return_mean': target_returns.mean().detach(),
         'realsim_reward_mean': rew.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
         'adv_global_std': adv_raw.std().detach(),
@@ -9458,15 +9461,11 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'critic_target_v_r': target_v_r.detach(),
         'critic_mc_loss': critic_mc_loss.detach(),
         'adv_action_corr': adv_action_corr.detach(),
-        # leftover jsonl key (imagination-actor era); same tensor
-        'imag_adv_action_corr': adv_action_corr.detach(),
         'actor_logp_mean': logp.mean().detach(),
         'actor_logp_std': logp.std().detach(),
         'actor_ratio_mean': _ratio_mean.detach(),
         'actor_ratio_clip_frac': _ratio_clip_frac.detach(),
         'actor_pos_adv_frac': pos_adv_frac.detach(),
-        # leftover jsonl key (PMPO era); same tensor as ``actor_pos_adv_frac``
-        'pmpo_pos_frac': pos_adv_frac.detach(),
         'bc_loss': bc_loss_p3.detach(),
         'expert_bc_weight': torch.tensor(float(expert_bc_weight), device=device),
     }
@@ -10983,8 +10982,7 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
             'critic_rew_to_tgt_var', 'critic_pred_target_r',
             'critic_target_v_r', 'critic_mc_loss',
             'agent_minus_expert_return', 'actor_pos_adv_frac',
-            'adv_action_corr', 'imag_adv_action_corr',
-            'imagined_return_mean', 'return_scale',
+            'adv_action_corr', 'return_scale',
         ]
         with open(csv_path, 'w', newline='') as fh:
             w = csv.writer(fh)
@@ -14627,8 +14625,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             # is also low (genuine degeneracy), never on a
                             # performing low-σ policy.  ``adv_corr`` None (pre-corr
                             # logging) ⇒ fall back to the entropy-only trip.
-                            # Canonical jsonl key is ``adv_action_corr`` (real-sim);
-                            # leftover ``imag_adv_action_corr`` is the same tensor.
+                            # Canonical jsonl key is ``adv_action_corr``.
+                            # ``_row_adv_action_corr`` still reads leftover
+                            # ``imag_adv_action_corr`` from old logs.
                             _ac = _row_adv_action_corr(row)
                             if _ac is not None:
                                 adv_corr_window.append(abs(float(_ac)))

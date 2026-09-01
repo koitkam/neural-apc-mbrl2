@@ -98,12 +98,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > pred_std **0.608 vs 1.93**. Paired **−4.54 vs −94 BEATS 9/9** (beats P58).
 > **PARTIAL as DOB-amp**. **FALSIFIED as det_r→P26**. P2 buffer stayed 100%
 > P1-clean at the latch. **P65 LIVE** (`run_p65_p2flush`, pid **173526**,
-> sha `b4ee586`): P1→P2 replay flush. Still P1 @iter ~31 (recon 0.0034,
-> skip 0, matches P64). Dummy jsonl
+> sha `b4ee586`): P1→P2 replay flush. Still P1 @iter **63** (recon 0.0028,
+> skip 0, matches P64@63). Dummy jsonl
 > `wm_held_ol_ratio` **REMOVED**. `DREAMER_ACT_HIST_REQUIRED` **REMOVED**.
+> Leftover P3 jsonl alias **writes** **REMOVED**. Stale
+> `tools/run_nl_then_p09.sh` **DISCARDED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
-> Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
-> aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
+> Do not settle=`wm_tf_horizon`. Canonical jsonl `adv_action_corr`.
+> `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
 > `skip this/cum` (`n_grad_skip_iter`).
 > p136 `actor_kl_coef` **REMOVED**.
@@ -945,6 +947,9 @@ fixes BOTH:
   KEEP; P63 1step→K FO magnitude **REVERT** — FO~13 × sg(Δ1) detonated
   P1). Early window `s=K//2`. jsonl `wm_held_rollout_scale` /
   `wm_held_cv_drift`. Dummy `wm_held_ol_ratio` **REMOVED** (P64-live).
+  Leftover P3 jsonl alias writes (`imag_adv_action_corr` /
+  `pmpo_pos_frac` / `imagined_return_mean`) **REMOVED** (P65-live;
+  parsers still read old logs).
   SF `imagine_next_z` requires `action_history` (unwhitelisted
   `DREAMER_ACT_HIST_REQUIRED` zeros-fallback **REMOVED**; P64-live).
   `wm_held_rollout_settle_frac` is **removed**. `img_rollout out='h'` is removed
