@@ -97,7 +97,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > **×0.927 / ×0.932** DV **×0.893 / ×0.962** (new DV champ). det_r **0.352**
 > pred_std **0.608 vs 1.93**. Paired **−4.54 vs −94 BEATS 9/9** (beats P58).
 > **PARTIAL as DOB-amp**. **FALSIFIED as det_r→P26**. P2 buffer stayed 100%
-> P1-clean at the latch. **P65 EXIT** (`run_p65_p2flush`, pid **173526**,
+> P1-clean at the latch. **P66 EXIT** skip **REVERT**. **P65 EXIT** (`run_p65_p2flush`, pid **173526**,
 > sha `b4ee586`, 515 iters): P1→P2 replay flush **REVERT / FALSIFIED**.
 > Val MV **×0.830 / ×0.814** DV **×0.794 / ×0.844**. det_r **0.191**
 > pred_std **0.518 vs 1.93**. Paired **−11.95 vs −139** 9/9, loses to P64.
@@ -107,13 +107,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > `realsim_return_mean`. Stale `tools/run_nl_then_p09.sh` + p138/p136
 > one-off probes **DISCARDED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
-> **P66 LIVE P3** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, ~iter **280**):
-> per-seq `dob_ground` var-skip. GAIN-READY **0.84@DV** last_ok **76 locked**.
-> P2 buf **327/327**. `dob_ground` med **0.272** (P64 0.121) but
-> `dob_d_absmean` **0.043** (P64 0.063) — skip undilutes MSE, `|d|` did not
-> grow. Unfreeze **147** ent **−0.101 HELD** rscale **2.70**. rtgt collapsed.
-> Actor VALID; val pending. HEAD (not pid): jsonl `dob_ground_keep_frac`.
-> Do not settle=`wm_tf_horizon`. Canonical jsonl `adv_action_corr`.
+> **P66 EXIT** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, 515 iters):
+> per-seq `dob_ground` var-skip **REVERT / FALSIFIED**. Val MV **×0.766 /
+> ×0.774** DV **×0.773 / ×0.814**. det_r **0.264** pred_std **0.252 vs 1.93**.
+> Paired **−19.85 vs −104**, loses to P64. Third DOB-amp A/B. **P67:** teacher
+> `gain_match_len<=0` auto = `wm_tf_horizon` (test_sim 220). Do not settle=`wm_tf_horizon`.
+> Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
 > `skip this/cum` (`n_grad_skip_iter`).
@@ -173,7 +172,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **REVERT** (GAIN_NOT_READY; family closed). **P64 EXIT** P2 Kalman amp = P3
 > cap KEEP as protocol + actor-econ (paired **−4.54 vs −94**). **P65 EXIT**
 > P1→P2 replay flush **REVERT** (val pred_std 0.518 vs P64 0.608; paired
-> −12 vs −4.54). **P66** per-seq `dob_ground` var-skip. `derive_horizon` / sim `reset()` now
+> −12 vs −4.54). **P66 EXIT** per-seq `dob_ground` var-skip **REVERT /
+> FALSIFIED** (pred_std 0.252 vs P64 0.608; paired −19.85 vs −4.54).
+> **P67** teacher `gain_match_len` auto = `wm_tf_horizon`. `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
@@ -919,8 +920,12 @@ fixes BOTH:
   the decoder. Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
   finite-difference step-response asymptote (optionally hold a/dv
   `gain_match_settle_len` steps — auto = control horizon; TM probe settle
-  is `wm_tf_horizon` = max(80, 4×horizon) — then roll the prior K=`gain_match_len` steps, held baseline vs
-  +`gain_match_step` per MV/DV input, ΔCV/Δu. Sentinel `<=0`
+  is `wm_tf_horizon` = max(80, 4×horizon) — then roll the prior
+  K=`gain_match_len` steps, held baseline vs
+  +`gain_match_step` per MV/DV input, ΔCV/Δu. Sentinel `gain_match_len<=0`
+  auto = `wm_tf_horizon(H)` (P67; test_sim 220) so last-only Huber pins G
+  at the same window val TM / decomp use. Explicit `DREAMER_GAIN_MATCH_LEN=H`
+  A/B's P26–P66. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a
   nonlinear GRU). Explicit `DREAMER_GAIN_MATCH_STEP=1.0` A/B's
@@ -1100,11 +1105,10 @@ P2's batched DOB decode consumes (`dob_active=False`).
   actor as a free bonus. The disturbance is at max density (prob 1.0) so the
   observer sees plenty of residual. **P65 EXIT:** flushing the shared
   `TrajectoryBuffer` at P1→P2 **starved** Kalman ID (5 eps at first P2
-  step) and **worsened** val amp/det_r — **REVERT**. **P66:** `dob_ground`
-  skips per-sequence `var(dist/cv_std) ≤ 1e-3` (same gate as
-  `dist_match`) so P1 `d≡0` rows in the mixed ring do not L2-on-`d`→0.
-  Do not `/dvar`. No new knob. jsonl `dob_ground_keep_frac` is the
-  fraction of the batch that passed the gate (HEAD; P66 pid banners only).
+  step) and **worsened** val amp/det_r — **REVERT**. **P66 EXIT:** per-seq
+  `dob_ground` var-skip **REVERT / FALSIFIED** (pred_std 0.252 vs P64 0.608).
+  Mean MSE over all sequences. Do not `/dvar`. jsonl `dob_ground_keep_frac`
+  is 1.0 when grounding fires.
 - **Stage 3** — `g` and `(A,K)` are frozen (`_wm_frozen_now` drops `wm_total`);
   the actor/critic train on the static unbiased WM + working observer, **with
   disturbances + domain randomization on**, so the deployed controller is robust

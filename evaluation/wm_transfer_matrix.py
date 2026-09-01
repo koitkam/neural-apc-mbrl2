@@ -52,9 +52,10 @@ def wm_tf_horizon(control_horizon: int) -> int:
 
     Slow WM prior τ~2× plant; 1.5H under-settled and under-read DC-gain.
     Floor 80 covers fast plants (H=15 → 80, not 60).  Callers pass
-    ``horizon>0`` (TrainConfig ``wm_tf_horizon`` / leftover env) to override.  P44
-    gain-match settle is *control* H, not this window — do not silently
-    retarget the teacher here.
+    ``horizon>0`` (TrainConfig ``wm_tf_horizon`` / leftover env) to override.
+    P44 gain-match *settle* is control H, not this window.  P67 teacher
+    FD ``gain_match_len<=0`` auto-resolves to this window (last-only Huber
+    at the same K val TM uses); do not also retarget settle to 4H.
     """
     h = max(1, int(control_horizon or 1))
     return max(80, int(4 * h))

@@ -69,6 +69,7 @@ from training.train import (
                             _cube_plus_would_clip, _gain_match_clip_frac_t,
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
+                            _auto_gain_match_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
                             _gain_match_rest_window, _gain_match_rest_ic_state,
                             _held_rollout_win,
@@ -281,7 +282,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     _tb_ex.wm_input_isolation_len = 120
     _tb_ex._explicit_fields = {'aux_tbptt_steps'}
     assert _resolve_aux_tbptt_steps(_tb_ex) == 16
-    print('[smoke] OK  aux_tbptt_steps sim-adaptive (16-of-55; explicit wins)')
+    _tb_g = TrainConfig()
+    _tb_g.horizon = 55
+    _tb_g.gain_match_len = 220
+    assert _resolve_aux_tbptt_steps(_tb_g) == 16, _tb_g.aux_tbptt_steps
+    print('[smoke] OK  aux_tbptt_steps sim-adaptive (16-of-55; explicit wins; P67 K unused)')
 
     _gs = TrainConfig()
     assert abs(_resolve_gain_match_step(_gs) - 0.4) < 1e-12, _gs.gain_match_step
@@ -637,9 +642,16 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _wm_train_seq_len(_sl) == 121, _wm_train_seq_len(_sl)
     assert wm_train_seq_len_for_plant(64, 120, 1220) == 121
     assert wm_train_seq_len_for_plant(64, 120, 80) == 80
+    _sl.seq_len = 128
+    _sl.horizon = 55
+    _sl.wm_overshoot_len = 55
+    _sl.gain_match_len = 220
+    _sl.episode_length = 1220
+    assert _wm_train_seq_len(_sl) == 128, _wm_train_seq_len(_sl)
     print('[smoke] OK  isolation settle whole-episode hold (isolated_level, '
           'action_std=0, DV MV-action-isomorphic, sample len ≥ K+1)')
-    print('[smoke] OK  P1/P2 wm_train_T = max(seq_len, K+1) (test_sim unchanged)')
+    print('[smoke] OK  P1/P2 wm_train_T = max(seq_len, overshoot/H+1) '
+          '(P67 teacher K does not grow T)')
 
     # Frozen-g skip: isolation extra unroll (follow-up 10) AND the in-graph
     # g-only aux (overshoot / held-rollout / full-BPTT gain-match,
@@ -1729,6 +1741,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
+    assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
     assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
     assert "gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized'" in _src
     assert '_cube_step_held' in _src
@@ -1883,6 +1896,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'collect_rest_lookback' in _src
     assert '_gain_match_state_from_feat' in _src
     assert '_auto_gain_match_settle_len' in _src
+    assert '_auto_gain_match_len' in _src
     assert '_adv_action_corr' in _src
     assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
@@ -1897,8 +1911,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'p3amp=' in _src
     assert 'P2 replay flush' not in _src
     assert '_DIST_TARGET_VAR_GATE' in _src
-    assert 'seq_var > _DIST_TARGET_VAR_GATE' in _src
+    assert 'seq_var > _DIST_TARGET_VAR_GATE' not in _src
     assert 'dob_ground_keep_frac' in _src
+    assert '_auto_gain_match_len' in _src
     assert 'wm_held_cv_drift' in _src
     assert "'wm_held_ol_ratio'" not in _src
     assert "'pmpo_pos_frac': pos_adv_frac" not in _src
@@ -2039,6 +2054,7 @@ def _test_envfree_observer_recipe() -> None:
     assert c.gain_match_huber_per_input is True
     assert float(c.gain_match_huber_beta) == 1.0
     assert int(c.gain_match_settle_len) == -1
+    assert int(c.gain_match_len) == 0
     assert c.gain_match_clip_realized is True
     assert c.gain_match_rest_ic is True
     assert int(c.gain_match_rest_ic_len) == 0
@@ -2905,6 +2921,15 @@ def _test_gain_match_held_settle() -> None:
     _cfg_h.horizon = 55
     assert wm_tf_roll_len(_cfg_h, 0) == 220
     assert wm_tf_roll_len(_cfg_h, 100) == 100
+    c_k = TrainConfig()
+    c_k.horizon = 55
+    c_k.gain_match_len = 0
+    assert _auto_gain_match_len(c_k) == 220
+    assert int(c_k.gain_match_len) == 220
+    c_k2 = TrainConfig()
+    c_k2.horizon = 55
+    c_k2.gain_match_len = 55
+    assert _auto_gain_match_len(c_k2) == 55
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 
@@ -4485,6 +4510,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     from pathlib import Path
     cfg = TrainConfig()
     cfg.out_dir = tmp_path
+    cfg.horizon = 55
     cfg.rssm_latent_type = 'deterministic'
     cfg.gain_match_coef = 1.0
     cfg.dob_ground_coef = 2.0
@@ -4500,6 +4526,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'iso_dcv=off' in banner, banner
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
+    assert 'gmatch_len=220' in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
     assert 'gmatch_clip=True' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
@@ -4515,6 +4542,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert plan['config']['rssm_latent_type'] == 'deterministic'
     assert float(plan['config']['gain_match_coef']) == 1.0
     assert abs(float(plan['config']['gain_match_step']) - 0.4) < 1e-12
+    assert int(plan['config']['gain_match_len']) == 220
     assert float(plan['config']['dob_ground_coef']) == 2.0
     dcv = plan['isolation_dcv_scales']
     assert dcv['on'] is True

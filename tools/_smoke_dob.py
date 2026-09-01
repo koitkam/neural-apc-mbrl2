@@ -293,7 +293,7 @@ def _check_grounding():
     assert float(losses2['dob_ground']) == 0.0, 'missing dist must no-op'
     print('[smoke] OK  missing dist_target → dob_ground=0 (warned)')
 
-    # P66: per-sequence var skip (same _DIST_TARGET_VAR_GATE as dist_match).
+    # P66 EXIT: skip REVERT. keep_frac=1.0 when grounding fires (all-seq MSE).
     cfg3, model3, batch3 = _mk('rssm', dob=True, cv_idx=(2,))
     cfg3.dob_ground_coef = 2.0
     cfg3.dob_reg_coef = 0.0
@@ -303,9 +303,9 @@ def _check_grounding():
     lz = world_model_loss(model3, batch_z, cfg3)[0]
     gz = float(lz['dob_ground'])
     kz = float(lz['dob_ground_keep_frac'])
-    assert gz == 0.0, f'zero-var dist must skip dob_ground, got {gz}'
-    assert kz == 0.0, f'zero-var keep_frac must be 0, got {kz}'
-    print('[smoke] OK  zero-var dist → dob_ground=0 keep_frac=0 (per-seq skip)')
+    assert np.isfinite(gz), f'zero-var dist must still ground, got {gz}'
+    assert abs(kz - 1.0) < 1e-6, f'zero-var keep_frac must be 1 (no skip), got {kz}'
+    print(f'[smoke] OK  zero-var dist → dob_ground={gz:.4f} keep_frac=1 (no skip)')
 
     batch_m = dict(batch3)
     dist_m = batch3['dist'].clone()
@@ -314,14 +314,14 @@ def _check_grounding():
     lm = world_model_loss(model3, batch_m, cfg3)[0]
     gm = float(lm['dob_ground'])
     km = float(lm['dob_ground_keep_frac'])
-    assert gm > 0.0 and np.isfinite(gm), f'mixed batch must ground on load seqs, got {gm}'
-    assert abs(km - 2.0 / 3.0) < 1e-6, f'mixed keep_frac expected 2/3, got {km}'
-    print(f'[smoke] OK  mixed zero+load seqs → dob_ground={gm:.4f} keep_frac={km:.3f}')
+    assert gm > 0.0 and np.isfinite(gm), f'mixed batch must ground, got {gm}'
+    assert abs(km - 1.0) < 1e-6, f'mixed keep_frac expected 1, got {km}'
+    print(f'[smoke] OK  mixed zero+load seqs → dob_ground={gm:.4f} keep_frac=1')
 
     lf = world_model_loss(model3, batch3, cfg3)[0]
     kf = float(lf['dob_ground_keep_frac'])
     assert abs(kf - 1.0) < 1e-6, f'all-load keep_frac expected 1, got {kf}'
-    print('[smoke] OK  all-load seqs → keep_frac=1 (loss identity vs no skip)')
+    print('[smoke] OK  all-load seqs → keep_frac=1 (all-seq MSE)')
 
 
 if __name__ == '__main__':

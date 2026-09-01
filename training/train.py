@@ -823,8 +823,9 @@ class TrainConfig:
     # P25 RCA: the replay buffer MUST store ``n_dist = n_cv`` whenever this
     # is >0 OR the DOB is on — do not key storage off ``disturbance_head_dim``
     # (that field is forced 0 when DOB replaces the head).
-    # P66: per-sequence skip when ``var(dist/cv_std) ≤ _DIST_TARGET_VAR_GATE``
-    # (same gate as ``dist_match``).  P65 flush of the P1 ring is REVERTED.
+    # P66 EXIT: per-sequence var-skip **REVERT / FALSIFIED** as DOB-amp
+    # (pred_std 0.252 vs P64 0.608; det_r 0.264 vs 0.352).  Mean MSE over
+    # all sequences (P64 identity).  P65 flush of the P1 ring is REVERTED.
     dob_ground_coef: float = 0.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
@@ -935,14 +936,16 @@ class TrainConfig:
     # supervisor that pins the subdominant DV gain).  Resolved >0 only when the
     # continuous gain channel is on AND the identified gains are available.
     gain_match_coef: float = 0.0
-    gain_match_len: int = 0            # K step-response rollout steps (= horizon)
+    gain_match_len: int = 0            # K FD steps; <=0 auto = wm_tf_horizon(H)
     # Held prior-roll BEFORE the FD (P44).  Dataclass ``-1`` = off
     # (P43 identity: FD from the replay posterior).  ``0`` = auto
     # ``horizon`` (A/B only).  P44 env-free auto=H storm **2/2 @iter 66**
     # (G_pred≈0, CAPPED 0.76@DV) → REVERT default off.  The TM probe's
-    # default window is ``wm_tf_horizon(H) = max(80, 4·H)`` and settle
-    # ``S = H_tf`` (test_sim 220, not 55) — matching that 4H settle is a
-    # later A/B, not a retry of S=H.  P43 Huber ~1e-4 from PRBS
+    # default window is ``wm_tf_horizon(H) = max(80, 4·H)`` (test_sim
+    # 220).  **P67:** teacher FD K auto-resolves to that window
+    # (last-only Huber at the same settle val TM uses).  Matching 4H
+    # *settle* (S=H_tf) is still a later A/B, not a retry of S=H.
+    # P43 Huber ~1e-4 from PRBS
     # posteriors while the rest-then-step probe stays ~0.75@DV.  P43 DV
     # @H ×0.849 vs ss ×0.740 is a real 4H-asymptote gap (MV @H≈ss); do
     # not cite "@H≈ss" for DV.  Gradful (P25: detaching the gain-match
@@ -3634,9 +3637,11 @@ def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
     if cur > 0 and (
             'aux_tbptt_steps' in explicit or cur != 16):
         return cur
-    k = int(getattr(cfg, 'wm_input_isolation_len', 0)
-            or getattr(cfg, 'gain_match_len', 0)
-            or getattr(cfg, 'horizon', 15) or 15)
+    # Isolation TBPTT follows isolation K (or control H).  Do not follow
+    # teacher FD ``gain_match_len`` (P67: that is ``wm_tf_horizon``, 4H).
+    k = int(getattr(cfg, 'wm_input_isolation_len', 0) or 0)
+    if k <= 0:
+        k = int(getattr(cfg, 'horizon', 15) or 15)
     auto = max(8, int(round(float(max(1, k)) / 3.5)))
     cfg.aux_tbptt_steps = int(auto)
     return int(auto)
@@ -4098,12 +4103,11 @@ def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
     return _wm_need_logged_aux(will_log, step_i, n_inner)
 
 
-# Unitless load-variance gate shared by dist_match (batch var) and
-# dob_ground (per-sequence var).  Below this the target is d≡0 / quiet
-# — grounding it is L2-on-d→0.  Same 1e-3 as the historical dist_match
-# skip; do not /dvar (would rescale the loss).  jsonl
-# ``dob_ground_keep_frac`` is the fraction of the batch that passed
-# the per-seq gate (observability; not a loss weight).
+# Unitless load-variance gate for dist_match (batch var).  Below this
+# the target is d≡0 / quiet.  Same 1e-3 as the historical skip; do not
+# /dvar (would rescale the loss).  P66 per-seq ``dob_ground`` skip at
+# this gate was REVERTED (FALSIFIED as DOB-amp).  jsonl
+# ``dob_ground_keep_frac`` is 1.0 when grounding fires (no skip).
 _DIST_TARGET_VAR_GATE = 1e-3
 
 
@@ -4175,8 +4179,11 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     used the auto-enabled recipe — the same class of silent-drop that missed
     the latent-type default.  Call after the last promotion (gain-match).
     P60: resolve ``gain_match_step`` sentinel so the dump stores 0.4 not 0.0.
+    P67: resolve ``gain_match_len`` sentinel so the dump stores ``wm_tf_horizon``
+    not 0.
     """
     _resolve_gain_match_step(cfg)
+    _auto_gain_match_len(cfg)
     out = Path(getattr(cfg, 'out_dir', None) or '.')
     plan_path = out / 'run_plan.json'
     if not plan_path.exists():
@@ -4231,6 +4238,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
+        f"gmatch_len={int(getattr(cfg, 'gain_match_len', 0) or 0)} "
         f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
         f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
@@ -4506,16 +4514,19 @@ def _wm_train_seq_len(cfg: 'TrainConfig') -> int:
 
     Follow-up 10 grew *isolation_buf* samples to ``max(seq_len, K+1)``.
     The MAIN WM batch still used ``cfg.seq_len``, so overshoot
-    (``K = min(K, T-1)``, needs future obs) and gain-match
-    (``n_valid = T-K``) truncated the identified settling length when
-    ``H >= seq_len`` (slow plant or ``DREAMER_SEQ_LEN`` pin) — P25-family
-    (forward Huber tiny, transfer-matrix DC dead).  P3 on-policy stays
-    ``seq_len`` (actor λ-returns, not the open-loop gain supervisor).
-    test_sim (seq_len=64, H≈55) is unchanged.
+    (``K = min(K, T-1)``, needs future obs) truncated the identified
+    settling length when ``H >= seq_len`` (slow plant or
+    ``DREAMER_SEQ_LEN`` pin) — P25-family (forward Huber tiny,
+    transfer-matrix DC dead).  Gain-match no longer truncates open-loop
+    ``K`` to ``T-1`` (held a/dv from the start; rest-IC FD rolls from
+    the rest cache).  Do **not** grow T to ``gain_match_len`` (P67
+    teacher ``K = wm_tf_horizon`` would stack a longer recon encode on
+    the compounding A/B; GPU probe sizes from ``horizon``).  P3
+    on-policy stays ``seq_len``.  test_sim (seq_len=128, H=55) is
+    unchanged.
     """
     k = max(
         int(getattr(cfg, 'wm_overshoot_len', 0) or 0),
-        int(getattr(cfg, 'gain_match_len', 0) or 0),
         int(getattr(cfg, 'horizon', 15) or 15),
     )
     return _seq_len_for_k(cfg, k)
@@ -7861,7 +7872,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     From a strided set of posterior start states, optionally hold a/dv for
     ``gain_match_settle_len`` steps (P44: auto = control horizon; TM
     probe settle is 4×horizon — see TrainConfig),
-    then roll the PRIOR forward ``K`` steps under (a) a HELD baseline
+    then roll the PRIOR forward ``K = gain_match_len`` steps (P67:
+    sentinel auto = ``wm_tf_horizon(H)`` so last-only Huber pins G at
+    the val TM window; explicit H A/B's P26–P66) under (a) a HELD baseline
     action/DV and (b) a unit STEP in each input channel.
 
     ``gain_match_rest_ic`` (P45 EXIT default): replace PRBS-posterior starts
@@ -8279,8 +8292,8 @@ def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
     P44 env-free auto=H storm **2/2 @iter 66** (G_pred≈0, CAPPED 0.76@DV)
     → default is ``-1`` (P43 FD-from-posterior).  ``DREAMER_GAIN_MATCH_SETTLE_LEN=0``
     still means auto H.  The TM probe defaults to ``wm_tf_horizon(H)``
-    (test_sim 220) and settle ``S = H_tf``.  Matching that 4H settle is
-    a later A/B, not a retry of S=H.
+    (test_sim 220).  P67 teacher FD K auto-resolves to that window;
+    matching 4H *settle* is still a later A/B, not a retry of S=H.
     Do not use ``or 0`` — that would treat ``-1`` as auto.  Mutates
     ``cfg.gain_match_settle_len`` only when it was 0.
     """
@@ -8289,6 +8302,27 @@ def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
         s = int(getattr(cfg, 'horizon', 15) or 15)
         cfg.gain_match_settle_len = s
     return s
+
+
+def _auto_gain_match_len(cfg: TrainConfig) -> int:
+    """Sentinel ``<=0`` → ``wm_tf_horizon(H)`` (val TM / decomp window).
+
+    P26–P66 auto was control H (test_sim 55).  Last-only Huber at K=H
+    pins G(H) while val OL-vs-real is at ``max(80,4H)`` (220).  P64
+    leftover compounding is 1-step-faithful / OL ×0.842.  This
+    lengthens FD K to the same settle the probe uses — not P44 S=H
+    (held settle before FD) and not a Huber reweight (P61 deferred
+    ``gain_match_len=4H`` as reweight).  Explicit
+    ``DREAMER_GAIN_MATCH_LEN=H`` A/B's the old teacher.  Mutates
+    ``cfg.gain_match_len``.
+    """
+    k = int(getattr(cfg, 'gain_match_len', 0) or 0)
+    if k > 0:
+        return k
+    from evaluation.wm_transfer_matrix import wm_tf_horizon
+    h = int(getattr(cfg, 'horizon', 15) or 15)
+    cfg.gain_match_len = int(wm_tf_horizon(h))
+    return int(cfg.gain_match_len)
 
 
 def _resolve_gain_match_targets(
@@ -8393,8 +8427,7 @@ def _resolve_gain_match_targets(
     if ('gain_match_coef' not in _explicit
             and float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0):
         cfg.gain_match_coef = 1.0
-    if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
-        cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
+    _auto_gain_match_len(cfg)
     # 0 = auto TM settle (S=H).  Negative = off (P43 FD-from-posterior).
     _auto_gain_match_settle_len(cfg)
     _resolve_aux_tbptt_steps(cfg)
@@ -8574,22 +8607,15 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 cv_std_t = _cv_obs_std_tensor(cfg, ds)
                 if cv_std_t is not None:
                     dtgt = dtgt / cv_std_t
-                # P65 EXIT: flushing P1 d≡0 rows starved P2 Kalman ID
-                # and *worsened* val amp/det_r.  Keep the mixed ring.
-                # Grounding a zero-load *sequence* is still L2-on-d→0
-                # (p19 hole).  dist_match already skips low-var
-                # *batches*; a mixed batch still has load variance so
-                # zeros enter the mean MSE.  Skip per sequence at the
-                # same unitless ``_DIST_TARGET_VAR_GATE``.  Do not
-                # /dvar (would rescale the loss — a second change).
-                _red = (1, 2) if dtgt.dim() >= 3 else (1,)
-                seq_var = dtgt.float().var(dim=_red)
-                mask = seq_var > _DIST_TARGET_VAR_GATE
-                dob_ground_keep_frac = mask.float().mean()
-                if mask.any():
-                    err = (ds.float() - dtgt.float()).pow(2).mean(dim=_red)
-                    dob_ground = err[mask].mean()
-                    wm_total = wm_total + dgc * dob_ground
+                # P66 EXIT: per-seq var-skip FALSIFIED as DOB-amp (Kalman
+                # |d| did not grow; val pred_std 0.252 vs P64 0.608).
+                # Mean MSE over all sequences (P64 identity).  Mixed
+                # ring KEEP (P65 flush REVERT).  Do not /dvar.
+                # jsonl ``dob_ground_keep_frac`` is 1.0 when this
+                # term fires (observability; no skip).
+                dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
+                dob_ground_keep_frac = torch.ones((), device=ds.device)
+                wm_total = wm_total + dgc * dob_ground
             elif not getattr(cfg, '_dob_ground_shape_warned', False):
                 print(f'[dob-ground] WARNING: dist_target shape {tuple(dtgt.shape)} '
                       f'!= d_t shape {tuple(ds.shape)} — grounding skipped.',
