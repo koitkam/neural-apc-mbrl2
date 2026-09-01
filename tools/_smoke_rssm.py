@@ -3156,6 +3156,10 @@ def _test_gain_match_rest_ic() -> None:
     gm2, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert abs(float(gm1) - float(gm2)) > 1e-6, (
         f'rest IC unused (gm1={float(gm1):.6f} gm2={float(gm2):.6f})')
+    import inspect as _ins
+    _gm_src = _ins.getsource(_wm_gain_match_loss)
+    assert "Huber baseline = rest last-obs CV" in _gm_src
+    assert 'o_rest[:, -1].index_select' in _gm_src
     cfg._gain_match_rest_obs = None
     cfg._gain_match_rest_act = None
     cfg._gain_match_rest_dev = None

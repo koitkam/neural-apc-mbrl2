@@ -960,7 +960,10 @@ class TrainConfig:
     # start (P44 EXIT: S=H storm 2/2, val DV ss/@H ×0.751/×0.842,
     # freeze last_ok 57).  **P45 EXIT PROMOTE** default True: first
     # GAIN-READY freeze since P40–P44 0.75@DV (gate 0.86@DV; val MV
-    # ss/@H ×0.877/×0.887, DV ×0.815/×0.875).  ``DREAMER_GAIN_MATCH_REST_IC=0``
+    # ss/@H ×0.877/×0.887, DV ×0.815/×0.875).  **P68:** rest-IC Huber
+    # baseline is last rest-obs CV (TM ``pre``), not held-K WM pred
+    # (P67 CAPPED 0.80@DV / val MV ×1.35; jsonl ×1 ≠ TM vs rest-pre).
+    # ``DREAMER_GAIN_MATCH_REST_IC=0``
     # reverts to PRBS-posterior FD.  Collect settle = max(H, lookback)
     # — **not** ``wm_tf_horizon``.  Encode ``L`` is
     # ``gain_match_rest_ic_len`` (P57 EXIT **REVERT** default ``0`` =
@@ -7859,7 +7862,8 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     _len_cfg = int(getattr(cfg, 'gain_match_rest_ic_len', 0))
     print(f'[gain-match] rest-ic N={n} L={L} settle={settle} '
           f'rest_ic_len={_len_cfg} '
-          f'(TM-protocol real-rest tail encode; isolation loss stays 0; '
+          f'(TM-protocol real-rest tail encode; Huber baseline = last '
+          f'rest-obs CV / TM pre, not held-K; isolation loss stays 0; '
           f'not wm_tf_horizon={_wm_tf_h(int(getattr(cfg, "horizon", 15) or 15))})',
           flush=True)
 
@@ -7883,10 +7887,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     with a teacher-forced encode of **real** rest lookbacks (TM
     rest-then-step IC).  Isolation loss stays 0.  When the rest cache
     is present, P44 WM-held settle is skipped (the lookback is already
-    rest).  The DIFFERENCE of
-    the decoded CV at step ``K`` cancels the common transient and isolates
-    the WM's realized STEADY-STATE gain ``ΔCV/Δinput``;
-    we match it to the identified gain (in WM/normalized units).  The continuous
+    rest).  **P68:** Huber ``ΔCV`` is decode(step_K) minus the last
+    rest-obs CV (TM ``pre``), not decode(held_K).  P67 last-only vs
+    held-K pinned identifier jsonl ×1 while val TM vs plant rest
+    stayed 0.80@DV / MV ×1.35.  PRBS-posterior fallback still uses
+    held-K.  Match the identified gain (WM/normalized units).  The continuous
     gain channel gives the WM the un-quantized capacity this loss grabs onto, so
     together they pin the subdominant DV gain the categorical attenuates.
 
@@ -8074,6 +8079,19 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     cv_last = cv_last.view(n_rolls, Bm, -1)
     cv_base = cv_last[0]
     cv_steps = cv_last[1:]
+    # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
+    # K-step held WM prediction.  Held-K compounding made P67 jsonl ×1
+    # while val TM vs rest-pre missed DC.  Rest-IC last obs is that
+    # ``pre`` (same cache as the encode).  PRBS fallback keeps held-K.
+    if rest is not None:
+        o_rest, _ = _gain_match_rest_ic_tensors(cfg, obs.device, obs.dtype)
+        if o_rest is not None and int(o_rest.shape[0]) == int(Bm):
+            cv_base = o_rest[:, -1].index_select(-1, cv_idx)
+            if not getattr(cfg, '_gain_match_rest_pre_logged', False):
+                print('[gain-match] Huber baseline = rest last-obs CV '
+                      '(TM pre; not held-K)',
+                      flush=True)
+                cfg._gain_match_rest_pre_logged = True  # type: ignore[attr-defined]
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
     loss = total
