@@ -1344,12 +1344,85 @@ class DreamerV4Config:
     cont_gain_deterministic_roll: bool = True
 
 
+def dreamer_v4_config_from_train(cfg, *, attn_impl: Optional[str] = None
+                                 ) -> 'DreamerV4Config':
+    """Architecture-shaping ``DreamerV4Config`` from a TrainConfig / ckpt cfg.
+
+    One constructor for train + val / TM / ONNX reload.  Missing fields
+    used to default ``world_model_type`` to ``sf_transformer`` (pre-P68)
+    while ``TrainConfig`` / this dataclass default ``rssm`` — a silent
+    rebuild of the wrong backbone (same leftover class as P29 latent).
+    ``attn_impl`` override: diagnostic CPU ``sdpa``, ONNX ``manual``.
+    """
+    if attn_impl is None:
+        attn_impl = getattr(cfg, 'attn_impl', 'auto')
+    return DreamerV4Config(
+        obs_dim=int(getattr(cfg, 'obs_dim')),
+        action_dim=int(getattr(cfg, 'action_dim')),
+        lookback=int(getattr(cfg, 'lookback')),
+        tok_hidden=int(getattr(cfg, 'tok_hidden')),
+        z_dim=int(getattr(cfg, 'z_dim')),
+        mae_p_max=float(getattr(cfg, 'mae_p_max')),
+        d_model=int(getattr(cfg, 'd_model')),
+        n_layers=int(getattr(cfg, 'n_layers')),
+        n_heads=int(getattr(cfg, 'n_heads')),
+        ff_mult=int(getattr(cfg, 'ff_mult')),
+        n_register=int(getattr(cfg, 'n_register')),
+        k_max=int(getattr(cfg, 'k_max')),
+        tau_n_bins=int(getattr(cfg, 'tau_n_bins')),
+        soft_cap=float(getattr(cfg, 'soft_cap')),
+        attn_impl=attn_impl,
+        n_action_bins=int(getattr(cfg, 'n_action_bins')),
+        head_hidden=int(getattr(cfg, 'head_hidden')),
+        head_n_layers=int(getattr(cfg, 'head_n_layers')),
+        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 8) or 8)),
+        n_critics=max(1, int(getattr(cfg, 'n_critics', 2) or 2)),
+        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
+        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -2.0)),
+        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
+        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
+        world_model_type=str(getattr(cfg, 'world_model_type', 'rssm')),
+        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
+        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
+        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+        rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'deterministic')),
+        rssm_latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
+        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
+        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
+        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
+        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
+        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
+        disturbance_head_hidden=int(
+            getattr(cfg, 'disturbance_head_hidden', 0) or 0),
+        disturbance_head_layers=int(
+            getattr(cfg, 'disturbance_head_layers', 2) or 2),
+        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
+        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
+        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
+        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
+        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
+        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
+        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
+        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
+        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
+        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
+        cont_dist_deterministic_roll=bool(getattr(
+            cfg, 'cont_dist_deterministic_roll', True)),
+        cont_gain_deterministic_roll=bool(getattr(
+            cfg, 'cont_gain_deterministic_roll', True)),
+    )
+
+
 class DreamerV4(nn.Module):
     def __init__(self, cfg: DreamerV4Config):
         super().__init__()
         self.cfg = cfg
         self.world_model_type = str(
-            getattr(cfg, 'world_model_type', 'sf_transformer')).lower()
+            getattr(cfg, 'world_model_type', 'rssm')).lower()
         if self.world_model_type == 'rssm':
             # DreamerV3 RSSM backbone.  No tokenizer (the RSSM has an
             # integrated MLP encoder/decoder); heads read from the
@@ -1701,11 +1774,9 @@ class DreamerV4(nn.Module):
 
         ``prior_policy`` stays in the module for checkpoint load / frozen
         param partition.  Prior-refresh knobs were a false A/B and are
-        **REMOVED**.
+        **REMOVED**.  Do not copy weights — nothing reads π_prior.
         """
-        self.prior_policy.load_state_dict(self.policy.state_dict())
-        for p in self.prior_policy.parameters():
-            p.requires_grad_(False)
+        return
 
     def reset_policy_exploration(self, optimizer=None) -> None:
         """Restore Gaussian σ to ``log_std_init``; no-op for discrete π.
@@ -2032,7 +2103,7 @@ __all__ = [
     'MLP', 'RMSNorm', 'SwiGLU', 'CausalAttention', 'TransformerBlock',
     'Tokenizer', 'DynamicsConfig', 'DynamicsTransformer',
     'TwohotHead', 'PolicyHead', 'ContinuousPolicyHead',
-    'DreamerV4Config', 'DreamerV4',
+    'DreamerV4Config', 'dreamer_v4_config_from_train', 'DreamerV4',
     'sample_tau_d', 'shortcut_corrupt', 'ramp_weight',
     'shortcut_forcing_loss',
 ]

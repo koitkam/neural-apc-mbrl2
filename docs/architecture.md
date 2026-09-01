@@ -107,11 +107,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > `realsim_return_mean`. Stale `tools/run_nl_then_p09.sh` + p138/p136
 > one-off probes **DISCARDED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
-> **P66 LIVE P1** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, iter **31**):
+> **P66 LIVE P1** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, iter **71**):
 > per-seq `dob_ground` var-skip (`_DIST_TARGET_VAR_GATE`; mixed ring KEEP).
-> Flush **off**. Recon **0.0041** skip **0**. HEAD (not this pid):
-> `expert_bc_p3_adaptive_scale` / `early_stop_p1_min_sf_drop_frac`
-> **REMOVED** (unread false A/Bs).
+> Flush **off**. Storm **1/2 @60** recovered (last_ok **71 unlocked**,
+> recon **0.0022**). P1 `dob_ground≡0` (hypothesis is P2-only).
+> HEAD (not this pid): `dreamer_v4_config_from_train` (rssm fallback);
+> `snapshot_prior_policy` true no-op. `expert_bc_p3_adaptive_scale` /
+> `early_stop_p1_min_sf_drop_frac` **REMOVED** (unread false A/Bs).
 > Do not settle=`wm_tf_horizon`. Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and

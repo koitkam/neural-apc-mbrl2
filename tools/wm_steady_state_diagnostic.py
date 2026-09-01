@@ -150,63 +150,16 @@ def _find_ckpt(run_dir: Path, ckpt_name: Optional[str] = None) -> Path:
 def _load_model(ckpt_path: Path, device: torch.device):
     """Load DreamerV4 model + cfg from a checkpoint."""
     from training.train import TrainConfig
-    from models.dreamer_v4 import DreamerV4, DreamerV4Config
+    from models.dreamer_v4 import DreamerV4, dreamer_v4_config_from_train
 
     ckpt_obj = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     cfg_dict = ckpt_obj.get('cfg') or {}
     valid_keys = set(TrainConfig.__dataclass_fields__.keys())
     cfg = TrainConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 
-    model_cfg = DreamerV4Config(
-        obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
-        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
-        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
-        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
-        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
-        n_action_bins=cfg.n_action_bins,
-        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
-        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
-        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
-        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
-        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
-        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
-        world_model_type=str(getattr(cfg, 'world_model_type', 'sf_transformer')),
-        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
-        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
-        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
-        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
-        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
-        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
-        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
-        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
-        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
-        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
-        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
-        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
-        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
-        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
-        # dv_feedforward changes feat_dim (DV in the head feat); thread it so a
-        # non-default reload matches the checkpoint structure.
-        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        # Neural Kalman filter / DOB (2026-06-11): thread so the rebuilt model
-        # has the d_t observer params (else load_state_dict fails on DOB keys).
-        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
-        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
-        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
-        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
-        # Continuous gain+disturbance latent (2026-06-22): thread so the rebuilt
-        # model has the cont prior/post nets + latent params (else the strict
-        # load_state_dict fails on the cont keys).
-        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
-        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
-        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
-        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
-        # 'sdpa' is significantly faster on CPU than 'manual' (uses torch's
-        # fused scaled_dot_product_attention which has a vectorised CPU path).
-        attn_impl='sdpa',
-    )
-    model = DreamerV4(model_cfg).to(device)
+    # 'sdpa' is significantly faster on CPU than 'manual' (fused SDPA).
+    model = DreamerV4(
+        dreamer_v4_config_from_train(cfg, attn_impl='sdpa')).to(device)
     sd = ckpt_obj['model']
     if any('._orig_mod.' in k for k in sd):
         sd = {k.replace('._orig_mod.', '.'): v for k, v in sd.items()}

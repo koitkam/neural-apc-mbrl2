@@ -4735,6 +4735,52 @@ def _test_collect_serve_cuda_graph_cpu() -> None:
     print('[smoke] OK  collect serve CUDA graph skipped on CPU; eager copy_')
 
 
+def _test_dreamer_v4_config_from_train() -> None:
+    """Reload helper: missing world_model_type → rssm; one constructor."""
+    from types import SimpleNamespace
+    from pathlib import Path
+    from models.dreamer_v4 import (
+        DreamerV4, dreamer_v4_config_from_train)
+
+    cfg = SimpleNamespace(
+        obs_dim=4, action_dim=1, lookback=8, tok_hidden=8, z_dim=8,
+        mae_p_max=0.1, d_model=16, n_layers=1, n_heads=1, ff_mult=2,
+        n_register=1, k_max=4, tau_n_bins=4, soft_cap=1.0,
+        n_action_bins=5, head_hidden=8, head_n_layers=1,
+    )
+    mc = dreamer_v4_config_from_train(cfg)
+    assert mc.world_model_type == 'rssm'
+    assert mc.rssm_latent_type == 'deterministic'
+    assert mc.n_critics == 2
+    assert abs(mc.policy_init_log_std - (-2.0)) < 1e-12
+    assert mc.cont_dist_deterministic_roll is True
+    assert mc.cont_gain_deterministic_roll is True
+    assert dreamer_v4_config_from_train(cfg, attn_impl='sdpa').attn_impl == 'sdpa'
+    assert dreamer_v4_config_from_train(cfg, attn_impl='manual').attn_impl == 'manual'
+
+    snap = DreamerV4.snapshot_prior_policy
+    # True no-op: method bytecode must not copy π_prior.
+    assert 'load_state_dict' not in snap.__code__.co_names
+    assert 'requires_grad_' not in snap.__code__.co_names
+
+    root = Path(__file__).resolve().parents[1]
+    val = (root / 'evaluation' / 'validate.py').read_text()
+    diag = (root / 'tools' / 'wm_steady_state_diagnostic.py').read_text()
+    bo = (root / 'workflow' / 'bo_runner.py').read_text()
+    exp = (root / 'inference' / 'export_onnx.py').read_text()
+    tr = (root / 'training' / 'train.py').read_text()
+    for src, tag in ((val, 'validate'), (diag, 'diag'), (bo, 'bo'),
+                     (exp, 'export'), (tr, 'train')):
+        assert 'dreamer_v4_config_from_train' in src, tag
+        assert "getattr(cfg, 'world_model_type', 'sf_transformer')" not in src
+        assert "getattr(cfg_loaded, 'world_model_type', 'sf_transformer')" not in src
+    # Model-object fallbacks still treat missing attr as old SF.
+    assert "getattr(model, 'world_model_type', 'sf_transformer')" in val
+    assert "getattr(model, 'world_model_type', 'sf_transformer')" in tr
+    print('[smoke] OK  dreamer_v4_config_from_train rssm fallback; '
+          'reload sites share helper; snapshot_prior_policy no-op')
+
+
 if __name__ == '__main__':
     import os
     import sys
@@ -4761,6 +4807,7 @@ if __name__ == '__main__':
     _test_stage1_dob_ground_skip()
     _test_stream_serve_matches_rollout()
     _test_collect_serve_cuda_graph_cpu()
+    _test_dreamer_v4_config_from_train()
     _test_envfree_observer_recipe()
     _test_identified_tau_cfg()
     _test_objective_runtime_cfg()

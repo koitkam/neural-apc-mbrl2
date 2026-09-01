@@ -43,7 +43,7 @@ import torch
 import torch.nn.functional as F
 
 from models.dreamer_v4 import (  # noqa: F401
-    DreamerV4, DreamerV4Config,
+    DreamerV4, dreamer_v4_config_from_train,
     shortcut_forcing_loss,
 )
 from utils.sim_factory import create_sim, resolve_sim_metadata
@@ -9481,54 +9481,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 # ---------------------------------------------------------------------------
 
 def build_model(cfg: TrainConfig) -> DreamerV4:
-    model_cfg = DreamerV4Config(
-        obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
-        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
-        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
-        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
-        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
-        attn_impl=cfg.attn_impl,
-        n_action_bins=cfg.n_action_bins,
-        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
-        mtp_length=max(1, int(cfg.mtp_length)),
-        n_critics=max(1, int(getattr(cfg, 'n_critics', 1) or 1)),
-        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
-        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
-        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
-        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
-        world_model_type=str(getattr(cfg, 'world_model_type', 'rssm')),
-        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
-        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
-        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
-        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
-        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
-        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-        rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'deterministic')),
-        rssm_latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
-        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
-        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
-        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
-        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
-        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
-        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
-        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
-        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
-        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
-        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
-        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
-        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
-        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
-        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
-        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
-        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
-        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
-        cont_dist_deterministic_roll=bool(getattr(
-            cfg, 'cont_dist_deterministic_roll', True)),
-        cont_gain_deterministic_roll=bool(getattr(
-            cfg, 'cont_gain_deterministic_roll', True)),
-    )
-    model = DreamerV4(model_cfg)
+    model = DreamerV4(dreamer_v4_config_from_train(cfg))
     # torch.compile — DEFAULT OFF (P29 RCA).  TrainConfig ``compile_mode=''``
     # is eager; a 2026-06-05 leftover treated empty as default-on unless
     # ``DREAMER_COMPILE=0``, so env-free P29 compiled while P26/P28 (observer
