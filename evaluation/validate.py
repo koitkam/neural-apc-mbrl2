@@ -1861,21 +1861,20 @@ def run_validation(*,
     # ``int(seeds)+1`` total = 4 by default), each with the FULL feature set:
     #   * the measured-DV scripted schedule (events spread across the episode), and
     #   * the unmeasured/hidden disturbance at FULL phase-3 amplitude, ALSO spread
-    #     across the whole episode (``DREAMER_HIDDEN_DIST_SPREAD``) so it reads as a
-    #     realistic load active start->end instead of a few front-loaded events
-    #     holding a DC offset.
+    #     across the whole episode (TrainConfig ``hidden_dist_spread``, default
+    #     ON in training too) so it reads as a realistic load active start->end
+    #     instead of a few front-loaded events holding a DC offset.
     # The seeds differ only by RNG draw, so the four plots show the same realistic
     # operating regime under different disturbance realisations.  The PASS/FAIL
     # fidelity gates run on a separate CLEAN env (``_disturbance_prob_override=0``)
     # and are unaffected by this.
     n_plots = int(seeds) + 1
     seed_plan: List[Tuple[int, bool]] = [(10_000 + s, True) for s in range(n_plots)]
-    # Spread the hidden disturbance across the whole episode for validation only
-    # (training keeps the front-loaded sequential placement).  Saved/restored
-    # around the seed loop so we never leak the override.
-    _hd_spread_prev = os.environ.get('DREAMER_HIDDEN_DIST_SPREAD')
-    os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '1'
-    for seed, unmeasured_full in seed_plan:
+    # Pin spread ON for val plots even if an A/B set training spread=0.
+    # Explicit cfg — do not poke leftover ``DREAMER_HIDDEN_DIST_SPREAD``.
+    from utils.hidden_disturbance import force_val_hidden_dist_spread
+    with force_val_hidden_dist_spread(cfg):
+      for seed, unmeasured_full in seed_plan:
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
         # Force the hidden disturbance on every validation episode (always test
@@ -2104,12 +2103,6 @@ def run_validation(*,
 
         seed_results.append(eps)
         print(f'[val] seed {seed}: {len(eps)} episodes done', flush=True)
-
-    # Restore the hidden-disturbance spread override (validation-scoped).
-    if _hd_spread_prev is None:
-        os.environ.pop('DREAMER_HIDDEN_DIST_SPREAD', None)
-    else:
-        os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = _hd_spread_prev
 
     plot_summary(seed_results, out_dir / 'summary.png',
                   title=f'{controller_dir.name}  validation summary  '

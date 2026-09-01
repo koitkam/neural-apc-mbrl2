@@ -97,8 +97,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **×0.927 / ×0.932** DV **×0.893 / ×0.962** (new DV champ). det_r **0.352**
 > pred_std **0.608 vs 1.93**. Paired **−4.54 vs −94 BEATS 9/9** (beats P58).
 > **PARTIAL as DOB-amp**. **FALSIFIED as det_r→P26**. P2 buffer stayed 100%
-> P1-clean at the latch. **P65** flushes replay at P1→P2.
-> Dummy jsonl
+> P1-clean at the latch. **P65 LIVE** (`run_p65_p2flush`, pid **173526**,
+> sha `b4ee586`): P1→P2 replay flush. Still P1 @iter ~31 (recon 0.0034,
+> skip 0, matches P64). Dummy jsonl
 > `wm_held_ol_ratio` **REMOVED**. `DREAMER_ACT_HIST_REQUIRED` **REMOVED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
@@ -191,7 +192,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > plus expert move-law (`expert_move_frac` / `backoff_frac` / …)
 > and CLI extras (`POLICY_*` /
 > `GRAD_CLIP` / seed counts / plant-derived arch) that `single_run`
-> used to drop are TrainConfig + `ENV_OVERRIDES`.
+> used to drop are TrainConfig + `ENV_OVERRIDES`. Val/diag pin
+> `hidden_dist_spread=True` via `force_val_hidden_dist_spread` (no leftover
+> `DREAMER_HIDDEN_DIST_SPREAD` poke).
 
 > **2026-06-11 (status 2026-08):** the neural-Kalman-filter / DOB disturbance
 > observer (§3) is implemented in both backbones and is **default ON**

@@ -59,7 +59,8 @@ if obs_norm is not None:
     except Exception as e:
         print('obs_norm restore skipped', e)
 
-os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '1'
+from utils.hidden_disturbance import force_val_hidden_dist_spread
+# HiddenDisturbance is built at env.reset; pin spread on cfg (not leftover env).
 env._hidden_disturbance_force = True
 env._current_phase = 3
 env._training_progress = 1.0
@@ -71,7 +72,8 @@ cv_idx = list(env.cv_indices)
 mv_idx = list(getattr(env, 'mv_indices', []) or [])
 head = getattr(model, 'disturbance', None)
 
-obs_window = env.reset(exploration=False)
+with force_val_hidden_dist_spread(cfg):
+    obs_window = env.reset(exploration=False)
 state = rssm.initial_state(1, device)
 prev_a = torch.zeros(1, int(env.action_dim), device=device)
 

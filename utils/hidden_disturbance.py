@@ -50,6 +50,7 @@ identified through ``sim.cv_indices`` and respects
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -100,6 +101,45 @@ def _knob_bool(cfg, field: str, env_key: str, default: bool) -> bool:
     if cfg is not None:
         return bool(getattr(cfg, field, default))
     return bool(default)
+
+
+@contextmanager
+def force_val_hidden_dist_spread(cfg):
+    """Pin ``hidden_dist_spread=True`` on ``cfg`` for val/diag (no os.environ).
+
+    Training already defaults spread ON.  Val used to poke
+    ``DREAMER_HIDDEN_DIST_SPREAD=1`` (leftover dual path; a stale comment
+    claimed training was still front-loaded).  Explicit cfg beats leftover
+    env=0 so plots still spread when an A/B disables training spread.
+    """
+    if cfg is None:
+        yield
+        return
+    prev = bool(getattr(cfg, 'hidden_dist_spread', True))
+    had_ex = hasattr(cfg, '_explicit_fields')
+    prev_ex = getattr(cfg, '_explicit_fields', None)
+    try:
+        cfg.hidden_dist_spread = True
+        try:
+            cfg._explicit_fields = set(prev_ex or ()) | {'hidden_dist_spread'}
+        except Exception:
+            pass
+        yield
+    finally:
+        try:
+            cfg.hidden_dist_spread = prev
+        except Exception:
+            pass
+        if not had_ex:
+            try:
+                delattr(cfg, '_explicit_fields')
+            except Exception:
+                pass
+        else:
+            try:
+                cfg._explicit_fields = prev_ex
+            except Exception:
+                pass
 
 
 def _parse_pair(raw, lo_default: float, hi_default: float) -> tuple:

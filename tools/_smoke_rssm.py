@@ -2160,6 +2160,8 @@ def _test_envfree_observer_recipe() -> None:
     assert c.val_wm_transfer is True
     assert c.val_wm_postprior is True
     assert c.val_wm_distpred is True
+    assert c.hidden_dist_spread is True
+    assert 'DREAMER_HIDDEN_DIST_SPREAD' in ENV_OVERRIDES
     assert abs(float(c.horizon_settle_n_tau) - 4.0) < 1e-12
     assert int(c.horizon_max) == 120
     assert abs(float(c.episode_settle_multiple) - 20.0) < 1e-12
@@ -3909,6 +3911,7 @@ def _test_noise_hidden_cfg() -> None:
         'DREAMER_PROCESS_NOISE_AMP_RAMP',
         'DREAMER_DISTURBANCE_PROB_WM',
         'DREAMER_HIDDEN_DISTURBANCE',
+        'DREAMER_HIDDEN_DIST_SPREAD',
     )
     prev = {k: os.environ.get(k) for k in keys}
     try:
@@ -3925,6 +3928,7 @@ def _test_noise_hidden_cfg() -> None:
         assert abs(curriculum_amp_scale(1.0, phase=None, cfg=c) - 0.2) < 1e-12
         assert abs(float(c.hidden_dist_p_revert) - 0.7) < 1e-12
         assert c.hidden_dist_shape_weights == '0.5,0.3,0.2'
+        assert c.hidden_dist_spread is True
         s0 = noise_curriculum_scale(0.0, phase=1)
         s_cfg = noise_curriculum_scale(0.0, phase=1, cfg=c)
         assert s0 == 0.0 and s_cfg == 0.0
@@ -3953,6 +3957,26 @@ def _test_noise_hidden_cfg() -> None:
         c_on.hidden_disturbance = True
         c_on._explicit_fields = {'hidden_disturbance'}  # type: ignore
         assert hidden_disturbance_enabled(cfg=c_on) is True  # explicit beats leftover
+        from utils.hidden_disturbance import (
+            _knob_bool, force_val_hidden_dist_spread)
+        os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '0'
+        c_spread = TrainConfig()
+        assert _knob_bool(c_spread, 'hidden_dist_spread',
+                          'DREAMER_HIDDEN_DIST_SPREAD', True) is False
+        with force_val_hidden_dist_spread(c_spread):
+            assert c_spread.hidden_dist_spread is True
+            assert _knob_bool(c_spread, 'hidden_dist_spread',
+                              'DREAMER_HIDDEN_DIST_SPREAD', True) is True
+        assert _knob_bool(c_spread, 'hidden_dist_spread',
+                          'DREAMER_HIDDEN_DIST_SPREAD', True) is False
+        from pathlib import Path
+        _root = Path(__file__).resolve().parents[1]
+        src_val = (_root / 'evaluation' / 'validate.py').read_text()
+        src_dp = (_root / 'evaluation' / 'wm_disturbance_prediction.py').read_text()
+        assert "os.environ['DREAMER_HIDDEN_DIST_SPREAD']" not in src_val
+        assert "os.environ['DREAMER_HIDDEN_DIST_SPREAD']" not in src_dp
+        assert 'force_val_hidden_dist_spread' in src_val
+        assert 'force_val_hidden_dist_spread' in src_dp
     finally:
         for k, old in prev.items():
             if old is None:
