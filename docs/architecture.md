@@ -98,8 +98,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > pred_std **0.608 vs 1.93**. Paired **−4.54 vs −94 BEATS 9/9** (beats P58).
 > **PARTIAL as DOB-amp**. **FALSIFIED as det_r→P26**. P2 buffer stayed 100%
 > P1-clean at the latch. **P65 LIVE** (`run_p65_p2flush`, pid **173526**,
-> sha `b4ee586`): P1→P2 replay flush. Still P1 @iter **63** (recon 0.0028,
-> skip 0, matches P64@63). Dummy jsonl
+> sha `b4ee586`): P1→P2 replay flush. Still P1 @iter **69** (recon 0.0012
+> after storm **1/2 @67** recovered). Dummy jsonl
 > `wm_held_ol_ratio` **REMOVED**. `DREAMER_ACT_HIST_REQUIRED` **REMOVED**.
 > Leftover P3 jsonl alias **writes** **REMOVED**. Stale
 > `tools/run_nl_then_p09.sh` **DISCARDED**.
