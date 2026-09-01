@@ -174,7 +174,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > P1→P2 replay flush **REVERT** (val pred_std 0.518 vs P64 0.608; paired
 > −12 vs −4.54). **P66 EXIT** per-seq `dob_ground` var-skip **REVERT /
 > FALSIFIED** (pred_std 0.252 vs P64 0.608; paired −19.85 vs −4.54).
-> **P67** teacher `gain_match_len` auto = `wm_tf_horizon`. `derive_horizon` / sim `reset()` now
+> **P67 LIVE P1 iter 17** (`run_p67_gmatch4h`, pid **187753**): teacher
+> `gain_match_len` auto = `wm_tf_horizon` (K=220). jsonl MV/DV **×1.01 / ×1.01**
+> skip 0 `t_wm` 134 s ~14.3 GB. Encode T lookback. Val OL-vs-real pending.
+> `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
