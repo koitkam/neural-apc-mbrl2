@@ -300,17 +300,28 @@ def _check_grounding():
     cfg3._cv_obs_std = [1.0]
     batch_z = dict(batch3)
     batch_z['dist'] = torch.zeros_like(batch3['dist'])
-    gz = float(world_model_loss(model3, batch_z, cfg3)[0]['dob_ground'])
+    lz = world_model_loss(model3, batch_z, cfg3)[0]
+    gz = float(lz['dob_ground'])
+    kz = float(lz['dob_ground_keep_frac'])
     assert gz == 0.0, f'zero-var dist must skip dob_ground, got {gz}'
-    print('[smoke] OK  zero-var dist → dob_ground=0 (per-seq skip)')
+    assert kz == 0.0, f'zero-var keep_frac must be 0, got {kz}'
+    print('[smoke] OK  zero-var dist → dob_ground=0 keep_frac=0 (per-seq skip)')
 
     batch_m = dict(batch3)
     dist_m = batch3['dist'].clone()
     dist_m[0].zero_()
     batch_m['dist'] = dist_m
-    gm = float(world_model_loss(model3, batch_m, cfg3)[0]['dob_ground'])
+    lm = world_model_loss(model3, batch_m, cfg3)[0]
+    gm = float(lm['dob_ground'])
+    km = float(lm['dob_ground_keep_frac'])
     assert gm > 0.0 and np.isfinite(gm), f'mixed batch must ground on load seqs, got {gm}'
-    print(f'[smoke] OK  mixed zero+load seqs → dob_ground={gm:.4f} (zeros skipped)')
+    assert abs(km - 2.0 / 3.0) < 1e-6, f'mixed keep_frac expected 2/3, got {km}'
+    print(f'[smoke] OK  mixed zero+load seqs → dob_ground={gm:.4f} keep_frac={km:.3f}')
+
+    lf = world_model_loss(model3, batch3, cfg3)[0]
+    kf = float(lf['dob_ground_keep_frac'])
+    assert abs(kf - 1.0) < 1e-6, f'all-load keep_frac expected 1, got {kf}'
+    print('[smoke] OK  all-load seqs → keep_frac=1 (loss identity vs no skip)')
 
 
 if __name__ == '__main__':

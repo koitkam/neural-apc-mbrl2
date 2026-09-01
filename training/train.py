@@ -4101,7 +4101,9 @@ def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
 # Unitless load-variance gate shared by dist_match (batch var) and
 # dob_ground (per-sequence var).  Below this the target is d≡0 / quiet
 # — grounding it is L2-on-d→0.  Same 1e-3 as the historical dist_match
-# skip; do not /dvar (would rescale the loss).
+# skip; do not /dvar (would rescale the loss).  jsonl
+# ``dob_ground_keep_frac`` is the fraction of the batch that passed
+# the per-seq gate (observability; not a loss weight).
 _DIST_TARGET_VAR_GATE = 1e-3
 
 
@@ -8545,6 +8547,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # target batch['dist'] is in ENGINEERING CV units and d_t is NORMALIZED, so
     # divide by the running CV obs-norm std (threaded on cfg as _cv_obs_std).
     dob_ground = torch.zeros((), device=feats.device)
+    dob_ground_keep_frac = torch.zeros((), device=feats.device)
     dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
     if dob_live and dgc > 0.0:
         if dist_target is None:
@@ -8582,6 +8585,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 _red = (1, 2) if dtgt.dim() >= 3 else (1,)
                 seq_var = dtgt.float().var(dim=_red)
                 mask = seq_var > _DIST_TARGET_VAR_GATE
+                dob_ground_keep_frac = mask.float().mean()
                 if mask.any():
                     err = (ds.float() - dtgt.float()).pow(2).mean(dim=_red)
                     dob_ground = err[mask].mean()
@@ -8704,6 +8708,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dist_match_loss': dist_match_loss.detach(),
         'dob_reg': dob_reg.detach(),
         'dob_ground': dob_ground.detach(),
+        'dob_ground_keep_frac': dob_ground_keep_frac.detach(),
         'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
     }
@@ -14021,6 +14026,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
+            row.setdefault('dob_ground', 0.0)
+            row.setdefault('dob_ground_keep_frac', 0.0)
             # P39 diag A: emit last computed per-head grad norms (if any).
             # Values may be float (grad norms) or str (error messages); pass
             # strings through unchanged so jsonl serialisation works.

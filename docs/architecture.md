@@ -107,13 +107,12 @@ env-gated off · **[planned]** = designed, not yet built.
 > `realsim_return_mean`. Stale `tools/run_nl_then_p09.sh` + p138/p136
 > one-off probes **DISCARDED**.
 > Champion **P64** econ / **P53** μ-ratio / **P26** MV ss / **P64** DV ss.
-> **P66 LIVE P1** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, iter **71**):
-> per-seq `dob_ground` var-skip (`_DIST_TARGET_VAR_GATE`; mixed ring KEEP).
-> Flush **off**. Storm **1/2 @60** recovered (last_ok **71 unlocked**,
-> recon **0.0022**). P1 `dob_ground≡0` (hypothesis is P2-only).
-> HEAD (not this pid): `dreamer_v4_config_from_train` (rssm fallback);
-> `snapshot_prior_policy` true no-op. `expert_bc_p3_adaptive_scale` /
-> `early_stop_p1_min_sf_drop_frac` **REMOVED** (unread false A/Bs).
+> **P66 LIVE P3** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, ~iter **280**):
+> per-seq `dob_ground` var-skip. GAIN-READY **0.84@DV** last_ok **76 locked**.
+> P2 buf **327/327**. `dob_ground` med **0.272** (P64 0.121) but
+> `dob_d_absmean` **0.043** (P64 0.063) — skip undilutes MSE, `|d|` did not
+> grow. Unfreeze **147** ent **−0.101 HELD** rscale **2.70**. rtgt collapsed.
+> Actor VALID; val pending. HEAD (not pid): jsonl `dob_ground_keep_frac`.
 > Do not settle=`wm_tf_horizon`. Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -1104,7 +1103,8 @@ P2's batched DOB decode consumes (`dob_active=False`).
   step) and **worsened** val amp/det_r — **REVERT**. **P66:** `dob_ground`
   skips per-sequence `var(dist/cv_std) ≤ 1e-3` (same gate as
   `dist_match`) so P1 `d≡0` rows in the mixed ring do not L2-on-`d`→0.
-  Do not `/dvar`. No new knob.
+  Do not `/dvar`. No new knob. jsonl `dob_ground_keep_frac` is the
+  fraction of the batch that passed the gate (HEAD; P66 pid banners only).
 - **Stage 3** — `g` and `(A,K)` are frozen (`_wm_frozen_now` drops `wm_total`);
   the actor/critic train on the static unbiased WM + working observer, **with
   disturbances + domain randomization on**, so the deployed controller is robust

@@ -1889,6 +1889,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_wm_recon_scalar(wm_losses)' in _src
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
+    assert "row.setdefault('dob_ground_keep_frac'" in _src
     assert "out='obs'" in _src
     assert 'held_cv=True' in _src
     assert 'p1amp=' in _src
@@ -1897,6 +1898,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'P2 replay flush' not in _src
     assert '_DIST_TARGET_VAR_GATE' in _src
     assert 'seq_var > _DIST_TARGET_VAR_GATE' in _src
+    assert 'dob_ground_keep_frac' in _src
     assert 'wm_held_cv_drift' in _src
     assert "'wm_held_ol_ratio'" not in _src
     assert "'pmpo_pos_frac': pos_adv_frac" not in _src
