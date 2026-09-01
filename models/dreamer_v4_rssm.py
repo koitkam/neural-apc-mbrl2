@@ -1127,10 +1127,10 @@ class RSSMDynamics(nn.Module):
         unused K-stack (gain-match FD Huber is last-step feat).
         ``out`` selects what is stacked (GRU recurrence is identical):
           * ``'feat'`` (default) — full ``state.feat``
-          * ``'h'`` — ``state.h`` only (held-rollout drift; no F-stack)
+          * ``'h'`` — ``state.h`` only (isolation TBPTT chunks; no F-stack)
           * ``'obs'`` — ``decode(feat)`` per step.  Pointwise MLP ⇒
             ``stack(decode(feat_k))`` ≡ ``decode(stack(core))`` (overshoot
-            does not need the unused F-stack; one decode after K).
+            / P62 held decode-CV; one decode after K, no unused F-stack).
         ``last_only`` materializes ``out`` once after the K-loop (no
         intermediate decode / feat copies).
 

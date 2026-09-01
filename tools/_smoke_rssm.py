@@ -72,6 +72,7 @@ from training.train import (
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
                             _gain_match_rest_window, _gain_match_rest_ic_state,
                             _held_rollout_win,
+                            _wm_held_rollout_stationarity_loss,
                             _rest_ic_can_cuda_graph,
                             _RestICGraphModule, _rest_ic_last_tensors,
                             _rest_ic_note_capture_miss,
@@ -1508,7 +1509,7 @@ def _test_img_rollout_last_only() -> None:
     """Gain-match last-step Huber: last_only ≡ stack[:, -1]; GRU still gets grad.
 
     ``out='h'`` / ``out='obs'`` are identity vs slicing/decoding the feat
-    stack (overshoot/held skip the unused F-stack).
+    stack (isolation TBPTT / overshoot skip the unused F-stack).
     """
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
     torch.manual_seed(0)
@@ -1872,7 +1873,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "out='obs'" in _src
-    assert "out='h'" in _src
+    assert 'held_cv=True' in _src
+    assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
     assert "last_only=True, out='obs'" in _src
     assert '_p1_fidelity_local_plateau' in _src
@@ -2909,6 +2911,57 @@ def _test_held_rollout_win_fits_k() -> None:
         s = max(w, min(s, k - 2 * w))
         assert s >= w and (k - w) > (s + w), (k, w_req, w, s)
     print('[smoke] OK  held-rollout win clamps to (K-1)/4 (test_sim 8)')
+
+
+def _test_held_rollout_cv_space() -> None:
+    """P62: held late−early is decode-CV, not GRU h (p139 compounding RCA)."""
+    import inspect
+    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
+
+    src = inspect.getsource(_wm_held_rollout_stationarity_loss)
+    assert "out='obs'" in src, 'held must roll decode, not out=h'
+    assert 'cv_index_t' in src
+    assert "out='h'" not in src
+
+    class _Wrap:
+        world_model_type = 'rssm'
+
+        def __init__(self, dyn):
+            self.dynamics = dyn
+
+    torch.manual_seed(0)
+    rcfg = RSSMConfig(obs_dim=4, action_dim=1, deter_dim=16,
+                      n_categoricals=4, n_classes=4, embed_dim=16,
+                      hidden_dim=16, latent_type='deterministic',
+                      cont_gain_dim=2, cv_indices=(0,))
+    dyn = RSSMDynamics(rcfg)
+    model = _Wrap(dyn)
+    B, T = 2, 16
+    obs = torch.randn(B, T, rcfg.obs_dim)
+    act = torch.rand(B, T, rcfg.action_dim) * 2 - 1
+    feat_dim = dyn.deter_dim + dyn.stoch_flat_dim + dyn.cont_dim
+    feats = torch.randn(B, T, feat_dim)
+    cfg = TrainConfig()
+    cfg.wm_held_rollout_coef = 0.5
+    cfg.wm_held_rollout_len = 8
+    cfg.wm_held_rollout_gate_recon = 0.0
+    cfg.wm_held_rollout_max_starts = 2
+    torch.manual_seed(0)
+    hd0, n0 = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
+    assert torch.isfinite(hd0).all() and float(hd0) >= 0.0 and n0 > 0
+    snap = {n: p.detach().clone() for n, p in dyn.decoder.named_parameters()}
+    with torch.no_grad():
+        for p in dyn.decoder.parameters():
+            p.add_(1.0)
+    torch.manual_seed(0)
+    hd1, _ = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
+    with torch.no_grad():
+        for n, p in dyn.decoder.named_parameters():
+            p.copy_(snap[n])
+    assert abs(float(hd0) - float(hd1)) > 1e-8, (
+        f'held ignored decoder ({float(hd0):.5f} vs {float(hd1):.5f})')
+    print(f'[smoke] OK  held decode-CV stationarity '
+          f'(loss {float(hd0):.4f}→{float(hd1):.4f} on decoder noise)')
 
 
 def _test_collect_rest_lookback_tm_pairing() -> None:
@@ -4623,6 +4676,7 @@ if __name__ == '__main__':
     _test_gain_match_held_settle()
     _test_gain_match_rest_window()
     _test_held_rollout_win_fits_k()
+    _test_held_rollout_cv_space()
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
     _test_p3_reset_log_std()

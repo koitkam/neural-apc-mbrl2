@@ -325,15 +325,30 @@ def main():
     assert torch.isfinite(ov_a).all() and torch.isfinite(ov_b).all()
     assert abs(float(ov_a) - float(ov_b)) > 1e-8, \
         'overshoot must read posterior c (loss unchanged when only c shifted)'
-    # Held-rollout is GAIN-NEUTRAL (late−early drift of h). A constant c
+    # Held-rollout is GAIN-NEUTRAL (late−early decoded-CV). A constant c
     # offset that persists can cancel in that difference — do not require
-    # the loss to move. Still require a finite term; img_rollout(c0) above
-    # already proves the start-c path.
+    # the loss to move. Still require a finite term; decoder noise below
+    # proves the decode-CV path. img_rollout(c0) above already proves start-c.
     torch.manual_seed(2)
     hd_a, _ = _wm_held_rollout_stationarity_loss(model, feats_c, obs, act, cfg)
     assert torch.isfinite(hd_a).all() and float(hd_a) >= 0.0
+    _dec_snap = {n: p.detach().clone()
+                 for n, p in rssm.decoder.named_parameters()}
+    with torch.no_grad():
+        for p in rssm.decoder.parameters():
+            p.add_(0.5)
+    torch.manual_seed(2)
+    hd_dec, _ = _wm_held_rollout_stationarity_loss(
+        model, feats_c, obs, act, cfg)
+    with torch.no_grad():
+        for n, p in rssm.decoder.named_parameters():
+            p.copy_(_dec_snap[n])
+    assert abs(float(hd_a) - float(hd_dec)) > 1e-8, (
+        f'held must read decode (h-only would ignore decoder; '
+        f'{float(hd_a):.5f} vs {float(hd_dec):.5f})')
     print(f'[overshoot-c0] OK: overshoot {float(ov_a):.5f}→{float(ov_b):.5f} '
-          f'(c-slice shift); held finite {float(hd_a):.5f} (gain-neutral)')
+          f'(c-slice shift); held finite {float(hd_a):.5f} '
+          f'(decode-CV; decoder noise {float(hd_dec):.5f})')
 
     # ---- P28 follow-up 14: production path starts from posterior MEAN c,
     # not the reparameterized sample packed into feat.  Shifting only the
