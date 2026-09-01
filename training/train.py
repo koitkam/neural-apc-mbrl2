@@ -6873,9 +6873,13 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     delta_K = cv_K - start_cv
     fo = _held_ol_fo_scale(cfg, K)
     target = delta_1.detach() * fo
-    scale = tail.detach().std().clamp_min(1e-3)
     err = delta_K - target
-    loss = (err / scale).pow(2).mean()
+    # P63 abort iter 1: std-normalized MSE detonated (loss 1.18e5, skip 5/5)
+    # when imagined-CV std sat the 1e-3 floor.  Same class as 1/|tgt| Huber.
+    # Abs Huber β=1 in z-scored CV (gain-match scalar). jsonl scale still
+    # records tail std so a quiet Huber is not mistaken for a tiny denom.
+    scale = tail.detach().std()
+    loss = F.smooth_l1_loss(delta_K, target, beta=1.0)
     tgt_d = target.detach()
     den = tgt_d.pow(2).sum().clamp_min(1e-8)
     ol_ratio = (delta_K.detach() * tgt_d).sum() / den

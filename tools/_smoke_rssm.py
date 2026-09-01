@@ -2962,6 +2962,7 @@ def _test_held_rollout_cv_space() -> None:
     assert float(d0['wm_held_rollout_scale']) >= 1e-3
     assert float(d0['wm_held_cv_drift']) >= 0.0
     assert torch.isfinite(d0['wm_held_ol_ratio']).all()
+    assert float(hd0) < 50.0, f'held magnitude detonated at init ({float(hd0):.3f})'
     snap = {n: p.detach().clone() for n, p in dyn.decoder.named_parameters()}
     with torch.no_grad():
         for p in dyn.decoder.parameters():
