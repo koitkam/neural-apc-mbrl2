@@ -8679,8 +8679,6 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             'wm_held_rollout_scale', torch.zeros((), device=feats.device)),
         'wm_held_cv_drift': held_diag.get(
             'wm_held_cv_drift', torch.zeros((), device=feats.device)),
-        'wm_held_ol_ratio': held_diag.get(
-            'wm_held_ol_ratio', torch.zeros((), device=feats.device)),
         'cont_kl': cont_kl.detach(),
         'cont_gain_persist': cont_gain_persist.detach(),
         'gain_match_loss': gain_match_loss.detach(),
@@ -8829,8 +8827,6 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
             'wm_held_rollout_scale', torch.zeros((), device=device)),
         'wm_held_cv_drift': held_diag.get(
             'wm_held_cv_drift', torch.zeros((), device=device)),
-        'wm_held_ol_ratio': held_diag.get(
-            'wm_held_ol_ratio', torch.zeros((), device=device)),
     }
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away

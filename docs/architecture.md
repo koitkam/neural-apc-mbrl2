@@ -92,8 +92,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > 1step→K FO magnitude **DISCARDED / REVERT**. Storm **2/2**, recon stuck
 > ~0.5, GAIN_NOT_READY **9.75@MV**, P3 skipped. Do **not** score actor.
 > Held-magnitude family **closed**. KEEP `out='obs'` late−early.
-> **P64 LAUNCH** (`run_p64_p2amp`): P2 Kalman amp = P3/val cap (P1 stays
-> 0.2). `[resolved-cfg] held_cv=True p1amp=0.2 p2amp=1 p3amp=1`.
+> **P64 LIVE** (`run_p64_p2amp`, pid **169231**): P2 Kalman amp = P3/val cap (P1 stays
+> 0.2). `[resolved-cfg] held_cv=True p1amp=0.2 p2amp=1 p3amp=1`. P1 iter **23**
+> recon **0.0039** skip **0** held **1.4e-4** (P62-class; P63 was ~0.5). P2 amp
+> not on yet. Dummy jsonl `wm_held_ol_ratio` **REMOVED** (HEAD).
 > Champion **P58** econ / **P53** μ-ratio / **P26** observer.
 > Do not settle=`wm_tf_horizon`. jsonl `adv_action_corr`
 > aliases leftover `imag_adv_action_corr`. `training_diagnostics` is
@@ -933,7 +935,7 @@ fixes BOTH:
   Held-rollout is `out='obs'` then decoded-CV **late−early** (P62 space
   KEEP; P63 1step→K FO magnitude **REVERT** — FO~13 × sg(Δ1) detonated
   P1). Early window `s=K//2`. jsonl `wm_held_rollout_scale` /
-  `wm_held_cv_drift` (`wm_held_ol_ratio` unused, emits 0).
+  `wm_held_cv_drift`. Dummy `wm_held_ol_ratio` **REMOVED** (P64-live).
   `wm_held_rollout_settle_frac` is **removed**. `img_rollout out='h'` is removed
   (P61 held; isolation TBPTT still default-feat + `keep_c` on `h`).
   CUDA: `make_graphed_callables` on

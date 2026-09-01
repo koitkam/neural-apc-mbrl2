@@ -1877,6 +1877,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'p2amp=' in _src
     assert 'p3amp=' in _src
     assert 'wm_held_cv_drift' in _src
+    assert "'wm_held_ol_ratio'" not in _src
     assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
     assert "last_only=True, out='obs'" in _src
@@ -2932,6 +2933,7 @@ def _test_held_rollout_cv_space() -> None:
     assert 'K // 2' in src
     assert '_held_ol_fo_scale' not in src
     assert 'delta_1.detach()' not in src
+    assert 'wm_held_ol_ratio' not in src
 
     class _Wrap:
         world_model_type = 'rssm'
