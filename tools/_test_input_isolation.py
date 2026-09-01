@@ -330,15 +330,16 @@ def main():
     # the loss to move. Still require a finite term; decoder noise below
     # proves the decode-CV path. img_rollout(c0) above already proves start-c.
     torch.manual_seed(2)
-    hd_a, _ = _wm_held_rollout_stationarity_loss(model, feats_c, obs, act, cfg)
+    hd_a, _, d_a = _wm_held_rollout_stationarity_loss(model, feats_c, obs, act, cfg)
     assert torch.isfinite(hd_a).all() and float(hd_a) >= 0.0
+    assert float(d_a.get('wm_held_cv_drift', 0.0)) >= 0.0
     _dec_snap = {n: p.detach().clone()
                  for n, p in rssm.decoder.named_parameters()}
     with torch.no_grad():
         for p in rssm.decoder.parameters():
             p.add_(0.5)
     torch.manual_seed(2)
-    hd_dec, _ = _wm_held_rollout_stationarity_loss(
+    hd_dec, _, _ = _wm_held_rollout_stationarity_loss(
         model, feats_c, obs, act, cfg)
     with torch.no_grad():
         for n, p in rssm.decoder.named_parameters():

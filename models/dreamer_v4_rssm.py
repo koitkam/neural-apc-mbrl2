@@ -1126,13 +1126,14 @@ class RSSMDynamics(nn.Module):
         recurrence / last-step as ``stack[:, -1]``, without keeping the
         unused K-stack (gain-match FD Huber is last-step feat).
         ``out`` selects what is stacked (GRU recurrence is identical):
-          * ``'feat'`` (default) — full ``state.feat``
-          * ``'h'`` — ``state.h`` only (isolation TBPTT chunks; no F-stack)
+          * ``'feat'`` (default) — full ``state.feat`` (isolation TBPTT
+            chunks slice ``h`` for ``keep_c``; loss still needs decode)
           * ``'obs'`` — ``decode(feat)`` per step.  Pointwise MLP ⇒
             ``stack(decode(feat_k))`` ≡ ``decode(stack(core))`` (overshoot
             / P62 held decode-CV; one decode after K, no unused F-stack).
         ``last_only`` materializes ``out`` once after the K-loop (no
-        intermediate decode / feat copies).
+        intermediate decode / feat copies).  ``out='h'`` was P61 held
+        and is **removed** (no training call site).
 
         P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
         the open-loop gain supervisor trained a ``c=0`` GRU path while
@@ -1156,7 +1157,7 @@ class RSSMDynamics(nn.Module):
         if self.cont_dim > 0:
             c = (c0 if c0 is not None else cached_zeros_bd(
                 self, int(Bm), self.cont_dim, h0.dtype, h0.device))
-        if out not in ('feat', 'h', 'obs'):
+        if out not in ('feat', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
         # Layout-only IC: ``img_step`` replaces ``z_logits`` (no in-place
         # write).  Deterministic latent never reads this softmax slot.
@@ -1165,12 +1166,10 @@ class RSSMDynamics(nn.Module):
             h0.dtype, h0.device, attr='_img_zlogits_zeros')
         state = RSSMState(
             h=h0, z_logits=z_logits, z=z0, c=c)
-        feats = None if last_only else []
         h_l = z_l = c_l = dv_l = None
-        if not last_only and out != 'h':
+        if not last_only:
             h_l, z_l, c_l, dv_l = [], [], [], []
         img_step = self.img_step
-        out_h = out == 'h'
         out_obs = out == 'obs'
         act_k = _time_unbind(actions)
         dv_seq = _time_unbind(dvs)
@@ -1179,18 +1178,11 @@ class RSSMDynamics(nn.Module):
             state = img_step(state, act_k[k], dv=dv_k, sample=sample)
             if last_only:
                 continue
-            if out_h:
-                feats.append(state.h)
-            else:
-                _append_decode_core(h_l, z_l, c_l, dv_l, state)
+            _append_decode_core(h_l, z_l, c_l, dv_l, state)
         if last_only:
-            if out_h:
-                return state.h
             if out_obs:
                 return self.decode(state.feat)
             return state.feat                                 # (Bm, *)
-        if out_h:
-            return torch.stack(feats, dim=1)                  # (Bm, K, H)
         core = _stack_decode_core(h_l, z_l, c_l, dv_l)
         if out_obs:
             return self.decode(core)                          # (Bm, K, obs)

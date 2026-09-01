@@ -6757,7 +6757,8 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
                                         cfg: TrainConfig,
                                         recon_loss: Optional[torch.Tensor] = None,
                                         c_mean: Optional[torch.Tensor] = None,
-                                        ) -> Tuple[torch.Tensor, float]:
+                                        ) -> Tuple[torch.Tensor, float,
+                                                   Dict[str, torch.Tensor]]:
     """Option (b2, P89 / P62): multi-step HELD-ACTION decode-CV stationarity.
 
     Complements the 1-step ``_rssm_steady_consistency`` (which only fires on the
@@ -6777,18 +6778,23 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     is still GAIN-NEUTRAL (tail displacement, not magnitude; transient
     ``[0, s)`` unconstrained so overshoot/gain-match still set G) and
     scale-robust (normalised by the rollout's own CV std).  RSSM-interface
-    (rssm + tssm); returns ``(0, 0.0)`` for the SF backbone.  Cost ~ O(B·max_starts·K) GRU
+    (rssm + tssm); returns ``(0, 0.0, {})`` for the SF backbone.  Cost ~ O(B·max_starts·K) GRU
     steps, bounded by ``wm_held_rollout_max_starts``.  ``sample=True`` so the
     straight-through categorical grad trains the PRIOR (the drift source).
+    jsonl extras (identity, no extra forward): ``wm_held_rollout_scale``
+    (CV std in the loss denom) and ``wm_held_cv_drift`` (unnormalized
+    |late−early| mean) so a quiet normalized loss is not mistaken for a
+    quiet CV (P62 vs P61 h-std).
     """
     coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
     K = int(getattr(cfg, 'wm_held_rollout_len', 0) or 0)
     device = obs.device
     zero = torch.zeros((), device=device, dtype=obs.dtype)
+    empty: Dict[str, torch.Tensor] = {}
     if coef <= 0.0 or K < 4:
-        return zero, 0.0
+        return zero, 0.0, empty
     if not _is_rssm_interface(model):
-        return zero, 0.0
+        return zero, 0.0, empty
     rssm = model.dynamics
     B, T = obs.shape[:2]
     _win_req = int(getattr(cfg, 'wm_held_rollout_win', 8) or 8)
@@ -6802,7 +6808,7 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     # keep the two averaging windows non-overlapping inside [0, K)
     s = max(win, min(s, K - 2 * win))
     if s < win or K - win <= s + win:
-        return zero, 0.0
+        return zero, 0.0, empty
     max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 8) or 8))
     stride = max(1, T // max_starts)
     starts = _cached_strided_arange(
@@ -6845,7 +6851,12 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     scale = tail.detach().std().clamp_min(1e-3)
     early = tail[:, s:s + win].mean(dim=1)                       # (Bm, n_cv|D)
     late = tail[:, K - win:].mean(dim=1)
-    loss = ((late - early) / scale).pow(2).mean()
+    delta = late - early
+    loss = (delta / scale).pow(2).mean()
+    extras: Dict[str, torch.Tensor] = {
+        'wm_held_rollout_scale': scale.detach(),
+        'wm_held_cv_drift': delta.detach().abs().mean(),
+    }
     # Soft recon-fidelity gate (mirror overshoot): ramp the term in only as
     # 1-step recon converges so an untrained decoder/prior is not destabilised
     # early in P1.  ``gate_recon<=0`` disables.
@@ -6853,7 +6864,7 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     if thr > 0.0 and recon_loss is not None:
         gate = torch.clamp(thr / recon_loss.detach().clamp_min(1e-6), max=1.0)
         loss = gate * loss
-    return loss, float(S)
+    return loss, float(S), extras
 
 
 def _recon_channel_weights(cfg: TrainConfig, n_ch: int, device,
@@ -8639,8 +8650,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
 
     # ----- (b2, P89) multi-step held-action rollout stationarity (RSSM) -----
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
+    held_diag: Dict[str, torch.Tensor] = {}
     if _run_held and held_coef > 0.0 and _g_live:
-        held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
+        held_loss, _held_starts, held_diag = _wm_held_rollout_stationarity_loss(
             model, feats, obs_cur, act, cfg, recon_loss=recon_loss,
             c_mean=_c_mean)
     else:
@@ -8676,6 +8688,10 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=feats.device),
         'wm_held_rollout_loss': held_loss.detach(),
+        'wm_held_rollout_scale': held_diag.get(
+            'wm_held_rollout_scale', torch.zeros((), device=feats.device)),
+        'wm_held_cv_drift': held_diag.get(
+            'wm_held_cv_drift', torch.zeros((), device=feats.device)),
         'cont_kl': cont_kl.detach(),
         'cont_gain_persist': cont_gain_persist.detach(),
         'gain_match_loss': gain_match_loss.detach(),
@@ -8802,7 +8818,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # ----- (b2, P89) held-action rollout stationarity — RSSM-ONLY (SF no-op) --
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
-    held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
+    held_loss, _held_starts, held_diag = _wm_held_rollout_stationarity_loss(
         model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
 
     losses: Dict[str, torch.Tensor] = {
@@ -8820,6 +8836,10 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=device),
         'wm_held_rollout_loss': held_loss.detach(),
+        'wm_held_rollout_scale': held_diag.get(
+            'wm_held_rollout_scale', torch.zeros((), device=device)),
+        'wm_held_cv_drift': held_diag.get(
+            'wm_held_cv_drift', torch.zeros((), device=device)),
     }
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away

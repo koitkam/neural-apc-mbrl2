@@ -923,7 +923,11 @@ fixes BOTH:
   `feat[..., :dec_in]`). Overshoot `out='obs'` is one `decode` after K.
   Held-rollout (P62) is the same `out='obs'` then decoded-CV late−early
   stationarity (P89 measured GRU `h`; P61 h-loss ~6e-4 while
-  1step→openloop stayed ×0.77).
+  1step→openloop stayed ×0.77). jsonl `wm_held_rollout_scale` /
+  `wm_held_cv_drift` are the loss denom and unnormalized |late−early|
+  (identity; P62 LIVE held was quieter than P61 at matched iters —
+  scale mismatch vs a quiet CV). `img_rollout out='h'` is removed
+  (P61 held; isolation TBPTT still default-feat + `keep_c` on `h`).
   CUDA: `make_graphed_callables` on
   `_RestICGraphModule` wrapping that T-loop when
   `gain_match_rest_ic_cuda_graph` (default True; RSSM

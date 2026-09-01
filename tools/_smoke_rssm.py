@@ -1508,8 +1508,9 @@ def _test_store_aux_feats_identity() -> None:
 def _test_img_rollout_last_only() -> None:
     """Gain-match last-step Huber: last_only ≡ stack[:, -1]; GRU still gets grad.
 
-    ``out='h'`` / ``out='obs'`` are identity vs slicing/decoding the feat
-    stack (isolation TBPTT / overshoot skip the unused F-stack).
+    ``out='obs'`` is identity vs decoding the feat stack (overshoot / P62
+    held).  ``out='h'`` was P61 held and is removed (isolation TBPTT
+    keeps default feat and slices ``h`` for ``keep_c``).
     """
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
     torch.manual_seed(0)
@@ -1528,15 +1529,14 @@ def _test_img_rollout_last_only() -> None:
     assert last.shape == roll[:, -1].shape, (last.shape, roll[:, -1].shape)
     err = float((last - roll[:, -1]).detach().abs().max())
     assert err < 1e-6, f'last_only != stack[:, -1] (max_err={err})'
-    h_roll = m.img_rollout(h0, z0, acts, sample=False, out='h')
-    h_err = float((h_roll - roll[..., :cfg.deter_dim]).detach().abs().max())
-    assert h_err < 1e-6, f"out='h' != feat[..., :deter] (max_err={h_err})"
+    try:
+        m.img_rollout(h0, z0, acts, sample=False, out='h')
+        raise AssertionError("out='h' should be removed")
+    except ValueError as exc:
+        assert 'out' in str(exc)
     obs_roll = m.img_rollout(h0, z0, acts, sample=False, out='obs')
     obs_err = float((obs_roll - m.decode(roll)).detach().abs().max())
     assert obs_err < 1e-5, f"out='obs' != decode(feat) (max_err={obs_err})"
-    last_h = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='h')
-    last_h_err = float((last_h - h_roll[:, -1]).detach().abs().max())
-    assert last_h_err < 1e-6, f"last_only out='h' != stack[:, -1] (max_err={last_h_err})"
     last_obs = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='obs')
     last_obs_err = float((last_obs - obs_roll[:, -1]).detach().abs().max())
     assert last_obs_err < 1e-5, f"last_only out='obs' != stack[:, -1] (max_err={last_obs_err})"
@@ -1551,9 +1551,8 @@ def _test_img_rollout_last_only() -> None:
                 if p.grad is not None)
     assert gru_g > 0.0, 'last_only decode/feat lost GRU gradient'
     print(f'[smoke] OK  img_rollout last_only ≡ stack[:, -1] '
-          f'(max_err={err:.2e}); out=h/obs identity '
-          f'(h={h_err:.2e} obs={obs_err:.2e} last_h={last_h_err:.2e} '
-          f'last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}; '
+          f'(max_err={err:.2e}); out=obs identity '
+          f'(obs={obs_err:.2e} last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}; '
           f'z_logits cache identity max_err={cache_err:.2e}')
 
 
@@ -1874,6 +1873,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "out='obs'" in _src
     assert 'held_cv=True' in _src
+    assert 'wm_held_cv_drift' in _src
     assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
     assert "last_only=True, out='obs'" in _src
@@ -2947,21 +2947,26 @@ def _test_held_rollout_cv_space() -> None:
     cfg.wm_held_rollout_gate_recon = 0.0
     cfg.wm_held_rollout_max_starts = 2
     torch.manual_seed(0)
-    hd0, n0 = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
+    hd0, n0, d0 = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
     assert torch.isfinite(hd0).all() and float(hd0) >= 0.0 and n0 > 0
+    assert float(d0['wm_held_rollout_scale']) >= 1e-3
+    assert float(d0['wm_held_cv_drift']) >= 0.0
     snap = {n: p.detach().clone() for n, p in dyn.decoder.named_parameters()}
     with torch.no_grad():
         for p in dyn.decoder.parameters():
             p.add_(1.0)
     torch.manual_seed(0)
-    hd1, _ = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
+    hd1, _, d1 = _wm_held_rollout_stationarity_loss(model, feats, obs, act, cfg)
     with torch.no_grad():
         for n, p in dyn.decoder.named_parameters():
             p.copy_(snap[n])
     assert abs(float(hd0) - float(hd1)) > 1e-8, (
         f'held ignored decoder ({float(hd0):.5f} vs {float(hd1):.5f})')
+    assert abs(float(d0['wm_held_cv_drift']) - float(d1['wm_held_cv_drift'])) > 1e-8
     print(f'[smoke] OK  held decode-CV stationarity '
-          f'(loss {float(hd0):.4f}→{float(hd1):.4f} on decoder noise)')
+          f'(loss {float(hd0):.4f}→{float(hd1):.4f} on decoder noise; '
+          f'drift {float(d0["wm_held_cv_drift"]):.4f}→'
+          f'{float(d1["wm_held_cv_drift"]):.4f})')
 
 
 def _test_collect_rest_lookback_tm_pairing() -> None:
