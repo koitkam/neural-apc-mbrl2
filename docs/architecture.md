@@ -110,8 +110,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P66 EXIT** (`run_p66_dobvar`, pid **181468**, sha `38880f9`, 515 iters):
 > per-seq `dob_ground` var-skip **REVERT / FALSIFIED**. Val MV **×0.766 /
 > ×0.774** DV **×0.773 / ×0.814**. det_r **0.264** pred_std **0.252 vs 1.93**.
-> Paired **−19.85 vs −104**, loses to P64. Third DOB-amp A/B. **P67:** teacher
-> `gain_match_len<=0` auto = `wm_tf_horizon` (test_sim 220). Do not settle=`wm_tf_horizon`.
+> Paired **−19.85 vs −104**, loses to P64. Third DOB-amp A/B. **P67 LIVE
+> extra-P1 iter 94:** teacher K=220 jsonl ×1; gate **82 FAIL 0.80@DV**,
+> gate **94 FAIL 0.79@DV** (P64 PASS 0.91@DV). Extra-P1 overshot MV
+> **1.11/@H 1.22**. Do not settle=`wm_tf_horizon`. Do not teacher-K N+1.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -174,10 +176,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > P1→P2 replay flush **REVERT** (val pred_std 0.518 vs P64 0.608; paired
 > −12 vs −4.54). **P66 EXIT** per-seq `dob_ground` var-skip **REVERT /
 > FALSIFIED** (pred_std 0.252 vs P64 0.608; paired −19.85 vs −4.54).
-> **P67 LIVE P1 iter 69** (`run_p67_gmatch4h`, pid **187753**): teacher
-> `gain_match_len` auto = `wm_tf_horizon` (K=220). Storm **1/2 @67** recovered;
-> last_ok **69 unlocked**; teacher **×0.995 / ×0.983**; recon **0.0056**;
-> `t_wm` 134 s ~14.3 GB. Encode T lookback. Val OL-vs-real pending.
+> **P67 LIVE extra-P1 iter 94** (`run_p67_gmatch4h`, pid **187753**):
+> teacher K=220 jsonl **×1.006 / ×1.021**. Storm **1/2 @67** recovered.
+> Gate **82 FAIL 0.80@DV**; gate **94 FAIL 0.79@DV** vs P64 **PASS 0.91@DV**.
+> Extra-P1 MV **1.11/@H 1.22**. Encode T lookback. Cap 929884. Do not
+> score actor if GAIN_NOT_READY. Val OL-vs-real pending.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
