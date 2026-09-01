@@ -33,8 +33,9 @@ import torch
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Public helpers (also used by workflow.single_run for on-the-fly empirical
-# batch-size selection — see DREAMER_GPU_CALIBRATE).
+# Public helpers (also used by workflow.single_run / bo_runner for
+# on-the-fly empirical batch-size selection via
+# ``pick_batch_size_for_plant`` / ``gpu_probe_knobs()``).
 # ───────────────────────────────────────────────────────────────────────────
 
 def measure_per_sample_mb(cfg, bs_probe: int = 4) -> dict:

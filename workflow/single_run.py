@@ -297,8 +297,8 @@ def main() -> int:
     # falls back to paper_default=16.
     #
     # ``wm_overhead_factor`` reserves headroom the WM-only probe does NOT
-    # measure: the actor/critic/optimizer state and the Phase-3 imagination
-    # rollout (horizon-step latent unroll).  ``gpu_probe_knobs()`` inside
+    # measure: actor/critic/optimizer state and P3 collect/val graphs.
+    # ``gpu_probe_knobs()`` inside
     # ``pick_batch_size_for_plant`` reads TrainConfig ``wm_overhead`` /
     # ``gpu_target_util`` / ``gpu_max_bs`` (leftover ``DREAMER_WM_OVERHEAD``
     # / ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``).  Identity 1.30 /

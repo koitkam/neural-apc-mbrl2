@@ -1852,12 +1852,9 @@ class DreamerV4(nn.Module):
         ``z_history``     : ``(B, T_ctx, z_dim)``  — clean past latents.
         ``action``        : ``(B, action_dim)``    — action taken at the next step.
         ``action_history``: ``(B, T_ctx, action_dim)`` — REAL past actions
-            that produced ``z_history``.  REQUIRED for correctness: during
-            WM training the dynamics always sees real actions at every
-            position; passing zeros for the past creates a train/inference
-            distribution mismatch and the dynamics produces garbage.
-            (Defaults to zeros for back-compat with old callers; warn-loud
-            via ``DREAMER_ACT_HIST_REQUIRED=1`` to catch missing hookups.)
+            that produced ``z_history``.  Required.  Omitting it used to
+            zero-fill the past (train/inference mismatch); that fallback
+            is gone.
         ``tau_ctx``       : context noise level.  ``None`` (default) → auto
             ``1.0 / k_max`` so the past τ lands at ``(k_max-1)/k_max`` which
             is the MAX value in the training τ-grid (sample_tau_d only ever
@@ -1882,19 +1879,14 @@ class DreamerV4(nn.Module):
         z_seq = torch.cat([z_past_corr, z0], dim=1)                       # (B, T_ctx+1, z)
         # Action: real past actions + supplied current action.
         if action_history is None:
-            import os as _os
-            if _os.environ.get('DREAMER_ACT_HIST_REQUIRED', '').strip() in ('1','true','True'):
-                raise ValueError(
-                    'imagine_next_z called without action_history; this is '
-                    'a train/inference distribution bug.  Pass the real '
-                    'past actions that produced z_history.')
-            act_past = torch.zeros(B, T_ctx, cfg.action_dim, device=device,
-                                    dtype=action.dtype)
-        else:
-            assert action_history.shape == (B, T_ctx, cfg.action_dim), (
-                f'action_history shape {tuple(action_history.shape)} != '
-                f'expected ({B}, {T_ctx}, {cfg.action_dim})')
-            act_past = action_history.to(device=device, dtype=action.dtype)
+            raise ValueError(
+                'imagine_next_z called without action_history; this is '
+                'a train/inference distribution bug.  Pass the real '
+                'past actions that produced z_history.')
+        assert action_history.shape == (B, T_ctx, cfg.action_dim), (
+            f'action_history shape {tuple(action_history.shape)} != '
+            f'expected ({B}, {T_ctx}, {cfg.action_dim})')
+        act_past = action_history.to(device=device, dtype=action.dtype)
         act_seq = torch.cat([act_past, action.unsqueeze(1)], dim=1)       # (B, T_ctx+1, A)
         # τ / d sequences: past = (1 - tau_ctx, d_min), current = (0 → 1, d_min).
         d_min = 1.0 / cfg.k_max

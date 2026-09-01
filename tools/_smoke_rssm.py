@@ -2060,6 +2060,10 @@ def _test_envfree_observer_recipe() -> None:
     assert not hasattr(c, 'gain_match_relative')
     from workflow._plant_prepare import ENV_OVERRIDES
     assert 'DREAMER_WM_HELD_ROLLOUT_SETTLE_FRAC' not in ENV_OVERRIDES
+    assert 'DREAMER_ACT_HIST_REQUIRED' not in ENV_OVERRIDES
+    _dv4 = open(__import__('models.dreamer_v4', fromlist=['dummy']).__file__).read()
+    assert 'DREAMER_ACT_HIST_REQUIRED' not in _dv4
+    assert 'action_history is None' in _dv4
     assert 'DREAMER_GAIN_MATCH_SETTLE_LEN' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_REST_IC_LEN' in ENV_OVERRIDES
