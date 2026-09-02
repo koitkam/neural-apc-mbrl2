@@ -147,13 +147,16 @@ env-gated off · **[planned]** = designed, not yet built.
 > **GAIN-READY 0.81@MV**. Val MV **×0.809 / ×0.873** DV **×0.848 /
 > ×0.941**. 1step→OL **×0.836**. det_r **0.074**. Paired **−48 vs
 > −105**, mv_viol **20**. Skip rms stalled **0.00387** — teacher-pin
-> no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75 LIVE**
+> no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75 LIVE P3 ~260**
 > FOPDT rise teacher (`run_p75_gmatchfo`, pid **230450**): `gmatch_fo=True`.
-> Iter 64 P1 skip 0 last_ok 60 unlocked@64. Wrap@61 (recon 0.40) recovered.
-> jsonl last-step ×0.99/×0.99. CPU TM@K=55 P75@60 MV **×0.69** mid/FO/ss
-> **1.19** (vs @40 ×0.63 / 1.05; SS recovered, rise overshoots FO). H=55
-> fidelity **0.261**. Rise Huber mass 1.4%. HEAD jsonl `*_ratio_mid` +
-> `rise_wfrac` (not in this pid). Persist KEEP. No new knob.
+> P1→P2 @82 **GAIN-READY 0.84@MV** last_ok **82** skip **0**. Wrap@61
+> recovered. CPU TM@K=55 freeze ckpt80 MV **×0.83** mid/FO/ss **1.24**
+> (P64@80 ×0.97 / 1.15; P73@80 ×0.57 / 1.43). FO at K=H (rise mass 1.4%)
+> did not pin rise vs P64. P2→P3 @136 mtp 0.950. Unfreeze 147 ent HELD
+> −0.107; logp spike recovered; rscale 1.85 KEEP; rtgt med 0.002.
+> Valid actor experiment — do not score until val. HEAD jsonl
+> `*_ratio_mid` + `rise_wfrac` (not in this pid). Persist KEEP. No new
+> knob. Do not second GPU job.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -230,7 +233,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > as compounding** (val 1step→OL ×0.761 OL ×0.743; persist_rel 0.037).
 > **P74 EXIT** decoder skip **REVERT** (`run_p74_gcvskip`, 381 iters):
 > val MV ×0.809 det_r **0.074** mv_viol **20**. Teacher-pin no-op +
-> DOB steal. **P75** FOPDT rise teacher on gain-match.
+> DOB steal. **P75 LIVE P3 ~260** FOPDT rise teacher: GAIN-READY 0.84@MV;
+> freeze TM rise still overshoots FO (mid/FO/ss 1.24 vs P64 1.15).
+> Unfreeze 147 ent HELD; rscale 1.85; rtgt med 0.002. Valid actor
+> experiment — do not score until val.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
