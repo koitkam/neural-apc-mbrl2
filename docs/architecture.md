@@ -149,7 +149,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > −105**, mv_viol **20**. Skip rms stalled **0.00387** — teacher-pin
 > no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75 LIVE**
 > FOPDT rise teacher (`run_p75_gmatchfo`, pid **230450**): `gmatch_fo=True`.
-> Iter 1 teacher ×0.561/×−0.422. Persist KEEP. No new knob.
+> Iter 26 P1 skip 0 last_ok 26 jsonl last-step ×0.997/×0.975. CPU TM@K=55
+> iter20 MV ×0.80 mid/FO/ss **0.70** vs P64@80 ×0.97 / 1.17. HEAD jsonl
+> `*_ratio_mid` (not in this pid). Persist KEEP. No new knob.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -609,7 +611,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > that lookback). P43 DV @H ×0.849 vs ss ×0.740 — do not cite `@H≈ss`
 > for DV. `DREAMER_GAIN_MATCH_SETTLE_LEN=0` is auto-H A/B only.
 > jsonl `wm_gain_match_mv_ratio` / `wm_gain_match_dv_ratio` =
-> mean `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss; not in P44 pid).
+> mean last-step `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss; not in P44 pid).
+> HEAD also logs `*_ratio_mid` / `*_ratio_mid_fo` at `k=(K-1)//4`
+> (P75-live; not in pid **230450**).
 > **P45 EXIT PROMOTE** `gain_match_rest_ic` (default True): first
 > GAIN-READY freeze since P40–P44 (gate 0.86@DV; val MV ss/@H
 > **×0.877 / ×0.887**, DV **×0.815 / ×0.875**, det_r 0.148). Real held-OP
@@ -992,8 +996,11 @@ fixes BOTH:
   last_ok-81 hygiene / **FALSIFIED as compounding** (persist_rel 0.037;
   1step→OL ×0.761). P69–P73 G-family closed as a compounding attack.
   **P74 EXIT REVERT:** decoder `gain_cv_skip` was a teacher-pin no-op
-  (rms 0.00387; det_r 0.074; mv_viol 20). **P75:** gain-match Huber is
-  `G_tgt · FO(k)/FO(K)` (identified τ/θ; last step still DC). Explicit
+  (rms 0.00387; det_r 0.074; mv_viol 20).   **P75:** gain-match Huber is
+  `G_tgt · FO(k)/FO(K)` (identified τ/θ; last step still DC). jsonl
+  last-step `*_ratio` is still DC; HEAD `*_ratio_mid` /
+  `*_ratio_mid_fo` at `k=(K-1)//4` (no extra FD; not in P75 pid).
+  Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a

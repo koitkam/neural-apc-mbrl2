@@ -1854,6 +1854,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_dv_loss' in _src
     assert 'gain_match_mv_ratio' in _src
     assert 'gain_match_dv_ratio' in _src
+    assert 'gain_match_mv_ratio_mid' in _src
+    assert 'gain_match_dv_ratio_mid' in _src
+    assert 'gain_match_mv_ratio_mid_fo' in _src
     assert '_gain_match_pred_over_tgt' in _src
     assert '_gain_match_tgt_tensor' in _src
     assert '_should_lock_last_ok' in _src
@@ -2043,6 +2046,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "row.setdefault('dob_ground_keep_frac'" in _src
+    assert "row.setdefault('wm_gain_match_mv_ratio_mid'" in _src
+    assert "row.setdefault('wm_gain_match_mv_ratio_mid_fo'" in _src
     assert "out='obs'" in _src
     assert 'held_cv=True' in _src
     assert 'p1amp=' in _src
@@ -3292,6 +3297,12 @@ def _test_gain_match_rest_ic() -> None:
     assert 'gain_match_ol_tail_loss' not in diag1
     assert 'gain_match_ol_persist_rel' in diag1
     assert torch.isfinite(diag1['gain_match_ol_persist_rel']).all()
+    assert 'gain_match_mv_ratio_mid' in diag1
+    assert 'gain_match_dv_ratio_mid' in diag1
+    assert 'gain_match_mv_ratio_mid_fo' in diag1
+    assert 'gain_match_dv_ratio_mid_fo' in diag1
+    assert torch.isfinite(diag1['gain_match_mv_ratio_mid']).all()
+    assert torch.isfinite(diag1['gain_match_mv_ratio_mid_fo']).all()
     gm1.backward()
     cont_g = sum(float(p.grad.abs().sum())
                  for n, p in model.dynamics.named_parameters()

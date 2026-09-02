@@ -8259,6 +8259,32 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                     cv_base, cv_steps[n_mv_t:], dv_tgts, du[n_mv_t:])
                 diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
                     g_all[n_mv_t:], dv_tgts, cfg)
+            # P75: last-step ``*_ratio`` is DC (FO(K)/FO(K)=1) so it
+            # cannot show a contracted rise.  ``k=(K-1)//4`` is
+            # unitless (held-win convention; test_sim K=55 → k=13,
+            # FO≈0.58) and uses the same FD stack — no extra roll.
+            # ``*_mid_fo`` = (G_wm/G_tgt) / FO[k]; 1 = rise match.
+            if cv_steps.dim() == 4:
+                Kk = int(cv_steps.shape[2])
+                k_mid = max(0, (Kk - 1) // 4)
+                g_mid = (cv_steps[:, :, k_mid, :] - cv_base) / torch.where(
+                    ok, den, torch.ones_like(den))
+                fo = _gain_match_fopdt_frac(
+                    cfg, Kk, g_mid.device, g_mid.dtype)
+                fo_m = fo[k_mid].clamp_min(0.0)
+                if n_mv_t:
+                    r_mid = _gain_match_pred_over_tgt(
+                        g_mid[:n_mv_t], mv_tgts, cfg)
+                    diag['gain_match_mv_ratio_mid'] = r_mid
+                    if float(fo_m) >= 1e-6:
+                        diag['gain_match_mv_ratio_mid_fo'] = r_mid / fo_m
+                if dv_tgts:
+                    r_mid_dv = _gain_match_pred_over_tgt(
+                        g_mid[n_mv_t:], dv_tgts, cfg)
+                    diag['gain_match_dv_ratio_mid'] = r_mid_dv
+                    if float(fo_m) >= 1e-6:
+                        diag['gain_match_dv_ratio_mid_fo'] = (
+                            r_mid_dv / fo_m)
     return loss, diag
 
 
@@ -14207,6 +14233,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_ol_persist_rel' in row:
                 row.setdefault('wm_gain_match_ol_persist_rel',
                             row['gain_match_ol_persist_rel'])
+            if 'gain_match_mv_ratio_mid' in row:
+                row.setdefault('wm_gain_match_mv_ratio_mid',
+                            row['gain_match_mv_ratio_mid'])
+            if 'gain_match_dv_ratio_mid' in row:
+                row.setdefault('wm_gain_match_dv_ratio_mid',
+                            row['gain_match_dv_ratio_mid'])
+            if 'gain_match_mv_ratio_mid_fo' in row:
+                row.setdefault('wm_gain_match_mv_ratio_mid_fo',
+                            row['gain_match_mv_ratio_mid_fo'])
+            if 'gain_match_dv_ratio_mid_fo' in row:
+                row.setdefault('wm_gain_match_dv_ratio_mid_fo',
+                            row['gain_match_dv_ratio_mid_fo'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
