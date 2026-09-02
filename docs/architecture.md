@@ -202,7 +202,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > Rest-pre skips the unused held-K `img_rollout` row. **P69 EXIT**
 > stop-grad OL tail **REVERT** (TBPTT-on-DC; CAPPED 0.75@MV). **P70 EXIT**
 > hold-G **REVERT** (CAPPED −0.60@MV). **P71 EXIT** gain-c out of GRU
-> **REVERT** (CAPPED 0.76@DV). **P72** restores G in GRU.
+> **REVERT** (CAPPED 0.76@DV). **P72 LIVE** restores G in GRU.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
