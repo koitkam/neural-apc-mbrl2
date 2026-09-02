@@ -951,7 +951,8 @@ class TrainConfig:
     # @H ×0.849 vs ss ×0.740 is a real 4H-asymptote gap (MV @H≈ss); do
     # not cite "@H≈ss" for DV.  Gradful (P25: detaching the gain-match
     # roll kills DC).  Extra cost is one ``Bm×S`` roll vs the FD's
-    # ``(1+n_mv+n_dv)·Bm×K``.  ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
+    # ``(n_mv+n_dv)·Bm×K`` (rest-pre; PRBS fallback still
+    # ``(1+n_mv+n_dv)·Bm×K``).  ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
     gain_match_settle_len: int = -1
     # P45 EXIT PROMOTE: TM-protocol rest IC.  Collect real held-OP lookbacks
     # (noise-free const-action), teacher-force ``rollout_observed``
@@ -7076,12 +7077,15 @@ def _gain_match_fd_held(
         a_base: torch.Tensor, dv0: Optional[torch.Tensor],
         n_mv: int, n_dv: int, step: float,
         *, clip_realized: bool = False,
+        include_held: bool = True,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Baseline + one unit step per MV then per DV (broadcast, no clone-loop).
 
-    ``a_held`` is ``(1+n_mv+n_dv, Bm, A)``; ``dv_held`` is the same layout
-    or ``None`` when the plant has no DV.  Identity with stacking
-    ``[a_base, a_base+e_j, …]`` / ``[dv0, dv0, …, dv0+e_k]``.
+    ``a_held`` is ``(1+n_mv+n_dv, Bm, A)`` when ``include_held`` (PRBS /
+    held-K ``cv_base``); rest-pre Huber skips the unused held row so the
+    stack is ``(n_mv+n_dv, Bm, A)``.  ``dv_held`` matches or is ``None``.
+    Identity with stacking ``[a_base, a_base+e_j, …]`` /
+    ``[dv0, dv0, …, dv0+e_k]`` when held is included.
 
     ``clip_realized`` (P61): clamp held a/dv to ``[-1, 1]`` and reverse
     a per-start step that the cube would shrink.  Off = P60 commanded
@@ -7089,60 +7093,72 @@ def _gain_match_fd_held(
     """
     n_mv = int(n_mv)
     n_dv = int(n_dv)
+    off = 1 if include_held else 0
     if clip_realized:
-        a_parts = [a_base.unsqueeze(0)]
+        a_parts = ([a_base.unsqueeze(0)] if include_held else [])
         if n_mv:
             a_parts.append(_cube_step_held(a_base, n_mv, step))
         if n_dv:
             a_parts.append(a_base.unsqueeze(0).expand(n_dv, -1, -1).contiguous())
-        a_held = torch.cat(a_parts, dim=0)
+        a_held = torch.cat(a_parts, dim=0) if a_parts else a_base.new_zeros(
+            0, *a_base.shape)
         if dv0 is None:
             return a_held, None
-        dv_parts = [dv0.unsqueeze(0)]
+        dv_parts = ([dv0.unsqueeze(0)] if include_held else [])
         if n_mv:
             dv_parts.append(
                 dv0.unsqueeze(0).expand(n_mv, -1, -1).contiguous())
         if n_dv:
             dv_parts.append(_cube_step_held(dv0, n_dv, step))
+        if not dv_parts:
+            return a_held, dv0.new_zeros(0, *dv0.shape)
         return a_held, torch.cat(dv_parts, dim=0)
-    n_rolls = 1 + n_mv + n_dv
+    n_rolls = off + n_mv + n_dv
     da = a_base.new_zeros(n_rolls, a_base.shape[-1])
     if n_mv:
         _i = torch.arange(n_mv, device=a_base.device)
-        da[_i + 1, _i] = step
+        da[_i + off, _i] = step
     a_held = a_base.unsqueeze(0) + da.unsqueeze(1)
     if dv0 is None:
         return a_held, None
     dd = dv0.new_zeros(n_rolls, dv0.shape[-1])
     if n_dv:
         _j = torch.arange(n_dv, device=dv0.device)
-        dd[_j + 1 + n_mv, _j] = step
+        dd[_j + off + n_mv, _j] = step
     return a_held, dv0.unsqueeze(0) + dd.unsqueeze(1)
 
 
 def _gain_match_realized_du(
         a_held: torch.Tensor, dv_held: Optional[torch.Tensor],
-        n_mv: int, n_dv: int) -> torch.Tensor:
-    """Signed applied Δu of each FD roll vs baseline row 0.  ``(n_in, Bm)``.
+        n_mv: int, n_dv: int,
+        *, include_held: bool = True,
+        a_base: Optional[torch.Tensor] = None,
+        dv0: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Signed applied Δu of each FD roll vs held baseline.  ``(n_in, Bm)``.
 
     TM ``compute_transfer_matrix`` divides ΔCV by realized ΔMV, not the
     commanded step (p136).  Unclipped ``a_base+step`` → identity ``step``.
+    Rest-pre (``include_held=False``) subtracts ``a_base``/``dv0`` — the
+    unused held row is not in ``a_held``.
     """
     n_mv = int(n_mv)
     n_dv = int(n_dv)
     Bm = a_held.shape[1]
+    off = 1 if include_held else 0
+    a0 = a_held[0] if include_held else a_base
+    dv_b = dv_held[0] if include_held else dv0
     parts = []
     if n_mv:
-        # roll ``1+j`` steps channel ``j``.  Diagonal (not ``stack`` of
+        # roll ``off+j`` steps channel ``j``.  Diagonal (not ``stack`` of
         # mismatched advanced-index shapes): ``n_mv=1`` used to
         # broadcast ``(1,Bm)-(Bm,1)`` → ``(Bm,Bm)``.
-        stepped = a_held[1:1 + n_mv, :, :n_mv]
+        stepped = a_held[off:off + n_mv, :, :n_mv]
         du_mv = stepped.diagonal(dim1=0, dim2=2).transpose(0, 1)
-        parts.append(du_mv - a_held[0, :, :n_mv].transpose(0, 1))
+        parts.append(du_mv - a0[:, :n_mv].transpose(0, 1))
     if n_dv and dv_held is not None:
-        stepped = dv_held[1 + n_mv:1 + n_mv + n_dv, :, :n_dv]
+        stepped = dv_held[off + n_mv:off + n_mv + n_dv, :, :n_dv]
         du_dv = stepped.diagonal(dim1=0, dim2=2).transpose(0, 1)
-        parts.append(du_dv - dv_held[0, :, :n_dv].transpose(0, 1))
+        parts.append(du_dv - dv_b[:, :n_dv].transpose(0, 1))
     if not parts:
         return a_held.new_zeros(0, Bm)
     return torch.cat(parts, dim=0)
@@ -7153,6 +7169,7 @@ def _gain_match_fd_action_seq(
         n_mv: int, n_dv: int, step: float, K: int, Bm: int,
         *, cache_owner=None, cache_key=None,
         clip_realized: bool = False,
+        include_held: bool = True,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                    torch.Tensor, torch.Tensor]:
     """Held FD actions expanded to ``(n_rolls·Bm, K, *)``.
@@ -7160,7 +7177,8 @@ def _gain_match_fd_action_seq(
     Rest-IC ``a_base``/``dv0`` are the last rest frame (static).  Cache
     when ``cache_key`` is set.  PRBS-posterior starts change every
     batch — leave ``cache_key=None``.  Dropped with the rest-IC graph
-    at g freeze.  ``clip_realized`` is part of the cache key (caller).
+    at g freeze.  ``clip_realized`` / ``include_held`` are part of the
+    cache key (caller).  Rest-pre Huber skips the unused held roll.
 
     Also returns realized ``du`` ``(n_in, Bm)`` and ``clip_frac`` (mean
     reverse-mask).  Both are functions of the held rest — cache them
@@ -7171,7 +7189,8 @@ def _gain_match_fd_action_seq(
         if cached is not None and cached[0] == cache_key:
             return cached[1], cached[2], cached[3], cached[4]
     a_held, dv_held = _gain_match_fd_held(
-        a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized)
+        a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized,
+        include_held=include_held)
     n_rolls = int(a_held.shape[0])
     a_seq = (a_held.unsqueeze(2)
              .expand(n_rolls, Bm, K, a_held.shape[-1])
@@ -7183,7 +7202,9 @@ def _gain_match_fd_action_seq(
                   .expand(n_rolls, Bm, K, dv_held.shape[-1])
                   .reshape(n_rolls * Bm, K, dv_held.shape[-1])
                   .contiguous())
-    du = _gain_match_realized_du(a_held, dv_held, n_mv, n_dv)
+    du = _gain_match_realized_du(
+        a_held, dv_held, n_mv, n_dv, include_held=include_held,
+        a_base=a_base, dv0=dv0)
     clip_frac = _gain_match_clip_frac_t(
         a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized)
     if cache_owner is not None and cache_key is not None:
@@ -7895,6 +7916,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     gain channel gives the WM the un-quantized capacity this loss grabs onto, so
     together they pin the subdominant DV gain the categorical attenuates.
 
+    Rest-pre skips the unused held-K ``img_rollout`` row (Huber does not
+    read ``decode(held_K)``).  PRBS-posterior fallback still rolls it.
+
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder + GRU (not the categorical
     we are trying to bypass).  RSSM + TSSM (the TSSM rolls from a fresh
@@ -7908,7 +7932,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
 
     Eager (P31 default): RSSM/TSSM ``img_rollout`` stacks the baseline
     + one step per MV/DV into a single roll (batch
-    ``Bm·(1+n_mv+n_dv)``) so the K-step prior loop runs once.  Huber is
+    ``Bm·(1+n_mv+n_dv)``; rest-pre skips the unused held row so
+    ``Bm·(n_mv+n_dv)``) so the K-step prior loop runs once.  Huber is
     last-step ``ΔCV/Δu`` (P26 DC-gain), so the roll uses
     ``last_only=True, out='obs'`` (same last decode as
     ``decode(stack[:, -1])``; no unused K-stack or last-feat).
@@ -8043,7 +8068,16 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # K-loops (linear in n_mv+n_dv) were dead after P32 TSSM wiring.
     n_mv_t = len(mv_tgts)
     n_dv_t = len(dv_tgts)
-    n_rolls = 1 + int(n_mv_t) + int(n_dv_t)
+    # P68 rest-pre: plant rest is ``cv_base``.  The held-K decode is
+    # unused — skip that extra ``Bm×K`` prior roll (test_sim 3→2 rolls).
+    # PRBS fallback still needs held-K ``cv_base``.
+    o_rest = None
+    if rest is not None:
+        o_rest, _ = _gain_match_rest_ic_tensors(cfg, obs.device, obs.dtype)
+        if o_rest is None or int(o_rest.shape[0]) != int(Bm):
+            o_rest = None
+    skip_held = o_rest is not None
+    n_rolls = int(n_mv_t) + int(n_dv_t) + (0 if skip_held else 1)
     cache_owner = None
     cache_key = None
     if rest is not None:
@@ -8055,12 +8089,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                 int(K), int(Bm), str(a_base.device), str(a_base.dtype),
                 int(a_base.shape[-1]),
                 0 if dv0 is None else int(dv0.shape[-1]),
-                int(bool(_clip)),
+                int(bool(_clip)), int(bool(skip_held)),
             )
     a_seq, dv_seq, du, clip_frac_t = _gain_match_fd_action_seq(
         a_base, dv0, n_mv_t, n_dv_t, step, K, Bm,
         cache_owner=cache_owner, cache_key=cache_key,
-        clip_realized=_clip)
+        clip_realized=_clip, include_held=not skip_held)
 
     def _repeat_starts(t):
         return (t.unsqueeze(0).expand(n_rolls, *t.shape)
@@ -8077,21 +8111,21 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         last_only=True, out='obs')
     cv_last = last_obs.index_select(-1, cv_idx)
     cv_last = cv_last.view(n_rolls, Bm, -1)
-    cv_base = cv_last[0]
-    cv_steps = cv_last[1:]
     # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
     # K-step held WM prediction.  Held-K compounding made P67 jsonl ×1
     # while val TM vs rest-pre missed DC.  Rest-IC last obs is that
     # ``pre`` (same cache as the encode).  PRBS fallback keeps held-K.
-    if rest is not None:
-        o_rest, _ = _gain_match_rest_ic_tensors(cfg, obs.device, obs.dtype)
-        if o_rest is not None and int(o_rest.shape[0]) == int(Bm):
-            cv_base = o_rest[:, -1].index_select(-1, cv_idx)
-            if not getattr(cfg, '_gain_match_rest_pre_logged', False):
-                print('[gain-match] Huber baseline = rest last-obs CV '
-                      '(TM pre; not held-K)',
-                      flush=True)
-                cfg._gain_match_rest_pre_logged = True  # type: ignore[attr-defined]
+    if skip_held:
+        cv_base = o_rest[:, -1].index_select(-1, cv_idx)
+        cv_steps = cv_last
+        if not getattr(cfg, '_gain_match_rest_pre_logged', False):
+            print('[gain-match] Huber baseline = rest last-obs CV '
+                  '(TM pre; not held-K)',
+                  flush=True)
+            cfg._gain_match_rest_pre_logged = True  # type: ignore[attr-defined]
+    else:
+        cv_base = cv_last[0]
+        cv_steps = cv_last[1:]
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
     loss = total

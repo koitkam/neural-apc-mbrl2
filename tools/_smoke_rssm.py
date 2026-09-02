@@ -2770,6 +2770,16 @@ def _test_gain_match_fd_held() -> None:
     assert dv1 is None and a1.shape == (2, Bm, 1)
     assert torch.allclose(a1[0], a_base[:, :1])
     assert torch.allclose(a1[1, :, 0], a_base[:, 0] + step)
+    step_a, step_dv = _gain_match_fd_held(
+        a_base, dv0, n_mv, n_dv, step, include_held=False)
+    assert step_a.shape == (n_mv + n_dv, Bm, n_mv)
+    assert torch.allclose(step_a, got_a[1:])
+    assert torch.allclose(step_dv, got_dv[1:])
+    du_all = _gain_match_realized_du(got_a, got_dv, n_mv, n_dv)
+    du_st = _gain_match_realized_du(
+        step_a, step_dv, n_mv, n_dv, include_held=False,
+        a_base=a_base, dv0=dv0)
+    assert torch.allclose(du_st, du_all)
     print('[smoke] OK  gain-match FD held stack (broadcast ≡ clone-loop)')
 
 
@@ -2866,6 +2876,13 @@ def _test_gain_match_fd_action_seq() -> None:
     assert torch.allclose(a3, ref_a) and torch.allclose(d3, ref_dv)
     assert torch.allclose(du3, du_ref) and torch.allclose(du4, du_ref)
     assert float(cf1) == 0.0 and float(cf3) == 0.0
+    a_st, d_st, du_st, cf_st = _gain_match_fd_action_seq(
+        a_base, dv0, n_mv, n_dv, step, K, Bm, include_held=False)
+    assert a_st.shape[0] == ref_a.shape[0] - Bm
+    assert torch.allclose(a_st, ref_a[Bm:])
+    assert torch.allclose(d_st, ref_dv[Bm:])
+    assert torch.allclose(du_st, du_ref)
+    assert float(cf_st) == 0.0
     print('[smoke] OK  gain-match FD action seq cache (rest-IC identity)')
 
 
@@ -3160,6 +3177,8 @@ def _test_gain_match_rest_ic() -> None:
     _gm_src = _ins.getsource(_wm_gain_match_loss)
     assert "Huber baseline = rest last-obs CV" in _gm_src
     assert 'o_rest[:, -1].index_select' in _gm_src
+    assert 'include_held=not skip_held' in _gm_src
+    assert 'skip_held = o_rest is not None' in _gm_src
     cfg._gain_match_rest_obs = None
     cfg._gain_match_rest_act = None
     cfg._gain_match_rest_dev = None

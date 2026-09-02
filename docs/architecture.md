@@ -181,7 +181,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > K=220 **CAPPED 0.80@DV**. Val MV **×1.348 / ×1.510** DV **×0.787 /
 > ×1.005**. OL-vs-real **×0.814**. det_r **0.026**. Actor INVALID.
 > HEAD **REVERT** auto K to control H. Do not teacher-K N+1. **P68**
-> rest-pre Huber (TM `pre`, not held-K).
+> rest-pre Huber (TM `pre`, not held-K). Rest-pre skips the unused
+> held-K `img_rollout` row (HEAD; not pid 193014).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
