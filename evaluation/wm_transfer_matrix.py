@@ -29,7 +29,7 @@ not the action vector).  Sim-agnostic: any MV/CV count.
 
 Standalone use:
   PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python -m evaluation.wm_transfer_matrix \
+  $PWD/../neural-APC-mbrl2-env/bin/python -m evaluation.wm_transfer_matrix \
       --run-dir output/test_sim/run_XXXX
 """
 from __future__ import annotations

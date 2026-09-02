@@ -19,7 +19,7 @@ Backbone-agnostic (runs rssm + sf_transformer).  CPU-safe; touches no GPU run.
 
 Run:
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  ./../neural-apc-mbrl-env/bin/python tools/_smoke_grad_isolation.py
+  ../neural-APC-mbrl2-env/bin/python tools/_smoke_grad_isolation.py
 """
 import sys
 from pathlib import Path

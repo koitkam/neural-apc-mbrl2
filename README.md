@@ -170,9 +170,11 @@ Both share the same plant-derivation chain:
 ## Quick start — full workflow (recommended)
 
 ```bash
-source ../neural-apc-mbrl-env/bin/activate
-python -m workflow.bo_runner --simulation-dir simulation/test_sim
+source ../neural-APC-mbrl2-env/bin/activate
+python -m workflow.single_run --simulation-dir simulation/test_sim --out-dir output/test_sim/run_local
 ```
+
+BO (optional): `python -m workflow.bo_runner --simulation-dir simulation/test_sim`.
 
 That's the whole command.  Everything is auto-derived:
 
@@ -582,8 +584,8 @@ rationale here.
 ## Setup
 
 ```bash
-python3 -m venv ../neural-apc-mbrl-env
-source ../neural-apc-mbrl-env/bin/activate
+python3 -m venv ../neural-APC-mbrl2-env
+source ../neural-APC-mbrl2-env/bin/activate
 pip install -r requirements.txt
 ```
 

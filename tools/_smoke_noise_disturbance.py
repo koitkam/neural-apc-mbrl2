@@ -13,7 +13,7 @@ Verifies WITHOUT a real sim / GPU:
 
 Run (CPU):
   PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_noise_disturbance.py
+  $PWD/../neural-APC-mbrl2-env/bin/python tools/_smoke_noise_disturbance.py
 """
 import os
 
