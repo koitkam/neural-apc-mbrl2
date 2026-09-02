@@ -124,8 +124,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P69 EXIT** (`run_p69_oltail`, pid **198448**, sha `256c889`,
 > 76 iters): stop-grad OL tail **REVERT**. CAPPED **0.75@MV** last_ok
 > **18**. Val MV **×0.383 / ×0.384** DV **×0.792 / ×0.828**. Actor
-> INVALID. Window-extension family **closed**. **P70 LIVE**
-> (`run_p70_cgainhold`): OL hold of gain-c after first `img_step`.
+> INVALID. Window-extension family **closed**. **P70 EXIT**
+> (`run_p70_cgainhold`, pid **204329**, sha `35af8cf`, 60 iters):
+> hold-G **REVERT**. Storm 2/2 CAPPED **−0.60@MV** last_ok **2**.
+> Val MV **+0.478 vs −0.32** rel_err **2.49**. Actor INVALID.
+> **P71:** gain-c decoder/feat only (not in GRU).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -938,8 +941,10 @@ collapse when the DOB is removed (p136: head amplitude 2% of true). One change
 fixes BOTH:
 
 - **GAIN block** (`cont_gain_dim = n_cv·(n_mv+n_dv)`): inferred in-context from the
-  lookback, feeds the GRU (so `h` carries the per-episode gain forward) **and**
-  the decoder. Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
+  lookback; **P71:** decoder + `feat` only — it does **not** enter the GRU /
+  TSSM token (P70 hold-in-recurrence detonated: storm 2/2, DC ×−0.60@MV).
+  Dist-c still rolls in the core (`recurrence_c_dim = cont_dist_dim`;
+  env-free 0 ⇒ GRU sees `[z, a, dv]`). Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
   finite-difference step-response asymptote (optionally hold a/dv
   `gain_match_settle_len` steps — auto = control horizon; TM probe settle
   is `wm_tf_horizon` = max(80, 4×horizon) — then roll the prior
@@ -951,9 +956,9 @@ fixes BOTH:
   rest-obs CV (TM `pre`), not held-K — KEEP as protocol / FALSIFIED as
   TM pin (val MV ×0.69). **P69 EXIT REVERT:** stop-grad OL tail
   (`wm_tf_horizon−K`) was TBPTT-on-the-DC-window (CAPPED 0.75@MV).
-  **P70:** open-loop hold of `c[..., :cont_gain_dim]` after the first
-  `img_step` (1-step prior still infers G; remaining OL copies it so
-  DC does not need GRU memory across 4H). Explicit
+  **P70 EXIT REVERT:** OL hold of `c[..., :cont_gain_dim]` after the first
+  `img_step` detonated (GAIN_NOT_READY −0.60@MV). Window/hold family
+  **closed**. Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a
@@ -1053,8 +1058,10 @@ fixes BOTH:
   > clean→disturbance curriculum (the textbook sysID recipe) activates
   > automatically with the DOB on.
 
-`feat = [h, z_flat, c, (dv), (d)]`; the decoder reads `[h, z, c, (dv)]`. Both
-blocks feed the GRU transition. `cont_gain_dim == cont_dist_dim == 0` ⇒
+`feat = [h, z_flat, c, (dv), (d)]`; the decoder reads `[h, z, c, (dv)]`.
+**P71:** only the dist block of `c` feeds the GRU / TSSM token
+(`recurrence_c_dim = cont_dist_dim`). Gain-c is decoder/feat only.
+`cont_gain_dim == cont_dist_dim == 0` ⇒
 byte-identical to the pre-cont model (regression-verified). Env knobs:
 `DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /
 `_KL_SCALE` / `_GAIN_PERSIST_COEF`, `DREAMER_GAIN_MATCH_COEF` / `_LEN` /

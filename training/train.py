@@ -7921,13 +7921,15 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     read ``decode(held_K)``).  PRBS-posterior fallback still rolls it.
 
     **P69 REVERT:** stop-grad OL tail after teacher K was TBPTT-on-the
-    DC window (P24 class; CAPPED GAIN_NOT_READY 0.75@MV).  Compounding
-    is attacked in ``img_step`` (P70 hold of gain-c), not a longer
-    teacher.  ``gmatch_ol_tail=`` stays 0.
+    DC window (P24 class; CAPPED GAIN_NOT_READY 0.75@MV).  **P70
+    REVERT:** OL hold of gain-c after the first ``img_step`` detonated
+    (storm 2/2, DC ×−0.60@MV).  **P71:** gain-c is decoder/feat only
+    — it does not enter the GRU / TSSM token.  ``gmatch_ol_tail=``
+    stays 0.
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
-    flows into the CONTINUOUS gain channel + decoder + GRU (not the categorical
-    we are trying to bypass).  RSSM + TSSM (the TSSM rolls from a fresh
+    flows into the CONTINUOUS gain channel + decoder (not the categorical
+    we are trying to bypass; P71: gain-c does not enter the GRU).  RSSM + TSSM (the TSSM rolls from a fresh
     KV-cache); ``(0, {})`` for other backbones / when off.
 
     P28 follow-up 13: ``K`` is the identified settling length, not
@@ -8376,8 +8378,8 @@ def _gain_match_ol_tail_len(cfg: TrainConfig, K: int) -> int:
 
     Stop-grad OL tail (``wm_tf_horizon−K``) was TBPTT-on-the-DC-window
     (P24 class; CAPPED 0.75@MV). Banner still prints ``gmatch_ol_tail=0``.
-    Compounding is the P70 gain-c hold in ``img_step``, not a longer
-    teacher. ``cfg`` / ``K`` unused (signature kept for the banner).
+    **P70 REVERT** hold-G; **P71** gain-c is decoder/feat only (not a
+    longer teacher). ``cfg`` / ``K`` unused (signature kept for the banner).
     """
     del cfg, K
     return 0

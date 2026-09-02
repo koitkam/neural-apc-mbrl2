@@ -127,7 +127,7 @@ import torch.nn.functional as F
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
 from models.dreamer_v4_rssm import (
     _CategoricalLatent, _ContinuousLatent, _prior_c_from_net,
-    _hold_continuous_gain_c, _time_unbind,
+    _recurrence_c, _time_unbind,
     cached_zeros_bd, cached_zeros_btd, cached_onehot_z, dob_kalman_scan,
     _append_decode_core, _stack_decode_core)
 
@@ -362,11 +362,13 @@ class TransformerSSMDynamics(nn.Module):
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
         # Continuous gain+disturbance latent (2026-06-22) — mirror of
         # RSSMDynamics: a GAIN block (C1-supervised) + DISTURBANCE block
-        # (amortized Kalman).  Feeds the token (so the transformer carries it)
-        # AND the decoder.  cont_gain_dim==cont_dist_dim==0 ⇒ pre-cont model.
+        # (amortized Kalman).  Decoder + feat still read both.  **P71:**
+        # only the dist block enters the token (gain is decoder/feat-only).
+        # cont_gain_dim==cont_dist_dim==0 ⇒ pre-cont model.
         self.cont_gain_dim = int(getattr(cfg, 'cont_gain_dim', 0) or 0)
         self.cont_dist_dim = int(getattr(cfg, 'cont_dist_dim', 0) or 0)
         self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
+        self.recurrence_c_dim = int(self.cont_dist_dim)
         self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
         self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
         # Deterministic cont-disturbance roll in imagination (p140 RCA).
@@ -403,9 +405,10 @@ class TransformerSSMDynamics(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
-        # Token projection: [z_{t-1}_flat ; (c) ; a_t ; (dv_t)] -> d_model.
+        # Token projection: [z_{t-1}_flat ; (dist-c) ; a_t ; (dv_t)] -> d_model.
+        # Gain-c stays out of the token (P71; decoder/feat still read it).
         self.token_proj = nn.Linear(
-            self.stoch_flat_dim + self.cont_dim + self.action_dim + self.dv_dim,
+            self.stoch_flat_dim + self.recurrence_c_dim + self.action_dim + self.dv_dim,
             self.deter_dim)
         # Causal transformer (custom blocks: support full + KV-cached step).
         self.n_heads = int(cfg.n_heads)
@@ -537,14 +540,12 @@ class TransformerSSMDynamics(nn.Module):
                      action: torch.Tensor,
                      dv: Optional[torch.Tensor] = None,
                      c: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """token = proj([z_flat ; (c) ; action ; (dv)]) -> (B, d_model)."""
+        """token = proj([z_flat ; (dist-c) ; action ; (dv)]) -> (B, d_model)."""
         parts = [z.flatten(start_dim=-2)]
-        if self.cont_dim > 0:
-            if c is None:
-                c = cached_zeros_bd(
-                    self, int(action.shape[0]), self.cont_dim,
-                    action.dtype, action.device)
-            parts.append(c)
+        rc = _recurrence_c(
+            self, c, int(action.shape[0]), action.dtype, action.device)
+        if rc is not None:
+            parts.append(rc)
         parts.append(action)
         if self.dv_dim > 0:
             if dv is None:
@@ -612,25 +613,20 @@ class TransformerSSMDynamics(nn.Module):
 
     def img_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  dv: Optional[torch.Tensor] = None,
-                 sample: bool = True,
-                 hold_gain_c: bool = False) -> TSSMState:
+                 sample: bool = True) -> TSSMState:
         """Imagined (prior-only) step: build the token from (prev.z, action,
         dv), advance the KV-cached transformer ONE step, read the prior off the
         new position.  ``dv`` (B, dv_dim) is the exogenous measured-DV input
         when DV-as-input is on; ``None`` -> zeros.  ``kv_cache=None`` (feat-only
         reconstruction by a Markovian consumer) starts a fresh context.
-        ``hold_gain_c``: P70 OL hold of the static gain block (see RSSM).
         """
         h, d_new, dv_new, new_cache, new_pos = self._core_transition(
             prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
-        # Continuous-latent prior (RSSM mirror).  Gain-c held after the
-        # first prior step (P70).  Skip discarded randn when det-roll
+        # Continuous-latent prior (RSSM mirror).  P70 hold REVERT; P71
+        # gain-c is decoder/feat only.  Skip discarded randn when det-roll
         # replaces the whole sample with the prior MEAN.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
-        if hold_gain_c:
-            c_new, c_mean = _hold_continuous_gain_c(
-                self, c_new, c_mean, prev)
         return TSSMState(h=h, z_logits=z_logits, z=z,
                          kv_cache=new_cache, pos=new_pos, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
@@ -677,13 +673,12 @@ class TransformerSSMDynamics(nn.Module):
         ``last_only`` materializes ``out`` once after the K-loop.
         ``out='h'`` removed with RSSM (P62; no training call site).
         ``prev_state`` continues KV-cache (smoke continue + detach).
-        ``return_state`` also returns the last ``TSSMState``.  Gain-c
-        is held after the first prior step (P70).
+        ``return_state`` also returns the last ``TSSMState``.  P70
+        gain-c hold REVERT; P71 gain-c is decoder/feat only.
         """
         if out not in ('feat', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
         K = actions.shape[1]
-        continue_ol = prev_state is not None
         if prev_state is not None:
             state = prev_state
             Bm = int(state.h.shape[0])
@@ -708,8 +703,7 @@ class TransformerSSMDynamics(nn.Module):
         for k in range(K):
             dv_k = None if dv_seq is None else dv_seq[k]
             state = img_step(
-                state, act_k[k], dv=dv_k, sample=sample,
-                hold_gain_c=(k > 0 or continue_ol))
+                state, act_k[k], dv=dv_k, sample=sample)
             if last_only:
                 continue
             _append_decode_core(h_l, z_l, c_l, dv_l, state)

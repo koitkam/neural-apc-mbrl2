@@ -109,7 +109,7 @@ def test_img_rollout_equals_img_step():
         seq = []
         for k in range(K):
             state = m.img_step(
-                state, acts[:, k], sample=False, hold_gain_c=(k > 0))
+                state, acts[:, k], sample=False)
             seq.append(state.feat)
         seq = torch.stack(seq, dim=1)
     max_err = float((roll - seq).abs().max())
@@ -144,6 +144,10 @@ def test_img_rollout_equals_img_step():
     print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e}); "
           f"last_only ≡ stack[:, -1] (max_err={last_err:.2e}); "
           f"out=obs identity (obs={obs_err:.2e} last_obs={last_obs_err:.2e})")
+    want_in = (int(m.stoch_flat_dim) + int(m.recurrence_c_dim)
+               + int(cfg.action_dim) + int(m.dv_dim))
+    assert int(m.token_proj.in_features) == want_in, (
+        f'token_proj in={m.token_proj.in_features} want {want_in}')
 
 
 def test_img_step_det_roll_skips_sample():
