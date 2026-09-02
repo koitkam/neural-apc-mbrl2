@@ -772,7 +772,8 @@ class RSSMDynamics(nn.Module):
         # Scope 2: the head-facing feature includes the DV feedforward (dv_dim
         # when on) so the heads condition on the measured DV, plus the DOB
         # disturbance estimate ``d`` (one scalar per CV).  The decoder reads
-        # ``[h, z, (dv)]`` (see ``_decode_in_dim`` / ``decode``).
+        # ``[h, z, c, (dv)]`` (see ``_decode_in_dim`` / ``decode``); P74
+        # ``gain_cv_skip`` then adds ``c[:G]`` onto CV.
         core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
         return (core + self._dv_feed_dim
                 + (self.n_cv if getattr(self, 'dob_enabled', False) else 0))
