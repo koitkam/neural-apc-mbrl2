@@ -1838,6 +1838,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
     assert 'f"gmatch_ol_tail=0 "' not in _src
+    assert "persist {_lf('gain_match_ol_persist_rel')}" in _src
     assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
     assert "gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized'" in _src
     assert '_cube_step_held' in _src

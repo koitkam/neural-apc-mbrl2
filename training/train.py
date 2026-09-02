@@ -14237,6 +14237,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                    if _rssm else
                    f"sf {_lf('sf_loss')} ")
                 + f"gmatch {_lf('gain_match_loss')} "
+                + (f"persist {_lf('gain_match_ol_persist_rel')} "
+                   if row.get('gain_match_ol_persist_rel') is not None else '')
                 + f"iso {_lf('wm_input_isolation_loss')} "
                 + f"ss {_lf('wm_ss_match_loss')} "
                 + (f"dobg {_lf('dob_ground')} "
