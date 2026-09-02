@@ -4246,7 +4246,6 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_len={int(getattr(cfg, 'gain_match_len', 0) or 0)} "
-        f"gmatch_ol_tail=0 "
         f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
         f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
@@ -7929,7 +7928,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     token input again (G-out-of-recurrence freeze-failed 0.76@DV).
     **P73:** ``cont_gain_persist_coef`` also L2-pins OL gain-c at teacher
     K to ``sg(rest-IC MEAN G)`` (not a longer window, not a hard hold,
-    not G-out-of-GRU).  ``gmatch_ol_tail=`` stays 0.
+    not G-out-of-GRU).  Dummy ``gmatch_ol_tail=0`` banner **REMOVED**
+    (P69 field was always 0).
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder (not the categorical

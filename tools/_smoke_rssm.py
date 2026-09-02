@@ -1837,7 +1837,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
-    assert "gmatch_ol_tail=0 " in _src
+    assert 'f"gmatch_ol_tail=0 "' not in _src
     assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
     assert "gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized'" in _src
     assert '_cube_step_held' in _src
@@ -4687,7 +4687,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_len=55' in banner, banner
-    assert 'gmatch_ol_tail=0' in banner, banner
+    assert 'gmatch_ol_tail' not in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
     assert 'gmatch_clip=True' in banner, banner
     assert 'gmatch_rest=True' in banner, banner
