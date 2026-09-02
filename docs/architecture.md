@@ -154,7 +154,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > **0.446**. Paired **−24.50 vs −84.89** VALID 8/9, mv_viol **1.50**.
 > Rise mass 1.4% at K=H. FO family **closed**. Persist KEEP. Last-step
 > DC Huber restored. **P76** RSSM GRU update-gate bias `log(H/16)`
-> (test_sim ~1.24; both slices, idle logit 2b; LIVE probe20 conv=0).
+> (test_sim ~1.24; both slices, idle logit 2b; LIVE P1 iter 63:
+> conv=0 through probe60; CPU TM@60 MV ×0.821 vs P64 ×0.923).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -234,7 +235,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > DOB steal. **P75 EXIT** FOPDT rise **REVERT** (`run_p75_gmatchfo`,
 > 391 iters): val MV ×0.822 1step→OL ×0.803 paired −24.50 vs −84.89
 > 8/9. FO family closed. **P76** GRU update-gate bias `log(H/16)`
-> (LIVE: z_mean 0.91 vs P64 0.68; probe20 conv=0).
+> (LIVE iter 63: z_mean 0.91 vs P64 0.70; probe60 conv=0; TM@60
+> MV ×0.821 vs P64 ×0.923).
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -1004,9 +1006,10 @@ fixes BOTH:
   (rms 0.00387; det_r 0.074; mv_viol 20).   **P75 EXIT REVERT:**
   FOPDT rise teacher (rise mass 1.4% at K=H; val 1step→OL ×0.803).
   Last-step DC Huber restored. **P76:** RSSM GRU update-gate bias
-  `log(H/16)` on both GRU slices (idle logit `2b`; LIVE ckpt20
-  z_mean **0.91** vs P64 **0.68**; probe20 **conv=0** while peers
-  0.50 — keep-h slows held-action SS). No new knob.
+  `log(H/16)` on both GRU slices (idle logit `2b`; LIVE ckpt60
+  z_mean **0.91** vs P64 **0.70**; probe60 **conv=0** while P64 0.25 /
+  P75 0.50 — keep-h; CPU TM@60 MV **×0.821** DV **×0.842** vs P64
+  ×0.923/×0.888). No new knob.
   Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
