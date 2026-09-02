@@ -69,7 +69,7 @@ from training.train import (
                             _cube_plus_would_clip, _gain_match_clip_frac_t,
                             _gain_match_state_from_feat,
                             _gain_match_held_settle, _auto_gain_match_settle_len,
-                            _auto_gain_match_len,
+                            _auto_gain_match_len, _gain_match_ol_tail_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
                             _gain_match_rest_window, _gain_match_rest_ic_state,
                             _held_rollout_win,
@@ -1570,6 +1570,19 @@ def _test_img_rollout_last_only() -> None:
     last_obs = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='obs')
     last_obs_err = float((last_obs - obs_roll[:, -1]).detach().abs().max())
     assert last_obs_err < 1e-5, f"last_only out='obs' != stack[:, -1] (max_err={last_obs_err})"
+    last_s, st = m.img_rollout(
+        h0, z0, acts, sample=False, last_only=True, out='obs',
+        return_state=True)
+    assert float((last_s - last_obs).detach().abs().max()) < 1e-6
+    acts2 = torch.rand(B, 2, cfg.action_dim) * 2 - 1
+    cont = m.img_rollout(
+        st.h, st.z, acts2, sample=False, last_only=True, out='obs',
+        c0=st.c, prev_state=st.detach(), return_state=False)
+    long = m.img_rollout(
+        h0, z0, torch.cat([acts, acts2], dim=1), sample=False,
+        last_only=True, out='obs')
+    cont_err = float((cont - long).detach().abs().max())
+    assert cont_err < 1e-5, f'prev_state continue != long roll (max_err={cont_err})'
     store = getattr(m, '_img_zlogits_zeros', None)
     assert isinstance(store, dict) and store, 'img_rollout z_logits zeros not cached'
     roll2 = m.img_rollout(h0, z0, acts, sample=False)
@@ -1742,6 +1755,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
+    assert "gmatch_ol_tail={_gain_match_ol_tail_len" in _src
     assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
     assert "gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized'" in _src
     assert '_cube_step_held' in _src
@@ -1897,6 +1911,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_state_from_feat' in _src
     assert '_auto_gain_match_settle_len' in _src
     assert '_auto_gain_match_len' in _src
+    assert '_gain_match_ol_tail_len' in _src
     assert '_adv_action_corr' in _src
     assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
@@ -2951,6 +2966,15 @@ def _test_gain_match_held_settle() -> None:
     c_k3.horizon = 55
     c_k3.gain_match_len = 220
     assert _auto_gain_match_len(c_k3) == 220
+    c_t = TrainConfig()
+    c_t.horizon = 55
+    c_t.wm_tf_horizon = 0
+    assert _gain_match_ol_tail_len(c_t, 55) == 165
+    c_t.wm_tf_horizon = 220
+    assert _gain_match_ol_tail_len(c_t, 55) == 165
+    assert _gain_match_ol_tail_len(c_t, 220) == 0
+    c_t.wm_tf_horizon = 6
+    assert _gain_match_ol_tail_len(c_t, 4) == 2
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 
@@ -3129,6 +3153,7 @@ def _test_gain_match_rest_ic() -> None:
     cfg.cont_dist_dim = 0
     cfg.gain_match_coef = 1.0
     cfg.gain_match_len = 4
+    cfg.wm_tf_horizon = 6
     cfg.gain_match_settle_len = 8
     cfg.gain_match_rest_ic = True
     cfg.gain_match_mv_target = ((-1.0,),)
@@ -3146,8 +3171,11 @@ def _test_gain_match_rest_ic() -> None:
     cfg._gain_match_rest_obs = rest_o.numpy()
     cfg._gain_match_rest_act = rest_a.numpy()
     model.zero_grad(set_to_none=True)
-    gm1, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    gm1, diag1 = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert torch.isfinite(gm1).all() and float(gm1) > 0.0, float(gm1)
+    assert int(diag1.get('gain_match_ol_tail_len', -1)) == 2, diag1.get(
+        'gain_match_ol_tail_len')
+    assert float(diag1['gain_match_ol_tail_loss']) >= 0.0
     gm1.backward()
     cont_g = sum(float(p.grad.abs().sum())
                  for n, p in model.dynamics.named_parameters()
@@ -3179,6 +3207,15 @@ def _test_gain_match_rest_ic() -> None:
     assert 'o_rest[:, -1].index_select' in _gm_src
     assert 'include_held=not skip_held' in _gm_src
     assert 'skip_held = o_rest is not None' in _gm_src
+    assert 'rest-IC OL tail Huber' in _gm_src
+    assert 'prev_state=st_k.detach()' in _gm_src
+    cfg.wm_tf_horizon = 4
+    gm_notail, d_notail = _wm_gain_match_loss(
+        model, feats.detach(), obs, act, cfg)
+    assert int(d_notail['gain_match_ol_tail_len']) == 0
+    assert abs(float(gm1) - float(gm_notail)) > 1e-8, (
+        'OL tail unused (same loss at K_tail=2 vs 0)')
+    cfg.wm_tf_horizon = 6
     cfg._gain_match_rest_obs = None
     cfg._gain_match_rest_act = None
     cfg._gain_match_rest_dev = None
@@ -4554,6 +4591,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_len=55' in banner, banner
+    assert 'gmatch_ol_tail=165' in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
     assert 'gmatch_clip=True' in banner, banner
     assert 'gmatch_rest=True' in banner, banner

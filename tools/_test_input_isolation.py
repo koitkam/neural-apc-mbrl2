@@ -255,6 +255,7 @@ def main():
     # tensors move the loss).  Isolation loss stays off.
     cfg.gain_match_rest_ic = True
     cfg.gain_match_settle_len = 4
+    cfg.wm_tf_horizon = 6  # K=6 → K_tail=0; isolation identity vs P68
     N, L = 3, 8
     rest_o = torch.randn(N, L, cfg.obs_dim)
     rest_a = torch.rand(N, L, cfg.action_dim) * 2 - 1

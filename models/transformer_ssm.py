@@ -654,7 +654,9 @@ class TransformerSSMDynamics(nn.Module):
                     sample: bool = True,
                     c0: Optional[torch.Tensor] = None,
                     last_only: bool = False,
-                    out: str = 'feat') -> torch.Tensor:
+                    out: str = 'feat',
+                    prev_state: Optional[TSSMState] = None,
+                    return_state: bool = False):
         """Prior-only rollout of K steps from ``(h0, z0[, c0])``.
 
         Same contract as ``RSSMDynamics.img_rollout`` so gain-match can
@@ -666,20 +668,26 @@ class TransformerSSMDynamics(nn.Module):
         ``out``: ``'feat'`` (default) / ``'obs'`` — see RSSM.
         ``last_only`` materializes ``out`` once after the K-loop.
         ``out='h'`` removed with RSSM (P62; no training call site).
+        ``prev_state`` continues KV-cache (P69 OL tail).  ``return_state``
+        also returns the last ``TSSMState``.
         """
-        Bm = h0.shape[0]
-        K = actions.shape[1]
-        c = None
-        if self.cont_dim > 0:
-            c = (c0 if c0 is not None else cached_zeros_bd(
-                self, int(Bm), self.cont_dim, h0.dtype, h0.device))
         if out not in ('feat', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
-        z_logits = cached_zeros_btd(
-            self, Bm, self.n_categoricals, self.n_classes,
-            h0.dtype, h0.device, attr='_img_zlogits_zeros')
-        state = TSSMState(
-            h=h0, z_logits=z_logits, z=z0, c=c, kv_cache=None, pos=0)
+        K = actions.shape[1]
+        if prev_state is not None:
+            state = prev_state
+            Bm = int(state.h.shape[0])
+        else:
+            Bm = h0.shape[0]
+            c = None
+            if self.cont_dim > 0:
+                c = (c0 if c0 is not None else cached_zeros_bd(
+                    self, int(Bm), self.cont_dim, h0.dtype, h0.device))
+            z_logits = cached_zeros_btd(
+                self, Bm, self.n_categoricals, self.n_classes,
+                h0.dtype, h0.device, attr='_img_zlogits_zeros')
+            state = TSSMState(
+                h=h0, z_logits=z_logits, z=z0, c=c, kv_cache=None, pos=0)
         h_l = z_l = c_l = dv_l = None
         if not last_only:
             h_l, z_l, c_l, dv_l = [], [], [], []
@@ -694,13 +702,13 @@ class TransformerSSMDynamics(nn.Module):
                 continue
             _append_decode_core(h_l, z_l, c_l, dv_l, state)
         if last_only:
-            if out_obs:
-                return self.decode(state.feat)
-            return state.feat
-        core = _stack_decode_core(h_l, z_l, c_l, dv_l)
-        if out_obs:
-            return self.decode(core)
-        return core
+            out_t = self.decode(state.feat) if out_obs else state.feat
+        else:
+            core = _stack_decode_core(h_l, z_l, c_l, dv_l)
+            out_t = self.decode(core) if out_obs else core
+        if return_state:
+            return out_t, state
+        return out_t
 
     def obs_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,

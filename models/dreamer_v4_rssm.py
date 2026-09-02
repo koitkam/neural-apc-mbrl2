@@ -1110,7 +1110,9 @@ class RSSMDynamics(nn.Module):
                     sample: bool = True,
                     c0: Optional[torch.Tensor] = None,
                     last_only: bool = False,
-                    out: str = 'feat') -> torch.Tensor:
+                    out: str = 'feat',
+                    prev_state: Optional[RSSMState] = None,
+                    return_state: bool = False):
         """Prior-only (imagined) rollout of K steps from ``(h0, z0[, c0])``.
 
         ``h0`` (Bm, deter_dim), ``z0`` (Bm, n_categoricals, n_classes),
@@ -1134,6 +1136,9 @@ class RSSMDynamics(nn.Module):
         ``last_only`` materializes ``out`` once after the K-loop (no
         intermediate decode / feat copies).  ``out='h'`` was P61 held
         and is **removed** (no training call site).
+        ``prev_state`` continues an existing prior (P69 OL tail: stop-grad
+        at teacher K then roll to the val TM window).  ``return_state``
+        also returns the last ``RSSMState``.
 
         P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
         the open-loop gain supervisor trained a ``c=0`` GRU path while
@@ -1151,21 +1156,25 @@ class RSSMDynamics(nn.Module):
         applied *between* ``img_rollout`` chunks in train.py (``h``-only
         ``keep_c``) so compile-on always sees a TBPTT-free graph.
         """
-        Bm = h0.shape[0]
-        K = actions.shape[1]
-        c = None
-        if self.cont_dim > 0:
-            c = (c0 if c0 is not None else cached_zeros_bd(
-                self, int(Bm), self.cont_dim, h0.dtype, h0.device))
         if out not in ('feat', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
-        # Layout-only IC: ``img_step`` replaces ``z_logits`` (no in-place
-        # write).  Deterministic latent never reads this softmax slot.
-        z_logits = cached_zeros_btd(
-            self, Bm, self.n_categoricals, self.n_classes,
-            h0.dtype, h0.device, attr='_img_zlogits_zeros')
-        state = RSSMState(
-            h=h0, z_logits=z_logits, z=z0, c=c)
+        K = actions.shape[1]
+        if prev_state is not None:
+            state = prev_state
+            Bm = int(state.h.shape[0])
+        else:
+            Bm = h0.shape[0]
+            c = None
+            if self.cont_dim > 0:
+                c = (c0 if c0 is not None else cached_zeros_bd(
+                    self, int(Bm), self.cont_dim, h0.dtype, h0.device))
+            # Layout-only IC: ``img_step`` replaces ``z_logits`` (no in-place
+            # write).  Deterministic latent never reads this softmax slot.
+            z_logits = cached_zeros_btd(
+                self, Bm, self.n_categoricals, self.n_classes,
+                h0.dtype, h0.device, attr='_img_zlogits_zeros')
+            state = RSSMState(
+                h=h0, z_logits=z_logits, z=z0, c=c)
         h_l = z_l = c_l = dv_l = None
         if not last_only:
             h_l, z_l, c_l, dv_l = [], [], [], []
@@ -1180,13 +1189,13 @@ class RSSMDynamics(nn.Module):
                 continue
             _append_decode_core(h_l, z_l, c_l, dv_l, state)
         if last_only:
-            if out_obs:
-                return self.decode(state.feat)
-            return state.feat                                 # (Bm, *)
-        core = _stack_decode_core(h_l, z_l, c_l, dv_l)
-        if out_obs:
-            return self.decode(core)                          # (Bm, K, obs)
-        return core                                           # (Bm, K, F)
+            out_t = self.decode(state.feat) if out_obs else state.feat
+        else:
+            core = _stack_decode_core(h_l, z_l, c_l, dv_l)
+            out_t = self.decode(core) if out_obs else core
+        if return_state:
+            return out_t, state
+        return out_t
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the

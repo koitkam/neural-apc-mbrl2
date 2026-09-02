@@ -127,6 +127,19 @@ def test_img_rollout_equals_img_step():
     last_obs = m.img_rollout(h0, z0, acts, sample=False, last_only=True, out='obs')
     last_obs_err = float((last_obs - obs_roll[:, -1]).detach().abs().max())
     assert last_obs_err < 1e-5, f"last_only out='obs' != stack[:, -1] (max_err={last_obs_err})"
+    last_s, st = m.img_rollout(
+        h0, z0, acts, sample=False, last_only=True, out='obs',
+        return_state=True)
+    assert float((last_s - last_obs).detach().abs().max()) < 1e-6
+    acts2 = torch.rand(B, 2, cfg.action_dim) * 2 - 1
+    cont = m.img_rollout(
+        st.h, st.z, acts2, sample=False, last_only=True, out='obs',
+        c0=st.c, prev_state=st.detach())
+    long = m.img_rollout(
+        h0, z0, torch.cat([acts, acts2], dim=1), sample=False,
+        last_only=True, out='obs')
+    cont_err = float((cont - long).detach().abs().max())
+    assert cont_err < 1e-5, f'prev_state continue != long roll (max_err={cont_err})'
     print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e}); "
           f"last_only ≡ stack[:, -1] (max_err={last_err:.2e}); "
           f"out=obs identity (obs={obs_err:.2e} last_obs={last_obs_err:.2e})")
