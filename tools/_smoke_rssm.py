@@ -1698,6 +1698,12 @@ def _test_gain_match_fopdt_frac() -> None:
     assert 0.0 < float(fo[2]) < float(fo[26]) < 1.0
     fo2 = _gain_match_fopdt_frac(cfg, 55, torch.device('cpu'), torch.float32)
     assert fo2 is fo  # cached
+    from training.train import _gain_match_tail_wfrac
+    rise, last, k_mid = _gain_match_tail_wfrac(
+        cfg, 55, torch.device('cpu'), torch.float32)
+    assert k_mid == 13
+    assert 0.01 < float(rise) < 0.03
+    assert 0.04 < float(last) < 0.08
     rssm_cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
                           n_categoricals=4, n_classes=4, embed_dim=16,
                           hidden_dim=16, latent_type='deterministic',
@@ -1707,7 +1713,8 @@ def _test_gain_match_fopdt_frac() -> None:
     feat = torch.randn(4, m.feat_dim)
     x = feat[..., :m._decode_in_dim]
     assert torch.allclose(m.decode(feat), m.decoder(x), atol=1e-6, rtol=1e-5)
-    print('[smoke] OK  FOPDT rise frac last=1 dead-time zeros; skip REVERT')
+    print('[smoke] OK  FOPDT rise frac last=1 dead-time zeros; '
+          'rise_wfrac weakly weighted; skip REVERT')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -1857,6 +1864,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_mv_ratio_mid' in _src
     assert 'gain_match_dv_ratio_mid' in _src
     assert 'gain_match_mv_ratio_mid_fo' in _src
+    assert 'gain_match_rise_wfrac' in _src
     assert '_gain_match_pred_over_tgt' in _src
     assert '_gain_match_tgt_tensor' in _src
     assert '_should_lock_last_ok' in _src
@@ -2048,6 +2056,9 @@ def _test_isolation_dcv_scales() -> None:
     assert "row.setdefault('dob_ground_keep_frac'" in _src
     assert "row.setdefault('wm_gain_match_mv_ratio_mid'" in _src
     assert "row.setdefault('wm_gain_match_mv_ratio_mid_fo'" in _src
+    assert 'def _gain_match_tail_wfrac' in _src
+    assert "row.setdefault('wm_gain_match_rise_wfrac'" in _src
+    assert 'rise_wfrac=' in _src
     assert "out='obs'" in _src
     assert 'held_cv=True' in _src
     assert 'p1amp=' in _src
@@ -3301,6 +3312,11 @@ def _test_gain_match_rest_ic() -> None:
     assert 'gain_match_dv_ratio_mid' in diag1
     assert 'gain_match_mv_ratio_mid_fo' in diag1
     assert 'gain_match_dv_ratio_mid_fo' in diag1
+    assert 'gain_match_rise_wfrac' in diag1
+    assert 'gain_match_last_wfrac' in diag1
+    rw = float(diag1['gain_match_rise_wfrac'])
+    lw = float(diag1['gain_match_last_wfrac'])
+    assert 0.0 < rw < lw < 1.0, (rw, lw)
     assert torch.isfinite(diag1['gain_match_mv_ratio_mid']).all()
     assert torch.isfinite(diag1['gain_match_mv_ratio_mid_fo']).all()
     gm1.backward()

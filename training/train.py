@@ -6777,6 +6777,24 @@ def _overshoot_tail_wk(cfg: 'TrainConfig', K: int, device,
     return wk
 
 
+def _gain_match_tail_wfrac(cfg: 'TrainConfig', K: int, device,
+                            dtype) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Huber mass on rise ``k=1..k_mid`` vs last step. Identity vs ``wk``.
+
+    P75 reuses overshoot ``(k/K)^p`` so last-step DC still dominates
+    (p131 ``/K`` dilution).  Rise Huber is weakly weighted — jsonl
+    last-step ×1 cannot show that.  ``k_mid=(K-1)//4`` is the same
+    unitless slice as ``*_ratio_mid``.  Cached via ``_overshoot_tail_wk``.
+    """
+    Kk = int(K)
+    k_mid = max(0, (Kk - 1) // 4)
+    wk = _overshoot_tail_wk(cfg, Kk, device, dtype)
+    wsum = wk.sum().clamp_min(1.0)
+    rise = wk[:k_mid + 1].sum() / wsum
+    last = wk[-1] / wsum
+    return rise, last, k_mid
+
+
 def _gain_match_fopdt_frac(cfg: 'TrainConfig', K: int, device,
                            dtype) -> torch.Tensor:
     """τ-normalized FOPDT step fraction; last sample is 1.
@@ -8200,11 +8218,6 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                   '(TM pre; not held-K)',
                   flush=True)
             cfg._gain_match_rest_pre_logged = True  # type: ignore[attr-defined]
-        if not getattr(cfg, '_gain_match_fo_logged', False):
-            print('[gain-match] FOPDT rise teacher (τ-normalized; '
-                  'last step = DC tgt; P74 skip REVERT)',
-                  flush=True)
-            cfg._gain_match_fo_logged = True  # type: ignore[attr-defined]
     else:
         cv_base = cv_k[0, :, -1]
         cv_steps = cv_k[1:]
@@ -8266,7 +8279,18 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
             # ``*_mid_fo`` = (G_wm/G_tgt) / FO[k]; 1 = rise match.
             if cv_steps.dim() == 4:
                 Kk = int(cv_steps.shape[2])
-                k_mid = max(0, (Kk - 1) // 4)
+                rise_w, last_w, k_mid = _gain_match_tail_wfrac(
+                    cfg, Kk, cv_steps.device, cv_steps.dtype)
+                diag['gain_match_rise_wfrac'] = rise_w.detach()
+                diag['gain_match_last_wfrac'] = last_w.detach()
+                if not getattr(cfg, '_gain_match_fo_logged', False):
+                    print('[gain-match] FOPDT rise teacher (τ-normalized; '
+                          'last step = DC tgt; P74 skip REVERT) '
+                          f'k_mid={k_mid} rise_wfrac={float(rise_w):.4f} '
+                          f'last_wfrac={float(last_w):.4f} '
+                          '(overshoot (k/K)^p tail; rise Huber weakly weighted)',
+                          flush=True)
+                    cfg._gain_match_fo_logged = True  # type: ignore[attr-defined]
                 g_mid = (cv_steps[:, :, k_mid, :] - cv_base) / torch.where(
                     ok, den, torch.ones_like(den))
                 fo = _gain_match_fopdt_frac(
@@ -14245,6 +14269,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_dv_ratio_mid_fo' in row:
                 row.setdefault('wm_gain_match_dv_ratio_mid_fo',
                             row['gain_match_dv_ratio_mid_fo'])
+            if 'gain_match_rise_wfrac' in row:
+                row.setdefault('wm_gain_match_rise_wfrac',
+                            row['gain_match_rise_wfrac'])
+            if 'gain_match_last_wfrac' in row:
+                row.setdefault('wm_gain_match_last_wfrac',
+                            row['gain_match_last_wfrac'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)

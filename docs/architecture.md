@@ -149,9 +149,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > −105**, mv_viol **20**. Skip rms stalled **0.00387** — teacher-pin
 > no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75 LIVE**
 > FOPDT rise teacher (`run_p75_gmatchfo`, pid **230450**): `gmatch_fo=True`.
-> Iter 26 P1 skip 0 last_ok 26 jsonl last-step ×0.997/×0.975. CPU TM@K=55
-> iter20 MV ×0.80 mid/FO/ss **0.70** vs P64@80 ×0.97 / 1.17. HEAD jsonl
-> `*_ratio_mid` (not in this pid). Persist KEEP. No new knob.
+> Iter 64 P1 skip 0 last_ok 60 unlocked@64. Wrap@61 (recon 0.40) recovered.
+> jsonl last-step ×0.99/×0.99. CPU TM@K=55 P75@60 MV **×0.69** mid/FO/ss
+> **1.19** (vs @40 ×0.63 / 1.05; SS recovered, rise overshoots FO). H=55
+> fidelity **0.261**. Rise Huber mass 1.4%. HEAD jsonl `*_ratio_mid` +
+> `rise_wfrac` (not in this pid). Persist KEEP. No new knob.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
