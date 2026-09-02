@@ -144,9 +144,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **×0.761** OL **×0.743**. det_r **0.630**. Paired **−4.91 vs −125**
 > VALID 9/9. P69–P73 G-family **closed**. **P74 LIVE** decoder
 > `gain_cv_skip` (`run_p74_gcvskip`, pid **221013**): zero-init
-> `Linear(c[:G]→n_cv)` onto CV after the decode MLP. P1 iter 25
-> skip rms **stalled 0.0042** after teacher pin @5. Persist KEEP.
-> No new knob.
+> `Linear(c[:G]→n_cv)` onto CV after the decode MLP. P1 iter **57**
+> skip rms **stalled 0.0041** (ckpt-40 W shrinking vs last_ok-19).
+> Teacher pin @5; persist still 0.05–0.73. Persist KEEP. No new knob.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -222,8 +222,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P73 EXIT** OL persist KEEP as last_ok-81 hygiene / **FALSIFIED
 > as compounding** (val 1step→OL ×0.761 OL ×0.743; persist_rel 0.037).
 > **P74 LIVE** (`run_p74_gcvskip`, pid **221013**): decoder
-> `gain_cv_skip` (zero-init `c[:G]→CV`). P1 iter 25 skip rms **stalled
-> 0.0042** after teacher pin @5 — not yet a compounding test.
+> `gain_cv_skip` (zero-init `c[:G]→CV`). P1 iter **57** skip rms
+> **stalled 0.0041** after teacher pin @5 — not yet a compounding test.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig

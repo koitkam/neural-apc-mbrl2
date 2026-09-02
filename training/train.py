@@ -8824,8 +8824,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
     }
+    # jsonl / banner only (1×2 weight; not in ``wm_total``).  Same last-
+    # logged-inner gate as Huber MV/DV splits.  Default True so probes
+    # / direct callers still get the key.
     _gskip = getattr(rssm, 'gain_cv_skip', None)
-    if _gskip is not None:
+    if (_gskip is not None
+            and bool(getattr(cfg, '_wm_need_logged_aux', True))):
         losses['gain_cv_skip_rms'] = (
             _gskip.weight.detach().pow(2).mean().sqrt())
     losses.update(kl_diag)

@@ -2034,6 +2034,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "last_only=True, out='obs', return_state=True" in _src
     assert 'gcvskip=True' in _src
     assert 'gain_cv_skip_rms' in _src
+    assert '1×2 weight; not in' in _src
     assert '_adv_action_corr' in _src
     assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
