@@ -138,8 +138,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > VALID 9/9, mv_viol **9.70**). Dummy `gain_match_ol_tail_*` jsonl
 > **REMOVED**. Dummy `gmatch_ol_tail=0` banner **REMOVED**.
 > **P73 LIVE** OL gain-c persist at teacher K
-> (`run_p73_olgpersist`, pid **214644**; P1 skip **0**, last_ok
-> advancing past P72's freeze-at-15).
+> (`run_p73_olgpersist`, pid **214644**; P1 iter **53** skip **0**,
+> last_ok **53 unlocked** — P72 froze 15 after storm 2@16).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
