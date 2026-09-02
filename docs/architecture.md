@@ -197,8 +197,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > HEAD **REVERT** auto K to control H. Do not teacher-K N+1. **P68 EXIT**
 > rest-pre Huber **KEEP as protocol** / **FALSIFIED as TM/compounding/champ**.
 > Rest-pre skips the unused held-K `img_rollout` row. **P69 EXIT**
-> stop-grad OL tail **REVERT** (TBPTT-on-DC; CAPPED 0.75@MV). **P70**
-> holds gain-c after the first prior step (not a longer teacher).
+> stop-grad OL tail **REVERT** (TBPTT-on-DC; CAPPED 0.75@MV). **P70 EXIT**
+> hold-G **REVERT** (CAPPED −0.60@MV). **P71 LIVE** gain-c decoder/feat
+> only (not in GRU).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
