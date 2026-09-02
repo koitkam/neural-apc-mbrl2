@@ -1583,6 +1583,33 @@ def _test_img_rollout_last_only() -> None:
         last_only=True, out='obs')
     cont_err = float((cont - long).detach().abs().max())
     assert cont_err < 1e-5, f'prev_state continue != long roll (max_err={cont_err})'
+    # P69: stop-grad at teacher K must not leak into the first-K state.
+    # Without detach, the same tail *does* reach h0 (positive control).
+    m.zero_grad(set_to_none=True)
+    h0_leak = h0.detach().requires_grad_(True)
+    last_leak, st_leak = m.img_rollout(
+        h0_leak, z0.detach(), acts, sample=False, last_only=True, out='obs',
+        return_state=True)
+    tail_leak = m.img_rollout(
+        st_leak.h, st_leak.z, acts2, sample=False, last_only=True, out='obs',
+        c0=st_leak.c, prev_state=st_leak, return_state=False)
+    tail_leak.sum().backward()
+    leak = 0.0 if h0_leak.grad is None else float(h0_leak.grad.abs().max())
+    assert leak > 0.0, 'positive-control tail without detach missed h0'
+    m.zero_grad(set_to_none=True)
+    h0_sg = h0.detach().requires_grad_(True)
+    last_sg, st_sg = m.img_rollout(
+        h0_sg, z0.detach(), acts, sample=False, last_only=True, out='obs',
+        return_state=True)
+    tail_sg = m.img_rollout(
+        st_sg.h, st_sg.z, acts2, sample=False, last_only=True, out='obs',
+        c0=st_sg.c, prev_state=st_sg.detach(), return_state=False)
+    tail_sg.sum().backward()
+    sg = 0.0 if h0_sg.grad is None else float(h0_sg.grad.abs().max())
+    assert sg == 0.0, (
+        f'OL tail prev_state.detach() leaked grad into teacher-K state '
+        f'(max={sg})')
+    m.zero_grad(set_to_none=True)
     store = getattr(m, '_img_zlogits_zeros', None)
     assert isinstance(store, dict) and store, 'img_rollout z_logits zeros not cached'
     roll2 = m.img_rollout(h0, z0, acts, sample=False)
@@ -1596,7 +1623,8 @@ def _test_img_rollout_last_only() -> None:
     print(f'[smoke] OK  img_rollout last_only ≡ stack[:, -1] '
           f'(max_err={err:.2e}); out=obs identity '
           f'(obs={obs_err:.2e} last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}; '
-          f'z_logits cache identity max_err={cache_err:.2e}')
+          f'z_logits cache identity max_err={cache_err:.2e}; '
+          f'OL-tail stop-grad leak={sg:.1e} (control={leak:.2e})')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
