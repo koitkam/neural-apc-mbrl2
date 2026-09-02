@@ -1681,40 +1681,36 @@ def _test_img_rollout_last_only() -> None:
     print('[smoke] OK  full c (gain+dist) enters GRU')
 
 
-def _test_gain_match_fopdt_frac() -> None:
-    """P75: FO last=1; dead-time zeros pre-θ; mid < last; decode is MLP-only."""
-    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
-    from training.train import TrainConfig, _gain_match_fopdt_frac
-    torch.manual_seed(0)
-    cfg = TrainConfig()
-    cfg.identified_tau_dominant = 53.0
-    cfg.identified_dead_time = 8.0
-    cfg.sample_rate = 4.0
-    fo = _gain_match_fopdt_frac(cfg, 55, torch.device('cpu'), torch.float32)
-    assert int(fo.numel()) == 55
-    assert abs(float(fo[-1]) - 1.0) < 1e-6
-    assert float(fo[0]) == 0.0  # t=4s < θ=8s
-    assert float(fo[1]) == 0.0  # t=8s
-    assert 0.0 < float(fo[2]) < float(fo[26]) < 1.0
-    fo2 = _gain_match_fopdt_frac(cfg, 55, torch.device('cpu'), torch.float32)
-    assert fo2 is fo  # cached
-    from training.train import _gain_match_tail_wfrac
-    rise, last, k_mid = _gain_match_tail_wfrac(
-        cfg, 55, torch.device('cpu'), torch.float32)
-    assert k_mid == 13
-    assert 0.01 < float(rise) < 0.03
-    assert 0.04 < float(last) < 0.08
-    rssm_cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
-                          n_categoricals=4, n_classes=4, embed_dim=16,
-                          hidden_dim=16, latent_type='deterministic',
-                          cont_gain_dim=2, cv_indices=(0,))
-    m = RSSMDynamics(rssm_cfg)
+def _test_gru_update_gate_bias() -> None:
+    """P76: H=55 z-bias ≈1.24 on update slice; H=0 leaves PyTorch init;
+    decoder still MLP-only (P74 skip REVERT)."""
+    import math
+    from models.dreamer_v4_rssm import (
+        RSSMConfig, RSSMDynamics, gru_update_gate_bias)
+    assert abs(gru_update_gate_bias(0) - 0.0) < 1e-12
+    b55 = float(math.log(55.0 / 16.0))
+    assert abs(gru_update_gate_bias(55) - b55) < 1e-6
+    cfg0 = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                      n_categoricals=4, n_classes=4, embed_dim=16,
+                      hidden_dim=16, latent_type='deterministic',
+                      cont_gain_dim=2, cv_indices=(0,), horizon=0)
+    m0 = RSSMDynamics(cfg0)
+    assert abs(float(m0._gru_update_gate_bias)) < 1e-12
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     cont_gain_dim=2, cv_indices=(0,), horizon=55)
+    m = RSSMDynamics(cfg)
+    hs = int(cfg.deter_dim)
+    expect = torch.full((hs,), b55)
+    assert torch.allclose(m.gru.bias_ih[hs:2 * hs].detach(), expect)
+    assert torch.allclose(m.gru.bias_hh[hs:2 * hs].detach(), expect)
+    assert abs(float(m._gru_update_gate_bias) - b55) < 1e-6
     assert not hasattr(m, 'gain_cv_skip') or getattr(m, 'gain_cv_skip', None) is None
     feat = torch.randn(4, m.feat_dim)
     x = feat[..., :m._decode_in_dim]
     assert torch.allclose(m.decode(feat), m.decoder(x), atol=1e-6, rtol=1e-5)
-    print('[smoke] OK  FOPDT rise frac last=1 dead-time zeros; '
-          'rise_wfrac weakly weighted; skip REVERT')
+    print('[smoke] OK  GRU update-gate bias log(H/16); skip REVERT')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -1861,10 +1857,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_dv_loss' in _src
     assert 'gain_match_mv_ratio' in _src
     assert 'gain_match_dv_ratio' in _src
-    assert 'gain_match_mv_ratio_mid' in _src
-    assert 'gain_match_dv_ratio_mid' in _src
-    assert 'gain_match_mv_ratio_mid_fo' in _src
-    assert 'gain_match_rise_wfrac' in _src
+    assert 'gain_match_mv_ratio_mid' not in _src
+    assert 'gain_match_mv_ratio_mid_fo' not in _src
+    assert 'gain_match_rise_wfrac' not in _src
     assert '_gain_match_pred_over_tgt' in _src
     assert '_gain_match_tgt_tensor' in _src
     assert '_should_lock_last_ok' in _src
@@ -1987,7 +1982,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def cached_onehot_z' in _cz
     assert 'def _prior_c_from_net' in _cz
     assert 'def _recurrence_c' in _cz
-    assert 'def _gain_match_fopdt_frac' in _src
+    assert 'def gru_update_gate_bias' in _rssm_src
+    assert 'bias_ih[hs:2 * hs]' in _rssm_src
     assert 'def init_gain_cv_skip' not in _rssm_src
     assert 'def apply_gain_cv_skip' not in _rssm_src
     assert 'self.recurrence_c_dim = int(self.cont_dim)' in _rssm_src
@@ -2043,8 +2039,9 @@ def _test_isolation_dcv_scales() -> None:
     assert '_auto_gain_match_len' in _src
     assert '_gain_match_ol_tail_len' not in _src
     assert 'gain_match_ol_persist_rel' in _src
-    assert "last_only=False, out='obs', return_state=True" in _src
-    assert 'gmatch_fo=True' in _src
+    assert "last_only=True, out='obs', return_state=True" in _src
+    assert 'gmatch_fo=True' not in _src
+    assert 'gru_zbias=' in _src
     assert 'gain_cv_skip_rms' not in _src
     assert '1×2 weight; not in' not in _src
     assert '_adv_action_corr' in _src
@@ -2054,11 +2051,11 @@ def _test_isolation_dcv_scales() -> None:
     assert 'Lock is recon-only (not skip-free)' in _src
     assert "row.setdefault('wm_isolation_loss'" in _src
     assert "row.setdefault('dob_ground_keep_frac'" in _src
-    assert "row.setdefault('wm_gain_match_mv_ratio_mid'" in _src
-    assert "row.setdefault('wm_gain_match_mv_ratio_mid_fo'" in _src
-    assert 'def _gain_match_tail_wfrac' in _src
-    assert "row.setdefault('wm_gain_match_rise_wfrac'" in _src
-    assert 'rise_wfrac=' in _src
+    assert "row.setdefault('wm_gain_match_mv_ratio_mid'" not in _src
+    assert "row.setdefault('wm_gain_match_mv_ratio_mid_fo'" not in _src
+    assert 'def _gain_match_tail_wfrac' not in _src
+    assert "row.setdefault('wm_gain_match_rise_wfrac'" not in _src
+    assert 'rise_wfrac=' not in _src
     assert "out='obs'" in _src
     assert 'held_cv=True' in _src
     assert 'p1amp=' in _src
@@ -2078,7 +2075,7 @@ def _test_isolation_dcv_scales() -> None:
                 / 'run_nl_then_p09.sh').exists()
     assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
-    assert "last_only=False, out='obs', return_state=True" in _src
+    assert "last_only=False, out='obs', return_state=True" not in _src
     assert '_p1_fidelity_local_plateau' in _src
     assert 'np.clip(g_min / (g * a0), floor, smax)' in _src
     assert 'wm_isolation_dcv_min_scale' in _src
@@ -3308,17 +3305,12 @@ def _test_gain_match_rest_ic() -> None:
     assert 'gain_match_ol_tail_loss' not in diag1
     assert 'gain_match_ol_persist_rel' in diag1
     assert torch.isfinite(diag1['gain_match_ol_persist_rel']).all()
-    assert 'gain_match_mv_ratio_mid' in diag1
-    assert 'gain_match_dv_ratio_mid' in diag1
-    assert 'gain_match_mv_ratio_mid_fo' in diag1
-    assert 'gain_match_dv_ratio_mid_fo' in diag1
-    assert 'gain_match_rise_wfrac' in diag1
-    assert 'gain_match_last_wfrac' in diag1
-    rw = float(diag1['gain_match_rise_wfrac'])
-    lw = float(diag1['gain_match_last_wfrac'])
-    assert 0.0 < rw < lw < 1.0, (rw, lw)
-    assert torch.isfinite(diag1['gain_match_mv_ratio_mid']).all()
-    assert torch.isfinite(diag1['gain_match_mv_ratio_mid_fo']).all()
+    assert 'gain_match_mv_ratio_mid' not in diag1
+    assert 'gain_match_dv_ratio_mid' not in diag1
+    assert 'gain_match_mv_ratio_mid_fo' not in diag1
+    assert 'gain_match_dv_ratio_mid_fo' not in diag1
+    assert 'gain_match_rise_wfrac' not in diag1
+    assert 'gain_match_last_wfrac' not in diag1
     gm1.backward()
     cont_g = sum(float(p.grad.abs().sum())
                  for n, p in model.dynamics.named_parameters()
@@ -5009,6 +5001,9 @@ def _test_dreamer_v4_config_from_train() -> None:
     assert abs(mc.policy_init_log_std - (-2.0)) < 1e-12
     assert mc.cont_dist_deterministic_roll is True
     assert mc.cont_gain_deterministic_roll is True
+    assert int(mc.horizon) == 0
+    cfg.horizon = 55
+    assert int(dreamer_v4_config_from_train(cfg).horizon) == 55
     assert dreamer_v4_config_from_train(cfg, attn_impl='sdpa').attn_impl == 'sdpa'
     assert dreamer_v4_config_from_train(cfg, attn_impl='manual').attn_impl == 'manual'
 
@@ -5056,7 +5051,7 @@ if __name__ == '__main__':
     _test_buffer_clear()
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
-    _test_gain_match_fopdt_frac()
+    _test_gru_update_gate_bias()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()

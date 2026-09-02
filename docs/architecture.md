@@ -147,16 +147,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > **GAIN-READY 0.81@MV**. Val MV **×0.809 / ×0.873** DV **×0.848 /
 > ×0.941**. 1step→OL **×0.836**. det_r **0.074**. Paired **−48 vs
 > −105**, mv_viol **20**. Skip rms stalled **0.00387** — teacher-pin
-> no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75 LIVE P3 ~260**
-> FOPDT rise teacher (`run_p75_gmatchfo`, pid **230450**): `gmatch_fo=True`.
-> P1→P2 @82 **GAIN-READY 0.84@MV** last_ok **82** skip **0**. Wrap@61
-> recovered. CPU TM@K=55 freeze ckpt80 MV **×0.83** mid/FO/ss **1.24**
-> (P64@80 ×0.97 / 1.15; P73@80 ×0.57 / 1.43). FO at K=H (rise mass 1.4%)
-> did not pin rise vs P64. P2→P3 @136 mtp 0.950. Unfreeze 147 ent HELD
-> −0.107; logp spike recovered; rscale 1.85 KEEP; rtgt med 0.002.
-> Valid actor experiment — do not score until val. HEAD jsonl
-> `*_ratio_mid` + `rise_wfrac` (not in this pid). Persist KEEP. No new
-> knob. Do not second GPU job.
+> no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75 EXIT**
+> FOPDT rise teacher **REVERT** (`run_p75_gmatchfo`, pid **230450**,
+> 391 iters): GAIN-READY 0.84@MV. Val MV **×0.822 / ×0.815** DV
+> **×0.838 / ×0.858**. 1step→OL **×0.803** OL **×0.799**. det_r
+> **0.446**. Paired **−24.50 vs −84.89** VALID 8/9, mv_viol **1.50**.
+> Rise mass 1.4% at K=H. FO family **closed**. Persist KEEP. Last-step
+> DC Huber restored. **P76** RSSM GRU update-gate bias `log(H/16)`
+> (test_sim ~1.24; no new knob).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -233,10 +231,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > as compounding** (val 1step→OL ×0.761 OL ×0.743; persist_rel 0.037).
 > **P74 EXIT** decoder skip **REVERT** (`run_p74_gcvskip`, 381 iters):
 > val MV ×0.809 det_r **0.074** mv_viol **20**. Teacher-pin no-op +
-> DOB steal. **P75 LIVE P3 ~260** FOPDT rise teacher: GAIN-READY 0.84@MV;
-> freeze TM rise still overshoots FO (mid/FO/ss 1.24 vs P64 1.15).
-> Unfreeze 147 ent HELD; rscale 1.85; rtgt med 0.002. Valid actor
-> experiment — do not score until val.
+> DOB steal. **P75 EXIT** FOPDT rise **REVERT** (`run_p75_gmatchfo`,
+> 391 iters): val MV ×0.822 1step→OL ×0.803 paired −24.50 vs −84.89
+> 8/9. FO family closed. **P76** GRU update-gate bias `log(H/16)`.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -620,8 +617,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > for DV. `DREAMER_GAIN_MATCH_SETTLE_LEN=0` is auto-H A/B only.
 > jsonl `wm_gain_match_mv_ratio` / `wm_gain_match_dv_ratio` =
 > mean last-step `G_pred/G_tgt` (Huber~0 hid the P43 rest-step miss; not in P44 pid).
-> HEAD also logs `*_ratio_mid` / `*_ratio_mid_fo` at `k=(K-1)//4`
-> (P75-live; not in pid **230450**).
+> P75 jsonl `*_ratio_mid` / `*_mid_fo` **REMOVED** with the FOPDT teacher.
 > **P45 EXIT PROMOTE** `gain_match_rest_ic` (default True): first
 > GAIN-READY freeze since P40–P44 (gate 0.86@DV; val MV ss/@H
 > **×0.877 / ×0.887**, DV **×0.815 / ×0.875**, det_r 0.148). Real held-OP
@@ -1004,10 +1000,10 @@ fixes BOTH:
   last_ok-81 hygiene / **FALSIFIED as compounding** (persist_rel 0.037;
   1step→OL ×0.761). P69–P73 G-family closed as a compounding attack.
   **P74 EXIT REVERT:** decoder `gain_cv_skip` was a teacher-pin no-op
-  (rms 0.00387; det_r 0.074; mv_viol 20).   **P75:** gain-match Huber is
-  `G_tgt · FO(k)/FO(K)` (identified τ/θ; last step still DC). jsonl
-  last-step `*_ratio` is still DC; HEAD `*_ratio_mid` /
-  `*_ratio_mid_fo` at `k=(K-1)//4` (no extra FD; not in P75 pid).
+  (rms 0.00387; det_r 0.074; mv_viol 20).   **P75 EXIT REVERT:**
+  FOPDT rise teacher (rise mass 1.4% at K=H; val 1step→OL ×0.803).
+  Last-step DC Huber restored. **P76:** RSSM GRU update-gate bias
+  `log(H/16)` so `h` retains DC over the TM horizon (no new knob).
   Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the

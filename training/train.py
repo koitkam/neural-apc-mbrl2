@@ -4228,6 +4228,8 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     else:
         # Env-free P40: dcv_match default True is inert while isolation is off.
         _iso_txt = 'iso_dcv=off '
+    _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
+    _gru_zb = math.log(_h_zb / 16.0) if _h_zb > 0 else 0.0
     print(
         '[resolved-cfg] '
         f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
@@ -4259,7 +4261,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)} "
         f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
         f"held_cv=True "
-        f"gmatch_fo=True "
+        f"gru_zbias={_gru_zb:.3g} "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -6777,56 +6779,6 @@ def _overshoot_tail_wk(cfg: 'TrainConfig', K: int, device,
     return wk
 
 
-def _gain_match_tail_wfrac(cfg: 'TrainConfig', K: int, device,
-                            dtype) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Huber mass on rise ``k=1..k_mid`` vs last step. Identity vs ``wk``.
-
-    P75 reuses overshoot ``(k/K)^p`` so last-step DC still dominates
-    (p131 ``/K`` dilution).  Rise Huber is weakly weighted — jsonl
-    last-step ×1 cannot show that.  ``k_mid=(K-1)//4`` is the same
-    unitless slice as ``*_ratio_mid``.  Cached via ``_overshoot_tail_wk``.
-    """
-    Kk = int(K)
-    k_mid = max(0, (Kk - 1) // 4)
-    wk = _overshoot_tail_wk(cfg, Kk, device, dtype)
-    wsum = wk.sum().clamp_min(1.0)
-    rise = wk[:k_mid + 1].sum() / wsum
-    last = wk[-1] / wsum
-    return rise, last, k_mid
-
-
-def _gain_match_fopdt_frac(cfg: 'TrainConfig', K: int, device,
-                           dtype) -> torch.Tensor:
-    """τ-normalized FOPDT step fraction; last sample is 1.
-
-    P75: last-only Huber pins DC at teacher K (P26) but leaves the
-    rise unsupervised — val compounding is 1-step faithful / OL short.
-    Teacher ``G_tgt · FO(k)/FO(K)`` uses identified ``τ`` / ``θ``
-    (already on TrainConfig) so step K is the same DC target as P73
-    and earlier k supervise the TM rise.  Dead-time zeros pre-θ
-    samples.  Not a gray-box plant: the neural OL still predicts;
-    the identifier G/τ/θ are the same teacher gain-match already
-    trusted at k=K.  Cached (K, τ, θ, sr, device, dtype).
-    """
-    tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
-    dead = float(getattr(cfg, 'identified_dead_time', 0.0) or 0.0)
-    sr = float(getattr(cfg, 'sample_rate', 1.0) or 1.0)
-    key = (int(K), float(tau), float(dead), float(sr), str(device), str(dtype))
-    cached = getattr(cfg, '_gmatch_fo_frac', None)
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    k = torch.arange(1, int(K) + 1, device=device, dtype=dtype)
-    t = k * sr
-    dt = (t - float(dead)).clamp_min(0.0)
-    if tau <= 1e-6:
-        fo = (dt > 0.0).to(dtype=dtype)
-    else:
-        fo = 1.0 - torch.exp(-dt / tau)
-    fo = fo / fo[-1].clamp_min(1e-6)
-    cfg._gmatch_fo_frac = (key, fo)  # type: ignore[attr-defined]
-    return fo
-
-
 def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
                                         obs: torch.Tensor, act: torch.Tensor,
                                         cfg: TrainConfig,
@@ -7981,10 +7933,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     hygiene** / **FALSIFIED as compounding** (persist_rel 0.037 @81;
     val 1step→OL ×0.761).  **P74 EXIT REVERT:** decoder
     ``gain_cv_skip`` was a teacher-pin no-op (rms stalled 0.00387;
-    det_r 0.074; paired −48 vs −105, mv_viol 20).  **P75:** last-only
-    DC Huber → τ-normalized FOPDT rise (``G·FO(k)/FO(K)``); step K is
-    the same DC target. Dummy
+    det_r 0.074; paired −48 vs −105, mv_viol 20).  **P75 EXIT REVERT:**
+    FOPDT rise teacher (rise Huber mass 1.4% at K=H; val 1step→OL
+    ×0.803 vs P64 ×0.85). Dummy
     ``gmatch_ol_tail=0`` banner **REMOVED** (P69 field was always 0).
+    **P76:** RSSM GRU update-gate bias ``log(H/16)``; last-step DC
+    Huber restored (P64/P73).
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder (not the categorical
@@ -8000,12 +7954,13 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     Eager (P31 default): RSSM/TSSM ``img_rollout`` stacks the baseline
     + one step per MV/DV into a single roll (batch
     ``Bm·(1+n_mv+n_dv)``; rest-pre skips the unused held row so
-    ``Bm·(n_mv+n_dv)``) so the K-step prior loop runs once.  **P75:**
-    Huber is the FOPDT rise (last step still DC ``ΔCV/Δu``); the roll
-    keeps ``last_only=False, out='obs'`` (decoded-obs K-stack is
-    ~100× smaller than a feat stack).  ``return_state`` is the P73
-    OL gain-c persist IC.  Sequential ``img_step`` fallback REMOVED
-    (both RSSM-interface backbones expose ``img_rollout``).
+    ``Bm·(n_mv+n_dv)``) so the K-step prior loop runs once.  **P76:**
+    last-step DC Huber (P75 FOPDT rise **REVERT**);
+    ``last_only=True, out='obs', return_state=True``.  Decoded-obs
+    last step is ~100× smaller than a feat stack.  ``return_state``
+    is the P73 OL gain-c persist IC.  Sequential ``img_step``
+    fallback REMOVED (both RSSM-interface backbones expose
+    ``img_rollout``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
@@ -8111,39 +8066,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     _clip = _cfg_on(cfg, 'gain_match_clip_realized', True)
 
     def _huber_from_cv(cv_base, cv_step_stack, tgts, du_in):
-        # ``cv_step_stack`` (n_in, Bm, n_cv) last-only OR
-        # (n_in, Bm, K, n_cv) FOPDT rise (P75).  One mean Huber ≡ mean
-        # of per-input means (equal Bm×n_cv).  P27 relative scale is
-        # gone.  P61: divide by realized Δu (TM p136), mask cube no-ops.
-        # P75: K-stack Hubers ``G_wm(k)`` vs ``G_tgt · FO(k)/FO(K)``
-        # with overshoot tail weights so last-step DC still dominates
-        # (p131 /K dilution).
+        # ``cv_step_stack`` (n_in, Bm, n_cv) last-step DC.  One mean
+        # Huber ≡ mean of per-input means (equal Bm×n_cv).  P27
+        # relative scale is gone.  P61: divide by realized Δu (TM
+        # p136), mask cube no-ops.  P75 FOPDT K-stack **REVERT**.
         if not tgts:
             return zero
-        if cv_step_stack.dim() == 4:
-            n_in, Bm_k, K_k, n_cv = cv_step_stack.shape
-            den = du_in.view(n_in, Bm_k, 1, 1)
-            ok = den.abs() >= 1e-6
-            base = cv_base.view(1, Bm_k, 1, n_cv)
-            g_wm = (cv_step_stack - base) / torch.where(
-                ok, den, torch.ones_like(den))
-            tgt = _gain_match_tgt_tensor(g_wm[:, :, 0, :], tgts, cfg)
-            fo = _gain_match_fopdt_frac(
-                cfg, int(K_k), g_wm.device, g_wm.dtype)
-            tgt_b = (tgt.view(n_in, 1, 1, n_cv) * fo.view(1, 1, K_k, 1)
-                     ).expand_as(g_wm)
-            if _per:
-                e = g_wm - tgt_b
-                b = tgt_b.abs().clamp_min(1e-6)
-                abs_e = e.abs()
-                el = torch.where(abs_e < b, 0.5 * e.square() / b,
-                                 abs_e - 0.5 * b)
-            else:
-                el = F.smooth_l1_loss(
-                    g_wm, tgt_b, beta=_hb, reduction='none')
-            wk = _overshoot_tail_wk(cfg, int(K_k), el.device, el.dtype)
-            w = ok.to(dtype=el.dtype) * wk.view(1, 1, K_k, 1)
-            return (el * w).sum() / w.sum().clamp_min(1.0)
         den = du_in.unsqueeze(-1)
         ok = den.abs() >= 1e-6
         g_wm = (cv_step_stack - cv_base) / torch.where(
@@ -8198,14 +8126,14 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     h_b = _repeat_starts(h0)
     z_b = _repeat_starts(z0)
     c_b = _repeat_starts(c0) if c0 is not None else None
-    # P75: decoded-obs K-stack for FOPDT rise Huber.  Last step is the
-    # same DC ``ΔCV/Δu`` as P73 (FO(K)/FO(K)=1).  Persist still reads
-    # ``return_state``.  Obs K-stack is ~100× smaller than feat.
+    # P76: last-step DC Huber (P75 FOPDT K-stack REVERT).  Persist
+    # still reads ``return_state``.  Last obs is ~100× smaller than
+    # a feat stack.
     roll_obs, st_k = rssm.img_rollout(
         h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
-        last_only=False, out='obs', return_state=True)
+        last_only=True, out='obs', return_state=True)
     cv_k = roll_obs.index_select(-1, cv_idx)
-    cv_k = cv_k.view(n_rolls, Bm, int(K), -1)
+    cv_k = cv_k.view(n_rolls, Bm, -1)
     # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
     # K-step held WM prediction.  Held-K compounding made P67 jsonl ×1
     # while val TM vs rest-pre missed DC.  Rest-IC last obs is that
@@ -8219,7 +8147,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                   flush=True)
             cfg._gain_match_rest_pre_logged = True  # type: ignore[attr-defined]
     else:
-        cv_base = cv_k[0, :, -1]
+        cv_base = cv_k[0]
         cv_steps = cv_k[1:]
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
@@ -8253,9 +8181,7 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         if bool(getattr(cfg, '_wm_need_logged_aux', True)):
             den = du.unsqueeze(-1)
             ok = den.abs() >= 1e-6
-            cv_last = (cv_steps[:, :, -1, :] if cv_steps.dim() == 4
-                       else cv_steps)
-            g_all = (cv_last - cv_base) / torch.where(
+            g_all = (cv_steps - cv_base) / torch.where(
                 ok, den, torch.ones_like(den))
             diag['gain_match_du_frac'] = (
                 du.abs().mean() / max(abs(float(step)), 1e-6))
@@ -8272,43 +8198,6 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                     cv_base, cv_steps[n_mv_t:], dv_tgts, du[n_mv_t:])
                 diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
                     g_all[n_mv_t:], dv_tgts, cfg)
-            # P75: last-step ``*_ratio`` is DC (FO(K)/FO(K)=1) so it
-            # cannot show a contracted rise.  ``k=(K-1)//4`` is
-            # unitless (held-win convention; test_sim K=55 → k=13,
-            # FO≈0.58) and uses the same FD stack — no extra roll.
-            # ``*_mid_fo`` = (G_wm/G_tgt) / FO[k]; 1 = rise match.
-            if cv_steps.dim() == 4:
-                Kk = int(cv_steps.shape[2])
-                rise_w, last_w, k_mid = _gain_match_tail_wfrac(
-                    cfg, Kk, cv_steps.device, cv_steps.dtype)
-                diag['gain_match_rise_wfrac'] = rise_w.detach()
-                diag['gain_match_last_wfrac'] = last_w.detach()
-                if not getattr(cfg, '_gain_match_fo_logged', False):
-                    print('[gain-match] FOPDT rise teacher (τ-normalized; '
-                          'last step = DC tgt; P74 skip REVERT) '
-                          f'k_mid={k_mid} rise_wfrac={float(rise_w):.4f} '
-                          f'last_wfrac={float(last_w):.4f} '
-                          '(overshoot (k/K)^p tail; rise Huber weakly weighted)',
-                          flush=True)
-                    cfg._gain_match_fo_logged = True  # type: ignore[attr-defined]
-                g_mid = (cv_steps[:, :, k_mid, :] - cv_base) / torch.where(
-                    ok, den, torch.ones_like(den))
-                fo = _gain_match_fopdt_frac(
-                    cfg, Kk, g_mid.device, g_mid.dtype)
-                fo_m = fo[k_mid].clamp_min(0.0)
-                if n_mv_t:
-                    r_mid = _gain_match_pred_over_tgt(
-                        g_mid[:n_mv_t], mv_tgts, cfg)
-                    diag['gain_match_mv_ratio_mid'] = r_mid
-                    if float(fo_m) >= 1e-6:
-                        diag['gain_match_mv_ratio_mid_fo'] = r_mid / fo_m
-                if dv_tgts:
-                    r_mid_dv = _gain_match_pred_over_tgt(
-                        g_mid[n_mv_t:], dv_tgts, cfg)
-                    diag['gain_match_dv_ratio_mid'] = r_mid_dv
-                    if float(fo_m) >= 1e-6:
-                        diag['gain_match_dv_ratio_mid_fo'] = (
-                            r_mid_dv / fo_m)
     return loss, diag
 
 
@@ -14257,24 +14146,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_ol_persist_rel' in row:
                 row.setdefault('wm_gain_match_ol_persist_rel',
                             row['gain_match_ol_persist_rel'])
-            if 'gain_match_mv_ratio_mid' in row:
-                row.setdefault('wm_gain_match_mv_ratio_mid',
-                            row['gain_match_mv_ratio_mid'])
-            if 'gain_match_dv_ratio_mid' in row:
-                row.setdefault('wm_gain_match_dv_ratio_mid',
-                            row['gain_match_dv_ratio_mid'])
-            if 'gain_match_mv_ratio_mid_fo' in row:
-                row.setdefault('wm_gain_match_mv_ratio_mid_fo',
-                            row['gain_match_mv_ratio_mid_fo'])
-            if 'gain_match_dv_ratio_mid_fo' in row:
-                row.setdefault('wm_gain_match_dv_ratio_mid_fo',
-                            row['gain_match_dv_ratio_mid_fo'])
-            if 'gain_match_rise_wfrac' in row:
-                row.setdefault('wm_gain_match_rise_wfrac',
-                            row['gain_match_rise_wfrac'])
-            if 'gain_match_last_wfrac' in row:
-                row.setdefault('wm_gain_match_last_wfrac',
-                            row['gain_match_last_wfrac'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
