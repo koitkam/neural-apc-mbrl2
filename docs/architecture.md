@@ -147,8 +147,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **GAIN-READY 0.81@MV**. Val MV **×0.809 / ×0.873** DV **×0.848 /
 > ×0.941**. 1step→OL **×0.836**. det_r **0.074**. Paired **−48 vs
 > −105**, mv_viol **20**. Skip rms stalled **0.00387** — teacher-pin
-> no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75**
-> FOPDT rise teacher (`G·FO(k)/FO(K)`; last step = DC; no new knob).
+> no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75 LIVE**
+> FOPDT rise teacher (`run_p75_gmatchfo`, pid **230450**): `gmatch_fo=True`.
+> Iter 1 teacher ×0.561/×−0.422. Persist KEEP. No new knob.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
