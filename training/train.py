@@ -4259,6 +4259,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)} "
         f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
         f"held_cv=True "
+        f"gcvskip=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -7926,10 +7927,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     REVERT:** OL hold of gain-c after the first ``img_step`` detonated
     (storm 2/2, DC ×−0.60@MV).  **P71 REVERT:** gain-c is a GRU / TSSM
     token input again (G-out-of-recurrence freeze-failed 0.76@DV).
-    **P73:** ``cont_gain_persist_coef`` also L2-pins OL gain-c at teacher
-    K to ``sg(rest-IC MEAN G)`` (not a longer window, not a hard hold,
-    not G-out-of-GRU).  Dummy ``gmatch_ol_tail=0`` banner **REMOVED**
-    (P69 field was always 0).
+    **P73 EXIT:** OL gain-c persist at teacher K **KEEP as last_ok-81
+    hygiene** / **FALSIFIED as compounding** (persist_rel 0.037 @81;
+    val 1step→OL ×0.761).  **P74:** decoder ``gain_cv_skip`` (zero-init
+    Linear ``c[:G]→CV``) so DC cannot hide in contracted ``h``. Dummy
+    ``gmatch_ol_tail=0`` banner **REMOVED** (P69 field was always 0).
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder (not the categorical
@@ -8822,6 +8824,10 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
     }
+    _gskip = getattr(rssm, 'gain_cv_skip', None)
+    if _gskip is not None:
+        losses['gain_cv_skip_rms'] = (
+            _gskip.weight.detach().pow(2).mean().sqrt())
     losses.update(kl_diag)
     losses.update(gain_match_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
@@ -14136,6 +14142,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_ol_persist_rel' in row:
                 row.setdefault('wm_gain_match_ol_persist_rel',
                             row['gain_match_ol_persist_rel'])
+            if 'gain_cv_skip_rms' in row:
+                row.setdefault('wm_gain_cv_skip_rms', row['gain_cv_skip_rms'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
@@ -14239,6 +14247,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 + f"gmatch {_lf('gain_match_loss')} "
                 + (f"persist {_lf('gain_match_ol_persist_rel')} "
                    if row.get('gain_match_ol_persist_rel') is not None else '')
+                + (f"gskip {_lf('gain_cv_skip_rms')} "
+                   if row.get('gain_cv_skip_rms') is not None else '')
                 + f"iso {_lf('wm_input_isolation_loss')} "
                 + f"ss {_lf('wm_ss_match_loss')} "
                 + (f"dobg {_lf('dob_ground')} "

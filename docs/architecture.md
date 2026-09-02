@@ -137,9 +137,14 @@ env-gated off · **[planned]** = designed, not yet built.
 > DV **×0.642 / ×0.641**; OL **×0.633**; paired **−22.71 vs −92.72**
 > VALID 9/9, mv_viol **9.70**). Dummy `gain_match_ol_tail_*` jsonl
 > **REMOVED**. Dummy `gmatch_ol_tail=0` banner **REMOVED**.
-> **P73 LIVE** OL gain-c persist at teacher K
-> (`run_p73_olgpersist`, pid **214644**; P2 after P1 GAIN-READY
-> **0.83@DV** last_ok **81** skip **0** — P72 froze 15 after storm 2@16).
+> **P73 EXIT** (`run_p73_olgpersist`, pid **214644**, sha `e09eb3d`,
+> 515 iters): OL gain-c persist **KEEP as last_ok-81 hygiene** /
+> **FALSIFIED as compounding / TM-pin / champ**. persist_rel **0.037
+> @81**. Val MV **×0.722 / ×0.769** DV **×0.743 / ×0.835**. 1step→OL
+> **×0.761** OL **×0.743**. det_r **0.630**. Paired **−4.91 vs −125**
+> VALID 9/9. P69–P73 G-family **closed**. **P74 LAUNCH** decoder
+> `gain_cv_skip` (`run_p74_gcvskip`): zero-init `Linear(c[:G]→n_cv)`
+> onto CV after the decode MLP. Persist KEEP. No new knob.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -212,7 +217,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > hold-G **REVERT** (CAPPED −0.60@MV). **P71 EXIT** gain-c out of GRU
 > **REVERT** (CAPPED 0.76@DV). **P72 EXIT** G-in-GRU KEEP as revert /
 > FALSIFIED as TM (val MV ×0.647 OL ×0.633; paired −22.71 VALID).
-> **P73** OL gain-c persist at teacher K. Dummy ol-tail jsonl **REMOVED**.
+> **P73 EXIT** OL persist KEEP as last_ok-81 hygiene / **FALSIFIED
+> as compounding** (val 1step→OL ×0.761 OL ×0.743; persist_rel 0.037).
+> **P74** decoder `gain_cv_skip` (zero-init `c[:G]→CV`). Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
@@ -812,7 +819,8 @@ the same leftover-env class (identity defaults; dual-read at
 - **World model** is the **observer**: `encoder → posterior z` (sees obs),
   `prior z_hat` (open-loop / overshoot roll — observer compounding, not an
   actor imagination engine; actor imagination is deleted), deterministic
-  core `h`, and `decoder g(feat) → obs_hat`. Trained by `opt_world`
+  core `h`, and `decoder g(feat) → obs_hat` plus P74 `gain_cv_skip(c[:G])`
+  on CV (zero-init Linear; identity at init). Trained by `opt_world`
   (recon + KL + overshoot/held-rollout + gain-match). **DOB `d_t` is
   default ON** (neural Kalman; unmeasured load only; MV and DV are both
   measured inputs to `f()`). The leftover **disturbance head** is opt-in
@@ -972,7 +980,11 @@ fixes BOTH:
   (`wm_tf_horizon−K`) was TBPTT-on-the-DC-window (CAPPED 0.75@MV).
   **P70 EXIT REVERT:** OL hold of `c[..., :cont_gain_dim]` after the first
   `img_step` detonated (GAIN_NOT_READY −0.60@MV). Window/hold family
-  **closed**. Explicit
+  **closed**. **P73 EXIT:** OL gain-c persist at teacher K KEEP as
+  last_ok-81 hygiene / **FALSIFIED as compounding** (persist_rel 0.037;
+  1step→OL ×0.761). P69–P73 G-family closed as a compounding attack.
+  **P74:** `decode` adds zero-init `gain_cv_skip(c[:G])` onto CV so DC
+  cannot hide in contracted `h`. Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a

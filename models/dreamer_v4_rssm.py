@@ -156,6 +156,41 @@ def _append_decode_core(h_l, z_l, c_l, dv_l, st) -> None:
         dv_l.append(st.dv)
 
 
+def init_gain_cv_skip(mod: nn.Module) -> None:
+    """P74: zero-init Linear ``c[:G] → n_cv``. Identity decode at init.
+
+    P73 persist pinned OL ``c_K≈c0`` (rel 0.037 @ last_ok 81) while
+    1step→OL stayed ×0.76: the decoder MLP was reading contracted ``h``.
+    An additive skip forces ``∂CV/∂c_gain`` independent of GRU ``h``.
+    Learned on the observer latent — not a gray-box plant. No new knob.
+    """
+    gdim = int(getattr(mod, 'cont_gain_dim', 0) or 0)
+    n_cv = int(getattr(mod, 'n_cv', 0) or 0)
+    if gdim > 0 and n_cv > 0:
+        skip = nn.Linear(gdim, n_cv, bias=False)
+        nn.init.zeros_(skip.weight)
+        mod.add_module('gain_cv_skip', skip)
+    else:
+        mod.gain_cv_skip = None
+
+
+def apply_gain_cv_skip(
+        mod: nn.Module, feat: torch.Tensor, decoded: torch.Tensor
+        ) -> torch.Tensor:
+    """Add ``gain_cv_skip(c[:G])`` onto CV channels. No-op if skip is None."""
+    skip = getattr(mod, 'gain_cv_skip', None)
+    if skip is None:
+        return decoded
+    gdim = int(getattr(mod, 'cont_gain_dim', 0) or 0)
+    off = int(mod.deter_dim) + int(mod.stoch_flat_dim)
+    if gdim <= 0 or int(feat.shape[-1]) < off + gdim:
+        return decoded
+    delta = skip(feat[..., off:off + gdim])
+    out = decoded.clone()
+    out.index_add_(-1, mod.cv_index_t, delta.to(dtype=out.dtype))
+    return out
+
+
 def _stack_decode_core(h_l, z_l, c_l, dv_l) -> torch.Tensor:
     """``(B, T, dec_in)`` ≡ ``stack(state.feat[..., :dec_in], dim=1)``.
 
@@ -654,12 +689,13 @@ class RSSMDynamics(nn.Module):
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
-        # Decoder: [h, z, (dv)] → reconstructed (normalized) obs.  Reads the
-        # latent core (deter + stoch) PLUS the exogenous DV when DV-feedforward
-        # is on, so the CV reconstruction ``g(h, z, dv)`` has a DIRECT ∂CV/∂dv
-        # path that skips the categorical bottleneck (p129 RCA).  The DOB d-tail
-        # (Scope 2) is sliced off in ``decode`` and re-added via ``apply_dob``
-        # (the g + d factorisation).
+        # Decoder: [h, z, c, (dv)] → reconstructed (normalized) obs.  Reads the
+        # latent core (deter + stoch + cont) PLUS the exogenous DV when
+        # DV-decoder-feedforward is on.  The DOB d-tail (Scope 2) is sliced
+        # off in ``decode`` and re-added via ``apply_dob`` (g + d).  **P74:**
+        # ``gain_cv_skip`` then adds a zero-init Linear ``c[:G]→CV`` so DC
+        # gain cannot hide in contracted ``h`` (P73 persist fired, OL still
+        # ×0.76).
         self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim + self.cont_dim
                             + self._dv_decode_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
@@ -729,6 +765,7 @@ class RSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
+        init_gain_cv_skip(self)
 
     @property
     def feat_dim(self) -> int:
@@ -1226,14 +1263,14 @@ class RSSMDynamics(nn.Module):
         return out_t
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
-        # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the
-        # DV (when fed forward) sits right after the latent core so it is part
-        # of the contiguous front slice, while any DOB d-tail beyond it is
-        # sliced OFF (re-added by ``apply_dob``).  When DV-feedforward and DOB
-        # are both off, ``feat`` is already core-width so this is a no-op slice.
+        # Scope 2 + DV feedforward: the decoder learns ``g([h, z, c, (dv)])``;
+        # the DV (when decoder-ff is on) sits after the latent core so it is
+        # part of the contiguous front slice, while any DOB d-tail beyond it
+        # is sliced OFF (re-added by ``apply_dob``).  P74 adds
+        # ``gain_cv_skip(c[:G])`` onto CV after the MLP (zero-init).
         x = feat[..., :self._decode_in_dim]
         out = self.decoder(x)
-        return out
+        return apply_gain_cv_skip(self, feat, out)
 
 
 def stream_serve_step(dyn, state, prev_action: torch.Tensor,
