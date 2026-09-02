@@ -176,7 +176,9 @@ def main():
         z=z0.clone(), c=c0.clone())
     seq_feats = []
     for k in range(K_iso):
-        st = _rssm.img_step(st, a_all[:, k], dv=dv_all[:, k], sample=False)
+        st = _rssm.img_step(
+            st, a_all[:, k], dv=dv_all[:, k], sample=False,
+            hold_gain_c=(k > 0))
         seq_feats.append(st.feat)
         if (k < K_iso - 1 and (k + 1) % tbptt == 0 and k < ss_k0 - 1):
             st = st.detach(keep_c=True)
@@ -255,7 +257,7 @@ def main():
     # tensors move the loss).  Isolation loss stays off.
     cfg.gain_match_rest_ic = True
     cfg.gain_match_settle_len = 4
-    cfg.wm_tf_horizon = 6  # K=6 → K_tail=0; isolation identity vs P68
+    cfg.wm_tf_horizon = 6  # P69 REVERT: K_tail always 0; identity vs P68
     N, L = 3, 8
     rest_o = torch.randn(N, L, cfg.obs_dim)
     rest_a = torch.rand(N, L, cfg.action_dim) * 2 - 1
@@ -442,8 +444,10 @@ def main():
                                      device=obs.device, dtype=f0.dtype),
                 z=z0.clone(),
                 c=(c0.clone() if c0 is not None else None))
-            for _ in range(K):
-                st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
+            for i in range(K):
+                st = rssm.img_step(
+                    st, a_held, dv=dv_held, sample=False,
+                    hold_gain_c=(i > 0))
             return rssm.decode(st.feat).index_select(-1, cv_idx)
 
         cv_base = _roll(a_base, dv0)

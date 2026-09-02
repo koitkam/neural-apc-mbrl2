@@ -121,10 +121,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > OL-vs-real **×0.716**. det_r **0.535** pred_std **0.401 vs 1.93**.
 > Paired **−3.90 vs −85.35 BEATS 9/9**. mv_viol **1.92** vs P64 0.33.
 > Freeze last_ok **73 GAIN-READY 0.89@DV**. Champion stays **P64**.
-> **P69 LIVE** (`run_p69_oltail`, pid **198448**, sha `256c889`):
-> stop-grad OL tail `K_tail=165`. Step 4 `device=cuda`
-> `gmatch_len=55 gmatch_ol_tail=165`. Iter 15 teacher ×0.99/×1.01
-> tail ×1.00/×1.02, tail_loss 0.0006, skip 0. One GPU job.
+> **P69 EXIT** (`run_p69_oltail`, pid **198448**, sha `256c889`,
+> 76 iters): stop-grad OL tail **REVERT**. CAPPED **0.75@MV** last_ok
+> **18**. Val MV **×0.383 / ×0.384** DV **×0.792 / ×0.828**. Actor
+> INVALID. Window-extension family **closed**. **P70 LIVE**
+> (`run_p70_cgainhold`): OL hold of gain-c after first `img_step`.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -192,9 +193,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > ×1.005**. OL-vs-real **×0.814**. det_r **0.026**. Actor INVALID.
 > HEAD **REVERT** auto K to control H. Do not teacher-K N+1. **P68 EXIT**
 > rest-pre Huber **KEEP as protocol** / **FALSIFIED as TM/compounding/champ**.
-> Rest-pre skips the unused held-K `img_rollout` row. **P69 LIVE**
-> stop-grad OL tail (`wm_tf_horizon−K` after teacher K; not full-BPTT 4H;
-> pid **198448**, `gmatch_ol_tail=165`). Iter 15 jsonl teacher+tail ~×1.
+> Rest-pre skips the unused held-K `img_rollout` row. **P69 EXIT**
+> stop-grad OL tail **REVERT** (TBPTT-on-DC; CAPPED 0.75@MV). **P70**
+> holds gain-c after the first prior step (not a longer teacher).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
@@ -948,9 +949,11 @@ fixes BOTH:
   P67 auto=`wm_tf_horizon` (220) EXIT CAPPED **0.80@DV**, val MV
   **×1.35** DV **×0.79**. **P68 EXIT:** rest-IC Huber baseline is last
   rest-obs CV (TM `pre`), not held-K — KEEP as protocol / FALSIFIED as
-  TM pin (val MV ×0.69). **P69:** after last-only Huber at K=H, stop-grad
-  the prior and continue `wm_tf_horizon−K` steps (val TM window) with the
-  same tgt — not teacher-K, not FO 1step→K. Explicit
+  TM pin (val MV ×0.69). **P69 EXIT REVERT:** stop-grad OL tail
+  (`wm_tf_horizon−K`) was TBPTT-on-the-DC-window (CAPPED 0.75@MV).
+  **P70:** open-loop hold of `c[..., :cont_gain_dim]` after the first
+  `img_step` (1-step prior still infers G; remaining OL copies it so
+  DC does not need GRU memory across 4H). Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a

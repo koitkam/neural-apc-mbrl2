@@ -271,6 +271,33 @@ def _prior_c_from_net(mod, h: torch.Tensor, sample: bool):
     return c_new, c_mean, c_std
 
 
+def _hold_continuous_gain_c(mod, c, c_mean, prev):
+    """Open-loop hold of the static gain block: G is a plant property.
+
+    Posterior ``obs_step`` still infers ``c``. The 1-step prior
+    (``obs_step`` → ``img_step`` default, and ``img_rollout`` step 0)
+    still infers G. Remaining open-loop ``img_step`` copies
+    ``prev``'s gain slice so DC does not require ``h`` to remember
+    the step across ``wm_tf_horizon``. Dist block still rolls. No
+    extra TrainConfig field: ``cont_gain_persist_coef`` already treats
+    G as a per-episode constant on the posterior; this is the matching
+    open-loop identity.
+    """
+    gdim = int(getattr(mod, 'cont_gain_dim', 0) or 0)
+    if gdim <= 0 or c is None or prev is None:
+        return c, c_mean
+    prev_c = getattr(prev, 'c', None)
+    if prev_c is None or prev_c.shape[-1] < gdim or c.shape[-1] < gdim:
+        return c, c_mean
+    c = torch.cat([prev_c[..., :gdim], c[..., gdim:]], dim=-1)
+    if c_mean is not None and c_mean.shape[-1] >= gdim:
+        prev_m = getattr(prev, 'c_mean', None)
+        src = prev_m if prev_m is not None else prev_c
+        if src is not None and src.shape[-1] >= gdim:
+            c_mean = torch.cat([src[..., :gdim], c_mean[..., gdim:]], dim=-1)
+    return c, c_mean
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -820,19 +847,27 @@ class RSSMDynamics(nn.Module):
 
     def img_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  dv: Optional[torch.Tensor] = None,
-                 sample: bool = True) -> RSSMState:
+                 sample: bool = True,
+                 hold_gain_c: bool = False) -> RSSMState:
         """Imagined (prior-only) step: advance the state with no obs.
 
         ``dv`` (B, dv_dim) is the exogenous measured-DV input when DV-as-input
         is enabled (``dv_dim > 0``); ``None`` is filled with zeros.  Ignored
-        entirely when ``dv_dim == 0`` (paper behaviour)."""
+        entirely when ``dv_dim == 0`` (paper behaviour).
+        ``hold_gain_c``: copy ``prev``'s gain block into the new prior
+        (P70 OL hold).  Default off so a 1-step prior still infers G;
+        ``img_rollout`` turns it on after the first step.
+        """
         h, d_new, dv_new = self._gru_transition(prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
-        # Continuous-latent prior p(c'|h'): gain persists (carried via h) and
-        # the disturbance OU-rolls; both inferred from the recurrent state.
-        # Deterministic-roll blocks use the prior MEAN (p20 / p140).  Skip
-        # discarded ``randn`` when the whole ``c`` is that mean.
+        # Continuous-latent prior p(c'|h'): disturbance OU-rolls from h.
+        # Gain is inferred on the first prior step then held (P70) so DC
+        # does not require ``h`` to remember the step across 4H.
+        # Deterministic-roll uses the prior MEAN (p20 / p140) before hold.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
+        if hold_gain_c:
+            c_new, c_mean = _hold_continuous_gain_c(
+                self, c_new, c_mean, prev)
         return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
 
@@ -1136,9 +1171,9 @@ class RSSMDynamics(nn.Module):
         ``last_only`` materializes ``out`` once after the K-loop (no
         intermediate decode / feat copies).  ``out='h'`` was P61 held
         and is **removed** (no training call site).
-        ``prev_state`` continues an existing prior (P69 OL tail: stop-grad
-        at teacher K then roll to the val TM window).  ``return_state``
-        also returns the last ``RSSMState``.
+        ``prev_state`` continues an existing prior (KV / GRU state; smoke
+        continue + detach).  ``return_state`` also returns the last
+        ``RSSMState``.  Gain-c is held inside ``img_step`` (P70).
 
         P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
         the open-loop gain supervisor trained a ``c=0`` GRU path while
@@ -1159,6 +1194,7 @@ class RSSMDynamics(nn.Module):
         if out not in ('feat', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
         K = actions.shape[1]
+        continue_ol = prev_state is not None
         if prev_state is not None:
             state = prev_state
             Bm = int(state.h.shape[0])
@@ -1184,7 +1220,9 @@ class RSSMDynamics(nn.Module):
         dv_seq = _time_unbind(dvs)
         for k in range(K):
             dv_k = None if dv_seq is None else dv_seq[k]
-            state = img_step(state, act_k[k], dv=dv_k, sample=sample)
+            state = img_step(
+                state, act_k[k], dv=dv_k, sample=sample,
+                hold_gain_c=(k > 0 or continue_ol))
             if last_only:
                 continue
             _append_decode_core(h_l, z_l, c_l, dv_l, state)

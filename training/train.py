@@ -7920,12 +7920,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     Rest-pre skips the unused held-K ``img_rollout`` row (Huber does not
     read ``decode(held_K)``).  PRBS-posterior fallback still rolls it.
 
-    **P69:** rest-IC only, after last-only Huber at ``K=H``, stop-grad the
-    prior state and continue the same held step for
-    ``wm_tf_horizon − K`` steps (val TM window).  Last-step Huber vs the
-    same identifier tgt / rest-pre ``cv_base``.  Not teacher-K (P67 full
-    BPTT 4H CAPPED) and not FO 1step→K (P63).  ``K_tail=0`` when
-    ``gain_match_len >= wm_tf_horizon`` (identity).
+    **P69 REVERT:** stop-grad OL tail after teacher K was TBPTT-on-the
+    DC window (P24 class; CAPPED GAIN_NOT_READY 0.75@MV).  Compounding
+    is attacked in ``img_step`` (P70 hold of gain-c), not a longer
+    teacher.  ``gmatch_ol_tail=`` stays 0.
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder + GRU (not the categorical
@@ -8114,9 +8112,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # Last-step Huber only: skip the unused (Bm, K, F) stack.
     # ``out='obs'`` decodes once after the K-loop (same as
     # ``decode(last feat)``; no extra last-feat tensor).
-    last_obs, st_k = rssm.img_rollout(
+    last_obs = rssm.img_rollout(
         h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
-        last_only=True, out='obs', return_state=True)
+        last_only=True, out='obs')
     cv_last = last_obs.index_select(-1, cv_idx)
     cv_last = cv_last.view(n_rolls, Bm, -1)
     # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
@@ -8137,37 +8135,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
     loss = total
-    # P69: compounding is 1step→OL contraction after teacher K (P68
-    # OL-vs-real ×0.716 vs 1-step ×0.897).  Stop-grad at K then Huber
-    # the val-TM last decode — not P67 full-BPTT 4H, not P63 FO.
-    k_tail = _gain_match_ol_tail_len(cfg, K) if skip_held else 0
-    cv_tail = None
-    if k_tail > 0:
-        if not getattr(cfg, '_gain_match_ol_tail_logged', False):
-            print('[gain-match] rest-IC OL tail Huber '
-                  f'K_tail={k_tail} (stop-grad @K={K}; val TM window; '
-                  'not teacher-K)',
-                  flush=True)
-            cfg._gain_match_ol_tail_logged = True  # type: ignore[attr-defined]
-        a_tail = a_seq[:, -1:].expand(-1, k_tail, -1).contiguous()
-        dv_tail = None
-        if dv_seq is not None:
-            dv_tail = dv_seq[:, -1:].expand(-1, k_tail, -1).contiguous()
-        last_tf, _ = rssm.img_rollout(
-            st_k.h, st_k.z, a_tail, dvs=dv_tail, sample=False,
-            c0=st_k.c, last_only=True, out='obs',
-            prev_state=st_k.detach(), return_state=True)
-        cv_tail = last_tf.index_select(-1, cv_idx).view(n_rolls, Bm, -1)
-        tail_huber = _huber_from_cv(
-            cv_base, cv_tail, list(mv_tgts) + list(dv_tgts), du)
-        loss = loss + tail_huber
-        diag['gain_match_ol_tail_len'] = torch.tensor(
-            float(k_tail), device=obs.device)
-        diag['gain_match_ol_tail_loss'] = tail_huber.detach()
-    else:
-        diag['gain_match_ol_tail_len'] = torch.tensor(
-            0.0, device=obs.device)
-        diag['gain_match_ol_tail_loss'] = zero.detach()
+    # P69 REVERT: OL tail Huber deleted (TBPTT-on-asymptote). jsonl keys
+    # stay 0 so old-log parsers do not see None.
+    diag['gain_match_ol_tail_len'] = torch.tensor(
+        0.0, device=obs.device)
+    diag['gain_match_ol_tail_loss'] = zero.detach()
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
     # (L1 sat ±1) is the loss change; the MV/DV split still shows
@@ -8195,17 +8167,6 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                     cv_base, cv_steps[n_mv_t:], dv_tgts, du[n_mv_t:])
                 diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
                     g_all[n_mv_t:], dv_tgts, cfg)
-            if cv_tail is not None:
-                g_tail = (cv_tail - cv_base) / torch.where(
-                    ok, den, torch.ones_like(den))
-                if n_mv_t:
-                    diag['gain_match_ol_tail_mv_ratio'] = (
-                        _gain_match_pred_over_tgt(
-                            g_tail[:n_mv_t], mv_tgts, cfg))
-                if dv_tgts:
-                    diag['gain_match_ol_tail_dv_ratio'] = (
-                        _gain_match_pred_over_tgt(
-                            g_tail[n_mv_t:], dv_tgts, cfg))
     return loss, diag
 
 
@@ -8228,10 +8189,10 @@ def _rssm_tbptt_img_rollout(
         return rssm.img_rollout(h0, z0, a_all, dvs=dv_all,
                                 sample=sample, c0=c0)
     chunks = []
+    prev = None
     h, z, c = h0, z0, c0
     k0 = 0
     _tbptt = int(tbptt_steps)
-    _ze = rssm.deter_dim + rssm.stoch_flat_dim
     while k0 < K:
         k_cut = None
         for k in range(k0, K):
@@ -8241,17 +8202,19 @@ def _rssm_tbptt_img_rollout(
                 break
         k1 = (k_cut + 1) if k_cut is not None else K
         dv_ch = (dv_all[:, k0:k1] if dv_all is not None else None)
-        roll = rssm.img_rollout(h, z, a_all[:, k0:k1], dvs=dv_ch,
-                                sample=sample, c0=c)
+        if prev is not None:
+            roll, st = rssm.img_rollout(
+                h, z, a_all[:, k0:k1], dvs=dv_ch, sample=sample,
+                prev_state=prev, return_state=True)
+        else:
+            roll, st = rssm.img_rollout(
+                h, z, a_all[:, k0:k1], dvs=dv_ch, sample=sample,
+                c0=c, return_state=True)
         chunks.append(roll)
         if k1 >= K:
             break
-        last = roll[:, -1]
-        h = last[..., :rssm.deter_dim].detach()
-        z = last[..., rssm.deter_dim:_ze].reshape(
-            last.shape[0], rssm.n_categoricals, rssm.n_classes).detach()
-        c = (last[..., _ze:_ze + rssm.cont_dim]
-             if rssm.cont_dim > 0 else None)
+        prev = st.detach(keep_c=True)
+        h, z, c = prev.h, prev.z, prev.c
         k0 = k1
     return torch.cat(chunks, dim=1)
 
@@ -8409,20 +8372,15 @@ def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
 
 
 def _gain_match_ol_tail_len(cfg: TrainConfig, K: int) -> int:
-    """Extra OL steps after teacher ``K`` so last Huber sits at val TM.
+    """P69 REVERT: always 0. Window-extension family closed.
 
-    P67 full-BPTT ``K=wm_tf_horizon`` CAPPED GAIN_NOT_READY 0.80@DV.
-    This tail is stop-grad at teacher K (control H) then continues —
-    compounding after H, not a teacher-K retry.  Explicit
-    ``wm_tf_horizon>0`` (smoke / A/B) wins; ``0`` = auto
-    ``max(80, 4·H)``.  ``K_tail=0`` when teacher K already covers the
-    val window (identity, including ``DREAMER_GAIN_MATCH_LEN=220``).
+    Stop-grad OL tail (``wm_tf_horizon−K``) was TBPTT-on-the-DC-window
+    (P24 class; CAPPED 0.75@MV). Banner still prints ``gmatch_ol_tail=0``.
+    Compounding is the P70 gain-c hold in ``img_step``, not a longer
+    teacher. ``cfg`` / ``K`` unused (signature kept for the banner).
     """
-    h_tf = int(getattr(cfg, 'wm_tf_horizon', 0) or 0)
-    if h_tf <= 0:
-        from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
-        h_tf = _wm_tf_h(int(getattr(cfg, 'horizon', 15) or 15))
-    return max(0, int(h_tf) - int(K))
+    del cfg, K
+    return 0
 
 
 def _auto_gain_match_len(cfg: TrainConfig) -> int:

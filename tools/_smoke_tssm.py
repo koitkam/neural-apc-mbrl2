@@ -108,7 +108,8 @@ def test_img_rollout_equals_img_step():
             z=z0.clone(), kv_cache=None, pos=0)
         seq = []
         for k in range(K):
-            state = m.img_step(state, acts[:, k], sample=False)
+            state = m.img_step(
+                state, acts[:, k], sample=False, hold_gain_c=(k > 0))
             seq.append(state.feat)
         seq = torch.stack(seq, dim=1)
     max_err = float((roll - seq).abs().max())

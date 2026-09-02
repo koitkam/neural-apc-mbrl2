@@ -1620,11 +1620,24 @@ def _test_img_rollout_last_only() -> None:
     gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
                 if p.grad is not None)
     assert gru_g > 0.0, 'last_only decode/feat lost GRU gradient'
+    # P70: after the first prior step, OL holds the static gain block.
+    gdim = int(cfg.cont_gain_dim)
+    c_hold = torch.randn(B, gdim)
+    _, st1 = m.img_rollout(
+        h0.detach(), z0, acts[:, :1], sample=False, c0=c_hold,
+        last_only=True, out='obs', return_state=True)
+    _, st_hold = m.img_rollout(
+        h0.detach(), z0, acts, sample=False, c0=c_hold,
+        last_only=True, out='obs', return_state=True)
+    hold_err = float(
+        (st_hold.c[..., :gdim] - st1.c[..., :gdim]).detach().abs().max())
+    assert hold_err < 1e-5, f'OL did not hold gain-c after step 1 (max_err={hold_err})'
     print(f'[smoke] OK  img_rollout last_only ≡ stack[:, -1] '
           f'(max_err={err:.2e}); out=obs identity '
           f'(obs={obs_err:.2e} last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}; '
           f'z_logits cache identity max_err={cache_err:.2e}; '
-          f'OL-tail stop-grad leak={sg:.1e} (control={leak:.2e})')
+          f'OL-tail stop-grad leak={sg:.1e} (control={leak:.2e}); '
+          f'gain-c hold max_err={hold_err:.2e}')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -1891,6 +1904,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def cached_zeros_bd' in _cz
     assert 'def cached_onehot_z' in _cz
     assert 'def _prior_c_from_net' in _cz
+    assert 'def _hold_continuous_gain_c' in _rssm_src
     assert 'sample=not take_mean' in _cz
     assert 'c0 if c0 is not None else cached_zeros_bd' in _rssm_src
     assert '_img_zlogits_zeros' in _rssm_src
@@ -2997,12 +3011,12 @@ def _test_gain_match_held_settle() -> None:
     c_t = TrainConfig()
     c_t.horizon = 55
     c_t.wm_tf_horizon = 0
-    assert _gain_match_ol_tail_len(c_t, 55) == 165
+    assert _gain_match_ol_tail_len(c_t, 55) == 0
     c_t.wm_tf_horizon = 220
-    assert _gain_match_ol_tail_len(c_t, 55) == 165
+    assert _gain_match_ol_tail_len(c_t, 55) == 0
     assert _gain_match_ol_tail_len(c_t, 220) == 0
     c_t.wm_tf_horizon = 6
-    assert _gain_match_ol_tail_len(c_t, 4) == 2
+    assert _gain_match_ol_tail_len(c_t, 4) == 0
     print(f'[smoke] OK  gain-match held settle unpack identity; gru |g|={gru_g:.3f}')
 
 
@@ -3201,9 +3215,9 @@ def _test_gain_match_rest_ic() -> None:
     model.zero_grad(set_to_none=True)
     gm1, diag1 = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert torch.isfinite(gm1).all() and float(gm1) > 0.0, float(gm1)
-    assert int(diag1.get('gain_match_ol_tail_len', -1)) == 2, diag1.get(
+    assert int(diag1.get('gain_match_ol_tail_len', -1)) == 0, diag1.get(
         'gain_match_ol_tail_len')
-    assert float(diag1['gain_match_ol_tail_loss']) >= 0.0
+    assert float(diag1['gain_match_ol_tail_loss']) == 0.0
     gm1.backward()
     cont_g = sum(float(p.grad.abs().sum())
                  for n, p in model.dynamics.named_parameters()
@@ -3235,14 +3249,15 @@ def _test_gain_match_rest_ic() -> None:
     assert 'o_rest[:, -1].index_select' in _gm_src
     assert 'include_held=not skip_held' in _gm_src
     assert 'skip_held = o_rest is not None' in _gm_src
-    assert 'rest-IC OL tail Huber' in _gm_src
-    assert 'prev_state=st_k.detach()' in _gm_src
+    assert 'rest-IC OL tail Huber' not in _gm_src
+    assert 'prev_state=st_k.detach()' not in _gm_src
     cfg.wm_tf_horizon = 4
     gm_notail, d_notail = _wm_gain_match_loss(
         model, feats.detach(), obs, act, cfg)
     assert int(d_notail['gain_match_ol_tail_len']) == 0
-    assert abs(float(gm1) - float(gm_notail)) > 1e-8, (
-        'OL tail unused (same loss at K_tail=2 vs 0)')
+    assert abs(float(gm2) - float(gm_notail)) < 1e-8, (
+        f'P69 tail revert: horizon must not change Huber '
+        f'(gm2={float(gm2):.6f} gm_h={float(gm_notail):.6f})')
     cfg.wm_tf_horizon = 6
     cfg._gain_match_rest_obs = None
     cfg._gain_match_rest_act = None
@@ -4619,7 +4634,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_len=55' in banner, banner
-    assert 'gmatch_ol_tail=165' in banner, banner
+    assert 'gmatch_ol_tail=0' in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
     assert 'gmatch_clip=True' in banner, banner
     assert 'gmatch_rest=True' in banner, banner

@@ -126,7 +126,8 @@ import torch.nn.functional as F
 # Reuse the proven RSSM building blocks so the categorical latent + KL are
 # bit-for-bit identical to the default backbone (only the dynamics core changes).
 from models.dreamer_v4_rssm import (
-    _CategoricalLatent, _ContinuousLatent, _prior_c_from_net, _time_unbind,
+    _CategoricalLatent, _ContinuousLatent, _prior_c_from_net,
+    _hold_continuous_gain_c, _time_unbind,
     cached_zeros_bd, cached_zeros_btd, cached_onehot_z, dob_kalman_scan,
     _append_decode_core, _stack_decode_core)
 
@@ -611,18 +612,25 @@ class TransformerSSMDynamics(nn.Module):
 
     def img_step(self, prev: TSSMState, prev_action: torch.Tensor,
                  dv: Optional[torch.Tensor] = None,
-                 sample: bool = True) -> TSSMState:
+                 sample: bool = True,
+                 hold_gain_c: bool = False) -> TSSMState:
         """Imagined (prior-only) step: build the token from (prev.z, action,
         dv), advance the KV-cached transformer ONE step, read the prior off the
         new position.  ``dv`` (B, dv_dim) is the exogenous measured-DV input
         when DV-as-input is on; ``None`` -> zeros.  ``kv_cache=None`` (feat-only
-        reconstruction by a Markovian consumer) starts a fresh context."""
+        reconstruction by a Markovian consumer) starts a fresh context.
+        ``hold_gain_c``: P70 OL hold of the static gain block (see RSSM).
+        """
         h, d_new, dv_new, new_cache, new_pos = self._core_transition(
             prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
-        # Continuous-latent prior (RSSM mirror).  Skip discarded randn when
-        # det-roll replaces the whole sample with the prior MEAN.
+        # Continuous-latent prior (RSSM mirror).  Gain-c held after the
+        # first prior step (P70).  Skip discarded randn when det-roll
+        # replaces the whole sample with the prior MEAN.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
+        if hold_gain_c:
+            c_new, c_mean = _hold_continuous_gain_c(
+                self, c_new, c_mean, prev)
         return TSSMState(h=h, z_logits=z_logits, z=z,
                          kv_cache=new_cache, pos=new_pos, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
@@ -668,12 +676,14 @@ class TransformerSSMDynamics(nn.Module):
         ``out``: ``'feat'`` (default) / ``'obs'`` — see RSSM.
         ``last_only`` materializes ``out`` once after the K-loop.
         ``out='h'`` removed with RSSM (P62; no training call site).
-        ``prev_state`` continues KV-cache (P69 OL tail).  ``return_state``
-        also returns the last ``TSSMState``.
+        ``prev_state`` continues KV-cache (smoke continue + detach).
+        ``return_state`` also returns the last ``TSSMState``.  Gain-c
+        is held after the first prior step (P70).
         """
         if out not in ('feat', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')
         K = actions.shape[1]
+        continue_ol = prev_state is not None
         if prev_state is not None:
             state = prev_state
             Bm = int(state.h.shape[0])
@@ -697,7 +707,9 @@ class TransformerSSMDynamics(nn.Module):
         dv_seq = _time_unbind(dvs)
         for k in range(K):
             dv_k = None if dv_seq is None else dv_seq[k]
-            state = img_step(state, act_k[k], dv=dv_k, sample=sample)
+            state = img_step(
+                state, act_k[k], dv=dv_k, sample=sample,
+                hold_gain_c=(k > 0 or continue_ol))
             if last_only:
                 continue
             _append_decode_core(h_l, z_l, c_l, dv_l, state)
