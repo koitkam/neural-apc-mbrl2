@@ -4244,7 +4244,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_len={int(getattr(cfg, 'gain_match_len', 0) or 0)} "
-        f"gmatch_ol_tail={_gain_match_ol_tail_len(cfg, int(getattr(cfg, 'gain_match_len', 0) or 0))} "
+        f"gmatch_ol_tail=0 "
         f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
         f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
@@ -8138,11 +8138,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
     loss = total
-    # P69 REVERT: OL tail Huber deleted (TBPTT-on-asymptote). jsonl keys
-    # stay 0 so old-log parsers do not see None.
-    diag['gain_match_ol_tail_len'] = torch.tensor(
-        0.0, device=obs.device)
-    diag['gain_match_ol_tail_loss'] = zero.detach()
+    # P69 REVERT: OL tail Huber deleted (TBPTT-on-asymptote). Dummy jsonl
+    # keys REMOVED (P72-live; same class as ``wm_held_ol_ratio``).
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
     # (L1 sat ±1) is the loss change; the MV/DV split still shows
@@ -8372,18 +8369,6 @@ def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
         s = int(getattr(cfg, 'horizon', 15) or 15)
         cfg.gain_match_settle_len = s
     return s
-
-
-def _gain_match_ol_tail_len(cfg: TrainConfig, K: int) -> int:
-    """P69 REVERT: always 0. Window-extension family closed.
-
-    Stop-grad OL tail (``wm_tf_horizon−K``) was TBPTT-on-the-DC-window
-    (P24 class; CAPPED 0.75@MV). Banner still prints ``gmatch_ol_tail=0``.
-    **P70 REVERT** hold-G; **P71 REVERT** G-out-of-GRU (not a
-    longer teacher). ``cfg`` / ``K`` unused (signature kept for the banner).
-    """
-    del cfg, K
-    return 0
 
 
 def _auto_gain_match_len(cfg: TrainConfig) -> int:
@@ -14127,18 +14112,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_clip_frac' in row:
                 row.setdefault('wm_gain_match_clip_frac',
                             row['gain_match_clip_frac'])
-            if 'gain_match_ol_tail_loss' in row:
-                row.setdefault('wm_gain_match_ol_tail_loss',
-                            row['gain_match_ol_tail_loss'])
-            if 'gain_match_ol_tail_len' in row:
-                row.setdefault('wm_gain_match_ol_tail_len',
-                            row['gain_match_ol_tail_len'])
-            if 'gain_match_ol_tail_mv_ratio' in row:
-                row.setdefault('wm_gain_match_ol_tail_mv_ratio',
-                            row['gain_match_ol_tail_mv_ratio'])
-            if 'gain_match_ol_tail_dv_ratio' in row:
-                row.setdefault('wm_gain_match_ol_tail_dv_ratio',
-                            row['gain_match_ol_tail_dv_ratio'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
