@@ -1681,33 +1681,33 @@ def _test_img_rollout_last_only() -> None:
     print('[smoke] OK  full c (gain+dist) enters GRU')
 
 
-def _test_gain_cv_skip() -> None:
-    """P74: zero-init Linear c[:G]→CV is identity; fill(1) adds sum(G) on CV0."""
+def _test_gain_match_fopdt_frac() -> None:
+    """P75: FO last=1; dead-time zeros pre-θ; mid < last; decode is MLP-only."""
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
+    from training.train import TrainConfig, _gain_match_fopdt_frac
     torch.manual_seed(0)
-    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
-                     n_categoricals=4, n_classes=4, embed_dim=16,
-                     hidden_dim=16, latent_type='deterministic',
-                     cont_gain_dim=2, cv_indices=(0,))
-    m = RSSMDynamics(cfg)
-    assert m.gain_cv_skip is not None
-    assert int(m.gain_cv_skip.in_features) == 2
-    assert int(m.gain_cv_skip.out_features) == 1
-    assert float(m.gain_cv_skip.weight.detach().abs().max()) == 0.0
-    B = 4
-    feat = torch.randn(B, m.feat_dim)
+    cfg = TrainConfig()
+    cfg.identified_tau_dominant = 53.0
+    cfg.identified_dead_time = 8.0
+    cfg.sample_rate = 4.0
+    fo = _gain_match_fopdt_frac(cfg, 55, torch.device('cpu'), torch.float32)
+    assert int(fo.numel()) == 55
+    assert abs(float(fo[-1]) - 1.0) < 1e-6
+    assert float(fo[0]) == 0.0  # t=4s < θ=8s
+    assert float(fo[1]) == 0.0  # t=8s
+    assert 0.0 < float(fo[2]) < float(fo[26]) < 1.0
+    fo2 = _gain_match_fopdt_frac(cfg, 55, torch.device('cpu'), torch.float32)
+    assert fo2 is fo  # cached
+    rssm_cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                          n_categoricals=4, n_classes=4, embed_dim=16,
+                          hidden_dim=16, latent_type='deterministic',
+                          cont_gain_dim=2, cv_indices=(0,))
+    m = RSSMDynamics(rssm_cfg)
+    assert not hasattr(m, 'gain_cv_skip') or getattr(m, 'gain_cv_skip', None) is None
+    feat = torch.randn(4, m.feat_dim)
     x = feat[..., :m._decode_in_dim]
-    d0 = m.decode(feat)
-    assert torch.allclose(d0, m.decoder(x), atol=1e-6, rtol=1e-5)
-    with torch.no_grad():
-        m.gain_cv_skip.weight.fill_(1.0)
-    d1 = m.decode(feat)
-    off = int(m.deter_dim) + int(m.stoch_flat_dim)
-    want = feat[..., off:off + 2].sum(-1)
-    got = (d1 - d0)[..., 0]
-    assert torch.allclose(got, want, atol=1e-5, rtol=1e-4), (got[:2], want[:2])
-    assert torch.allclose(d1[..., 1:], d0[..., 1:], atol=1e-6)
-    print('[smoke] OK  gain-CV skip zero-init identity; Linear G→CV additive')
+    assert torch.allclose(m.decode(feat), m.decoder(x), atol=1e-6, rtol=1e-5)
+    print('[smoke] OK  FOPDT rise frac last=1 dead-time zeros; skip REVERT')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -1976,8 +1976,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def cached_onehot_z' in _cz
     assert 'def _prior_c_from_net' in _cz
     assert 'def _recurrence_c' in _cz
-    assert 'def init_gain_cv_skip' in _rssm_src
-    assert 'def apply_gain_cv_skip' in _rssm_src
+    assert 'def _gain_match_fopdt_frac' in _src
+    assert 'def init_gain_cv_skip' not in _rssm_src
+    assert 'def apply_gain_cv_skip' not in _rssm_src
     assert 'self.recurrence_c_dim = int(self.cont_dim)' in _rssm_src
     assert 'self.recurrence_c_dim = int(self.cont_dist_dim)' not in _rssm_src
     assert 'def _hold_continuous_gain_c' not in _rssm_src
@@ -2031,10 +2032,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_auto_gain_match_len' in _src
     assert '_gain_match_ol_tail_len' not in _src
     assert 'gain_match_ol_persist_rel' in _src
-    assert "last_only=True, out='obs', return_state=True" in _src
-    assert 'gcvskip=True' in _src
-    assert 'gain_cv_skip_rms' in _src
-    assert '1×2 weight; not in' in _src
+    assert "last_only=False, out='obs', return_state=True" in _src
+    assert 'gmatch_fo=True' in _src
+    assert 'gain_cv_skip_rms' not in _src
+    assert '1×2 weight; not in' not in _src
     assert '_adv_action_corr' in _src
     assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
@@ -2061,7 +2062,7 @@ def _test_isolation_dcv_scales() -> None:
                 / 'run_nl_then_p09.sh').exists()
     assert 'cv_index_t' in _src
     assert 'last_only=True' in _src
-    assert "last_only=True, out='obs'" in _src
+    assert "last_only=False, out='obs', return_state=True" in _src
     assert '_p1_fidelity_local_plateau' in _src
     assert 'np.clip(g_min / (g * a0), floor, smax)' in _src
     assert 'wm_isolation_dcv_min_scale' in _src
@@ -5028,7 +5029,7 @@ if __name__ == '__main__':
     _test_buffer_clear()
     _test_store_aux_feats_identity()
     _test_img_rollout_last_only()
-    _test_gain_cv_skip()
+    _test_gain_match_fopdt_frac()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()

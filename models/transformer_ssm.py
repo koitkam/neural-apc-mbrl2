@@ -129,8 +129,7 @@ from models.dreamer_v4_rssm import (
     _CategoricalLatent, _ContinuousLatent, _prior_c_from_net,
     _recurrence_c, _time_unbind,
     cached_zeros_bd, cached_zeros_btd, cached_onehot_z, dob_kalman_scan,
-    _append_decode_core, _stack_decode_core,
-    init_gain_cv_skip, apply_gain_cv_skip)
+    _append_decode_core, _stack_decode_core)
 
 
 @dataclass
@@ -468,7 +467,6 @@ class TransformerSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
-        init_gain_cv_skip(self)
 
     @property
     def feat_dim(self) -> int:
@@ -508,10 +506,9 @@ class TransformerSSMDynamics(nn.Module):
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
         # DV feedforward + Scope 2 (mirror of RSSMDynamics.decode): decode
         # ``[h, z, c, (dv)]``; any DOB d-tail beyond it is sliced off
-        # (re-added by ``apply_dob``).  P74 ``gain_cv_skip`` matches RSSM.
+        # (re-added by ``apply_dob``).  P74 skip REVERT (matches RSSM).
         x = feat[..., :self._decode_in_dim]
-        out = self.decoder(x)
-        return apply_gain_cv_skip(self, feat, out)
+        return self.decoder(x)
 
     def initial_state(self, batch_size: int,
                       device: torch.device) -> TSSMState:

@@ -4259,7 +4259,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)} "
         f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
         f"held_cv=True "
-        f"gcvskip=True "
+        f"gmatch_fo=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -6777,6 +6777,38 @@ def _overshoot_tail_wk(cfg: 'TrainConfig', K: int, device,
     return wk
 
 
+def _gain_match_fopdt_frac(cfg: 'TrainConfig', K: int, device,
+                           dtype) -> torch.Tensor:
+    """τ-normalized FOPDT step fraction; last sample is 1.
+
+    P75: last-only Huber pins DC at teacher K (P26) but leaves the
+    rise unsupervised — val compounding is 1-step faithful / OL short.
+    Teacher ``G_tgt · FO(k)/FO(K)`` uses identified ``τ`` / ``θ``
+    (already on TrainConfig) so step K is the same DC target as P73
+    and earlier k supervise the TM rise.  Dead-time zeros pre-θ
+    samples.  Not a gray-box plant: the neural OL still predicts;
+    the identifier G/τ/θ are the same teacher gain-match already
+    trusted at k=K.  Cached (K, τ, θ, sr, device, dtype).
+    """
+    tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+    dead = float(getattr(cfg, 'identified_dead_time', 0.0) or 0.0)
+    sr = float(getattr(cfg, 'sample_rate', 1.0) or 1.0)
+    key = (int(K), float(tau), float(dead), float(sr), str(device), str(dtype))
+    cached = getattr(cfg, '_gmatch_fo_frac', None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    k = torch.arange(1, int(K) + 1, device=device, dtype=dtype)
+    t = k * sr
+    dt = (t - float(dead)).clamp_min(0.0)
+    if tau <= 1e-6:
+        fo = (dt > 0.0).to(dtype=dtype)
+    else:
+        fo = 1.0 - torch.exp(-dt / tau)
+    fo = fo / fo[-1].clamp_min(1e-6)
+    cfg._gmatch_fo_frac = (key, fo)  # type: ignore[attr-defined]
+    return fo
+
+
 def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
                                         obs: torch.Tensor, act: torch.Tensor,
                                         cfg: TrainConfig,
@@ -7929,8 +7961,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     token input again (G-out-of-recurrence freeze-failed 0.76@DV).
     **P73 EXIT:** OL gain-c persist at teacher K **KEEP as last_ok-81
     hygiene** / **FALSIFIED as compounding** (persist_rel 0.037 @81;
-    val 1step→OL ×0.761).  **P74:** decoder ``gain_cv_skip`` (zero-init
-    Linear ``c[:G]→CV``) so DC cannot hide in contracted ``h``. Dummy
+    val 1step→OL ×0.761).  **P74 EXIT REVERT:** decoder
+    ``gain_cv_skip`` was a teacher-pin no-op (rms stalled 0.00387;
+    det_r 0.074; paired −48 vs −105, mv_viol 20).  **P75:** last-only
+    DC Huber → τ-normalized FOPDT rise (``G·FO(k)/FO(K)``); step K is
+    the same DC target. Dummy
     ``gmatch_ol_tail=0`` banner **REMOVED** (P69 field was always 0).
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
@@ -7947,12 +7982,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     Eager (P31 default): RSSM/TSSM ``img_rollout`` stacks the baseline
     + one step per MV/DV into a single roll (batch
     ``Bm·(1+n_mv+n_dv)``; rest-pre skips the unused held row so
-    ``Bm·(n_mv+n_dv)``) so the K-step prior loop runs once.  Huber is
-    last-step ``ΔCV/Δu`` (P26 DC-gain), so the roll uses
-    ``last_only=True, out='obs'`` (same last decode as
-    ``decode(stack[:, -1])``; no unused K-stack or last-feat).
-    Sequential ``img_step`` fallback REMOVED (both RSSM-interface
-    backbones expose ``img_rollout``).
+    ``Bm·(n_mv+n_dv)``) so the K-step prior loop runs once.  **P75:**
+    Huber is the FOPDT rise (last step still DC ``ΔCV/Δu``); the roll
+    keeps ``last_only=False, out='obs'`` (decoded-obs K-stack is
+    ~100× smaller than a feat stack).  ``return_state`` is the P73
+    OL gain-c persist IC.  Sequential ``img_step`` fallback REMOVED
+    (both RSSM-interface backbones expose ``img_rollout``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
@@ -8058,11 +8093,39 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     _clip = _cfg_on(cfg, 'gain_match_clip_realized', True)
 
     def _huber_from_cv(cv_base, cv_step_stack, tgts, du_in):
-        # ``cv_step_stack`` (n_in, Bm, n_cv).  One mean Huber ≡ mean of
-        # per-input means (equal Bm×n_cv).  P27 relative scale is gone.
-        # P61: divide by realized Δu (TM p136), mask cube no-ops.
+        # ``cv_step_stack`` (n_in, Bm, n_cv) last-only OR
+        # (n_in, Bm, K, n_cv) FOPDT rise (P75).  One mean Huber ≡ mean
+        # of per-input means (equal Bm×n_cv).  P27 relative scale is
+        # gone.  P61: divide by realized Δu (TM p136), mask cube no-ops.
+        # P75: K-stack Hubers ``G_wm(k)`` vs ``G_tgt · FO(k)/FO(K)``
+        # with overshoot tail weights so last-step DC still dominates
+        # (p131 /K dilution).
         if not tgts:
             return zero
+        if cv_step_stack.dim() == 4:
+            n_in, Bm_k, K_k, n_cv = cv_step_stack.shape
+            den = du_in.view(n_in, Bm_k, 1, 1)
+            ok = den.abs() >= 1e-6
+            base = cv_base.view(1, Bm_k, 1, n_cv)
+            g_wm = (cv_step_stack - base) / torch.where(
+                ok, den, torch.ones_like(den))
+            tgt = _gain_match_tgt_tensor(g_wm[:, :, 0, :], tgts, cfg)
+            fo = _gain_match_fopdt_frac(
+                cfg, int(K_k), g_wm.device, g_wm.dtype)
+            tgt_b = (tgt.view(n_in, 1, 1, n_cv) * fo.view(1, 1, K_k, 1)
+                     ).expand_as(g_wm)
+            if _per:
+                e = g_wm - tgt_b
+                b = tgt_b.abs().clamp_min(1e-6)
+                abs_e = e.abs()
+                el = torch.where(abs_e < b, 0.5 * e.square() / b,
+                                 abs_e - 0.5 * b)
+            else:
+                el = F.smooth_l1_loss(
+                    g_wm, tgt_b, beta=_hb, reduction='none')
+            wk = _overshoot_tail_wk(cfg, int(K_k), el.device, el.dtype)
+            w = ok.to(dtype=el.dtype) * wk.view(1, 1, K_k, 1)
+            return (el * w).sum() / w.sum().clamp_min(1.0)
         den = du_in.unsqueeze(-1)
         ok = den.abs() >= 1e-6
         g_wm = (cv_step_stack - cv_base) / torch.where(
@@ -8117,30 +8180,34 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     h_b = _repeat_starts(h0)
     z_b = _repeat_starts(z0)
     c_b = _repeat_starts(c0) if c0 is not None else None
-    # Last-step Huber only: skip the unused (Bm, K, F) stack.
-    # ``out='obs'`` decodes once after the K-loop (same as
-    # ``decode(last feat)``; no extra last-feat tensor).
-    # ``return_state`` is the P73 OL gain-c persist IC (no extra roll).
-    last_obs, st_k = rssm.img_rollout(
+    # P75: decoded-obs K-stack for FOPDT rise Huber.  Last step is the
+    # same DC ``ΔCV/Δu`` as P73 (FO(K)/FO(K)=1).  Persist still reads
+    # ``return_state``.  Obs K-stack is ~100× smaller than feat.
+    roll_obs, st_k = rssm.img_rollout(
         h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
-        last_only=True, out='obs', return_state=True)
-    cv_last = last_obs.index_select(-1, cv_idx)
-    cv_last = cv_last.view(n_rolls, Bm, -1)
+        last_only=False, out='obs', return_state=True)
+    cv_k = roll_obs.index_select(-1, cv_idx)
+    cv_k = cv_k.view(n_rolls, Bm, int(K), -1)
     # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
     # K-step held WM prediction.  Held-K compounding made P67 jsonl ×1
     # while val TM vs rest-pre missed DC.  Rest-IC last obs is that
     # ``pre`` (same cache as the encode).  PRBS fallback keeps held-K.
     if skip_held:
         cv_base = o_rest[:, -1].index_select(-1, cv_idx)
-        cv_steps = cv_last
+        cv_steps = cv_k
         if not getattr(cfg, '_gain_match_rest_pre_logged', False):
             print('[gain-match] Huber baseline = rest last-obs CV '
                   '(TM pre; not held-K)',
                   flush=True)
             cfg._gain_match_rest_pre_logged = True  # type: ignore[attr-defined]
+        if not getattr(cfg, '_gain_match_fo_logged', False):
+            print('[gain-match] FOPDT rise teacher (τ-normalized; '
+                  'last step = DC tgt; P74 skip REVERT)',
+                  flush=True)
+            cfg._gain_match_fo_logged = True  # type: ignore[attr-defined]
     else:
-        cv_base = cv_last[0]
-        cv_steps = cv_last[1:]
+        cv_base = cv_k[0, :, -1]
+        cv_steps = cv_k[1:]
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
     loss = total
@@ -8173,7 +8240,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         if bool(getattr(cfg, '_wm_need_logged_aux', True)):
             den = du.unsqueeze(-1)
             ok = den.abs() >= 1e-6
-            g_all = (cv_steps - cv_base) / torch.where(
+            cv_last = (cv_steps[:, :, -1, :] if cv_steps.dim() == 4
+                       else cv_steps)
+            g_all = (cv_last - cv_base) / torch.where(
                 ok, den, torch.ones_like(den))
             diag['gain_match_du_frac'] = (
                 du.abs().mean() / max(abs(float(step)), 1e-6))
@@ -8824,14 +8893,6 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
     }
-    # jsonl / banner only (1×2 weight; not in ``wm_total``).  Same last-
-    # logged-inner gate as Huber MV/DV splits.  Default True so probes
-    # / direct callers still get the key.
-    _gskip = getattr(rssm, 'gain_cv_skip', None)
-    if (_gskip is not None
-            and bool(getattr(cfg, '_wm_need_logged_aux', True))):
-        losses['gain_cv_skip_rms'] = (
-            _gskip.weight.detach().pow(2).mean().sqrt())
     losses.update(kl_diag)
     losses.update(gain_match_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
@@ -14146,8 +14207,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_ol_persist_rel' in row:
                 row.setdefault('wm_gain_match_ol_persist_rel',
                             row['gain_match_ol_persist_rel'])
-            if 'gain_cv_skip_rms' in row:
-                row.setdefault('wm_gain_cv_skip_rms', row['gain_cv_skip_rms'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
@@ -14251,8 +14310,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 + f"gmatch {_lf('gain_match_loss')} "
                 + (f"persist {_lf('gain_match_ol_persist_rel')} "
                    if row.get('gain_match_ol_persist_rel') is not None else '')
-                + (f"gskip {_lf('gain_cv_skip_rms')} "
-                   if row.get('gain_cv_skip_rms') is not None else '')
                 + f"iso {_lf('wm_input_isolation_loss')} "
                 + f"ss {_lf('wm_ss_match_loss')} "
                 + (f"dobg {_lf('dob_ground')} "

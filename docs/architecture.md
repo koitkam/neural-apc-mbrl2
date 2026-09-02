@@ -142,12 +142,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED as compounding / TM-pin / champ**. persist_rel **0.037
 > @81**. Val MV **×0.722 / ×0.769** DV **×0.743 / ×0.835**. 1step→OL
 > **×0.761** OL **×0.743**. det_r **0.630**. Paired **−4.91 vs −125**
-> VALID 9/9. P69–P73 G-family **closed**. **P74 LIVE** decoder
-> `gain_cv_skip` (`run_p74_gcvskip`, pid **221013**): **GAIN-READY
-> @82 0.81@MV / 0.87@DV** last_ok **82**. Skip rms **stalled 0.00387**
-> through freeze (max 0.0046 @5). persist_rel **0.103 @82**. P2 ~131
-> dobg **0.25** `dob_d` **0.066**. Skip is a teacher-pin no-op until
-> val 1step→OL. Persist KEEP. No new knob.
+> VALID 9/9. P69–P73 G-family **closed**. **P74 EXIT** decoder skip
+> **REVERT** (`run_p74_gcvskip`, pid **221013**, 381 iters): freeze
+> **GAIN-READY 0.81@MV**. Val MV **×0.809 / ×0.873** DV **×0.848 /
+> ×0.941**. 1step→OL **×0.836**. det_r **0.074**. Paired **−48 vs
+> −105**, mv_viol **20**. Skip rms stalled **0.00387** — teacher-pin
+> no-op + DOB-shaped steal. Decoder-skip family **closed**. **P75**
+> FOPDT rise teacher (`G·FO(k)/FO(K)`; last step = DC; no new knob).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -222,10 +223,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > FALSIFIED as TM (val MV ×0.647 OL ×0.633; paired −22.71 VALID).
 > **P73 EXIT** OL persist KEEP as last_ok-81 hygiene / **FALSIFIED
 > as compounding** (val 1step→OL ×0.761 OL ×0.743; persist_rel 0.037).
-> **P74 LIVE** (`run_p74_gcvskip`, pid **221013**): decoder
-> `gain_cv_skip` **GAIN-READY @82 0.81@MV**. Skip rms **stalled
-> 0.00387** through freeze — teacher-pin no-op; compounding waits
-> on val 1step→OL. P2 ~131 dobg **0.25**.
+> **P74 EXIT** decoder skip **REVERT** (`run_p74_gcvskip`, 381 iters):
+> val MV ×0.809 det_r **0.074** mv_viol **20**. Teacher-pin no-op +
+> DOB steal. **P75** FOPDT rise teacher on gain-match.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -826,8 +826,8 @@ the same leftover-env class (identity defaults; dual-read at
 - **World model** is the **observer**: `encoder → posterior z` (sees obs),
   `prior z_hat` (open-loop / overshoot roll — observer compounding, not an
   actor imagination engine; actor imagination is deleted), deterministic
-  core `h`, and `decoder g(feat) → obs_hat` plus P74 `gain_cv_skip(c[:G])`
-  on CV (zero-init Linear; identity at init). Trained by `opt_world`
+  core `h`, and `decoder g(feat) → obs_hat` (P74 `gain_cv_skip`
+  **REVERT**). Trained by `opt_world`
   (recon + KL + overshoot/held-rollout + gain-match). **DOB `d_t` is
   default ON** (neural Kalman; unmeasured load only; MV and DV are both
   measured inputs to `f()`). The leftover **disturbance head** is opt-in
@@ -987,11 +987,12 @@ fixes BOTH:
   (`wm_tf_horizon−K`) was TBPTT-on-the-DC-window (CAPPED 0.75@MV).
   **P70 EXIT REVERT:** OL hold of `c[..., :cont_gain_dim]` after the first
   `img_step` detonated (GAIN_NOT_READY −0.60@MV). Window/hold family
-  **closed**. **P73 EXIT:** OL gain-c persist at teacher K KEEP as
+  **closed**.   **P73 EXIT:** OL gain-c persist at teacher K KEEP as
   last_ok-81 hygiene / **FALSIFIED as compounding** (persist_rel 0.037;
   1step→OL ×0.761). P69–P73 G-family closed as a compounding attack.
-  **P74:** `decode` adds zero-init `gain_cv_skip(c[:G])` onto CV so DC
-  cannot hide in contracted `h`. Explicit
+  **P74 EXIT REVERT:** decoder `gain_cv_skip` was a teacher-pin no-op
+  (rms 0.00387; det_r 0.074; mv_viol 20). **P75:** gain-match Huber is
+  `G_tgt · FO(k)/FO(K)` (identified τ/θ; last step still DC). Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
   val TM probe (P59 RCA / P60 — G(Δu=1) ≠ G(Δu=0.4) on a

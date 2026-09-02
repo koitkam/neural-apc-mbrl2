@@ -367,29 +367,20 @@ def test_diagnostics_probes_route_tssm():
           "(_is_rssm_like + _is_rssm_model True; feat_from_window works)")
 
 
-def test_gain_cv_skip():
-    """P74 TSSM: zero-init skip identity; fill(1) adds sum(G) on CV0."""
+def test_decode_mlp_only():
+    """P74 skip REVERT: decode is the MLP; no gain_cv_skip module."""
     torch.manual_seed(0)
     cfg = TransformerSSMConfig(
         obs_dim=6, action_dim=2, deter_dim=32, n_categoricals=4, n_classes=4,
         embed_dim=16, n_layers=2, n_heads=4, max_seq_len=64,
         cont_gain_dim=2, cv_indices=(0,))
     m = TransformerSSMDynamics(cfg).eval()
-    assert m.gain_cv_skip is not None
-    assert float(m.gain_cv_skip.weight.detach().abs().max()) == 0.0
+    assert not hasattr(m, 'gain_cv_skip') or getattr(m, 'gain_cv_skip', None) is None
     B = 3
     feat = torch.randn(B, m.feat_dim)
     x = feat[..., :m._decode_in_dim]
-    d0 = m.decode(feat)
-    assert torch.allclose(d0, m.decoder(x), atol=1e-6, rtol=1e-5)
-    with torch.no_grad():
-        m.gain_cv_skip.weight.fill_(1.0)
-    d1 = m.decode(feat)
-    off = int(m.deter_dim) + int(m.stoch_flat_dim)
-    want = feat[..., off:off + 2].sum(-1)
-    got = (d1 - d0)[..., 0]
-    assert torch.allclose(got, want, atol=1e-5, rtol=1e-4), (got[:2], want[:2])
-    print('[smoke] OK  TSSM gain-CV skip zero-init identity; Linear G→CV additive')
+    assert torch.allclose(m.decode(feat), m.decoder(x), atol=1e-6, rtol=1e-5)
+    print('[smoke] OK  TSSM decode is MLP-only (P74 skip REVERT)')
 
 
 if __name__ == '__main__':
@@ -403,5 +394,5 @@ if __name__ == '__main__':
     test_stepwise_equals_full_sequence()
     test_end_to_end_dreamer_tssm()
     test_diagnostics_probes_route_tssm()
-    test_gain_cv_skip()
+    test_decode_mlp_only()
     print("\n[smoke] ALL TSSM checks PASSED")
