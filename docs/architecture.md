@@ -121,7 +121,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > OL-vs-real **×0.716**. det_r **0.535** pred_std **0.401 vs 1.93**.
 > Paired **−3.90 vs −85.35 BEATS 9/9**. mv_viol **1.92** vs P64 0.33.
 > Freeze last_ok **73 GAIN-READY 0.89@DV**. Champion stays **P64**.
-> Next P69 stop-grad OL tail.
+> **P69 LIVE** (`run_p69_oltail`, pid **198448**, sha `256c889`):
+> stop-grad OL tail `K_tail=165`. Step 4 `device=cuda`
+> `gmatch_len=55 gmatch_ol_tail=165`. Iter 1 teacher ×0.67/×−1.30
+> tail ×0.67/×−1.29. One GPU job.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -189,8 +192,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > ×1.005**. OL-vs-real **×0.814**. det_r **0.026**. Actor INVALID.
 > HEAD **REVERT** auto K to control H. Do not teacher-K N+1. **P68 EXIT**
 > rest-pre Huber **KEEP as protocol** / **FALSIFIED as TM/compounding/champ**.
-> Rest-pre skips the unused held-K `img_rollout` row. **P69** stop-grad OL
-> tail (`wm_tf_horizon−K` after teacher K; not full-BPTT 4H).
+> Rest-pre skips the unused held-K `img_rollout` row. **P69 LIVE**
+> stop-grad OL tail (`wm_tf_horizon−K` after teacher K; not full-BPTT 4H;
+> pid **198448**, `gmatch_ol_tail=165`).
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
