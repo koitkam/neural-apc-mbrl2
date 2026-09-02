@@ -1998,6 +1998,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_auto_gain_match_settle_len' in _src
     assert '_auto_gain_match_len' in _src
     assert '_gain_match_ol_tail_len' not in _src
+    assert 'gain_match_ol_persist_rel' in _src
+    assert "last_only=True, out='obs', return_state=True" in _src
     assert '_adv_action_corr' in _src
     assert '[p1→p2] recon' in _src
     assert '_smooth_l1_gain_match' in _src
@@ -3252,6 +3254,8 @@ def _test_gain_match_rest_ic() -> None:
     assert torch.isfinite(gm1).all() and float(gm1) > 0.0, float(gm1)
     assert 'gain_match_ol_tail_len' not in diag1
     assert 'gain_match_ol_tail_loss' not in diag1
+    assert 'gain_match_ol_persist_rel' in diag1
+    assert torch.isfinite(diag1['gain_match_ol_persist_rel']).all()
     gm1.backward()
     cont_g = sum(float(p.grad.abs().sum())
                  for n, p in model.dynamics.named_parameters()
@@ -3285,6 +3289,9 @@ def _test_gain_match_rest_ic() -> None:
     assert 'skip_held = o_rest is not None' in _gm_src
     assert 'rest-IC OL tail Huber' not in _gm_src
     assert 'prev_state=st_k.detach()' not in _gm_src
+    assert 'gain_match_ol_persist_rel' in _gm_src
+    assert 'return_state=True' in _gm_src
+    assert 'def _hold_continuous_gain_c' not in _gm_src
     cfg.wm_tf_horizon = 4
     gm_notail, d_notail = _wm_gain_match_loss(
         model, feats.detach(), obs, act, cfg)
@@ -3292,6 +3299,18 @@ def _test_gain_match_rest_ic() -> None:
     assert abs(float(gm2) - float(gm_notail)) < 1e-8, (
         f'P69 tail revert: horizon must not change Huber '
         f'(gm2={float(gm2):.6f} gm_h={float(gm_notail):.6f})')
+    cfg.cont_gain_persist_coef = 0.0
+    gm_z, d_z = _wm_gain_match_loss(
+        model, feats.detach(), obs, act, cfg)
+    assert 'gain_match_ol_persist_rel' not in d_z
+    cfg.cont_gain_persist_coef = 0.1
+    gm_p, d_p = _wm_gain_match_loss(
+        model, feats.detach(), obs, act, cfg)
+    assert 'gain_match_ol_persist_rel' in d_p
+    assert torch.isfinite(d_p['gain_match_ol_persist_rel']).all()
+    assert float(gm_p) + 1e-8 >= float(gm_z), (
+        f'P73 persist must be extra L2 (gm_p={float(gm_p):.6f} '
+        f'gm_z={float(gm_z):.6f})')
     cfg.wm_tf_horizon = 6
     cfg._gain_match_rest_obs = None
     cfg._gain_match_rest_act = None

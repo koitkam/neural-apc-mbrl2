@@ -1048,6 +1048,8 @@ class TrainConfig:
     # Gain-channel persistence: a light L2 on the step-to-step change of the
     # gain block (the gain is a per-episode CONSTANT, so it should not wander).
     # p08 (2026-07-10): 0.0→0.1 (enabled now that the gain channel is default-on).
+    # P73: the same coef also L2-pins OL gain-c at teacher K to sg(rest-IC
+    # MEAN G). Posterior Δ persist does not constrain ``img_rollout`` prior G.
     cont_gain_persist_coef: float = 0.1
     # ---- MIMO self-supervised per-INPUT isolation (2026-07-10) ----
     # The DATA-DRIVEN generalisation of C(1) gain-match: on isolated-excitation
@@ -7925,8 +7927,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     REVERT:** OL hold of gain-c after the first ``img_step`` detonated
     (storm 2/2, DC ×−0.60@MV).  **P71 REVERT:** gain-c is a GRU / TSSM
     token input again (G-out-of-recurrence freeze-failed 0.76@DV).
-    ``gmatch_ol_tail=``
-    stays 0.
+    **P73:** ``cont_gain_persist_coef`` also L2-pins OL gain-c at teacher
+    K to ``sg(rest-IC MEAN G)`` (not a longer window, not a hard hold,
+    not G-out-of-GRU).  ``gmatch_ol_tail=`` stays 0.
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder (not the categorical
@@ -8115,9 +8118,10 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # Last-step Huber only: skip the unused (Bm, K, F) stack.
     # ``out='obs'`` decodes once after the K-loop (same as
     # ``decode(last feat)``; no extra last-feat tensor).
-    last_obs = rssm.img_rollout(
+    # ``return_state`` is the P73 OL gain-c persist IC (no extra roll).
+    last_obs, st_k = rssm.img_rollout(
         h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
-        last_only=True, out='obs')
+        last_only=True, out='obs', return_state=True)
     cv_last = last_obs.index_select(-1, cv_idx)
     cv_last = cv_last.view(n_rolls, Bm, -1)
     # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
@@ -8140,6 +8144,23 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     loss = total
     # P69 REVERT: OL tail Huber deleted (TBPTT-on-asymptote). Dummy jsonl
     # keys REMOVED (P72-live; same class as ``wm_held_ol_ratio``).
+    # P73: posterior 1-step persist does not constrain OL
+    # ``cont_prior(h)``. Endpoint L2 toward sg(rest-IC MEAN G) at
+    # teacher K — not P69 extra K, not P70 hold in ``img_step``, not
+    # P71 routing. GRU still sees full c. Dist-c is not pinned.
+    gp_coef = float(getattr(cfg, 'cont_gain_persist_coef', 0.0) or 0.0)
+    n_gain = int(getattr(rssm, 'cont_gain_dim', 0) or 0)
+    c_tail = getattr(st_k, 'c', None)
+    if (gp_coef > 0.0 and n_gain > 0 and c_b is not None
+            and c_tail is not None):
+        cg_d = min(n_gain, int(c_tail.shape[-1]), int(c_b.shape[-1]))
+        persist_err = (c_tail[..., :cg_d] - c_b[..., :cg_d].detach()).pow(2)
+        loss = loss + gp_coef * persist_err.mean()
+        if bool(getattr(cfg, '_wm_need_logged_aux', True)):
+            with torch.no_grad():
+                denom = c_b[..., :cg_d].abs().mean().clamp_min(1e-6)
+                diag['gain_match_ol_persist_rel'] = (
+                    persist_err.mean().sqrt() / denom).detach()
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
     # (L1 sat ±1) is the loss change; the MV/DV split still shows
@@ -14112,6 +14133,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_clip_frac' in row:
                 row.setdefault('wm_gain_match_clip_frac',
                             row['gain_match_clip_frac'])
+            if 'gain_match_ol_persist_rel' in row:
+                row.setdefault('wm_gain_match_ol_persist_rel',
+                            row['gain_match_ol_persist_rel'])
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)

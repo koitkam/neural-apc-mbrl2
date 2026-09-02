@@ -131,9 +131,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > **P71 EXIT** (`run_p71_nogainc`, pid **208659**, sha `5a16c67`,
 > 93 iters): gain-c out of GRU **REVERT**. CAPPED **0.76@DV** last_ok
 > **38**. Val MV **×1.089 / ×0.899** DV **×0.701 / ×0.759**. Actor
-> INVALID. G-recurrence family **closed**. **P72 LIVE** G-in-GRU freeze
-> **GAIN-READY 0.87@DV** last_ok **15** (P2; val pending). Dummy
-> `gain_match_ol_tail_*` jsonl **REMOVED**.
+> INVALID. G-recurrence family **closed**. **P72 EXIT** G-in-GRU **KEEP
+> as P71 REVERT** / **FALSIFIED as TM/compounding/champ** (freeze
+> **GAIN-READY 0.87@DV** last_ok **15**; val MV **×0.647 / ×0.626**
+> DV **×0.642 / ×0.641**; OL **×0.633**; paired **−22.71 vs −92.72**
+> VALID 9/9, mv_viol **9.70**). Dummy `gain_match_ol_tail_*` jsonl
+> **REMOVED**. **P73** OL gain-c persist at teacher K (same
+> `cont_gain_persist_coef`; no new knob).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -204,8 +208,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > Rest-pre skips the unused held-K `img_rollout` row. **P69 EXIT**
 > stop-grad OL tail **REVERT** (TBPTT-on-DC; CAPPED 0.75@MV). **P70 EXIT**
 > hold-G **REVERT** (CAPPED −0.60@MV). **P71 EXIT** gain-c out of GRU
-> **REVERT** (CAPPED 0.76@DV). **P72 LIVE** restores G in GRU (freeze
-> **GAIN-READY 0.87@DV** last_ok **15**). Dummy ol-tail jsonl **REMOVED**.
+> **REVERT** (CAPPED 0.76@DV). **P72 EXIT** G-in-GRU KEEP as revert /
+> FALSIFIED as TM (val MV ×0.647 OL ×0.633; paired −22.71 VALID).
+> **P73** OL gain-c persist at teacher K. Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
