@@ -1710,7 +1710,8 @@ def _test_gru_update_gate_bias() -> None:
     feat = torch.randn(4, m.feat_dim)
     x = feat[..., :m._decode_in_dim]
     assert torch.allclose(m.decode(feat), m.decoder(x), atol=1e-6, rtol=1e-5)
-    print('[smoke] OK  GRU update-gate bias log(H/16); skip REVERT')
+    print('[smoke] OK  GRU update-gate bias log(H/16) on both slices '
+          '(idle logit 2b); skip REVERT')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -1983,6 +1984,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _prior_c_from_net' in _cz
     assert 'def _recurrence_c' in _cz
     assert 'def gru_update_gate_bias' in _rssm_src
+    assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
     assert 'bias_ih[hs:2 * hs]' in _rssm_src
     assert 'def init_gain_cv_skip' not in _rssm_src
     assert 'def apply_gain_cv_skip' not in _rssm_src

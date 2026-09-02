@@ -424,7 +424,9 @@ def gru_update_gate_bias(horizon: int) -> float:
     reconstruct gain from a contracted recurrent state (P73 RCA:
     persist pinned ``c``; 1-step faithful / OL short).  Derived
     ``log(max(H,1)/16)``.  ``H<=0`` (RSSMConfig default) → 0, leaving
-    PyTorch init.  test_sim H=55 → ~1.235.  No TrainConfig knob.
+    PyTorch init.  test_sim H=55 → ~1.235.  Applied to **both**
+    ``bias_ih[hs:2hs]`` and ``bias_hh[hs:2hs]``, so the idle logit is
+    ``2b`` (sigmoid ~0.92) not ``b``.  No TrainConfig knob.
     RSSM-only (TSSM has no GRU).
     """
     h = int(horizon or 0)
@@ -1184,8 +1186,8 @@ class RSSMDynamics(nn.Module):
         Returns stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
         ``last_only=True`` returns only the K-step value ``(Bm, *)`` — same
         recurrence / last-step as ``stack[:, -1]``, without keeping the
-        unused K-stack (overshoot / held last_only; P75 gain-match
-        keeps the K-stack of decoded obs for the FOPDT rise teacher).
+        unused K-stack (overshoot / held / gain-match last-step DC Huber;
+        P75 FOPDT K-stack **REVERT**).
         ``out`` selects what is stacked (GRU recurrence is identical):
           * ``'feat'`` (default) — full ``state.feat`` (isolation TBPTT
             chunks slice ``h`` for ``keep_c``; loss still needs decode)
