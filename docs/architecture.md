@@ -136,8 +136,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > **GAIN-READY 0.87@DV** last_ok **15**; val MV **×0.647 / ×0.626**
 > DV **×0.642 / ×0.641**; OL **×0.633**; paired **−22.71 vs −92.72**
 > VALID 9/9, mv_viol **9.70**). Dummy `gain_match_ol_tail_*` jsonl
-> **REMOVED**. **P73** OL gain-c persist at teacher K (same
-> `cont_gain_persist_coef`; no new knob).
+> **P73 LIVE** OL gain-c persist at teacher K (`run_p73_olgpersist`, pid
+> **214644**; Step 4 CONFIRMED). Dummy `gain_match_ol_tail_*` jsonl
+> **REMOVED**.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
