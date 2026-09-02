@@ -1523,10 +1523,10 @@ def _test_store_aux_feats_identity() -> None:
                       if p.grad is not None)
         assert cprior_g == 0.0, f'Stage-1 rest-IC still used cont_prior (|g|={cprior_g})'
         if int(m.recurrence_c_dim) > 0:
-            assert cpost_g > 0.0, 'Stage-1 last_only lost dist-c GRU gradient'
+            assert cpost_g > 0.0, 'Stage-1 last_only lost cont-c GRU gradient'
         else:
             assert cpost_g == 0.0, (
-                f'gain-only cont_post leaked into GRU h (|g|={cpost_g})')
+                f'cont_post leaked into GRU h with rdim=0 (|g|={cpost_g})')
     m.dob_active = True
     bud = _dob_scan_mix_budget_bytes()
     assert 4 * 1024 * 1024 <= bud <= 64 * 1024 * 1024
@@ -1624,12 +1624,13 @@ def _test_img_rollout_last_only() -> None:
     gru_g = sum(float(p.grad.abs().sum()) for p in m.gru.parameters()
                 if p.grad is not None)
     assert gru_g > 0.0, 'last_only decode/feat lost GRU gradient'
-    # P70 hold REVERT / P71: gain-c is decoder/feat only — not in GRU.
+    # P71 REVERT: gain-c is a GRU input again (P68 / P64 identity).
     gdim = int(cfg.cont_gain_dim)
+    assert int(m.recurrence_c_dim) == int(m.cont_dim)
     want_in = (int(m.stoch_flat_dim) + int(m.recurrence_c_dim)
                + int(m.action_dim) + int(m.dv_dim))
     assert int(m.gru.input_size) == want_in, (
-        f'GRU in={m.gru.input_size} want {want_in} (gain must not enter)')
+        f'GRU in={m.gru.input_size} want {want_in} (full c must enter)')
     assert int(m.pre_gru.net[0].in_features) == want_in
     c_a = torch.zeros(B, gdim); c_a[:, 0] = 1.0
     c_b = torch.zeros(B, gdim); c_b[:, 0] = -1.0
@@ -1640,7 +1641,7 @@ def _test_img_rollout_last_only() -> None:
         h0.detach(), z0, acts, sample=False, c0=c_b,
         last_only=True, out='obs', return_state=True)
     h_err = float((sa.h - sb.h).detach().abs().max())
-    assert h_err < 1e-5, f'gain-c IC leaked into GRU h (max_err={h_err})'
+    assert h_err > 1e-4, f'gain-c IC missed GRU h (max_err={h_err})'
     d1 = m.decode(sa.feat).detach()
     c_pert = sa.c.clone(); c_pert[..., :gdim] = c_pert[..., :gdim] + 1.0
     sa.c = c_pert
@@ -1652,15 +1653,17 @@ def _test_img_rollout_last_only() -> None:
           f'(obs={obs_err:.2e} last_obs={last_obs_err:.2e}); gru |g|={gru_g:.3f}; '
           f'z_logits cache identity max_err={cache_err:.2e}; '
           f'OL-tail stop-grad leak={sg:.1e} (control={leak:.2e}); '
-          f'gain-c not in GRU h_err={h_err:.2e} decode_d={dec_err:.2e}')
-    # Dist-c still enters the GRU (a state, not a plant gain).
+          f'gain-c in GRU h_err={h_err:.2e} decode_d={dec_err:.2e}')
+    # Dist-c still enters the GRU (a state). Gain-c also enters (P71 revert).
     cfg_d = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
                        n_categoricals=4, n_classes=4, embed_dim=16,
                        hidden_dim=16, latent_type='deterministic',
                        cont_gain_dim=2, cont_dist_dim=2)
     md = RSSMDynamics(cfg_d)
-    want_d = (int(md.stoch_flat_dim) + 2 + int(md.action_dim) + int(md.dv_dim))
+    want_d = (int(md.stoch_flat_dim) + int(md.cont_dim)
+              + int(md.action_dim) + int(md.dv_dim))
     assert int(md.gru.input_size) == want_d
+    assert int(md.recurrence_c_dim) == int(md.cont_dim)
     c_g = torch.zeros(B, 4); c_g[:, 0] = 1.0
     c_g2 = torch.zeros(B, 4); c_g2[:, 0] = -1.0
     c_d = torch.zeros(B, 4); c_d[:, 2] = 1.0
@@ -1673,9 +1676,9 @@ def _test_img_rollout_last_only() -> None:
     _, sd = md.img_rollout(
         h0.detach(), z0, acts, sample=False, c0=c_d,
         last_only=True, out='obs', return_state=True)
-    assert float((sg1.h - sg2.h).detach().abs().max()) < 1e-5
+    assert float((sg1.h - sg2.h).detach().abs().max()) > 1e-4
     assert float((sg1.h - sd.h).detach().abs().max()) > 1e-4
-    print('[smoke] OK  dist-c enters GRU; gain-c does not')
+    print('[smoke] OK  full c (gain+dist) enters GRU')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -1943,6 +1946,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def cached_onehot_z' in _cz
     assert 'def _prior_c_from_net' in _cz
     assert 'def _recurrence_c' in _cz
+    assert 'self.recurrence_c_dim = int(self.cont_dim)' in _rssm_src
+    assert 'self.recurrence_c_dim = int(self.cont_dist_dim)' not in _rssm_src
     assert 'def _hold_continuous_gain_c' not in _rssm_src
     assert 'sample=not take_mean' in _cz
     assert 'c0 if c0 is not None else cached_zeros_bd' in _rssm_src

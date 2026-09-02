@@ -128,7 +128,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`run_p70_cgainhold`, pid **204329**, sha `35af8cf`, 60 iters):
 > hold-G **REVERT**. Storm 2/2 CAPPED **−0.60@MV** last_ok **2**.
 > Val MV **+0.478 vs −0.32** rel_err **2.49**. Actor INVALID.
-> **P71:** gain-c decoder/feat only (not in GRU).
+> **P71 EXIT** (`run_p71_nogainc`, pid **208659**, sha `5a16c67`,
+> 93 iters): gain-c out of GRU **REVERT**. CAPPED **0.76@DV** last_ok
+> **38**. Val MV **×1.089 / ×0.899** DV **×0.701 / ×0.759**. Actor
+> INVALID. G-recurrence family **closed**. **P72:** gain-c back in GRU.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -198,8 +201,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > rest-pre Huber **KEEP as protocol** / **FALSIFIED as TM/compounding/champ**.
 > Rest-pre skips the unused held-K `img_rollout` row. **P69 EXIT**
 > stop-grad OL tail **REVERT** (TBPTT-on-DC; CAPPED 0.75@MV). **P70 EXIT**
-> hold-G **REVERT** (CAPPED −0.60@MV). **P71 LIVE** gain-c decoder/feat
-> only (not in GRU).
+> hold-G **REVERT** (CAPPED −0.60@MV). **P71 EXIT** gain-c out of GRU
+> **REVERT** (CAPPED 0.76@DV). **P72** restores G in GRU.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
@@ -942,10 +945,10 @@ collapse when the DOB is removed (p136: head amplitude 2% of true). One change
 fixes BOTH:
 
 - **GAIN block** (`cont_gain_dim = n_cv·(n_mv+n_dv)`): inferred in-context from the
-  lookback; **P71:** decoder + `feat` only — it does **not** enter the GRU /
-  TSSM token (P70 hold-in-recurrence detonated: storm 2/2, DC ×−0.60@MV).
-  Dist-c still rolls in the core (`recurrence_c_dim = cont_dist_dim`;
-  env-free 0 ⇒ GRU sees `[z, a, dv]`). Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
+  lookback; **P71 REVERT:** it **does** enter the GRU / TSSM token
+  (`recurrence_c_dim = cont_dim`). G-out-of-recurrence freeze-failed
+  0.76@DV and killed the DV 1-step prior (P64 post→1step ×0.987).
+  Env-free gain-only ⇒ GRU sees `[z, c_gain, a, dv]`. Supervised by **C(1) gain-matching** (`_wm_gain_match_loss`): a
   finite-difference step-response asymptote (optionally hold a/dv
   `gain_match_settle_len` steps — auto = control horizon; TM probe settle
   is `wm_tf_horizon` = max(80, 4×horizon) — then roll the prior
@@ -1060,8 +1063,8 @@ fixes BOTH:
   > automatically with the DOB on.
 
 `feat = [h, z_flat, c, (dv), (d)]`; the decoder reads `[h, z, c, (dv)]`.
-**P71:** only the dist block of `c` feeds the GRU / TSSM token
-(`recurrence_c_dim = cont_dist_dim`). Gain-c is decoder/feat only.
+**P71 REVERT:** the full `c` feeds the GRU / TSSM token
+(`recurrence_c_dim = cont_dim`). Gain-c is a recurrent plant-gain state.
 `cont_gain_dim == cont_dist_dim == 0` ⇒
 byte-identical to the pre-cont model (regression-verified). Env knobs:
 `DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /

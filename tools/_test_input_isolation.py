@@ -282,11 +282,11 @@ def main():
     print(f'[gain-match-rest-ic] OK: rest encode is FD IC '
           f'(cont {cont_grad_rest:.4e})')
 
-    # ---- P71: gain-c is decoder/feat only. img_rollout c0 gain must
-    # NOT move the prior roll (P70 hold-in-GRU detonated). omit≡zeros
-    # still holds (both ignored). Dist-c still enters the core.
+    # ---- P71 REVERT: gain-c IC enters the GRU again (P68 identity).
+    # omit≡zeros still holds. Dist-c still enters the core.
     rssm = model.dynamics
     assert rssm.cont_dim > 0
+    assert rssm.recurrence_c_dim == rssm.cont_dim
     torch.manual_seed(0)
     Bm, Kc = 2, 4
     h0 = torch.zeros(Bm, rssm.deter_dim)
@@ -299,11 +299,11 @@ def main():
     f_lo = rssm.img_rollout(h0, z0, a_seq, sample=False, c0=c_lo)
     f_none = rssm.img_rollout(h0, z0, a_seq, sample=False)
     assert f_hi.shape == f_lo.shape == f_none.shape
-    assert torch.allclose(f_hi, f_lo, atol=1e-5, rtol=1e-5), (
-        'img_rollout gain-c IC must not enter the GRU (P71)')
+    assert not torch.allclose(f_hi, f_lo, atol=1e-5, rtol=1e-5), (
+        'img_rollout gain-c IC must enter the GRU (P71 revert)')
     assert torch.allclose(f_lo, f_none, atol=1e-5, rtol=1e-5), \
         'c0=0 must match omitted c0 (back-compat zero-fill)'
-    print('[img-rollout-c0] OK: gain-c IC ignored by GRU; omit≡zeros')
+    print('[img-rollout-c0] OK: gain-c IC enters GRU; omit≡zeros')
 
     cfg.wm_overshoot_coef = 0.3
     cfg.wm_overshoot_len = 6
@@ -323,8 +323,8 @@ def main():
     torch.manual_seed(1)
     ov_b, _ = _wm_latent_overshoot_loss(model, feats_shift, obs, act, cfg)
     assert torch.isfinite(ov_a).all() and torch.isfinite(ov_b).all()
-    assert abs(float(ov_a) - float(ov_b)) < 1e-7, (
-        'overshoot gain-c IC must not enter the GRU (P71)')
+    assert abs(float(ov_a) - float(ov_b)) > 1e-7, (
+        'overshoot gain-c IC must enter the GRU (P71 revert)')
     # Held-rollout is decode-CV late−early (P62; P63 magnitude REVERT).
     # Decoder noise below proves the decode-CV path.
     torch.manual_seed(2)
@@ -345,13 +345,12 @@ def main():
     assert abs(float(hd_a) - float(hd_dec)) > 1e-8, (
         f'held must read decode (h-only would ignore decoder; '
         f'{float(hd_a):.5f} vs {float(hd_dec):.5f})')
-    print(f'[overshoot-c0] OK: overshoot {float(ov_a):.5f}≡{float(ov_b):.5f} '
-          f'(gain-c IC ignored); held finite {float(hd_a):.5f} '
+    print(f'[overshoot-c0] OK: overshoot {float(ov_a):.5f}≠{float(ov_b):.5f} '
+          f'(gain-c IC in GRU); held finite {float(hd_a):.5f} '
           f'(decode-CV; decoder noise {float(hd_dec):.5f})')
 
-    # ---- P28 follow-up 14 / P71: feat c-slice is ignored when c_mean is
-    # passed (sample vs mean). Gain-c mean is also ignored by the GRU
-    # (decoder/feat only); dist-c still enters when present.
+    # ---- P28 follow-up 14: feat c-slice is ignored when c_mean is
+    # passed (sample vs mean). Gain-c mean enters the GRU (P71 revert).
     with torch.no_grad():
         feats_live, *_, cont = rssm.rollout_observed(obs, act, sample=True)
     assert cont is not None and 'post_mean' in cont
@@ -374,8 +373,8 @@ def main():
     assert torch.isfinite(ov_m_mean).all()
     assert abs(float(ov_m0) - float(ov_m_feat)) < 1e-7, (
         'overshoot with c_mean must ignore feat c-slice (sample vs mean)')
-    assert abs(float(ov_m0) - float(ov_m_mean)) < 1e-7, (
-        'overshoot gain-c mean must not enter the GRU (P71)')
+    assert abs(float(ov_m0) - float(ov_m_mean)) > 1e-7, (
+        'overshoot gain-c mean must enter the GRU (P71 revert)')
     cfg.gain_match_coef = 1.0
     cfg.gain_match_len = 6
     cfg.gain_match_mv_target = ((0.5,),)
@@ -393,11 +392,11 @@ def main():
     assert torch.isfinite(gm_m_mean).all()
     assert abs(float(gm_m0) - float(gm_m_feat)) < 1e-7, (
         'gain-match with c_mean must ignore feat c-slice')
-    assert abs(float(gm_m0) - float(gm_m_mean)) < 1e-7, (
-        'gain-match gain-c mean must not enter the GRU (P71)')
+    assert abs(float(gm_m0) - float(gm_m_mean)) > 1e-7, (
+        'gain-match gain-c mean must enter the GRU (P71 revert)')
     print(f'[overshoot-c-mean] OK: feat-slice Δ={abs(float(ov_m0)-float(ov_m_feat)):.2e} '
           f'(ignored); gain-c mean Δ={abs(float(ov_m0)-float(ov_m_mean)):.2e} '
-          f'(GRU-ignored); gain-match Δ={abs(float(gm_m0)-float(gm_m_mean)):.2e}')
+          f'(GRU); gain-match Δ={abs(float(gm_m0)-float(gm_m_mean)):.2e}')
 
     # Batched img_rollout FD (eager default) must match sequential img_step
     # rolls — same last-step ΔCV/Δu Huber that pins DC gain (P26).

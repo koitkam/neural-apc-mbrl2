@@ -272,15 +272,13 @@ def _prior_c_from_net(mod, h: torch.Tensor, sample: bool):
 
 
 def _recurrence_c(mod, c, batch, dtype, device):
-    """Disturbance slice of ``c`` for the GRU / TSSM token.
+    """Continuous latent that enters the GRU / TSSM token.
 
-    Gain (``c[..., :cont_gain_dim]``) is decoder/feat only — a plant
-    property. Feeding it to the recurrence made OL G compound through
-    ``h`` (1-step faithful / OL short of plant) and made P70's hold
-    fight the GRU (storm 2/2, DC ×−0.60@MV). Dist block still enters
-    the core (a state). Env-free ``cont_dist_dim=0`` ⇒ GRU sees no
-    ``c``. ``cont_gain_persist_coef`` still treats posterior G as a
-    per-episode constant.
+    Default is the full ``c`` (gain + dist). P71 set
+    ``recurrence_c_dim=cont_dist_dim`` so G was decoder/feat only; freeze
+    0.76@DV and the DV 1-step prior died (P64 post→1step ×0.987). Do not
+    restore that without a new mechanism. Env-free gain-only ⇒ GRU sees
+    ``[z, c_gain, a, dv]`` (P68 / P64 identity).
     """
     rdim = int(getattr(mod, 'recurrence_c_dim', 0) or 0)
     if rdim <= 0:
@@ -289,14 +287,14 @@ def _recurrence_c(mod, c, batch, dtype, device):
         return cached_zeros_bd(
             mod, int(batch), rdim, dtype, device,
             attr='_recurrence_c_zeros')
-    gdim = int(getattr(mod, 'cont_gain_dim', 0) or 0)
-    if gdim <= 0:
+    cdim = int(c.shape[-1])
+    if cdim == rdim:
         return c
-    if int(c.shape[-1]) < gdim + rdim:
-        return cached_zeros_bd(
-            mod, int(batch), rdim, dtype, device,
-            attr='_recurrence_c_zeros')
-    return c[..., gdim:gdim + rdim]
+    if cdim > rdim:
+        return c[..., :rdim]
+    return cached_zeros_bd(
+        mod, int(batch), rdim, dtype, device,
+        attr='_recurrence_c_zeros')
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +377,9 @@ class RSSMConfig:
     # so the WM ADAPTS to DR) and a DISTURBANCE block (= n_cv, an amortized
     # Kalman state inferred from the innovation + rolled forward by the prior —
     # the "inherent" replacement for the bolt-on DOB).  The decoder still
-    # reads both.  **P71:** only the DISTURBANCE block enters the GRU /
-    # TSSM token; gain is decoder/feat-only (a plant property — P70 hold
-    # of gain-c in the recurrence detonated P1).  ``cont_gain_dim ==
+    # reads both.  **P71 REVERT:** the full ``c`` (gain + dist) enters the
+    # GRU / TSSM token. G-out-of-recurrence (P69–P71) freeze-failed 0.76@DV
+    # and killed the DV 1-step prior.  ``cont_gain_dim ==
     # cont_dist_dim == 0`` ⇒ byte-identical to the pre-continuous-latent
     # model.
     cont_gain_dim: int = 0
@@ -612,12 +610,12 @@ class RSSMDynamics(nn.Module):
         # Continuous gain+disturbance latent (2026-06-22).  cont_dim splits into
         # a supervised GAIN block (first ``cont_gain_dim`` dims) and a
         # DISTURBANCE block (last ``cont_dist_dim`` dims).  Decoder + feat
-        # still read both.  **P71:** only the dist block enters the GRU
-        # (gain is a plant property; P70 hold-in-recurrence detonated).
+        # still read both.  **P71 REVERT:** full ``c`` enters the GRU
+        # (G-out-of-recurrence freeze-failed 0.76@DV).
         self.cont_gain_dim = int(getattr(cfg, 'cont_gain_dim', 0) or 0)
         self.cont_dist_dim = int(getattr(cfg, 'cont_dist_dim', 0) or 0)
         self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
-        self.recurrence_c_dim = int(self.cont_dist_dim)
+        self.recurrence_c_dim = int(self.cont_dim)
         self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
         self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
         # Deterministic cont-disturbance roll in imagination (p140 RCA).
@@ -648,8 +646,8 @@ class RSSMDynamics(nn.Module):
             bool(getattr(cfg, 'dv_decoder_feedforward', False))
             and self.dv_feedforward)
         self._dv_decode_dim = self.dv_dim if self.dv_decoder_feedforward else 0
-        # Transition input = [z_flat ; (dist-c) ; action ; (dv)].  Gain-c
-        # stays out of the GRU (P71; decoder/feat still read it).
+        # Transition input = [z_flat ; c ; action ; (dv)].  c is gain
+        # (+ dist when a dist head is on). P71 G-out-of-GRU REVERT.
         trans_in = (self.stoch_flat_dim + self.recurrence_c_dim
                     + self.action_dim + self.dv_dim)
 
@@ -820,8 +818,7 @@ class RSSMDynamics(nn.Module):
         ``_posterior_step`` (posterior heads on ``h``; prior_net unused).
         Returns ``(h, d_new, dv_new)``.
         """
-        # GRU input = [z_flat ; (dist-c) ; action ; (dv)].  Gain-c is
-        # decoder/feat only (P71). Dist-c still rolls in the core.
+        # GRU input = [z_flat ; c ; action ; (dv)].  Full c (P71 REVERT).
         parts = [prev.stoch_flat]
         rc = _recurrence_c(
             self, prev.c, int(prev_action.shape[0]),
@@ -858,9 +855,9 @@ class RSSMDynamics(nn.Module):
         """
         h, d_new, dv_new = self._gru_transition(prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
-        # Continuous-latent prior p(c'|h'): disturbance OU-rolls from h.
-        # Gain is inferred every prior step (P70 hold REVERT) and does
-        # not enter the GRU (P71). Deterministic-roll uses the prior MEAN.
+        # Continuous-latent prior p(c'|h'). P70 hold REVERT (no copy of
+        # step-1 G). P71 REVERT: G is a GRU input again so h can carry DC
+        # gain. Deterministic-roll uses the prior MEAN.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
         return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
@@ -1167,8 +1164,8 @@ class RSSMDynamics(nn.Module):
         and is **removed** (no training call site).
         ``prev_state`` continues an existing prior (KV / GRU state; smoke
         continue + detach).  ``return_state`` also returns the last
-        ``RSSMState``.  P70 gain-c hold REVERT; P71 gain-c is
-        decoder/feat only (not a GRU input).
+        ``RSSMState``.  P70 gain-c hold REVERT; P71 G-out-of-GRU
+        REVERT (full ``c`` is a GRU input again).
 
         P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
         the open-loop gain supervisor trained a ``c=0`` GRU path while

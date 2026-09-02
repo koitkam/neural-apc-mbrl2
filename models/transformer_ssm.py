@@ -362,13 +362,13 @@ class TransformerSSMDynamics(nn.Module):
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
         # Continuous gain+disturbance latent (2026-06-22) — mirror of
         # RSSMDynamics: a GAIN block (C1-supervised) + DISTURBANCE block
-        # (amortized Kalman).  Decoder + feat still read both.  **P71:**
-        # only the dist block enters the token (gain is decoder/feat-only).
+        # (amortized Kalman).  Decoder + feat still read both.  **P71
+        # REVERT:** full ``c`` enters the token (same identity as RSSM).
         # cont_gain_dim==cont_dist_dim==0 ⇒ pre-cont model.
         self.cont_gain_dim = int(getattr(cfg, 'cont_gain_dim', 0) or 0)
         self.cont_dist_dim = int(getattr(cfg, 'cont_dist_dim', 0) or 0)
         self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
-        self.recurrence_c_dim = int(self.cont_dist_dim)
+        self.recurrence_c_dim = int(self.cont_dim)
         self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
         self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
         # Deterministic cont-disturbance roll in imagination (p140 RCA).
@@ -405,8 +405,8 @@ class TransformerSSMDynamics(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.embed_dim, self.obs_dim),
         )
-        # Token projection: [z_{t-1}_flat ; (dist-c) ; a_t ; (dv_t)] -> d_model.
-        # Gain-c stays out of the token (P71; decoder/feat still read it).
+        # Token projection: [z_{t-1}_flat ; c ; a_t ; (dv_t)] -> d_model.
+        # Full c (P71 G-out-of-token REVERT).
         self.token_proj = nn.Linear(
             self.stoch_flat_dim + self.recurrence_c_dim + self.action_dim + self.dv_dim,
             self.deter_dim)
@@ -540,7 +540,7 @@ class TransformerSSMDynamics(nn.Module):
                      action: torch.Tensor,
                      dv: Optional[torch.Tensor] = None,
                      c: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """token = proj([z_flat ; (dist-c) ; action ; (dv)]) -> (B, d_model)."""
+        """token = proj([z_flat ; c ; action ; (dv)]) -> (B, d_model)."""
         parts = [z.flatten(start_dim=-2)]
         rc = _recurrence_c(
             self, c, int(action.shape[0]), action.dtype, action.device)
@@ -624,7 +624,7 @@ class TransformerSSMDynamics(nn.Module):
             prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
         # Continuous-latent prior (RSSM mirror).  P70 hold REVERT; P71
-        # gain-c is decoder/feat only.  Skip discarded randn when det-roll
+        # G-out-of-token REVERT.  Skip discarded randn when det-roll
         # replaces the whole sample with the prior MEAN.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
         return TSSMState(h=h, z_logits=z_logits, z=z,
@@ -674,7 +674,7 @@ class TransformerSSMDynamics(nn.Module):
         ``out='h'`` removed with RSSM (P62; no training call site).
         ``prev_state`` continues KV-cache (smoke continue + detach).
         ``return_state`` also returns the last ``TSSMState``.  P70
-        gain-c hold REVERT; P71 gain-c is decoder/feat only.
+        gain-c hold REVERT; P71 G-out-of-token REVERT.
         """
         if out not in ('feat', 'obs'):
             raise ValueError(f'img_rollout out={out!r}')

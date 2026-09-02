@@ -146,6 +146,7 @@ def test_img_rollout_equals_img_step():
           f"out=obs identity (obs={obs_err:.2e} last_obs={last_obs_err:.2e})")
     want_in = (int(m.stoch_flat_dim) + int(m.recurrence_c_dim)
                + int(cfg.action_dim) + int(m.dv_dim))
+    assert int(m.recurrence_c_dim) == int(m.cont_dim)
     assert int(m.token_proj.in_features) == want_in, (
         f'token_proj in={m.token_proj.in_features} want {want_in}')
 
