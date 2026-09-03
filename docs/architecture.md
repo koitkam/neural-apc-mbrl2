@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE P1 iter 20 rest-IC `prev_state=` probe20 H=55 **+0.225 conv=0** still short of P64 +0.498; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE P1 iter 21 rest-IC `prev_state=` probe20 H=55 **+0.225 conv=0** still short of P64 +0.498; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -162,7 +162,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED** as Markovian rest-IC (`run_p77_tssm`, pid **242511**, 158 iters):
 > CAPPED **−0.46@MV / 0.74@DV** last_ok **104**; val MV **×−0.496 / ×−0.129**
 > DV **×0.736 / ×0.655**; 1step→OL **×0.379**; det_r **0.090** pred_std **3.52 vs 1.93**;
-> conv=0; actor INVALID. **P78 LIVE** rest-IC `prev_state=` (`run_p78_prevkv`, pid **261143**).
+> conv=0; actor INVALID. **P78 LIVE** rest-IC `prev_state=` (`run_p78_prevkv`, pid **261143** P1 iter **21**; probe20 H=55 **+0.225 conv=0**).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
