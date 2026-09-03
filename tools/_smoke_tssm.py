@@ -144,6 +144,23 @@ def test_img_rollout_equals_img_step():
     print(f"[smoke] OK img_rollout ≡ sequential img_step (max_err={max_err:.2e}); "
           f"last_only ≡ stack[:, -1] (max_err={last_err:.2e}); "
           f"out=obs identity (obs={obs_err:.2e} last_obs={last_obs_err:.2e})")
+    # Fresh (h,z) start is Markovian; continuing the encode cache is not.
+    obs = torch.randn(B, 8, cfg.obs_dim)
+    act_win = torch.rand(B, 8, cfg.action_dim) * 2 - 1
+    with torch.no_grad():
+        _, _, _, enc, *_ = m.rollout_observed(obs, act_win, sample=False)
+        ol = torch.zeros(B, 4, cfg.action_dim)
+        mark = m.img_rollout(
+            enc.h, enc.z, ol, sample=False, c0=enc.c,
+            last_only=True, out='obs')
+        cached = m.img_rollout(
+            enc.h, enc.z, ol, sample=False, c0=enc.c,
+            last_only=True, out='obs', prev_state=enc)
+    mark_delta = float((mark - cached).abs().mean())
+    assert mark_delta > 1e-4, (
+        f'TSSM Markovian ≡ cached after encode (Δ={mark_delta})')
+    print(f"[smoke] OK Markovian img_rollout(h,z) ≠ cached prev_state "
+          f"(Δ={mark_delta:.3e})")
     want_in = (int(m.stoch_flat_dim) + int(m.recurrence_c_dim)
                + int(cfg.action_dim) + int(m.dv_dim))
     assert int(m.recurrence_c_dim) == int(m.cont_dim)

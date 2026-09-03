@@ -72,6 +72,7 @@ from training.train import (
                             _auto_gain_match_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
                             _gain_match_rest_window, _gain_match_rest_ic_state,
+                            _expand_dyn_state, _rest_ic_last_state,
                             _held_rollout_win,
                             _wm_held_rollout_stationarity_loss,
                             _rest_ic_can_cuda_graph,
@@ -1926,6 +1927,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_gain_match_rest_window' in _src
     assert 'gain_match_rest_ic_len: int = 0' in _src
     assert '_gain_match_rest_ic_state' in _src
+    assert 'def _expand_dyn_state' in _src
+    assert 'def _rest_ic_last_state' in _src
+    assert 'TSSM OL continues rest-IC KV-cache' in _src
+    assert 'prev_state=st_b' in _src
     assert '_rest_ic_can_cuda_graph' in _src
     assert "type(rssm).__name__ != 'RSSMDynamics'" in _src
     assert 'make_graphed_callables' in _src
@@ -3327,7 +3332,9 @@ def _test_gain_match_rest_ic() -> None:
     st2 = _gain_match_rest_ic_state(
         model.dynamics, cfg, obs.device, obs.dtype)
     assert st1 is not None and st2 is not None
+    assert len(st1) == 6 and len(st2) == 6
     assert st1[3] is st2[3] and st1[4] is st2[4]
+    assert st1[5] is None  # RSSM: GRU h is the history; no KV to continue
     cfg._gain_match_rest_obs = (rest_o + 1.5).numpy()
     cfg._gain_match_rest_dev = None
     # Leave `_gain_match_rest_adv` stale: new device tensors must bust it.
@@ -3346,6 +3353,8 @@ def _test_gain_match_rest_ic() -> None:
     assert 'skip_held = o_rest is not None' in _gm_src
     assert 'rest-IC OL tail Huber' not in _gm_src
     assert 'prev_state=st_k.detach()' not in _gm_src
+    assert 'prev_state=st_b' in _gm_src
+    assert "getattr(st0, 'kv_cache', None) is not None" in _gm_src
     assert 'gain_match_ol_persist_rel' in _gm_src
     assert 'return_state=True' in _gm_src
     assert 'def _hold_continuous_gain_c' not in _gm_src
@@ -3435,6 +3444,88 @@ def _test_gain_match_rest_ic() -> None:
     _arm_rest_ic_stream_mismatch_warn(False)
     _arm_rest_ic_stream_mismatch_warn(False)
     print('[smoke] OK  rest-ic AccumulateGrad warn arm/disarm is idempotent')
+
+
+def _test_gain_match_tssm_kv_continue() -> None:
+    """P78: TSSM rest-IC FD continues KV; Markovian (h,z) start differs."""
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim = 6
+    cfg.action_dim = 1
+    cfg.lookback = 8
+    cfg.world_model_type = 'tssm'
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.d_model = 32
+    cfg.head_hidden = 32
+    cfg.head_n_layers = 1
+    cfg.mtp_length = 2
+    cfg.horizon = 4
+    cfg.seq_len = 16
+    cfg.dv_dim = 1
+    cfg.dv_indices = (3,)
+    cfg.cv_obs_indices = (0,)
+    cfg.dob_enabled = False
+    cfg.cont_latent_enabled = True
+    cfg.cont_gain_dim = 2
+    cfg.cont_dist_dim = 0
+    cfg.gain_match_coef = 1.0
+    cfg.gain_match_len = 4
+    cfg.tssm_max_seq_len = 64
+    cfg.gain_match_settle_len = -1
+    cfg.gain_match_rest_ic = True
+    cfg.gain_match_mv_target = ((-1.0,),)
+    cfg.gain_match_dv_target = ((0.5,),)
+    cfg.gain_match_huber_per_input = False
+    model = build_model(cfg)
+    rssm = model.dynamics
+    N, L = 3, 8
+    rest_o = torch.randn(N, L, 6)
+    rest_a = torch.rand(N, L, 1) * 2 - 1
+    cfg._gain_match_rest_obs = rest_o.numpy()
+    cfg._gain_match_rest_act = rest_a.numpy()
+    packed = _gain_match_rest_ic_state(rssm, cfg, rest_o.device, rest_o.dtype)
+    assert packed is not None and len(packed) == 6
+    h0, z0, c0, a_base, dv0, prev = packed
+    assert prev is not None and prev.kv_cache is not None
+    assert int(prev.pos) == L
+    st_b = _expand_dyn_state(prev, 2)
+    assert int(st_b.h.shape[0]) == 2 * N
+    assert int(st_b.kv_cache[0][0].shape[0]) == 2 * N
+    K = 4
+    a_seq = a_base.unsqueeze(1).expand(N, K, 1).contiguous()
+    dv_seq = dv0.unsqueeze(1).expand(N, K, dv0.shape[-1]).contiguous()
+    with torch.no_grad():
+        mark = rssm.img_rollout(
+            h0, z0, a_seq, dvs=dv_seq, sample=False, c0=c0,
+            last_only=True, out='obs')
+        cached = rssm.img_rollout(
+            h0, z0, a_seq, dvs=dv_seq, sample=False, c0=c0,
+            last_only=True, out='obs', prev_state=prev)
+    delta = float((mark - cached).abs().mean())
+    assert delta > 1e-4, f'TSSM Markovian ≡ cached (Δ={delta})'
+    B, T = 2, 16
+    obs = torch.randn(B, T, 6)
+    act = torch.rand(B, T, 1) * 2 - 1
+    with torch.no_grad():
+        feats, *_ = rssm.rollout_observed(obs, act, sample=False)
+    model.zero_grad(set_to_none=True)
+    gm, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm).all() and float(gm) > 0.0
+    gm.backward()
+    tf_g = sum(float(p.grad.abs().sum())
+               for n, p in rssm.named_parameters()
+               if p.grad is not None
+               and ('blocks' in n or 'token_proj' in n))
+    assert tf_g > 0.0, 'TSSM KV-continue FD did not reach transformer'
+    cfg._gain_match_rest_obs = None
+    cfg._gain_match_rest_act = None
+    cfg._gain_match_rest_dev = None
+    print(f'[smoke] OK  TSSM rest-IC FD continues KV '
+          f'(Markovian Δ={delta:.4g}; tf|g|={tf_g:.4g})')
 
 
 def _test_p3_reset_log_std() -> None:
@@ -5085,6 +5176,7 @@ if __name__ == '__main__':
     _test_held_rollout_cv_space()
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
+    _test_gain_match_tssm_kv_continue()
     _test_p3_reset_log_std()
     _test_bc_mean_only()
     _test_p3_stop_grad_log_std()

@@ -34,7 +34,7 @@ import time
 import warnings
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -7323,20 +7323,61 @@ def _gain_match_rest_ic_tensors(
     return cache[1], cache[2]
 
 
-def _rest_ic_last_tensors(rssm, obs: torch.Tensor, act: torch.Tensor):
-    """Last ``h/z/c_mean`` of a rest-IC ``last_only`` encode (eager).
-
-    TSSM: drops ``kv_cache`` (RSSM ``h`` already is the history).  P77 LIVE
-    CPU @wm_best70: Markovian vs cached |Δ| 0.256 / 1step→OL ×0.272 — do
-    not change while the GPU job is running.
-    """
-    _, _, _, state, *_ = rssm.rollout_observed(
-        obs, act, sample=False, store_aux=False, last_only=True,
-        return_feats=False)
+def _rest_ic_c_from_state(state, obs: torch.Tensor) -> torch.Tensor:
+    """Last rest-IC continuous latent (posterior MEAN when present)."""
     c = state.c_mean if getattr(state, 'c_mean', None) is not None else state.c
     if c is None:
         c = obs.new_zeros(obs.shape[0], 0)
-    return state.h, state.z, c
+    return c
+
+
+def _rest_ic_last_state(rssm, obs: torch.Tensor, act: torch.Tensor):
+    """Last rest-IC ``rollout_observed`` state (eager; keeps TSSM KV)."""
+    _, _, _, state, *_ = rssm.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True,
+        return_feats=False)
+    return state
+
+
+def _rest_ic_last_tensors(rssm, obs: torch.Tensor, act: torch.Tensor):
+    """Last ``h/z/c_mean`` of a rest-IC ``last_only`` encode (eager).
+
+    Graph capture still unpacks this triple (RSSM).  TSSM gain-match
+    uses ``_rest_ic_last_state`` so the FD can continue ``kv_cache``
+    (P77 RCA: Markovian ``img_rollout(h,z)`` pinned jsonl ×1 while
+    5-level TM / probe were cached).
+    """
+    state = _rest_ic_last_state(rssm, obs, act)
+    return state.h, state.z, _rest_ic_c_from_state(state, obs)
+
+
+def _expand_dyn_state(state, n: int):
+    """Tile batch dim 0 ``n`` times for stacked gain-match FD rolls.
+
+    Identity at ``n<=1``.  TSSM KV tensors are ``(B, heads, pos, hd)``;
+    ``pos`` is a token count (not tiled).  RSSM has no ``kv_cache``.
+    """
+    n = int(n)
+    if state is None or n <= 1:
+        return state
+
+    def _rep(t):
+        if t is None or not torch.is_tensor(t):
+            return t
+        return (t.unsqueeze(0).expand(n, *t.shape)
+                .reshape(n * int(t.shape[0]), *t.shape[1:]).contiguous())
+
+    kw = {}
+    for f in fields(type(state)):
+        val = getattr(state, f.name)
+        if f.name == 'pos':
+            kw[f.name] = int(val or 0)
+        elif f.name == 'kv_cache':
+            kw[f.name] = (None if val is None
+                          else [(_rep(k), _rep(v)) for k, v in val])
+        else:
+            kw[f.name] = _rep(val)
+    return type(state)(**kw)
 
 
 def _amp_parent_autocast_on(device_type: str = 'cuda') -> bool:
@@ -7771,16 +7812,16 @@ def _release_rest_ic_after_g_freeze(rssm) -> None:
 
 
 def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
-    """Encode cached rest lookbacks → ``(h0, z0, c0, a_base, dv0)``.
+    """Encode cached rest lookbacks → ``(h0, z0, c0, a_base, dv0, prev)``.
 
     Teacher-forced posterior (TM ``_imagine_open_loop_rssm`` warm-start).
     ``sample=False`` + last ``c_mean`` (follow-up 14).  ``store_aux=False``
     skips unused logit stacks.  ``last_only=True`` + ``return_feats=False``
     skips the unused T-stack **and** the last feat / Stage-1 zero-``d``
-    tail (rest-IC only needs ``h/z/c_mean``; GRU recurrence identical).
-    Stage-1 encode uses ``_posterior_step`` (skip unused ``prior_net`` /
-    ``cont_prior_net``; next GRU input is the posterior).  None if the
-    cache is empty.
+    tail.  RSSM CUDA-graph still returns ``h/z/c`` only (``prev=None``:
+    GRU ``h`` is the history).  TSSM eager encode keeps ``kv_cache`` so
+    the FD can continue the lookback (P77 Markovian hole).  Stage-1
+    encode uses ``_posterior_step``.  None if the cache is empty.
 
     CUDA: ``make_graphed_callables`` on ``_RestICGraphModule`` wrapping
     the T-loop when ``gain_match_rest_ic_cuda_graph`` (default True),
@@ -7803,7 +7844,14 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
     o, a = _gain_match_rest_ic_tensors(cfg, device, dtype)
     if o is None or a is None:
         return None
-    h0, z0, c0 = _rest_ic_encode_hzc(rssm, o, a, cfg)
+    prev = None
+    if _rest_ic_can_cuda_graph(rssm, o, cfg):
+        h0, z0, c0 = _rest_ic_encode_hzc(rssm, o, a, cfg)
+    else:
+        prev = _rest_ic_last_state(rssm, o, a)
+        h0, z0, c0 = prev.h, prev.z, _rest_ic_c_from_state(prev, o)
+        if getattr(prev, 'kv_cache', None) is None:
+            prev = None
     # Last rest frame is static (encode weights are not).  Cache a_base /
     # dv0 next to the device lookbacks — 100×/iter index_select identity.
     adv_key = (id(o), id(a), int(getattr(rssm, 'dv_dim', 0) or 0))
@@ -7817,7 +7865,7 @@ def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
             dv0 = o[:, -1].index_select(-1, rssm.dv_index_t).contiguous()
         cfg._gain_match_rest_adv = (  # type: ignore[attr-defined]
             adv_key, a_base, dv0)
-    return h0, z0, c0, a_base, dv0
+    return h0, z0, c0, a_base, dv0, prev
 
 
 def collect_rest_lookback(
@@ -8015,9 +8063,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     if rest is not None:
         # P45: TM-protocol IC (real rest encode).  Skip P44 WM-held
         # settle of a PRBS start — the lookback *is* the rest.
-        h0, z0, c0, a_base, dv0 = rest
+        h0, z0, c0, a_base, dv0 = rest[:5]
+        st0 = rest[5] if len(rest) > 5 else None
         Bm = int(h0.shape[0])
     else:
+        st0 = None
         max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
         n_valid = (T - K) if T > K else T
         if n_valid < 1:
@@ -8138,9 +8188,32 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # P76: last-step DC Huber (P75 FOPDT K-stack REVERT).  Persist
     # still reads ``return_state``.  Last obs is ~100× smaller than
     # a feat stack.
+    # P78: TSSM continues rest-IC KV (teacher = TM cached dynamics).
+    # RSSM ``st0 is None`` → Markovian ``(h,z)`` identity (GRU ``h``
+    # already is the history).  Not P69 (no extra DC window).
+    st_b = None
+    if (st0 is not None
+            and getattr(st0, 'kv_cache', None) is not None):
+        max_len = int(getattr(rssm, 'max_seq_len', 0) or 0)
+        pos = int(getattr(st0, 'pos', 0) or 0)
+        if max_len > 0 and pos + int(K) > max_len:
+            if not getattr(cfg, '_gain_match_kv_overflow_logged', False):
+                print('[gain-match] rest-IC KV '
+                      f'pos={pos}+K={int(K)} exceeds '
+                      f'max_seq_len={max_len}; Markovian h/z fallback',
+                      flush=True)
+                cfg._gain_match_kv_overflow_logged = True  # type: ignore[attr-defined]
+        else:
+            st_b = _expand_dyn_state(st0, n_rolls)
+            if not getattr(cfg, '_gain_match_kv_logged', False):
+                print('[gain-match] TSSM OL continues rest-IC KV-cache '
+                      f'(pos={pos}+K={int(K)}; not Markovian h/z)',
+                      flush=True)
+                cfg._gain_match_kv_logged = True  # type: ignore[attr-defined]
     roll_obs, st_k = rssm.img_rollout(
         h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
-        last_only=True, out='obs', return_state=True)
+        last_only=True, out='obs', return_state=True,
+        prev_state=st_b)
     cv_k = roll_obs.index_select(-1, cv_idx)
     cv_k = cv_k.view(n_rolls, Bm, -1)
     # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a

@@ -14,19 +14,20 @@ opt-out ``DREAMER_WORLD_MODEL_TYPE=rssm``).  Wired through ``build_model``,
 O(window²) recompute); smoke ``tools/_smoke_tssm.py`` checks cached step vs
 full-sequence.  Rest-IC CUDA-graph is RSSM-only (kv-cache grows).
 
-KNOWN GAP (P77 LIVE probe70; do not patch the live job): teacher-forced
+KNOWN GAP (P77 LIVE probe / P78 HEAD): teacher-forced
 ``rollout_observed`` and the fidelity probe warm the KV-cache over the
-lookback, but gain-match / overshoot / held / isolation start
-``img_rollout(h, z)`` with ``kv_cache=None`` (RSSM-correct: GRU ``h`` *is*
-the history; TSSM then rolls a 1-token Markovian net).  ``_rest_ic_last_tensors``
-returns only ``h/z/c`` and drops the encode cache.  CPU @wm_best70:
-Markovian vs cached CV |Δ| 0.256 (iter50 0.123 — diverging); 1step→OL
-×0.272 (iter50 ×0.097).  Probe H=1 beat P64, H=55/conv still dead @10–70
-(cached compounding).  A later attributed A/B would pass ``prev_state``
-into those OL rolls.  Metric: probe H=55 r / conv / val 1step→OL vs P64 ×0.85.
+lookback.  Gain-match rest-IC FD now continues that cache via
+``img_rollout(..., prev_state=)`` (P78; RSSM identity — GRU ``h`` is
+the history).  Overshoot / held / isolation still start
+``img_rollout(h, z)`` with ``kv_cache=None`` (Markovian 1-token net).
+CPU @wm_best70 (live P77 pid, Markovian teacher): Markovian vs cached
+CV |Δ| 0.256; 1step→OL ×0.272.  Probe H=55 / conv still cached
+compounding.  Metric for P78: freeze GAIN-READY vs P64 0.91@DV;
+jsonl teacher should no longer pin a different DC than 5-level TM.
 
 KV-cache does not slide; one imagination rollout must stay inside
-``max_seq_len`` (lookback + H on test_sim).
+``max_seq_len`` (lookback + H on test_sim; overflow falls back to
+Markovian).
 
 WHY a transformer core (vs the current SF/flow transformer):
   The existing ``world_model_type='sf_transformer'`` is a shortcut-forcing/flow
@@ -311,8 +312,8 @@ class TransformerSSMDynamics(nn.Module):
     """Causal-transformer dynamics core implementing the RSSMDynamics interface.
 
     KV-cached ``_step`` is the live transition.  ``img_rollout(..., prev_state=)``
-    continues the cache; a fresh ``(h0, z0)`` start is Markovian (see module
-    docstring KNOWN GAP).
+    continues the cache (gain-match rest-IC FD; smoke continue + detach).
+    A fresh ``(h0, z0)`` start is Markovian (overshoot / held / isolation).
     """
 
     def __init__(self, cfg: TransformerSSMConfig):
