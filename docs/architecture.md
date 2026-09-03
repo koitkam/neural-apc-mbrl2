@@ -244,7 +244,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > 8/9. FO family closed. **P76 EXIT** GRU z-bias **REVERT**
 > (`run_p76_grubias`, 148 iters): freeze 0.80@MV GAIN_NOT_READY; val
 > MV ×0.865 1step→OL ×0.770; actor INVALID. **P77 EXIT** TSSM Markovian rest-IC
-> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL **×0.567**; det_r **0.010**). TSSM family closed; env-free default **rssm**. **P79 LIVE P3** pid **277462** orig-P1 @82 **PASS** last_ok **81** **0.81@DV** (not GAIN-READY vs P64 **0.91@DV**). P2→P3 @136 no `[p3-skip]`. First P3 ent **−0.240@137**. Probe130 H=55 **+0.146 conv=0.50**.
+> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL **×0.567**; det_r **0.010**). TSSM family closed; env-free default **rssm**. **P79 LIVE P3** pid **277462** orig-P1 @82 **PASS** last_ok **81** **0.81@DV** (not GAIN-READY vs P64 **0.91@DV**). P2→P3 @136 no `[p3-skip]`. `best.pt` **166** det **−41.6**.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
