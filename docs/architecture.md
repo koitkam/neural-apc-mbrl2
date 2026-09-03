@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 LIVE A/B iter 57 wrap-recovered; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77 LIVE A/B iter 60; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -159,9 +159,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > GAIN_NOT_READY**; val MV **×0.865 / ×1.004** DV **×0.819 / ×0.896**;
 > 1step→OL **×0.770**; actor INVALID. Keep-h stalled conv. Do not
 > GRU-bias N+1. **P77** env-free `world_model_type='tssm'`
-> (LIVE P1 iter 57 wrap-recovered skip 0; probe50 H=1 r=+0.509 H=55 r=+0.273 conv=0
-> gain_fid=0.389; recon best 0.0057@53 ~2.2× P64; wrap 0.147@56 then 0.022@57;
-> persist_rel 0.50@57; CPU @wm_best50 Markovian |Δ|=0.123 1step→OL ×0.097 — no live patch).
+> (LIVE P1 iter 60; probe60 H=1 r=+0.682 beat P64; H=55 r=+0.293 conv=0
+> gain_fid=0.882 best_h=1 — do not treat as health; recon 0.011@60 best 0.0057@53;
+> wrap 0.147@56 recovered skip 0; CPU @wm_best50 Markovian |Δ|=0.123 1step→OL ×0.097 — no live patch).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
