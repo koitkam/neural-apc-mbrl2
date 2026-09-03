@@ -157,7 +157,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`run_p76_grubias`, pid **237453**, 148 iters): freeze **0.80@MV
 > GAIN_NOT_READY**; val MV **×0.865 / ×1.004** DV **×0.819 / ×0.896**;
 > 1step→OL **×0.770**; actor INVALID. Keep-h stalled conv. Do not
-> GRU-bias N+1. **P77** env-free `world_model_type='tssm'`.
+> GRU-bias N+1. **P77** env-free `world_model_type='tssm'`
+> (LIVE P1 iter 4; teacher ×0.97/×1.07; recon 0.385 vs P76 0.048).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
