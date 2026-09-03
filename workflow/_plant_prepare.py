@@ -679,8 +679,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
         'runtime_setpoint_n_magnitude_strata', int),
     'DREAMER_RUNTIME_SETPOINT_TARGET_INSIDE_MARGIN_FRAC': (
         'runtime_setpoint_target_inside_margin_frac', float),
-    # ---- World-model backbone (P68 RSSM / P77 TSSM) ----
-    # ``tssm`` (P77 env-free default) vs ``rssm`` vs ``sf_transformer``.
+    # ---- World-model backbone (P68 RSSM / P77–P78 TSSM opt-in) ----
+    # ``rssm`` (P64/P79 env-free default) vs ``tssm`` vs ``sf_transformer``.
     # RSSM latent sizes and KL-balance knobs.  See TrainConfig.
     'DREAMER_WORLD_MODEL_TYPE':           ('world_model_type',               str),
     'DREAMER_RSSM_DETER_DIM':             ('rssm_deter_dim',                 int),

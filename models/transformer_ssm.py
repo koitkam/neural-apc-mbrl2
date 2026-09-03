@@ -7,23 +7,21 @@ critic warmup, joint mode) and swap ONLY the recurrent dynamics core (GRU + 32x3
 categorical RSSM) for a **causal transformer sequence model** that performs
 IN-CONTEXT SYSTEM IDENTIFICATION over the lookback window.
 
-STATUS (P77): env-free default (``TrainConfig.world_model_type='tssm'``;
-opt-out ``DREAMER_WORLD_MODEL_TYPE=rssm``).  Wired through ``build_model``,
+STATUS (P79): opt-in (``DREAMER_WORLD_MODEL_TYPE=tssm``).  P77 Markovian
++ P78 rest-IC KV-continue **FALSIFIED** as freeze / GAIN-READY; env-free
+default is RSSM.  Wired through ``build_model``,
 ``world_model_loss``, collect/val, gpu-calib, overshoot / held / gain-match
 (RSSM-interface).  ``_step`` is the per-layer KV-cache (O(window) vs
 O(window²) recompute); smoke ``tools/_smoke_tssm.py`` checks cached step vs
 full-sequence.  Rest-IC CUDA-graph is RSSM-only (kv-cache grows).
 
-KNOWN GAP (P77 LIVE probe / P78 HEAD): teacher-forced
+KNOWN GAP (P77 EXIT / P78 freeze FALSIFIED): teacher-forced
 ``rollout_observed`` and the fidelity probe warm the KV-cache over the
-lookback.  Gain-match rest-IC FD now continues that cache via
-``img_rollout(..., prev_state=)`` (P78; RSSM identity — GRU ``h`` is
-the history).  Overshoot / held / isolation still start
-``img_rollout(h, z)`` with ``kv_cache=None`` (Markovian 1-token net).
-CPU @wm_best70 (live P77 pid, Markovian teacher): Markovian vs cached
-CV |Δ| 0.256; 1step→OL ×0.272.  Probe H=55 / conv still cached
-compounding.  Metric for P78: freeze GAIN-READY vs P64 0.91@DV;
-jsonl teacher should no longer pin a different DC than 5-level TM.
+lookback.  Gain-match rest-IC FD continues that cache via
+``img_rollout(..., prev_state=)`` (P78 KEEP as OL lift / FALSIFIED as
+freeze; RSSM identity — GRU ``h`` is the history).  Overshoot / held /
+isolation still start ``img_rollout(h, z)`` with ``kv_cache=None``
+(Markovian 1-token net).  Do not KV-overshoot/held N+1.
 
 KV-cache does not slide; one imagination rollout must stay inside
 ``max_seq_len`` (lookback + H on test_sim; overflow falls back to

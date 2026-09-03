@@ -1,7 +1,7 @@
 """Recurrent State-Space Model (RSSM) world-model for DreamerV4.
 
 Drop-in GRU observer, selected via ``TrainConfig.world_model_type == 'rssm'``
-(P77 env-free default is ``'tssm'``; missing-ckpt fallback stays ``rssm``).  Motivation: across P64/P66/P67 the SF-transformer's
+(P79 env-free default after P77+P78 TSSM FALSIFIED; missing-ckpt fallback stays ``rssm``).  Motivation: across P64/P66/P67 the SF-transformer's
 ``wm_pred_converges_under_constant_action`` was pinned at **0.0** — it
 has no recurrent state able to hold an equilibrium (sliding-window
 attention + a freshly resampled ``z0 ~ N(0, I)`` each call → a

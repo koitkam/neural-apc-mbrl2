@@ -875,14 +875,14 @@ class TrainConfig:
     curriculum_wm_id_dr_off: bool = True
 
 
-    # ---- World-model backbone (P68 RSSM / P77 TSSM) ----
-    # ``'tssm'`` is the P77 env-free default: transformer-SSM over the
-    # lookback — in-context SysID instead of a GRU ``h`` that must carry
-    # DC (P73 compounding leftover; P76 keep-h REVERT).  ``'rssm'``
-    # restores the DreamerV3 GRU observer
-    # (``DREAMER_WORLD_MODEL_TYPE=rssm``).  ``'sf_transformer'`` is the
-    # original V4 shortcut-forcing WM (no held-action fixed point).
-    world_model_type: str = 'tssm'
+    # ---- World-model backbone (P68 RSSM / P77–P78 TSSM opt-in) ----
+    # ``'rssm'`` is the P64/P79 env-free default: DreamerV3 GRU observer.
+    # ``'tssm'`` (transformer-SSM over the lookback) was P77/P78 env-free;
+    # consecutive family FALSIFIED as freeze / GAIN-READY (Markovian then
+    # rest-IC KV-continue).  Opt in ``DREAMER_WORLD_MODEL_TYPE=tssm``.
+    # ``'sf_transformer'`` is the original V4 shortcut-forcing WM (no
+    # held-action fixed point).
+    world_model_type: str = 'rssm'
     rssm_deter_dim: int = 512          # GRU hidden (paper Medium)
     rssm_n_categoricals: int = 32      # paper
     rssm_n_classes: int = 32           # paper
@@ -7993,9 +7993,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     ``gmatch_ol_tail=0`` banner **REMOVED** (P69 field was always 0).
     **P76 EXIT REVERT:** RSSM GRU update-gate bias ``log(H/16)``
     (keep-h stalled conv; freeze GAIN_NOT_READY 0.80@MV).  Last-step
-    DC Huber stays (P64/P73).  **P77:** env-free observer is TSSM
-    (``world_model_type='tssm'``; ``DREAMER_WORLD_MODEL_TYPE=rssm``
-    restores GRU).
+    DC Huber stays (P64/P73).  **P77 EXIT FALSIFIED** Markovian TSSM
+    rest-IC.  **P78 freeze FALSIFIED** KV-continue as GAIN-READY
+    (KEEP as attributed OL lift vs Markovian).  Consecutive TSSM family
+    closed.  Env-free observer is RSSM (``world_model_type='rssm'``;
+    ``DREAMER_WORLD_MODEL_TYPE=tssm`` opt-in).
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder (not the categorical

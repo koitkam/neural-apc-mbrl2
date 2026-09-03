@@ -2,9 +2,9 @@
 
 Living architecture reference for the model-based APC controller. Keep this in
 sync with the code when the data flow changes (it is part of the repo on
-purpose). Backbone-agnostic: the **TSSM** (P77 env-free default; transformer
-over the lookback) and **RSSM** (opt-out `DREAMER_WORLD_MODEL_TYPE=rssm`) are
-duck-compatible — `TSSMState`
+purpose). Backbone-agnostic: the **RSSM** (P64/P79 env-free default; GRU)
+and **TSSM** (opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`; transformer over the
+lookback) are duck-compatible — `TSSMState`
 mirrors `RSSMState` (`.h`, `.z_logits`, `.z`, `.feat`, `.stoch_flat`) and both
 expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 `feat = cat([h, stoch_flat])` and `decode(feat) → obs`.
@@ -12,8 +12,8 @@ expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 Status legend: **[current]** = implemented & default · **[opt-in]** = implemented,
 env-gated off · **[planned]** = designed, not yet built.
 
-> **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE P2 after CAPPED freeze last_ok **91** **4.08@MV / 0.72@DV** GAIN_NOT_READY; live cap 0.72@DV discarded; probe110 H=55 **+0.242 conv=0**; jsonl ×1 ≠ 5-level TM; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> **2026-09-03 CURRENT env-free recipe (test_sim first):** RSSM **deterministic**
+> (P77+P78 TSSM family **FALSIFIED**; P78 freeze last_ok **91** **4.08@MV / 0.72@DV** GAIN_NOT_READY; KV-continue KEEP as OL lift / FALSIFIED as freeze; opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -162,7 +162,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED** as Markovian rest-IC (`run_p77_tssm`, pid **242511**, 158 iters):
 > CAPPED **−0.46@MV / 0.74@DV** last_ok **104**; val MV **×−0.496 / ×−0.129**
 > DV **×0.736 / ×0.655**; 1step→OL **×0.379**; det_r **0.090** pred_std **3.52 vs 1.93**;
-> conv=0; actor INVALID. **P78 LIVE P2** after CAPPED freeze last_ok **91** **4.08@MV / 0.72@DV** (`run_p78_prevkv`, pid **261143**; live cap 0.72@DV discarded; probe110 H=55 **+0.242 conv=0**; jsonl ×1 ≠ 5-level).
+> conv=0; actor INVALID. **P78 freeze FALSIFIED** KV-continue as GAIN-READY (`run_p78_prevkv`, pid **261143**; last_ok **91** **4.08@MV / 0.72@DV**; live cap 0.72@DV discarded; CPU last_ok OL **×0.520**; probe110 H=55 **+0.242 conv=0**; jsonl ×1 ≠ 5-level). TSSM family closed; env-free default **rssm**.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -244,7 +244,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > 8/9. FO family closed. **P76 EXIT** GRU z-bias **REVERT**
 > (`run_p76_grubias`, 148 iters): freeze 0.80@MV GAIN_NOT_READY; val
 > MV ×0.865 1step→OL ×0.770; actor INVALID. **P77 EXIT** TSSM Markovian rest-IC
-> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 LIVE P2** freeze last_ok **91** **4.08@MV / 0.72@DV** (live cap 0.72@DV discarded; CPU last_ok OL **×0.520** vs P77 **×0.106**; probe110 H=55 **+0.242 conv=0**).
+> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 freeze FALSIFIED** KV-continue as GAIN-READY (last_ok **91** **4.08@MV / 0.72@DV**; live cap 0.72@DV discarded; CPU last_ok OL **×0.520** vs P77 **×0.106**; probe110 H=55 **+0.242 conv=0**). TSSM family closed; env-free default **rssm**.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -595,7 +595,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > gate); wrap-recovery unlock still untested. Extra-P1 recovered basin stays
 > locked (P40). Do not raise lock_ratio.
 > Gain-match `img_rollout(..., last_only=True, out='obs', prev_state=)`
-> continues TSSM rest-IC KV (P78 LIVE P2 pid **261143** freeze last_ok **91** **4.08@MV** GAIN_NOT_READY; live cap 0.72@DV discarded; CPU last_ok OL **×0.520** / post **×0.561**; probe110 H=55 **+0.242 conv=0**; RSSM `prev_state=None` identity). jsonl emits
+> continues TSSM rest-IC KV (P78 freeze FALSIFIED as GAIN-READY / KEEP as OL lift; pid **261143** last_ok **91** **4.08@MV**; live cap 0.72@DV discarded; CPU last_ok OL **×0.520** / post **×0.561**; probe110 H=55 **+0.242 conv=0**; RSSM `prev_state=None` identity). jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
 > **P42 EXIT** (`run_p42_lastoklock`, launch `72f7b48`, 158 iters,
@@ -1017,8 +1017,8 @@ fixes BOTH:
   Last-step DC Huber restored. **P76 EXIT REVERT:** RSSM GRU
   update-gate bias `log(H/16)` (keep-h stalled conv; freeze
   GAIN_NOT_READY 0.80@MV; val 1step→OL ×0.770). Do not GRU-bias N+1.
-  **P77 EXIT FALSIFIED** Markovian rest-IC; TSSM default KEEP for
-  **P78 LIVE P2** freeze last_ok **91** **4.08@MV** (live cap 0.72@DV discarded; CPU OL **×0.520**; probe110 H=55 **+0.242 conv=0**; opt-out `DREAMER_WORLD_MODEL_TYPE=rssm`).
+  **P77 EXIT FALSIFIED** Markovian rest-IC; **P78 freeze FALSIFIED**
+  KV-continue as GAIN-READY (KEEP as OL lift; last_ok **91** **4.08@MV**; live cap 0.72@DV discarded; CPU OL **×0.520**; probe110 H=55 **+0.242 conv=0**). TSSM family closed. Env-free default **rssm** (opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`).
   Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the

@@ -2047,7 +2047,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gmatch_fo=True' not in _src
     assert 'gru_zbias=' in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
-    assert "world_model_type: str = 'tssm'" in _src
+    assert "world_model_type: str = 'rssm'" in _src
     assert 'gain_cv_skip_rms' not in _src
     assert '1×2 weight; not in' not in _src
     assert '_adv_action_corr' in _src
@@ -2204,7 +2204,7 @@ def _test_snr_measured_scope() -> None:
 def _test_envfree_observer_recipe() -> None:
     """Env-free TrainConfig must already be the P26 observer / P28 actor stack."""
     c = TrainConfig()
-    assert c.world_model_type == 'tssm', c.world_model_type
+    assert c.world_model_type == 'rssm', c.world_model_type
     assert c.rssm_latent_type == 'deterministic', c.rssm_latent_type
     assert c.wm_best_restore_at_p2 is False
     assert int(c.n_critics) == 2

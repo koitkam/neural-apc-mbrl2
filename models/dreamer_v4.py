@@ -1281,7 +1281,7 @@ class DreamerV4Config:
     n_critics: int = 2
     # ===== World-model backbone selection =====
     # ``'rssm'`` is the missing-ckpt fallback (P66 / P77: never default a
-    # loaded graph to TSSM or SF).  TrainConfig env-free default is ``'tssm'``.
+    # loaded graph to TSSM or SF).  TrainConfig env-free default is ``'rssm'``.
     world_model_type: str = 'rssm'
     rssm_deter_dim: int = 512
     rssm_n_categoricals: int = 32
