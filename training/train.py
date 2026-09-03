@@ -7327,7 +7327,8 @@ def _rest_ic_last_tensors(rssm, obs: torch.Tensor, act: torch.Tensor):
     """Last ``h/z/c_mean`` of a rest-IC ``last_only`` encode (eager).
 
     TSSM: drops ``kv_cache`` (RSSM ``h`` already is the history).  P77 LIVE
-    diagnosis — do not change while the GPU job is running.
+    CPU @wm_best70: Markovian vs cached |Δ| 0.256 / 1step→OL ×0.272 — do
+    not change while the GPU job is running.
     """
     _, _, _, state, *_ = rssm.rollout_observed(
         obs, act, sample=False, store_aux=False, last_only=True,
