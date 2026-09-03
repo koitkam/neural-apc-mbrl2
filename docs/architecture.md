@@ -158,7 +158,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > GAIN_NOT_READY**; val MV **×0.865 / ×1.004** DV **×0.819 / ×0.896**;
 > 1step→OL **×0.770**; actor INVALID. Keep-h stalled conv. Do not
 > GRU-bias N+1. **P77** env-free `world_model_type='tssm'`
-> (LIVE P1 iter 6; teacher ×0.98/×0.99; recon 0.423@6 vs P76 0.029).
+> (LIVE P1 iter 8; teacher ×0.95/×1.38 DV overgain; recon 0.386 vs P76 0.013).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
