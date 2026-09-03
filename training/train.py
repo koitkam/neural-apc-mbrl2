@@ -1049,7 +1049,9 @@ class TrainConfig:
     # p08 (2026-07-10): 0.0→0.1 (enabled now that the gain channel is default-on).
     # P73: the same coef also L2-pins OL gain-c at teacher K to sg(rest-IC
     # MEAN G). Posterior Δ persist does not constrain ``img_rollout`` prior G.
-    cont_gain_persist_coef: float = 0.1
+    # P79 EXIT: rssm KEEP; identity missed P64 freeze 0.91@DV (P79 0.81@DV
+    # last_ok 81). P64 predates OL persist. P80 A/B: default 0.1→0.0.
+    cont_gain_persist_coef: float = 0.0
     # ---- MIMO self-supervised per-INPUT isolation (2026-07-10) ----
     # The DATA-DRIVEN generalisation of C(1) gain-match: on isolated-excitation
     # episodes (ONE input swept, all others held) the CV response is driven by
