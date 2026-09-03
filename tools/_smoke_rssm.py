@@ -1682,14 +1682,11 @@ def _test_img_rollout_last_only() -> None:
 
 
 def _test_gru_update_gate_bias() -> None:
-    """P76: H=55 z-bias ≈1.24 on update slice; H=0 leaves PyTorch init;
-    decoder still MLP-only (P74 skip REVERT)."""
-    import math
+    """P76 REVERT: z-bias is 0 (PyTorch init); decoder still MLP-only."""
     from models.dreamer_v4_rssm import (
         RSSMConfig, RSSMDynamics, gru_update_gate_bias)
     assert abs(gru_update_gate_bias(0) - 0.0) < 1e-12
-    b55 = float(math.log(55.0 / 16.0))
-    assert abs(gru_update_gate_bias(55) - b55) < 1e-6
+    assert abs(gru_update_gate_bias(55) - 0.0) < 1e-12
     cfg0 = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
                       n_categoricals=4, n_classes=4, embed_dim=16,
                       hidden_dim=16, latent_type='deterministic',
@@ -1701,17 +1698,16 @@ def _test_gru_update_gate_bias() -> None:
                      hidden_dim=16, latent_type='deterministic',
                      cont_gain_dim=2, cv_indices=(0,), horizon=55)
     m = RSSMDynamics(cfg)
+    assert abs(float(m._gru_update_gate_bias)) < 1e-12
+    # PyTorch GRUCell init is not the P76 fill of log(H/16).
     hs = int(cfg.deter_dim)
-    expect = torch.full((hs,), b55)
-    assert torch.allclose(m.gru.bias_ih[hs:2 * hs].detach(), expect)
-    assert torch.allclose(m.gru.bias_hh[hs:2 * hs].detach(), expect)
-    assert abs(float(m._gru_update_gate_bias) - b55) < 1e-6
+    filled = torch.full((hs,), float(__import__('math').log(55.0 / 16.0)))
+    assert not torch.allclose(m.gru.bias_ih[hs:2 * hs].detach(), filled)
     assert not hasattr(m, 'gain_cv_skip') or getattr(m, 'gain_cv_skip', None) is None
     feat = torch.randn(4, m.feat_dim)
     x = feat[..., :m._decode_in_dim]
     assert torch.allclose(m.decode(feat), m.decoder(x), atol=1e-6, rtol=1e-5)
-    print('[smoke] OK  GRU update-gate bias log(H/16) on both slices '
-          '(idle logit 2b); skip REVERT')
+    print('[smoke] OK  GRU update-gate bias REVERT (PyTorch init); skip REVERT')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -1931,6 +1927,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gain_match_rest_ic_len: int = 0' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert '_rest_ic_can_cuda_graph' in _src
+    assert "type(rssm).__name__ != 'RSSMDynamics'" in _src
     assert 'make_graphed_callables' in _src
     assert 'cache_enabled=False' in _src
     assert 'enabled=False' in _src
@@ -1985,7 +1982,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _recurrence_c' in _cz
     assert 'def gru_update_gate_bias' in _rssm_src
     assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
-    assert 'bias_ih[hs:2 * hs]' in _rssm_src
+    assert 'fill_(_zbias)' not in _rssm_src
     assert 'def init_gain_cv_skip' not in _rssm_src
     assert 'def apply_gain_cv_skip' not in _rssm_src
     assert 'self.recurrence_c_dim = int(self.cont_dim)' in _rssm_src
@@ -2044,6 +2041,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "last_only=True, out='obs', return_state=True" in _src
     assert 'gmatch_fo=True' not in _src
     assert 'gru_zbias=' in _src
+    assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
+    assert "world_model_type: str = 'tssm'" in _src
     assert 'gain_cv_skip_rms' not in _src
     assert '1×2 weight; not in' not in _src
     assert '_adv_action_corr' in _src
@@ -2200,6 +2199,7 @@ def _test_snr_measured_scope() -> None:
 def _test_envfree_observer_recipe() -> None:
     """Env-free TrainConfig must already be the P26 observer / P28 actor stack."""
     c = TrainConfig()
+    assert c.world_model_type == 'tssm', c.world_model_type
     assert c.rssm_latent_type == 'deterministic', c.rssm_latent_type
     assert c.wm_best_restore_at_p2 is False
     assert int(c.n_critics) == 2
@@ -4820,6 +4820,7 @@ def _test_stage1_dob_ground_skip() -> None:
     cfg.obs_dim, cfg.action_dim = 6, 1
     cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
     cfg.mtp_length = 4
+    cfg.world_model_type = 'rssm'
     cfg.dob_enabled = True
     cfg.dob_ground_coef = 2.0
     cfg.cv_obs_indices = (0,)
@@ -4856,6 +4857,7 @@ def _test_stream_serve_matches_rollout() -> None:
     cfg.obs_dim, cfg.action_dim = 6, 1
     cfg.lookback, cfg.seq_len, cfg.horizon = 8, 8, 4
     cfg.mtp_length = 4
+    cfg.world_model_type = 'rssm'
     cfg.rssm_deter_dim = 32
     cfg.rssm_n_categoricals = 4
     cfg.rssm_n_classes = 4
@@ -4939,6 +4941,7 @@ def _test_collect_serve_cuda_graph_cpu() -> None:
     cfg.obs_dim, cfg.action_dim = 4, 1
     cfg.lookback, cfg.seq_len, cfg.horizon = 8, 8, 4
     cfg.mtp_length = 1
+    cfg.world_model_type = 'rssm'
     cfg.rssm_deter_dim = 16
     cfg.rssm_n_categoricals = 4
     cfg.rssm_n_classes = 4

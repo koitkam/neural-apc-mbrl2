@@ -875,15 +875,14 @@ class TrainConfig:
     curriculum_wm_id_dr_off: bool = True
 
 
-    # ---- World-model backbone (P68, 2026-05-30) ----
-    # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
-    # default: its deterministic GRU core can learn a held-action fixed
-    # point ``h* = f(h*, z*, a)`` — the structural property the
-    # SF-transformer lacked (``wm_pred_converges_under_constant_action``
-    # pinned at 0.0 across P64/P66/P67, the upstream cause of the
-    # bootstrap-cascade that every critic/reward-side fix failed to break).
-    # ``'sf_transformer'`` selects the original V4 shortcut-forcing WM.
-    world_model_type: str = 'rssm'
+    # ---- World-model backbone (P68 RSSM / P77 TSSM) ----
+    # ``'tssm'`` is the P77 env-free default: transformer-SSM over the
+    # lookback — in-context SysID instead of a GRU ``h`` that must carry
+    # DC (P73 compounding leftover; P76 keep-h REVERT).  ``'rssm'``
+    # restores the DreamerV3 GRU observer
+    # (``DREAMER_WORLD_MODEL_TYPE=rssm``).  ``'sf_transformer'`` is the
+    # original V4 shortcut-forcing WM (no held-action fixed point).
+    world_model_type: str = 'tssm'
     rssm_deter_dim: int = 512          # GRU hidden (paper Medium)
     rssm_n_categoricals: int = 32      # paper
     rssm_n_classes: int = 32           # paper
@@ -4229,9 +4228,11 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         # Env-free P40: dcv_match default True is inert while isolation is off.
         _iso_txt = 'iso_dcv=off '
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
-    _gru_zb = math.log(_h_zb / 16.0) if _h_zb > 0 else 0.0
+    from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
+    _gru_zb = float(_gru_zbias_fn(_h_zb))
     print(
         '[resolved-cfg] '
+        f"wm={getattr(cfg, 'world_model_type', 'rssm')} "
         f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
         f"restore_p2={bool(getattr(cfg, 'wm_best_restore_at_p2', False))} "
         f"gain_match={float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0):.3g} "
@@ -7935,10 +7936,13 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     ``gain_cv_skip`` was a teacher-pin no-op (rms stalled 0.00387;
     det_r 0.074; paired −48 vs −105, mv_viol 20).  **P75 EXIT REVERT:**
     FOPDT rise teacher (rise Huber mass 1.4% at K=H; val 1step→OL
-    ×0.803 vs P64 ×0.85). Dummy
+    ×0.803 vs P64 ×0.85).  Dummy
     ``gmatch_ol_tail=0`` banner **REMOVED** (P69 field was always 0).
-    **P76:** RSSM GRU update-gate bias ``log(H/16)``; last-step DC
-    Huber restored (P64/P73).
+    **P76 EXIT REVERT:** RSSM GRU update-gate bias ``log(H/16)``
+    (keep-h stalled conv; freeze GAIN_NOT_READY 0.80@MV).  Last-step
+    DC Huber stays (P64/P73).  **P77:** env-free observer is TSSM
+    (``world_model_type='tssm'``; ``DREAMER_WORLD_MODEL_TYPE=rssm``
+    restores GRU).
 
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
     flows into the CONTINUOUS gain channel + decoder (not the categorical

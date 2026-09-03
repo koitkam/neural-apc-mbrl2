@@ -61,8 +61,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -410,29 +408,24 @@ class RSSMConfig:
     # sampling variance → a stable, unbiased observer gain.  No-op when
     # sample=False or no gain block.
     cont_gain_deterministic_roll: bool = True
-    # Control horizon (TrainConfig.horizon).  RSSM GRU update-gate bias
-    # is ``log(H/16)`` (P76; LSTM forget-bias analogue).  0 = PyTorch
-    # default init (smokes / missing field).  Not a TrainConfig knob.
+    # Control horizon (TrainConfig.horizon).  P76 GRU update-gate bias
+    # ``log(H/16)`` **REVERT** (keep-h stalled held-SS / freeze
+    # GAIN_NOT_READY).  Field kept so old RSSMConfig still constructs;
+    # ``gru_update_gate_bias`` is identically 0 (PyTorch init).
     horizon: int = 0
 
 
 def gru_update_gate_bias(horizon: int) -> float:
-    """LSTM forget-bias analogue for PyTorch ``GRUCell`` update gate.
+    """P76 REVERT: always 0 (PyTorch ``GRUCell`` init).
 
-    PyTorch: ``h' = (1-z)*n + z*h``.  Positive ``z`` bias keeps old
-    ``h`` across the TM horizon so DC does not require the decoder to
-    reconstruct gain from a contracted recurrent state (P73 RCA:
-    persist pinned ``c``; 1-step faithful / OL short).  Derived
-    ``log(max(H,1)/16)``.  ``H<=0`` (RSSMConfig default) → 0, leaving
-    PyTorch init.  test_sim H=55 → ~1.235.  Applied to **both**
-    ``bias_ih[hs:2hs]`` and ``bias_hh[hs:2hs]``, so the idle logit is
-    ``2b`` (sigmoid ~0.92) not ``b``.  No TrainConfig knob.
-    RSSM-only (TSSM has no GRU).
+    ``log(H/16)`` on both update-gate slices (idle logit ``2b`` →
+    sigmoid ~0.92) kept ``||h||`` and **prevented settling** (conv=0
+    through P1; freeze last_ok 84 5-level 0.80@MV GAIN_NOT_READY;
+    val 1step→OL ×0.770 vs P64 ×0.85).  Opposite of a DC fixed point.
+    ``horizon`` is unused; kept so call sites / resolved-cfg stay.
     """
-    h = int(horizon or 0)
-    if h <= 0:
-        return 0.0
-    return float(math.log(max(h, 1) / 16.0))
+    del horizon
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -692,16 +685,9 @@ class RSSMDynamics(nn.Module):
         self.pre_gru = _MLP(trans_in, trans_in,
                             hidden_dim=self.hidden_dim, num_layers=1)
         self.gru = nn.GRUCell(trans_in, self.deter_dim)
-        # P76: update-gate bias so ``h`` retains DC over H (Jozefowicz
-        # 2015 LSTM forget-bias analogue).  PyTorch GRUCell gates are
-        # ``[reset, update, new]`` each ``deter_dim``.
-        _zbias = gru_update_gate_bias(int(getattr(cfg, 'horizon', 0) or 0))
-        self._gru_update_gate_bias = float(_zbias)
-        if abs(_zbias) > 0.0:
-            hs = int(self.deter_dim)
-            with torch.no_grad():
-                self.gru.bias_ih[hs:2 * hs].fill_(_zbias)
-                self.gru.bias_hh[hs:2 * hs].fill_(_zbias)
+        # P76 REVERT: do not fill the update-gate bias. Keep-h FALSIFIED.
+        self._gru_update_gate_bias = float(
+            gru_update_gate_bias(int(getattr(cfg, 'horizon', 0) or 0)))
         # Prior p(z'|h') and posterior q(z'|h', embed).
         _lt = str(getattr(cfg, 'latent_type', 'deterministic'))
         _ln = float(getattr(cfg, 'latent_noise', 0.0) or 0.0)
