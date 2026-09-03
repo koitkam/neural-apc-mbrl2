@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** RSSM **deterministic**
-> (P77+P78 TSSM family **FALSIFIED**; P78 EXIT last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; KV-continue KEEP as OL lift / FALSIFIED as freeze; opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`; **P79 LIVE** pid **277462** env-free `wm=rssm` P1 probe30 H=55 **+0.479 conv=0**) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77+P78 TSSM family **FALSIFIED**; P78 EXIT last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; KV-continue KEEP as OL lift / FALSIFIED as freeze; opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`; **P79 LIVE** pid **277462** env-free `wm=rssm` P1 wrap-lock last_ok **34** recon **0.139@38** recovering; probe30 H=55 **+0.479 conv=0**) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -162,7 +162,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED** as Markovian rest-IC (`run_p77_tssm`, pid **242511**, 158 iters):
 > CAPPED **−0.46@MV / 0.74@DV** last_ok **104**; val MV **×−0.496 / ×−0.129**
 > DV **×0.736 / ×0.655**; 1step→OL **×0.379**; det_r **0.090** pred_std **3.52 vs 1.93**;
-> conv=0; actor INVALID. **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (`run_p78_prevkv`, pid **261143**, 158 iters): last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL-vs-real **×0.567**; det_r **0.010** pred_std **2.45 vs 1.93**; actor INVALID. TSSM family closed; env-free default **rssm**. **P79 LIVE** (`run_p79_rssmrevert`, pid **277462**): Step 4 CONFIRMED `wm=rssm` `device=cuda` bs=**128** rest-IC graph **captured**. Probe30 H=1 **+0.553** H=55 **+0.479 conv=0** best_h=55 (H=55 still above floor; **conv 0.25→0** vs P64 0.50). Do **not** launch a second GPU job.
+> conv=0; actor INVALID. **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (`run_p78_prevkv`, pid **261143**, 158 iters): last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL-vs-real **×0.567**; det_r **0.010** pred_std **2.45 vs 1.93**; actor INVALID. TSSM family closed; env-free default **rssm**. **P79 LIVE** (`run_p79_rssmrevert`, pid **277462**): Step 4 CONFIRMED `wm=rssm` `device=cuda` bs=**128** rest-IC graph **captured**. Probe30 H=55 **+0.479 conv=0**. Wrap-lock last_ok **34** @35 recon **0.582** skip **0** recovering **0.139@38**. Do **not** launch a second GPU job.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -244,7 +244,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > 8/9. FO family closed. **P76 EXIT** GRU z-bias **REVERT**
 > (`run_p76_grubias`, 148 iters): freeze 0.80@MV GAIN_NOT_READY; val
 > MV ×0.865 1step→OL ×0.770; actor INVALID. **P77 EXIT** TSSM Markovian rest-IC
-> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL **×0.567**; det_r **0.010**). TSSM family closed; env-free default **rssm**. **P79 LIVE** pid **277462** `wm=rssm` bs=128 graph captured. Probe30 H=55 **+0.479 conv=0**.
+> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL **×0.567**; det_r **0.010**). TSSM family closed; env-free default **rssm**. **P79 LIVE** pid **277462** `wm=rssm` bs=128 graph captured. Wrap-lock last_ok **34**; probe30 H=55 **+0.479 conv=0**.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -1018,7 +1018,7 @@ fixes BOTH:
   update-gate bias `log(H/16)` (keep-h stalled conv; freeze
   GAIN_NOT_READY 0.80@MV; val 1step→OL ×0.770). Do not GRU-bias N+1.
   **P77 EXIT FALSIFIED** Markovian rest-IC; **P78 EXIT FALSIFIED**
-  KV-continue as GAIN-READY (KEEP as OL lift; last_ok **91** **4.08@MV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857**; det_r **0.010**). TSSM family closed. Env-free default **rssm** (opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`). **P79 LIVE** pid **277462** Step 4 CONFIRMED `wm=rssm` bs=128 rest-IC graph captured. Probe30 H=55 **+0.479 conv=0**.
+  KV-continue as GAIN-READY (KEEP as OL lift; last_ok **91** **4.08@MV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857**; det_r **0.010**). TSSM family closed. Env-free default **rssm** (opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`). **P79 LIVE** pid **277462** Step 4 CONFIRMED `wm=rssm` bs=128 rest-IC graph captured. Wrap-lock last_ok **34**; probe30 H=55 **+0.479 conv=0**.
   Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
