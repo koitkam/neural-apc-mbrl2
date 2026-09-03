@@ -7,22 +7,24 @@ critic warmup, joint mode) and swap ONLY the recurrent dynamics core (GRU + 32x3
 categorical RSSM) for a **causal transformer sequence model** that performs
 IN-CONTEXT SYSTEM IDENTIFICATION over the lookback window.
 
-STATUS (2026-06-06): FUNCTIONAL + wired (build_model 'tssm' branch, dispatch,
-diagnostics, collection, gpu-calib all route it as an rssm-interface backbone).
-Transitions implemented with a **per-layer KV-CACHE** (``_step`` advances one
-token in O(window) vs O(window^2) recompute); the cached path is validated EQUAL
-to the full-sequence forward by tools/_smoke_tssm.py (max_err ~5e-7).  Custom
-causal transformer (``_CausalSelfAttention`` + ``_Block``, pre-LN) supports both
-a full forward (``forward_full`` — training / reference) and a cached single-step
-(``forward_step`` — imagination) on the SAME weights.  REMAINING: a GPU A/B run
-vs RSSM (ideally under DR), and consumer-compat for the overshoot/held-rollout
-losses (currently no-op for TSSM — feat-only Markovian reconstruction loses the
-transformer context; windowed attention already supervises multi-step natively).
-NOTE the KV-cache assumes a single imagination rollout stays within
-``max_seq_len`` (true for H<=horizon from a lookback-sized context); it does not
-slide the cache, so absolute positional encoding stays exact.  ``NotImplemented``
-no longer applies.  See "Wiring plan" + "Open design decisions"
-below.
+STATUS (P77): env-free default (``TrainConfig.world_model_type='tssm'``;
+opt-out ``DREAMER_WORLD_MODEL_TYPE=rssm``).  Wired through ``build_model``,
+``world_model_loss``, collect/val, gpu-calib, overshoot / held / gain-match
+(RSSM-interface).  ``_step`` is the per-layer KV-cache (O(window) vs
+O(window²) recompute); smoke ``tools/_smoke_tssm.py`` checks cached step vs
+full-sequence.  Rest-IC CUDA-graph is RSSM-only (kv-cache grows).
+
+KNOWN GAP (P77 LIVE diagnosis; do not patch the live job): teacher-forced
+``rollout_observed`` and the fidelity probe warm the KV-cache over the
+lookback, but gain-match / overshoot / held / isolation start
+``img_rollout(h, z)`` with ``kv_cache=None`` (RSSM-correct: GRU ``h`` *is*
+the history; TSSM then rolls a 1-token Markovian net).  ``_rest_ic_last_tensors``
+returns only ``h/z/c`` and drops the encode cache.  A later attributed A/B
+would pass ``prev_state`` into those OL rolls.  Metric: probe H=55 r / conv
+/ val 1step→OL vs P64 ×0.85.
+
+KV-cache does not slide; one imagination rollout must stay inside
+``max_seq_len`` (lookback + H on test_sim).
 
 WHY a transformer core (vs the current SF/flow transformer):
   The existing ``world_model_type='sf_transformer'`` is a shortcut-forcing/flow
@@ -68,49 +70,11 @@ CORE ARCHITECTURE (the transition methods to implement):
   for training prior grad — same ST requirement the overshoot/held-rollout losses
   rely on).  decode(feat) reconstructs obs.
 
-  img_step (imagination, the PERF-CRITICAL path): advance ONE step under a held/
-  given action with NO obs.  Naive = re-run the transformer over the whole token
-  history each step (O(T^2) over H imagination steps).  CORRECT + FAST = maintain
-  a KV-CACHE in the State object: each img_step appends one token, attends it
-  against cached keys/values -> O(T) per step.  *** This KV-cache is the main
-  reason this is a scaffold, not a finished impl — it must be implemented +
-  numerically validated (img_step result == teacher-forced rollout on the same
-  actions) before any training run. ***
-
-WIRING PLAN (when implemented):
-  1. models/dreamer_v4.py DreamerV4.__init__: add ``elif world_model_type ==
-     'tssm': self.dynamics = TransformerSSMDynamics(tssm_cfg)`` alongside the
-     RSSM branch; ensure parameters_world() includes it (it already globs
-     self.dynamics.parameters()).
-  2. training/train.py world_model_loss / real-sim actor-critic dispatch: the RSSM
-     branch checks ``world_model_type == 'rssm'``; widen to
-     ``in ('rssm', 'tssm')`` since the interface is identical (feat=[h,z_flat],
-     rollout_observed/img_step/decode).  Verify _wm_latent_overshoot_loss and
-     _wm_held_rollout_stationarity_loss (which read rssm.deter_dim /
-     n_categoricals / img_step) work unchanged — they will, by contract.
-  3. ENV_OVERRIDES: DREAMER_WORLD_MODEL_TYPE already exists; add TSSM dims
-     (DREAMER_TSSM_{D_MODEL,N_LAYERS,N_HEADS}).
-  4. compile + the inference/export_onnx path (RSSM ONNX is not implemented;
-     TSSM ONNX is a separate task).
-
-OPEN DESIGN DECISIONS (resolve before implementing):
-  - deter_dim == d_model couples the feature size to the transformer width; the
-    V4 heads are built on feat_dim = deter_dim + K*C, so picking d_model sets the
-    head input size (fine, but note it for model-size BO).
-  - KL free-bits: reuse rssm_kl_loss verbatim (post vs prior logits) — no change.
-  - Positional encoding over the lookback: absolute vs rotary; rotary preferred
-    for length generalization (imagination H may exceed training seq_len).
-  - Observer / aux rolls pass ``sample=`` explicitly (isolation/gain-match
-    ``False``).  ``DREAMER_RSSM_IMAG_LATENT_MODE`` was a deleted-imagination
-    leftover and is no longer a TrainConfig field.
-  - Numerical-equivalence test (MUST pass): img_step rolled K steps under the
-    SAME actions as a teacher-forced rollout must match within tol (proves the
-    KV-cache path == the full-attention path).
-
-Until the transition methods' KV-cache + dispatch wiring are done, ``build_model``
-must NOT dispatch to this class.  STATUS: transitions IMPLEMENTED (naive windowed
-recompute, CPU-tested via tools/_smoke_tssm.py); KV-cache + consumer-compat +
-dispatch remain (see top-of-file STATUS).
+  img_step (imagination, the PERF-CRITICAL path): advance ONE step under a held
+  / given action with NO obs.  ``_step`` appends one token and attends it
+  against the KV-cache -> O(T) per step.  Callers that pass a warmed
+  ``TSSMState`` (``rollout_observed``, fidelity probe) keep lookback context.
+  Callers that rebuild from sliced ``(h, z)`` start ``kv_cache=None``.
 """
 
 from __future__ import annotations
@@ -344,8 +308,9 @@ def _sinusoidal_pos(n: int, d: int, device, dtype) -> torch.Tensor:
 class TransformerSSMDynamics(nn.Module):
     """Causal-transformer dynamics core implementing the RSSMDynamics interface.
 
-    Naive (recompute) transitions — correct + CPU-tested.  KV-cache is a future
-    pure-speed optimization gated by the equivalence test (see module docstring).
+    KV-cached ``_step`` is the live transition.  ``img_rollout(..., prev_state=)``
+    continues the cache; a fresh ``(h0, z0)`` start is Markovian (see module
+    docstring KNOWN GAP).
     """
 
     def __init__(self, cfg: TransformerSSMConfig):

@@ -2,8 +2,9 @@
 
 Living architecture reference for the model-based APC controller. Keep this in
 sync with the code when the data flow changes (it is part of the repo on
-purpose). Backbone-agnostic: the **RSSM** (default) and **TSSM** (transformer,
-opt-in via `DREAMER_WORLD_MODEL_TYPE=tssm`) are duck-compatible — `TSSMState`
+purpose). Backbone-agnostic: the **TSSM** (P77 env-free default; transformer
+over the lookback) and **RSSM** (opt-out `DREAMER_WORLD_MODEL_TYPE=rssm`) are
+duck-compatible — `TSSMState`
 mirrors `RSSMState` (`.h`, `.z_logits`, `.z`, `.feat`, `.stoch_flat`) and both
 expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 `feat = cat([h, stoch_flat])` and `decode(feat) → obs`.
@@ -11,8 +12,8 @@ expose `obs_step` / `img_step` / `decode` / `rollout_observed`, with
 Status legend: **[current]** = implemented & default · **[opt-in]** = implemented,
 env-gated off · **[planned]** = designed, not yet built.
 
-> **2026-08-29 CURRENT env-free recipe (test_sim first):** RSSM **deterministic**
-> continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
+> (P77 LIVE A/B; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset

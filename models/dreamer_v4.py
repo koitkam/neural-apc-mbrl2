@@ -1280,12 +1280,8 @@ class DreamerV4Config:
     # P26 RCA / P27: TD3-style min-of-N twohot critics.  1 = paper single head.
     n_critics: int = 2
     # ===== World-model backbone selection =====
-    # ``'rssm'`` (new default 2026-05-30) uses the DreamerV3 recurrent
-    # state-space model (GRU + categorical latent) whose deterministic
-    # core can learn a held-action fixed point — the property the
-    # SF-transformer lacked (0% steady-state convergence drove the
-    # bootstrap-cascade across P64/P66/P67).  ``'sf_transformer'`` keeps
-    # the original V4 shortcut-forcing transformer dynamics.
+    # ``'rssm'`` is the missing-ckpt fallback (P66 / P77: never default a
+    # loaded graph to TSSM or SF).  TrainConfig env-free default is ``'tssm'``.
     world_model_type: str = 'rssm'
     rssm_deter_dim: int = 512
     rssm_n_categoricals: int = 32

@@ -7324,7 +7324,11 @@ def _gain_match_rest_ic_tensors(
 
 
 def _rest_ic_last_tensors(rssm, obs: torch.Tensor, act: torch.Tensor):
-    """Last ``h/z/c_mean`` of a rest-IC ``last_only`` encode (eager)."""
+    """Last ``h/z/c_mean`` of a rest-IC ``last_only`` encode (eager).
+
+    TSSM: drops ``kv_cache`` (RSSM ``h`` already is the history).  P77 LIVE
+    diagnosis — do not change while the GPU job is running.
+    """
     _, _, _, state, *_ = rssm.rollout_observed(
         obs, act, sample=False, store_aux=False, last_only=True,
         return_feats=False)
