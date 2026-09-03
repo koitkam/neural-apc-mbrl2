@@ -161,7 +161,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > GRU-bias N+1. **P77** env-free `world_model_type='tssm'`
 > (LIVE P1 iter 50; probe50 H=1 r=+0.509 H=55 r=+0.273 conv=0
 > gain_fid=0.389; recon best 0.007 ~2.5× P64; persist_rel 0.51;
-> CPU @wm_best40 Markovian |Δ|=0.14 1step→OL ×0.077 — no live patch).
+> CPU @wm_best50 Markovian |Δ|=0.123 1step→OL ×0.097 — no live patch).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -774,7 +774,7 @@ flowchart TB
     GD --> OBS
   end
 
-  subgraph WM["World model (RSSM default / TSSM opt-in)  — opt_world"]
+  subgraph WM["World model (TSSM default / RSSM opt-out)  — opt_world"]
     ENC["encoder / embed(obs)"]
     POST["posterior obs_step\n-> z (sees obs)"]
     PRIOR["prior img_step\n-> z_hat (no obs)"]
