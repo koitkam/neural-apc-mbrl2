@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 LIVE P2 iter 153 after CAPPED GAIN_NOT_READY −0.46@MV / 0.74@DV last_ok 104; orig-P1 @82 FAIL −1.06@MV; extra-P1 @94 FAIL −0.29@MV; P2@150 H=55 +0.152 conv=0 collapsed from +0.475@130 — not freeze health; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE rest-IC `prev_state=`; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -158,11 +158,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > (`run_p76_grubias`, pid **237453**, 148 iters): freeze **0.80@MV
 > GAIN_NOT_READY**; val MV **×0.865 / ×1.004** DV **×0.819 / ×0.896**;
 > 1step→OL **×0.770**; actor INVALID. Keep-h stalled conv. Do not
-> GRU-bias N+1. **P77** env-free `world_model_type='tssm'`
-> (LIVE P2 iter **153** after CAPPED GAIN_NOT_READY **−0.46@MV / 0.74@DV** last_ok **104**
-> vs P64 0.91@DV; extra-P1 @94 **−0.29@MV / 0.80@DV** worsened; orig-P1 @82 **−1.06@MV**;
-> probe100 H=1 r=+0.567 H=55 r=+0.299 conv=0; P2@150 H=1 +0.585 H=55 +0.152 conv=0 (collapsed from +0.475@130) — not freeze health;
-> recon freeze 0.0026; jsonl ×1 ≠ 5-level; HEAD P78 `prev_state=` not this pid; do not score actor).
+> GRU-bias N+1. **P77 EXIT** env-free `world_model_type='tssm'`
+> **FALSIFIED** as Markovian rest-IC (`run_p77_tssm`, pid **242511**, 158 iters):
+> CAPPED **−0.46@MV / 0.74@DV** last_ok **104**; val MV **×−0.496 / ×−0.129**
+> DV **×0.736 / ×0.655**; 1step→OL **×0.379**; det_r **0.090** pred_std **3.52 vs 1.93**;
+> conv=0; actor INVALID. **P78 LIVE** rest-IC `prev_state=` (`run_p78_prevkv`, pid **261143**).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -243,8 +243,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > 391 iters): val MV ×0.822 1step→OL ×0.803 paired −24.50 vs −84.89
 > 8/9. FO family closed. **P76 EXIT** GRU z-bias **REVERT**
 > (`run_p76_grubias`, 148 iters): freeze 0.80@MV GAIN_NOT_READY; val
-> MV ×0.865 1step→OL ×0.770; actor INVALID. **P77** TSSM default
-> (LIVE Markovian rest-IC OL). **P78 HEAD** rest-IC `prev_state=`.
+> MV ×0.865 1step→OL ×0.770; actor INVALID. **P77 EXIT** TSSM Markovian rest-IC
+> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 LIVE** rest-IC `prev_state=`.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -595,7 +595,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > gate); wrap-recovery unlock still untested. Extra-P1 recovered basin stays
 > locked (P40). Do not raise lock_ratio.
 > Gain-match `img_rollout(..., last_only=True, out='obs', prev_state=)`
-> continues TSSM rest-IC KV (P78 HEAD; RSSM `prev_state=None` identity). jsonl emits
+> continues TSSM rest-IC KV (P78 LIVE pid **261143**; RSSM `prev_state=None` identity). jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
 > **P42 EXIT** (`run_p42_lastoklock`, launch `72f7b48`, 158 iters,
@@ -1017,8 +1017,8 @@ fixes BOTH:
   Last-step DC Huber restored. **P76 EXIT REVERT:** RSSM GRU
   update-gate bias `log(H/16)` (keep-h stalled conv; freeze
   GAIN_NOT_READY 0.80@MV; val 1step→OL ×0.770). Do not GRU-bias N+1.
-  **P77:** env-free `world_model_type='tssm'` (opt-out
-  `DREAMER_WORLD_MODEL_TYPE=rssm`).
+  **P77 EXIT FALSIFIED** Markovian rest-IC; TSSM default KEEP for
+  **P78 LIVE** `prev_state=` (opt-out `DREAMER_WORLD_MODEL_TYPE=rssm`).
   Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
