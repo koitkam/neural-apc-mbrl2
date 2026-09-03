@@ -154,10 +154,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > **0.446**. Paired **−24.50 vs −84.89** VALID 8/9, mv_viol **1.50**.
 > Rise mass 1.4% at K=H. FO family **closed**. Persist KEEP. Last-step
 > DC Huber restored. **P76** RSSM GRU update-gate bias `log(H/16)`
-> (test_sim ~1.24; both slices, idle logit 2b; LIVE P2: orig-P1 FAIL
-> 0.79@DV; extra-P1 live 0.84 discarded; freeze last_ok 84 5-level
-> **0.80@MV ready=False**; conv=0 through P2@100; n=1 last_ok TM
-> ×0.907/×0.928 vs P64@80 ×0.971/×0.915).
+> (test_sim ~1.24; both slices, idle logit 2b; LIVE P2 iter 118:
+> orig-P1 FAIL 0.79@DV; extra-P1 live 0.84 discarded; freeze last_ok
+> 84 5-level **0.80@MV ready=False**; conv=0 through P2@100, conv=0.25
+> at frozen-g probe 110; n=1 last_ok TM ×0.907/×0.928 vs P64@80
+> ×0.971/×0.915).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -237,8 +238,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > DOB steal. **P75 EXIT** FOPDT rise **REVERT** (`run_p75_gmatchfo`,
 > 391 iters): val MV ×0.822 1step→OL ×0.803 paired −24.50 vs −84.89
 > 8/9. FO family closed. **P76** GRU update-gate bias `log(H/16)`
-> (LIVE P2: freeze last_ok 84 5-level 0.80@MV ready=False; conv=0;
-> z-bias still 1.23).
+> (LIVE P2 iter 118: freeze last_ok 84 5-level 0.80@MV ready=False;
+> conv=0 through P2@100, conv=0.25 at probe 110; z-bias still 1.23).
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -1008,11 +1009,12 @@ fixes BOTH:
   (rms 0.00387; det_r 0.074; mv_viol 20).   **P75 EXIT REVERT:**
   FOPDT rise teacher (rise mass 1.4% at K=H; val 1step→OL ×0.803).
   Last-step DC Huber restored. **P76:** RSSM GRU update-gate bias
-  `log(H/16)` on both GRU slices (idle logit `2b`; LIVE P2 freeze
-  last_ok 84 5-level **0.80@MV ready=False**; conv=**0** through
-  P2@100; z-bias still **1.23** / z_mean **0.89** vs P64 **0.73**;
-  CPU n=1 last_ok TM MV **×0.907** DV **×0.928** vs P64@80
-  ×0.971/×0.915 — n=1 ≠ 5-level gate). No new knob.
+  `log(H/16)` on both GRU slices (idle logit `2b`; LIVE P2 iter 118
+  freeze last_ok 84 5-level **0.80@MV ready=False**; conv=**0**
+  through P2@100, conv=0.25 at frozen-g probe 110; z-bias still
+  **1.23** / z_mean **0.89** vs P64 **0.73**; CPU n=1 last_ok TM MV
+  **×0.907** DV **×0.928** vs P64@80 ×0.971/×0.915 — n=1 ≠ 5-level
+  gate). No new knob.
   Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
