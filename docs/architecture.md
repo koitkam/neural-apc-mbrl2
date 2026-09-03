@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE P1 iter 68 rest-IC `prev_state=` probe60 H=55 **+0.440 conv=0 best_h=55**; recon **0.0035**; jsonl ×1 ≠ GAIN-READY; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE P1 iter 70 rest-IC `prev_state=` probe70 H=55 **+0.308 conv=0 best_h=13** (collapsed vs probe60 +0.440); recon **0.0038**; jsonl ×1 ≠ GAIN-READY; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -162,7 +162,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED** as Markovian rest-IC (`run_p77_tssm`, pid **242511**, 158 iters):
 > CAPPED **−0.46@MV / 0.74@DV** last_ok **104**; val MV **×−0.496 / ×−0.129**
 > DV **×0.736 / ×0.655**; 1step→OL **×0.379**; det_r **0.090** pred_std **3.52 vs 1.93**;
-> conv=0; actor INVALID. **P78 LIVE** rest-IC `prev_state=` (`run_p78_prevkv`, pid **261143** P1 iter **68**; probe60 H=55 **+0.440 conv=0 best_h=55**; recon **0.0035**; jsonl ×1 ≠ GAIN-READY).
+> conv=0; actor INVALID. **P78 LIVE** rest-IC `prev_state=` (`run_p78_prevkv`, pid **261143** P1 iter **70**; probe70 H=55 **+0.308 conv=0 best_h=13** collapsed vs probe60 +0.440; recon **0.0038**; jsonl ×1 ≠ GAIN-READY).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -595,7 +595,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > gate); wrap-recovery unlock still untested. Extra-P1 recovered basin stays
 > locked (P40). Do not raise lock_ratio.
 > Gain-match `img_rollout(..., last_only=True, out='obs', prev_state=)`
-> continues TSSM rest-IC KV (P78 LIVE pid **261143** P1 iter **68**; RSSM `prev_state=None` identity). jsonl emits
+> continues TSSM rest-IC KV (P78 LIVE pid **261143** P1 iter **70**; RSSM `prev_state=None` identity). jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
 > **P42 EXIT** (`run_p42_lastoklock`, launch `72f7b48`, 158 iters,
