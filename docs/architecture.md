@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 LIVE P2 after CAPPED GAIN_NOT_READY −0.46@MV / 0.74@DV last_ok 104; orig-P1 @82 FAIL −1.06@MV; extra-P1 @94 FAIL −0.29@MV; probe100 H=55 0.299 conv=0; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77 LIVE P2 iter 130 after CAPPED GAIN_NOT_READY −0.46@MV / 0.74@DV last_ok 104; orig-P1 @82 FAIL −1.06@MV; extra-P1 @94 FAIL −0.29@MV; P2@130 H=55 +0.475 conv=0 best_h=55 — not freeze health; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -159,9 +159,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > GAIN_NOT_READY**; val MV **×0.865 / ×1.004** DV **×0.819 / ×0.896**;
 > 1step→OL **×0.770**; actor INVALID. Keep-h stalled conv. Do not
 > GRU-bias N+1. **P77** env-free `world_model_type='tssm'`
-> (LIVE P2 after CAPPED GAIN_NOT_READY **−0.46@MV / 0.74@DV** last_ok **104**
+> (LIVE P2 iter **130** after CAPPED GAIN_NOT_READY **−0.46@MV / 0.74@DV** last_ok **104**
 > vs P64 0.91@DV; extra-P1 @94 **−0.29@MV / 0.80@DV** worsened; orig-P1 @82 **−1.06@MV**;
-> probe100 H=1 r=+0.567 H=55 r=+0.299 conv=0; P2@110 H=1 +0.810 H=55 +0.262 conv=0 — not freeze health;
+> probe100 H=1 r=+0.567 H=55 r=+0.299 conv=0; P2@130 H=1 +0.719 H=55 +0.475 conv=0 best_h=55 — not freeze health;
 > recon freeze 0.0026; jsonl ×1 ≠ 5-level; HEAD P78 `prev_state=` not this pid; do not score actor).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
