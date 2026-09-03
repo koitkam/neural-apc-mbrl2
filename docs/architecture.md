@@ -162,7 +162,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED** as Markovian rest-IC (`run_p77_tssm`, pid **242511**, 158 iters):
 > CAPPED **−0.46@MV / 0.74@DV** last_ok **104**; val MV **×−0.496 / ×−0.129**
 > DV **×0.736 / ×0.655**; 1step→OL **×0.379**; det_r **0.090** pred_std **3.52 vs 1.93**;
-> conv=0; actor INVALID. **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (`run_p78_prevkv`, pid **261143**, 158 iters): last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL-vs-real **×0.567**; det_r **0.010** pred_std **2.45 vs 1.93**; actor INVALID. TSSM family closed; env-free default **rssm**. **P79 LIVE** (`run_p79_rssmrevert`, pid **277462**): Step 4 CONFIRMED `wm=rssm` `device=cuda` bs=**128** rest-IC graph **captured**; iter 1 recon **0.096** `t_wm` **96 s**. Do **not** launch a second GPU job.
+> conv=0; actor INVALID. **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (`run_p78_prevkv`, pid **261143**, 158 iters): last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL-vs-real **×0.567**; det_r **0.010** pred_std **2.45 vs 1.93**; actor INVALID. TSSM family closed; env-free default **rssm**. **P79 LIVE** (`run_p79_rssmrevert`, pid **277462**): Step 4 CONFIRMED `wm=rssm` `device=cuda` bs=**128** rest-IC graph **captured**. Probe10 H=1 **+0.463** H=55 **+0.341 conv=0.25**. Do **not** launch a second GPU job.
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
