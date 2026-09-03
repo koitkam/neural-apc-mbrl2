@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 LIVE extra-P1 iter 85; orig-P1 @82 FAIL −1.06@MV; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77 LIVE extra-P1 iter 88; orig-P1 @82 FAIL −1.06@MV; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -159,10 +159,10 @@ env-gated off · **[planned]** = designed, not yet built.
 > GAIN_NOT_READY**; val MV **×0.865 / ×1.004** DV **×0.819 / ×0.896**;
 > 1step→OL **×0.770**; actor INVALID. Keep-h stalled conv. Do not
 > GRU-bias N+1. **P77** env-free `world_model_type='tssm'`
-> (LIVE extra-P1 iter 85; orig-P1 @82 FAIL GAIN_NOT_READY **−1.06@MV**
+> (LIVE extra-P1 iter 88; orig-P1 @82 FAIL GAIN_NOT_READY **−1.06@MV**
 > DC [−1.06, 0.75] @H [−0.20, 0.70] noisy sign-flip vs P64 0.91@DV / P76 0.79@DV;
-> probe80 H=1 r=+0.583 H=55 r=+0.423 conv=0; persist delayed spike 0.212@85 (5 iters after full inject @80);
-> recon best 0.0029@85; wrap 0.147@56 recovered skip 0; CPU @wm_best70 Markovian |Δ|=0.256 1step→OL ×0.272 — no live patch; do not score actor).
+> probe80 H=1 r=+0.583 H=55 r=+0.423 conv=0; persist 0.212@85 → 0.033@88 (delayed spike decayed);
+> recon best 0.0029@87; wrap 0.147@56 recovered skip 0; CPU @wm_best70 Markovian |Δ|=0.256 1step→OL ×0.272 — no live patch; do not score actor).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
