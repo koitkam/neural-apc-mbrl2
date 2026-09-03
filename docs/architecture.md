@@ -162,7 +162,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > (LIVE 2nd extra-P1 after @94 FAIL GAIN_NOT_READY **−0.29@MV / 0.80@DV**
 > vs P64 0.91@DV; orig-P1 @82 **−1.06@MV**; probe90 H=1 r=+0.592 H=55 r=+0.147 conv=0 gain_fid=0.859
 > best_h=1 — H=55 collapsed vs 0.423@80; do not treat gain_fid as health;
-> recon best 0.0025@94; persist 0.026; 2nd EXTEND to 904752; CPU @wm_best70 1step→OL ×0.272 — no live patch; do not score actor).
+> recon best 0.0021@96; persist 0.028; 2nd EXTEND to 904752; CPU @wm_best70 1step→OL ×0.272 — no live patch; do not score actor).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
