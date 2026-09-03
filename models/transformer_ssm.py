@@ -14,12 +14,14 @@ opt-out ``DREAMER_WORLD_MODEL_TYPE=rssm``).  Wired through ``build_model``,
 O(window²) recompute); smoke ``tools/_smoke_tssm.py`` checks cached step vs
 full-sequence.  Rest-IC CUDA-graph is RSSM-only (kv-cache grows).
 
-KNOWN GAP (P77 LIVE diagnosis; do not patch the live job): teacher-forced
+KNOWN GAP (P77 LIVE probe40; do not patch the live job): teacher-forced
 ``rollout_observed`` and the fidelity probe warm the KV-cache over the
 lookback, but gain-match / overshoot / held / isolation start
 ``img_rollout(h, z)`` with ``kv_cache=None`` (RSSM-correct: GRU ``h`` *is*
 the history; TSSM then rolls a 1-token Markovian net).  ``_rest_ic_last_tensors``
-returns only ``h/z/c`` and drops the encode cache.  A later attributed A/B
+returns only ``h/z/c`` and drops the encode cache.  CPU @wm_best40:
+Markovian vs cached CV |Δ| 0.14; 1step→OL ×0.077.  Probe H=1 above floor,
+H=55/conv still dead (cached compounding).  A later attributed A/B
 would pass ``prev_state`` into those OL rolls.  Metric: probe H=55 r / conv
 / val 1step→OL vs P64 ×0.85.
 
