@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** TSSM **deterministic**
-> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE 2nd extra-P1 iter 100 after extra-P1@94 FAIL **0.45@MV / 0.74@DV**; last_ok **91 locked**; probe100 H=55 **+0.149 conv=0**; jsonl ×1 ≠ 5-level TM; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77 EXIT Markovian rest-IC **FALSIFIED**; P78 LIVE P2 after CAPPED freeze last_ok **91** **4.08@MV / 0.72@DV** GAIN_NOT_READY; live cap 0.72@DV discarded; probe100 H=55 **+0.149 conv=0**; jsonl ×1 ≠ 5-level TM; RSSM via `DREAMER_WORLD_MODEL_TYPE=rssm`) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -162,7 +162,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED** as Markovian rest-IC (`run_p77_tssm`, pid **242511**, 158 iters):
 > CAPPED **−0.46@MV / 0.74@DV** last_ok **104**; val MV **×−0.496 / ×−0.129**
 > DV **×0.736 / ×0.655**; 1step→OL **×0.379**; det_r **0.090** pred_std **3.52 vs 1.93**;
-> conv=0; actor INVALID. **P78 LIVE 2nd extra-P1** after extra-P1@94 FAIL **0.45@MV / 0.74@DV** (`run_p78_prevkv`, pid **261143** iter **100** last_ok **91 locked**; probe100 H=55 **+0.149 conv=0**; jsonl ×1 ≠ 5-level).
+> conv=0; actor INVALID. **P78 LIVE P2** after CAPPED freeze last_ok **91** **4.08@MV / 0.72@DV** (`run_p78_prevkv`, pid **261143**; live cap 0.72@DV discarded; probe100 H=55 **+0.149 conv=0**; jsonl ×1 ≠ 5-level).
 > Canonical jsonl `adv_action_corr`.
 > `training_diagnostics` is
 > 3×3 (logp_std / clip_frac / rtgt). P3 banner prints `logp`/`clip` and
@@ -244,7 +244,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > 8/9. FO family closed. **P76 EXIT** GRU z-bias **REVERT**
 > (`run_p76_grubias`, 148 iters): freeze 0.80@MV GAIN_NOT_READY; val
 > MV ×0.865 1step→OL ×0.770; actor INVALID. **P77 EXIT** TSSM Markovian rest-IC
-> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 LIVE** rest-IC `prev_state=` (iter **102**; extra-P1@94 **0.45@MV**; CPU last_ok OL **×0.520** vs P77 last_ok **×0.106**, post **×0.561** vs **×0.843**).
+> **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 LIVE P2** freeze last_ok **91** **4.08@MV / 0.72@DV** (live cap 0.72@DV discarded; CPU last_ok OL **×0.520** vs P77 **×0.106**).
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
@@ -595,7 +595,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > gate); wrap-recovery unlock still untested. Extra-P1 recovered basin stays
 > locked (P40). Do not raise lock_ratio.
 > Gain-match `img_rollout(..., last_only=True, out='obs', prev_state=)`
-> continues TSSM rest-IC KV (P78 LIVE 2nd extra-P1 pid **261143** iter **102** extra-P1@94 FAIL **0.45@MV**; last_ok **91 locked**; probe100 H=55 **+0.149 conv=0**; CPU last_ok OL **×0.520** / post **×0.561**; RSSM `prev_state=None` identity). jsonl emits
+> continues TSSM rest-IC KV (P78 LIVE P2 pid **261143** freeze last_ok **91** **4.08@MV** GAIN_NOT_READY; live cap 0.72@DV discarded; CPU last_ok OL **×0.520** / post **×0.561**; RSSM `prev_state=None` identity). jsonl emits
 > `wm_score_ema*` and isolation/ss keys as 0 when teacher off.
 > `[resolved-cfg]` prints `iso_dcv=off` when the teacher is off.
 > **P42 EXIT** (`run_p42_lastoklock`, launch `72f7b48`, 158 iters,
@@ -1018,7 +1018,7 @@ fixes BOTH:
   update-gate bias `log(H/16)` (keep-h stalled conv; freeze
   GAIN_NOT_READY 0.80@MV; val 1step→OL ×0.770). Do not GRU-bias N+1.
   **P77 EXIT FALSIFIED** Markovian rest-IC; TSSM default KEEP for
-  **P78 LIVE** `prev_state=` iter **102** last_ok **91** CPU OL **×0.520** (opt-out `DREAMER_WORLD_MODEL_TYPE=rssm`).
+  **P78 LIVE P2** freeze last_ok **91** **4.08@MV** (live cap 0.72@DV discarded; CPU OL **×0.520**; opt-out `DREAMER_WORLD_MODEL_TYPE=rssm`).
   Explicit
   `DREAMER_GAIN_MATCH_LEN=220` A/B's 4H. Sentinel `gain_match_step<=0`
   auto = `wm_tf_step_frac` so the teacher amplitude matches the
