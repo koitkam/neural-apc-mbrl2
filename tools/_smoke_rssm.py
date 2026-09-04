@@ -76,6 +76,7 @@ from training.train import (
                             _expand_dyn_state, _rest_ic_last_state,
                             _held_rollout_win,
                             _wm_held_rollout_stationarity_loss,
+                            _wm_latent_overshoot_loss,
                             _rest_ic_can_cuda_graph,
                             _RestICGraphModule, _rest_ic_last_tensors,
                             _rest_ic_note_capture_miss,
@@ -1151,6 +1152,8 @@ def _test_recon_channel_weights_cache() -> None:
               text.index('def _cached_arange_1k')]
     assert 'obs_win = obs[:, idx]' in ov
     assert ov.count('obs[:, idx]') == 1
+    assert 'cv_index_t' in ov
+    assert 'CV-only' in ov
     iso = text[text.index('def _wm_input_isolation_loss'):
                text.index('def _auto_gain_match_settle_len')]
     assert 'obs_win = obs[:, idx]' in iso
@@ -3318,6 +3321,59 @@ def _test_held_rollout_cv_space() -> None:
           f'{float(d1["wm_held_cv_drift"]):.4f})')
 
 
+def _test_overshoot_cv_only() -> None:
+    """P86: overshoot MSE is CV channels only; non-CV obs must not move it."""
+    import inspect
+    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
+
+    src = inspect.getsource(_wm_latent_overshoot_loss)
+    assert 'cv_index_t' in src
+    assert 'index_select' in src
+
+    class _Wrap:
+        world_model_type = 'rssm'
+
+        def __init__(self, dyn):
+            self.dynamics = dyn
+
+    torch.manual_seed(0)
+    rcfg = RSSMConfig(obs_dim=4, action_dim=1, deter_dim=16,
+                      n_categoricals=4, n_classes=4, embed_dim=16,
+                      hidden_dim=16, latent_type='deterministic',
+                      cont_gain_dim=2, cv_indices=(0,))
+    dyn = RSSMDynamics(rcfg)
+    model = _Wrap(dyn)
+    B, T = 2, 16
+    obs = torch.randn(B, T, rcfg.obs_dim)
+    act = torch.rand(B, T, rcfg.action_dim) * 2 - 1
+    feat_dim = dyn.deter_dim + dyn.stoch_flat_dim + dyn.cont_dim
+    feats = torch.randn(B, T, feat_dim)
+    cfg = TrainConfig()
+    cfg.wm_overshoot_coef = 0.3
+    cfg.wm_overshoot_len = 8
+    cfg.wm_overshoot_gate_recon = 0.0
+    cfg.wm_overshoot_max_starts = 2
+    torch.manual_seed(0)
+    ov0, n0 = _wm_latent_overshoot_loss(model, feats, obs, act, cfg)
+    assert torch.isfinite(ov0).all() and float(ov0) > 0.0 and n0 > 0
+    obs_other = obs.clone()
+    obs_other[..., 2] = obs_other[..., 2] + 5.0
+    torch.manual_seed(0)
+    ov_other, _ = _wm_latent_overshoot_loss(model, feats, obs_other, act, cfg)
+    assert abs(float(ov0) - float(ov_other)) < 1e-6, (
+        f'overshoot used non-CV obs ({float(ov0):.5f} vs {float(ov_other):.5f})')
+    obs_cv = obs.clone()
+    obs_cv[..., 0] = obs_cv[..., 0] + 5.0
+    torch.manual_seed(0)
+    ov_cv, _ = _wm_latent_overshoot_loss(model, feats, obs_cv, act, cfg)
+    assert abs(float(ov0) - float(ov_cv)) > 1e-5, (
+        'overshoot ignored CV obs')
+    print(f'[smoke] OK  overshoot CV-only '
+          f'(loss {float(ov0):.4f}; non-CV Δ '
+          f'{abs(float(ov0)-float(ov_other)):.2e}; CV Δ '
+          f'{abs(float(ov0)-float(ov_cv)):.4f})')
+
+
 def _test_collect_rest_lookback_tm_pairing() -> None:
     """Rest collect records obs AFTER the hold step (TM ``_settle_capture``)."""
     import numpy as _np
@@ -5324,6 +5380,7 @@ if __name__ == '__main__':
     _test_gain_match_rest_window()
     _test_held_rollout_win_fits_k()
     _test_held_rollout_cv_space()
+    _test_overshoot_cv_only()
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
     _test_gain_match_tssm_kv_continue()

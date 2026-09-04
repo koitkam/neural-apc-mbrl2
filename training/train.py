@@ -1705,6 +1705,10 @@ class TrainConfig:
     # Default 0.3 = p117 recipe: the open-loop compounding lever (promoted
     # 2026-06-14; was 0.0).  ``wm_overshoot_len`` auto-tunes to H in
     # ``auto_tune_seed_buffer``.
+    # P86: MSE is **CV-only** (``cv_index_t``). All-obs MSE let MV/DV/derived
+    # dilute the compounding supervisor (P85 1step→OL ×0.697 vs P79 ×0.840
+    # with the same tail). ``wm_recon_cv_weight=6`` still left CV a
+    # minority of D-dim mass after mean-1 renormalisation. No new knob.
     # (p143 TESTED coef 0.5 + tail_power 1.0 to fix the categorical MV@H slow-
     # rise; the calibrated transfer matrix on wm_best showed it made MV@H WORSE
     # 0.86->0.68 (de-emphasising the settled tail where the MV gain compounds)
@@ -4278,6 +4282,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)} "
         f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
         f"held_cv=True "
+        f"ov_cv=True "
         f"gru_zbias={_gru_zb:.3g} "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
@@ -6621,11 +6626,11 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     is the PlaNet/Dreamer-v1 "latent overshooting" objective (v2/v3 dropped it
     because 1-step sufficed for Atari): from a strided set of start positions
     ``t`` we reconstruct the posterior state, roll the PRIOR forward ``K`` steps
-    under the REAL actions ``a_{t+1..t+K}`` WITH NO OBSERVATIONS, decode each
-    predicted feature and penalise ``MSE(decode, obs_{t+1..t+K})``.  This
-    directly trains the gru+prior+decoder for accurate MULTI-step prediction —
-    what makes a long imagination horizon H legitimately usable instead of
-    leaning on the WM's weakest capability.
+    under the REAL actions ``a_{t+1..t+K}`` WITH NO OBSERVATIONS, decode, and
+    penalise **CV-only** ``MSE(decode_CV, obs_CV_{t+1..t+K})`` (P86; was
+    all-obs MSE).  Tail ``(k/K)^p`` KEEP.  This trains gru+prior+decoder
+    on CV DC compounding (the TM 1step→OL lever), instead of easy MV/DV
+    channels drowning the mean.
 
     RSSM-interface (rssm + tssm); returns ``(0, 0.0)`` for the SF-transformer
     backbone (its shortcut-forcing loss is the native multi-step-prediction
@@ -6679,31 +6684,34 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     preds = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True,
                              c0=c0, out='obs').reshape(B, S, K, -1)  # (B,S,K,D)
     tgt = obs_win.detach()                                        # (B, S, K, D)
-    # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
-    # contraction (decomp 1step→openloop ×0.876; probe: sampled open-loop gain
-    # 0.79 vs real, and sample=False is WORSE 0.32 → the gain lives in the
-    # learned SAMPLED prior, the loss is weak supervision NOT a sampling EIV) is
-    # a STEADY-STATE / DC-gain phenomenon: the 1-step prior is faithful (×1.001)
-    # but the gain compounds away over the rollout.  A UNIFORM ``/K`` mean
-    # dilutes the settled tail to ~1/K weight, so the DC gain (where the
-    # contraction lives) is under-supervised.  Weight step ``k`` by
-    # ``(k/K)^tail_power`` (a smooth low-frequency / DC emphasis) and normalise
-    # by Σw — bounded magnitude (still a weighted mean, no term inflation) so it
-    # cannot destabilise the WM, but it concentrates the gain gradient on the
-    # steady-state (p=2 → the last step gets ~3× its uniform weight, the noisy
-    # early transient less — which the 1-step recon/KL already cover).
-    # ``tail_power=0`` recovers the exact uniform mean.  Sim-agnostic (unitless
-    # step fraction), backbone-agnostic.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
-    # Vectorized over K (same as the old per-step ``_weighted_recon_mse``
-    # loop: mean_{B,S,D} then weighted mean_k).  Eager P30: this was 55
-    # Python MSE calls per WM step.  ``k_off`` / ``wk`` are cached (K
-    # is static after auto-tune).
-    se = (preds.float() - tgt.float()).pow(2)
-    ch_w = _recon_channel_weights(cfg, int(preds.shape[-1]),
-                                  preds.device, torch.float32)
-    if ch_w is not None:
-        se = se * ch_w.view(*([1] * (se.dim() - 1)), -1)
-    mse_k = se.mean(dim=(0, 1, 3))                                # (K,)
+    # P86: CV-only MSE. All-obs mean (even with recon_cv_weight=6) left CV a
+    # minority of D-dim mass; decomp 1step→OL is CV DC. Non-CV plants keep
+    # the old all-obs + channel-weight path. Tail (k/K)^p KEEP (p143 p=1
+    # mid-rise HURT; not last-only).
+    cv_idx = getattr(rssm, 'cv_index_t', None)
+    n_cv = int(getattr(rssm, 'n_cv', 0) or 0)
+    use_cv = (cv_idx is not None and n_cv > 0 and int(cv_idx.numel()) > 0)
+    if use_cv and not getattr(cfg, '_overshoot_cv_logged', False):
+        print('[overshoot] CV-only (P86; not all-obs MSE)', flush=True)
+        cfg._overshoot_cv_logged = True  # type: ignore[attr-defined]
+    if use_cv:
+        preds = preds.index_select(-1, cv_idx)
+        tgt = tgt.index_select(-1, cv_idx)
+        se = (preds.float() - tgt.float()).pow(2)
+        mse_k = se.mean(dim=(0, 1, 3))                            # (K,)
+    else:
+        # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop
+        # gain contraction is a DC phenomenon: the 1-step prior is faithful
+        # but the gain compounds away over the rollout.  A UNIFORM ``/K``
+        # mean dilutes the settled tail.  Weight step ``k`` by
+        # ``(k/K)^tail_power`` and normalise by Σw.  ``tail_power=0`` is
+        # uniform.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
+        se = (preds.float() - tgt.float()).pow(2)
+        ch_w = _recon_channel_weights(cfg, int(preds.shape[-1]),
+                                      preds.device, torch.float32)
+        if ch_w is not None:
+            se = se * ch_w.view(*([1] * (se.dim() - 1)), -1)
+        mse_k = se.mean(dim=(0, 1, 3))                            # (K,)
     wk = _overshoot_tail_wk(cfg, K, mse_k.device, mse_k.dtype)
     loss = (mse_k * wk).sum() / wk.sum().clamp_min(1e-8)
     # Soft recon-fidelity gate: ramp the term in only as 1-step recon converges
