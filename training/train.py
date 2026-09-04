@@ -4141,11 +4141,21 @@ def _wm_need_dist_target(model, cfg: 'TrainConfig') -> bool:
     n_dist = int(getattr(dyn, 'cont_dist_dim', 0) or 0)
     if dm > 0.0 and n_dist > 0:
         return True
+    return _wm_need_dist_head_loss(model, cfg)
+
+
+def _wm_need_dist_head_loss(model, cfg: 'TrainConfig') -> bool:
+    """True when ``_disturbance_head_loss`` would run a live P87 head.
+
+    Env-free: DOB retires the head (``model.disturbance is None``,
+    ``disturbance_head_dim=0``) so the helper early-returns zeros.
+    Skip the call (identity jsonl zeros) rather than 100×/iter Python.
+    Keep the function for a P87 A/B.  Do not key this off
+    ``disturbance_head_dim`` alone — a live module is the gate.
+    """
     dist_head = getattr(model, 'disturbance', None)
     dist_coef = float(getattr(cfg, 'disturbance_loss_scale', 0.0) or 0.0)
-    if dist_head is not None and dist_coef > 0.0:
-        return True
-    return False
+    return dist_head is not None and dist_coef > 0.0
 
 
 def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
@@ -8867,9 +8877,14 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # policy reads the same feature) and regularising it toward the smooth
     # slow-OU target.  Scaled by a soft WM-fidelity gate so a not-yet-
     # converged decoder is not destabilised early in P1.
-    dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
-        model, feats, dist_target, recon_loss, cfg)
-    wm_total = wm_total + dist_term
+    # Env-free head is None (DOB owns d_t): skip the call (identity zeros).
+    if _wm_need_dist_head_loss(model, cfg):
+        dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
+            model, feats, dist_target, recon_loss, cfg)
+        wm_total = wm_total + dist_term
+    else:
+        dist_loss = torch.zeros((), device=feats.device)
+        dist_rmse = 0.0
 
     # ----- (#2, P88) multi-step latent overshooting (RSSM) -----
     # mbrl2 real-sim perf (2026-07-08): the two multi-step aux rollouts
@@ -9059,8 +9074,13 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Same auxiliary supervised head as the RSSM path, reading the agent-
     # register hidden state ``agent_hid`` (the feature the BC/reward heads
     # use).  Recon proxy for the fidelity gate is the tokenizer recon loss.
-    dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
-        model, agent_hid, batch.get('dist'), recon_loss, cfg)
+    # Env-free head is None: skip the call (identity zeros).
+    if _wm_need_dist_head_loss(model, cfg):
+        dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
+            model, agent_hid, batch.get('dist'), recon_loss, cfg)
+    else:
+        dist_term = dist_loss = torch.zeros((), device=device)
+        dist_rmse = 0.0
 
     # ----- (#2, P88) latent overshooting — RSSM-ONLY BY DESIGN ---------------
     # Parity decision (not a TODO): the SF-transformer ALREADY trains multi-step

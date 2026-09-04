@@ -61,7 +61,8 @@ from training.train import (
                             _load_module_state,
                             _p1_need_agent_finetune,
                             _wm_need_logged_aux,
-                            _wm_need_dist_target, _p1_wm_h2d_keys,
+                            _wm_need_dist_target, _wm_need_dist_head_loss,
+                            _p1_wm_h2d_keys,
                             _replay_h2d_keys,
                             _smooth_l1_gain_match, _gain_match_fd_held,
                             _gain_match_fd_action_seq,
@@ -1279,6 +1280,7 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     c.dist_match_coef = 0.0
     c.disturbance_loss_scale = 1.0
     assert _wm_need_dist_target(m, c) is False
+    assert _wm_need_dist_head_loss(m, c) is False
     assert _p1_wm_h2d_keys(_wm_need_dist_target(m, c)) == ('obs', 'act')
     assert _replay_h2d_keys(False, True) == ('obs', 'act', 'rew', 'expert')
     assert _replay_h2d_keys(False, True, False) == ('obs', 'act', 'rew')
@@ -1295,6 +1297,7 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     m.dynamics.cont_dist_dim = 0
     m.disturbance = object()
     assert _wm_need_dist_target(m, c) is True
+    assert _wm_need_dist_head_loss(m, c) is True
     print('[smoke] OK  time-unbind identity + Stage-1 zeros cache + P1 dist H2D')
 
 
@@ -2106,6 +2109,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _wm_need_logged_aux' in _src
     assert '_wm_need_enc_diag' in _src
     assert 'def _wm_need_dist_target' in _src
+    assert 'def _wm_need_dist_head_loss' in _src
     assert 'def _p1_wm_h2d_keys' in _src
     assert 'def _replay_h2d_keys' in _src
     assert '_h2d_keys = _p1_wm_h2d_keys' in _src
@@ -4036,6 +4040,45 @@ def _test_id_tau_no_plant_sentinel() -> None:
     assert "IDENTIFIED_DEAD_TIME', '8'" not in probe_src
     assert "REPO / 'simulation' / 'test_sim'" not in probe_src
     assert 'def _wire_run_artifacts' in probe_src
+    audit_src = (root / 'tools' / 'audit_data_generation_v2.py').read_text()
+    assert "AUDIT_TAU', '55'" not in audit_src
+    assert "AUDIT_DEAD', '8'" not in audit_src
+    assert "AUDIT_SAMPLE_RATE', '4'" not in audit_src
+    assert "AUDIT_EPISODE_LEN', '1220'" not in audit_src
+    assert "AUDIT_LOOKBACK', '120'" not in audit_src
+    assert 'def _resolve_audit_plant_knobs' in audit_src
+    from types import SimpleNamespace
+    try:
+        from tools.audit_data_generation_v2 import _resolve_audit_plant_knobs
+    except ImportError:
+        from audit_data_generation_v2 import _resolve_audit_plant_knobs
+    empty = SimpleNamespace(tau=None, dead=None, sample_rate=None,
+                            episode_len=None, lookback=None)
+    try:
+        _resolve_audit_plant_knobs(empty, None)
+        raise AssertionError('expected SystemExit refusing test_sim knobs')
+    except SystemExit as e:
+        assert 'refuse to invent' in str(e)
+    cli = SimpleNamespace(tau=53.0, dead=8.0, sample_rate=4,
+                          episode_len=1220, lookback=128)
+    tau_c, dead_c, sr_c, ep_c, lb_c, src_c = _resolve_audit_plant_knobs(
+        cli, None)
+    assert (tau_c, dead_c, sr_c, ep_c, lb_c) == (53.0, 8.0, 4, 1220, 128)
+    import json, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        rd = Path(td)
+        (rd / 'plant_id.json').write_text(json.dumps({
+            'tau': 53.0, 'dead_time': 8.0, 'lookback': 128}))
+        (rd / 'run_plan.json').write_text(json.dumps({
+            'tau': 53.0, 'dead_time': 8.0, 'sample_rate': 4,
+            'episode_length': 1220, 'lookback': 128,
+            'config': {'episode_length': 1220, 'lookback': 128,
+                       'sample_rate': 4}}))
+        tau_r, dead_r, sr_r, ep_r, lb_r, src_r = _resolve_audit_plant_knobs(
+            empty, rd)
+        assert abs(tau_r - 53.0) < 1e-12 and abs(dead_r - 8.0) < 1e-12
+        assert (sr_r, ep_r, lb_r) == (4, 1220, 128)
+        assert src_r.startswith('source_run=')
     print('[smoke] OK  missing SysID τ does not invent 50 s; identified τ identity')
 
 
@@ -5030,6 +5073,8 @@ def _test_stage1_dob_ground_skip() -> None:
     }
     losses, _, _ = world_model_loss(model, batch, cfg)
     assert float(losses['dob_ground']) == 0.0, float(losses['dob_ground'])
+    assert float(losses['disturbance_loss']) == 0.0, float(losses['disturbance_loss'])
+    assert model.disturbance is None
     recon = torch.randn(B, T, cfg.obs_dim)
     d0 = torch.zeros(B, T, model.dynamics.n_cv)
     out = model.dynamics.apply_dob(recon, d0)
