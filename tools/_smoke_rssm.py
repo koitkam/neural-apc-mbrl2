@@ -4170,29 +4170,38 @@ def _test_cfg_or_env_float_identity() -> None:
 
 
 def _test_auto_tune_formula_input_cfg_or_env() -> None:
-    """Seed/PRBS/η formula inputs: TrainConfig default, explicit, leftover env."""
+    """Seed/PRBS/η formula inputs: TrainConfig default, explicit; leftover ignored."""
     import os
     c = TrainConfig()
-    v, user = _cfg_or_env(c, 'seed_target_cv_frac', 'SEED_TARGET_CV_FRAC', 0.20, float)
+    v, user = _cfg_or_env(c, 'seed_target_cv_frac', 'DREAMER_SEED_TARGET_CV_FRAC', 0.20, float)
     assert abs(v - 0.20) < 1e-12 and user is False
-    v, user = _cfg_or_env(c, 'prbs_seg_min', 'PRBS_SEG_MIN', 8, int)
+    v, user = _cfg_or_env(c, 'prbs_seg_min', 'DREAMER_PRBS_SEG_MIN', 8, int)
     assert v == 8 and user is False
     c.seed_target_cv_frac = 0.15
     c._explicit_fields = {'seed_target_cv_frac'}  # type: ignore[attr-defined]
-    v, user = _cfg_or_env(c, 'seed_target_cv_frac', 'SEED_TARGET_CV_FRAC', 0.20, float)
+    v, user = _cfg_or_env(c, 'seed_target_cv_frac', 'DREAMER_SEED_TARGET_CV_FRAC', 0.20, float)
     assert abs(v - 0.15) < 1e-12 and user is True
-    prev = os.environ.get('SEED_SIGMA_CAP')
+    prev_left = os.environ.get('SEED_SIGMA_CAP')
+    prev_d = os.environ.get('DREAMER_SEED_SIGMA_CAP')
     try:
         os.environ['SEED_SIGMA_CAP'] = '0.22'
         c2 = TrainConfig()
-        v, user = _cfg_or_env(c2, 'seed_sigma_cap', 'SEED_SIGMA_CAP', 0.30, float)
-        assert abs(v - 0.22) < 1e-12 and user is True
+        v, user = _cfg_or_env(c2, 'seed_sigma_cap', 'DREAMER_SEED_SIGMA_CAP', 0.30, float)
+        assert abs(v - 0.30) < 1e-12 and user is False  # leftover ignored
+        os.environ['DREAMER_SEED_SIGMA_CAP'] = '0.22'
+        c3 = TrainConfig()
+        v_d, u_d = _cfg_or_env(c3, 'seed_sigma_cap', 'DREAMER_SEED_SIGMA_CAP', 0.30, float)
+        assert abs(v_d - 0.22) < 1e-12 and u_d is True
     finally:
-        if prev is None:
+        if prev_left is None:
             os.environ.pop('SEED_SIGMA_CAP', None)
         else:
-            os.environ['SEED_SIGMA_CAP'] = prev
-    print('[smoke] OK  auto-tune formula-input cfg-or-env (default / explicit / leftover)')
+            os.environ['SEED_SIGMA_CAP'] = prev_left
+        if prev_d is None:
+            os.environ.pop('DREAMER_SEED_SIGMA_CAP', None)
+        else:
+            os.environ['DREAMER_SEED_SIGMA_CAP'] = prev_d
+    print('[smoke] OK  auto-tune formula-input cfg-or-env (default / explicit; leftover SEED_* ignored)')
 
 
 def _test_policy_sigma_bounds_honours_cfg() -> None:

@@ -303,9 +303,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # ``auto_tune_seed_buffer``; identity defaults).  Leftover
     # ``PMPO_ENTROPY_COEF_BASELINE`` / ``PMPO_ENTROPY_SIGMA_REF`` /
     # ``SEED_TARGET_CV_FRAC`` / ``SEED_SIGMA_CAP`` / ``PRBS_SEG_MIN`` /
-    # ``PRBS_SEG_MIN_FLOOR`` still win when the DREAMER_* field is not
-    # explicit.  Do not collide with ``DREAMER_PMPO_ENTROPY_COEF`` (the
-    # resolved η).
+    # ``PRBS_SEG_MIN_FLOOR`` ignored (P87-live; TrainConfig +
+    # ``DREAMER_*`` only).  Do not collide with
+    # ``DREAMER_PMPO_ENTROPY_COEF`` (the resolved η).
     'DREAMER_PMPO_ENTROPY_ETA_V3':     ('pmpo_entropy_eta_v3',     float),
     'DREAMER_PMPO_ENTROPY_SIGMA_REF':  ('pmpo_entropy_sigma_ref',  float),
     'DREAMER_SEED_TARGET_CV_FRAC':     ('seed_target_cv_frac',     float),

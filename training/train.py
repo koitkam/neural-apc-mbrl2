@@ -156,8 +156,9 @@ class TrainConfig:
     # formula produces for σ_max ≈ 0.33. Formula inputs
     # ``pmpo_entropy_eta_v3`` / ``pmpo_entropy_sigma_ref`` were
     # ``os.environ.get`` (worked, missing from ``run_plan``). Leftover
-    # ``PMPO_ENTROPY_COEF_BASELINE`` / ``PMPO_ENTROPY_SIGMA_REF`` still
-    # win when the DREAMER_* field is not explicit.
+    # ``PMPO_ENTROPY_COEF_BASELINE`` / ``PMPO_ENTROPY_SIGMA_REF`` are
+    # **not** read (P87-live; same class as ``OBJ_REWARD_SCALE``).
+    # A/B ``DREAMER_PMPO_ENTROPY_ETA_V3`` / ``DREAMER_PMPO_ENTROPY_SIGMA_REF``.
     pmpo_entropy_coef: float = 1e-4
     pmpo_entropy_eta_v3: float = 3e-4
     pmpo_entropy_sigma_ref: float = 1.0
@@ -1232,8 +1233,8 @@ class TrainConfig:
     # Seed-σ formula inputs (``σ = clip(frac·cv_w/mv_auth, 0.01, cap)``).
     # Were ``os.environ.get('SEED_TARGET_CV_FRAC'/'SEED_SIGMA_CAP')``
     # inside ``auto_tune_seed_buffer`` (worked, missing from
-    # ``run_plan``). Unitless. Leftover names still win when the
-    # DREAMER_* field is not explicit.
+    # ``run_plan``). Unitless. Leftover names are **not** read
+    # (P87-live; TrainConfig + ``DREAMER_SEED_*`` only).
     seed_target_cv_frac: float = 0.20
     seed_sigma_cap: float = 0.30
     random_seed_episodes: int = 6
@@ -1284,6 +1285,7 @@ class TrainConfig:
     # Clip floors for the PRBS segment formula (agent steps, not
     # engineering units).  Were ``os.environ.get('PRBS_SEG_MIN' /
     # 'PRBS_SEG_MIN_FLOOR')`` (worked, missing from ``run_plan``).
+    # Leftover names are **not** read (P87-live; A/B ``DREAMER_PRBS_SEG_MIN*``).
     prbs_seg_min: int = 8
     prbs_seg_min_floor: int = 2
     # Constant-action seed episodes (2026-05-21, p31 RCA).  Holds the
@@ -2252,9 +2254,9 @@ def _cfg_or_env(cfg, field: str, env_key: str, default, cast=float):
 
     ``user_set`` is True when the field is in ``_explicit_fields`` or
     the env-var is present (P62 adaptive clip must not override an
-    explicit ``DREAMER_REWARD_RAW_CLIP_MIN``).  Leftover non-DREAMER
-    names (``SEED_TARGET_CV_FRAC``, ``PRBS_SEG_MIN``, …) use the same
-    path so a thin launch cannot silently drop a formula input.
+    explicit ``DREAMER_REWARD_RAW_CLIP_MIN``).  Pass ``DREAMER_*``
+    keys (P87-live: leftover ``SEED_*`` / ``PRBS_SEG_MIN*`` /
+    ``PMPO_ENTROPY_*`` are ignored).
     """
     explicit = set(getattr(cfg, '_explicit_fields', set()) or set()) \
         if cfg is not None else set()
@@ -10304,9 +10306,9 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         # MV range so the WM sees clean step-response transitions
         # across most of the operating band.  Override via
         # ``DREAMER_SEED_TARGET_CV_FRAC`` (leftover ``SEED_TARGET_CV_FRAC``
-        # still wins when the field is not explicit).
+        # ignored — P87-live).
         target_frac, _ = _cfg_or_env(
-            cfg, 'seed_target_cv_frac', 'SEED_TARGET_CV_FRAC', 0.20, float)
+            cfg, 'seed_target_cv_frac', 'DREAMER_SEED_TARGET_CV_FRAC', 0.20, float)
         cv_w = float(np.mean(cv_widths))
         # Bumped 2026-05-08 (run_p7 RCA): cap raised 0.10 → 0.30 to give
         # low-MV-authority plants enough seed-buffer coverage breadth.
@@ -10314,7 +10316,7 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         # cap (see ``policy_log_std_max`` below) so the policy clamp
         # does not widen with this knob.
         sigma_seed_cap, _ = _cfg_or_env(
-            cfg, 'seed_sigma_cap', 'SEED_SIGMA_CAP', 0.30, float)
+            cfg, 'seed_sigma_cap', 'DREAMER_SEED_SIGMA_CAP', 0.30, float)
         sigma = float(np.clip(target_frac * cv_w / mv_auth,
                                 0.01, sigma_seed_cap))
         sigma_source = (f'mv_authority(target_cv_frac={target_frac:.2f}, '
@@ -10465,9 +10467,9 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # (σ_max=0.30) → η = 9e-5, matching the value found by manual
     # tuning in run_p7.
     eta_v3_baseline, _ = _cfg_or_env(
-        cfg, 'pmpo_entropy_eta_v3', 'PMPO_ENTROPY_COEF_BASELINE', 3e-4, float)
+        cfg, 'pmpo_entropy_eta_v3', 'DREAMER_PMPO_ENTROPY_ETA_V3', 3e-4, float)
     sigma_v3_ref = max(1e-3, float(_cfg_or_env(
-        cfg, 'pmpo_entropy_sigma_ref', 'PMPO_ENTROPY_SIGMA_REF', 1.0, float)[0]))
+        cfg, 'pmpo_entropy_sigma_ref', 'DREAMER_PMPO_ENTROPY_SIGMA_REF', 1.0, float)[0]))
     eta_adaptive = eta_v3_baseline * (target_sigma_max / sigma_v3_ref)
     out['pmpo_entropy_coef'] = {
         'value': float(eta_adaptive),
@@ -10633,7 +10635,7 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         ep_len = max(1, int(getattr(cfg, 'episode_length', 1)))
         seg_target = (theta_plant + 4.0 * tau_plant) / float(sr)
         seg_min_pgate, _ = _cfg_or_env(
-            cfg, 'prbs_seg_min', 'PRBS_SEG_MIN', 8, int)
+            cfg, 'prbs_seg_min', 'DREAMER_PRBS_SEG_MIN', 8, int)
         seg_cap = max(seg_min_pgate + 1, ep_len // 4)
         seg_auto = int(np.clip(round(seg_target), seg_min_pgate, seg_cap))
         # Multi-timescale PRBS: fast hold ~ τ / 3 / sr.  This excites
@@ -10641,7 +10643,7 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         # the *transient* dynamics (not just steady-state gain).
         # Floor 2 (need at least 2 steps for a settled action).
         seg_min_floor, _ = _cfg_or_env(
-            cfg, 'prbs_seg_min_floor', 'PRBS_SEG_MIN_FLOOR', 2, int)
+            cfg, 'prbs_seg_min_floor', 'DREAMER_PRBS_SEG_MIN_FLOOR', 2, int)
         seg_min_target = (tau_plant / 3.0) / float(sr)
         seg_min_auto = int(np.clip(
             round(seg_min_target), seg_min_floor,

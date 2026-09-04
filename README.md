@@ -267,7 +267,10 @@ search *and* keep warm-starting model weights.
 | `DREAMER_HORIZON_SETTLE_NTAU` / `DREAMER_HORIZON_MAX` | `H=(θ+n_τ·τ)/sr` formula (defaults 4.0 / 120). |
 | `DREAMER_INIT_RANDOMIZATION` / `_FRAC` | IC domain randomization (default ON / 0.6 of span). |
 | `DREAMER_WM_OVERHEAD` | GPU-calib WM-only probe headroom (default 1.30). |
-| `SEED_TARGET_CV_FRAC` | leftover alias of `DREAMER_SEED_TARGET_CV_FRAC` (default 0.20). |
+| `SEED_TARGET_CV_FRAC` | **ignored leftover** (P87-live); A/B `DREAMER_SEED_TARGET_CV_FRAC` (default 0.20). |
+| `SEED_SIGMA_CAP` | **ignored leftover** (P87-live); A/B `DREAMER_SEED_SIGMA_CAP` (default 0.30). |
+| `PRBS_SEG_MIN` / `PRBS_SEG_MIN_FLOOR` | **ignored leftover** (P87-live); A/B `DREAMER_PRBS_SEG_MIN` / `_FLOOR` (defaults 8 / 2). |
+| `PMPO_ENTROPY_COEF_BASELINE` / `PMPO_ENTROPY_SIGMA_REF` | **ignored leftover** (P87-live); A/B `DREAMER_PMPO_ENTROPY_ETA_V3` / `DREAMER_PMPO_ENTROPY_SIGMA_REF`. |
 | `SIGMA_MAX_CAP` | **ignored leftover** (P82-live); A/B `DREAMER_SIGMA_MAX_CAP` (default 0.30). |
 | `SIGMA_MAX_FLOOR` | **ignored leftover** (P82-live); A/B `DREAMER_SIGMA_MAX_FLOOR` (default 0.10). |
 | `SIGMA_MAX_OVER_SEED` | **ignored leftover** (P82-live); A/B `DREAMER_SIGMA_MAX_OVER_SEED` (default 1.0). |
@@ -527,7 +530,7 @@ early via the `on_iter_end` callback in the trainer.
 | `trial_steps` | 50 000 | `40 eps × max(1, complexity / 4) × ep_len`, clamped | `--trial_steps` |
 | `final_steps` | 200 000 | `10 × trial_steps`, clamped | `--final_steps` |
 | `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_ATTN_IMPL` / leftover `DREAMER_FAST_ATTN` |
-| `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, SEED_SIGMA_CAP)` with `target_cv_frac=0.20` | `DREAMER_SEED_TARGET_CV_FRAC`, leftover `SEED_TARGET_CV_FRAC` |
+| `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, seed_sigma_cap)` with `target_cv_frac=0.20` | `DREAMER_SEED_TARGET_CV_FRAC` (leftover `SEED_*` ignored) |
 | `policy_log_std_max` | log(1.0) | `log(clip(σ_max_mult × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `DREAMER_SIGMA_MAX_*` (leftover `SIGMA_MAX_*` ignored) |
 | `policy_log_std_min` | log(0.1) | `log(σ_max / sigma_min_ratio)` (default ratio **1.2**) | `DREAMER_SIGMA_MIN_RATIO` (leftover `SIGMA_MIN_RATIO_OF_MAX` ignored) |
 
