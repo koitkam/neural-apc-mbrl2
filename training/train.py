@@ -414,9 +414,10 @@ class TrainConfig:
     reward_cal_target_sym_mag: float = 6.0
     # Gate for the percentile→twohot scale.  ``auto`` (env-free) runs
     # calibration; ``off`` leaves scale=1; a numeric string forces
-    # that scale.  Was ``os.environ.get('OBJ_REWARD_SCALE')`` (worked,
-    # missing from ``run_plan``).  Leftover ``OBJ_REWARD_SCALE`` still
-    # wins when the DREAMER_* field is not explicit.
+    # that scale.  Was leftover ``OBJ_REWARD_SCALE`` (worked, missing
+    # from ``run_plan``).  Leftover ``OBJ_REWARD_SCALE`` is **not**
+    # read (P87-live; same silent-A/B class as ``SIGMA_*`` /
+    # ``AGENT_DISTURBANCE_*``).  A/B ``DREAMER_OBJ_REWARD_SCALE``.
     obj_reward_scale: str = 'auto'
     # Reward-engine leftovers (``utils/objective_runtime.py``).  Were
     # ``os.environ.get`` every ``env.step`` (worked, missing from
@@ -2230,8 +2231,8 @@ class TrainConfig:
     # ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS`` in gpu_calibrate
     # (worked, missing from ``run_plan``).  Identity 0.80 / 512.
     # ``gpu_probe_knobs()`` is the probe source of truth.  ``DREAMER_BATCH_SIZE``
-    # pins ``batch_size`` and skips the probe (leftover ``OBJ_BATCH_SIZE``
-    # still wins when DREAMER is unset).
+    # pins ``batch_size`` and skips the probe.  Leftover ``OBJ_BATCH_SIZE``
+    # is **not** read (P87-live; login leftover was a silent A/B).
     gpu_target_util: float = 0.80
     gpu_max_bs: int = 512
 
@@ -11418,7 +11419,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     # ---- Reward calibration (V4 reward head expects O(1) per-step rewards) ----
     obj_scale_env, _ = _cfg_or_env(
-        cfg, 'obj_reward_scale', 'OBJ_REWARD_SCALE', 'auto', str)
+        cfg, 'obj_reward_scale', 'DREAMER_OBJ_REWARD_SCALE', 'auto', str)
     obj_scale_env = str(obj_scale_env or 'auto').strip().lower()
     if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
         cal_mode = str(getattr(cfg, 'reward_cal_mode', 'baseline')

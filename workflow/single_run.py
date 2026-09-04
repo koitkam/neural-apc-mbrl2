@@ -303,7 +303,7 @@ def main() -> int:
     # ``gpu_target_util`` / ``gpu_max_bs`` (leftover ``DREAMER_WM_OVERHEAD``
     # / ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``).  Identity 1.30 /
     # 0.80 / 512.  ``explicit_batch_size`` pins B and skips the probe
-    # (``DREAMER_BATCH_SIZE`` then leftover ``OBJ_BATCH_SIZE``).
+    # (``DREAMER_BATCH_SIZE`` only; leftover ``OBJ_BATCH_SIZE`` ignored).
     # Probe the P1/P2 WM unroll T (max(seq_len, H+1)), not lookback-seq_len,
     # so a slow plant's DC-gain window is in the memory budget (follow-up 13).
     # test_sim seq_len=64, H≈55 → unchanged.

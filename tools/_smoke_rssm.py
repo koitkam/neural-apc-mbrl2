@@ -4227,10 +4227,32 @@ def _test_policy_sigma_bounds_honours_cfg() -> None:
             os.environ.pop('DREAMER_SIGMA_MIN_RATIO', None)
         else:
             os.environ['DREAMER_SIGMA_MIN_RATIO'] = prev_d
-    v, user = _cfg_or_env(TrainConfig(), 'obj_reward_scale',
-                          'OBJ_REWARD_SCALE', 'auto', str)
-    assert v == 'auto' and user is False
-    print('[smoke] OK  policy σ bounds honour TrainConfig 1.2 (leftover SIGMA_* ignored)')
+    prev_obj = os.environ.get('OBJ_REWARD_SCALE')
+    prev_dobj = os.environ.get('DREAMER_OBJ_REWARD_SCALE')
+    try:
+        os.environ.pop('OBJ_REWARD_SCALE', None)
+        os.environ.pop('DREAMER_OBJ_REWARD_SCALE', None)
+        v, user = _cfg_or_env(TrainConfig(), 'obj_reward_scale',
+                              'DREAMER_OBJ_REWARD_SCALE', 'auto', str)
+        assert v == 'auto' and user is False
+        os.environ['OBJ_REWARD_SCALE'] = 'off'
+        v_left, u_left = _cfg_or_env(TrainConfig(), 'obj_reward_scale',
+                                     'DREAMER_OBJ_REWARD_SCALE', 'auto', str)
+        assert v_left == 'auto' and u_left is False
+        os.environ['DREAMER_OBJ_REWARD_SCALE'] = 'off'
+        v_d, u_d = _cfg_or_env(TrainConfig(), 'obj_reward_scale',
+                               'DREAMER_OBJ_REWARD_SCALE', 'auto', str)
+        assert v_d == 'off' and u_d is True
+    finally:
+        if prev_obj is None:
+            os.environ.pop('OBJ_REWARD_SCALE', None)
+        else:
+            os.environ['OBJ_REWARD_SCALE'] = prev_obj
+        if prev_dobj is None:
+            os.environ.pop('DREAMER_OBJ_REWARD_SCALE', None)
+        else:
+            os.environ['DREAMER_OBJ_REWARD_SCALE'] = prev_dobj
+    print('[smoke] OK  policy σ bounds honour TrainConfig 1.2 (leftover SIGMA_* ignored; leftover OBJ_REWARD_SCALE ignored)')
 
 
 def _test_attention_auto_ignores_leftover_fast_attn() -> None:
@@ -4515,7 +4537,7 @@ def _test_noise_hidden_cfg() -> None:
 
 
 def _test_gpu_calib_cfg() -> None:
-    """GPU-calib budget + batch pin: TrainConfig default, leftover OBJ, DREAMER wins."""
+    """GPU-calib budget + batch pin: TrainConfig default; leftover OBJ ignored; DREAMER wins."""
     import os
     from workflow._plant_prepare import (
         ENV_OVERRIDES, explicit_batch_size, gpu_probe_knobs,
@@ -4542,7 +4564,7 @@ def _test_gpu_calib_cfg() -> None:
         assert abs(util - 0.80) < 1e-12
         assert cap == 512
         os.environ['OBJ_BATCH_SIZE'] = '24'
-        assert explicit_batch_size() == 24
+        assert explicit_batch_size() is None  # leftover ignored (P87-live)
         os.environ['DREAMER_BATCH_SIZE'] = '48'
         assert explicit_batch_size() == 48
         os.environ['DREAMER_WM_OVERHEAD'] = '1.5'
@@ -4558,7 +4580,7 @@ def _test_gpu_calib_cfg() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  GPU-calib TrainConfig + gpu_probe_knobs leftover env')
+    print('[smoke] OK  GPU-calib TrainConfig + leftover OBJ_BATCH_SIZE ignored')
 
 
 def _test_sim_snr_cfg() -> None:

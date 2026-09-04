@@ -253,10 +253,8 @@ search *and* keep warm-starting model weights.
 
 | Var | Effect |
 |---|---|
-| `OBJ_REWARD_SCALE` | leftover alias of `DREAMER_OBJ_REWARD_SCALE` (`auto` / `off` / `<float>`). Canonical path is the DREAMER_* whitelist. |
-| `DREAMER_OBJ_REWARD_SCALE` | `auto` (default) / `off` / `<float>` — disable or force reward scale |
-| `OBJ_BATCH_SIZE` | leftover alias of `DREAMER_BATCH_SIZE` — pin B and skip the GPU-calib probe |
-| `DREAMER_BATCH_SIZE` | pin `batch_size` (else empirical GPU-calib). Leftover `OBJ_BATCH_SIZE` still wins when DREAMER is unset. |
+| `DREAMER_OBJ_REWARD_SCALE` | `auto` (default) / `off` / `<float>` — disable or force reward scale. Leftover `OBJ_REWARD_SCALE` is ignored. |
+| `DREAMER_BATCH_SIZE` | pin `batch_size` (else empirical GPU-calib). Leftover `OBJ_BATCH_SIZE` is ignored. |
 | `DREAMER_TARGET_UTIL` | GPU-calib VRAM fraction (default 0.80). Dual-read at probe. |
 | `DREAMER_MAX_BS` | GPU-calib hard ceiling (default 512). Dual-read at probe. |
 | `SIM_EPISODE_LENGTH` | force episode length (else auto from settling time) |
@@ -520,8 +518,8 @@ early via the `on_iter_end` callback in the trainer.
 
 | Knob | Floor (paper) | Auto rule | Override |
 |---|---|---|---|
-| `batch_size` | 16 | nearest power of two filling `gpu_target_util` of GPU memory (empirical probe); ceiling `gpu_max_bs` | `DREAMER_BATCH_SIZE` (leftover `OBJ_BATCH_SIZE`) |
-| `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `OBJ_REWARD_SCALE` |
+| `batch_size` | 16 | nearest power of two filling `gpu_target_util` of GPU memory (empirical probe); ceiling `gpu_max_bs` | `DREAMER_BATCH_SIZE` |
+| `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `DREAMER_OBJ_REWARD_SCALE` |
 | `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `SIM_EPISODE_LENGTH` |
 | `sample_rate` | 5 | `min(τ_fast / 10, θ_fast / 2)` | `SIM_SAMPLE_RATE` |
 | `seq_len` | 64 | `max(64, ⌈(3τ + θ) / sr⌉)` | — |

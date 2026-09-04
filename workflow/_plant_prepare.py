@@ -212,19 +212,18 @@ def _as_attn_impl(s: str) -> str:
 def explicit_batch_size() -> Optional[int]:
     """Skip the GPU-calib probe when a batch size is already pinned.
 
-    Canonical ``DREAMER_BATCH_SIZE`` wins.  Leftover ``OBJ_BATCH_SIZE``
-    still wins when the DREAMER field is unset (same leftover-env class
-    as ``OBJ_REWARD_SCALE``).  ``None`` → empirical probe.
+    Canonical ``DREAMER_BATCH_SIZE`` only.  Leftover ``OBJ_BATCH_SIZE``
+    is **not** read (P87-live; login leftover was a silent A/B outside
+    ``ENV_OVERRIDES`` / ``run_plan``, same class as ``SIGMA_*`` /
+    leftover ``OBJ_REWARD_SCALE``).  ``None`` → empirical probe.
     """
-    for key in ('DREAMER_BATCH_SIZE', 'OBJ_BATCH_SIZE'):
-        raw = os.environ.get(key, '').strip()
-        if not raw:
-            continue
-        try:
-            return max(1, int(raw))
-        except ValueError:
-            continue
-    return None
+    raw = os.environ.get('DREAMER_BATCH_SIZE', '').strip()
+    if not raw:
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return None
 
 
 def gpu_probe_knobs() -> Tuple[float, float, int]:
@@ -339,7 +338,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # GPU-calib budget + hard batch pin.  Were leftover ``os.environ.get``
     # in ``tools/gpu_calibrate.py`` / ``OBJ_BATCH_SIZE`` in single_run/BO
     # (worked, missing from ``run_plan``).  Identity 0.80 / 512.
-    # Probe still dual-reads env (runs before TrainConfig exists).
+    # Leftover ``OBJ_BATCH_SIZE`` ignored (P87-live).  Probe still
+    # dual-reads ``DREAMER_*`` env (runs before TrainConfig exists).
     'DREAMER_TARGET_UTIL':             ('gpu_target_util',         float),
     'DREAMER_MAX_BS':                  ('gpu_max_bs',              int),
     'DREAMER_BATCH_SIZE':              ('batch_size',              int),
@@ -507,6 +507,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_REWARD_CAL_TARGET_SYM_MAG':   ('reward_cal_target_sym_mag',    float),
     # Gate for percentile→twohot scale.  Was leftover ``OBJ_REWARD_SCALE``
     # (worked, missing from ``run_plan``).  Identity default ``auto``.
+    # Leftover ``OBJ_REWARD_SCALE`` ignored (P87-live).
     'DREAMER_OBJ_REWARD_SCALE':            ('obj_reward_scale',             str),
     # Reward-engine leftovers (``utils/objective_runtime.py``).  Identity.
     # Dual-read leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*``.  Clip ``<0``
