@@ -272,7 +272,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > `sim_domain_randomization` / `sim_param_randomization_pct` sentinel −1=auto)
 > and operator-event schedule (`disturbance_authority_frac` /
 > `disturbance_recovery_frac` / `disturbance_settle_steps` /
-> `disturbance_quiet_frac`; leftover `AGENT_DISTURBANCE_*`)
+> `disturbance_quiet_frac`; A/B `DREAMER_DISTURBANCE_*`; leftover
+> `AGENT_DISTURBANCE_*` is not read)
 > plus expert move-law (`expert_move_frac` / `backoff_frac` / …)
 > and CLI extras (`POLICY_*` /
 > `GRAD_CLIP` / seed counts / plant-derived arch) that `single_run`

@@ -796,9 +796,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Sentinel <0 = identifier-derived bake.  Leftover SIM_PARAM was
     # dead after wrap overwrite.  Identity env-free (auto).
     'DREAMER_SIM_PARAM_RANDOMIZATION_PCT': ('sim_param_randomization_pct', float),
-    # Operator-event schedule.  Were leftover ``AGENT_DISTURBANCE_*``
-    # (worked, missing from ``run_plan``).  Identity.  Dual-read at
-    # ``build_training_disturbance_schedule``.  Settle 0 = auto.
+    # Operator-event schedule.  TrainConfig + these keys.  Leftover
+    # ``AGENT_DISTURBANCE_*`` is **not** read (P82-live).  Settle 0 = auto.
     'DREAMER_DISTURBANCE_AUTHORITY_FRAC': ('disturbance_authority_frac',    float),
     'DREAMER_DISTURBANCE_RECOVERY_FRAC':  ('disturbance_recovery_frac',     float),
     'DREAMER_DISTURBANCE_SETTLE_STEPS':   ('disturbance_settle_steps',      int),
@@ -856,7 +855,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_ES_GRADSKIP_WINDOW':         ('early_stop_grad_skip_window_iters', int),
     'DREAMER_ES_GRADSKIP_MAX':            ('early_stop_grad_skip_max', int),
     'DREAMER_ES_P2_MAX_RMTP':             ('early_stop_p2_max_reward_mtp_loss', float),
-    # (c) WM disturbance-estimator head (P87, default ON; RSSM backbone).
+    # P87 head A/B.  Env-free DOB default-ON retires the head (dim=0).
     'DREAMER_DISTURBANCE_HEAD':           ('disturbance_head',               _as_bool),
     'DREAMER_DISTURBANCE_LOSS_SCALE':     ('disturbance_loss_scale',         float),
     'DREAMER_DISTURBANCE_HEAD_STOP_GRAD': ('disturbance_head_stop_grad',     _as_bool),
@@ -864,7 +863,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_DISTURBANCE_LOSS_GATE_RECON':('disturbance_loss_gate_recon',    float),
     'DREAMER_DISTURBANCE_HEAD_HIDDEN':    ('disturbance_head_hidden',        int),
     'DREAMER_DISTURBANCE_HEAD_LAYERS':    ('disturbance_head_layers',        int),
-    # Neural Kalman filter / disturbance observer (DOB, 2026-06-11; default off).
+    # Neural Kalman / DOB (default ON; ``=0`` restores pre-DOB).
     'DREAMER_DOB_ENABLED':                ('dob_enabled',                    _as_bool),
     'DREAMER_DOB_REG_COEF':               ('dob_reg_coef',                   float),
     'DREAMER_DOB_DECAY_INIT':             ('dob_decay_init',                 float),

@@ -45,9 +45,15 @@ def _explicit(cfg, field: str) -> bool:
     return field in (getattr(cfg, "_explicit_fields", set()) or set())
 
 
-def _knob_float(cfg, field: str, dreamer_key: str, leftover_key: str,
+def _knob_float(cfg, field: str, dreamer_key: str,
                 default: float) -> float:
-    """Explicit TrainConfig, else DREAMER_*, else leftover AGENT_*, else default."""
+    """Explicit TrainConfig, else DREAMER_*, else cfg field, else default.
+
+    Leftover ``AGENT_DISTURBANCE_*`` is **not** read (P82-live).  Login
+    leftovers were a silent A/B outside ``ENV_OVERRIDES`` / ``run_plan``.
+    Tests / CLI that skip ``apply_dreamer_env_overrides`` still opt in
+    via ``DREAMER_*``.
+    """
     if _explicit(cfg, field):
         try:
             return float(getattr(cfg, field))
@@ -59,12 +65,6 @@ def _knob_float(cfg, field: str, dreamer_key: str, leftover_key: str,
             return float(d_raw)
         except Exception:
             pass
-    l_raw = os.environ.get(leftover_key)
-    if l_raw not in (None, ""):
-        try:
-            return float(l_raw)
-        except Exception:
-            pass
     if cfg is not None:
         try:
             return float(getattr(cfg, field, default))
@@ -73,10 +73,9 @@ def _knob_float(cfg, field: str, dreamer_key: str, leftover_key: str,
     return float(default)
 
 
-def _knob_int(cfg, field: str, dreamer_key: str, leftover_key: str,
+def _knob_int(cfg, field: str, dreamer_key: str,
               default: int) -> int:
-    return int(round(_knob_float(cfg, field, dreamer_key, leftover_key,
-                                 float(default))))
+    return int(round(_knob_float(cfg, field, dreamer_key, float(default))))
 
 
 def _state_name(sim, idx: int) -> str:
@@ -328,13 +327,12 @@ def get_authority_target_frac(default: float = 0.65, cfg=None) -> float:
 
     Default 0.65 leaves 35% headroom for OU drift, measurement noise, and
     transient overshoot.  TrainConfig ``disturbance_authority_frac``;
-    leftover ``AGENT_DISTURBANCE_AUTHORITY_FRAC``.  Set to 0 to disable
+    A/B ``DREAMER_DISTURBANCE_AUTHORITY_FRAC``.  Set to 0 to disable
     the budget entirely (legacy behaviour).
     """
     val = _knob_float(
         cfg, 'disturbance_authority_frac',
         'DREAMER_DISTURBANCE_AUTHORITY_FRAC',
-        'AGENT_DISTURBANCE_AUTHORITY_FRAC',
         default)
     return float(np.clip(val, 0.0, 1.5))
 
@@ -376,7 +374,6 @@ def clamp_event_to_authority_budget(
     recovery_frac = float(np.clip(_knob_float(
         cfg, 'disturbance_recovery_frac',
         'DREAMER_DISTURBANCE_RECOVERY_FRAC',
-        'AGENT_DISTURBANCE_RECOVERY_FRAC',
         0.20), 0.0, 1.0))
     if (allowed_cv == 0.0) or (np.sign(allowed_cv) != sign):
         if recovery_frac <= 0.0:
@@ -415,7 +412,6 @@ def build_training_disturbance_schedule(
     quiet_frac = float(np.clip(_knob_float(
         cfg, 'disturbance_quiet_frac',
         'DREAMER_DISTURBANCE_QUIET_FRAC',
-        'AGENT_DISTURBANCE_QUIET_FRAC',
         0.12), 0.0, 0.5))
     if rng.uniform() < quiet_frac:
         return []
@@ -445,7 +441,6 @@ def build_training_disturbance_schedule(
     settle_steps = _knob_int(
         cfg, 'disturbance_settle_steps',
         'DREAMER_DISTURBANCE_SETTLE_STEPS',
-        'AGENT_DISTURBANCE_SETTLE_STEPS',
         0)
     if settle_steps > 0:
         settle = max(32, int(settle_steps))

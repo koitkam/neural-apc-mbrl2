@@ -4562,7 +4562,7 @@ def _test_sim_snr_cfg() -> None:
 
 
 def _test_agent_disturbance_cfg() -> None:
-    """Operator-event schedule: TrainConfig default, leftover AGENT_*, DREAMER wins."""
+    """Operator-event schedule: TrainConfig default; DREAMER_* A/B; leftover AGENT_* ignored."""
     import os
     from utils.training_disturbance import (
         build_training_disturbance_schedule, get_authority_target_frac,
@@ -4588,7 +4588,7 @@ def _test_agent_disturbance_cfg() -> None:
         assert abs(get_authority_target_frac() - 0.65) < 1e-12
         assert abs(get_authority_target_frac(cfg=c) - 0.65) < 1e-12
         os.environ['AGENT_DISTURBANCE_AUTHORITY_FRAC'] = '0.40'
-        assert abs(get_authority_target_frac(cfg=c) - 0.40) < 1e-12
+        assert abs(get_authority_target_frac(cfg=c) - 0.65) < 1e-12
         os.environ['DREAMER_DISTURBANCE_AUTHORITY_FRAC'] = '0.55'
         assert abs(get_authority_target_frac(cfg=c) - 0.55) < 1e-12
         c_ex = TrainConfig()
@@ -4602,7 +4602,14 @@ def _test_agent_disturbance_cfg() -> None:
             proposed_delta=1.0, cv_impact_per_unit=1.0,
             cumulative_cv_impact=10.0, mv_authority_cv=1.0,
             target_frac=0.65)
-        assert abs(d0 + 0.50) < 1e-12
+        assert abs(d0 + 0.20) < 1e-12, d0
+        os.environ['DREAMER_DISTURBANCE_RECOVERY_FRAC'] = '0.50'
+        d_env, _ = clamp_event_to_authority_budget(
+            proposed_delta=1.0, cv_impact_per_unit=1.0,
+            cumulative_cv_impact=10.0, mv_authority_cv=1.0,
+            target_frac=0.65)
+        assert abs(d_env + 0.50) < 1e-12, d_env
+        os.environ.pop('DREAMER_DISTURBANCE_RECOVERY_FRAC', None)
         c_rec = TrainConfig()
         c_rec.disturbance_recovery_frac = 0.10
         c_rec._explicit_fields = {'disturbance_recovery_frac'}  # type: ignore
@@ -4637,7 +4644,7 @@ def _test_agent_disturbance_cfg() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  operator-event TrainConfig + leftover AGENT_* identity')
+    print('[smoke] OK  operator-event TrainConfig + DREAMER_*; leftover AGENT_* ignored')
 
 
 def _test_sim_runtime_cfg() -> None:

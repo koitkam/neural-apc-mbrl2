@@ -1652,13 +1652,12 @@ class TrainConfig:
     # Explicit ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` / leftover SIM_*
     # now win at bake.  ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``.
     sim_param_randomization_pct: float = -1.0
-    # Operator-event schedule (measured DV steps).  Were leftover
-    # ``AGENT_DISTURBANCE_*`` in ``utils/training_disturbance.py``
-    # (worked, missing from ``run_plan``).  Identity.  Dual-read at
-    # schedule build.  ``disturbance_settle_steps=0`` = identifier-
-    # derived.  Unused AGENT_* helpers (curriculum/progressive flags,
-    # MVSaturationMonitor, intensity controller, init-offset mix) were
-    # never called and are removed.
+    # Operator-event schedule (measured DV steps).  TrainConfig +
+    # ``DREAMER_DISTURBANCE_*``.  Leftover ``AGENT_DISTURBANCE_*`` is
+    # **not** read (P82-live; login silent A/B).  ``settle_steps=0`` =
+    # identifier-derived.  Unused AGENT_* helpers (curriculum /
+    # progressive / sat-monitor / intensity / init-offset) were never
+    # called and are removed.
     disturbance_authority_frac: float = 0.65
     disturbance_recovery_frac: float = 0.20
     disturbance_settle_steps: int = 0
