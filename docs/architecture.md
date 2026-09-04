@@ -1257,7 +1257,7 @@ the freezes, WM frozen by S3). Both backbones.
 | RSSM (`obs_step`/`img_step`/`decode`/`rollout_observed`) | `models/dreamer_v4_rssm.py` |
 | TSSM (transformer, duck-compatible) | `models/transformer_ssm.py` |
 | Heads (reward/value/policy/disturbance), param groups | `models/dreamer_v4.py` (`parameters_world/_actor/_critic`) |
-| WM loss (recon + P1 prior-CV recon / KL / overshoot / held-rollout; P87 head skipped when None) | `training/train.py` (`world_model_loss`, `_rssm_world_model_loss`, `_wm_need_dist_head_loss`, `_disturbance_head_loss`) |
+| WM loss (recon + KL / overshoot / held-rollout; P87 head always called, zeros when None) | `training/train.py` (`world_model_loss`, `_rssm_world_model_loss`, `_disturbance_head_loss`; `_wm_need_dist_head_loss` is H2D only) |
 | Real-sim λ-returns + MC grounding + actor/critic | `training/train.py` (`_realsim_actor_critic_step`) |
 | Hidden load + Gd disturbance | `utils/hidden_disturbance.py` (`HiddenDisturbance`) |
 | Neural Kalman filter / DOB (`d_t` state) | `models/dreamer_v4_rssm.py` + `models/transformer_ssm.py` (`dob_enabled`, `obs_step`/`img_step`/`apply_dob`); recon in `training/train.py:_rssm_world_model_loss` |

@@ -2099,6 +2099,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_wm_need_enc_diag' in _src
     assert 'def _wm_need_dist_target' in _src
     assert 'def _wm_need_dist_head_loss' in _src
+    # P85: always-call P87 helper (P82-live skip FALSIFIED as P79 identity).
+    assert 'if _wm_need_dist_head_loss(model, cfg):' not in _src
     assert 'def _p1_wm_h2d_keys' in _src
     assert 'def _replay_h2d_keys' in _src
     assert '_h2d_keys = _p1_wm_h2d_keys' in _src
