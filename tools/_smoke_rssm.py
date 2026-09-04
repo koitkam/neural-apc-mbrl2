@@ -1540,6 +1540,79 @@ def _test_store_aux_feats_identity() -> None:
           f'kalman mix budget={bud}')
 
 
+def _test_prior_cv_recon_p1() -> None:
+    """P81: Stage-1 keep_aux packs prior_core; P1 loss pins decode(prior).
+
+    P2 Kalman still consumes prior_core; prior recon is gated off so ν
+    is not starved. rest-IC last_only still skips prior heads (covered
+    by ``_test_store_aux_feats_identity``).
+    """
+    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
+    torch.manual_seed(0)
+    rcfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                      n_categoricals=4, n_classes=4, embed_dim=16,
+                      hidden_dim=16, latent_type='deterministic',
+                      cont_gain_dim=2, dob_enabled=True, cv_indices=(0,))
+    m = RSSMDynamics(rcfg)
+    m.dob_active = False
+    B, T = 2, 8
+    obs = torch.randn(B, T, 6)
+    act = torch.rand(B, T, 2) * 2 - 1
+    _f, _po, _pr, _st, _ds, cont = m.rollout_observed(
+        obs, act, sample=False, store_aux=True)
+    assert cont is not None and 'prior_core' in cont
+    pc = cont['prior_core']
+    dec_in = (m.deter_dim + m.stoch_flat_dim + m.cont_dim + m._dv_feed_dim)
+    assert tuple(pc.shape) == (B, T, dec_in), pc.shape
+    _f2, _po2, _pr2, _st2, _ds2, cont_iso = m.rollout_observed(
+        obs, act, sample=False, store_aux=False)
+    assert cont_iso is None or 'prior_core' not in cont_iso
+    tcfg = TrainConfig()
+    tcfg.obs_dim, tcfg.action_dim = 6, 2
+    tcfg.lookback, tcfg.seq_len, tcfg.horizon = 8, 8, 4
+    tcfg.mtp_length = 4
+    tcfg.world_model_type = 'rssm'
+    tcfg.dob_enabled = True
+    tcfg.cv_obs_indices = (0,)
+    tcfg.compile_mode = 'off'
+    tcfg.wm_overshoot_coef = 0.0
+    tcfg.wm_held_rollout_coef = 0.0
+    tcfg.gain_match_coef = 0.0
+    tcfg.wm_input_isolation_coef = 0.0
+    tcfg.rssm_deter_dim = 16
+    tcfg.rssm_n_categoricals = 4
+    tcfg.rssm_n_classes = 4
+    tcfg.rssm_embed_dim = 16
+    tcfg.rssm_hidden_dim = 16
+    tcfg.d_model = 32
+    tcfg.head_hidden = 32
+    tcfg.head_n_layers = 1
+    model = build_model(tcfg)
+    model.set_dob_active(False)
+    batch = {
+        'obs': obs, 'act': act,
+        'rew': torch.zeros(B, T),
+        'cont': torch.ones(B, T),
+        'expert': torch.zeros(B, T),
+    }
+    model.zero_grad(set_to_none=True)
+    losses, _, _ = world_model_loss(model, batch, tcfg)
+    pr = float(losses['wm_prior_recon_loss'])
+    assert torch.isfinite(losses['wm_prior_recon_loss']).all() and pr > 0.0, pr
+    losses['wm_total'].backward()
+    prior_g = sum(float(p.grad.abs().sum())
+                  for p in model.dynamics.prior_net.parameters()
+                  if p.grad is not None)
+    assert prior_g > 0.0, 'P1 prior recon lost prior_net gradient'
+    model.zero_grad(set_to_none=True)
+    model.set_dob_active(True)
+    losses2, _, _ = world_model_loss(model, batch, tcfg)
+    assert float(losses2['wm_prior_recon_loss']) == 0.0, float(
+        losses2['wm_prior_recon_loss'])
+    print(f'[smoke] OK  P1 prior-CV recon fires ({pr:.4f}); P2 gated 0; '
+          f'prior_net |g|={prior_g:.3f}')
+
+
 def _test_img_rollout_last_only() -> None:
     """Gain-match last-step Huber: last_only ≡ stack[:, -1]; GRU still gets grad.
 
@@ -2206,6 +2279,7 @@ def _test_envfree_observer_recipe() -> None:
     c = TrainConfig()
     assert c.world_model_type == 'rssm', c.world_model_type
     assert c.rssm_latent_type == 'deterministic', c.rssm_latent_type
+    assert abs(float(c.cont_gain_persist_coef) - 0.1) < 1e-12
     assert c.wm_best_restore_at_p2 is False
     assert int(c.n_critics) == 2
     assert c.return_scale_freeze_after_warmup is True
@@ -5146,6 +5220,7 @@ if __name__ == '__main__':
     _test_buffer_sample_keys()
     _test_buffer_clear()
     _test_store_aux_feats_identity()
+    _test_prior_cv_recon_p1()
     _test_img_rollout_last_only()
     _test_gru_update_gate_bias()
     _test_img_step_det_roll_skips_sample()

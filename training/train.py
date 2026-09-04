@@ -8665,6 +8665,18 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     if dob_live:
         recon = rssm.apply_dob(recon, ds)
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
+    # P81: pin decode(prior) → obs in P1 (g live, d≡0). Posterior recon
+    # can autoencode the current CV; the 1-step prior must predict from
+    # GRU(h, a, dv). P79 val DV post→1step ×0.863 (P64 ×0.987 faithful)
+    # while MV compounding was already P64-class. P2 Kalman already uses
+    # decode(prior) as the innovation base — pinning prior to raw obs
+    # there would starve ν. No new coef: same recon_scale. MV and DV
+    # share the recon (do not special-case DV).
+    prior_recon_loss = torch.zeros((), device=feats.device)
+    prior_core = (cont.get('prior_core') if isinstance(cont, dict) else None)
+    if prior_core is not None and not dob_live:
+        prior_pred = rssm.decode(prior_core)
+        prior_recon_loss = _weighted_recon_mse(prior_pred, obs_cur, cfg)
     latent_type = str(getattr(cfg, 'rssm_latent_type', 'deterministic')).lower()
     joint_embed_loss = torch.zeros((), device=feats.device)
     if latent_type == 'deterministic':
@@ -8676,14 +8688,18 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         kl_diag = {}
         joint_embed_loss = rssm_joint_embed_loss(post_logits, prior_logits)
         je_coef = float(getattr(cfg, 'rssm_joint_embed_coef', 1.0) or 0.0)
-        wm_total = cfg.recon_scale * recon_loss + je_coef * joint_embed_loss
+        wm_total = (cfg.recon_scale * recon_loss
+                    + cfg.recon_scale * prior_recon_loss
+                    + je_coef * joint_embed_loss)
     else:
         kl_loss, kl_diag = rssm_kl_loss(
             post_logits, prior_logits,
             free_bits=float(getattr(cfg, 'rssm_free_bits', 1.0)),
             dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
             repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
-        wm_total = cfg.recon_scale * recon_loss + kl_loss
+        wm_total = (cfg.recon_scale * recon_loss
+                    + cfg.recon_scale * prior_recon_loss
+                    + kl_loss)
     # ----- continuous-latent KL (gain + disturbance channels) -----
     # The Gaussian analogue of the categorical KL: trains the prior to ROLL the
     # gain (persist) + disturbance (OU) forward so imagination carries them.
@@ -8691,7 +8707,8 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     cont_gain_persist = torch.zeros((), device=feats.device)
     dist_match_loss = torch.zeros((), device=feats.device)
     ck_scale = float(getattr(cfg, 'cont_kl_scale', 1.0) or 0.0)
-    if cont is not None and ck_scale > 0.0:
+    if (cont is not None and ck_scale > 0.0
+            and cont.get('post_mean') is not None):
         from models.dreamer_v4_rssm import rssm_cont_kl_loss
         cont_kl, _cont_kl_diag = rssm_cont_kl_loss(
             cont['post_mean'], cont['post_std'],
@@ -8895,6 +8912,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
 
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
+        'wm_prior_recon_loss': prior_recon_loss.detach(),
         'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
         'kl_loss': kl_loss,
         'wm_total': wm_total,
@@ -14332,6 +14350,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
             _obs = (
                 f"recon {_lf('recon_loss')} "
+                + (f"precon {_lf('wm_prior_recon_loss')} "
+                   if _rssm else '')
                 + (f"kl {_lf('kl_loss', 3)} "
                    f"jemb {_lf('joint_embed_loss')} "
                    if _rssm else

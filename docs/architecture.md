@@ -934,7 +934,10 @@ flowchart LR
   `d_t = A·d_{t-1} + K·ν_t` (`K` = **learned** Kalman gain).
 - **Output**: decoder `CV = g(h,z) + d_t`. `g` now learns the *true* gain because
   `d_t` absorbs the unexplained movement (de-confounds the attenuation). The
-  recon loss compares `g(feat)+d_t` vs `obs`, and an L2 prior on `d_t`
+  posterior recon compares `g(feat)+d_t` vs `obs`. P1 (d≡0) also pins
+  `decode(prior)` vs obs at the same `recon_scale` (jsonl `wm_prior_recon_loss`;
+  P81) so the 1-step prior cannot hide behind posterior autoencoding. P2
+  gates that term off. An L2 prior on `d_t`
   (`dob_reg_coef`, the Kalman "process-noise-is-small" assumption) keeps the
   model using `d_t` only for the genuine residual.
 - **Grounding (KalmanNet, P19)**: the recon innovation alone under-drives `d_t`
@@ -1175,8 +1178,12 @@ freeze is `DreamerV4.set_world_model_trainable(g, dob, reward)` (toggles
 
 The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 **no head-dim change at a stage boundary**. In Stage 1 the estimate is *suppressed*
-(`d_t ≡ 0`), not removed — `rollout_observed` skips the prior-core harvest that
-P2's batched DOB decode consumes (`dob_active=False`).
+(`d_t ≡ 0`), not removed. rest-IC `last_only` still skips prior heads. P1
+`keep_aux` harvests `prior_core` so `_rssm_world_model_loss` pins
+`decode(prior)` vs obs at `recon_scale` (P81; posterior recon can autoencode
+the current CV without teaching the teacher-forced 1-step). That term is
+**gated off when `dob_live`** so P2 Kalman ν=`CV_obs−decode(prior)` is not
+starved. P2 still batched-decodes prior for the Kalman.
 
 | | **Stage 1 = P1** (plant id) | **Stage 2 = P2** (observer id) | **Stage 3 = P3** (controller) |
 |---|---|---|---|
@@ -1247,7 +1254,7 @@ the freezes, WM frozen by S3). Both backbones.
 | RSSM (`obs_step`/`img_step`/`decode`/`rollout_observed`) | `models/dreamer_v4_rssm.py` |
 | TSSM (transformer, duck-compatible) | `models/transformer_ssm.py` |
 | Heads (reward/value/policy/disturbance), param groups | `models/dreamer_v4.py` (`parameters_world/_actor/_critic`) |
-| WM loss (recon/KL/overshoot/held-rollout, disturbance) | `training/train.py` (`world_model_loss`, `_disturbance_head_loss`) |
+| WM loss (recon + P1 prior-CV recon / KL / overshoot / held-rollout, disturbance) | `training/train.py` (`world_model_loss`, `_rssm_world_model_loss`, `_disturbance_head_loss`) |
 | Real-sim λ-returns + MC grounding + actor/critic | `training/train.py` (`_realsim_actor_critic_step`) |
 | Hidden load + Gd disturbance | `utils/hidden_disturbance.py` (`HiddenDisturbance`) |
 | Neural Kalman filter / DOB (`d_t` state) | `models/dreamer_v4_rssm.py` + `models/transformer_ssm.py` (`dob_enabled`, `obs_step`/`img_step`/`apply_dob`); recon in `training/train.py:_rssm_world_model_loss` |
