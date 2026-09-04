@@ -1051,9 +1051,11 @@ class TrainConfig:
     # MEAN G). Posterior Δ persist does not constrain ``img_rollout`` prior G.
     # P79 EXIT: rssm KEEP; identity missed P64 freeze 0.91@DV (P79 0.81@DV
     # last_ok 81 GAIN-READY, actor VALID, loses to P64). P64 predates OL persist.
-    # P80 LIVE A/B: default 0.1→0.0 (pid 293761; jsonl cont_gain_persist=0).
-    # Do not restore 0.1 while P80 is the one GPU job.
-    cont_gain_persist_coef: float = 0.0
+    # P80 EXIT REVERT: default 0.1→0.0 FALSIFIED as P64 freeze-DV/TM/champ
+    # (freeze 0.87@DV still short of 0.91; val MV ×0.723 vs P79 ×0.923;
+    # 1step→OL ×0.735 vs P79 ×0.840; paired −35 vs P79 −10.57 / P64 −4.54).
+    # Persist-off regressed P79 TM to P73-class. Restore 0.1. Do not persist N+1.
+    cont_gain_persist_coef: float = 0.1
     # ---- MIMO self-supervised per-INPUT isolation (2026-07-10) ----
     # The DATA-DRIVEN generalisation of C(1) gain-match: on isolated-excitation
     # episodes (ONE input swept, all others held) the CV response is driven by
