@@ -935,13 +935,12 @@ flowchart LR
   `d_t = A·d_{t-1} + K·ν_t` (`K` = **learned** Kalman gain).
 - **Output**: decoder `CV = g(h,z) + d_t`. `g` now learns the *true* gain because
   `d_t` absorbs the unexplained movement (de-confounds the attenuation). The
-  posterior recon compares `g(feat)+d_t` vs `obs`. P1 (d≡0) also pins
-  `decode(prior)` vs obs at the same `recon_scale` with **decoder weights
-  stop-grad** (jsonl `wm_prior_recon_loss`; P81 live decode KEEP as 1-step /
-  FALSIFIED as TM; P82 LIVE extra-P1 orig-P1 FAIL **0.77@MV**, extra FAIL
-  **0.75@MV** last_ok 84 — stop-grad did not recover TM vs P81 extra PASS
-  0.85@MV) so GRU/prior match obs-space 1-step without stealing
-  the DC map. P2 gates that term off. An L2 prior on `d_t`
+  posterior recon compares `g(feat)+d_t` vs `obs`. P1 no longer pins
+  `decode(prior)` vs obs (**P83** family REVERT: P81 live decode KEEP as
+  1-step / FALSIFIED as TM; P82 stop-grad FALSIFIED — val MV ×0.779 vs
+  P79 ×0.923, DV post→1step ×0.958 vs P81 ×0.966). jsonl
+  `wm_prior_recon_loss` / banner `precon` stay 0. P2 Kalman still
+  batched-decodes prior for ν. An L2 prior on `d_t`
   (`dob_reg_coef`, the Kalman "process-noise-is-small" assumption) keeps the
   model using `d_t` only for the genuine residual.
 - **Grounding (KalmanNet, P19)**: the recon innovation alone under-drives `d_t`
@@ -1183,14 +1182,9 @@ freeze is `DreamerV4.set_world_model_trainable(g, dob, reward)` (toggles
 The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 **no head-dim change at a stage boundary**. In Stage 1 the estimate is *suppressed*
 (`d_t ≡ 0`), not removed. rest-IC `last_only` still skips prior heads. P1
-`keep_aux` harvests `prior_core` so `_rssm_world_model_loss` pins
-`decode(prior)` vs obs at `recon_scale` with **stop-grad decoder** (P81 live
-decode FALSIFIED as TM; P82 LIVE extra-P1 orig-P1 FAIL 0.77@MV / extra
-0.75@MV vs P81 extra PASS 0.85@MV; posterior recon can autoencode the current CV
-without teaching the teacher-forced 1-step, and must not steal gain-match's
-DC map). That term is
-**gated off when `dob_live`** so P2 Kalman ν=`CV_obs−decode(prior)` is not
-starved. P2 still batched-decodes prior for the Kalman.
+no longer packs `prior_core` into `cont` (**P83** family REVERT after P81
+KEEP-as-1-step / FALSIFIED-as-TM and P82 stop-grad FALSIFIED). jsonl
+`wm_prior_recon_loss` stays 0. P2 still batched-decodes prior for the Kalman.
 
 | | **Stage 1 = P1** (plant id) | **Stage 2 = P2** (observer id) | **Stage 3 = P3** (controller) |
 |---|---|---|---|

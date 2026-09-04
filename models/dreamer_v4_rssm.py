@@ -1025,18 +1025,16 @@ class RSSMDynamics(nn.Module):
         # exactly the signal the posterior should map.  Single pass when off.
         two_pass = bool(getattr(self, '_cont_post_uses_innov', False))
         # Prior-core: P2 Kalman / cont-dist two-pass still need the T-list
-        # for a batched decode.  P81 also harvests it on the keep_aux
-        # training path so ``decode(prior)`` can pin the 1-step CV prior
-        # (P32 skipped the Stage-1 T-list because nothing consumed it;
-        # posterior recon + joint-embed left the teacher-forced prior
-        # untrained in obs space).  rest-IC ``last_only`` still skips.
+        # for a batched decode.  P81/P82 Stage-1 keep_aux harvest REVERT
+        # (obs-space prior recon FALSIFIED as TM).  rest-IC ``last_only``
+        # still skips.
         _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
         post_l, prior_l = [], []
         h_l, z_l, c_l, dv_l = [], [], [], []
         ph_l, pz_l, pc_l, pdv_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         keep_aux = bool(store_aux) and not last_only
-        _stack_prior = _need_prior_core or keep_aux
+        _stack_prior = _need_prior_core
         # last_only rest-IC only needs the last RSSMState.  Building
         # post.feat every t was T concatenations of [h,z,c,dv,d] then
         # discarding all but the last.  Kalman / two-pass still need
@@ -1103,7 +1101,7 @@ class RSSMDynamics(nn.Module):
                     prior_l.append(prior.z_logits)
                     c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-                if keep_aux or (self.dob_enabled and self.dob_active):
+                if _stack_prior:
                     _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if last_only and not return_feats:
             return None, None, None, state, None, None
@@ -1145,8 +1143,7 @@ class RSSMDynamics(nn.Module):
             feats = post_core
         # Continuous-latent KL stats + posterior sample (for the cont KL +
         # gain-matching aux loss + disturbance readout).  ``None`` when off.
-        # P81: ``prior_core`` is the teacher-forced prior decode input
-        # (same parts as ``post_core``) for P1 ``decode(prior)`` recon.
+        # P81/P82 no longer pack ``prior_core`` into ``cont`` (family REVERT).
         cont = None
         if keep_aux:
             if self.cont_dim > 0:
@@ -1157,10 +1154,6 @@ class RSSMDynamics(nn.Module):
                     'prior_std': torch.stack(c_ps_l, dim=1),
                     'sample': post_core[..., core:core + self.cont_dim],
                 }
-            if prior_core is not None:
-                if cont is None:
-                    cont = {}
-                cont['prior_core'] = prior_core
         return feats, post_logits, prior_logits, state, ds, cont
 
     def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,

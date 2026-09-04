@@ -1543,13 +1543,13 @@ def _test_store_aux_feats_identity() -> None:
           f'kalman mix budget={bud}')
 
 
-def _test_prior_cv_recon_p1() -> None:
-    """P81: Stage-1 keep_aux packs prior_core; P1 loss pins decode(prior).
+def _test_prior_cv_recon_reverted() -> None:
+    """P83: P81/P82 obs-space prior recon is gone.
 
-    P82: that pin stop-grads the decoder (P81 live decode FALSIFIED as TM).
-    P2 Kalman still consumes prior_core; prior recon is gated off so ν
-    is not starved. rest-IC last_only still skips prior heads (covered
-    by ``_test_store_aux_feats_identity``).
+    Stage-1 ``keep_aux`` must not pack ``prior_core`` (P32 skip restored).
+    jsonl ``wm_prior_recon_loss`` stays 0. P2 Kalman still batched-decodes
+    prior internally (``ds`` live); rest-IC last_only still skips prior
+    heads (covered by ``_test_store_aux_feats_identity``).
     """
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
     torch.manual_seed(0)
@@ -1564,13 +1564,12 @@ def _test_prior_cv_recon_p1() -> None:
     act = torch.rand(B, T, 2) * 2 - 1
     _f, _po, _pr, _st, _ds, cont = m.rollout_observed(
         obs, act, sample=False, store_aux=True)
-    assert cont is not None and 'prior_core' in cont
-    pc = cont['prior_core']
-    dec_in = (m.deter_dim + m.stoch_flat_dim + m.cont_dim + m._dv_feed_dim)
-    assert tuple(pc.shape) == (B, T, dec_in), pc.shape
-    _f2, _po2, _pr2, _st2, _ds2, cont_iso = m.rollout_observed(
-        obs, act, sample=False, store_aux=False)
-    assert cont_iso is None or 'prior_core' not in cont_iso
+    assert cont is None or 'prior_core' not in cont
+    m.dob_active = True
+    _f2, _po2, _pr2, _st2, ds2, cont2 = m.rollout_observed(
+        obs, act, sample=False, store_aux=True)
+    assert ds2 is not None and ds2.shape[:2] == (B, T)
+    assert cont2 is None or 'prior_core' not in cont2
     tcfg = TrainConfig()
     tcfg.obs_dim, tcfg.action_dim = 6, 2
     tcfg.lookback, tcfg.seq_len, tcfg.horizon = 8, 8, 4
@@ -1599,27 +1598,10 @@ def _test_prior_cv_recon_p1() -> None:
         'cont': torch.ones(B, T),
         'expert': torch.zeros(B, T),
     }
-    # Isolated prior term must not train the decoder (P82); graph from THIS
-    # dynamics, not the shape-probe ``m`` above.
-    from training.train import _decode_stopgrad_decoder
-    _fm, _pom, _prm, _stm, _dsm, cont_m = model.dynamics.rollout_observed(
-        obs, act, sample=False, store_aux=True)
-    assert cont_m is not None and 'prior_core' in cont_m
-    model.zero_grad(set_to_none=True)
-    pred_sg = _decode_stopgrad_decoder(model.dynamics, cont_m['prior_core'])
-    ((pred_sg - obs).pow(2).mean()).backward()
-    dec_g_sg = sum(float(p.grad.abs().sum())
-                   for p in model.dynamics.decoder.parameters()
-                   if p.grad is not None)
-    prior_g_sg = sum(float(p.grad.abs().sum())
-                     for p in model.dynamics.prior_net.parameters()
-                     if p.grad is not None)
-    assert dec_g_sg == 0.0, dec_g_sg
-    assert prior_g_sg > 0.0, 'P82 stop-grad decoder lost prior_net gradient'
     model.zero_grad(set_to_none=True)
     losses, _, _ = world_model_loss(model, batch, tcfg)
     pr = float(losses['wm_prior_recon_loss'])
-    assert torch.isfinite(losses['wm_prior_recon_loss']).all() and pr > 0.0, pr
+    assert pr == 0.0, pr
     losses['wm_total'].backward()
     prior_g = sum(float(p.grad.abs().sum())
                   for p in model.dynamics.prior_net.parameters()
@@ -1627,16 +1609,16 @@ def _test_prior_cv_recon_p1() -> None:
     dec_g = sum(float(p.grad.abs().sum())
                 for p in model.dynamics.decoder.parameters()
                 if p.grad is not None)
-    assert prior_g > 0.0, 'P1 prior recon lost prior_net gradient'
+    assert prior_g > 0.0, 'joint-embed / recon lost prior_net gradient'
     assert dec_g > 0.0, 'posterior recon lost decoder gradient'
     model.zero_grad(set_to_none=True)
     model.set_dob_active(True)
     losses2, _, _ = world_model_loss(model, batch, tcfg)
     assert float(losses2['wm_prior_recon_loss']) == 0.0, float(
         losses2['wm_prior_recon_loss'])
-    print(f'[smoke] OK  P1 prior-CV recon fires ({pr:.4f}); P2 gated 0; '
-          f'prior_net |g|={prior_g:.3f}; decoder |g|={dec_g:.3f} '
-          f'(isolated prior decoder |g|={dec_g_sg:.3g})')
+    print(f'[smoke] OK  P1 prior-CV recon REVERT (precon=0); '
+          f'P2 Kalman ds live; prior_net |g|={prior_g:.3f}; '
+          f'decoder |g|={dec_g:.3f}')
 
 
 def _test_img_rollout_last_only() -> None:
@@ -5304,7 +5286,7 @@ if __name__ == '__main__':
     _test_buffer_sample_keys()
     _test_buffer_clear()
     _test_store_aux_feats_identity()
-    _test_prior_cv_recon_p1()
+    _test_prior_cv_recon_reverted()
     _test_img_rollout_last_only()
     _test_gru_update_gate_bias()
     _test_img_step_det_roll_skips_sample()

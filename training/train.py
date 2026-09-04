@@ -8640,24 +8640,6 @@ def _resolve_gain_match_targets(
           flush=True)
 
 
-def _decode_stopgrad_decoder(rssm, feat: torch.Tensor) -> torch.Tensor:
-    """``rssm.decode(feat)`` with decoder-weight grads blocked; ``feat`` keeps its graph.
-
-    P82: P81 prior recon at ``recon_scale`` sent precon ~4× posterior recon
-    through the same MLP that posterior recon and gain-match own. DV
-    post→1step recovered (P79 ×0.863 → P81 ×0.966) but val MV TM collapsed
-    (P79 ×0.923 → ×0.768) — decoder steal of the DC map. Stop-grad decoder
-    trains GRU/prior only (Dreamer-style: decoder from posterior recon;
-    dynamics from prior-in-obs-space). No new knob. RSSM + TSSM both expose
-    ``decoder`` + ``_decode_in_dim``.
-    """
-    x = feat[..., : int(rssm._decode_in_dim)]
-    dec = rssm.decoder
-    params = {n: p.detach() for n, p in dec.named_parameters()}
-    bufs = dict(dec.named_buffers())
-    return torch.func.functional_call(dec, (params, bufs), (x,))
-
-
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                             act: torch.Tensor, cfg: TrainConfig,
                             dist_target: Optional[torch.Tensor] = None,
@@ -8692,20 +8674,13 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     if dob_live:
         recon = rssm.apply_dob(recon, ds)
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
-    # P81: pin decode(prior) → obs in P1 (g live, d≡0). Posterior recon
-    # can autoencode the current CV; the 1-step prior must predict from
-    # GRU(h, a, dv). P79 val DV post→1step ×0.863 (P64 ×0.987 faithful)
-    # while MV compounding was already P64-class. P2 Kalman already uses
-    # decode(prior) as the innovation base — pinning prior to raw obs
-    # there would starve ν. No new coef: same recon_scale. MV and DV
-    # share the recon (do not special-case DV).
-    # P82: stop-grad the decoder on this term (live ``decode(prior)``
-    # FALSIFIED as TM — precon ~4× recon stole the DC map).
+    # P81/P82 prior-recon family REVERT (P82 EXIT): obs-space
+    # ``decode(prior)`` (live or stop-grad decoder) FALSIFIED as TM
+    # (P81 val MV ×0.768, P82 ×0.779 vs P79 ×0.923), did not keep the
+    # 1-step pin (P82 DV post→1step ×0.958 vs P81 ×0.966), and hurt
+    # DOB amp / actor econ. P2 Kalman still batched-decodes prior for ν.
+    # jsonl ``wm_prior_recon_loss`` stays 0 so old parsers do not None.
     prior_recon_loss = torch.zeros((), device=feats.device)
-    prior_core = (cont.get('prior_core') if isinstance(cont, dict) else None)
-    if prior_core is not None and not dob_live:
-        prior_pred = _decode_stopgrad_decoder(rssm, prior_core)
-        prior_recon_loss = _weighted_recon_mse(prior_pred, obs_cur, cfg)
     latent_type = str(getattr(cfg, 'rssm_latent_type', 'deterministic')).lower()
     joint_embed_loss = torch.zeros((), device=feats.device)
     if latent_type == 'deterministic':
@@ -8718,7 +8693,6 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         joint_embed_loss = rssm_joint_embed_loss(post_logits, prior_logits)
         je_coef = float(getattr(cfg, 'rssm_joint_embed_coef', 1.0) or 0.0)
         wm_total = (cfg.recon_scale * recon_loss
-                    + cfg.recon_scale * prior_recon_loss
                     + je_coef * joint_embed_loss)
     else:
         kl_loss, kl_diag = rssm_kl_loss(
@@ -8727,7 +8701,6 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
             repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
         wm_total = (cfg.recon_scale * recon_loss
-                    + cfg.recon_scale * prior_recon_loss
                     + kl_loss)
     # ----- continuous-latent KL (gain + disturbance channels) -----
     # The Gaussian analogue of the categorical KL: trains the prior to ROLL the
