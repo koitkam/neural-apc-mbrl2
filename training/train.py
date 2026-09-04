@@ -8631,6 +8631,24 @@ def _resolve_gain_match_targets(
           flush=True)
 
 
+def _decode_stopgrad_decoder(rssm, feat: torch.Tensor) -> torch.Tensor:
+    """``rssm.decode(feat)`` with decoder-weight grads blocked; ``feat`` keeps its graph.
+
+    P82: P81 prior recon at ``recon_scale`` sent precon ~4× posterior recon
+    through the same MLP that posterior recon and gain-match own. DV
+    post→1step recovered (P79 ×0.863 → P81 ×0.966) but val MV TM collapsed
+    (P79 ×0.923 → ×0.768) — decoder steal of the DC map. Stop-grad decoder
+    trains GRU/prior only (Dreamer-style: decoder from posterior recon;
+    dynamics from prior-in-obs-space). No new knob. RSSM + TSSM both expose
+    ``decoder`` + ``_decode_in_dim``.
+    """
+    x = feat[..., : int(rssm._decode_in_dim)]
+    dec = rssm.decoder
+    params = {n: p.detach() for n, p in dec.named_parameters()}
+    bufs = dict(dec.named_buffers())
+    return torch.func.functional_call(dec, (params, bufs), (x,))
+
+
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                             act: torch.Tensor, cfg: TrainConfig,
                             dist_target: Optional[torch.Tensor] = None,
@@ -8672,10 +8690,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # decode(prior) as the innovation base — pinning prior to raw obs
     # there would starve ν. No new coef: same recon_scale. MV and DV
     # share the recon (do not special-case DV).
+    # P82: stop-grad the decoder on this term (live ``decode(prior)``
+    # FALSIFIED as TM — precon ~4× recon stole the DC map).
     prior_recon_loss = torch.zeros((), device=feats.device)
     prior_core = (cont.get('prior_core') if isinstance(cont, dict) else None)
     if prior_core is not None and not dob_live:
-        prior_pred = rssm.decode(prior_core)
+        prior_pred = _decode_stopgrad_decoder(rssm, prior_core)
         prior_recon_loss = _weighted_recon_mse(prior_pred, obs_cur, cfg)
     latent_type = str(getattr(cfg, 'rssm_latent_type', 'deterministic')).lower()
     joint_embed_loss = torch.zeros((), device=feats.device)

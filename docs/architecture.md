@@ -935,9 +935,10 @@ flowchart LR
 - **Output**: decoder `CV = g(h,z) + d_t`. `g` now learns the *true* gain because
   `d_t` absorbs the unexplained movement (de-confounds the attenuation). The
   posterior recon compares `g(feat)+d_t` vs `obs`. P1 (d≡0) also pins
-  `decode(prior)` vs obs at the same `recon_scale` (jsonl `wm_prior_recon_loss`;
-  P81) so the 1-step prior cannot hide behind posterior autoencoding. P2
-  gates that term off. An L2 prior on `d_t`
+  `decode(prior)` vs obs at the same `recon_scale` with **decoder weights
+  stop-grad** (jsonl `wm_prior_recon_loss`; P81 live decode KEEP as 1-step /
+  FALSIFIED as TM; P82) so GRU/prior match obs-space 1-step without stealing
+  the DC map. P2 gates that term off. An L2 prior on `d_t`
   (`dob_reg_coef`, the Kalman "process-noise-is-small" assumption) keeps the
   model using `d_t` only for the genuine residual.
 - **Grounding (KalmanNet, P19)**: the recon innovation alone under-drives `d_t`
@@ -1180,8 +1181,10 @@ The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 **no head-dim change at a stage boundary**. In Stage 1 the estimate is *suppressed*
 (`d_t ≡ 0`), not removed. rest-IC `last_only` still skips prior heads. P1
 `keep_aux` harvests `prior_core` so `_rssm_world_model_loss` pins
-`decode(prior)` vs obs at `recon_scale` (P81; posterior recon can autoencode
-the current CV without teaching the teacher-forced 1-step). That term is
+`decode(prior)` vs obs at `recon_scale` with **stop-grad decoder** (P81 live
+decode FALSIFIED as TM; P82; posterior recon can autoencode the current CV
+without teaching the teacher-forced 1-step, and must not steal gain-match's
+DC map). That term is
 **gated off when `dob_live`** so P2 Kalman ν=`CV_obs−decode(prior)` is not
 starved. P2 still batched-decodes prior for the Kalman.
 

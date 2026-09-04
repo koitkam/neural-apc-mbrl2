@@ -1543,6 +1543,7 @@ def _test_store_aux_feats_identity() -> None:
 def _test_prior_cv_recon_p1() -> None:
     """P81: Stage-1 keep_aux packs prior_core; P1 loss pins decode(prior).
 
+    P82: that pin stop-grads the decoder (P81 live decode FALSIFIED as TM).
     P2 Kalman still consumes prior_core; prior recon is gated off so ν
     is not starved. rest-IC last_only still skips prior heads (covered
     by ``_test_store_aux_feats_identity``).
@@ -1595,6 +1596,23 @@ def _test_prior_cv_recon_p1() -> None:
         'cont': torch.ones(B, T),
         'expert': torch.zeros(B, T),
     }
+    # Isolated prior term must not train the decoder (P82); graph from THIS
+    # dynamics, not the shape-probe ``m`` above.
+    from training.train import _decode_stopgrad_decoder
+    _fm, _pom, _prm, _stm, _dsm, cont_m = model.dynamics.rollout_observed(
+        obs, act, sample=False, store_aux=True)
+    assert cont_m is not None and 'prior_core' in cont_m
+    model.zero_grad(set_to_none=True)
+    pred_sg = _decode_stopgrad_decoder(model.dynamics, cont_m['prior_core'])
+    ((pred_sg - obs).pow(2).mean()).backward()
+    dec_g_sg = sum(float(p.grad.abs().sum())
+                   for p in model.dynamics.decoder.parameters()
+                   if p.grad is not None)
+    prior_g_sg = sum(float(p.grad.abs().sum())
+                     for p in model.dynamics.prior_net.parameters()
+                     if p.grad is not None)
+    assert dec_g_sg == 0.0, dec_g_sg
+    assert prior_g_sg > 0.0, 'P82 stop-grad decoder lost prior_net gradient'
     model.zero_grad(set_to_none=True)
     losses, _, _ = world_model_loss(model, batch, tcfg)
     pr = float(losses['wm_prior_recon_loss'])
@@ -1603,14 +1621,19 @@ def _test_prior_cv_recon_p1() -> None:
     prior_g = sum(float(p.grad.abs().sum())
                   for p in model.dynamics.prior_net.parameters()
                   if p.grad is not None)
+    dec_g = sum(float(p.grad.abs().sum())
+                for p in model.dynamics.decoder.parameters()
+                if p.grad is not None)
     assert prior_g > 0.0, 'P1 prior recon lost prior_net gradient'
+    assert dec_g > 0.0, 'posterior recon lost decoder gradient'
     model.zero_grad(set_to_none=True)
     model.set_dob_active(True)
     losses2, _, _ = world_model_loss(model, batch, tcfg)
     assert float(losses2['wm_prior_recon_loss']) == 0.0, float(
         losses2['wm_prior_recon_loss'])
     print(f'[smoke] OK  P1 prior-CV recon fires ({pr:.4f}); P2 gated 0; '
-          f'prior_net |g|={prior_g:.3f}')
+          f'prior_net |g|={prior_g:.3f}; decoder |g|={dec_g:.3f} '
+          f'(isolated prior decoder |g|={dec_g_sg:.3g})')
 
 
 def _test_img_rollout_last_only() -> None:
