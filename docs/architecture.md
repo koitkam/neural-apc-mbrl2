@@ -938,7 +938,9 @@ flowchart LR
   posterior recon compares `g(feat)+d_t` vs `obs`. P1 (d≡0) also pins
   `decode(prior)` vs obs at the same `recon_scale` with **decoder weights
   stop-grad** (jsonl `wm_prior_recon_loss`; P81 live decode KEEP as 1-step /
-  FALSIFIED as TM; P82) so GRU/prior match obs-space 1-step without stealing
+  FALSIFIED as TM; P82 LIVE extra-P1 orig-P1 FAIL **0.77@MV**, extra FAIL
+  **0.75@MV** last_ok 84 — stop-grad did not recover TM vs P81 extra PASS
+  0.85@MV) so GRU/prior match obs-space 1-step without stealing
   the DC map. P2 gates that term off. An L2 prior on `d_t`
   (`dob_reg_coef`, the Kalman "process-noise-is-small" assumption) keeps the
   model using `d_t` only for the genuine residual.
@@ -1183,7 +1185,8 @@ The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 (`d_t ≡ 0`), not removed. rest-IC `last_only` still skips prior heads. P1
 `keep_aux` harvests `prior_core` so `_rssm_world_model_loss` pins
 `decode(prior)` vs obs at `recon_scale` with **stop-grad decoder** (P81 live
-decode FALSIFIED as TM; P82; posterior recon can autoencode the current CV
+decode FALSIFIED as TM; P82 LIVE extra-P1 orig-P1 FAIL 0.77@MV / extra
+0.75@MV vs P81 extra PASS 0.85@MV; posterior recon can autoencode the current CV
 without teaching the teacher-forced 1-step, and must not steal gain-match's
 DC map). That term is
 **gated off when `dob_live`** so P2 Kalman ν=`CV_obs−decode(prior)` is not

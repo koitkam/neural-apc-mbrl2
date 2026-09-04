@@ -4147,7 +4147,7 @@ def _test_auto_tune_formula_input_cfg_or_env() -> None:
 
 
 def _test_policy_sigma_bounds_honours_cfg() -> None:
-    """p10 σ_min_ratio=1.2 must not be floored at leftover 1.3."""
+    """p10 σ_min_ratio=1.2; leftover SIGMA_* ignored; DREAMER_* still opts in."""
     import os
     c = TrainConfig()
     assert abs(float(c.sigma_min_ratio) - 1.2) < 1e-12
@@ -4156,23 +4156,32 @@ def _test_policy_sigma_bounds_honours_cfg() -> None:
     assert abs(b['target_sigma_min'] - 0.219 / 1.2) < 1e-9
     c.sigma_min_ratio = 1.2
     c._explicit_fields = {'sigma_min_ratio'}  # type: ignore[attr-defined]
-    prev = os.environ.get('SIGMA_MIN_RATIO_OF_MAX')
+    prev_left = os.environ.get('SIGMA_MIN_RATIO_OF_MAX')
+    prev_d = os.environ.get('DREAMER_SIGMA_MIN_RATIO')
     try:
         os.environ['SIGMA_MIN_RATIO_OF_MAX'] = '2.5'
         b_exp = _resolve_policy_sigma_bounds(c, 0.219)
         assert abs(b_exp['sigma_min_ratio'] - 1.2) < 1e-12
         c2 = TrainConfig()
         b_left = _resolve_policy_sigma_bounds(c2, 0.219)
-        assert abs(b_left['sigma_min_ratio'] - 2.5) < 1e-12
+        assert abs(b_left['sigma_min_ratio'] - 1.2) < 1e-12
+        os.environ['DREAMER_SIGMA_MIN_RATIO'] = '2.5'
+        c3 = TrainConfig()
+        b_d = _resolve_policy_sigma_bounds(c3, 0.219)
+        assert abs(b_d['sigma_min_ratio'] - 2.5) < 1e-12
     finally:
-        if prev is None:
+        if prev_left is None:
             os.environ.pop('SIGMA_MIN_RATIO_OF_MAX', None)
         else:
-            os.environ['SIGMA_MIN_RATIO_OF_MAX'] = prev
+            os.environ['SIGMA_MIN_RATIO_OF_MAX'] = prev_left
+        if prev_d is None:
+            os.environ.pop('DREAMER_SIGMA_MIN_RATIO', None)
+        else:
+            os.environ['DREAMER_SIGMA_MIN_RATIO'] = prev_d
     v, user = _cfg_or_env(TrainConfig(), 'obj_reward_scale',
                           'OBJ_REWARD_SCALE', 'auto', str)
     assert v == 'auto' and user is False
-    print('[smoke] OK  policy σ bounds honour TrainConfig 1.2 (leftover still wins)')
+    print('[smoke] OK  policy σ bounds honour TrainConfig 1.2 (leftover SIGMA_* ignored)')
 
 
 def _test_attention_auto_ignores_leftover_fast_attn() -> None:

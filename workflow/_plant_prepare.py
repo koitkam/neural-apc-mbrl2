@@ -482,9 +482,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # 2026-05-27 (P59 refactor): σ_max / σ_min auto-tune formula inputs.
     # Canonical DREAMER_* path.  Leftover ``SIGMA_MAX_OVER_SEED`` /
     # ``SIGMA_MAX_FLOOR`` / ``SIGMA_MAX_CAP`` / ``SIGMA_MIN_RATIO_OF_MAX``
-    # still win inside ``_resolve_policy_sigma_bounds`` when the field
-    # is not explicit.  Auto-tune no longer re-reads DREAMER_* (would
-    # beat leftover-vs-explicit order) and no longer floors
+    # are **not** read (P82-live).  Auto-tune no longer floors
     # ``sigma_min_ratio`` at 1.3 (that undid TrainConfig 1.2).
     'DREAMER_SIGMA_MAX_OVER_SEED': ('sigma_max_mult',            float),
     'DREAMER_SIGMA_MAX_FLOOR':     ('sigma_max_floor',           float),

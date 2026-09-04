@@ -143,8 +143,8 @@ class TrainConfig:
     # p10 RCA: 1.6 → **1.2**.  Auto-tune used to ``max(1.3, cfg)`` which
     # silently undid this default (P45/P46/P47 env-free resolved
     # log_std_min from 1.3, entropy floor −0.363).  Formula now uses
-    # this field.  Leftover ``SIGMA_MIN_RATIO_OF_MAX`` still wins when
-    # the DREAMER_* field is not explicit.
+    # this field.  Leftover ``SIGMA_MIN_RATIO_OF_MAX`` is **not** read
+    # (P82-live; same class as ``AGENT_DISTURBANCE_*``).
     sigma_min_ratio: float = 1.2      # σ_min = σ_max / sigma_min_ratio (p10 RCA: 1.6→1.2, raise σ floor)
     # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
     # ``auto_initialize_hyperparams`` as ``η = η_v3 × σ_max / σ_v3_ref``
@@ -10173,23 +10173,25 @@ def _resolve_policy_sigma_bounds(cfg: 'TrainConfig', sigma_seed: float
                                   ) -> Dict[str, float]:
     """σ_max / σ_min from TrainConfig formula inputs.
 
-    Leftover ``SIGMA_MAX_*`` / ``SIGMA_MIN_RATIO_OF_MAX`` win only when
-    the DREAMER_* field is not explicit (same class as
-    ``SEED_TARGET_CV_FRAC``).  ``sigma_min_ratio`` is the TrainConfig
-    default (1.2).  Do **not** floor at 1.3 — that leftover
-    ``max(1.3, …)`` silently undid the p10 RCA and ignored
-    ``DREAMER_SIGMA_MIN_RATIO`` (P45/P46/P47 env-free entropy floor
-    −0.363 = H(σ_max/1.3)).
+    Leftover ``SIGMA_MAX_*`` / ``SIGMA_MIN_RATIO_OF_MAX`` are **not**
+    read (P82-live).  Login leftovers were a silent A/B outside
+    ``ENV_OVERRIDES`` / ``run_plan`` (same class as
+    ``AGENT_DISTURBANCE_*``).  Tests / CLI that skip
+    ``apply_dreamer_env_overrides`` still opt in via ``DREAMER_SIGMA_*``.
+    ``sigma_min_ratio`` is the TrainConfig default (1.2).  Do **not**
+    floor at 1.3 — that leftover ``max(1.3, …)`` silently undid the p10
+    RCA and ignored ``DREAMER_SIGMA_MIN_RATIO`` (P45/P46/P47 env-free
+    entropy floor −0.363 = H(σ_max/1.3)).
     """
     sigma_seed = float(sigma_seed)
     sigma_max_mult, _ = _cfg_or_env(
-        cfg, 'sigma_max_mult', 'SIGMA_MAX_OVER_SEED', 1.0, float)
+        cfg, 'sigma_max_mult', 'DREAMER_SIGMA_MAX_OVER_SEED', 1.0, float)
     sigma_max_floor, _ = _cfg_or_env(
-        cfg, 'sigma_max_floor', 'SIGMA_MAX_FLOOR', 0.10, float)
+        cfg, 'sigma_max_floor', 'DREAMER_SIGMA_MAX_FLOOR', 0.10, float)
     sigma_max_cap, _ = _cfg_or_env(
-        cfg, 'sigma_max_cap', 'SIGMA_MAX_CAP', 0.30, float)
+        cfg, 'sigma_max_cap', 'DREAMER_SIGMA_MAX_CAP', 0.30, float)
     sigma_min_ratio, _ = _cfg_or_env(
-        cfg, 'sigma_min_ratio', 'SIGMA_MIN_RATIO_OF_MAX', 1.2, float)
+        cfg, 'sigma_min_ratio', 'DREAMER_SIGMA_MIN_RATIO', 1.2, float)
     sigma_min_ratio = max(1.01, float(sigma_min_ratio))
     target_sigma_max = float(np.clip(
         float(sigma_max_mult) * sigma_seed,
@@ -10440,9 +10442,9 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # band with the WM's training distribution.
     # 2026-05-27 (P59 refactor): formula inputs are TrainConfig +
     # ``ENV_OVERRIDES``.  Leftover ``SIGMA_MAX_*`` /
-    # ``SIGMA_MIN_RATIO_OF_MAX`` still win when the DREAMER_* field is
-    # not explicit.  Cap history: 0.20→0.30 (p21) →0.20 (p24) →0.30
-    # (p26).  ``sigma_min_ratio`` default 1.2 (p10); do not floor 1.3.
+    # ``SIGMA_MIN_RATIO_OF_MAX`` ignored (P82-live).  Cap history:
+    # 0.20→0.30 (p21) →0.20 (p24) →0.30 (p26).  ``sigma_min_ratio``
+    # default 1.2 (p10); do not floor 1.3.
     _sig = _resolve_policy_sigma_bounds(cfg, sigma_seed)
     sigma_max_mult = _sig['sigma_max_mult']
     sigma_max_floor = _sig['sigma_max_floor']
