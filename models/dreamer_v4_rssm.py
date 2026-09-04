@@ -1024,17 +1024,18 @@ class RSSMDynamics(nn.Module):
         # imagination).  pass-1 ν ≈ the full load (its c_dist is ~uninformative),
         # exactly the signal the posterior should map.  Single pass when off.
         two_pass = bool(getattr(self, '_cont_post_uses_innov', False))
-        # Prior-core: P2 Kalman / cont-dist two-pass still need the T-list
-        # for a batched decode.  P81/P82 Stage-1 keep_aux harvest REVERT
-        # (obs-space prior recon FALSIFIED as TM).  rest-IC ``last_only``
-        # still skips.
+        # Prior-core is only consumed by the batched DOB decode (P2
+        # ``dob_active``) or the cont-dist two-pass.  Stage-1 P1 forces
+        # ``d_t≡0`` and discarded the T-list — skip the append.
+        # P84: restore this P79 surface. P83 REVERT left P81's
+        # empty-list prior_core stack in the compiled graph; P1
+        # ph_l is empty and that branch is not P79.
         _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
         post_l, prior_l = [], []
         h_l, z_l, c_l, dv_l = [], [], [], []
         ph_l, pz_l, pc_l, pdv_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
         keep_aux = bool(store_aux) and not last_only
-        _stack_prior = _need_prior_core
         # last_only rest-IC only needs the last RSSMState.  Building
         # post.feat every t was T concatenations of [h,z,c,dv,d] then
         # discarding all but the last.  Kalman / two-pass still need
@@ -1074,7 +1075,7 @@ class RSSMDynamics(nn.Module):
                     if self.cont_dim > 0:
                         c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                         c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-                if _stack_prior:
+                if _need_prior_core:
                     _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if two_pass:
             # ONE batched prior decode → CV forecast → innovation ν, then
@@ -1101,7 +1102,7 @@ class RSSMDynamics(nn.Module):
                     prior_l.append(prior.z_logits)
                     c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
                     c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-                if _stack_prior:
+                if self.dob_enabled and self.dob_active:
                     _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if last_only and not return_feats:
             return None, None, None, state, None, None
@@ -1111,16 +1112,13 @@ class RSSMDynamics(nn.Module):
             post_core = _stack_decode_core(h_l, z_l, c_l, dv_l)
         post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)
         prior_logits = (torch.stack(prior_l, dim=1) if keep_aux else None)
-        prior_core = (_stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
-                      if ph_l else None)
         ds = None
         if self.dob_enabled:
             if self.dob_active:
                 # ONE batched prior decode → CV forecast base (d-free), then the
                 # scalar per-CV Kalman filter.  d_t = A·d_{t-1} + K·ν with
                 # ν = CV_obs − (base + A·d_{t-1}) ⇒ d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-                if prior_core is None:
-                    prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
+                prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
@@ -1143,17 +1141,16 @@ class RSSMDynamics(nn.Module):
             feats = post_core
         # Continuous-latent KL stats + posterior sample (for the cont KL +
         # gain-matching aux loss + disturbance readout).  ``None`` when off.
-        # P81/P82 no longer pack ``prior_core`` into ``cont`` (family REVERT).
+        # P83/P84: do not pack ``prior_core`` into ``cont`` (family REVERT).
         cont = None
-        if keep_aux:
-            if self.cont_dim > 0:
-                cont = {
-                    'post_mean': torch.stack(c_qm_l, dim=1),   # (B,T,cont_dim)
-                    'post_std': torch.stack(c_qs_l, dim=1),
-                    'prior_mean': torch.stack(c_pm_l, dim=1),
-                    'prior_std': torch.stack(c_ps_l, dim=1),
-                    'sample': post_core[..., core:core + self.cont_dim],
-                }
+        if self.cont_dim > 0 and keep_aux:
+            cont = {
+                'post_mean': torch.stack(c_qm_l, dim=1),   # (B,T,cont_dim)
+                'post_std': torch.stack(c_qs_l, dim=1),
+                'prior_mean': torch.stack(c_pm_l, dim=1),
+                'prior_std': torch.stack(c_ps_l, dim=1),
+                'sample': post_core[..., core:core + self.cont_dim],
+            }
         return feats, post_logits, prior_logits, state, ds, cont
 
     def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,

@@ -936,11 +936,12 @@ flowchart LR
 - **Output**: decoder `CV = g(h,z) + d_t`. `g` now learns the *true* gain because
   `d_t` absorbs the unexplained movement (de-confounds the attenuation). The
   posterior recon compares `g(feat)+d_t` vs `obs`. P1 no longer pins
-  `decode(prior)` vs obs (**P83** family REVERT: P81 live decode KEEP as
-  1-step / FALSIFIED as TM; P82 stop-grad FALSIFIED — val MV ×0.779 vs
-  P79 ×0.923, DV post→1step ×0.958 vs P81 ×0.966). jsonl
-  `wm_prior_recon_loss` / banner `precon` stay 0. P2 Kalman still
-  batched-decodes prior for ν. An L2 prior on `d_t`
+  `decode(prior)` vs obs (**P83** family REVERT FALSIFIED as P79 identity:
+  incomplete REVERT left P81 empty-list `prior_core` stack in the compiled
+  Stage-1 graph; iter-1 recon 0.338 vs P79 0.096; storm 2/2; GAIN_NOT_READY).
+  **P84** restores the P79 `rollout_observed` surface (`prior_core` stacked
+  only inside `dob_active`). jsonl `wm_prior_recon_loss` / banner `precon`
+  stay 0. P2 Kalman still batched-decodes prior for ν. An L2 prior on `d_t`
   (`dob_reg_coef`, the Kalman "process-noise-is-small" assumption) keeps the
   model using `d_t` only for the genuine residual.
 - **Grounding (KalmanNet, P19)**: the recon innovation alone under-drives `d_t`
@@ -1182,9 +1183,10 @@ freeze is `DreamerV4.set_world_model_trainable(g, dob, reward)` (toggles
 The DOB is built ON for the whole run so `feat` is always `core + n_cv` wide —
 **no head-dim change at a stage boundary**. In Stage 1 the estimate is *suppressed*
 (`d_t ≡ 0`), not removed. rest-IC `last_only` still skips prior heads. P1
-no longer packs `prior_core` into `cont` (**P83** family REVERT after P81
-KEEP-as-1-step / FALSIFIED-as-TM and P82 stop-grad FALSIFIED). jsonl
-`wm_prior_recon_loss` stays 0. P2 still batched-decodes prior for the Kalman.
+no longer packs `prior_core` into `cont` (**P83** family REVERT FALSIFIED
+as identity; **P84** restores P79 compile surface — no empty-list
+`prior_core` stack). jsonl `wm_prior_recon_loss` stays 0. P2 still
+batched-decodes prior for the Kalman.
 
 | | **Stage 1 = P1** (plant id) | **Stage 2 = P2** (observer id) | **Stage 3 = P3** (controller) |
 |---|---|---|---|

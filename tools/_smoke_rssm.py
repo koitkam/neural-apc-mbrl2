@@ -1544,14 +1544,20 @@ def _test_store_aux_feats_identity() -> None:
 
 
 def _test_prior_cv_recon_reverted() -> None:
-    """P83: P81/P82 obs-space prior recon is gone.
+    """P83/P84: P81/P82 obs-space prior recon is gone.
 
     Stage-1 ``keep_aux`` must not pack ``prior_core`` (P32 skip restored).
-    jsonl ``wm_prior_recon_loss`` stays 0. P2 Kalman still batched-decodes
+    P84 restores the P79 compile surface: ``prior_core`` is stacked only
+    inside ``dob_active`` (no empty-list prior_core leftover). jsonl
+    ``wm_prior_recon_loss`` stays 0. P2 Kalman still batched-decodes
     prior internally (``ds`` live); rest-IC last_only still skips prior
     heads (covered by ``_test_store_aux_feats_identity``).
     """
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
+    import inspect
+    _src = inspect.getsource(RSSMDynamics.rollout_observed)
+    assert '_stack_prior' not in _src, 'P83 leftover _stack_prior alias'
+    assert 'if ph_l else' not in _src, 'P83 leftover empty prior_core stack'
     torch.manual_seed(0)
     rcfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
                       n_categoricals=4, n_classes=4, embed_dim=16,
@@ -1617,6 +1623,7 @@ def _test_prior_cv_recon_reverted() -> None:
     assert float(losses2['wm_prior_recon_loss']) == 0.0, float(
         losses2['wm_prior_recon_loss'])
     print(f'[smoke] OK  P1 prior-CV recon REVERT (precon=0); '
+          f'P79 compile surface (no empty prior_core stack); '
           f'P2 Kalman ds live; prior_net |g|={prior_g:.3f}; '
           f'decoder |g|={dec_g:.3f}')
 
