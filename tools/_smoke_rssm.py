@@ -1152,8 +1152,11 @@ def _test_recon_channel_weights_cache() -> None:
               text.index('def _cached_arange_1k')]
     assert 'obs_win = obs[:, idx]' in ov
     assert ov.count('obs[:, idx]') == 1
-    assert 'cv_index_t' in ov
-    assert 'CV-only' in ov
+    assert 'f0 = f0.detach()' in ov
+    assert 'c0 = c0.detach()' in ov
+    assert "print('[overshoot] CV-only" not in ov
+    assert 'index_select(-1, cv_idx)' not in ov
+    assert '_recon_channel_weights' in ov
     iso = text[text.index('def _wm_input_isolation_loss'):
                text.index('def _auto_gain_match_settle_len')]
     assert 'obs_win = obs[:, idx]' in iso
@@ -3321,14 +3324,9 @@ def _test_held_rollout_cv_space() -> None:
           f'{float(d1["wm_held_cv_drift"]):.4f})')
 
 
-def _test_overshoot_cv_only() -> None:
-    """P86: overshoot MSE is CV channels only; non-CV obs must not move it."""
-    import inspect
+def _test_overshoot_stopgrad_start() -> None:
+    """P87: overshoot start is stop-grad; MSE is all-obs (P86 CV-only REVERT)."""
     from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
-
-    src = inspect.getsource(_wm_latent_overshoot_loss)
-    assert 'cv_index_t' in src
-    assert 'index_select' in src
 
     class _Wrap:
         world_model_type = 'rssm'
@@ -3347,31 +3345,35 @@ def _test_overshoot_cv_only() -> None:
     obs = torch.randn(B, T, rcfg.obs_dim)
     act = torch.rand(B, T, rcfg.action_dim) * 2 - 1
     feat_dim = dyn.deter_dim + dyn.stoch_flat_dim + dyn.cont_dim
-    feats = torch.randn(B, T, feat_dim)
+    feats = torch.randn(B, T, feat_dim, requires_grad=True)
+    c_mean = torch.randn(B, T, dyn.cont_dim, requires_grad=True)
     cfg = TrainConfig()
     cfg.wm_overshoot_coef = 0.3
     cfg.wm_overshoot_len = 8
     cfg.wm_overshoot_gate_recon = 0.0
     cfg.wm_overshoot_max_starts = 2
     torch.manual_seed(0)
-    ov0, n0 = _wm_latent_overshoot_loss(model, feats, obs, act, cfg)
+    ov0, n0 = _wm_latent_overshoot_loss(
+        model, feats, obs, act, cfg, c_mean=c_mean)
     assert torch.isfinite(ov0).all() and float(ov0) > 0.0 and n0 > 0
+    ov0.backward()
+    assert feats.grad is None or float(feats.grad.abs().max()) == 0.0, (
+        'overshoot leaked grad into start feats')
+    assert c_mean.grad is None or float(c_mean.grad.abs().max()) == 0.0, (
+        'overshoot leaked grad into c_mean start')
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0.0
+               for p in dyn.parameters()), (
+        'overshoot produced no GRU/decoder grad')
     obs_other = obs.clone()
     obs_other[..., 2] = obs_other[..., 2] + 5.0
     torch.manual_seed(0)
-    ov_other, _ = _wm_latent_overshoot_loss(model, feats, obs_other, act, cfg)
-    assert abs(float(ov0) - float(ov_other)) < 1e-6, (
-        f'overshoot used non-CV obs ({float(ov0):.5f} vs {float(ov_other):.5f})')
-    obs_cv = obs.clone()
-    obs_cv[..., 0] = obs_cv[..., 0] + 5.0
-    torch.manual_seed(0)
-    ov_cv, _ = _wm_latent_overshoot_loss(model, feats, obs_cv, act, cfg)
-    assert abs(float(ov0) - float(ov_cv)) > 1e-5, (
-        'overshoot ignored CV obs')
-    print(f'[smoke] OK  overshoot CV-only '
-          f'(loss {float(ov0):.4f}; non-CV Δ '
-          f'{abs(float(ov0)-float(ov_other)):.2e}; CV Δ '
-          f'{abs(float(ov0)-float(ov_cv)):.4f})')
+    ov_other, _ = _wm_latent_overshoot_loss(
+        model, feats.detach(), obs_other, act, cfg, c_mean=c_mean.detach())
+    assert abs(float(ov0.detach()) - float(ov_other)) > 1e-5, (
+        'overshoot ignored non-CV obs after P86 REVERT')
+    print(f'[smoke] OK  overshoot stop-grad start '
+          f'(loss {float(ov0.detach()):.4f}; non-CV Δ '
+          f'{abs(float(ov0.detach())-float(ov_other)):.4f})')
 
 
 def _test_collect_rest_lookback_tm_pairing() -> None:
@@ -5380,7 +5382,7 @@ if __name__ == '__main__':
     _test_gain_match_rest_window()
     _test_held_rollout_win_fits_k()
     _test_held_rollout_cv_space()
-    _test_overshoot_cv_only()
+    _test_overshoot_stopgrad_start()
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
     _test_gain_match_tssm_kv_continue()
