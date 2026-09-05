@@ -57,7 +57,6 @@ Paper-faithful details retained from DreamerV3 (Hafner et al. 2023, §3-4):
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -409,11 +408,10 @@ class RSSMConfig:
     # sample=False or no gain block.
     cont_gain_deterministic_roll: bool = True
     # Control horizon (TrainConfig.horizon).  P76 GRU update-gate bias
-    # ``log(H/16)`` **REVERT** (keep-h stalled held-SS / freeze
-    # GAIN_NOT_READY).  Field kept so old RSSMConfig still constructs;
-    # ``gru_update_gate_bias`` is identically 0 (PyTorch init).
-    # P88 residual mix after the vanilla GRU uses the same H:
-    # ``g_init = 1/H`` (H≤1 → vanilla ``g=1``).
+    # **REVERT** and P88 residual mix **REVERT** (keep-h family closed:
+    # P88 EXIT last_ok 59 GAIN_NOT_READY 0.40@MV).  Field kept so old
+    # RSSMConfig still constructs; ``gru_update_gate_bias`` is
+    # identically 0 (PyTorch init).
     horizon: int = 0
 
 
@@ -428,27 +426,6 @@ def gru_update_gate_bias(horizon: int) -> float:
     """
     del horizon
     return 0.0
-
-
-def gru_hres_init_mix(horizon: int) -> float:
-    """Initial residual-GRU mix ``g``. ``1/H`` when ``H>1`` else ``1`` (vanilla).
-
-    ``h = prev.h + g * (h_gru - prev.h)``. ``g=0`` is identity-h (DC of
-    the start is conserved). ``g=1`` is the vanilla ``GRUCell``. test_sim
-    H=55 → ``g≈0.018``. Not P76: the GRU itself is un-biased; ``g`` is a
-    learned logit so it can grow if 1-step / settling need it. No new
-    TrainConfig knob — H is already the control horizon.
-    """
-    H = int(horizon or 0)
-    if H <= 1:
-        return 1.0
-    return 1.0 / float(H)
-
-
-def gru_hres_logit(horizon: int) -> float:
-    """``logit(g)`` for ``gru_hres_init_mix``, clamped off {0,1}."""
-    g = min(max(gru_hres_init_mix(horizon), 1e-6), 1.0 - 1e-6)
-    return math.log(g / (1.0 - g))
 
 
 # ---------------------------------------------------------------------------
@@ -709,18 +686,9 @@ class RSSMDynamics(nn.Module):
                             hidden_dim=self.hidden_dim, num_layers=1)
         self.gru = nn.GRUCell(trans_in, self.deter_dim)
         # P76 REVERT: do not fill the update-gate bias. Keep-h FALSIFIED.
+        # P88 EXIT REVERT: no residual mix after GRUCell (vanilla ``h``).
         _H = int(getattr(cfg, 'horizon', 0) or 0)
         self._gru_update_gate_bias = float(gru_update_gate_bias(_H))
-        # P88: residual mix after vanilla GRUCell. Init ``g=1/H`` (H≤1 → 1).
-        self._gru_hres_init = float(gru_hres_init_mix(_H))
-        self.gru_hres_logit = nn.Parameter(
-            torch.tensor(gru_hres_logit(_H), dtype=torch.float32))
-        if self._gru_hres_init < 1.0 - 1e-6:
-            print(
-                f'[rssm] residual GRU mix init g={self._gru_hres_init:.3g} '
-                f'(1/H; P88; not P76 z-bias)',
-                flush=True,
-            )
         # Prior p(z'|h') and posterior q(z'|h', embed).
         _lt = str(getattr(cfg, 'latent_type', 'deterministic'))
         _ln = float(getattr(cfg, 'latent_noise', 0.0) or 0.0)
@@ -865,15 +833,14 @@ class RSSMDynamics(nn.Module):
                         dv: Optional[torch.Tensor] = None
                         ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                                    Optional[torch.Tensor]]:
-        """pre_gru + GRUCell + residual mix + DOB predict + DV carry.
+        """pre_gru + vanilla GRUCell + DOB predict + DV carry.
 
         Shared by ``img_step`` (prior heads on ``h``) and rest-IC
         ``_posterior_step`` (posterior heads on ``h``; prior_net unused).
         ``img_rollout`` uses the same ``img_step``. Returns
         ``(h, d_new, dv_new)``.
-        P88: ``h = prev.h + σ(logit) * (h_gru - prev.h)`` after a vanilla
-        ``GRUCell`` (P76 z-bias stays 0). ``g=0`` identity-h; ``g=1``
-        vanilla GRU. Init ``g=1/H``.
+        P88 EXIT REVERT: no residual mix (keep-h family closed with P76).
+        P76 z-bias stays 0.
         """
         # GRU input = [z_flat ; c ; action ; (dv)].  Full c (P71 REVERT).
         parts = [prev.stoch_flat]
@@ -889,9 +856,7 @@ class RSSMDynamics(nn.Module):
                     self, int(prev_action.shape[0]), self.dv_dim,
                     prev_action.dtype, prev_action.device)
             parts.append(dv)
-        h_gru = self.gru(self.pre_gru(torch.cat(parts, dim=-1)), prev.h)
-        g = torch.sigmoid(self.gru_hres_logit)
-        h = prev.h + g * (h_gru - prev.h)
+        h = self.gru(self.pre_gru(torch.cat(parts, dim=-1)), prev.h)
         # Stage-1 (``dob_active=False``) forces ``d_t≡0`` after the loop
         # and ``d`` is not a GRU input — skip the unused sigmoid·d
         # (P1 rest-IC + main WM T-loop, 100 inner steps).  P2 Kalman

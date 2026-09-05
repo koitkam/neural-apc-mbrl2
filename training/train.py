@@ -828,6 +828,8 @@ class TrainConfig:
     # P66 EXIT: per-sequence var-skip **REVERT / FALSIFIED** as DOB-amp
     # (pred_std 0.252 vs P64 0.608; det_r 0.264 vs 0.352).  Mean MSE over
     # all sequences (P64 identity).  P65 flush of the P1 ring is REVERTED.
+    # P89: high-pass the residual (val detrend window) so raw DC drift
+    # does not dominate the MSE that should train dynamic tracking.
     dob_ground_coef: float = 0.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
@@ -4131,6 +4133,58 @@ def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
 _DIST_TARGET_VAR_GATE = 1e-3
 
 
+def _dob_ground_hp_window(cfg: 'TrainConfig', T: int) -> int:
+    """Val-protocol high-pass width for ``dob_ground``, clipped to the WM window.
+
+    Same formula as disturbance-prediction detrend: ``round(mult × H)``
+    with ``disturbance_detrend_settle_mult`` (default 4).  Training
+    sequences are ``seq_len`` (test_sim 128) so the window is
+    ``min(4H, T)`` — on test_sim that is **T** (per-crop DC removal).
+    ``0`` disables the high-pass (raw MSE; ``mult<=0`` or ``H<1``).
+    No new TrainConfig field.
+    """
+    T = int(T)
+    if T < 2:
+        return 0
+    H = int(getattr(cfg, 'horizon', 0) or 0)
+    mult = float(getattr(cfg, 'disturbance_detrend_settle_mult', 4.0) or 0.0)
+    if H < 1 or mult <= 0.0:
+        return 0
+    w = int(round(mult * float(H)))
+    if w <= 1:
+        return 0
+    return int(min(T, w))
+
+
+def _highpass_bt(x: torch.Tensor, w: int) -> torch.Tensor:
+    """``x - MA(x, w)`` matching ``evaluation.wm_disturbance_prediction``.
+
+    ``x`` is ``(B, T, C)``. ``w<=1`` is identity (val MA is zeros).
+    ``w>=T`` subtracts the per-(B, C) mean.  Centered edge-padded MA
+    otherwise.  Differentiable in ``x``.
+    """
+    w = int(w)
+    if w <= 1:
+        return x
+    B, T, C = x.shape
+    xf = x.float()
+    if w >= T:
+        return xf - xf.mean(dim=1, keepdim=True)
+    pad = w // 2
+    xt = xf.transpose(1, 2).reshape(B * C, 1, T)
+    xt = F.pad(xt, (pad, pad), mode='replicate')
+    k = xt.new_full((1, 1, w), 1.0 / float(w))
+    ma = F.conv1d(xt, k, padding=0)
+    L = int(ma.shape[-1])
+    if L > T:
+        extra = L - T
+        ma = ma[..., extra // 2: extra // 2 + T]
+    elif L < T:
+        ma = F.pad(ma, (0, T - L))
+    ma = ma.reshape(B, C, T).transpose(1, 2)
+    return xf - ma
+
+
 def _wm_need_dist_target(model, cfg: 'TrainConfig') -> bool:
     """True when ``world_model_loss`` actually indexes ``batch['dist']``.
 
@@ -4253,11 +4307,9 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         # Env-free P40: dcv_match default True is inert while isolation is off.
         _iso_txt = 'iso_dcv=off '
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
-    from models.dreamer_v4_rssm import (
-        gru_update_gate_bias as _gru_zbias_fn,
-        gru_hres_init_mix as _gru_hres_fn)
+    from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
     _gru_zb = float(_gru_zbias_fn(_h_zb))
-    _gru_hres = float(_gru_hres_fn(_h_zb))
+    _hpw = _dob_ground_hp_window(cfg, int(getattr(cfg, 'seq_len', 0) or 0))
     print(
         '[resolved-cfg] '
         f"wm={getattr(cfg, 'world_model_type', 'rssm')} "
@@ -4292,7 +4344,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"held_cv=True "
         f"ov_sgstart=True "
         f"gru_zbias={_gru_zb:.3g} "
-        f"gru_hres={_gru_hres:.3g} "
+        f"dob_hp={_hpw} "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -8827,9 +8879,24 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 # |d| did not grow; val pred_std 0.252 vs P64 0.608).
                 # Mean MSE over all sequences (P64 identity).  Mixed
                 # ring KEEP (P65 flush REVERT).  Do not /dvar.
+                # P89: high-pass both sides with the val detrend window
+                # ``min(4H, T)`` so slow drift (feedback-rejectable) does
+                # not dominate the MSE that should train det_r / AC amp.
                 # jsonl ``dob_ground_keep_frac`` is 1.0 when this
                 # term fires (observability; no skip).
-                dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
+                _hpw = _dob_ground_hp_window(cfg, int(ds.shape[1]))
+                if _hpw > 1:
+                    if not getattr(cfg, '_dob_ground_hp_logged', False):
+                        print(
+                            f'[dob-ground] high-pass MA w={_hpw} '
+                            f'(min(4H,T); val detrend; P89)',
+                            flush=True)
+                        cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
+                    ds_hp = _highpass_bt(ds, _hpw)
+                    dt_hp = _highpass_bt(dtgt, _hpw)
+                    dob_ground = (ds_hp - dt_hp).pow(2).mean()
+                else:
+                    dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
                 dob_ground_keep_frac = torch.ones((), device=ds.device)
                 wm_total = wm_total + dgc * dob_ground
             elif not getattr(cfg, '_dob_ground_shape_warned', False):
@@ -14275,11 +14342,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_ol_persist_rel' in row:
                 row.setdefault('wm_gain_match_ol_persist_rel',
                             row['gain_match_ol_persist_rel'])
-            _hres_logit = getattr(getattr(model, 'dynamics', None),
-                                  'gru_hres_logit', None)
-            if isinstance(_hres_logit, torch.nn.Parameter):
-                row['gru_hres_mix'] = float(
-                    torch.sigmoid(_hres_logit.detach()))
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)

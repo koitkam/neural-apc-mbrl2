@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** RSSM **deterministic**
-> (P77+P78 TSSM family **FALSIFIED**; P78 EXIT last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; KV-continue KEEP as OL lift / FALSIFIED as freeze; opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`; **P79 EXIT** KEEP rssm / **FALSIFIED as P64-identity** (`run_p79_rssmrevert`, pid **277462**, 204 iters): GAIN-READY **0.81@DV** last_ok **81**; val MV **×0.923 / ×0.953** DV **×0.781 / ×0.838**; 1step→OL **×0.840**; paired **−10.57 vs −82.79** VALID 9/9 loses to P64 **−4.54**; **P80 EXIT** persist 0.1→0.0 **REVERT** (`run_p80_persist0`, pid **293761**, 515 iters budget): freeze GAIN-READY **0.86@MV / 0.87@DV** last_ok **82**; val MV **×0.723 / ×0.755** DV **×0.789 / ×0.857**; 1step→OL **×0.735** OL **×0.743**; paired **−35.33 vs −107.43** VALID 8/9 loses to P64 **−4.54** / P79 **−10.57**; persist **0.1 KEEP**; **P85 EXIT** always-call KEEP as P1 / FALSIFIED as val TM (MV **×0.671** 1step→OL **×0.697** paired **−24.84**); **P86 EXIT** CV-only overshoot **REVERT** (GAIN_NOT_READY 3.36@MV; actor INVALID); **P87 EXIT** overshoot stop-grad start KEEP as freeze / **FALSIFIED as compounding** (`run_p87_ovsgstart`, 515 iters): GAIN-READY **0.86@DV** last_ok **82**; val MV **×0.681 / ×0.732** 1step→OL **×0.733**; det_r **0.157**; paired **−21.19 vs −100.44** VALID 9/9; overshoot family **closed**; **P88 LIVE** residual GRU mix (`run_p88_grures`, pid **343419** P2: freeze last_ok **59** **GAIN_NOT_READY 0.40@MV**; extra-P1 live **0.83@DV** discarded P40 lock; mix **0.018→0.030**; skip **0**; not EXIT)) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77+P78 TSSM family **FALSIFIED**; P78 EXIT last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; KV-continue KEEP as OL lift / FALSIFIED as freeze; opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`; **P79 EXIT** KEEP rssm / **FALSIFIED as P64-identity** (`run_p79_rssmrevert`, pid **277462**, 204 iters): GAIN-READY **0.81@DV** last_ok **81**; val MV **×0.923 / ×0.953** DV **×0.781 / ×0.838**; 1step→OL **×0.840**; paired **−10.57 vs −82.79** VALID 9/9 loses to P64 **−4.54**; **P80 EXIT** persist 0.1→0.0 **REVERT** (`run_p80_persist0`, pid **293761**, 515 iters budget): freeze GAIN-READY **0.86@MV / 0.87@DV** last_ok **82**; val MV **×0.723 / ×0.755** DV **×0.789 / ×0.857**; 1step→OL **×0.735** OL **×0.743**; paired **−35.33 vs −107.43** VALID 8/9 loses to P64 **−4.54** / P79 **−10.57**; persist **0.1 KEEP**; **P85 EXIT** always-call KEEP as P1 / FALSIFIED as val TM (MV **×0.671** 1step→OL **×0.697** paired **−24.84**); **P86 EXIT** CV-only overshoot **REVERT** (GAIN_NOT_READY 3.36@MV; actor INVALID); **P87 EXIT** overshoot stop-grad start KEEP as freeze / **FALSIFIED as compounding** (`run_p87_ovsgstart`, 515 iters): GAIN-READY **0.86@DV** last_ok **82**; val MV **×0.681 / ×0.732** 1step→OL **×0.733**; det_r **0.157**; paired **−21.19 vs −100.44** VALID 9/9; overshoot family **closed**; **P88 EXIT** residual GRU mix **REVERT** (`run_p88_grures`, pid **343419**, 158 iters): last_ok **59** **GAIN_NOT_READY 0.40@MV**; extra-P1 live **0.83@DV** discarded P40; actor INVALID; P76+P88 keep-h **closed**; **P89 LIVE** high-pass `dob_ground` (`run_p89_dobhp`; MA `min(4H,T)`)) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -337,7 +337,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > under-drives `d_t` (the slow load is a small share of the recon MSE) and
 > `dob_reg` opposes it, so imagination + the critic stayed disturbance-blind and
 > the actor collapsed below the open-loop baseline. Grounding adds a direct
-> `dob_ground_coef · ‖d_t − true_load‖²` (unit-matched via the running CV
+> `dob_ground_coef · ‖HP(d_t) − HP(true_load)‖²` (P89: high-pass MA
+> `min(4H,T)` matching val detrend; unit-matched via the running CV
 > obs-norm std) that tunes the Kalman `A,K` to TRACK the load — the structural fix
 > for the manual `dob_gain_init` amplitude tuning. `dob_reg_coef → 0` when
 > grounding is on. First run: p19 (`run_p19_dobground`).
@@ -948,7 +949,9 @@ flowchart LR
   in Stage-2 (the slow load is a small share of the recon MSE and `dob_reg`
   opposes it, so the load amplitude is under-estimated — p18: `d_t` vs true load
   r=0.42, ~0.3× amplitude). When `dob_ground_coef > 0` a direct target
-  `‖d_t − true_load‖²` (the sim's known hidden load, unit-matched to `d_t`'s
+  `‖HP(d_t) − HP(true_load)‖²` (**P89:** high-pass MA `min(round(4H),T)` with
+  existing `disturbance_detrend_settle_mult`; test_sim crop = per-window DC;
+  `mult<=0` keeps raw MSE) of the sim's known hidden load, unit-matched to `d_t`'s
   normalized space via the running CV obs-norm std, threaded as `cfg._cv_obs_std`)
   tunes the Kalman `A,K` to TRACK the load — the structural replacement for the
   manual `dob_gain_init` amplitude tuning and the `dob_reg` prior
@@ -1214,7 +1217,9 @@ batched-decodes prior for the Kalman.
   `TrajectoryBuffer` at P1→P2 **starved** Kalman ID (5 eps at first P2
   step) and **worsened** val amp/det_r — **REVERT**. **P66 EXIT:** per-seq
   `dob_ground` var-skip **REVERT / FALSIFIED** (pred_std 0.252 vs P64 0.608).
-  Mean MSE over all sequences. Do not `/dvar`. jsonl `dob_ground_keep_frac`
+  Mean MSE over all sequences. Do not `/dvar`. **P89 LIVE:** MSE is
+  high-pass (`x−MA(x,w)`, `w=min(4H,T)`) so DC drift that val `det_r`
+  already ignores does not dominate P2. jsonl `dob_ground_keep_frac`
   is 1.0 when grounding fires.
 - **Stage 3** — `g` and `(A,K)` are frozen (`_wm_frozen_now` drops `wm_total`);
   the actor/critic train on the static unbiased WM + working observer, **with

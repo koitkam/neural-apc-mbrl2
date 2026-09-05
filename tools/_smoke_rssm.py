@@ -1805,50 +1805,70 @@ def _test_gru_update_gate_bias() -> None:
     print('[smoke] OK  GRU update-gate bias REVERT (PyTorch init); skip REVERT')
 
 
-def _test_gru_residual_mix() -> None:
-    """P88: ``h = prev.h + g*(h_gru-prev.h)``; ``g=1/H``; mix 0/1 identities."""
+def _test_gru_vanilla_no_residual_mix() -> None:
+    """P88 EXIT REVERT: GRUCell ``h`` is vanilla; no mix Parameter."""
     from dataclasses import replace
-    from models.dreamer_v4_rssm import (
-        RSSMConfig, RSSMDynamics, gru_hres_init_mix, gru_hres_logit)
-    assert abs(gru_hres_init_mix(0) - 1.0) < 1e-12
-    assert abs(gru_hres_init_mix(1) - 1.0) < 1e-12
-    assert abs(gru_hres_init_mix(55) - 1.0 / 55.0) < 1e-12
+    from models.dreamer_v4_rssm import RSSMConfig, RSSMDynamics
     torch.manual_seed(0)
-    cfg0 = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
-                      n_categoricals=4, n_classes=4, embed_dim=16,
-                      hidden_dim=16, latent_type='deterministic',
-                      cont_gain_dim=2, horizon=0)
-    m0 = RSSMDynamics(cfg0)
-    assert abs(float(m0._gru_hres_init) - 1.0) < 1e-12
-    assert abs(float(torch.sigmoid(m0.gru_hres_logit).detach()) - 1.0) < 1e-5
     cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
                      n_categoricals=4, n_classes=4, embed_dim=16,
                      hidden_dim=16, latent_type='deterministic',
                      cont_gain_dim=2, horizon=55)
     m = RSSMDynamics(cfg)
-    assert abs(float(m._gru_hres_init) - 1.0 / 55.0) < 1e-12
-    assert abs(float(torch.sigmoid(m.gru_hres_logit).detach())
-               - 1.0 / 55.0) < 1e-5
+    assert not hasattr(m, 'gru_hres_logit')
     B = 4
     prev = replace(m.initial_state(B, torch.device('cpu')),
                    h=torch.randn(B, m.deter_dim))
     a = torch.randn(B, cfg.action_dim)
-    m.gru_hres_logit.data.fill_(20.0)
-    h_gru, _, _ = m._gru_transition(prev, a)
-    m.gru_hres_logit.data.fill_(-20.0)
-    h_id, _, _ = m._gru_transition(prev, a)
-    assert torch.allclose(h_id, prev.h, atol=1e-5, rtol=1e-5)
-    m.gru_hres_logit.data.fill_(
-        float(gru_hres_logit(55)))
+    parts = [prev.stoch_flat]
+    from models.dreamer_v4_rssm import _recurrence_c
+    rc = _recurrence_c(m, prev.c, B, a.dtype, a.device)
+    if rc is not None:
+        parts.append(rc)
+    parts.append(a)
+    h_cell = m.gru(m.pre_gru(torch.cat(parts, dim=-1)), prev.h)
     h, _, _ = m._gru_transition(prev, a)
-    g = 1.0 / 55.0
-    expect = prev.h + g * (h_gru - prev.h)
-    assert torch.allclose(h, expect, atol=1e-5, rtol=1e-5)
-    # mix=1 ≡ vanilla GRUCell (sigmoid(20) ≈ 1)
-    m.gru_hres_logit.data.fill_(20.0)
-    h1, _, _ = m._gru_transition(prev, a)
-    assert torch.allclose(h1, h_gru, atol=1e-5, rtol=1e-5)
-    print('[smoke] OK  residual GRU mix (g=1/H; mix 0 identity; mix 1 vanilla)')
+    assert torch.allclose(h, h_cell, atol=1e-5, rtol=1e-5)
+    print('[smoke] OK  vanilla GRUCell (P88 residual mix REVERT)')
+
+
+def _test_dob_ground_highpass() -> None:
+    """P89: val-protocol high-pass; test_sim window is T (4H>seq_len)."""
+    import numpy as np
+    from evaluation.wm_disturbance_prediction import _highpass_detrend
+    from training.train import _dob_ground_hp_window, _highpass_bt, TrainConfig
+    cfg = TrainConfig()
+    cfg.horizon = 55
+    cfg.seq_len = 128
+    cfg.disturbance_detrend_settle_mult = 4.0
+    assert _dob_ground_hp_window(cfg, 128) == 128  # min(220, 128)
+    cfg0 = TrainConfig()
+    cfg0.horizon = 55
+    cfg0.disturbance_detrend_settle_mult = 0.0
+    assert _dob_ground_hp_window(cfg0, 128) == 0
+    torch.manual_seed(0)
+    x = torch.randn(3, 32, 2)
+    # DC + ramp: zero-mean ramp alone does not move |x| after w=T mean-sub.
+    x = x + 3.0 + torch.linspace(-2.0, 2.0, 32).view(1, 32, 1)
+    hp = _highpass_bt(x, 32)
+    assert hp.abs().mean() < x.abs().mean()
+    assert float(hp.mean(dim=1).abs().max()) < 1e-5
+    # mean-subtract identity vs val w>=n
+    x1 = x[0, :, 0].detach().cpu().numpy()
+    np_hp = _highpass_detrend(x1, 32)
+    th_hp = hp[0, :, 0].detach().cpu().numpy()
+    assert np.allclose(th_hp, np_hp, atol=1e-5, rtol=1e-5)
+    # odd-w conv vs numpy
+    hp7 = _highpass_bt(x, 7)
+    np7 = _highpass_detrend(x1, 7)
+    assert np.allclose(hp7[0, :, 0].detach().cpu().numpy(), np7,
+                       atol=1e-4, rtol=1e-4)
+    # even-w conv vs numpy (symmetric kernel; not the test_sim crop path)
+    hp8 = _highpass_bt(x, 8)
+    np8 = _highpass_detrend(x1, 8)
+    assert np.allclose(hp8[0, :, 0].detach().cpu().numpy(), np8,
+                       atol=1e-4, rtol=1e-4)
+    print('[smoke] OK  dob_ground high-pass (min(4H,T); val MA identity)')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
@@ -2126,9 +2146,12 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _prior_c_from_net' in _cz
     assert 'def _recurrence_c' in _cz
     assert 'def gru_update_gate_bias' in _rssm_src
-    assert 'def gru_hres_init_mix' in _rssm_src
-    assert 'gru_hres_logit' in _rssm_src
-    assert 'g * (h_gru - prev.h)' in _rssm_src
+    assert 'def gru_hres_init_mix' not in _rssm_src
+    assert 'gru_hres_logit' not in _rssm_src
+    assert 'g * (h_gru - prev.h)' not in _rssm_src
+    assert 'def _dob_ground_hp_window' in _src
+    assert 'def _highpass_bt' in _src
+    assert '[dob-ground] high-pass MA w=' in _src
     assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
     assert 'fill_(_zbias)' not in _rssm_src
     assert 'def init_gain_cv_skip' not in _rssm_src
@@ -2192,8 +2215,9 @@ def _test_isolation_dcv_scales() -> None:
     assert "last_only=True, out='obs', return_state=True" in _src
     assert 'gmatch_fo=True' not in _src
     assert 'gru_zbias=' in _src
-    assert 'gru_hres=' in _src
-    assert 'gru_hres_mix' in _src
+    assert 'gru_hres=' not in _src
+    assert 'gru_hres_mix' not in _src
+    assert 'dob_hp=' in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
     assert "world_model_type: str = 'rssm'" in _src
     assert 'gain_cv_skip_rms' not in _src
@@ -5438,7 +5462,8 @@ if __name__ == '__main__':
     _test_prior_cv_recon_reverted()
     _test_img_rollout_last_only()
     _test_gru_update_gate_bias()
-    _test_gru_residual_mix()
+    _test_gru_vanilla_no_residual_mix()
+    _test_dob_ground_highpass()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()

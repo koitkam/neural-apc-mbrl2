@@ -1246,7 +1246,7 @@ class DreamerV4Config:
     obs_dim: int
     action_dim: int
     lookback: int                          # transformer context length T_ctx
-    horizon: int = 0                       # control H; P88 residual GRU mix 1/H
+    horizon: int = 0                       # control H (P76/P88 keep-h REVERT)
     # Tokenizer
     tok_hidden: int = 256
     z_dim: int = 24
