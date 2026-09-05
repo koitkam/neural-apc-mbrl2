@@ -425,8 +425,8 @@ class TrainConfig:
     # ``run_plan``).  Identity defaults.  Clip sentinel ``<0`` = adaptive
     # ``adaptive_penalty_clip``.  ``obj_auto_cv_over_econ_ratio=0`` =
     # follow ``obj_auto_violation_margin`` (historical
-    # ``get(..., str(margin))``).  Dual-read leftover ``OBJECTIVE_*`` /
-    # ``OBJ_AUTO_*`` when DREAMER is unset.  Integral dead-time damping
+    # ``get(..., str(margin))``).  Leftover ``OBJECTIVE_*`` /
+    # ``OBJ_AUTO_*`` ignored (P90-live).  Integral dead-time damping
     # prefers ``identified_tau_dominant`` / ``identified_dead_time``.
     objective_integral_coef: float = 0.05
     objective_integral_windup: float = 5.0
@@ -439,8 +439,8 @@ class TrainConfig:
     obj_auto_violation_tolerance: float = 0.02
     # Auto-weights leftover formula knobs (``utils/auto_weights.py``).
     # Were ``_env_float('OBJ_AUTO_*')`` (worked, missing from
-    # ``run_plan``).  Identity defaults.  Dual-read leftover when the
-    # DREAMER field is not explicit.  ``obj_auto_typical_cv_violation``
+    # ``run_plan``).  Identity defaults.  Leftover ``OBJ_AUTO_*`` ignored
+    # (P90-live).  ``obj_auto_typical_cv_violation``
     # code default is **0.10** (module docstring said 0.05 — stale).
     obj_auto_mv_violation_base: float = 25.0
     obj_auto_cv_violation_base: float = 25.0
@@ -461,9 +461,9 @@ class TrainConfig:
     obj_auto_violation_rate_coef_max: float = 1.5
     obj_auto_differentiable_depth: float = 0.20
     obj_auto_reward_clip_floor: float = 50.0
-    # Leftover ``OBJ_USE_NORMALIZED`` (``load_objective_spec``).  Identity
-    # ON.  Dual-read leftover; explicit cfg / ``DREAMER_OBJ_USE_NORMALIZED``
-    # wins.
+    # ``load_objective_spec`` / ``_objective_uses_normalized``.  Identity
+    # ON.  Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live).  A/B
+    # ``DREAMER_OBJ_USE_NORMALIZED``.
     objective_use_normalized: bool = True
     objective_violation_rate_coef: str = 'auto'
     objective_penalty_sat_mode: str = 'tanh'
@@ -686,8 +686,8 @@ class TrainConfig:
     # Operator-limit / target step size as a fraction of the base span.
     # APCEnv constructs ``RuntimeSetpointConfig`` with dataclass defaults
     # **0.15 / 0.20** (do **not** switch to ``auto_derive``: τ-derived
-    # change counts / ramp are not test_sim identity).  Dual-read leftover
-    # ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` when the field is not explicit.
+    # change counts / ramp are not test_sim identity).  Leftover
+    # ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` ignored (P90-live).
     runtime_setpoint_bounds_jitter_frac: float = 0.15
     runtime_setpoint_target_jitter_frac: float = 0.20
     # Remaining RuntimeSetpointConfig schedule knobs (identity 1/2, 0.10,
@@ -2291,8 +2291,9 @@ def _runtime_setpoint_config_from_cfg(cfg) -> RuntimeSetpointConfig:
     """APCEnv ``RuntimeSetpointConfig`` from TrainConfig (test_sim identity).
 
     Do **not** call ``auto_derive`` (τ-derived change-count / ramp would
-    not be env-free identity).  Jitter dual-reads leftover
-    ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` when the field is not explicit.
+    not be env-free identity).  Jitter reads
+    ``DREAMER_RUNTIME_SETPOINT_*_JITTER_FRAC`` (leftover
+    ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` ignored; P90-live).
     """
     def _i(field: str, env_key: str, default: int) -> int:
         v, _ = _cfg_or_env(cfg, field, env_key, default, int)
@@ -2331,11 +2332,11 @@ def _runtime_setpoint_config_from_cfg(cfg) -> RuntimeSetpointConfig:
         bounds_enabled=bool(getattr(cfg, 'runtime_setpoint_variation', True)),
         bounds_jitter_fraction=float(np.clip(_cfg_or_env_float(
             cfg, 'runtime_setpoint_bounds_jitter_frac',
-            'RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION', 0.15)[0],
+            'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC', 0.15)[0],
             0.05, 0.45)),
         target_jitter_fraction=float(np.clip(_cfg_or_env_float(
             cfg, 'runtime_setpoint_target_jitter_frac',
-            'RUNTIME_SETPOINT_TARGET_JITTER_FRACTION', 0.20)[0],
+            'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC', 0.20)[0],
             0.05, 0.45)),
         bounds_changes_per_episode=(bmin, bmax),
         target_changes_per_episode=(tmin, tmax),

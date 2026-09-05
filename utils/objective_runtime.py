@@ -161,9 +161,8 @@ def _objective_uses_normalized(obj_w: Dict, terms: Dict, cfg=None) -> bool:
     d_raw = os.environ.get('DREAMER_OBJ_USE_NORMALIZED')
     if d_raw not in (None, ''):
         return str(d_raw).strip().lower() not in ('0', 'false', 'off', 'no', 'n', 'f')
-    l_raw = os.environ.get('OBJ_USE_NORMALIZED')
-    if l_raw not in (None, ''):
-        return str(l_raw).strip().lower() not in ('0', 'false', 'off', 'no', 'n', 'f')
+    # Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live; same silent-A/B
+    # class as ``OBJ_REWARD_SCALE`` / ``SEED_*``).
     if isinstance(terms, dict) and 'objective_use_normalized' in terms:
         return bool(int(_safe_float(terms.get('objective_use_normalized', 1), 1)))
     if cfg is not None:
@@ -255,11 +254,13 @@ def _obj_explicit(cfg, field: str) -> bool:
 
 def _obj_float(cfg, field: str, dreamer_key: str, leftover_key: str,
                default: float, spec=None, spec_key: str = '') -> float:
-    """Explicit TrainConfig, else DREAMER_*, else leftover, else spec, else default.
+    """Explicit TrainConfig, else DREAMER_*, else spec, else cfg, else default.
 
-    Matches historical ``os.environ.get`` then spec then default.  Identity
-    env-free (TrainConfig defaults = leftover fallbacks).
+    Leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*`` names are ignored (P90-live;
+    login leftover was a silent A/B outside ``run_plan``).  ``leftover_key``
+    stays on the signature so call sites do not churn.  Identity env-free.
     """
+    _ = leftover_key
     if _obj_explicit(cfg, field):
         try:
             return float(getattr(cfg, field))
@@ -269,12 +270,6 @@ def _obj_float(cfg, field: str, dreamer_key: str, leftover_key: str,
     if d_raw not in (None, ''):
         try:
             return float(d_raw)
-        except Exception:
-            pass
-    l_raw = os.environ.get(leftover_key)
-    if l_raw not in (None, ''):
-        try:
-            return float(l_raw)
         except Exception:
             pass
     if spec_key and isinstance(spec, dict) and spec.get(spec_key) is not None:
@@ -294,12 +289,10 @@ def _obj_bool(cfg, field: str, dreamer_key: str, leftover_key: str,
               default: bool) -> bool:
     if _obj_explicit(cfg, field):
         return bool(getattr(cfg, field))
+    _ = leftover_key
     d_raw = os.environ.get(dreamer_key)
     if d_raw not in (None, ''):
         return str(d_raw).strip().lower() not in _BOOL_OFF
-    l_raw = os.environ.get(leftover_key)
-    if l_raw not in (None, ''):
-        return str(l_raw).strip().lower() not in _BOOL_OFF
     if cfg is not None:
         return bool(getattr(cfg, field, default))
     return bool(default)
@@ -309,12 +302,10 @@ def _obj_str(cfg, field: str, dreamer_key: str, leftover_key: str,
              default: str, spec=None, spec_key: str = '') -> str:
     if _obj_explicit(cfg, field):
         return str(getattr(cfg, field, default) or default)
+    _ = leftover_key
     d_raw = os.environ.get(dreamer_key)
     if d_raw not in (None, ''):
         return str(d_raw).strip()
-    l_raw = os.environ.get(leftover_key)
-    if l_raw not in (None, ''):
-        return str(l_raw).strip()
     if spec_key and isinstance(spec, dict) and spec.get(spec_key) is not None:
         return str(spec.get(spec_key)).strip()
     if cfg is not None:
@@ -357,8 +348,8 @@ def resolve_integral_config(objective_spec=None, cfg=None) -> Tuple[bool, float,
     :func:`compute_objective_components` (which applies the penalty) and
     the environment (which sizes/normalises the exposed accumulator
     observation channel).  Precedence: explicit TrainConfig >
-    ``DREAMER_*`` > leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*`` > spec >
-    default.  Identity env-free.
+    ``DREAMER_*`` > spec > default.  Leftover ``OBJECTIVE_*`` /
+    ``OBJ_AUTO_*`` ignored (P90-live).  Identity env-free.
 
     Returns ``(enabled, coef, windup)``.
     """
@@ -367,7 +358,7 @@ def resolve_integral_config(objective_spec=None, cfg=None) -> Tuple[bool, float,
     # ON by default (opt-out): a small positive coefficient applies a
     # dwell penalty for SUSTAINED limit violation, attacking the passive
     # "park just outside the bound" attractor. Opt out by setting the coef
-    # to 0 (env ``OBJECTIVE_INTEGRAL_COEF`` or spec ``integral_coef``).
+    # to 0 (env ``DREAMER_OBJECTIVE_INTEGRAL_COEF`` or spec ``integral_coef``).
     coef = _obj_float(
         cfg, 'objective_integral_coef',
         'DREAMER_OBJECTIVE_INTEGRAL_COEF', 'OBJECTIVE_INTEGRAL_COEF',

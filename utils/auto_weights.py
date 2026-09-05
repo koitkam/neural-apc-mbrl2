@@ -45,7 +45,7 @@ base weights so each tier dominates the one below it at the configured
   Slow MVs get more penalty; fast MVs less.
 
 All magnitudes can be overridden via TrainConfig / ``DREAMER_OBJ_AUTO_*``
-(ENV_OVERRIDES) or leftover ``OBJ_AUTO_*`` env vars:
+(ENV_OVERRIDES). Leftover ``OBJ_AUTO_*`` names are ignored (P90-live):
 - ``OBJ_AUTO_MV_VIOLATION_BASE``      (default 25.0; linear-equivalent floor)
 - ``OBJ_AUTO_CV_VIOLATION_BASE``      (default 25.0; linear-equivalent floor)
 - ``OBJ_AUTO_CV_RANK_DECAY``          (default 0.5)
@@ -93,7 +93,12 @@ def _explicit(cfg, field: str) -> bool:
 
 def _knob_float(cfg, field: str, dreamer_key: str, leftover_key: str,
                 default: float) -> float:
-    """Explicit TrainConfig, else DREAMER_*, else leftover, else cfg, else default."""
+    """Explicit TrainConfig, else DREAMER_*, else cfg, else default.
+
+    Leftover ``OBJ_AUTO_*`` / ``OBJECTIVE_*`` names are ignored (P90-live).
+    ``leftover_key`` stays on the signature so call sites do not churn.
+    """
+    _ = leftover_key
     if field and _explicit(cfg, field):
         try:
             return float(getattr(cfg, field))
@@ -104,13 +109,6 @@ def _knob_float(cfg, field: str, dreamer_key: str, leftover_key: str,
         if d_raw not in (None, ''):
             try:
                 return float(d_raw)
-            except Exception:
-                pass
-    if leftover_key:
-        l_raw = os.environ.get(leftover_key)
-        if l_raw not in (None, ''):
-            try:
-                return float(l_raw)
             except Exception:
                 pass
     if cfg is not None and field:
@@ -503,26 +501,27 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # The user sets ONLY the economic weights; this ratio + the integral
     # compensation auto-derive the rest.
     # TrainConfig sentinel 0 = follow margin (objective_runtime identity).
-    # Leftover / DREAMER still win when set (historical ``get(..., margin)``
-    # when unset).
+    # DREAMER still wins when set. Leftover ``OBJ_AUTO_CV_OVER_ECON_RATIO``
+    # ignored (P90-live).
     if _explicit(cfg, 'obj_auto_cv_over_econ_ratio'):
         _ratio_raw = float(getattr(cfg, 'obj_auto_cv_over_econ_ratio'))
         cv_over_econ_ratio = max(1e-3, _ratio_raw if _ratio_raw > 0.0 else margin)
     else:
         _d_ratio = os.environ.get('DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO')
-        _l_ratio = os.environ.get('OBJ_AUTO_CV_OVER_ECON_RATIO')
         if _d_ratio not in (None, ''):
             try:
                 cv_over_econ_ratio = max(1e-3, float(_d_ratio))
             except Exception:
                 cv_over_econ_ratio = max(1e-3, margin)
-        elif _l_ratio not in (None, ''):
-            try:
-                cv_over_econ_ratio = max(1e-3, float(_l_ratio))
-            except Exception:
-                cv_over_econ_ratio = max(1e-3, margin)
         else:
-            cv_over_econ_ratio = max(1e-3, margin)
+            try:
+                _ratio_raw = float(getattr(
+                    cfg, 'obj_auto_cv_over_econ_ratio', 0.0) or 0.0) \
+                    if cfg is not None else 0.0
+            except Exception:
+                _ratio_raw = 0.0
+            cv_over_econ_ratio = max(
+                1e-3, _ratio_raw if _ratio_raw > 0.0 else margin)
     econ_over_target_ratio = max(1.0, _knob_float(
         cfg, 'obj_auto_econ_over_target_ratio',
         'DREAMER_OBJ_AUTO_ECON_OVER_TARGET_RATIO',

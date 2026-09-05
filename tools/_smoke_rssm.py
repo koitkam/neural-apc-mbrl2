@@ -2706,7 +2706,7 @@ def _test_identified_tau_cfg() -> None:
 
 
 def _test_objective_runtime_cfg() -> None:
-    """Reward-engine leftovers: TrainConfig default, leftover OBJECTIVE_*, DREAMER wins."""
+    """Reward-engine: TrainConfig default; leftover OBJECTIVE_* ignored; DREAMER wins."""
     import os
     from utils.objective_runtime import (
         resolve_integral_config, resolve_integral_leak,
@@ -2728,6 +2728,7 @@ def _test_objective_runtime_cfg() -> None:
         'DREAMER_OBJ_AUTO_VIOLATION_MARGIN', 'OBJ_AUTO_VIOLATION_MARGIN',
         'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO', 'OBJ_AUTO_CV_OVER_ECON_RATIO',
         'DREAMER_OBJECTIVE_PENALTY_CLIP', 'OBJECTIVE_PENALTY_CLIP',
+        'DREAMER_OBJ_AUTO_INTEGRAL_DEADTIME_K', 'OBJ_AUTO_INTEGRAL_DEADTIME_K',
         'IDENTIFIED_TAU_DOMINANT', 'IDENTIFIED_DEAD_TIME',
     )
     prev = {k: os.environ.get(k) for k in keys}
@@ -2743,7 +2744,7 @@ def _test_objective_runtime_cfg() -> None:
         assert abs(coef_c - 0.05) < 1e-12
         os.environ['OBJECTIVE_INTEGRAL_COEF'] = '0.11'
         _, coef_l, _ = resolve_integral_config(cfg=c)
-        assert abs(coef_l - 0.11) < 1e-12, coef_l
+        assert abs(coef_l - 0.05) < 1e-12, coef_l  # leftover ignored
         os.environ['DREAMER_OBJECTIVE_INTEGRAL_COEF'] = '0.07'
         _, coef_d, _ = resolve_integral_config(cfg=c)
         assert abs(coef_d - 0.07) < 1e-12, coef_d
@@ -2755,16 +2756,21 @@ def _test_objective_runtime_cfg() -> None:
         os.environ.pop('DREAMER_OBJECTIVE_INTEGRAL_COEF', None)
         os.environ.pop('OBJECTIVE_INTEGRAL_COEF', None)
         os.environ['OBJECTIVE_INTEGRAL_LEAK'] = '0.90'
-        assert abs(resolve_integral_leak() - 0.90) < 1e-12
+        assert abs(resolve_integral_leak() - 0.98) < 1e-12  # leftover ignored
         os.environ['DREAMER_OBJECTIVE_INTEGRAL_LEAK'] = '0.85'
         assert abs(resolve_integral_leak(cfg=c) - 0.85) < 1e-12
-        # Ratio sentinel 0 follows leftover margin (historical get(..., str(margin))).
         os.environ.pop('DREAMER_OBJECTIVE_INTEGRAL_LEAK', None)
         os.environ.pop('OBJECTIVE_INTEGRAL_LEAK', None)
         os.environ['OBJ_AUTO_VIOLATION_MARGIN'] = '4.0'
         os.environ['OBJ_AUTO_CV_OVER_ECON_RATIO'] = '1.0'
         os.environ['OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE'] = '1'
         os.environ['OBJ_AUTO_INTEGRAL_DEADTIME_K'] = '0'
+        _, coef_left, _ = resolve_integral_config()
+        assert abs(coef_left - 0.05) < 1e-12, coef_left  # leftover ignored
+        os.environ['DREAMER_OBJ_AUTO_VIOLATION_MARGIN'] = '4.0'
+        os.environ['DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO'] = '1.0'
+        os.environ['DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE'] = '1'
+        os.environ['DREAMER_OBJ_AUTO_INTEGRAL_DEADTIME_K'] = '0'
         _, coef_b, _ = resolve_integral_config()
         assert abs(coef_b - 0.20) < 1e-9, coef_b  # 0.05 * min(4/1, 10)
         # Cache: second derive with same empty obj_w + bounds is the same object.
@@ -2787,11 +2793,11 @@ def _test_objective_runtime_cfg() -> None:
             else:
                 os.environ[k] = old
         _AUTO_W_CACHE.clear()
-    print('[smoke] OK  objective leftover TrainConfig + DREAMER beats OBJECTIVE_*')
+    print('[smoke] OK  objective TrainConfig + DREAMER; leftover OBJECTIVE_* ignored')
 
 
 def _test_auto_weights_cfg() -> None:
-    """Auto-weights leftover OBJ_AUTO_*: TrainConfig default, leftover, DREAMER, explicit."""
+    """Auto-weights: TrainConfig default; leftover OBJ_AUTO_* ignored; DREAMER + explicit."""
     import os
     from utils.auto_weights import derive_auto_weights
     from utils.runtime_setpoints import RuntimeSetpointConfig
@@ -2831,10 +2837,14 @@ def _test_auto_weights_cfg() -> None:
         assert w0['mv_violation_weights'] == w1['mv_violation_weights']
         os.environ['OBJ_AUTO_MV_OVER_CV_RATIO'] = '4.0'
         w_l = derive_auto_weights(cfg=c, **kw)
-        assert float(w_l['mv_violation_weights'][0]) > float(w0['mv_violation_weights'][0])
-        os.environ['DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO'] = '2.0'
+        assert abs(float(w_l['mv_violation_weights'][0])
+                   - float(w0['mv_violation_weights'][0])) < 1e-6  # leftover ignored
+        os.environ['DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO'] = '4.0'
         w_d = derive_auto_weights(cfg=c, **kw)
-        assert abs(float(w_d['mv_violation_weights'][0])
+        assert float(w_d['mv_violation_weights'][0]) > float(w0['mv_violation_weights'][0])
+        os.environ['DREAMER_OBJ_AUTO_MV_OVER_CV_RATIO'] = '2.0'
+        w_d2 = derive_auto_weights(cfg=c, **kw)
+        assert abs(float(w_d2['mv_violation_weights'][0])
                    - float(w0['mv_violation_weights'][0])) < 1e-6
         c_ex = TrainConfig()
         c_ex.obj_auto_mv_over_cv_ratio = 1.0
@@ -2847,7 +2857,7 @@ def _test_auto_weights_cfg() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  auto-weights TrainConfig + leftover OBJ_AUTO_* identity')
+    print('[smoke] OK  auto-weights TrainConfig + DREAMER; leftover OBJ_AUTO_* ignored')
 
 
 def _test_runtime_setpoint_schedule_cfg() -> None:
@@ -2887,11 +2897,15 @@ def _test_runtime_setpoint_schedule_cfg() -> None:
         os.environ['RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION'] = '0.28'
         ad2 = RuntimeSetpointConfig.auto_derive(
             targets_enabled=False, episode_length=1220)
-        assert abs(float(ad2.bounds_jitter_fraction) - 0.28) < 1e-12
+        assert abs(float(ad2.bounds_jitter_fraction) - 0.15) < 1e-12  # leftover ignored
+        rs_left = _runtime_setpoint_config_from_cfg(c)
+        assert abs(float(rs_left.bounds_jitter_fraction) - 0.15) < 1e-12
         os.environ['DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC'] = '0.18'
         ad3 = RuntimeSetpointConfig.auto_derive(
             targets_enabled=False, episode_length=1220)
         assert abs(float(ad3.bounds_jitter_fraction) - 0.18) < 1e-12
+        rs_d = _runtime_setpoint_config_from_cfg(c)
+        assert abs(float(rs_d.bounds_jitter_fraction) - 0.18) < 1e-12
         c_ex = TrainConfig()
         c_ex.runtime_setpoint_bounds_changes_max = 4
         c_ex._explicit_fields = {'runtime_setpoint_bounds_changes_max'}  # type: ignore[attr-defined]
@@ -2903,7 +2917,7 @@ def _test_runtime_setpoint_schedule_cfg() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  runtime-setpoint schedule TrainConfig + auto_derive jitter 0.15/0.20')
+    print('[smoke] OK  runtime-setpoint schedule TrainConfig + DREAMER; leftover jitter ignored')
 
 
 def _test_step_seed_shaping_prbs_seg_cfg() -> None:

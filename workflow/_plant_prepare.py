@@ -510,7 +510,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Leftover ``OBJ_REWARD_SCALE`` ignored (P87-live).
     'DREAMER_OBJ_REWARD_SCALE':            ('obj_reward_scale',             str),
     # Reward-engine leftovers (``utils/objective_runtime.py``).  Identity.
-    # Dual-read leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*``.  Clip ``<0``
+    # Leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*`` ignored (P90-live).  Clip ``<0``
     # = adaptive.  ``obj_auto_cv_over_econ_ratio=0`` follows margin.
     'DREAMER_OBJECTIVE_INTEGRAL_COEF':     ('objective_integral_coef',      float),
     'DREAMER_OBJECTIVE_INTEGRAL_WINDUP':   ('objective_integral_windup',    float),
@@ -525,8 +525,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO': ('obj_auto_cv_over_econ_ratio',  float),
     'DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE': (
         'obj_auto_violation_tolerance', float),
-    # Auto-weights leftover formula knobs.  Identity.  Dual-read leftover
-    # ``OBJ_AUTO_*`` inside ``derive_auto_weights``.
+    # Auto-weights leftover formula knobs.  Identity.  Leftover
+    # ``OBJ_AUTO_*`` ignored (P90-live; TrainConfig + ``DREAMER_*`` only).
     'DREAMER_OBJ_AUTO_MV_VIOLATION_BASE': (
         'obj_auto_mv_violation_base', float),
     'DREAMER_OBJ_AUTO_CV_VIOLATION_BASE': (
@@ -656,8 +656,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_MV_ACTION_FULL_RANGE':       ('mv_action_map_full_range',       _as_bool),
     'DREAMER_RUNTIME_SETPOINT_VARIATION': ('runtime_setpoint_variation',     _as_bool),
     # APCEnv schedule (dataclass 0.15 / 0.20 / 1–2 / 0.10 / 3 / 0.05).
-    # Dual-read leftover ``RUNTIME_SETPOINT_*_JITTER_FRACTION``.  Do **not**
-    # switch APCEnv to ``auto_derive`` (τ-derived change-count / ramp).
+    # Leftover ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` ignored (P90-live).
+    # Do **not** switch APCEnv to ``auto_derive`` (τ-derived change-count / ramp).
     'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC': (
         'runtime_setpoint_bounds_jitter_frac', float),
     'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC': (

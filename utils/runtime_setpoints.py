@@ -84,7 +84,11 @@ class _ScheduledChange:
 
 
 def _jitter_frac(*keys: str, default: float) -> float:
-    """Explicit leftover/DREAMER env, else dataclass default (0.15 / 0.20)."""
+    """First set DREAMER env wins, else dataclass default (0.15 / 0.20).
+
+    Leftover ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` is not in ``keys``
+    (P90-live; silent A/B when DREAMER unset).
+    """
     for key in keys:
         raw = os.environ.get(key)
         if raw in (None, ''):
@@ -149,8 +153,9 @@ class RuntimeSetpointConfig:
         - Number of changes per episode is bounded so each change has at least
           ``5 * (tau + theta)`` settling time.
         - Ramp duration is ~ ``2 * (tau + theta) / episode_length`` (bounded).
-        - Jitter dual-reads DREAMER_* then leftover ``RUNTIME_SETPOINT_*``.
-          APCEnv does **not** call this (change-count / ramp are not identity).
+        - Jitter reads ``DREAMER_RUNTIME_SETPOINT_*_JITTER_FRAC`` only.
+          Leftover ``RUNTIME_SETPOINT_*`` ignored (P90-live).  APCEnv does
+          **not** call this (change-count / ramp are not identity).
         """
         ep = max(1, int(episode_length))
         if tau_dominant is None or not math.isfinite(float(tau_dominant)) or float(tau_dominant) <= 0:
@@ -168,14 +173,12 @@ class RuntimeSetpointConfig:
 
         # Jitter matches APCEnv / TrainConfig (0.15 / 0.20).  Leftover
         # 0.25 was an unused ``from_spec`` default and is not identity.
-        # Dual-read DREAMER_* then leftover ``RUNTIME_SETPOINT_*``.
+        # DREAMER_* only (P90-live leftover ``RUNTIME_SETPOINT_*`` ignored).
         bounds_jitter = _jitter_frac(
             'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC',
-            'RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION',
             default=0.15)
         target_jitter = _jitter_frac(
             'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC',
-            'RUNTIME_SETPOINT_TARGET_JITTER_FRACTION',
             default=0.20)
 
         return cls(
