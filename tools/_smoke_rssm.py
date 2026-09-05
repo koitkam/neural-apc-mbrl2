@@ -4509,11 +4509,18 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
         h2, _ = derive_horizon(tau=55.0, dead_time=8.0, sample_rate=4)
         assert h2 == 40, h2
         assert horizon_formula_knobs()[1] == 40
+        # Explicit arg beats leftover env (P92-live). Leftover would cap 40.
+        h_exp, _ = derive_horizon(
+            tau=55.0, dead_time=8.0, sample_rate=4, max_h=120)
+        assert h_exp == 57, h_exp
         os.environ.pop('DREAMER_HORIZON_MAX', None)
         os.environ['DREAMER_HORIZON_SETTLE_NTAU'] = '2.0'
         h3, src3 = derive_horizon(tau=55.0, dead_time=8.0, sample_rate=4)
         assert h3 == 30, (h3, src3)
         assert abs(horizon_formula_knobs()[0] - 2.0) < 1e-12
+        h_exp2, _ = derive_horizon(
+            tau=55.0, dead_time=8.0, sample_rate=4, settle_n_tau=4.0)
+        assert h_exp2 == 57, h_exp2
         os.environ['DREAMER_INIT_RANDOMIZATION'] = '0'
         os.environ['DREAMER_INIT_RANDOMIZATION_FRAC'] = '0.4'
         assert _enabled() is False
@@ -4731,6 +4738,15 @@ def _test_gpu_calib_cfg() -> None:
         assert abs(oh - 1.5) < 1e-12
         assert abs(util - 0.65) < 1e-12
         assert cap == 64
+        # Explicit probe args beat leftover env (P92-live). Knobs still
+        # see leftover when the caller does not pass an explicit value.
+        from tools.gpu_calibrate import pick_batch_size_empirical
+        info = pick_batch_size_empirical(
+            model_size='S', seq_len=64, lookback=128, horizon=15,
+            k_max=8, sample_rate=4, obs_dim=6, action_dim=1,
+            max_bs=128, target_util=0.90)
+        assert int(info['max_bs']) == 128, info['max_bs']
+        assert abs(float(info['target_util']) - 0.90) < 1e-12
     finally:
         for k, old in prev.items():
             if old is None:

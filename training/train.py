@@ -2230,7 +2230,9 @@ class TrainConfig:
     # GPU-calib VRAM budget + hard ceiling.  Were leftover
     # ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS`` in gpu_calibrate
     # (worked, missing from ``run_plan``).  Identity 0.80 / 512.
-    # ``gpu_probe_knobs()`` is the probe source of truth.  ``DREAMER_BATCH_SIZE``
+    # ``gpu_probe_knobs()`` is the probe source of truth.  Explicit
+    # ``pick_batch_size_empirical`` args beat leftover env (P92-live).
+    # ``DREAMER_BATCH_SIZE``
     # pins ``batch_size`` and skips the probe.  Leftover ``OBJ_BATCH_SIZE``
     # is **not** read (P87-live; login leftover was a silent A/B).
     gpu_target_util: float = 0.80

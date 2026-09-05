@@ -181,8 +181,9 @@ def derive_horizon(
         ``H = round((dead_time + settle_n_tau * tau) / sample_rate)``
 
     Resolution order:
+    - explicit ``settle_n_tau`` / ``max_h`` args (win over leftover env)
     - leftover ``DREAMER_HORIZON_SETTLE_NTAU`` / ``DREAMER_HORIZON_MAX``
-    - explicit ``settle_n_tau`` / ``max_h`` args
+      via ``horizon_formula_knobs()`` when the arg is None
     - TrainConfig ``horizon_settle_n_tau`` / ``horizon_max`` (identity 4.0 / 120)
     - ``source='auto:{n}tau_settle'``: derived from identified dynamics.
     - ``source='default'``: paper floor (15) when no dynamics are available.
@@ -194,19 +195,10 @@ def derive_horizon(
     kn_tau, kn_max = horizon_formula_knobs()
     n_tau = kn_tau if settle_n_tau is None else float(settle_n_tau)
     cap = kn_max if max_h is None else int(max_h)
-    # Leftover env still wins over an explicit arg (historical A/B).
-    raw = os.environ.get('DREAMER_HORIZON_SETTLE_NTAU', '').strip()
-    if raw:
-        try:
-            n_tau = float(raw)
-        except ValueError:
-            pass
-    raw = os.environ.get('DREAMER_HORIZON_MAX', '').strip()
-    if raw:
-        try:
-            cap = int(float(raw))
-        except ValueError:
-            pass
+    # Explicit args override knobs (P92-live leftover-class: leftover
+    # ``DREAMER_HORIZON_*`` used to win over an explicit arg after knobs
+    # already applied it).  Leftover env still applies via
+    # ``horizon_formula_knobs()`` when the arg is None.
     cap = max(int(min_h), cap)
 
     tau_v = _safe_float(tau, 0.0)

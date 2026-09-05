@@ -255,8 +255,8 @@ search *and* keep warm-starting model weights.
 |---|---|
 | `DREAMER_OBJ_REWARD_SCALE` | `auto` (default) / `off` / `<float>` — disable or force reward scale. Leftover `OBJ_REWARD_SCALE` is ignored. |
 | `DREAMER_BATCH_SIZE` | pin `batch_size` (else empirical GPU-calib). Leftover `OBJ_BATCH_SIZE` is ignored. |
-| `DREAMER_TARGET_UTIL` | GPU-calib VRAM fraction (default 0.80). Dual-read at probe. |
-| `DREAMER_MAX_BS` | GPU-calib hard ceiling (default 512). Dual-read at probe. |
+| `DREAMER_TARGET_UTIL` | GPU-calib VRAM fraction (default 0.80). Read at `gpu_probe_knobs()`; explicit probe args win. |
+| `DREAMER_MAX_BS` | GPU-calib hard ceiling (default 512). Read at `gpu_probe_knobs()`; explicit probe args win. |
 | `DREAMER_EPISODE_LENGTH` | force episode length (else auto from settling time). Leftover `SIM_EPISODE_LENGTH` is ignored; `single_run` still writes `SIM_EPISODE_LENGTH` after derivation as IPC. |
 | `SIM_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10`) |
 | `SEED` | RNG seed (default 0) |

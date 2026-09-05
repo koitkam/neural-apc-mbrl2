@@ -250,8 +250,10 @@ def main() -> int:
     # actor/critic credit the full settling response of the slowest loop —
     # including the consequence of riding vs not-riding a moved operator
     # limit over the whole transient.  Floored at the paper default 15 and
-    # capped (TrainConfig ``horizon_max`` / leftover ``DREAMER_HORIZON_MAX``)
-    # via ``horizon_formula_knobs()``.  An explicit ``DREAMER_HORIZON`` still
+    # capped (TrainConfig ``horizon_max`` / leftover ``DREAMER_HORIZON_MAX``
+    # via ``horizon_formula_knobs()`` when no explicit arg).  An explicit
+    # ``derive_horizon(..., max_h=)`` beats leftover env (P92-live).
+    # An explicit ``DREAMER_HORIZON`` still
     # hard-overrides downstream via the env-override layer.
     horizon, horizon_source = derive_horizon(
         tau=tau, dead_time=dead, sample_rate=sample_rate)
@@ -306,7 +308,8 @@ def main() -> int:
     # ``pick_batch_size_for_plant`` reads TrainConfig ``wm_overhead`` /
     # ``gpu_target_util`` / ``gpu_max_bs`` (leftover ``DREAMER_WM_OVERHEAD``
     # / ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``).  Identity 1.30 /
-    # 0.80 / 512.  ``explicit_batch_size`` pins B and skips the probe
+    # 0.80 / 512.  Explicit probe args beat leftover env (P92-live).
+    # ``explicit_batch_size`` pins B and skips the probe
     # (``DREAMER_BATCH_SIZE`` only; leftover ``OBJ_BATCH_SIZE`` ignored).
     # Probe the P1/P2 WM unroll T (max(seq_len, H+1)), not lookback-seq_len,
     # so a slow plant's DC-gain window is in the memory budget (follow-up 13).

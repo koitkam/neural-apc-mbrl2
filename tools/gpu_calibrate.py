@@ -223,23 +223,10 @@ def pick_batch_size_empirical(*, model_size: str, seq_len: int, lookback: int,
             'target_util': target_util, 'min_bs': paper_default, 'max_bs': max_bs,
             'world_model_type': wmt,
             'wm_overhead_factor': wm_overhead_factor, 'bs_probe': bs_probe}
-    # Dual-read leftover env (probe runs before TrainConfig exists).
-    # Canonical fields: TrainConfig ``gpu_target_util`` / ``gpu_max_bs``
-    # + ``ENV_OVERRIDES`` ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``.
-    env_util = os.environ.get('DREAMER_TARGET_UTIL', '').strip()
-    if env_util:
-        try:
-            target_util = max(0.1, min(0.95, float(env_util)))
-            info['target_util'] = target_util
-        except ValueError:
-            pass
-    env_max_bs = os.environ.get('DREAMER_MAX_BS', '').strip()
-    if env_max_bs:
-        try:
-            max_bs = max(paper_default, int(env_max_bs))
-            info['max_bs'] = max_bs
-        except ValueError:
-            pass
+    # Leftover ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS`` used to overlay
+    # here and beat explicit args (P92-live **REMOVED**).  Unset sentinels
+    # resolve once in ``pick_batch_size_for_plant`` / CLI via
+    # ``gpu_probe_knobs()``.
     if not torch.cuda.is_available():
         info.update({'batch_size': paper_default, 'source': 'cpu_fallback',
                      'gpu_total_gb': 0.0})
@@ -323,7 +310,8 @@ def pick_batch_size_for_plant(*, model_size: str, seq_len: int, lookback: int,
     ``None`` overhead / util / max_bs resolve through
     ``gpu_probe_knobs()`` (TrainConfig ``wm_overhead=1.30`` /
     ``gpu_target_util=0.80`` / ``gpu_max_bs=512`` plus leftover env).
-    Env-free ``single_run`` is unchanged.  BO used to omit overhead and
+    Explicit args win over leftover env (P92-live).  Env-free
+    ``single_run`` is unchanged.  BO used to omit overhead and
     silently size against WM-only 1.0.
     """
     from workflow._plant_prepare import gpu_probe_knobs
@@ -551,12 +539,15 @@ def calibrate(sim_dir: Path, bs_probe: int = 4,
     peak_mb = float(meas['peak_mb'])
     per_sample_mb = float(meas['per_sample_mb'])
 
-    # Recommended bs under empirical per_sample using
-    # pick_batch_size_empirical's snap rule (target_util=0.65, [16, 256]).
+    # Recommended bs under empirical per_sample using production knobs
+    # (TrainConfig + leftover ``DREAMER_*`` via ``gpu_probe_knobs``).
+    from workflow._plant_prepare import gpu_probe_knobs
+    _oh, _util, _cap = gpu_probe_knobs()
     rec = pick_batch_size_empirical(
         model_size=model_size, seq_len=seq_len, lookback=lookback,
         horizon=horizon, k_max=k_max, sample_rate=sr_setup,
-        obs_dim=obs_dim, action_dim=action_dim, bs_probe=bs_probe)
+        obs_dim=obs_dim, action_dim=action_dim, bs_probe=bs_probe,
+        max_bs=_cap, target_util=_util, wm_overhead_factor=_oh)
     emp_bs = int(rec['batch_size'])
     target_util = float(rec['target_util'])
     gpu_total_gb = float(rec.get('gpu_total_gb', 0.0))

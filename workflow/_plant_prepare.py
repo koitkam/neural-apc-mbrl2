@@ -235,8 +235,11 @@ def gpu_probe_knobs() -> Tuple[float, float, int]:
     ``single_run``: those numbers **are** the TrainConfig defaults.
     Changing the dataclass now actually sizes B.  Leftover
     ``DREAMER_WM_OVERHEAD`` / ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``
-    still win when set (same keys as ``ENV_OVERRIDES``).  Does **not**
-    call ``apply_dreamer_env_overrides`` (that would reprint
+    still win here when set (same keys as ``ENV_OVERRIDES``; probe runs
+    before a plant-filled cfg).  Callers with **explicit** overhead /
+    util / max_bs must not re-read env on top (P92-live:
+    ``pick_batch_size_empirical`` leftover overlay **REMOVED**).  Does
+    **not** call ``apply_dreamer_env_overrides`` (that would reprint
     ``[env-override]`` at probe time and again at train start).
     """
     from training.train import TrainConfig
@@ -335,7 +338,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_EPISODE_LENGTH':          ('episode_length',          int),
     # IC domain-randomization + GPU-calib overhead.  ``ic_randomization_knobs()``
     # / ``gpu_probe_knobs()`` read TrainConfig then leftover env (no plant-filled
-    # cfg at those call sites).
+    # cfg at those call sites).  Explicit probe / ``derive_horizon`` args
+    # beat leftover env (P92-live).
     'DREAMER_INIT_RANDOMIZATION':      ('init_randomization',      _as_bool),
     'DREAMER_INIT_RANDOMIZATION_FRAC': ('init_randomization_frac', float),
     'DREAMER_WM_OVERHEAD':             ('wm_overhead',             float),

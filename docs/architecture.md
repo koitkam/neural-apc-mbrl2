@@ -248,13 +248,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
-> 4.0/120 / ON/0.6). `derive_episode_length` now
+> 4.0/120 / ON/0.6; explicit `derive_horizon` args beat leftover env). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; leftover
 > `SIM_EPISODE_LENGTH` **ignored** P92-live; pin `DREAMER_EPISODE_LENGTH`;
 > `single_run` still writes `SIM_EPISODE_LENGTH` as IPC).
 > GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
-> longer silently uses WM-only 1.0). Missing SysID keys do **not**
+> longer silently uses WM-only 1.0; explicit probe args beat leftover env). Missing SysID keys do **not**
 > invent τ=50 s / θ=5 s. APCEnv operator-limit schedule
 > (change counts 1–2, ramp/warmup 0.10, strata 3, inside-margin 0.05)
 > is TrainConfig + `ENV_OVERRIDES`; `auto_derive` jitter is **0.15 / 0.20**.
