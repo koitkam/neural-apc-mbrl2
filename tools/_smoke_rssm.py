@@ -51,6 +51,7 @@ from training.train import (
                             _should_warm_restore_wm_best,
                             _should_restore_last_ok_at_p1_freeze,
                             _should_lock_last_ok,
+                            _should_unlock_last_ok_after_skip_storm,
                             _should_probe_gain_on_last_ok,
                             _wm_recon_scalar,
                             _persist_last_ok_ckpt,
@@ -433,6 +434,30 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         recon=0.1447, recon_best=0.0033, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=False, already_locked=True,
         extra_p1=False)
+    # P92: skip-storm restore of a GAIN-READY last_ok stays locked;
+    # not-ready / probe-fail still unlocks (P45/P49 KEEP).
+    assert not _should_unlock_last_ok_after_skip_storm(
+        continue_p1=True, restored_gain_ready=True)
+    assert _should_unlock_last_ok_after_skip_storm(
+        continue_p1=True, restored_gain_ready=False)
+    assert _should_unlock_last_ok_after_skip_storm(
+        continue_p1=True, restored_gain_ready=None)
+    assert _should_unlock_last_ok_after_skip_storm(
+        continue_p1=False, restored_gain_ready=True)
+    assert _should_lock_last_ok(
+        recon=0.004, recon_best=0.002, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=True, already_locked=True,
+        gain_ready_locked=True)
+    assert not _should_lock_last_ok(
+        recon=0.004, recon_best=0.002, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=True, already_locked=True,
+        gain_ready_locked=False)
+    # Wrap recovery must not unlock a GAIN-READY skip-storm last_ok
+    # (P91 last_ok 31→44). Extra-P1 stay-lock unchanged (P40).
+    assert _should_lock_last_ok(
+        recon=0.0093, recon_best=0.0033, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=True,
+        extra_p1=False, gain_ready_locked=True)
     # Freeze recon healthy — restore because locked (P40 CAPPED 0.0045).
     assert _should_restore_last_ok_at_p1_freeze(
         recon=0.0045, recon_best=0.0015, ratio=5.0,
@@ -2008,6 +2033,10 @@ def _test_isolation_dcv_scales() -> None:
     assert '_record_isolation_dcv_span' in _src
     assert "'p1_last_ok_iter'" in _src
     assert "'p1_last_ok_locked'" in _src
+    assert "'p1_last_ok_gain_ready_locked'" in _src
+    assert '_should_unlock_last_ok_after_skip_storm' in _src
+    assert 'stay-locked after ' in _src
+    assert 'p1_skip_storm_gain_ready_locked' in _src
     assert "'p1_recon_best'" in _src
     assert '_persist_last_ok_ckpt' in _src
     assert "wrote {p1_last_ok_ckpt_path.name}" in _src

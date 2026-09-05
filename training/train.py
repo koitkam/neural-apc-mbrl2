@@ -3441,6 +3441,29 @@ def _recon_still_healthy(recon: float, recon_best: Optional[float],
     return r <= float(ratio) * b
 
 
+def _should_unlock_last_ok_after_skip_storm(
+        *,
+        continue_p1: bool,
+        restored_gain_ready: Optional[bool],
+) -> bool:
+    """Unlock last-ok after skip-storm restore unless the snapshot is GAIN-READY.
+
+    P91: storm 1 restored last_ok **31** (teacher MV ×0.999 DV ×0.989),
+    unlocked, last_ok walked to **44**, storm 2 froze 44 at 5-level
+    **0.76@DV** (GAIN_NOT_READY; ``[p3-skip]``). Teacher jsonl at 44 was
+    still ×0.95 — recon-healthy last_ok is gain-blind vs the 5-level
+    probe.
+
+    P45/P49 skip-storm unlock **KEEP** when the restored basin is *not*
+    GAIN-READY so last_ok can still advance (those freezes reached 77/82).
+    Cap-path unlock is identity (P1 ends). Probe fail (``None``)
+    fail-opens unlock. No new TrainConfig field.
+    """
+    if not continue_p1:
+        return True
+    return restored_gain_ready is not True
+
+
 def _should_lock_last_ok(
         *,
         recon: float,
@@ -3450,6 +3473,7 @@ def _should_lock_last_ok(
         skip_storm_restored: bool,
         already_locked: bool,
         extra_p1: bool = False,
+        gain_ready_locked: bool = False,
 ) -> bool:
     """Lock last-ok after a silent recon spike so recovery cannot overwrite it.
 
@@ -3458,10 +3482,12 @@ def _should_lock_last_ok(
     CAPPED with healthy recon so detonated-freeze did **not** restore 83.
     Recovered extra-P1 stays locked (``extra_p1=True``).
 
-    Skip-storm restore **unlocks** (post-restore healthy P1 should resume
-    snapshots — P40 storm 1/2 @65 then last-ok 66+). Wrap jitter at
-    ~5–10× best must **not** lock (lock_ratio default 20). Unitless
-    recon/recon.
+    Skip-storm restore **unlocks** when the restored snapshot is not
+    GAIN-READY (post-restore healthy P1 should resume snapshots — P40
+    storm 1/2 @65 then last-ok 66+; P45/P49). A GAIN-READY restore
+    **stays locked** (``gain_ready_locked``; P91 last_ok 31→44 walk).
+    Wrap jitter at ~5–10× best must **not** lock (lock_ratio default 20).
+    Unitless recon/recon.
 
     P41 live (original P1, not extra-P1): iter 57 recon 0.0887 / skip 0
     / gnorm 1.99 (42× best 0.0021) then recovered 0.0098 < 5× overwrote
@@ -3472,13 +3498,13 @@ def _should_lock_last_ok(
     recon recovered iter 26 but the lock never unlocked, so freeze
     restored 24 (0.81@DV) and discarded live gate 0.89@DV at iter 82.
     Original-P1 wrap recovery (``already_locked`` and recon back below
-    ``lock_ratio``, ``extra_p1=False``) **unlocks** so last-ok can
-    advance. Extra-P1 recovered basin stays locked (P40).
+    ``lock_ratio``, ``extra_p1=False``, not gain-ready-locked) **unlocks**
+    so last-ok can advance. Extra-P1 recovered basin stays locked (P40).
     """
     if skip_storm_restored:
-        return False
+        return bool(gain_ready_locked)
     if already_locked:
-        if extra_p1:
+        if extra_p1 or gain_ready_locked:
             return True
         try:
             r = float(recon)
@@ -12022,6 +12048,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_last_ok_sd: Optional[Dict[str, torch.Tensor]] = None
     p1_last_ok_iter: int = -1
     p1_last_ok_locked: bool = False
+    p1_last_ok_gain_ready_locked: bool = False
     p1_recon_best: Optional[float] = None
     p1_gain_not_ready_capped: bool = False
     p1_detonated_freeze_restored: bool = False
@@ -14172,9 +14199,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # spike (P40 extra-P1 0.48; P41 original-P1 0.089) locks the
         # snapshot so a later recovered recon cannot overwrite it.
         # Lock is recon-only (not skip-free): P41 iter 58 skip 1 sat on
-        # the same spike.  Skip-storm restore unlocks.  Original-P1 wrap
-        # recovery also unlocks (P48 freeze restored 24 after a recovered
-        # 43× wrap); extra-P1 recovered basin stays locked (P40).
+        # the same spike.  Skip-storm restore unlocks unless the
+        # restored snapshot is GAIN-READY (P91 last_ok 31→44).
+        # Original-P1 wrap recovery also unlocks (P48 freeze restored
+        # 24 after a recovered 43× wrap) unless gain-ready-locked.
+        # Extra-P1 recovered basin stays locked (P40).
         if (current_phase == 1
                 and bool(getattr(cfg, 'skip_storm_recover_p1', True))):
             _rlv = _wm_recon_scalar(wm_losses)
@@ -14190,7 +14219,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 has_last_ok=p1_last_ok_sd is not None,
                 skip_storm_restored=False,
                 already_locked=_was_locked,
-                extra_p1=int(p1_ext_steps) > 0)
+                extra_p1=int(p1_ext_steps) > 0,
+                gain_ready_locked=bool(p1_last_ok_gain_ready_locked))
+            if (not p1_last_ok_locked) and p1_last_ok_gain_ready_locked:
+                p1_last_ok_gain_ready_locked = False
             if _was_locked and not p1_last_ok_locked:
                 _best_s = (f'{p1_recon_best:.4f}'
                            if p1_recon_best is not None else 'n/a')
@@ -14204,7 +14236,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 print(f'[wm-last-ok] locked iter {p1_last_ok_iter} '
                       f'(recon {_rlv:.4f} > {_lock_ratio:g}× best {_best_s}); '
                       f'freeze restores this snapshot until wrap recovery '
-                      f'or skip-storm unlock',
+                      f'or skip-storm unlock (GAIN-READY skip-storm stay-locks)',
                       flush=True)
                 if p1_last_ok_ckpt_path is None:
                     p1_last_ok_ckpt_path = out_dir / 'wm_last_ok.pt'
@@ -14301,6 +14333,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 'p1_last_ok_iter': (int(p1_last_ok_iter)
                                     if int(p1_last_ok_iter) >= 0 else None),
                 'p1_last_ok_locked': bool(p1_last_ok_locked),
+                'p1_last_ok_gain_ready_locked': bool(
+                    p1_last_ok_gain_ready_locked),
                 'p1_recon_best': (float(p1_recon_best)
                                   if p1_recon_best is not None else None),
                 'wm_score_ema': (float(wm_score_ema)
@@ -14795,28 +14829,45 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     _force_p1_cap_at(total_env_steps))
                             grad_skip_history.clear()
                             skip_storm_p1_recovered = True
-                            if p1_last_ok_locked:
-                                print('[wm-last-ok] unlocked after skip-storm '
-                                      'restore', flush=True)
-                            p1_last_ok_locked = False
                             skip_storm_restore_source = _src
                             skip_storm_restore_iter = (
                                 int(p1_last_ok_iter)
                                 if _src == 'wm_last_ok'
                                 else int(wm_best_iter))
-                            # Storm-time FAIL must not stick if P1 continues —
-                            # the real P1→P2 gate decides.  Probe only when
-                            # this storm caps (actor_experiment_valid).
-                            if not _continue_p1:
-                                try:
-                                    _gp = _probe_observer_gain_ready(
-                                        model, env, device, cfg)
-                                    if (_gp is not None
-                                            and not bool(_gp.get(
-                                                'gain_ready', True))):
+                            # Probe restored weights: cap-path sets
+                            # actor_experiment_valid; continue-path
+                            # stay-locks a GAIN-READY last_ok (P91).
+                            _storm_gain_ready = None
+                            try:
+                                _gp = _probe_observer_gain_ready(
+                                    model, env, device, cfg)
+                                if _gp is not None and 'gain_ready' in _gp:
+                                    _storm_gain_ready = bool(_gp['gain_ready'])
+                                    if (not _continue_p1
+                                            and not _storm_gain_ready):
                                         p1_gain_not_ready_capped = True
-                                except Exception:
-                                    pass
+                            except Exception:
+                                pass
+                            if _should_unlock_last_ok_after_skip_storm(
+                                    continue_p1=_continue_p1,
+                                    restored_gain_ready=_storm_gain_ready):
+                                if p1_last_ok_locked:
+                                    print('[wm-last-ok] unlocked after '
+                                          'skip-storm restore',
+                                          flush=True)
+                                p1_last_ok_locked = False
+                                p1_last_ok_gain_ready_locked = False
+                            else:
+                                p1_last_ok_locked = True
+                                p1_last_ok_gain_ready_locked = True
+                                print(
+                                    '[wm-last-ok] stay-locked after '
+                                    'skip-storm restore (GAIN-READY '
+                                    f'last_ok iter {int(p1_last_ok_iter)})',
+                                    flush=True)
+                                mid_check_flags.append(
+                                    'p1_skip_storm_gain_ready_locked: '
+                                    f'last_ok iter {int(p1_last_ok_iter)}')
                             _restored = (Path(_ckpt).name
                                          if _ckpt is not None else _src)
                             if _continue_p1:
@@ -15241,6 +15292,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'p1_last_ok_iter': (int(p1_last_ok_iter)
                             if p1_last_ok_iter >= 0 else None),
         'p1_last_ok_locked': bool(p1_last_ok_locked),
+        'p1_last_ok_gain_ready_locked': bool(p1_last_ok_gain_ready_locked),
         'p1_gain_not_ready_capped': bool(p1_gain_not_ready_capped),
         'p1_detonated_freeze_restored': bool(p1_detonated_freeze_restored),
         'actor_experiment_valid': _actor_experiment_valid(
