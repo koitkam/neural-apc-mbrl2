@@ -13,7 +13,7 @@ Status legend: **[current]** = implemented & default · **[opt-in]** = implement
 env-gated off · **[planned]** = designed, not yet built.
 
 > **2026-09-03 CURRENT env-free recipe (test_sim first):** RSSM **deterministic**
-> (P77+P78 TSSM family **FALSIFIED**; P78 EXIT last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; KV-continue KEEP as OL lift / FALSIFIED as freeze; opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`; **P79 EXIT** KEEP rssm / **FALSIFIED as P64-identity** (`run_p79_rssmrevert`, pid **277462**, 204 iters): GAIN-READY **0.81@DV** last_ok **81**; val MV **×0.923 / ×0.953** DV **×0.781 / ×0.838**; 1step→OL **×0.840**; paired **−10.57 vs −82.79** VALID 9/9 loses to P64 **−4.54**; **P80 EXIT** persist 0.1→0.0 **REVERT** (`run_p80_persist0`, pid **293761**, 515 iters budget): freeze GAIN-READY **0.86@MV / 0.87@DV** last_ok **82**; val MV **×0.723 / ×0.755** DV **×0.789 / ×0.857**; 1step→OL **×0.735** OL **×0.743**; paired **−35.33 vs −107.43** VALID 8/9 loses to P64 **−4.54** / P79 **−10.57**; persist **0.1 KEEP**; **P85 EXIT** always-call KEEP as P1 / FALSIFIED as val TM (MV **×0.671** 1step→OL **×0.697** paired **−24.84**); **P86 EXIT** CV-only overshoot **REVERT** (GAIN_NOT_READY 3.36@MV; actor INVALID); **P87 EXIT** overshoot stop-grad start KEEP as freeze / **FALSIFIED as compounding** (`run_p87_ovsgstart`, 515 iters): GAIN-READY **0.86@DV** last_ok **82**; val MV **×0.681 / ×0.732** 1step→OL **×0.733**; det_r **0.157**; paired **−21.19 vs −100.44** VALID 9/9; overshoot family **closed**; **P88 EXIT** residual GRU mix **REVERT** (`run_p88_grures`, pid **343419**, 158 iters): last_ok **59** **GAIN_NOT_READY 0.40@MV**; extra-P1 live **0.83@DV** discarded P40; actor INVALID; P76+P88 keep-h **closed**; **P89 EXIT** high-pass `dob_ground` KEEP as protocol / PARTIAL amp / FALSIFIED champ (`run_p89_dobhp`, 216 iters): GAIN-READY **0.83@DV** last_ok **67**; val MV **×0.879 / ×0.880** 1step→OL **×0.935**; det_r **0.392**; paired **−9.91 vs −132** VALID 9/9 loses to P64 **−4.54** mv_viol **2.81**; **P90 EXIT** serve HP d-tail **REVERT** (`run_p90_dobhpfeat`, pid **352555**, sha `91a695e`, 65 iters): storm **2/2 @11** last_ok **7** GAIN_NOT_READY **−0.53@MV**; actor INVALID; P1 `d≡0` so feat HP was a no-op; val MV **×−18.49**; **P91** identity replay of P89 raw-`d` feat tail (`run_p91_nofeathp`)) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
+> (P77+P78 TSSM family **FALSIFIED**; P78 EXIT last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; KV-continue KEEP as OL lift / FALSIFIED as freeze; opt-in `DREAMER_WORLD_MODEL_TYPE=tssm`; **P79 EXIT** KEEP rssm / **FALSIFIED as P64-identity** (`run_p79_rssmrevert`, pid **277462**, 204 iters): GAIN-READY **0.81@DV** last_ok **81**; val MV **×0.923 / ×0.953** DV **×0.781 / ×0.838**; 1step→OL **×0.840**; paired **−10.57 vs −82.79** VALID 9/9 loses to P64 **−4.54**; **P80 EXIT** persist 0.1→0.0 **REVERT** (`run_p80_persist0`, pid **293761**, 515 iters budget): freeze GAIN-READY **0.86@MV / 0.87@DV** last_ok **82**; val MV **×0.723 / ×0.755** DV **×0.789 / ×0.857**; 1step→OL **×0.735** OL **×0.743**; paired **−35.33 vs −107.43** VALID 8/9 loses to P64 **−4.54** / P79 **−10.57**; persist **0.1 KEEP**; **P85 EXIT** always-call KEEP as P1 / FALSIFIED as val TM (MV **×0.671** 1step→OL **×0.697** paired **−24.84**); **P86 EXIT** CV-only overshoot **REVERT** (GAIN_NOT_READY 3.36@MV; actor INVALID); **P87 EXIT** overshoot stop-grad start KEEP as freeze / **FALSIFIED as compounding** (`run_p87_ovsgstart`, 515 iters): GAIN-READY **0.86@DV** last_ok **82**; val MV **×0.681 / ×0.732** 1step→OL **×0.733**; det_r **0.157**; paired **−21.19 vs −100.44** VALID 9/9; overshoot family **closed**; **P88 EXIT** residual GRU mix **REVERT** (`run_p88_grures`, pid **343419**, 158 iters): last_ok **59** **GAIN_NOT_READY 0.40@MV**; extra-P1 live **0.83@DV** discarded P40; actor INVALID; P76+P88 keep-h **closed**; **P89 EXIT** high-pass `dob_ground` KEEP as protocol / PARTIAL amp / FALSIFIED champ (`run_p89_dobhp`, 216 iters): GAIN-READY **0.83@DV** last_ok **67**; val MV **×0.879 / ×0.880** 1step→OL **×0.935**; det_r **0.392**; paired **−9.91 vs −132** VALID 9/9 loses to P64 **−4.54** mv_viol **2.81**; **P90 EXIT** serve HP d-tail **REVERT** (`run_p90_dobhpfeat`, pid **352555**, sha `91a695e`, 65 iters): storm **2/2 @11** last_ok **7** GAIN_NOT_READY **−0.53@MV**; actor INVALID; P1 `d≡0` so feat HP was a no-op; val MV **×−18.49**; **P91 LIVE** identity replay of P89 raw-`d` feat tail (`run_p91_nofeathp`, pid **355470**, sha `9d41fb8`): Step 4 CONFIRMED cuda/rssm eager `dob_hp=128` **no** `dob_feathp`; P1@4 skip **0** teacher pin **@3**; P90 storm@3 did not fire — not a verdict)) continuous latent, compile **eager**, **DOB on** (GAIN-ONLY cont; `d_t` is the
 > unmeasured load), DC supervisor = **gain-match only** (isolation/ss-match
 > **off**, P40 KEEP) + **rest-IC** (P45 PROMOTE) + settle **−1**. Actor =
 > `_realsim_actor_critic_step`. `skip_invalid_p3=True`. P46/P47 σ-reset
@@ -339,8 +339,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > the actor collapsed below the open-loop baseline. Grounding adds a direct
 > `dob_ground_coef · ‖HP(d_t) − HP(true_load)‖²` (P89 EXIT KEEP: high-pass MA
 > `min(4H,T)` matching val detrend; unit-matched via the running CV
-> obs-norm std; P90 serve feat is a separate causal EMA HP of Kalman `d`
-> at `4H`, not this MSE) that tunes the Kalman `A,K` to TRACK the load — the structural fix
+> obs-norm std; P90 serve-HP feat tail **REVERT** — actor/critic feat uses
+> raw `d.detach()`; this MSE is the P2 ground only) that tunes the Kalman `A,K` to TRACK the load — the structural fix
 > for the manual `dob_gain_init` amplitude tuning. `dob_reg_coef → 0` when
 > grounding is on. First run: p19 (`run_p19_dobground`).
 
@@ -1221,10 +1221,10 @@ batched-decodes prior for the Kalman.
   Mean MSE over all sequences. Do not `/dvar`. **P89 EXIT:** MSE is
   high-pass (`x−MA(x,w)`, `w=min(4H,T)`) so DC drift that val `det_r`
   already ignores does not dominate P2 (KEEP as protocol; PARTIAL amp;
-  FALSIFIED champ). **P90:** served feat tail is causal EMA HP
-  (`d−EMA(d,4H)`, W unclipped) so the actor does not see untrained DC
-  `d` as a load; Kalman state stays raw. jsonl `dob_ground_keep_frac`
-  is 1.0 when grounding fires.
+  FALSIFIED champ). **P90 EXIT REVERT:** served feat tail was causal EMA HP
+  (`d−EMA(d,4H)`); storm 2/2 last_ok **7** GAIN_NOT_READY — cannot attribute.
+  **P91 LIVE:** feat tail is raw `d.detach()` (P89 identity). Kalman state
+  stays raw. jsonl `dob_ground_keep_frac` is 1.0 when grounding fires.
 - **Stage 3** — `g` and `(A,K)` are frozen (`_wm_frozen_now` drops `wm_total`);
   the actor/critic train on the static unbiased WM + working observer, **with
   disturbances + domain randomization on**, so the deployed controller is robust
