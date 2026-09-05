@@ -4186,6 +4186,28 @@ def _dob_ground_hp_window(cfg: 'TrainConfig', T: int) -> int:
     return int(min(T, w))
 
 
+def _dob_ground_shape_amp(
+        ds: torch.Tensor, dt: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scale-free shape MSE + unitless amplitude square.
+
+    P89 HP MSE is Wiener: the MMSE fit shrinks ``pred_std`` (P89/P93
+    ``~0.5`` vs true ``1.93``). Shape z-scores the pred with **stop-grad
+    std** so phase grads cannot fight amplitude; amp owns
+    ``(pred_std / teacher_std - 1)^2``. Same ``dob_ground_coef``.
+    ``clamp_min(1e-3)`` is numerical, **not** the P66 skip gate.
+    Returns ``(loss, std_ratio)`` with ``std_ratio`` detached.
+    """
+    ds_f = ds.float()
+    dt_f = dt.float()
+    d_std = ds_f.std().clamp_min(1e-3)
+    t_std = dt_f.std().clamp_min(1e-3)
+    shape = (ds_f / d_std.detach() - dt_f / t_std).pow(2).mean()
+    ratio = d_std / t_std
+    amp = (ratio - 1.0).pow(2)
+    return shape + amp, ratio.detach()
+
+
 def _highpass_bt(x: torch.Tensor, w: int) -> torch.Tensor:
     """``x - MA(x, w)`` matching ``evaluation.wm_disturbance_prediction``.
 
@@ -4375,6 +4397,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"ov_sgstart=True "
         f"gru_zbias={_gru_zb:.3g} "
         f"dob_hp={_hpw} "
+        f"dob_hpamp=zstd "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -8876,6 +8899,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # divide by the running CV obs-norm std (threaded on cfg as _cv_obs_std).
     dob_ground = torch.zeros((), device=feats.device)
     dob_ground_keep_frac = torch.zeros((), device=feats.device)
+    dob_ground_std_ratio = torch.zeros((), device=feats.device)
     dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
     if dob_live and dgc > 0.0:
         if dist_target is None:
@@ -8908,7 +8932,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 # ring KEEP (P65 flush REVERT).  Do not /dvar.
                 # P89: high-pass both sides with the val detrend window
                 # ``min(4H, T)`` so slow drift (feedback-rejectable) does
-                # not dominate the MSE that should train det_r / AC amp.
+                # not dominate the term that should train det_r / AC amp.
+                # P94: replace Wiener HP MSE with z-score shape +
+                # unitless std-ratio amp (same coef; no new knob).
                 # jsonl ``dob_ground_keep_frac`` is 1.0 when this
                 # term fires (observability; no skip).
                 _hpw = _dob_ground_hp_window(cfg, int(ds.shape[1]))
@@ -8916,14 +8942,17 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                     if not getattr(cfg, '_dob_ground_hp_logged', False):
                         print(
                             f'[dob-ground] high-pass MA w={_hpw} '
-                            f'(min(4H,T); val detrend; P89)',
+                            f'(min(4H,T); val detrend; P89) '
+                            f'shape+amp z-score (P94; not Wiener MSE)',
                             flush=True)
                         cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
-                    ds_hp = _highpass_bt(ds, _hpw)
-                    dt_hp = _highpass_bt(dtgt, _hpw)
-                    dob_ground = (ds_hp - dt_hp).pow(2).mean()
+                    ds_g = _highpass_bt(ds, _hpw)
+                    dt_g = _highpass_bt(dtgt, _hpw)
                 else:
-                    dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
+                    ds_g = ds
+                    dt_g = dtgt
+                dob_ground, dob_ground_std_ratio = _dob_ground_shape_amp(
+                    ds_g, dt_g)
                 dob_ground_keep_frac = torch.ones((), device=ds.device)
                 wm_total = wm_total + dgc * dob_ground
             elif not getattr(cfg, '_dob_ground_shape_warned', False):
@@ -9049,6 +9078,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dob_reg': dob_reg.detach(),
         'dob_ground': dob_ground.detach(),
         'dob_ground_keep_frac': dob_ground_keep_frac.detach(),
+        'dob_ground_std_ratio': dob_ground_std_ratio.detach(),
         'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
     }
@@ -14459,6 +14489,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             row.setdefault('wm_ss_match_loss', 0.0)
             row.setdefault('dob_ground', 0.0)
             row.setdefault('dob_ground_keep_frac', 0.0)
+            row.setdefault('dob_ground_std_ratio', 0.0)
             # P39 diag A: emit last computed per-head grad norms (if any).
             # Values may be float (grad norms) or str (error messages); pass
             # strings through unchanged so jsonl serialisation works.

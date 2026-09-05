@@ -1917,6 +1917,37 @@ def _test_dob_ground_highpass() -> None:
     print('[smoke] OK  dob_ground high-pass (min(4H,T); val MA identity)')
 
 
+def _test_dob_ground_shape_amp() -> None:
+    """P94: z-score shape + std-ratio amp; stop-grad pred std in shape."""
+    from training.train import _dob_ground_shape_amp
+    torch.manual_seed(0)
+    dt = torch.randn(4, 32, 1)
+    loss, ratio = _dob_ground_shape_amp(dt, dt)
+    assert abs(float(ratio) - 1.0) < 1e-5
+    assert float(loss) < 1e-6
+    ds = 0.5 * dt
+    loss, ratio = _dob_ground_shape_amp(ds, dt)
+    assert abs(float(ratio) - 0.5) < 1e-4
+    assert abs(float(loss) - 0.25) < 1e-4  # shape ~0, amp (0.5-1)^2
+    # stop-grad: shape term does not flow through pred std
+    ds_g = (0.4 * dt).detach().requires_grad_(True)
+    d_std = ds_g.std().clamp_min(1e-3)
+    t_std = dt.std().clamp_min(1e-3)
+    shape = (ds_g / d_std.detach() - dt / t_std).pow(2).mean()
+    # A uniform scale of ds_g changes std but not z-score → shape unchanged
+    ds2 = (ds_g.detach() * 1.7).requires_grad_(True)
+    d_std2 = ds2.std().clamp_min(1e-3)
+    shape2 = (ds2 / d_std2.detach() - dt / t_std).pow(2).mean()
+    assert abs(float(shape.detach()) - float(shape2.detach())) < 1e-5
+    # amp alone pushes |d| up when under-gained
+    ds_a = (0.3 * dt).detach().requires_grad_(True)
+    loss_a, _ = _dob_ground_shape_amp(ds_a, dt)
+    g_a, = torch.autograd.grad(loss_a, ds_a)
+    align = float((g_a * ds_a.detach()).sum())
+    assert align < 0.0  # negative: reducing |d| raises loss → grow |d|
+    print('[smoke] OK  dob_ground shape+amp (z-score; unitless std-ratio)')
+
+
 def _test_img_step_det_roll_skips_sample() -> None:
     """Gain det-roll: sample=True prior c is the mean; skip discarded randn."""
     from models.dreamer_v4_rssm import (
@@ -2212,8 +2243,13 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gru_hres_logit' not in _rssm_src
     assert 'g * (h_gru - prev.h)' not in _rssm_src
     assert 'def _dob_ground_hp_window' in _src
+    assert 'def _dob_ground_shape_amp' in _src
     assert 'def _highpass_bt' in _src
     assert '[dob-ground] high-pass MA w=' in _src
+    assert 'shape+amp z-score' in _src
+    assert 'dob_hpamp=zstd' in _src
+    assert "row.setdefault('dob_ground_std_ratio'" in _src
+    assert '(ds_hp - dt_hp).pow(2).mean()' not in _src
     assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
     assert 'fill_(_zbias)' not in _rssm_src
     assert 'def init_gain_cv_skip' not in _rssm_src
@@ -2280,6 +2316,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gru_hres=' not in _src
     assert 'gru_hres_mix' not in _src
     assert 'dob_hp=' in _src
+    assert 'dob_hpamp=zstd' in _src
     assert 'dob_feathp=' not in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
     assert "world_model_type: str = 'rssm'" in _src
@@ -5638,6 +5675,7 @@ if __name__ == '__main__':
     _test_gru_update_gate_bias()
     _test_gru_vanilla_no_residual_mix()
     _test_dob_ground_highpass()
+    _test_dob_ground_shape_amp()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()
