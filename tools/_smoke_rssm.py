@@ -2941,12 +2941,15 @@ def _test_step_seed_shaping_prbs_seg_cfg() -> None:
 
 
 def _test_expert_move_law_cfg() -> None:
-    """Expert move-law leftovers: TrainConfig default, leftover env, explicit wins."""
+    """Expert move-law: TrainConfig default; leftover DREAMER_EXPERT_* ignored."""
     import os
     import numpy as np
     from utils.apc_expert import GainScheduleExpert
     from workflow._plant_prepare import ENV_OVERRIDES
 
+    src = open('utils/apc_expert.py').read()
+    assert "os.environ.get(env_key)" not in src
+    assert "DREAMER_EXPERT_MOVE_FRAC" not in src
     c = TrainConfig()
     assert abs(float(c.expert_move_frac) - 0.30) < 1e-12
     assert abs(float(c.expert_backoff_frac) - 0.12) < 1e-12
@@ -2973,19 +2976,20 @@ def _test_expert_move_law_cfg() -> None:
         assert abs(e0.backoff_frac - 0.12) < 1e-12
         os.environ['DREAMER_EXPERT_MOVE_FRAC'] = '0.22'
         e1 = GainScheduleExpert(cfg=c, **kw)
-        assert abs(e1.move_frac - 0.22) < 1e-12
+        assert abs(e1.move_frac - 0.30) < 1e-12  # leftover ignored
         c_ex = TrainConfig()
         c_ex.expert_move_frac = 0.11
-        c_ex._explicit_fields = {'expert_move_frac'}  # type: ignore[attr-defined]
         e2 = GainScheduleExpert(cfg=c_ex, **kw)
         assert abs(e2.move_frac - 0.11) < 1e-12
+        e3 = GainScheduleExpert(cfg=_cfg_from_env(), **kw)
+        assert abs(e3.move_frac - 0.22) < 1e-12  # whitelist still applies
     finally:
         for k, old in prev.items():
             if old is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  expert move-law TrainConfig + leftover env identity')
+    print('[smoke] OK  expert move-law TrainConfig; leftover DREAMER_EXPERT_* ignored')
 
 
 def _test_pin_eval_modules() -> None:

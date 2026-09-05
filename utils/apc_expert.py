@@ -54,8 +54,8 @@ All inputs are per-sim and already produced (objective spec + identified gains +
 the SS sweep).  No plant-specific constants.  SISO and MIMO use the identical code
 path; the pseudo-inverse / surrogate degenerate gracefully to the scalar case.
 Dimensionless knobs are overridable via TrainConfig ``expert_*`` fields
-(``DREAMER_EXPERT_*`` in ``ENV_OVERRIDES``).  Leftover env still wins
-when the field is not explicit.
+(``DREAMER_EXPERT_*`` in ``ENV_OVERRIDES`` / ``_cfg_from_env``).  Login
+leftover ``DREAMER_EXPERT_*`` without ``_cfg_from_env`` is ignored.
 """
 
 from __future__ import annotations
@@ -68,40 +68,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
-def _explicit(cfg, field: str) -> bool:
-    if cfg is None:
-        return False
-    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+def _knob_float(cfg, field: str, default: float) -> float:
+    """TrainConfig field, else constructor default.
 
-
-def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
-    """Explicit TrainConfig, else leftover ``DREAMER_EXPERT_*``, else default.
-
-    Identity with the historical ``os.environ.get`` path when ``cfg`` is
-    None / the field is not explicit.  Same leftover-env class as
-    ``objective_runtime`` / ``training_disturbance``.
+    ``DREAMER_EXPERT_*`` is applied by ``_cfg_from_env`` / ``ENV_OVERRIDES``.
+    Login leftover without ``_cfg_from_env`` is ignored.
     """
-    if _explicit(cfg, field):
-        try:
-            return float(getattr(cfg, field))
-        except Exception:
-            return float(default)
-    raw = os.environ.get(env_key)
-    if raw not in (None, ''):
-        try:
-            return float(raw)
-        except ValueError:
-            pass
     if cfg is not None:
         try:
             return float(getattr(cfg, field, default))
         except Exception:
             pass
     return float(default)
-
-
-def _env_float(key: str, default: float) -> float:
-    return _knob_float(None, '', key, default)
 
 
 # ---------------------------------------------------------------------------
@@ -412,8 +390,7 @@ class SteadyStateExpert(ABC):
         self.mv_bounds = np.asarray(mv_bounds, dtype='float64').reshape(-1, 2)
         self.n_mv = self.mv_bounds.shape[0]
         self.mv_span = np.maximum(self.mv_bounds[:, 1] - self.mv_bounds[:, 0], 1e-9)
-        self.move_frac = _knob_float(
-            cfg, 'expert_move_frac', 'DREAMER_EXPERT_MOVE_FRAC', move_frac)
+        self.move_frac = _knob_float(cfg, 'expert_move_frac', move_frac)
         self._u = self.mv_bounds.mean(axis=1).astype('float64')
 
     # ---- lifecycle -----------------------------------------------------
@@ -501,15 +478,11 @@ class GainScheduleExpert(SteadyStateExpert):
         self.mv_econ_sign = np.asarray(mv_econ_sign, dtype='float64').reshape(-1)
 
         self.backoff_frac = _knob_float(
-            cfg, 'expert_backoff_frac', 'DREAMER_EXPERT_BACKOFF_FRAC', backoff_frac)
-        self.econ_frac = _knob_float(
-            cfg, 'expert_econ_frac', 'DREAMER_EXPERT_ECON_FRAC', econ_frac)
-        self.loop_gain = _knob_float(
-            cfg, 'expert_loop_gain', 'DREAMER_EXPERT_LOOP_GAIN', loop_gain)
-        self.ridge_frac = _knob_float(
-            cfg, 'expert_ridge_frac', 'DREAMER_EXPERT_RIDGE_FRAC', ridge_frac)
-        self.feas_scale = _knob_float(
-            cfg, 'expert_feas_scale', 'DREAMER_EXPERT_FEAS_SCALE', feas_scale)
+            cfg, 'expert_backoff_frac', backoff_frac)
+        self.econ_frac = _knob_float(cfg, 'expert_econ_frac', econ_frac)
+        self.loop_gain = _knob_float(cfg, 'expert_loop_gain', loop_gain)
+        self.ridge_frac = _knob_float(cfg, 'expert_ridge_frac', ridge_frac)
+        self.feas_scale = _knob_float(cfg, 'expert_feas_scale', feas_scale)
 
         self.anchor_ops = [np.asarray(op, dtype='float64').reshape(-1) for op, _ in anchors]
         self.anchor_G = [np.asarray(G, dtype='float64').reshape(self.n_cv, self.n_mv)
@@ -731,15 +704,12 @@ class NNSteadyStateExpert(SteadyStateExpert):
         self.nominal_dv_eu = np.asarray(nominal_dv_eu, dtype='float64').reshape(-1)
 
         self.backoff_frac = _knob_float(
-            cfg, 'expert_backoff_frac', 'DREAMER_EXPERT_BACKOFF_FRAC', backoff_frac)
-        self.econ_scale = _knob_float(
-            cfg, 'expert_econ_scale', 'DREAMER_EXPERT_ECON_SCALE', econ_scale)
+            cfg, 'expert_backoff_frac', backoff_frac)
+        self.econ_scale = _knob_float(cfg, 'expert_econ_scale', econ_scale)
         self.opt_iters = int(_knob_float(
-            cfg, 'expert_opt_iters', 'DREAMER_EXPERT_OPT_ITERS', float(opt_iters)))
-        self.opt_lr = _knob_float(
-            cfg, 'expert_opt_lr', 'DREAMER_EXPERT_OPT_LR', opt_lr)
-        self.feas_scale = _knob_float(
-            cfg, 'expert_feas_scale', 'DREAMER_EXPERT_FEAS_SCALE', feas_scale)
+            cfg, 'expert_opt_iters', float(opt_iters)))
+        self.opt_lr = _knob_float(cfg, 'expert_opt_lr', opt_lr)
+        self.feas_scale = _knob_float(cfg, 'expert_feas_scale', feas_scale)
         self._dv_eu: Optional[np.ndarray] = None
 
     def is_usable(self) -> bool:

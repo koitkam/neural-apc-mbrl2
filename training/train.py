@@ -1477,8 +1477,9 @@ class TrainConfig:
     # Move-law (unitless fractions / counts).  Were leftover
     # ``DREAMER_EXPERT_*`` ``os.environ.get`` inside ``apc_expert``
     # (worked, missing from ``run_plan``).  Identity defaults match
-    # the constructor fallbacks.  Dual-read leftover when the field
-    # is not explicit; explicit cfg wins.
+    # the constructor fallbacks.  A/B only via ``DREAMER_EXPERT_*``
+    # (``ENV_OVERRIDES`` / ``_cfg_from_env``).  Login leftover without
+    # ``_cfg_from_env`` is ignored.
     expert_move_frac: float = 0.30
     expert_backoff_frac: float = 0.12
     expert_econ_frac: float = 0.02

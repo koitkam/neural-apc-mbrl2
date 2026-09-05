@@ -274,7 +274,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > `disturbance_recovery_frac` / `disturbance_settle_steps` /
 > `disturbance_quiet_frac`; A/B `DREAMER_DISTURBANCE_*`; leftover
 > `AGENT_DISTURBANCE_*` is not read)
-> plus expert move-law (`expert_move_frac` / `backoff_frac` / …)
+> plus expert move-law (`expert_move_frac` / `backoff_frac` / …;
+> leftover helper `DREAMER_EXPERT_*` **REMOVED** P92-live; `_cfg_from_env`
+> only)
 > and CLI extras (`POLICY_*` /
 > `GRAD_CLIP` / seed counts / plant-derived arch) that `single_run`
 > used to drop are TrainConfig + `ENV_OVERRIDES`. Val/diag pin
@@ -843,7 +845,9 @@ forced after the loop). Rest-IC `last_only` slices `act/embed/dv`
 (`[:, t]`) instead of `unbind`. Per-CV derived observables (`int_err` /
 Δcv / var) are TrainConfig `derived_observables` (default ON; window 0
 = auto 2τ/sr). Leftover helper dual-read of `DREAMER_DERIVED_*`
-**REMOVED** (P92-live; `_cfg_from_env` only). Process-noise ramp and
+**REMOVED** (P92-live; `_cfg_from_env` only). Leftover helper dual-read
+of `DREAMER_EXPERT_*` in `apc_expert` **REMOVED** (P92-live; `_cfg_from_env`
+only). Process-noise ramp and
 hidden-load schedule knobs are the same leftover-env class (identity
 defaults; dual-read at `noise_curriculum_scale` / `HiddenDisturbance`).
 
