@@ -258,7 +258,7 @@ search *and* keep warm-starting model weights.
 | `DREAMER_TARGET_UTIL` | GPU-calib VRAM fraction (default 0.80). Read at `gpu_probe_knobs()`; explicit probe args win. |
 | `DREAMER_MAX_BS` | GPU-calib hard ceiling (default 512). Read at `gpu_probe_knobs()`; explicit probe args win. |
 | `DREAMER_EPISODE_LENGTH` | force episode length (else auto from settling time). Leftover `SIM_EPISODE_LENGTH` is ignored; `single_run` still writes `SIM_EPISODE_LENGTH` after derivation as IPC. |
-| `SIM_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10`) |
+| `DREAMER_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10` / `θ_fast / 2`). Leftover `SIM_SAMPLE_RATE` is ignored at derive; `single_run` still writes `SIM_SAMPLE_RATE` after derivation as IPC. |
 | `SEED` | RNG seed (default 0) |
 | `DREAMER_ATTN_IMPL` | `auto` (default: SDPA on CUDA) / `sdpa` / `manual`. Leftover `DREAMER_FAST_ATTN` (`1`/`sdpa`, `0`/`manual`) maps to the same field. |
 | `DREAMER_FAST_ATTN` | leftover alias of `DREAMER_ATTN_IMPL`. |
@@ -524,7 +524,7 @@ early via the `on_iter_end` callback in the trainer.
 | `batch_size` | 16 | nearest power of two filling `gpu_target_util` of GPU memory (empirical probe); ceiling `gpu_max_bs` | `DREAMER_BATCH_SIZE` |
 | `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `DREAMER_OBJ_REWARD_SCALE` |
 | `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `DREAMER_EPISODE_LENGTH` (leftover `SIM_EPISODE_LENGTH` ignored) |
-| `sample_rate` | 5 | `min(τ_fast / 10, θ_fast / 2)` | `SIM_SAMPLE_RATE` |
+| `sample_rate` | 5 | `min(τ_fast / 10, θ_fast / 2)` | `DREAMER_SAMPLE_RATE` (leftover `SIM_SAMPLE_RATE` ignored) |
 | `seq_len` | 64 | `max(64, ⌈(3τ + θ) / sr⌉)` | — |
 | `model_size` | M | `S/M/L` from complexity score | — |
 | `trial_steps` | 50 000 | `40 eps × max(1, complexity / 4) × ep_len`, clamped | `--trial_steps` |

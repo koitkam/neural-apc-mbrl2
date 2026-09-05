@@ -336,6 +336,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_EPISODE_MIN_LENGTH':       ('episode_min_length',     int),
     'DREAMER_EPISODE_MAX_LENGTH':      ('episode_max_length',      int),
     'DREAMER_EPISODE_LENGTH':          ('episode_length',          int),
+    # Sample-rate pin.  Identity: derived from τ_fast/θ_fast (test_sim 4).
+    # Leftover ``SIM_SAMPLE_RATE`` ignored at derive (P94-live).
+    # ``single_run`` / BO still WRITE ``SIM_SAMPLE_RATE`` as IPC.
+    'DREAMER_SAMPLE_RATE':            ('sample_rate',              int),
     # IC domain-randomization + GPU-calib overhead.  ``ic_randomization_knobs()``
     # / ``gpu_probe_knobs()`` read TrainConfig then leftover env (no plant-filled
     # cfg at those call sites).  Explicit probe / ``derive_horizon`` args

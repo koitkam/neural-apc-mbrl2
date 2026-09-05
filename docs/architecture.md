@@ -251,7 +251,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > 4.0/120 / ON/0.6; explicit `derive_horizon` args beat leftover env). `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; leftover
 > `SIM_EPISODE_LENGTH` **ignored** P92-live; pin `DREAMER_EPISODE_LENGTH`;
-> `single_run` still writes `SIM_EPISODE_LENGTH` as IPC).
+> `single_run` still writes `SIM_EPISODE_LENGTH` as IPC;
+> leftover `SIM_SAMPLE_RATE` **ignored** P94-live; pin `DREAMER_SAMPLE_RATE`;
+> `single_run` still writes `SIM_SAMPLE_RATE` as IPC).
 > GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
 > longer silently uses WM-only 1.0; explicit probe args beat leftover env). Missing SysID keys do **not**

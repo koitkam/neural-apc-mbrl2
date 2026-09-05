@@ -175,6 +175,11 @@ class TrainConfig:
 
     # ----- Plant / windowing -----
     lookback: int = 32        # transformer context length T_ctx
+    # Sentinel 5 is the paper floor / ``derive_sample_rate`` default.
+    # ``single_run`` / BO replace it from τ_fast/θ_fast (test_sim → 4).
+    # Explicit pin is ``DREAMER_SAMPLE_RATE``.  Leftover ``SIM_SAMPLE_RATE``
+    # is ignored at derive (P94-live); ``single_run`` still writes it
+    # after derivation as IPC.
     sample_rate: int = 5
     episode_length: int = 600
     # Formula inputs for ``derive_episode_length``:
@@ -15453,9 +15458,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 # ``_cfg_from_env`` still calls ``apply_dreamer_env_overrides`` after
 # this loop.  Episode-length pin is ``DREAMER_EPISODE_LENGTH``
 # (whitelist).  Leftover ``SIM_EPISODE_LENGTH`` is ignored (P92-live).
+# Sample-rate pin is ``DREAMER_SAMPLE_RATE`` (whitelist).  Leftover
+# ``SIM_SAMPLE_RATE`` is ignored at derive (P94-live).
 _CLI_ONLY_ENV = (
     ('AGENT_TOTAL_STEPS', 'total_steps', int),
-    ('SIM_SAMPLE_RATE', 'sample_rate', int),
     ('CONTROLLER_OUT_DIR', 'out_dir', str),
 )
 

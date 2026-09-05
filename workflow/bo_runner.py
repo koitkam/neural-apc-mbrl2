@@ -153,15 +153,22 @@ from workflow._plant_prepare import (  # noqa: E402
 
 
 def initialize_from_plant(out_dir: Path) -> Dict:
-    """Backward-compat wrapper: dynamics + lookback identification using
-    the env-provided ``SIM_SAMPLE_RATE`` (defaults to 5).
+    """Backward-compat wrapper: dynamics + lookback identification.
 
-    New callers should use ``identify_dynamics_from_plant`` then
-    ``identify_lookback`` after the sample_rate is derived so the
-    lookback scan range reflects the actual agent timestep.
+    Prefers canonical ``DREAMER_SAMPLE_RATE``, else IPC
+    ``SIM_SAMPLE_RATE`` after derivation, else 5.  New callers should
+    use ``identify_dynamics_from_plant`` then ``identify_lookback``
+    after the sample_rate is derived so the lookback scan range
+    reflects the actual agent timestep.
     """
+    from utils.plant_init import sample_rate_pin
     plant = identify_dynamics_from_plant(out_dir)
-    sr = int(os.environ.get('SIM_SAMPLE_RATE', '5'))
+    sr_ipc = os.environ.get('SIM_SAMPLE_RATE', '').strip()
+    try:
+        sr_ipc_i = int(float(sr_ipc)) if sr_ipc else 0
+    except Exception:
+        sr_ipc_i = 0
+    sr = sample_rate_pin() or (sr_ipc_i if sr_ipc_i > 0 else 5)
     lb = identify_lookback(out_dir, tau=plant['tau'],
                            dead_time=plant['dead_time'], sample_rate=sr,
                            dynamics_raw=plant['dynamics_raw'],
@@ -584,11 +591,12 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         base.init_from_ckpt = ckpt_path
         print(f'[BO] init_from_ckpt={ckpt_path} '
               f'(applied to every trial + final retrain)', flush=True)
-    # Sample-rate env override is supported here for sims that hard-code their
-    # scan rate.  Episode length is auto-derived from identification (or
-    # from canonical ``DREAMER_EPISODE_LENGTH``).  Leftover
-    # ``SIM_EPISODE_LENGTH`` is ignored.
-    sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
+    # Sample-rate pin ``DREAMER_SAMPLE_RATE`` for sims that hard-code
+    # their scan rate.  Episode length is auto-derived from identification
+    # (or from canonical ``DREAMER_EPISODE_LENGTH``).  Leftover
+    # ``SIM_EPISODE_LENGTH`` / ``SIM_SAMPLE_RATE`` are ignored at derive.
+    from utils.plant_init import sample_rate_pin
+    sr_pin = sample_rate_pin()
 
     print('[BO] Phase 1a: dynamics identification', flush=True)
     plant = identify_dynamics_from_plant(out_dir / 'plant_id')
@@ -609,12 +617,12 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
                          log_prefix='[BO]')
 
     # Plant-tied derivations (sample_rate from fastest dynamics, model_size
-    # from complexity, seq_len ≥ settling time).  Env-supplied values take
-    # precedence so this stays simulator-agnostic.
+    # from complexity, seq_len ≥ settling time).  Canonical pin takes
+    # precedence; leftover ``SIM_SAMPLE_RATE`` is ignored at derive.
     from utils.sim_factory import create_sim, resolve_sim_metadata
     from utils.plant_init import derive_all, derive_step_budgets
     from tools.gpu_calibrate import pick_batch_size_for_plant
-    sr_override = int(sr_env) if sr_env else 0
+    sr_override = int(sr_pin) if sr_pin else 0
     tmp_sim = create_sim(episode_length=10,
                          sample_rate=max(1, sr_override or base.sample_rate))
     sim_meta = resolve_sim_metadata(tmp_sim)

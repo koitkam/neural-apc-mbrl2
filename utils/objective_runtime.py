@@ -470,10 +470,10 @@ def _shaping_linear_equiv_scale(cfg=None) -> float:
     matches the quadratic base penalty exactly at a tolerance-magnitude
     violation and stays strictly bounded below it for smaller dwells,
     restoring a usable gradient.  Adaptive: it scales with the per-channel
-    derived CV/MV violation weight.  Mirrors ``OBJ_AUTO_VIOLATION_TOLERANCE``
-    (default 0.02).  TrainConfig ``obj_auto_violation_tolerance`` +
-    ``DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE``; leftover still wins when
-    DREAMER is unset.
+    derived CV/MV violation weight.  TrainConfig
+    ``obj_auto_violation_tolerance`` +
+    ``DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE`` (default 0.02).  Leftover
+    ``OBJ_AUTO_VIOLATION_TOLERANCE`` is ignored (P90-live).
     """
     try:
         return max(1e-4, _obj_float(

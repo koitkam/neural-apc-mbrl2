@@ -1228,9 +1228,11 @@ def _test_cli_only_env_disjoint() -> None:
     assert not overlap, overlap
     kept = {k for k, _, _ in _CLI_ONLY_ENV}
     assert kept == {
-        'AGENT_TOTAL_STEPS', 'SIM_SAMPLE_RATE',
+        'AGENT_TOTAL_STEPS',
         'CONTROLLER_OUT_DIR',
     }
+    assert 'DREAMER_SAMPLE_RATE' in ENV_OVERRIDES
+    assert ENV_OVERRIDES['DREAMER_SAMPLE_RATE'][0] == 'sample_rate'
     print('[smoke] OK  _CLI_ONLY_ENV disjoint from ENV_OVERRIDES')
 
 
@@ -4657,6 +4659,56 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
     print('[smoke] OK  horizon/episode/IC/overhead cfg-or-env identity')
 
 
+def _test_sample_rate_pin_ignores_leftover() -> None:
+    """Sample-rate pin: leftover SIM_SAMPLE_RATE ignored; DREAMER_* pins."""
+    import os
+    from utils.plant_init import derive_all, derive_sample_rate, sample_rate_pin
+    keys = ('DREAMER_SAMPLE_RATE', 'SIM_SAMPLE_RATE')
+    prev = {k: os.environ.get(k) for k in keys}
+    dyn = {
+        'tau_dominant_identified': 53.0,
+        'dead_time_identified': 8.0,
+        'tau_fastest_identified': 50.0,
+        'dead_time_fastest_identified': 8.0,
+    }
+    meta = {'mv_indices': [0], 'cv_indices': [1], 'dv_indices': [2],
+            'state_dim': 4}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        assert sample_rate_pin() == 0
+        auto = derive_sample_rate(50.0, 8.0)
+        assert auto == 4, auto
+        d0 = derive_all(dyn, meta, sample_rate_override=sample_rate_pin())
+        assert int(d0['sample_rate']) == 4, d0['sample_rate']
+        os.environ['SIM_SAMPLE_RATE'] = '9'
+        assert sample_rate_pin() == 0  # leftover ignored
+        d_left = derive_all(dyn, meta, sample_rate_override=sample_rate_pin())
+        assert int(d_left['sample_rate']) == 4, d_left['sample_rate']
+        os.environ['DREAMER_SAMPLE_RATE'] = '8'
+        assert sample_rate_pin() == 8
+        d_pin = derive_all(dyn, meta, sample_rate_override=sample_rate_pin())
+        assert int(d_pin['sample_rate']) == 8 and d_pin.get(
+            'sample_rate_source') == 'override', d_pin
+        sr_src = open('workflow/single_run.py').read()
+        br_src = open('workflow/bo_runner.py').read()
+        pi_src = open('utils/plant_init.py').read()
+        assert "sr_env = os.environ.get('SIM_SAMPLE_RATE'" not in sr_src
+        assert "sr_env = os.environ.get('SIM_SAMPLE_RATE'" not in br_src
+        assert 'sample_rate_pin' in sr_src and 'sample_rate_pin' in br_src
+        assert "os.environ.get('DREAMER_SAMPLE_RATE'" in pi_src
+        assert "os.environ.get('SIM_SAMPLE_RATE'" not in pi_src
+        tr_src = open('training/train.py').read()
+        assert "('SIM_SAMPLE_RATE', 'sample_rate'" not in tr_src
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  sample-rate pin DREAMER_SAMPLE_RATE; leftover SIM_SAMPLE_RATE ignored')
+
+
 def _test_derived_observables_cfg() -> None:
     """Derived-obs: TrainConfig default ON; leftover DREAMER_DERIVED_* ignored."""
     import os
@@ -5722,6 +5774,7 @@ if __name__ == '__main__':
     _test_attention_auto_ignores_leftover_fast_attn()
     _test_wm_tf_knobs_cfg_or_env()
     _test_horizon_ic_overhead_cfg_or_env()
+    _test_sample_rate_pin_ignores_leftover()
     _test_derived_observables_cfg()
     _test_noise_hidden_cfg()
     _test_gpu_calib_cfg()

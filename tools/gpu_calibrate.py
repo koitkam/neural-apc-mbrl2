@@ -448,6 +448,10 @@ def calibrate(sim_dir: Path, bs_probe: int = 4,
                                      dead_time_fast=dead_fast)
         lookback = int(lb_info['lookback'])
 
+    from utils.plant_init import sample_rate_pin as _sr_pin
+    _pin = _sr_pin()
+    if _pin > 0:
+        sr_setup = int(_pin)
     os.environ['SIM_SAMPLE_RATE'] = str(sr_setup)
     os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{tau:g}'
     os.environ['IDENTIFIED_DEAD_TIME'] = f'{dead:g}'

@@ -10,7 +10,10 @@ identification).  The user only needs to pick the simulation.
 What is auto-derived (in order):
   1. ``CONTROL_SETUP_JSON``  = ``<sim_dir>/control_setup.json``
   2. ``CONTROL_OBJECTIVE_JSON`` = ``<sim_dir>/control_objective.json``
-  3. ``sample_rate`` from setup file (key ``sample_rate``) or env / default 5.
+  3. ``sample_rate`` from ``DREAMER_SAMPLE_RATE`` pin, else setup file
+     (key ``sample_rate``), else auto from ``τ_fast/10`` / ``θ_fast/2``.
+     Leftover ``SIM_SAMPLE_RATE`` is ignored at derive — ``single_run``
+     still writes it after derivation as IPC.
   4. ``tau``, ``dead_time``         <- ``dynamics_identifier``.
   5. ``lookback``                   <- ``lookback_identifier`` (centred on tau).
   6. ``episode_length``             <- ``auto_episode_length.derive_episode_length``
@@ -168,13 +171,14 @@ def main() -> int:
     dead_fast = plant_info['dead_time_fast']
 
     # ── Phase 1b: Plant-tied derivations (sample rate, model size, seq_len) ─
-    # Sample rate from the *fastest* identified channel.  An explicit
-    # SIM_SAMPLE_RATE in env or in the setup file overrides the derivation.
+    # Sample rate from the *fastest* identified channel.  Canonical pin
+    # ``DREAMER_SAMPLE_RATE`` or a setup-file scan rate overrides the
+    # formula.  Leftover ``SIM_SAMPLE_RATE`` is ignored at derive
+    # (P94-live); we still WRITE it after derivation as IPC.
     from utils.sim_factory import create_sim, resolve_sim_metadata
-    from utils.plant_init import derive_all
-    sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
+    from utils.plant_init import derive_all, sample_rate_pin
     sr_setup = _read_setup_sample_rate(setup_path, default=0)
-    sr_override = int(sr_env) if sr_env else int(sr_setup)
+    sr_override = sample_rate_pin() or int(sr_setup)
     # Build a temporary sim instance so we can read mv/cv/dv counts + state_dim.
     tmp_sim = create_sim(episode_length=10, sample_rate=max(1, sr_override or 5))
     sim_meta = resolve_sim_metadata(tmp_sim)
