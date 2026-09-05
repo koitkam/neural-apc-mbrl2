@@ -746,7 +746,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_EXPERT_USE_SS_SAMPLES':      ('expert_use_ss_samples',          _as_bool),
     # Move-law (were leftover ``os.environ.get`` in ``apc_expert``).
     # Identity 0.30 / 0.12 / 0.02 / 0.6 / 0.05 / 0.02 / 1.0 / 40 / 0.1.
-    # Dual-read leftover when the field is not explicit.
+    # Login leftover without ``_cfg_from_env`` is ignored (P92-live).
     'DREAMER_EXPERT_MOVE_FRAC':           ('expert_move_frac',               float),
     'DREAMER_EXPERT_BACKOFF_FRAC':        ('expert_backoff_frac',            float),
     'DREAMER_EXPERT_ECON_FRAC':           ('expert_econ_frac',               float),

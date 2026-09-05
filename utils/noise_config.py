@@ -294,7 +294,7 @@ def noise_curriculum_scale(progress: float,
     if phase is not None and int(phase) >= 3:
         return 1.0
     from utils.hidden_disturbance import _knob_raw
-    raw, _leftover = _knob_raw(cfg, 'process_noise_amp_ramp')
+    raw = _knob_raw(cfg, 'process_noise_amp_ramp')
     text = '0.0:0.4' if raw is None else str(raw).strip()
     if not text:
         return 1.0

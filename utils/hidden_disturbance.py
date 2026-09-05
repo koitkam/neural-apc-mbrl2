@@ -59,18 +59,18 @@ def _knob_raw(cfg, field: str, env_key: str = ''):
     """TrainConfig field only. ``env_key`` unused (leftover dual-read REMOVED).
 
     Login leftover ``DREAMER_*`` without ``_cfg_from_env`` is ignored.
-    A/B via ``ENV_OVERRIDES``. Second return is always False (was
-    leftover-env present). Empty cfg field is still a sentinel at
-    the caller.
+    A/B via ``ENV_OVERRIDES``. Leftover-flag return dropped (P93-live;
+    was always False after P92 dual-read REMOVED). Empty cfg field is
+    still a sentinel at the caller.
     """
     del env_key
     if cfg is not None:
-        return getattr(cfg, field, None), False
-    return None, False
+        return getattr(cfg, field, None)
+    return None
 
 
 def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
-    raw, _leftover = _knob_raw(cfg, field, env_key)
+    raw = _knob_raw(cfg, field, env_key)
     if raw is None or str(raw).strip() == '':
         return float(default)
     try:
@@ -184,10 +184,8 @@ def curriculum_amp_scale(progress: float, phase: Optional[int] = None,
     deployment amp). Malformed/empty field → cap.
     """
     cap = _phase_amp_cap(phase, cfg)
-    raw, leftover = _knob_raw(cfg, 'hidden_ou_amp_ramp',
-                              'DREAMER_HIDDEN_OU_AMP_RAMP')
-    if leftover and (raw is None or str(raw).strip() == ''):
-        return cap
+    raw = _knob_raw(cfg, 'hidden_ou_amp_ramp',
+                    'DREAMER_HIDDEN_OU_AMP_RAMP')
     text = '0.1:0.4' if raw is None else str(raw).strip()
     if not text:
         return cap
@@ -209,8 +207,8 @@ def curriculum_amp_scale(progress: float, phase: Optional[int] = None,
 def _sample_amp_jitter(rng: np.random.Generator, cfg=None) -> float:
     """Per-episode amplitude DR factor (multiplier on amp_frac).
 
-    Reads ``DREAMER_HIDDEN_OU_AMP_JITTER="<lo>:<hi>"`` (uniform band).
-    Default (unset): ``1.0`` — no jitter.
+    Reads ``hidden_ou_amp_jitter`` (A/B ``DREAMER_HIDDEN_OU_AMP_JITTER``).
+    Default (unset): ``0.6:1.6``. Pin ``1.0:1.0`` to disable.
 
     Part of Stage C #5: domain randomization across OU amplitude so the
     policy is robust to a *family* of disturbance magnitudes, not a
@@ -218,10 +216,8 @@ def _sample_amp_jitter(rng: np.random.Generator, cfg=None) -> float:
     """
     # Default ON (P37 onward): uniform ±60% around nominal amplitude.
     # Set ``DREAMER_HIDDEN_OU_AMP_JITTER=1.0:1.0`` to disable.
-    raw, leftover = _knob_raw(cfg, 'hidden_ou_amp_jitter',
-                              'DREAMER_HIDDEN_OU_AMP_JITTER')
-    if leftover and (raw is None or str(raw).strip() == ''):
-        return 1.0
+    raw = _knob_raw(cfg, 'hidden_ou_amp_jitter',
+                    'DREAMER_HIDDEN_OU_AMP_JITTER')
     text = '0.6:1.6' if raw is None else str(raw).strip()
     if not text:
         return 1.0
@@ -492,10 +488,10 @@ class HiddenDisturbance:
         # sim-adaptive (from the identified plant) + env-overridable.  UNIT DC
         # gain (the lag has no extra gain) so the authority-based amp cap on
         # the load is preserved at the CV.
-        tau_raw, _ = _knob_raw(cfg, 'hidden_dist_tau_frac',
-                               'DREAMER_HIDDEN_DIST_TAU_FRAC')
-        dt_raw, _ = _knob_raw(cfg, 'hidden_dist_deadtime_frac',
-                              'DREAMER_HIDDEN_DIST_DEADTIME_FRAC')
+        tau_raw = _knob_raw(cfg, 'hidden_dist_tau_frac',
+                            'DREAMER_HIDDEN_DIST_TAU_FRAC')
+        dt_raw = _knob_raw(cfg, 'hidden_dist_deadtime_frac',
+                           'DREAMER_HIDDEN_DIST_DEADTIME_FRAC')
         tau_lo, tau_hi = _parse_pair(tau_raw, 0.5, 1.0)
         dt_lo, dt_hi = _parse_pair(dt_raw, 0.5, 1.5)
         self.tau_d_steps = np.maximum(
@@ -588,12 +584,10 @@ class HiddenDisturbance:
         # ``ou_drift`` shape — a per-step random walk that read as
         # high-frequency noise — is removed.)
         default = np.array([0.5, 0.3, 0.2], dtype='float64')
-        raw, leftover = _knob_raw(getattr(self, '_cfg', None),
-                                  'hidden_dist_shape_weights',
-                                  'DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS')
+        raw = _knob_raw(getattr(self, '_cfg', None),
+                        'hidden_dist_shape_weights',
+                        'DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS')
         text = '' if raw is None else str(raw).strip()
-        if leftover and not text:
-            return default
         if text:
             try:
                 w = np.array([float(x) for x in text.split(',')],

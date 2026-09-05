@@ -4675,6 +4675,7 @@ def _test_noise_hidden_cfg() -> None:
     src = open('utils/hidden_disturbance.py').read()
     assert 'os.environ.get(env_key)' not in src
     assert 'if env_key in os.environ' not in src
+    assert 'if leftover and' not in src
     keys = (
         'DREAMER_PROCESS_NOISE_AMP_RAMP',
         'DREAMER_DISTURBANCE_PROB_WM',
