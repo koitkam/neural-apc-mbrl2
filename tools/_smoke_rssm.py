@@ -4539,10 +4539,13 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
 
 
 def _test_derived_observables_cfg() -> None:
-    """Derived-obs block: TrainConfig default ON, explicit, leftover env."""
+    """Derived-obs: TrainConfig default ON; leftover DREAMER_DERIVED_* ignored."""
     import os
     from utils.derived_observations import (
         derived_observables_enabled, derived_observables_window)
+    src = open('utils/derived_observations.py').read()
+    assert "os.environ.get('DREAMER_DERIVED_OBSERVABLES'" not in src
+    assert "os.environ.get('DREAMER_DERIVED_OBS_WINDOW'" not in src
     c = TrainConfig()
     assert c.derived_observables is True
     assert int(c.derived_observables_window) == 0
@@ -4550,24 +4553,23 @@ def _test_derived_observables_cfg() -> None:
     auto = derived_observables_window(cfg=c, tau=53.0, sample_rate=4.0)
     assert auto == 26, auto  # round(2*53/4)=26 (ties-to-even), clamp [8,128]
     c.derived_observables = False
-    c._explicit_fields = {'derived_observables'}  # type: ignore[attr-defined]
+    assert derived_observables_enabled(c) is False
     prev = os.environ.get('DREAMER_DERIVED_OBSERVABLES')
     prev_w = os.environ.get('DREAMER_DERIVED_OBS_WINDOW')
     try:
-        os.environ['DREAMER_DERIVED_OBSERVABLES'] = '1'
-        assert derived_observables_enabled(c) is False  # explicit beats leftover
-        os.environ.pop('DREAMER_DERIVED_OBSERVABLES', None)
-        c2 = TrainConfig()
         os.environ['DREAMER_DERIVED_OBSERVABLES'] = '0'
-        assert derived_observables_enabled(c2) is False  # leftover env
-        os.environ.pop('DREAMER_DERIVED_OBSERVABLES', None)
+        c2 = TrainConfig()
+        assert derived_observables_enabled(c2) is True  # leftover ignored
         os.environ['DREAMER_DERIVED_OBS_WINDOW'] = '16'
         assert derived_observables_window(cfg=TrainConfig(), tau=53.0,
-                                          sample_rate=4.0) == 16
+                                          sample_rate=4.0) == 26  # leftover ignored
         c3 = TrainConfig()
-        c3.derived_observables_window = 0
-        c3._explicit_fields = {'derived_observables_window'}  # type: ignore
+        c3.derived_observables_window = 16
         assert derived_observables_window(cfg=c3, tau=53.0,
+                                          sample_rate=4.0) == 16
+        c4 = TrainConfig()
+        c4.derived_observables_window = 0
+        assert derived_observables_window(cfg=c4, tau=53.0,
                                           sample_rate=4.0) == 26
     finally:
         if prev is None:
@@ -4578,7 +4580,7 @@ def _test_derived_observables_cfg() -> None:
             os.environ.pop('DREAMER_DERIVED_OBS_WINDOW', None)
         else:
             os.environ['DREAMER_DERIVED_OBS_WINDOW'] = prev_w
-    print('[smoke] OK  derived_observables TrainConfig + leftover env identity')
+    print('[smoke] OK  derived_observables TrainConfig; leftover DREAMER_DERIVED_* ignored')
 
 
 def _test_noise_hidden_cfg() -> None:

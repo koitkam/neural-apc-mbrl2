@@ -26,38 +26,27 @@ normalizer in ``APCEnv._update_obs_norm`` does not have to compensate
 for arbitrary CV scaling.
 
 Toggle via TrainConfig ``derived_observables`` (default ON since P37;
-``DREAMER_DERIVED_OBSERVABLES=0`` disables).  Window size is
-``derived_observables_window`` (0 = auto ``round(2·τ/sample_rate)``
-clamped to ``[8, 128]``) or leftover ``DREAMER_DERIVED_OBS_WINDOW``.
+``DREAMER_DERIVED_OBSERVABLES=0`` disables via ``_cfg_from_env``).
+Window size is ``derived_observables_window`` (0 = auto
+``round(2·τ/sample_rate)`` clamped to ``[8, 128]``).  Login leftover
+``DREAMER_DERIVED_*`` is ignored unless ``_cfg_from_env`` applied it.
 """
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from typing import Deque, Optional
 
 import numpy as np
 
 
-_BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f')
-
-
 def derived_observables_enabled(cfg=None, *, default: bool = True) -> bool:
     """Return True iff the derived-observables block is active.
 
-    Default ON (P37 onward).  Explicit TrainConfig /
-    ``DREAMER_DERIVED_OBSERVABLES`` wins over leftover env.  Set
-    ``=0`` to disable for ablations or a legacy-obs checkpoint
-    (different ``obs_dim``).
+    Default ON (P37 onward).  TrainConfig only — ``DREAMER_DERIVED_OBSERVABLES``
+    is applied by ``_cfg_from_env`` / ``ENV_OVERRIDES``.  Set ``=0`` to
+    disable for ablations or a legacy-obs checkpoint (different ``obs_dim``).
     """
-    explicit = set(getattr(cfg, '_explicit_fields', set()) or set()) \
-        if cfg is not None else set()
-    if 'derived_observables' in explicit:
-        return bool(getattr(cfg, 'derived_observables'))
-    raw = os.environ.get('DREAMER_DERIVED_OBSERVABLES', '').strip()
-    if raw:
-        return raw.lower() not in _BOOL_OFF
     if cfg is not None:
         return bool(getattr(cfg, 'derived_observables', default))
     return bool(default)
@@ -71,39 +60,21 @@ def derived_observables_window(default: int = 32,
     """Window length (in agent steps) for the rolling derived features.
 
     Resolution order:
-      1. Explicit TrainConfig ``derived_observables_window`` if > 0
-         (``0`` is the auto sentinel).
-      2. Leftover ``DREAMER_DERIVED_OBS_WINDOW`` if the field is not
-         explicit.
-      3. Non-explicit TrainConfig window if > 0.
-      4. ``round(2 * tau / sample_rate)`` clamped to ``[8, 128]`` when
+      1. TrainConfig ``derived_observables_window`` if > 0 (``0`` is the
+         auto sentinel; ``_cfg_from_env`` already applied
+         ``DREAMER_DERIVED_OBS_WINDOW``).
+      2. ``round(2 * tau / sample_rate)`` clamped to ``[8, 128]`` when
          both ``tau`` and ``sample_rate`` are provided (auto-tune per
          plant — covers ~2 dominant time-constants of context).
-      5. Static ``default`` fallback.
+      3. Static ``default`` fallback.
     """
-    explicit = set(getattr(cfg, '_explicit_fields', set()) or set()) \
-        if cfg is not None else set()
-    if cfg is not None and 'derived_observables_window' in explicit:
+    if cfg is not None:
         try:
             w = int(getattr(cfg, 'derived_observables_window', 0) or 0)
         except Exception:
             w = 0
         if w > 0:
             return max(2, w)
-    else:
-        raw = os.environ.get('DREAMER_DERIVED_OBS_WINDOW', '').strip()
-        if raw:
-            try:
-                return max(2, int(raw))
-            except Exception:
-                pass
-        if cfg is not None:
-            try:
-                w = int(getattr(cfg, 'derived_observables_window', 0) or 0)
-            except Exception:
-                w = 0
-            if w > 0:
-                return max(2, w)
     if tau is not None and sample_rate is not None:
         try:
             sr = max(1.0, float(sample_rate))

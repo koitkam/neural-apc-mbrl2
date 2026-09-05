@@ -703,14 +703,13 @@ class TrainConfig:
     runtime_setpoint_n_magnitude_strata: int = 3
     runtime_setpoint_target_inside_margin_frac: float = 0.05
     # Per-CV rolling int_err / Δcv / var appended to aug-obs (P37 ON).
-    # Was leftover ``DREAMER_DERIVED_OBSERVABLES`` (worked, missing from
-    # ``run_plan``).  ``=0`` restores the legacy obs layout (different
-    # ``obs_dim`` — do not mix with an ON checkpoint).
+    # ``DREAMER_DERIVED_OBSERVABLES=0`` via ``_cfg_from_env`` restores the
+    # legacy obs layout (different ``obs_dim`` — do not mix with an ON
+    # checkpoint).  Login leftover without ``_cfg_from_env`` is ignored.
     derived_observables: bool = True
     # Rolling window in agent steps.  Sentinel 0 = auto
-    # ``round(2·τ/sample_rate)`` clamped to ``[8, 128]``.  Leftover
-    # ``DREAMER_DERIVED_OBS_WINDOW`` still wins when the field is not
-    # explicit.
+    # ``round(2·τ/sample_rate)`` clamped to ``[8, 128]``.  A/B only via
+    # ``DREAMER_DERIVED_OBS_WINDOW`` (``ENV_OVERRIDES``).
     derived_observables_window: int = 0
 
     # ---- WM disturbance-estimator head (P87, 2026-06-05) ----
