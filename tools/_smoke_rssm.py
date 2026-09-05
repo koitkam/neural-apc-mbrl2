@@ -4686,7 +4686,7 @@ def _test_gpu_calib_cfg() -> None:
 
 
 def _test_sim_snr_cfg() -> None:
-    """Plant SNR: TrainConfig default, leftover SIM_*, DREAMER beats leftover."""
+    """Plant SNR: TrainConfig default; leftover SIM_* ignored; DREAMER wins."""
     import os
     from utils.noise_config import build_noise_config, resolve_sim_snr_knobs
     c = TrainConfig()
@@ -4721,7 +4721,7 @@ def _test_sim_snr_cfg() -> None:
         assert abs(float(ou['cv']['gain']) - 0.225) < 1e-9, ou['cv']
         assert abs(float(ou['dv']['gain']) - 0.9) < 1e-9, ou['dv']
         os.environ['SIM_OU_GAIN_CV'] = '0.25'
-        assert abs(float(resolve_sim_snr_knobs()['ou_gain_cv']) - 0.25) < 1e-12
+        assert abs(float(resolve_sim_snr_knobs()['ou_gain_cv']) - 0.15) < 1e-12  # leftover ignored
         os.environ['DREAMER_SIM_OU_GAIN_CV'] = '0.35'
         assert abs(float(resolve_sim_snr_knobs()['ou_gain_cv']) - 0.35) < 1e-12
         c_ex = TrainConfig()
@@ -4731,6 +4731,8 @@ def _test_sim_snr_cfg() -> None:
         os.environ.pop('DREAMER_SIM_OU_GAIN_CV', None)
         os.environ.pop('SIM_OU_GAIN_CV', None)
         os.environ['SIM_NOISE_ADAPTIVE'] = '0'
+        assert resolve_sim_snr_knobs()['adaptive'] is True  # leftover ignored
+        os.environ['DREAMER_SIM_NOISE_ADAPTIVE'] = '0'
         assert resolve_sim_snr_knobs()['adaptive'] is False
         os.environ['DREAMER_SIM_NOISE_ADAPTIVE'] = '1'
         assert resolve_sim_snr_knobs()['adaptive'] is True
@@ -4740,7 +4742,7 @@ def _test_sim_snr_cfg() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  plant-SNR TrainConfig + DREAMER_SIM_* beats leftover SIM_*')
+    print('[smoke] OK  plant-SNR TrainConfig + leftover SIM_* ignored; DREAMER_SIM_* wins')
 
 
 def _test_agent_disturbance_cfg() -> None:
@@ -4830,7 +4832,7 @@ def _test_agent_disturbance_cfg() -> None:
 
 
 def _test_sim_runtime_cfg() -> None:
-    """Wrapper seed/jitter/enable/DR: TrainConfig default, leftover SIM_*, DREAMER wins."""
+    """Wrapper seed/jitter/enable/DR: TrainConfig default; leftover SIM_* ignored; DREAMER wins."""
     import os
     from utils.noise_config import build_noise_config, resolve_sim_runtime_knobs
     from utils.sim_noise import DomainRandomizer, SimNoiseWrapper
@@ -4840,6 +4842,14 @@ def _test_sim_runtime_cfg() -> None:
     assert abs(float(c.sim_noise_jitter_pct) - 0.20) < 1e-12
     assert c.sim_domain_randomization is True
     assert abs(float(c.sim_param_randomization_pct) + 1.0) < 1e-12
+    from pathlib import Path as _P
+    _id_src = _P('utils/dynamics_identifier.py').read_text(encoding='utf-8')
+    assert "os.environ['DREAMER_SIM_NOISE_ENABLED'] = '0'" in _id_src
+    assert "os.environ['SIM_NOISE_ENABLED'] = '0'" not in _id_src
+    assert "os.environ['DREAMER_SIM_NOISE_JITTER_PCT'] = '0'" in _id_src
+    _fac_src = _P('utils/sim_factory.py').read_text(encoding='utf-8')
+    assert "'noise_enabled': 'DREAMER_SIM_NOISE_ENABLED'" in _fac_src
+    assert "'noise_enabled': 'SIM_NOISE_ENABLED'" not in _fac_src
     keys = (
         'DREAMER_SIM_NOISE_ENABLED', 'SIM_NOISE_ENABLED',
         'DREAMER_SIM_NOISE_SEED', 'SIM_NOISE_SEED',
@@ -4893,24 +4903,36 @@ def _test_sim_runtime_cfg() -> None:
         )
         assert baked['domain_randomization']['enabled'] is True
         os.environ['SIM_NOISE_AMPLITUDE_JITTER_PCT'] = '0'
-        assert abs(float(resolve_sim_runtime_knobs()['jitter_pct'])) < 1e-12
+        assert abs(float(resolve_sim_runtime_knobs()['jitter_pct']) - 0.20) < 1e-12  # leftover ignored
         os.environ['SIM_NOISE_JITTER_PCT'] = '0.10'
-        assert abs(float(resolve_sim_runtime_knobs()['jitter_pct']) - 0.10) < 1e-12
+        assert abs(float(resolve_sim_runtime_knobs()['jitter_pct']) - 0.20) < 1e-12  # leftover ignored
         os.environ['DREAMER_SIM_NOISE_JITTER_PCT'] = '0.05'
         assert abs(float(resolve_sim_runtime_knobs()['jitter_pct']) - 0.05) < 1e-12
         os.environ['SIM_NOISE_ENABLED'] = '0'
+        assert resolve_sim_runtime_knobs()['noise_enabled'] is True  # leftover ignored
+        wrap_left = SimNoiseWrapper(_Bare())
+        assert wrap_left._has_noise is True
+        os.environ['DREAMER_SIM_NOISE_ENABLED'] = '0'
         assert resolve_sim_runtime_knobs()['noise_enabled'] is False
         wrap_off = SimNoiseWrapper(_Bare())
         assert wrap_off._has_noise is False
         os.environ['DREAMER_SIM_NOISE_ENABLED'] = '1'
         assert resolve_sim_runtime_knobs()['noise_enabled'] is True
         os.environ['SIM_DOMAIN_RANDOMIZATION'] = '0'
-        assert resolve_sim_runtime_knobs()['domain_randomization'] is False
+        os.environ['DREAMER_DOMAIN_RANDOMIZATION'] = '0'
+        assert resolve_sim_runtime_knobs()['domain_randomization'] is True  # leftover ignored
+        dr_left = DomainRandomizer()
+        assert dr_left.enabled is True
+        os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '0'
+        dr_off = DomainRandomizer()
+        assert dr_off.enabled is False
         os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '1'
         assert resolve_sim_runtime_knobs()['domain_randomization'] is True
         os.environ['SIM_PARAM_RANDOMIZATION_PCT'] = '0.25'
+        assert resolve_sim_runtime_knobs()['param_randomization_pct'] is None  # leftover ignored
+        os.environ['DREAMER_SIM_PARAM_RANDOMIZATION_PCT'] = '0.12'
         assert abs(float(resolve_sim_runtime_knobs()['param_randomization_pct'])
-                   - 0.25) < 1e-12
+                   - 0.12) < 1e-12
         baked_ov = build_noise_config(
             state_variables=['CV', 'x', 'y', 'DV'],
             cv_indices=[0], dv_indices=[3], mv_indices=[1],
@@ -4919,10 +4941,7 @@ def _test_sim_runtime_cfg() -> None:
             sample_rate=4, noise_stdv=0.03,
         )
         assert abs(float(baked_ov['domain_randomization']
-                         ['param_randomization_pct']) - 0.25) < 1e-12
-        os.environ['DREAMER_SIM_PARAM_RANDOMIZATION_PCT'] = '0.12'
-        assert abs(float(resolve_sim_runtime_knobs()['param_randomization_pct'])
-                   - 0.12) < 1e-12
+                         ['param_randomization_pct']) - 0.12) < 1e-12
         c_ex = TrainConfig()
         c_ex.sim_noise_jitter_pct = 0.33
         c_ex._explicit_fields = {'sim_noise_jitter_pct'}  # type: ignore
@@ -4942,7 +4961,7 @@ def _test_sim_runtime_cfg() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  wrapper jitter/enable/DR TrainConfig + dead AMPLITUDE name')
+    print('[smoke] OK  wrapper jitter/enable/DR TrainConfig + leftover SIM_* ignored')
 
 
 def _test_adv_action_corr_vectorized() -> None:

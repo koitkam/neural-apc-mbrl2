@@ -23,8 +23,9 @@ only the steady-state map ``_temp_target`` is nonlinear.
 
 Inputs:
 - Constructor: episode_length, sample_rate.
-- Optional env vars: SIM_DOMAIN_RANDOMIZATION, SIM_PARAM_RANDOMIZATION_PCT,
-    SIM_DOMAIN_RANDOMIZATION_SEED.
+- Optional env vars: DREAMER_SIM_DOMAIN_RANDOMIZATION,
+    DREAMER_SIM_PARAM_RANDOMIZATION_PCT, DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED.
+    Leftover SIM_* names are ignored.
 
 Outputs:
 - reset() -> (state, done)

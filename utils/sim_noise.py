@@ -92,21 +92,18 @@ class OUActionNoise:
 class DomainRandomizer:
     """Per-episode parameter randomization utility.
 
-    Reads enable/disable, range, and seed from environment variables with a
-    configurable prefix list.  The first prefix that has a set env var wins;
-    if none are set the built-in defaults apply.
+    Reads enable/disable, range, and seed from ``DREAMER_SIM_*`` (TrainConfig
+    / ``ENV_OVERRIDES``).  Leftover ``SIM_*`` / ``DISTILLATION_*`` /
+    ``DREAMER_DOMAIN_RANDOMIZATION`` names are ignored (P91-live).
 
     Args:
-        env_prefixes: Ordered list of env-var prefixes to check, e.g.
-            ``['SIM', 'DISTILLATION']``.  For prefix ``SIM`` the env vars
-            ``SIM_DOMAIN_RANDOMIZATION``, ``SIM_PARAM_RANDOMIZATION_PCT``,
-            and ``SIM_DOMAIN_RANDOMIZATION_SEED`` are inspected.
+        env_prefixes: Unused leftover (kept so sim constructors do not churn).
         domain_randomization: Explicit override for enable/disable (*None*
-            falls back to env var, default enabled).
+            falls back to ``DREAMER_SIM_DOMAIN_RANDOMIZATION``, default enabled).
         param_randomization_pct: Explicit override for the ±% range (*None*
-            falls back to env var, default 0.10).
-        randomization_seed: Explicit seed (*None* falls back to env var,
-            default un-seeded).
+            falls back to ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``, default 0.10).
+        randomization_seed: Explicit seed (*None* falls back to
+            ``DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED``, default un-seeded).
     """
 
     def __init__(
@@ -117,26 +114,12 @@ class DomainRandomizer:
         randomization_seed=None,
     ):
         prefixes = list(env_prefixes or ['SIM'])
+        _ = prefixes  # leftover SIM_ / DISTILLATION_ prefixes ignored (P91-live)
 
         # --- enabled ---
-        # Canonical DREAMER_SIM_* then leftover DREAMER_DOMAIN_RANDOMIZATION
-        # (comments claimed this worked; it never did) then prefix SIM_ /
-        # DISTILLATION_ leftovers.
-        env_val = None
-        for key in (
-            'DREAMER_SIM_DOMAIN_RANDOMIZATION',
-            'DREAMER_DOMAIN_RANDOMIZATION',
-        ):
-            v = os.environ.get(key)
-            if v is not None:
-                env_val = v
-                break
-        if env_val is None:
-            for pfx in prefixes:
-                v = os.environ.get(f'{pfx}_DOMAIN_RANDOMIZATION')
-                if v is not None:
-                    env_val = v
-                    break
+        # TrainConfig / DREAMER_SIM_* only.  Leftover SIM_ /
+        # DISTILLATION_ / DREAMER_DOMAIN_RANDOMIZATION ignored (P91-live).
+        env_val = os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION')
         if domain_randomization is not None:
             self.enabled = bool(domain_randomization)
         elif env_val is not None:
@@ -147,18 +130,7 @@ class DomainRandomizer:
             self.enabled = True
 
         # --- fraction ---
-        env_pct = None
-        for key in ('DREAMER_SIM_PARAM_RANDOMIZATION_PCT',):
-            v = os.environ.get(key)
-            if v is not None:
-                env_pct = v
-                break
-        if env_pct is None:
-            for pfx in prefixes:
-                v = os.environ.get(f'{pfx}_PARAM_RANDOMIZATION_PCT')
-                if v is not None:
-                    env_pct = v
-                    break
+        env_pct = os.environ.get('DREAMER_SIM_PARAM_RANDOMIZATION_PCT')
         if param_randomization_pct is not None:
             self.frac = float(param_randomization_pct)
         elif env_pct is not None:
@@ -168,21 +140,9 @@ class DomainRandomizer:
         self.frac = float(np.clip(self.frac, 0.0, 0.5))
 
         # --- seed / rng ---
-        env_seed = ''
-        for key in (
-            'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
-            'DREAMER_DOMAIN_RANDOMIZATION_SEED',
-        ):
-            v = os.environ.get(key, '').strip()
-            if v:
-                env_seed = v
-                break
-        if not env_seed:
-            for pfx in prefixes:
-                v = os.environ.get(f'{pfx}_DOMAIN_RANDOMIZATION_SEED', '').strip()
-                if v:
-                    env_seed = v
-                    break
+        env_seed = str(
+            os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED') or ''
+        ).strip()
         seed_str = (
             str(randomization_seed).strip()
             if randomization_seed is not None
@@ -533,9 +493,10 @@ class SimNoiseWrapper:
     sigma by a uniform random factor in ``[1 - noise_jitter_pct,
     1 + noise_jitter_pct]``.  This prevents the agent from overfitting to a
     single noise profile.  TrainConfig ``sim_noise_jitter_pct`` /
-    ``DREAMER_SIM_NOISE_JITTER_PCT`` (leftover ``SIM_NOISE_JITTER_PCT``;
-    dead ``SIM_NOISE_AMPLITUDE_JITTER_PCT`` still written by SysID
-    ``clean_mode``).  Default **0.20**, i.e. ±20 %.
+    ``DREAMER_SIM_NOISE_JITTER_PCT``.  Leftover ``SIM_NOISE_JITTER_PCT`` /
+    ``SIM_NOISE_AMPLITUDE_JITTER_PCT`` ignored (P91-live).  SysID
+    ``clean_mode`` writes ``DREAMER_SIM_NOISE_JITTER_PCT=0``.  Default
+    **0.20**, i.e. ±20 %.
 
     Domain-randomization passthrough
     ---------------------------------
@@ -563,7 +524,7 @@ class SimNoiseWrapper:
         if cfg is None:
             cfg = getattr(sim, 'noise_config', None) or {}
 
-        # --- Runtime knobs (TrainConfig / DREAMER_SIM_* / leftover SIM_*) -
+        # --- Runtime knobs (TrainConfig / DREAMER_SIM_*; leftover SIM_* ignored) -
         from utils.noise_config import resolve_sim_runtime_knobs
         runtime = resolve_sim_runtime_knobs()
         noise_on = bool(runtime['noise_enabled'])

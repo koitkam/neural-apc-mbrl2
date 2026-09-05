@@ -37,8 +37,8 @@ import numpy as np
 
 # ── Defaults (overridable via TrainConfig / env) ─────────────────────────
 # Canonical DREAMER_SIM_* land in run_plan via ENV_OVERRIDES.  Leftover
-# SIM_* names still work when the DREAMER field is unset.  Dual-read at
-# bake time (phase 1a, before TrainConfig exists).
+# SIM_* knob names are ignored (P91-live; login leftover was a silent
+# A/B outside run_plan).  ``SIM_NOISE_CONFIG_JSON`` stays env-only (path).
 
 _DEFAULT_OU_SIGMA_FRAC = 0.008       # OU sigma = fraction of channel span
 _DEFAULT_OU_GAIN_CV = 0.15           # OU gain multiplier for CV channels
@@ -60,7 +60,12 @@ def _snr_explicit(cfg, field: str) -> bool:
 
 def _snr_float(cfg, field: str, dreamer_key: str, leftover_key: str,
                default: float) -> float:
-    """Explicit TrainConfig, else DREAMER_*, else leftover SIM_*, else default."""
+    """Explicit TrainConfig, else DREAMER_*, else cfg, else default.
+
+    Leftover ``SIM_*`` knob names are ignored (P91-live).  ``leftover_key``
+    stays on the signature so call sites do not churn.  Identity env-free.
+    """
+    _ = leftover_key
     if _snr_explicit(cfg, field):
         try:
             return float(getattr(cfg, field))
@@ -70,12 +75,6 @@ def _snr_float(cfg, field: str, dreamer_key: str, leftover_key: str,
     if d_raw not in (None, ''):
         try:
             return float(d_raw)
-        except Exception:
-            pass
-    l_raw = os.environ.get(leftover_key)
-    if l_raw not in (None, ''):
-        try:
-            return float(l_raw)
         except Exception:
             pass
     if cfg is not None:
@@ -88,14 +87,13 @@ def _snr_float(cfg, field: str, dreamer_key: str, leftover_key: str,
 
 def _snr_bool(cfg, field: str, dreamer_key: str, leftover_key: str,
               default: bool) -> bool:
-    """Same precedence as ``_snr_float``.  Leftover empty string is OFF."""
+    """Same precedence as ``_snr_float``.  Leftover ``SIM_*`` ignored."""
+    _ = leftover_key
     if _snr_explicit(cfg, field):
         return bool(getattr(cfg, field))
     d_raw = os.environ.get(dreamer_key)
     if d_raw not in (None, ''):
         return str(d_raw).strip().lower() not in _BOOL_OFF
-    if leftover_key in os.environ:
-        return str(os.environ.get(leftover_key, '')).strip().lower() not in _BOOL_OFF
     if cfg is not None:
         return bool(getattr(cfg, field, default))
     return bool(default)
@@ -143,18 +141,17 @@ _DEFAULT_DOMAIN_RANDOMIZATION = True
 
 def _snr_str(cfg, field: str, dreamer_key: str, leftover_key: str,
              default: str = '') -> str:
-    """Explicit TrainConfig, else DREAMER_*, else leftover, else default.
+    """Explicit TrainConfig, else DREAMER_*, else cfg, else default.
 
     Empty string = unset (unseeded RNG).  Explicit empty still wins.
+    Leftover ``SIM_*`` ignored (P91-live).
     """
+    _ = leftover_key
     if _snr_explicit(cfg, field):
         return str(getattr(cfg, field, default) or '')
     d_raw = os.environ.get(dreamer_key)
     if d_raw not in (None, ''):
         return str(d_raw).strip()
-    l_raw = os.environ.get(leftover_key)
-    if l_raw not in (None, ''):
-        return str(l_raw).strip()
     if cfg is not None:
         return str(getattr(cfg, field, default) or '')
     return str(default or '')
@@ -162,22 +159,17 @@ def _snr_str(cfg, field: str, dreamer_key: str, leftover_key: str,
 
 def _snr_flag_empty_on(cfg, field: str, dreamer_key: str, leftover_keys,
                        default: bool) -> bool:
-    """Bool with DomainRandomizer / ``SIM_NOISE_ENABLED`` identity.
+    """Bool with DomainRandomizer / ``DREAMER_SIM_NOISE_ENABLED`` identity.
 
-    Unset → default.  Empty leftover value is ON (not in the off-set).
-    ``leftover_keys`` is a string or a sequence (first set leftover wins).
+    Unset → default.  Leftover ``SIM_*`` / ``DREAMER_DOMAIN_RANDOMIZATION``
+    ignored (P91-live).  ``leftover_keys`` stays on the signature.
     """
+    _ = leftover_keys
     if _snr_explicit(cfg, field):
         return bool(getattr(cfg, field))
     d_raw = os.environ.get(dreamer_key)
     if d_raw not in (None, ''):
         return str(d_raw).strip().lower() not in _RUNTIME_BOOL_OFF
-    if isinstance(leftover_keys, str):
-        leftover_keys = (leftover_keys,)
-    for leftover_key in leftover_keys:
-        if leftover_key not in os.environ:
-            continue
-        return str(os.environ.get(leftover_key, '')).strip().lower() not in _RUNTIME_BOOL_OFF
     if cfg is not None:
         return bool(getattr(cfg, field, default))
     return bool(default)
@@ -185,7 +177,8 @@ def _snr_flag_empty_on(cfg, field: str, dreamer_key: str, leftover_keys,
 
 def _snr_float_multi(cfg, field: str, dreamer_key: str, leftover_keys,
                      default: float) -> float:
-    """Like ``_snr_float`` with several leftover names (first non-empty wins)."""
+    """Like ``_snr_float``.  Leftover names ignored (P91-live)."""
+    _ = leftover_keys
     if _snr_explicit(cfg, field):
         try:
             return float(getattr(cfg, field))
@@ -197,15 +190,6 @@ def _snr_float_multi(cfg, field: str, dreamer_key: str, leftover_keys,
             return float(d_raw)
         except Exception:
             pass
-    if isinstance(leftover_keys, str):
-        leftover_keys = (leftover_keys,)
-    for leftover_key in leftover_keys:
-        l_raw = os.environ.get(leftover_key)
-        if l_raw not in (None, ''):
-            try:
-                return float(l_raw)
-            except Exception:
-                pass
     if cfg is not None:
         try:
             return float(getattr(cfg, field, default))
@@ -218,10 +202,8 @@ def resolve_sim_runtime_knobs(cfg=None) -> Dict[str, Any]:
     """Runtime wrapper knobs (seed / jitter / enable / DR).
 
     Identity defaults match ``SimNoiseWrapper`` / ``DomainRandomizer``.
-    ``SIM_NOISE_AMPLITUDE_JITTER_PCT`` is the dead name ``clean_mode`` still
-    writes — dual-read so SysID actually zeros jitter.
-    Leftover ``DREAMER_DOMAIN_RANDOMIZATION`` (comments only; never read)
-    is an alias of ``SIM_DOMAIN_RANDOMIZATION``.
+    Leftover ``SIM_*`` / ``DREAMER_DOMAIN_RANDOMIZATION`` ignored (P91-live).
+    SysID ``clean_mode`` writes ``DREAMER_SIM_*`` (not leftover ``SIM_*``).
     """
     jitter = _snr_float_multi(
         cfg, 'sim_noise_jitter_pct',
@@ -254,10 +236,9 @@ def resolve_sim_param_randomization_pct(cfg=None) -> Optional[float]:
     """Override for baked DR ±%.  ``None`` = identifier-derived auto.
 
     Env-free identity: bake stays ``_domain_randomization_pct`` (test_sim
-    ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT`` used to set
-    ``DomainRandomizer.frac`` at sim init then get overwritten by that
-    bake after wrap — the A/B was dead.  Explicit cfg / ``DREAMER_*`` /
-    leftover now win at bake.  Sentinel ``<0`` is auto.
+    ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT`` ignored (P91-live).
+    Explicit cfg / ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` win at bake.
+    Sentinel ``<0`` is auto.
     """
     if _snr_explicit(cfg, 'sim_param_randomization_pct'):
         try:
@@ -269,13 +250,6 @@ def resolve_sim_param_randomization_pct(cfg=None) -> Optional[float]:
     if d_raw not in (None, ''):
         try:
             v = float(d_raw)
-            return None if v < 0.0 else float(v)
-        except Exception:
-            pass
-    l_raw = os.environ.get('SIM_PARAM_RANDOMIZATION_PCT')
-    if l_raw not in (None, ''):
-        try:
-            v = float(l_raw)
             return None if v < 0.0 else float(v)
         except Exception:
             pass
@@ -508,9 +482,8 @@ def build_noise_config(
 
     # ── OU noise entries ─────────────────────────────────────────────────
     # Adaptive SNR weighting is env-free ON (TrainConfig
-    # ``sim_noise_adaptive``).  Leftover ``SIM_NOISE_ADAPTIVE=0`` still
-    # disables it.  Comment that claimed default-OFF was stale — the
-    # historical ``os.environ.get(..., '1')`` path was already ON.
+    # ``sim_noise_adaptive``).  Leftover ``SIM_NOISE_ADAPTIVE`` ignored
+    # (P91-live; A/B ``DREAMER_SIM_NOISE_ADAPTIVE``).
     adaptive = bool(snr['adaptive'])
     base_gain_cv = float(snr['ou_gain_cv'])
     base_gain_dv = float(snr['ou_gain_dv'])

@@ -1630,10 +1630,9 @@ class TrainConfig:
     hidden_dist_tau_frac: str = '0.5:1.0'
     hidden_dist_deadtime_frac: str = '0.5:1.5'
     # Plant SNR (process OU + measurement).  Were leftover ``SIM_OU_*`` /
-    # ``SIM_MEAS_*`` / ``SIM_NOISE_ADAPTIVE`` in ``build_noise_config``
-    # (baked at phase 1a before TrainConfig, missing from ``run_plan``).
-    # Identity.  Dual-read at bake: ``DREAMER_SIM_*`` beats leftover
-    # ``SIM_*``.  ``SIM_NOISE_CONFIG_JSON`` stays env-only (path).
+    # ``SIM_MEAS_*`` / ``SIM_NOISE_ADAPTIVE`` in ``build_noise_config``.
+    # Identity.  TrainConfig + ``DREAMER_SIM_*`` only (P91-live leftover
+    # ``SIM_*`` ignored).  ``SIM_NOISE_CONFIG_JSON`` stays env-only (path).
     sim_noise_adaptive: bool = True
     sim_ou_sigma_frac: float = 0.008
     sim_ou_gain_cv: float = 0.15
@@ -1642,20 +1641,17 @@ class TrainConfig:
     sim_meas_noise_dv_frac: float = 0.010
     # Runtime wrapper (seed / jitter / enable / DR).  Were leftover
     # ``SIM_NOISE_SEED`` / ``SIM_NOISE_JITTER_PCT`` /
-    # ``SIM_DOMAIN_RANDOMIZATION``.  Identity.  Dual-read in
-    # ``SimNoiseWrapper`` / ``DomainRandomizer``.  Dead leftover
-    # ``SIM_NOISE_AMPLITUDE_JITTER_PCT`` (SysID ``clean_mode``) still
-    # zeros jitter.  ``DREAMER_DOMAIN_RANDOMIZATION`` is a leftover alias.
+    # ``SIM_DOMAIN_RANDOMIZATION``.  Identity.  TrainConfig +
+    # ``DREAMER_SIM_*`` only (P91-live leftover ``SIM_*`` ignored).
+    # SysID ``clean_mode`` writes ``DREAMER_SIM_*``.
     sim_noise_enabled: bool = True
     sim_noise_seed: str = ''
     sim_noise_jitter_pct: float = 0.20
     sim_domain_randomization: bool = True
     sim_domain_randomization_seed: str = ''
     # Runtime DR magnitude.  Sentinel <0 = identifier-derived bake
-    # (test_sim ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT`` was
-    # overwritten by that bake after wrap, so the env A/B was dead.
-    # Explicit ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` / leftover SIM_*
-    # now win at bake.  ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``.
+    # (test_sim ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT``
+    # ignored (P91-live).  Explicit ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``.
     sim_param_randomization_pct: float = -1.0
     # Operator-event schedule (measured DV steps).  TrainConfig +
     # ``DREAMER_DISTURBANCE_*``.  Leftover ``AGENT_DISTURBANCE_*`` is

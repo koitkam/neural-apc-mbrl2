@@ -318,15 +318,15 @@ held-action seed episodes fully noise-free, and the **process-noise curriculum**
 | `DREAMER_CLEAN_STEADY_SEEDS` | `0` to keep noise on the const-action / step-settle / isolation-settle seeds (default ON = noise-free seeds). |
 | `DREAMER_PROCESS_NOISE_CURRICULUM` | `0` to disable the P1 process+measurement noise ramp (default ON). |
 | `DREAMER_PROCESS_NOISE_AMP_RAMP` | `"<start>:<reach>"` (default `0.0:0.4`): noise scale ramps from `start` at progress=0 to full by `progress=reach` in P1/P2; P3 always full. Empty leftover env = full noise. |
-| `DREAMER_SIM_NOISE_ADAPTIVE` | SNR-weighted OU gain + measurement-sigma cap (default ON). Leftover `SIM_NOISE_ADAPTIVE`. Dual-read at `noise_config` bake. |
-| `DREAMER_SIM_OU_SIGMA_FRAC` | OU σ as a fraction of channel span (default 0.008). Leftover `SIM_OU_SIGMA_FRAC`. |
-| `DREAMER_SIM_OU_GAIN_CV` / `_DV` | OU gain multipliers (default 0.15 / 0.60). Leftover `SIM_OU_GAIN_CV` / `SIM_OU_GAIN_DV`. |
-| `DREAMER_SIM_MEAS_NOISE_CV_FRAC` / `_DV_FRAC` | Measurement-noise σ as a fraction of span (default 0.005 / 0.010). Leftover `SIM_MEAS_NOISE_*`. |
-| `DREAMER_SIM_NOISE_ENABLED` | Wrapper process+measurement noise (default ON). Leftover `SIM_NOISE_ENABLED`. SysID `clean_mode` sets 0. |
-| `DREAMER_SIM_NOISE_SEED` | Wrapper RNG seed (default empty = unseeded). Leftover `SIM_NOISE_SEED`. |
-| `DREAMER_SIM_NOISE_JITTER_PCT` | Per-episode OU/meas amplitude jitter ±fraction (default 0.20). Leftover `SIM_NOISE_JITTER_PCT`; dead `SIM_NOISE_AMPLITUDE_JITTER_PCT` still zeros SysID jitter. |
-| `DREAMER_SIM_DOMAIN_RANDOMIZATION` | Wrapper-level DR (default ON). Leftover `SIM_DOMAIN_RANDOMIZATION` / `DREAMER_DOMAIN_RANDOMIZATION`. |
-| `DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED` | DR RNG seed (default empty = unseeded). Leftover `SIM_DOMAIN_RANDOMIZATION_SEED`. |
+| `DREAMER_SIM_NOISE_ADAPTIVE` | SNR-weighted OU gain + measurement-sigma cap (default ON). Leftover `SIM_NOISE_ADAPTIVE` ignored (P91-live). A/B `DREAMER_SIM_NOISE_ADAPTIVE`. |
+| `DREAMER_SIM_OU_SIGMA_FRAC` | OU σ as a fraction of channel span (default 0.008). Leftover `SIM_OU_SIGMA_FRAC` ignored. |
+| `DREAMER_SIM_OU_GAIN_CV` / `_DV` | OU gain multipliers (default 0.15 / 0.60). Leftover `SIM_OU_GAIN_*` ignored. |
+| `DREAMER_SIM_MEAS_NOISE_CV_FRAC` / `_DV_FRAC` | Measurement-noise σ as a fraction of span (default 0.005 / 0.010). Leftover `SIM_MEAS_NOISE_*` ignored. |
+| `DREAMER_SIM_NOISE_ENABLED` | Wrapper process+measurement noise (default ON). Leftover `SIM_NOISE_ENABLED` ignored. SysID `clean_mode` writes `DREAMER_SIM_NOISE_ENABLED=0`. |
+| `DREAMER_SIM_NOISE_SEED` | Wrapper RNG seed (default empty = unseeded). Leftover `SIM_NOISE_SEED` ignored. |
+| `DREAMER_SIM_NOISE_JITTER_PCT` | Per-episode OU/meas amplitude jitter ±fraction (default 0.20). Leftover `SIM_NOISE_JITTER_PCT` / `SIM_NOISE_AMPLITUDE_JITTER_PCT` ignored. SysID writes `DREAMER_SIM_NOISE_JITTER_PCT=0`. |
+| `DREAMER_SIM_DOMAIN_RANDOMIZATION` | Wrapper-level DR (default ON). Leftover `SIM_DOMAIN_RANDOMIZATION` / `DREAMER_DOMAIN_RANDOMIZATION` ignored. |
+| `DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED` | DR RNG seed (default empty = unseeded). Leftover `SIM_DOMAIN_RANDOMIZATION_SEED` ignored. |
 | `DREAMER_DISTURBANCE_PROB_WM` | Per-episode probability cap in P1/P2 (default 0.10). In P1 acts as the upper bound of the adaptive ramp; in P2 acts as the floor (P2 starts at this value). Observable schedule events (SP/DV) fire on 100% of episodes, so 0.10 gives the WM ~10× more clean episodes than disturbed ones during early learning. |
 | `DREAMER_DISTURBANCE_PROB_P2` | Per-episode probability cap in P2 (default 0.20). P2 linearly ramps from `DREAMER_DISTURBANCE_PROB_WM` (0.10) up to this cap as critic training progresses. Rationale: critic learns value of imagined rollouts starting from buffered real states; broadening buffer coverage with more disturbed episodes lets the critic estimate value across the disturbed manifold. |
 | `DREAMER_DISTURBANCE_PROB_AGENT` | Per-episode probability cap in P3 (**default 0.30**, P89: was 0.50 — a realistic plant sees occasional upsets ~20–30% of the time, and 50% corrupted too much of the actor's gradient + never let the CV settle). P3 linearly ramps from `DREAMER_DISTURBANCE_PROB_P2` (0.20) up to this cap. |

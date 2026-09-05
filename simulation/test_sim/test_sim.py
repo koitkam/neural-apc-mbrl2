@@ -13,8 +13,9 @@ Functionality:
 
 Inputs:
 - Constructor: episode_length, sample_rate.
-- Optional env vars: SIM_DOMAIN_RANDOMIZATION, SIM_PARAM_RANDOMIZATION_PCT,
-    SIM_DOMAIN_RANDOMIZATION_SEED (and legacy DISTILLATION_* aliases).
+- Optional env vars: DREAMER_SIM_DOMAIN_RANDOMIZATION,
+    DREAMER_SIM_PARAM_RANDOMIZATION_PCT, DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED.
+    Leftover SIM_* / DISTILLATION_* names are ignored.
 
 Outputs:
 - reset() -> (state, done)

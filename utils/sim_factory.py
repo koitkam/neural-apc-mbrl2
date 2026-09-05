@@ -112,8 +112,8 @@ def _apply_setup_noise_and_randomization_env():
     :class:`SimNoiseWrapper` all see consistent defaults.
 
     Explicit env vars (exported by the user or set by the dynamics
-    identifier's ``clean_mode``) always win — we only fill in gaps via
-    ``os.environ.setdefault``. Defaults when the block is absent leave
+    identifier's ``clean_mode`` as ``DREAMER_SIM_*``) always win — we
+    only fill in gaps via ``os.environ.setdefault``. Defaults when the block is absent leave
     everything enabled (domain randomization ON, process noise ON,
     measurement noise ON).
     """
@@ -132,9 +132,9 @@ def _apply_setup_noise_and_randomization_env():
         return None
 
     mapping = {
-        'domain_randomization': 'SIM_DOMAIN_RANDOMIZATION',
-        'param_randomization_pct': 'SIM_PARAM_RANDOMIZATION_PCT',
-        'noise_enabled': 'SIM_NOISE_ENABLED',
+        'domain_randomization': 'DREAMER_SIM_DOMAIN_RANDOMIZATION',
+        'param_randomization_pct': 'DREAMER_SIM_PARAM_RANDOMIZATION_PCT',
+        'noise_enabled': 'DREAMER_SIM_NOISE_ENABLED',
     }
     for key, env_name in mapping.items():
         if key not in block:
