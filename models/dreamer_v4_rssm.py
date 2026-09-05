@@ -128,6 +128,110 @@ def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
     return torch.einsum('tsc,bsc->btc', pows, u)
 
 
+def dob_feat_hp_width(cfg) -> int:
+    """P90 serve-window: ``round(mult×H)`` (not clipped to ``seq_len``).
+
+    Val ``det_r`` detrends at ``4H`` (test_sim **220**).  P89 ground is
+    ``min(4H, T)`` because WM crops are shorter.  Actor feat uses the
+    val window so DC ``d`` slower than settling is not a phantom load.
+    ``0`` ⇒ identity (``mult<=0`` or ``H<1`` or ``W<=1``).
+    """
+    H = int(getattr(cfg, 'horizon', 0) or 0)
+    mult = float(getattr(cfg, 'disturbance_detrend_settle_mult', 4.0) or 0.0)
+    if H < 1 or mult <= 0.0:
+        return 0
+    w = int(round(mult * float(H)))
+    return w if w > 1 else 0
+
+
+def configure_dob_feat_hp(mod, cfg) -> None:
+    """P90: causal EMA high-pass on the served DOB tail.
+
+    P89 high-pass ``dob_ground`` stopped supervising DC ``d_t`` (val
+    ``det_r`` already drops drift slower than ``4H``).  The actor still
+    read raw ``d`` — untrained DC looks like a load ramp (gain↔disturbance
+    soak on posterior TM; chatter).  Feat tail is ``d − EMA(d, 4H)``;
+    Kalman state stays raw (recon / ``apply_dob``).  ``mult<=0`` or
+    ``H<1`` → α=0 identity.  No new TrainConfig field.
+    """
+    w = int(dob_feat_hp_width(cfg))
+    mod.dob_feat_hp_w = w
+    mod.dob_feat_hp_alpha = (1.0 / float(w)) if w > 1 else 0.0
+
+
+def dob_update_d_ma(
+        prev_ma: Optional[torch.Tensor], d_new: Optional[torch.Tensor],
+        alpha: float) -> Optional[torch.Tensor]:
+    """One-step causal EMA of Kalman ``d``. ``α<=0`` keeps ``ma≡0`` (identity)."""
+    if d_new is None:
+        return None
+    a = float(alpha)
+    if a <= 0.0:
+        return torch.zeros_like(d_new)
+    if prev_ma is None:
+        prev_ma = torch.zeros_like(d_new)
+    return prev_ma + a * (d_new - prev_ma)
+
+
+def next_d_ma(mod, prev, d_new: Optional[torch.Tensor]
+              ) -> Optional[torch.Tensor]:
+    return dob_update_d_ma(
+        None if prev is None else getattr(prev, 'd_ma', None),
+        d_new,
+        float(getattr(mod, 'dob_feat_hp_alpha', 0.0) or 0.0))
+
+
+def dob_feat_d_tail(d: Optional[torch.Tensor],
+                    d_ma: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Detached head-facing DOB tail. Identity when ``d_ma`` is None/α=0."""
+    if d is None:
+        return None
+    if d_ma is None:
+        return d.detach()
+    return (d - d_ma).detach()
+
+
+def dob_causal_hp_scan(
+        ds: torch.Tensor, alpha: float,
+        ma0: Optional[torch.Tensor] = None
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``hp_t = d_t − m_t``, ``m_t = (1−α) m_{t−1} + α d_t``, ``m_{-1}=ma0``.
+
+    ``ds`` is ``(B, T, n_cv)``.  Returns ``(hp, m_last)``.  ``α<=0`` is
+    identity (``m_last = 0``).  Reuses ``dob_kalman_scan``.
+    """
+    B, T, C = ds.shape
+    a = float(alpha)
+    if a <= 0.0 or T == 0:
+        z = (ds.new_zeros(B, C) if ma0 is None else ma0.to(
+            device=ds.device, dtype=ds.dtype))
+        return ds, z
+    coef = ds.new_full((C,), 1.0 - a)
+    ma = dob_kalman_scan(a * ds, coef)
+    if ma0 is not None:
+        t_idx = torch.arange(T, device=ds.device, dtype=ds.dtype) + 1.0
+        extra = coef.view(1, 1, C).pow(t_idx.view(1, T, 1)) * ma0.unsqueeze(1)
+        ma = ma + extra
+    return ds - ma, ma[:, -1]
+
+
+def apply_dob_feat_hp(mod, ds: torch.Tensor, last_only: bool
+                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """HP the Kalman sequence for the feat tail.
+
+    Returns ``(ds_out, ds_hp_out, d_ma_last)``.  Kalman ``ds`` is sliced
+    to T=1 when ``last_only`` and the scan ran on full T.  Stage-1 zeros
+    already match ``post_core`` T.
+    """
+    alpha = float(getattr(mod, 'dob_feat_hp_alpha', 0.0) or 0.0)
+    T = int(ds.shape[1])
+    ds_hp, d_ma_last = dob_causal_hp_scan(ds, alpha)
+    if last_only and T > 1:
+        ds = ds[:, -1:]
+        ds_hp = ds_hp[:, -1:]
+    return ds, ds_hp, d_ma_last
+
+
 def _time_unbind(x: Optional[torch.Tensor]):
     """Unbind time dim=1 once. ``None`` stays ``None``.
 
@@ -413,6 +517,10 @@ class RSSMConfig:
     # RSSMConfig still constructs; ``gru_update_gate_bias`` is
     # identically 0 (PyTorch init).
     horizon: int = 0
+    # Val-protocol detrend length in settling horizons (TrainConfig
+    # ``disturbance_detrend_settle_mult``, default 4).  P90 feat-tail EMA
+    # uses ``W=round(mult×H)``, α=1/W.  ``<=0`` disables the HP (identity).
+    disturbance_detrend_settle_mult: float = 4.0
 
 
 def gru_update_gate_bias(horizon: int) -> float:
@@ -459,6 +567,7 @@ class RSSMState:
     z_logits: torch.Tensor      # (..., n_categoricals, n_classes)
     z: torch.Tensor             # (..., n_categoricals, n_classes) one-hot (ST grad)
     d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
+    d_ma: Optional[torch.Tensor] = None  # (..., n_cv) causal EMA of d (P90 feat HP)
     dv: Optional[torch.Tensor] = None  # (..., dv_dim) exogenous DV feedforward (None=off)
     c: Optional[torch.Tensor] = None       # (..., cont_dim) continuous latent sample (None=off)
     c_mean: Optional[torch.Tensor] = None  # (..., cont_dim) post/prior mean (for KL)
@@ -481,7 +590,7 @@ class RSSMState:
             return t.detach() if t is not None else None
         return RSSMState(
             h=_d(self.h), z_logits=_d(self.z_logits), z=_d(self.z),
-            d=_d(self.d), dv=_d(self.dv),
+            d=_d(self.d), d_ma=_d(self.d_ma), dv=_d(self.dv),
             c=(self.c if keep_c else _d(self.c)),
             c_mean=(self.c_mean if keep_c else _d(self.c_mean)),
             c_std=(self.c_std if keep_c else _d(self.c_std)))
@@ -498,6 +607,8 @@ class RSSMState:
         #    use the gain/disturbance through it.
         #  * ``dv`` (DV feedforward) follows ``c``.  Not detached.
         #  * ``d`` (DOB) is appended LAST and DETACHED (sliced off by decode).
+        #    P90: the tail is the causal high-pass ``d − EMA(d, 4H)`` when
+        #    ``d_ma`` is live; Kalman ``d`` itself stays raw.
         # ``c is None`` AND ``dv is None`` AND ``d is None`` ⇒ feat = [h, z_flat]
         # (byte-identical to the paper RSSM).
         parts = [self.h, self.stoch_flat]
@@ -505,8 +616,9 @@ class RSSMState:
             parts.append(self.c)
         if self.dv is not None:
             parts.append(self.dv)
-        if self.d is not None:
-            parts.append(self.d.detach())
+        tail = dob_feat_d_tail(self.d, self.d_ma)
+        if tail is not None:
+            parts.append(tail)
         return torch.cat(parts, dim=-1)
 
 
@@ -751,6 +863,8 @@ class RSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
+        configure_dob_feat_hp(self, cfg)
+
     @property
     def feat_dim(self) -> int:
         # Scope 2: the head-facing feature includes the DV feedforward (dv_dim
@@ -789,6 +903,9 @@ class RSSMDynamics(nn.Module):
         d = (cached_zeros_bd(
                 self, B, self.n_cv, dtype, device, attr='_init_d_zeros')
              if self.dob_enabled else None)
+        d_ma = (cached_zeros_bd(
+                self, B, self.n_cv, dtype, device, attr='_init_dma_zeros')
+                if self.dob_enabled else None)
         dv = (cached_zeros_bd(
                 self, B, self.dv_dim, dtype, device, attr='_init_dv_zeros')
               if self.dv_feedforward else None)
@@ -805,7 +922,7 @@ class RSSMDynamics(nn.Module):
             c_std = cached_zeros_bd(
                 self, B, self.cont_dim, dtype, device,
                 attr='_init_cstd_zeros')
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c,
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, d_ma=d_ma, dv=dv, c=c,
                          c_mean=c_mean, c_std=c_std)
 
     # ----- DOB helpers --------------------------------------------------
@@ -883,7 +1000,8 @@ class RSSMDynamics(nn.Module):
         # step-1 G). P71 REVERT: G is a GRU input again so h can carry DC
         # gain. Deterministic-roll uses the prior MEAN.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new,
+                         d_ma=next_d_ma(self, prev, d_new), dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
 
     def _posterior_step(self, prev: RSSMState, prev_action: torch.Tensor,
@@ -905,6 +1023,7 @@ class RSSMDynamics(nn.Module):
             c_post, c_post_mean, c_post_std = self.cont_post_net(
                 post_in, sample=sample)
         return RSSMState(h=h, z_logits=post_logits, z=post_z, d=d_new,
+                         d_ma=next_d_ma(self, prev, d_new),
                          dv=dv_new, c=c_post, c_mean=c_post_mean,
                          c_std=c_post_std)
 
@@ -961,6 +1080,7 @@ class RSSMDynamics(nn.Module):
         # Posterior inherits the prior's exogenous DV feedforward (same measured
         # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
         post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z, d=d_post,
+                         d_ma=next_d_ma(self, prev, d_post),
                          dv=prior.dv, c=c_post, c_mean=c_post_mean,
                          c_std=c_post_std)
         return post, prior
@@ -1130,18 +1250,20 @@ class RSSMDynamics(nn.Module):
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
                 coef = (1.0 - K) * A                                  # (n_cv,)
                 ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
-                if last_only:
-                    ds = ds[:, -1:]
+                ds, ds_hp, d_ma_last = apply_dob_feat_hp(
+                    self, ds, last_only)
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
                 # Reuse a zeros buffer (identity; ``cat`` does not write it).
                 ds = cached_zeros_btd(
                     self, B, int(post_core.shape[1]), self.n_cv,
                     post_core.dtype, device)
-            feats = torch.cat([post_core, ds.detach()], dim=-1)
+                ds, ds_hp, d_ma_last = apply_dob_feat_hp(
+                    self, ds, last_only=False)
+            feats = torch.cat([post_core, ds_hp.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
-                              d=ds[:, -1], dv=state.dv, c=state.c,
-                              c_mean=state.c_mean, c_std=state.c_std)
+                              d=ds[:, -1], d_ma=d_ma_last, dv=state.dv,
+                              c=state.c, c_mean=state.c_mean, c_std=state.c_std)
         else:
             feats = post_core
         # Continuous-latent KL stats + posterior sample (for the cont KL +
@@ -1332,7 +1454,7 @@ def copy_obs_row(dst: torch.Tensor, row, host: Optional[torch.Tensor] = None
 # ---------------------------------------------------------------------------
 
 _RSSM_STATE_TENSORS = (
-    'h', 'z_logits', 'z', 'd', 'dv', 'c', 'c_mean', 'c_std')
+    'h', 'z_logits', 'z', 'd', 'd_ma', 'dv', 'c', 'c_mean', 'c_std')
 
 
 def _rssm_dob_live(dyn) -> bool:

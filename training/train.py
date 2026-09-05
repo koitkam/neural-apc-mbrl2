@@ -4308,8 +4308,10 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         _iso_txt = 'iso_dcv=off '
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
     from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
+    from models.dreamer_v4_rssm import dob_feat_hp_width as _dob_feathp_fn
     _gru_zb = float(_gru_zbias_fn(_h_zb))
     _hpw = _dob_ground_hp_window(cfg, int(getattr(cfg, 'seq_len', 0) or 0))
+    _feathpw = int(_dob_feathp_fn(cfg))
     print(
         '[resolved-cfg] '
         f"wm={getattr(cfg, 'world_model_type', 'rssm')} "
@@ -4345,6 +4347,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"ov_sgstart=True "
         f"gru_zbias={_gru_zb:.3g} "
         f"dob_hp={_hpw} "
+        f"dob_feathp={_feathpw} "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
