@@ -507,18 +507,16 @@ def identify_dynamics(
         prev_env = {
             k: os.environ.get(k)
             for k in (
-                'SIM_DOMAIN_RANDOMIZATION',
-                'DISTILLATION_DOMAIN_RANDOMIZATION',
-                'SIM_NOISE_AMPLITUDE_JITTER_PCT',
-                'SIM_NOISE_ENABLED',
-                'SIM_DOMAIN_RANDOMIZATION_SEED',
+                'DREAMER_SIM_DOMAIN_RANDOMIZATION',
+                'DREAMER_SIM_NOISE_JITTER_PCT',
+                'DREAMER_SIM_NOISE_ENABLED',
+                'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
             )
         }
-        os.environ['SIM_DOMAIN_RANDOMIZATION'] = '0'
-        os.environ['DISTILLATION_DOMAIN_RANDOMIZATION'] = '0'
-        os.environ['SIM_NOISE_AMPLITUDE_JITTER_PCT'] = '0'
-        os.environ['SIM_NOISE_ENABLED'] = '0'
-        os.environ['SIM_DOMAIN_RANDOMIZATION_SEED'] = '1337'
+        os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '0'
+        os.environ['DREAMER_SIM_NOISE_JITTER_PCT'] = '0'
+        os.environ['DREAMER_SIM_NOISE_ENABLED'] = '0'
+        os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED'] = '1337'
         noise_stdv = 0.0
     try:
         return _identify_dynamics_inner(

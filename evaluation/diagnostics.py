@@ -84,6 +84,7 @@ def _parse_train_log(jsonl_path: Path,
     ``actor_loss_type`` (reinforce / pmpo) so labels match the
     actually-trained policy.
     """
+    jsonl_path = Path(jsonl_path)
     rows: List[Dict] = []
     if not jsonl_path.exists():
         return rows, {'error': f'{jsonl_path.name} not found'}
@@ -125,11 +126,15 @@ def _parse_train_log(jsonl_path: Path,
                 'p1': {}, 'p2': {}, 'p3': {}}
     keys = ['recon_loss', 'sf_loss', 'reward_mtp_loss', 'bc_loss',
             'actor_loss', 'critic_loss', 'entropy_mean',
-            'imagined_return_mean', 'imagined_reward_mean',
-            # Both naming schemes are emitted by the trainer:
-            # ``actor_*`` from ``reinforce_actor_loss`` and ``pmpo_*``
-            # as back-compat aliases.  Keep both so old/new logs work.
-            'actor_kl_pen', 'pmpo_kl', 'pmpo_pos_frac', 'n_grad_skip',
+            # Canonical real-sim P3 keys.  ``imagined_*`` aliases remain
+            # for pre-P65 jsonl (P65-live dropped the identity writes).
+            'realsim_return_mean', 'imagined_return_mean',
+            'realsim_reward_mean', 'imagined_reward_mean',
+            'actor_kl_pen', 'pmpo_kl', 'actor_pos_adv_frac', 'pmpo_pos_frac',
+            'actor_logp_std', 'actor_ratio_clip_frac', 'actor_ratio_mean',
+            'critic_rew_to_tgt_var', 'return_scale',
+            'agent_minus_expert_return', 'adv_action_corr',
+            'imag_adv_action_corr', 'n_grad_skip', 'n_grad_skip_iter',
             'ema_return', 'return_window_mean']
     for ph_id, ph_key in ((1, 'p1'), (2, 'p2'), (3, 'p3')):
         rs = by_phase[ph_id]
@@ -143,7 +148,11 @@ def _parse_train_log(jsonl_path: Path,
     flags: List[str] = []
     p1 = summary['p1']
     if p1.get('n_iters', 0) > 0 and 'sf_loss' in p1:
-        if p1['sf_loss']['last'] >= 0.95 * p1['sf_loss']['first']:
+        # RSSM/TSSM emit sf_loss≡0 (shortcut-forcing is N/A).  Do NOT flag
+        # "did not drop" on a identically-zero series (P26 false positive).
+        _sf0 = float(p1['sf_loss']['first'])
+        _sf1 = float(p1['sf_loss']['last'])
+        if max(abs(_sf0), abs(_sf1)) >= 1e-8 and _sf1 >= 0.95 * _sf0:
             flags.append('P1: shortcut-forcing loss did not drop '
                           '(WM not learning dynamics)')
     p2 = summary['p2']
@@ -183,21 +192,23 @@ def _parse_train_log(jsonl_path: Path,
         if 'n_grad_skip' in p3 and p3['n_grad_skip']['max'] > 0:
             flags.append(f'P3: {int(p3["n_grad_skip"]["max"])} grad-clip '
                           f'skips (NaN/Inf in actor or critic gradient)')
-        # Advantage-sign skew: ``pmpo_pos_frac`` (alias under REINFORCE)
-        # is the fraction of imagined transitions with adv >= 0.  Both
-        # extremes indicate trouble: ~0 means critic baseline above all
-        # returns (over-optimistic value), ~1 means below all returns.
-        if 'pmpo_pos_frac' in p3:
-            pf_last = p3['pmpo_pos_frac']['last']
-            pf_med = p3['pmpo_pos_frac'].get('median', pf_last)
+        # Advantage-sign skew: ``actor_pos_adv_frac`` (leftover
+        # ``pmpo_pos_frac``) is the fraction of real-sim transitions with
+        # adv >= 0.  Both extremes indicate trouble: ~0 means critic
+        # baseline above all returns (over-optimistic value), ~1 means
+        # below all returns. Imagination actor is deleted.
+        _pf = p3.get('actor_pos_adv_frac') or p3.get('pmpo_pos_frac')
+        if _pf:
+            pf_last = _pf['last']
+            pf_med = _pf.get('median', pf_last)
             if pf_med <= 0.1:
                 flags.append(f'P3: advantage-positive fraction near zero '
                               f'(median={pf_med:.3f}); critic baseline '
-                              f'over-optimistic vs imagined returns')
+                              f'over-optimistic vs real-sim returns')
             elif pf_med >= 0.9:
                 flags.append(f'P3: advantage-positive fraction near one '
                               f'(median={pf_med:.3f}); critic baseline '
-                              f'under-pessimistic vs imagined returns')
+                              f'under-pessimistic vs real-sim returns')
     summary['flags'] = flags
     return rows, summary
 

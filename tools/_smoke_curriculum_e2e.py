@@ -13,8 +13,8 @@ freeze helpers in _smoke_curriculum.py):
   * the run completes without raising (phase transitions don't hiccup).
 
 Run (CPU, do not disturb a live GPU run):
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD DREAMER_COMPILE=0 \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_curriculum_e2e.py
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
+  ~/neural-APC-mbrl2-env/bin/python tools/_smoke_curriculum_e2e.py
 """
 import io
 import json

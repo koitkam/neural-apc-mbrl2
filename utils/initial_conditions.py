@@ -16,36 +16,80 @@ each simulator already knows its own ``(lo, hi)`` bounds for every
 variable, so this helper only needs the bounds and the legacy nominal /
 σ — no per-sim configuration is required.
 
-Env vars
---------
-* ``DREAMER_INIT_RANDOMIZATION`` — master switch.  Default ``1`` (on).
-  Set to ``0`` to restore the legacy narrow-Gaussian behaviour.
-* ``DREAMER_INIT_RANDOMIZATION_FRAC`` — fraction of the bounded range
-  used for the wide uniform draw.  Default ``0.6`` = uniform over a
-  60% slice of ``(hi - lo)`` centred on the legacy nominal.
+Env vars / TrainConfig
+----------------------
+* ``DREAMER_INIT_RANDOMIZATION`` / ``TrainConfig.init_randomization`` —
+  master switch.  Default ON.  Set to ``0`` to restore the legacy
+  narrow-Gaussian behaviour.
+* ``DREAMER_INIT_RANDOMIZATION_FRAC`` / ``TrainConfig.init_randomization_frac``
+  — fraction of the bounded range used for the wide uniform draw.
+  Default ``0.6`` = uniform over a 60% slice of ``(hi - lo)`` centred
+  on the legacy nominal.
 
-Both are read fresh on every call so test code can flip them without
-restarting the process.
+Simulators have no cfg at ``reset()``.  ``ic_randomization_knobs()``
+reads TrainConfig defaults then leftover env (identity ON / 0.6).
+ENV_OVERRIDES records the same keys in ``run_plan``.  Env is read
+fresh every call so tests can flip it without restarting.
 """
 
 from __future__ import annotations
 
 import os
+from typing import Optional, Tuple
 
 import numpy as np
 
+_IC_OFF = ('0', 'false', 'no', 'off')
+_TC_IC: Optional[Tuple[bool, float]] = None
+
+
+def ic_randomization_knobs() -> Tuple[bool, float]:
+    """Master switch / span fraction for sim ``reset()`` IC draws.
+
+    Simulators have no ``TrainConfig`` at ``reset()``, so this used to
+    hard-code leftover-env fallbacks ``1`` / ``0.6``.  Identity for
+    env-free: those numbers **are** the TrainConfig defaults.  Changing
+    the dataclass now actually widens/narrows the IC draw.  Leftover
+    ``DREAMER_INIT_RANDOMIZATION`` / ``DREAMER_INIT_RANDOMIZATION_FRAC``
+    still win when set (same keys as ``ENV_OVERRIDES``).  Env is read
+    fresh every call so tests can flip it without restarting.
+    """
+    global _TC_IC
+    if _TC_IC is None:
+        enabled, frac = True, 0.6
+        # Do not import training.train here: plant ID calls reset()
+        # before single_run imports TrainConfig.  Once train.py is in
+        # sys.modules, dataclass defaults win over the hardcoded 1/0.6.
+        import sys
+        mod = sys.modules.get('training.train')
+        cfg_cls = getattr(mod, 'TrainConfig', None) if mod is not None else None
+        if cfg_cls is not None:
+            cfg = cfg_cls()
+            enabled = bool(getattr(cfg, 'init_randomization', True))
+            frac = float(getattr(cfg, 'init_randomization_frac', 0.6) or 0.6)
+            _TC_IC = (enabled, frac)
+        else:
+            enabled, frac = True, 0.6
+    else:
+        enabled, frac = _TC_IC
+    raw = os.environ.get('DREAMER_INIT_RANDOMIZATION', '').strip()
+    if raw:
+        enabled = raw.lower() not in _IC_OFF
+    raw = os.environ.get('DREAMER_INIT_RANDOMIZATION_FRAC', '').strip()
+    if raw:
+        try:
+            frac = float(raw)
+        except ValueError:
+            pass
+    return bool(enabled), float(np.clip(frac, 0.05, 0.95))
+
 
 def _enabled() -> bool:
-    v = str(os.environ.get('DREAMER_INIT_RANDOMIZATION', '1')).strip().lower()
-    return v not in {'0', 'false', 'no', 'off'}
+    return ic_randomization_knobs()[0]
 
 
 def _frac() -> float:
-    try:
-        f = float(os.environ.get('DREAMER_INIT_RANDOMIZATION_FRAC', '0.6'))
-    except Exception:
-        f = 0.6
-    return float(np.clip(f, 0.05, 0.95))
+    return ic_randomization_knobs()[1]
 
 
 def sample_initial_value(

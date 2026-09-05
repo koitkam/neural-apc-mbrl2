@@ -13,7 +13,7 @@ Verifies, WITHOUT a real env, for BOTH backbones (rssm + tssm):
 
 Run (CPU):
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_dob.py
+  /home/koitkam/neural-APC-mbrl2-env/bin/python tools/_smoke_dob.py
 """
 import sys
 from pathlib import Path
@@ -24,7 +24,9 @@ import torch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from training.train import TrainConfig, build_model, world_model_loss  # noqa: E402
+from training.train import (  # noqa: E402
+    TrainConfig, build_model, world_model_loss, _replay_n_dist,
+)
 
 
 def _mk(wm_type='rssm', dob=False, cv_idx=(2,)):
@@ -200,6 +202,29 @@ def _check_scope2(wm_type):
               f"held={float(losses.get('wm_held_rollout_loss', 0)):.3f}) [{wm_type}]")
 
 
+def _check_kalman_scan():
+    """Closed-form scan == sequential recurrence (incl. grad through coef)."""
+    print('\n=== dob_kalman_scan identity ===')
+    from models.dreamer_v4_rssm import dob_kalman_scan
+    torch.manual_seed(0)
+    B, T, C = 4, 33, 3
+    u = torch.randn(B, T, C, requires_grad=True)
+    coef = torch.tensor([0.93, 0.10, 0.0], requires_grad=True)
+    got = dob_kalman_scan(u, coef)
+    d_prev = torch.zeros(B, C)
+    ref_l = []
+    for t in range(T):
+        d_prev = coef * d_prev + u[:, t]
+        ref_l.append(d_prev)
+    ref = torch.stack(ref_l, dim=1)
+    err = float((got.detach() - ref.detach()).abs().max())
+    assert err < 1e-5, f'scan vs loop max|Δ|={err}'
+    got.sum().backward()
+    assert u.grad is not None and coef.grad is not None
+    assert torch.isfinite(u.grad).all() and torch.isfinite(coef.grad).all()
+    print(f'[smoke] OK  dob_kalman_scan ≡ loop (max|Δ|={err:.2e}) + grad')
+
+
 def _check_compile_equiv(wm_type):
     """Compile-efficiency refactor (2026-06-12): the vectorized DOB
     ``rollout_observed`` (d-free recurrence + ONE batched prior decode + scalar
@@ -235,9 +260,75 @@ def _check_compile_equiv(wm_type):
           f'(max|Δfeats|={fe:.2e}, max|Δds|={de:.2e}) [{wm_type}]')
 
 
+def _check_grounding():
+    """P25 RCA: grounding must fire when DOB is on + batch['dist'] present,
+    even if disturbance_head_dim=0 (the production DOB-replaces-head layout).
+    Buffer width must be n_cv in that case — not keyed off the head dim."""
+    print('\n=== dob_ground (P25 RCA) ===')
+    cfg = TrainConfig()
+    cfg.cv_obs_indices = (0,)
+    cfg.dob_enabled = True
+    cfg.dob_ground_coef = 2.0
+    cfg.disturbance_head_dim = 0
+    assert _replay_n_dist(cfg) == 1, _replay_n_dist(cfg)
+    cfg.dob_enabled = False
+    cfg.dob_ground_coef = 0.0
+    assert _replay_n_dist(cfg) == 0, _replay_n_dist(cfg)
+    print('[smoke] OK  _replay_n_dist = n_cv when DOB/grounding on, 0 otherwise')
+
+    cfg, model, batch = _mk('rssm', dob=True, cv_idx=(2,))
+    cfg.dob_ground_coef = 2.0
+    cfg.dob_reg_coef = 0.0
+    cfg.disturbance_head_dim = 0
+    cfg._cv_obs_std = [1.0]
+    losses, _, _ = world_model_loss(model, batch, cfg)
+    g = float(losses['dob_ground'])
+    assert g > 0.0 and np.isfinite(g), f'dob_ground must be >0, got {g}'
+    print(f'[smoke] OK  dob_ground={g:.4f} with head_dim=0 + batch[dist]')
+
+    cfg2, model2, batch2 = _mk('rssm', dob=True, cv_idx=(2,))
+    cfg2.dob_ground_coef = 2.0
+    batch2.pop('dist', None)
+    losses2, _, _ = world_model_loss(model2, batch2, cfg2)
+    assert float(losses2['dob_ground']) == 0.0, 'missing dist must no-op'
+    print('[smoke] OK  missing dist_target → dob_ground=0 (warned)')
+
+    # P66 EXIT: skip REVERT. keep_frac=1.0 when grounding fires (all-seq MSE).
+    cfg3, model3, batch3 = _mk('rssm', dob=True, cv_idx=(2,))
+    cfg3.dob_ground_coef = 2.0
+    cfg3.dob_reg_coef = 0.0
+    cfg3._cv_obs_std = [1.0]
+    batch_z = dict(batch3)
+    batch_z['dist'] = torch.zeros_like(batch3['dist'])
+    lz = world_model_loss(model3, batch_z, cfg3)[0]
+    gz = float(lz['dob_ground'])
+    kz = float(lz['dob_ground_keep_frac'])
+    assert np.isfinite(gz), f'zero-var dist must still ground, got {gz}'
+    assert abs(kz - 1.0) < 1e-6, f'zero-var keep_frac must be 1 (no skip), got {kz}'
+    print(f'[smoke] OK  zero-var dist → dob_ground={gz:.4f} keep_frac=1 (no skip)')
+
+    batch_m = dict(batch3)
+    dist_m = batch3['dist'].clone()
+    dist_m[0].zero_()
+    batch_m['dist'] = dist_m
+    lm = world_model_loss(model3, batch_m, cfg3)[0]
+    gm = float(lm['dob_ground'])
+    km = float(lm['dob_ground_keep_frac'])
+    assert gm > 0.0 and np.isfinite(gm), f'mixed batch must ground, got {gm}'
+    assert abs(km - 1.0) < 1e-6, f'mixed keep_frac expected 1, got {km}'
+    print(f'[smoke] OK  mixed zero+load seqs → dob_ground={gm:.4f} keep_frac=1')
+
+    lf = world_model_loss(model3, batch3, cfg3)[0]
+    kf = float(lf['dob_ground_keep_frac'])
+    assert abs(kf - 1.0) < 1e-6, f'all-load keep_frac expected 1, got {kf}'
+    print('[smoke] OK  all-load seqs → keep_frac=1 (all-seq MSE)')
+
+
 if __name__ == '__main__':
+    _check_kalman_scan()
     for wm in ('rssm', 'tssm'):
         _check(wm)
         _check_scope2(wm)
         _check_compile_equiv(wm)
+    _check_grounding()
     print('\n[smoke] ALL DOB CHECKS PASSED (both backbones)')

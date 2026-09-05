@@ -13,7 +13,10 @@ What is auto-derived (in order):
   3. ``sample_rate`` from setup file (key ``sample_rate``) or env / default 5.
   4. ``tau``, ``dead_time``         <- ``dynamics_identifier``.
   5. ``lookback``                   <- ``lookback_identifier`` (centred on tau).
-  6. ``episode_length``             <- ``auto_episode_length.derive_episode_length``.
+  6. ``episode_length``             <- ``auto_episode_length.derive_episode_length``
+     (``k·(τ+θ)`` via ``episode_formula_knobs()``; identity 20 / 500 / 4000;
+     explicit pin ``DREAMER_EPISODE_LENGTH``; leftover ``SIM_EPISODE_LENGTH``
+     ignored — ``single_run`` still writes it after derivation as IPC).
   7. ``horizon``                    <- ``auto_episode_length.derive_horizon``
      (identified time-to-steady-state = dead_time + 4*tau, in agent steps;
      floored at the paper default 15, capped by DREAMER_HORIZON_MAX).
@@ -152,7 +155,8 @@ def main() -> int:
     print('[run] phase 1a: dynamics identification', flush=True)
     from workflow._plant_prepare import (
         identify_dynamics, build_noise_config, identify_lookback,
-        apply_dreamer_env_overrides,
+        apply_dreamer_env_overrides, explicit_batch_size,
+        pin_eval_modules_at_launch,
     )
     plant_dir = out_dir / 'plant_id'
     plant_info = identify_dynamics(plant_dir)
@@ -234,6 +238,11 @@ def main() -> int:
     # Episode length & horizon from plant.
     from utils.auto_episode_length import derive_episode_length, derive_horizon
     from workflow.bo_runner import MODEL_SIZE_PRESETS
+    # ``episode_formula_knobs()`` (TrainConfig 20 / 500 / 4000 then
+    # canonical ``DREAMER_EPISODE_*``).  Explicit pin
+    # ``DREAMER_EPISODE_LENGTH``.  Leftover ``SIM_EPISODE_LENGTH``
+    # ignored (P92-live).  Write ``SIM_EPISODE_LENGTH`` after derivation
+    # as IPC for env / validate.
     episode_length, ep_source = derive_episode_length()
     os.environ['SIM_EPISODE_LENGTH'] = str(episode_length)
     # Imagination horizon: sized to the identified time-to-steady-state
@@ -241,9 +250,11 @@ def main() -> int:
     # actor/critic credit the full settling response of the slowest loop —
     # including the consequence of riding vs not-riding a moved operator
     # limit over the whole transient.  Floored at the paper default 15 and
-    # capped (DREAMER_HORIZON_MAX) to bound WM-rollout error; tune the settle
-    # multiple via DREAMER_HORIZON_SETTLE_NTAU.  An explicit DREAMER_HORIZON
-    # still hard-overrides downstream via the env-override layer.
+    # capped (TrainConfig ``horizon_max`` / leftover ``DREAMER_HORIZON_MAX``
+    # via ``horizon_formula_knobs()`` when no explicit arg).  An explicit
+    # ``derive_horizon(..., max_h=)`` beats leftover env (P92-live).
+    # An explicit ``DREAMER_HORIZON`` still
+    # hard-overrides downstream via the env-override layer.
     horizon, horizon_source = derive_horizon(
         tau=tau, dead_time=dead, sample_rate=sample_rate)
     print(f'[run] horizon={horizon} ({horizon_source}; '
@@ -279,7 +290,8 @@ def main() -> int:
         print(f"[run] phase_fracs: {phase1_frac:.2f} / {phase2_frac:.2f} / {phase3_frac:.2f}", flush=True)
 
     # Build TrainConfig — every value either plant-tied or paper-faithful default.
-    from training.train import TrainConfig, train as run_training
+    from training.train import (TrainConfig, train as run_training,
+                                wm_train_seq_len_for_plant)
     from tools.gpu_calibrate import pick_batch_size_for_plant
     # Empirical batch sizing: spend ~10 s on a real fwd+bwd probe of
     # world_model_loss on synthetic data with the actual derived
@@ -291,32 +303,27 @@ def main() -> int:
     # falls back to paper_default=16.
     #
     # ``wm_overhead_factor`` reserves headroom the WM-only probe does NOT
-    # measure: the actor/critic/optimizer state and the Phase-3 imagination
-    # rollout (horizon-step latent unroll).  Tunable via DREAMER_WM_OVERHEAD;
-    # default 1.30 (≈30% reserve) keeps the RSSM run inside the card in P3.
-    try:
-        _wm_overhead = float(os.environ.get('DREAMER_WM_OVERHEAD', '1.30'))
-    except ValueError:
-        _wm_overhead = 1.30
-    _wm_overhead = max(1.0, _wm_overhead)
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
-    if bs_env:
-        try:
-            batch_size = max(1, int(bs_env))
-            bs_info = {'batch_size': batch_size, 'source': 'env_override'}
-        except Exception:
-            bs_info = pick_batch_size_for_plant(
-                model_size=model_size, seq_len=seq_len, lookback=lookback,
-                horizon=horizon, k_max=k_max, sample_rate=sample_rate,
-                episode_length=int(episode_length),
-                wm_overhead_factor=_wm_overhead)
-            batch_size = int(bs_info['batch_size'])
+    # measure: actor/critic/optimizer state and P3 collect/val graphs.
+    # ``gpu_probe_knobs()`` inside
+    # ``pick_batch_size_for_plant`` reads TrainConfig ``wm_overhead`` /
+    # ``gpu_target_util`` / ``gpu_max_bs`` (leftover ``DREAMER_WM_OVERHEAD``
+    # / ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS``).  Identity 1.30 /
+    # 0.80 / 512.  Explicit probe args beat leftover env (P92-live).
+    # ``explicit_batch_size`` pins B and skips the probe
+    # (``DREAMER_BATCH_SIZE`` only; leftover ``OBJ_BATCH_SIZE`` ignored).
+    # Probe the P1/P2 WM unroll T (max(seq_len, H+1)), not lookback-seq_len,
+    # so a slow plant's DC-gain window is in the memory budget (follow-up 13).
+    # test_sim seq_len=64, H≈55 → unchanged.
+    _probe_T = wm_train_seq_len_for_plant(seq_len, horizon, int(episode_length))
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        batch_size = bs_pin
+        bs_info = {'batch_size': batch_size, 'source': 'env_override'}
     else:
         bs_info = pick_batch_size_for_plant(
-            model_size=model_size, seq_len=seq_len, lookback=lookback,
+            model_size=model_size, seq_len=_probe_T, lookback=lookback,
             horizon=horizon, k_max=k_max, sample_rate=sample_rate,
-            episode_length=int(episode_length),
-            wm_overhead_factor=_wm_overhead)
+            episode_length=int(episode_length))
         batch_size = int(bs_info['batch_size'])
     if bs_info.get('source', '').startswith('empirical'):
         print(f"[gpu-calib] empirical probe: "
@@ -338,6 +345,8 @@ def main() -> int:
         lookback=lookback,
         sample_rate=sample_rate,
         episode_length=episode_length,
+        identified_tau_dominant=float(tau),
+        identified_dead_time=float(dead),
         total_steps=total_steps,
         horizon=horizon,
         seq_len=seq_len,
@@ -356,13 +365,13 @@ def main() -> int:
     # *after* dataclass construction so auto-tune (which compares
     # against the dataclass default to decide whether to overwrite)
     # treats env-injected values as user overrides and skips them.
-    # Note: ``training/train.py``'s ``_cfg_from_env()`` only runs when
-    # train.py is invoked as a CLI; when ``single_run.py`` is the
-    # entry-point we must perform the binding ourselves.  The whitelist
-    # lives in ``workflow/_plant_prepare.ENV_OVERRIDES`` and is shared
-    # with ``workflow/bo_runner.py`` so future knobs only need to be
-    # added in one place.
+    # Note: ``training/train.py``'s ``_cfg_from_env()`` (CLI) now calls
+    # the same whitelist.  The whitelist lives in
+    # ``workflow/_plant_prepare.ENV_OVERRIDES`` and is shared with
+    # ``workflow/bo_runner.py`` so future knobs only need to be added
+    # in one place.
     apply_dreamer_env_overrides(cfg)
+    pin_eval_modules_at_launch()
 
     plan = {
         'simulation_dir': str(sim_dir),
@@ -410,7 +419,8 @@ def main() -> int:
     print(json.dumps({k: v for k, v in plan.items() if k != 'config'},
                      indent=2), flush=True)
 
-    print('[run] phase 2: training', flush=True)
+    print('[run] workflow-step 2: training '
+          '(Dreamer P1 WM / P2 observer / P3 actor-critic)', flush=True)
     summary = run_training(cfg)
     with open(out_dir / 'run_summary.json', 'w') as f:
         json.dump({'plan': plan, 'summary': summary}, f, indent=2)
@@ -418,7 +428,9 @@ def main() -> int:
     # ── Phase 3: validation (parity with workflow.bo_runner final retrain) ──
     val_summary: Dict = {}
     if not args.no_validate:
-        print('[run] phase 3: validation', flush=True)
+        print('[run] workflow-step 3: held-out validation '
+              '(seed_*/disturbance_rejection plots; NOT Dreamer P3)',
+              flush=True)
         try:
             from evaluation.validate import run_validation
             # Validate best.pt (deterministic-best P3 ckpt) rather than final.pt
@@ -431,11 +443,29 @@ def main() -> int:
             # crashing with FileNotFoundError and emitting no plots at all.
             val_ckpt = 'best.pt'
             if not (out_dir / 'best.pt').exists():
+                # P27 RCA: this line used to say "likely P3 collapse" even when
+                # training never LEFT Dreamer P1 (grad_skip_storm @iter 50).
+                # Workflow "phase 3" is VALIDATION (seed_*/disturbance_rejection
+                # plots), not Dreamer Stage 3 / ``P3 iter`` actor-critic.
                 val_ckpt = 'final.pt'
-                print('[run] validation: best.pt not found '
-                      '(no improving P3 ckpt — likely P3 collapse/early-stop); '
-                      'falling back to final.pt (degraded controller)',
-                      flush=True)
+                _es = summary.get('early_stop_reason')
+                _p3it = summary.get('best_p3_iter')
+                _nit = summary.get('iters')
+                if _p3it is None:
+                    print('[run] validation: best.pt not found — Dreamer P3 '
+                          f'actor-critic NEVER RAN (stopped after {_nit} '
+                          f'iters'
+                          + (f': {_es}' if _es else '')
+                          + '). Validating final.pt (P1/P2 weights + P1 '
+                          'expert-BC policy). Seed plots are held-out eval, '
+                          'not evidence that Stage 3 finished.',
+                          flush=True)
+                else:
+                    print('[run] validation: best.pt not found '
+                          '(no improving P3 ckpt — likely P3 collapse/'
+                          'early-stop); falling back to final.pt '
+                          '(degraded controller)',
+                          flush=True)
             val_summary = run_validation(controller_dir=out_dir,
                                           episodes=int(args.val_episodes),
                                           seeds=int(args.val_seeds),

@@ -334,10 +334,10 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
             dv_pos + 3, 0.0  # DV state indices start at 3
         )
         alpha = self.sample_rate / max(self.dv_tau, float(self.sample_rate))
-        # Stochastic OU kick honours SIM_NOISE_ENABLED so the dynamics
-        # identifier (which sets it to '0') sees a deterministic plant while
-        # training keeps the realistic stochastic envelope.
-        noise_on = str(os.environ.get('SIM_NOISE_ENABLED', '1')).strip().lower() not in {
+        # Stochastic OU kick honours DREAMER_SIM_NOISE_ENABLED so SysID
+        # clean_mode (which sets it to '0') sees a deterministic plant.
+        # Leftover SIM_NOISE_ENABLED is ignored (P91-live).
+        noise_on = str(os.environ.get('DREAMER_SIM_NOISE_ENABLED', '1')).strip().lower() not in {
             '0', 'false', 'no', 'off',
         }
         noise = rng.standard_normal() * std * 0.05 if noise_on else 0.0
@@ -354,7 +354,7 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
         # Refresh per-episode randomised plant-wrapper parameters
         # (output gain/bias, input jitter std, actuator lag, MV dead-time,
         # DV mean-shift). All become neutral when domain randomisation is
-        # disabled via control_setup or SIM_DOMAIN_RANDOMIZATION=0.
+        # disabled via control_setup or DREAMER_SIM_DOMAIN_RANDOMIZATION=0.
         self._randomizer.sample_episode(n_dvs=len(_DV_TAGS))
 
         rng = self._randomizer.rng

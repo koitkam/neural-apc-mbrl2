@@ -12,11 +12,11 @@ architecture for the RSSM and TSSM cores:
   3. TEACHER-FORCING: rollout_observed extracts the DV from the obs at
      ``dv_indices`` and threads it (changing the obs DV channel changes feats).
   4. END-TO-END: build DreamerV4(rssm, dv_dim>0) + run world_model_loss and an
-     imagination step without error; the held-DV imagination path executes.
+     real-sim actor step without error; the held-DV prior path executes.
 
 Run:
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD DREAMER_COMPILE=0 \
-    $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_dv_input.py
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
+    ~/neural-APC-mbrl2-env/bin/python tools/_smoke_dv_input.py
 """
 import torch
 
@@ -103,8 +103,6 @@ def test_teacher_forcing(mk, name):
 
 def test_end_to_end_rssm():
     """Build DreamerV4(rssm, dv_dim>0) + WM loss + imagination run."""
-    import os
-    os.environ.setdefault('DREAMER_COMPILE', '0')
     from models.dreamer_v4 import DreamerV4, DreamerV4Config
     torch.manual_seed(0)
     cfg = DreamerV4Config(

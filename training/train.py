@@ -14,26 +14,27 @@ Algorithm 1 (paper-faithful, adapted to single-task online APC sim):
         offline-data setting); keep eq. 5 + eq. 7 live and add policy +
         reward multi-token-prediction heads (eq. 9).
 
-    Phase 3 — imagination training
-        Freeze tokenizer + dynamics + reward head. Snapshot the current
-        policy as the PMPO prior. Sample dataset contexts from the
-        replay buffer; imagine H steps using K=4 shortcut sampling per
-        step; train the value head with TD-λ (eq. 10) and the policy
-        head with PMPO (eq. 11). Run periodic evaluation episodes for
-        the return-window score (no buffer writes).
+    Phase 3 — real-sim actor/critic (mbrl2)
+        Observer (tokenizer + dynamics + DOB) is frozen. Actor-critic
+        trains on λ-returns from REAL simulator rollouts
+        (``_realsim_actor_critic_step``). Imagination actor training
+        was deleted.
 
 Phase budget: ``cfg.phaseN_frac`` of ``cfg.total_steps`` for N ∈ {1, 2, 3}.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
 import shutil
 import time
+import warnings
 from collections import deque
-from dataclasses import dataclass, field, asdict
+from contextlib import contextmanager
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,8 +43,8 @@ import torch
 import torch.nn.functional as F
 
 from models.dreamer_v4 import (  # noqa: F401
-    DreamerV4, DreamerV4Config,
-    shortcut_forcing_loss, pmpo_loss, reinforce_actor_loss,
+    DreamerV4, dreamer_v4_config_from_train,
+    shortcut_forcing_loss,
 )
 from utils.sim_factory import create_sim, resolve_sim_metadata
 from utils.objective_runtime import compute_objective_components
@@ -53,6 +54,7 @@ from utils.training_disturbance import (
     apply_disturbance_schedule,
 )
 from utils.hidden_disturbance import (
+    curriculum_amp_scale,
     get_phase_disturbance_prob,
     maybe_build_hidden_disturbance,
 )
@@ -138,6 +140,11 @@ class TrainConfig:
     # collapse, keeps entropy above the trip, and keeps on-policy exploration
     # alive so the (warmup-healthy) critic keeps getting diverse states to guide
     # μ.  Deterministic EVAL uses μ, so the wider training σ is exploration-only.
+    # p10 RCA: 1.6 → **1.2**.  Auto-tune used to ``max(1.3, cfg)`` which
+    # silently undid this default (P45/P46/P47 env-free resolved
+    # log_std_min from 1.3, entropy floor −0.363).  Formula now uses
+    # this field.  Leftover ``SIGMA_MIN_RATIO_OF_MAX`` is **not** read
+    # (P82-live; same class as ``AGENT_DISTURBANCE_*``).
     sigma_min_ratio: float = 1.2      # σ_min = σ_max / sigma_min_ratio (p10 RCA: 1.6→1.2, raise σ floor)
     # PMPO entropy bonus. Auto-derived from the auto-tuned σ_max in
     # ``auto_initialize_hyperparams`` as ``η = η_v3 × σ_max / σ_v3_ref``
@@ -146,51 +153,47 @@ class TrainConfig:
     # exploration bands typical of process control.
     # The dataclass default below (1e-4) is the sentinel value used
     # only when auto-tune is disabled or fails; it matches what the
-    # formula produces for σ_max ≈ 0.33. Set explicitly via env var
-    # PMPO_ENTROPY_COEF_BASELINE / PMPO_ENTROPY_SIGMA_REF or override
-    # the cfg field directly to bypass the auto-derivation.
+    # formula produces for σ_max ≈ 0.33. Formula inputs
+    # ``pmpo_entropy_eta_v3`` / ``pmpo_entropy_sigma_ref`` were
+    # ``os.environ.get`` (worked, missing from ``run_plan``). Leftover
+    # ``PMPO_ENTROPY_COEF_BASELINE`` / ``PMPO_ENTROPY_SIGMA_REF`` are
+    # **not** read (P87-live; same class as ``OBJ_REWARD_SCALE``).
+    # A/B ``DREAMER_PMPO_ENTROPY_ETA_V3`` / ``DREAMER_PMPO_ENTROPY_SIGMA_REF``.
     pmpo_entropy_coef: float = 1e-4
-    # Actor loss type. ``'reinforce'`` (DreamerV3 §3) is robust across
-    # simulators — V3 used this single recipe across 150+ tasks. The
-    # ``'pmpo'`` option uses V4's eq. 11 advantage-sign-split loss; this
-    # is the paper-faithful V4 actor for **discrete** actions, but it is
-    # numerically unstable for continuous TanhNormal actors because its
-    # negative-advantage branch is unbounded below.  We default to V3
-    # REINFORCE which has bounded gradients and proven cross-task
-    # robustness; switch to PMPO only for discrete-action sims if
-    # desired (env: DREAMER_ACTOR_LOSS=pmpo).
+    pmpo_entropy_eta_v3: float = 3e-4
+    pmpo_entropy_sigma_ref: float = 1.0
+    # Actor loss type. P3 always inlines DreamerV3 REINFORCE + μ-ratio
+    # (``_realsim_actor_critic_step``).  ``'pmpo'`` is a **false A/B**
+    # — ``train()`` refuses it.  V4 PMPO remains unwired for continuous
+    # TanhNormal (unbounded negative-advantage branch).
     actor_loss_type: str = 'reinforce'
-    # ----- Actor KL trust region (p136, 2026-06-21) -----
-    # The REINFORCE surrogate above already NORMALISES the advantage
-    # (adv/return_scale + disturbance-baseline + clip) — that IS the paper's
-    # "normalized_advantage", and on its own it lets the policy HUNT (p135:
-    # actor_logp_mean swung 0.35↔10.7; the actor underperformed the static
-    # expert).  ``reinforce_actor_loss`` carries a built-in KL-to-prior term
-    # (a trust region) that was hard-disabled (kl_coef=0).  ``actor_kl_coef``>0
-    # enables it: a GENTLE penalty on KL(π ‖ π_prior) toward a periodically
-    # refreshed snapshot of the recent policy, damping the per-update policy
-    # swing WITHOUT PMPO's continuous-action-unstable advantage-sign split.
-    # Sim-agnostic (unitless KL nats).  0.0 = legacy (no trust region); PMPO
-    # remains the stronger fallback.  ``DREAMER_ACTOR_KL_COEF``.
-    # REVERTED 0.3→0.0 (p136 verdict 2026-06-22): the KL trust region did NOT
-    # prevent the entropy collapse (actor_kl_pen faded to 0.001 — a refreshed-
-    # prior TR follows a SLOW σ-collapse, the wrong mechanism) and only added a
-    # confound.  The p136 collapse was DOWNSTREAM of the missing disturbance in
-    # imagination (DOB removed); the continuous-latent disturbance restores the
-    # objective.  Re-enable only if the policy HUNTS once the objective is fixed.
-    actor_kl_coef: float = 0.0
-    # Phased-P3 trust-region prior refresh cadence (iters).  The phased run
-    # snapshots π_prior ONCE at P3 start (near-uniform) — a static KL anchor is
-    # an entropy pull, NOT a trust region.  Refreshing every N P3 iters makes
-    # KL(π‖π_prior) a MOVING trust region (penalises rapid change from the
-    # recent policy → anti-hunting).  0 = keep the once-at-start snapshot.
-    # Sim-agnostic.  ``DREAMER_P3_PRIOR_REFRESH_ITERS``.
-    p3_prior_refresh_iters: int = 5
+    # ``DREAMER_ACTOR_LOSS=pmpo`` is a **false A/B** (P3 always inlines
+    # REINFORCE + μ-ratio; ``pmpo_loss`` / ``pmpo_alpha`` / ``pmpo_beta``
+    # / prior-refresh knobs **REMOVED**).  ``train()`` refuses ≠reinforce,
+    # same class as leftover imagination ``actor_train_source``.  The
+    # p136 ``actor_kl_coef`` TR was FALSIFIED and **REMOVED**.
 
     # ----- Plant / windowing -----
     lookback: int = 32        # transformer context length T_ctx
     sample_rate: int = 5
     episode_length: int = 600
+    # Formula inputs for ``derive_episode_length``:
+    # ``L = clip(round(k·(τ+θ)), min, max)``.  ``episode_formula_knobs()``
+    # reads these then leftover ``DREAMER_EPISODE_SETTLE_MULTIPLE`` /
+    # ``DREAMER_EPISODE_MIN_LENGTH`` / ``DREAMER_EPISODE_MAX_LENGTH``.
+    # Identity: 20 / 500 / 4000 (test_sim τ=53 θ=8 → 1220).  Changing
+    # the dataclass sizes L.  Explicit pin is ``DREAMER_EPISODE_LENGTH``.
+    # Leftover ``SIM_EPISODE_LENGTH`` is ignored at derive (P92-live).
+    episode_settle_multiple: float = 20.0
+    episode_min_length: int = 500
+    episode_max_length: int = 4000
+    # Identified plant timing (seconds).  Sentinel 0 = fall back to
+    # leftover ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME``
+    # env (CLI / old paths).  ``single_run`` / ``bo_runner`` write the
+    # identifier values so APCEnv / PRBS / SNR do not depend on env
+    # (P49 GPU-occupied leftover; identity).
+    identified_tau_dominant: float = 0.0
+    identified_dead_time: float = 0.0
 
     # ----- Training overall -----
     total_steps: int = 100_000
@@ -199,6 +202,18 @@ class TrainConfig:
     seq_len: int = 64
     batch_size: int = 16
     horizon: int = 15
+    # Formula inputs for ``derive_horizon``:
+    # ``H = round((θ + n_τ·τ) / sample_rate)`` floored at 15, capped at
+    # ``horizon_max``.  ``horizon_formula_knobs()`` reads these then
+    # leftover ``DREAMER_HORIZON_SETTLE_NTAU`` / ``DREAMER_HORIZON_MAX``.
+    # Identity: 4.0 (2% settle) / 120.  Changing the dataclass sizes H.
+    horizon_settle_n_tau: float = 4.0
+    horizon_max: int = 120
+    # Wide uniform IC randomization (domain randomization).
+    # ``ic_randomization_knobs()`` at sim ``reset()`` reads these then
+    # leftover ``DREAMER_INIT_RANDOMIZATION`` / ``_FRAC``.  Identity ON / 0.6.
+    init_randomization: bool = True
+    init_randomization_frac: float = 0.6
 
     # ----- Phase budget fractions (paper Algorithm 1) -----
     phase1_frac: Optional[float] = None
@@ -217,17 +232,12 @@ class TrainConfig:
     # the value head calibrates before actor coupling.  DREAMER_TRAIN_MODE.
     train_mode: str = 'phased'
     # ----- Actor training data source (mbrl2 fork) -----
-    # ``realsim`` (default; the only supported mode — imagination was removed):
-    # the WM(RSSM)+DOB are a FROZEN OBSERVER and the actor-critic trains on
-    # λ-returns from REAL rollouts of the true simulator with domain
-    # randomisation (``_realsim_actor_critic_step``).  Exact policy gradient
-    # w.r.t. the true dynamics, real-return-grounded critic (no cascade),
-    # DreamerV3 scale-invariant normalisation.  DREAMER_ACTOR_SOURCE.
+    # ``realsim`` is the only supported mode (imagination actor deleted).
+    # ``train()`` refuses any other value: a leftover ``imagination`` override
+    # used to skip the on-policy buffer and train P3 off replay (p01 chatter).
+    # DREAMER_ACTOR_SOURCE stays in ENV_OVERRIDES so a bad A/B is visible
+    # then aborted, not silently ignored.
     actor_train_source: str = 'realsim'
-    # joint mode: re-snapshot the PMPO prior policy every N iters (0 = once at
-    # start, like phased P3).  A slowly-refreshed prior keeps the KL anchor
-    # from going stale over a long single-phase run.
-    joint_prior_refresh_iters: int = 0
 
     # ----- Optimizers -----
     lr_world: float = 1e-4
@@ -389,6 +399,106 @@ class TrainConfig:
     # the asymmetry ratio to roughly 3 — symlog support becomes
     # near-symmetric and the bin distribution recovers.
     reward_clip_tail_k: float = 3.0
+    # Safety-net raw-reward clip (P43: -1e6 is "off").  Was
+    # ``os.environ.get`` inside ``APCEnv.__init__`` (worked, but
+    # missing from ``run_plan``).  ``DREAMER_REWARD_RAW_CLIP_MIN`` /
+    # ``_MAX`` are in ENV_OVERRIDES.
+    reward_raw_clip_min: float = -1e6
+    reward_raw_clip_max: float = 1e18
+    # Reward-scale calibration (percentile → twohot).  Was
+    # ``os.environ.get`` inside ``train()`` (worked, missing from
+    # ``run_plan``).  Unitless / mode strings.
+    reward_cal_mode: str = 'baseline'
+    reward_cal_target: str = 'percentile'
+    reward_cal_pct: float = 95.0
+    reward_cal_pct_val: float = 0.5
+    reward_cal_target_sym_mag: float = 6.0
+    # Gate for the percentile→twohot scale.  ``auto`` (env-free) runs
+    # calibration; ``off`` leaves scale=1; a numeric string forces
+    # that scale.  Was leftover ``OBJ_REWARD_SCALE`` (worked, missing
+    # from ``run_plan``).  Leftover ``OBJ_REWARD_SCALE`` is **not**
+    # read (P87-live; same silent-A/B class as ``SIGMA_*`` /
+    # ``AGENT_DISTURBANCE_*``).  A/B ``DREAMER_OBJ_REWARD_SCALE``.
+    obj_reward_scale: str = 'auto'
+    # Reward-engine leftovers (``utils/objective_runtime.py``).  Were
+    # ``os.environ.get`` every ``env.step`` (worked, missing from
+    # ``run_plan``).  Identity defaults.  Clip sentinel ``<0`` = adaptive
+    # ``adaptive_penalty_clip``.  ``obj_auto_cv_over_econ_ratio=0`` =
+    # follow ``obj_auto_violation_margin`` (historical
+    # ``get(..., str(margin))``).  Leftover ``OBJECTIVE_*`` /
+    # ``OBJ_AUTO_*`` ignored (P90-live).  Integral dead-time damping
+    # prefers ``identified_tau_dominant`` / ``identified_dead_time``.
+    objective_integral_coef: float = 0.05
+    objective_integral_windup: float = 5.0
+    objective_integral_leak: float = 0.98
+    obj_auto_integral_soft_compensate: bool = True
+    obj_auto_integral_soft_compensate_max: float = 10.0
+    obj_auto_integral_deadtime_k: float = 2.0
+    obj_auto_violation_margin: float = 2.0
+    obj_auto_cv_over_econ_ratio: float = 0.0
+    obj_auto_violation_tolerance: float = 0.02
+    # Auto-weights leftover formula knobs (``utils/auto_weights.py``).
+    # Were ``_env_float('OBJ_AUTO_*')`` (worked, missing from
+    # ``run_plan``).  Identity defaults.  Leftover ``OBJ_AUTO_*`` ignored
+    # (P90-live).  ``obj_auto_typical_cv_violation``
+    # code default is **0.10** (module docstring said 0.05 — stale).
+    obj_auto_mv_violation_base: float = 25.0
+    obj_auto_cv_violation_base: float = 25.0
+    obj_auto_cv_rank_decay: float = 0.5
+    obj_auto_mv_over_cv_ratio: float = 2.0
+    obj_auto_econ_over_target_ratio: float = 2.0
+    obj_auto_target_base: float = 0.5
+    obj_auto_cv_penalty_cap_frac: float = 0.5
+    obj_auto_typical_cv_violation: float = 0.10
+    obj_auto_move_over_cv_k: float = 20.0
+    obj_auto_move_base: float = 0.1
+    obj_auto_move_target_cost_frac: float = 0.005
+    obj_auto_move_sigma_ref: float = 0.3
+    obj_auto_econ_over_move_ratio: float = 2.0
+    obj_auto_reversal_gain: float = 0.3
+    obj_auto_violation_rate_coef_divisor: float = 4.0
+    obj_auto_violation_rate_coef_min: float = 0.3
+    obj_auto_violation_rate_coef_max: float = 1.5
+    obj_auto_differentiable_depth: float = 0.20
+    obj_auto_reward_clip_floor: float = 50.0
+    # ``load_objective_spec`` / ``_objective_uses_normalized``.  Identity
+    # ON.  Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live).  A/B
+    # ``DREAMER_OBJ_USE_NORMALIZED``.
+    objective_use_normalized: bool = True
+    objective_violation_rate_coef: str = 'auto'
+    objective_penalty_sat_mode: str = 'tanh'
+    objective_penalty_clip: float = -1.0
+    objective_reward_clip: float = -1.0
+    objective_feasibility_cap: float = 4.0
+    objective_feasibility_scale: float = 0.08
+    # May-2026 P39 probes.  Default OFF (extra retain_graph backward).
+    # Was ``os.environ.get`` (not ENV_OVERRIDES).  Opt in ``=10``.
+    diag_perhead_grads_every: int = 0
+    diag_latent_stability_every: int = 0
+    diag_disable_reward_mtp_in_p1: bool = False
+    diag_reward_mtp_stop_grad_in_p1: bool = False
+    # End-of-training WM steady-state diagnostic (default ON).  Horizon
+    # 0 = auto ``max(200, 8·H)``.  Device: ``cuda`` (identity with the
+    # previous train()-injected env — nvidia-smi would see *this* process
+    # as busy and fall back to CPU).  ``auto`` restores the picker;
+    # ``cpu`` forces host.  ``DREAMER_WM_DIAG_DEVICE``.
+    run_wm_diagnostic: bool = True
+    wm_diag_n_starts: int = 8
+    wm_diag_horizon: int = 0
+    wm_diag_device: str = 'cuda'
+    # Eval TM protocol + val-suite gates.  Were ``os.environ.get`` in
+    # ``evaluation/wm_transfer_matrix.py`` / ``validate.py`` (worked,
+    # missing from ``run_plan``).  Identity defaults.  Horizon/settle
+    # 0 = auto ``wm_tf_horizon(H)=max(80, 4·H)`` (already sim-adaptive).
+    # Levels / span / step_frac are unitless.
+    wm_tf_levels: int = 5
+    wm_tf_span: float = 0.6
+    wm_tf_step_frac: float = 0.4
+    wm_tf_horizon: int = 0
+    wm_tf_settle: int = 0
+    val_wm_transfer: bool = True
+    val_wm_postprior: bool = True
+    val_wm_distpred: bool = True
     # ---- Return-scale absolute cap (P79, 2026-06-02) ---------------
     # The (p95-p05)-spread EMA normaliser at ``DreamerV4.update_return_scale``
     # tracks a monotonically growing spread on the critic-pessimism
@@ -443,6 +553,7 @@ class TrainConfig:
     # exactly in the near-constraint zone where disturbance-driven overshoot
     # happens.  Still potential-based (policy-invariant) and sim-adaptive (a
     # fraction of the plant's own half-band).  ``1.0`` recovers the legacy tent.
+    # In ``ENV_OVERRIDES`` (identity 0.25; sibling of econ-margin).
     shaping_safe_margin_frac: float = 0.25
     # Fix 2a economic-shaping weight (2026-06-19, p129 RC-A).  Φ = Φ_safe +
     # ``shaping_econ_coef``·gate·Φ_econ, where Φ_econ ∈ [0,1] is a STATE-BASED
@@ -513,63 +624,11 @@ class TrainConfig:
     # to 8.0.  Set ``advantage_clip=0.0`` to disable (legacy unclamped).
     advantage_clip: float = 8.0
 
-    # ---- C : replay-grounded critic anchor (P66-RCA, 2026-05-29) ----
-    # The cascade's root cause is that the P3 critic regresses purely on
-    # IMAGINED λ-returns from a frozen, non-convergent WM: targets become
-    # ~95% self-bootstrap (critic_target_v_r→0.95, reward <1% of target var),
-    # so the critic drifts into a self-consistent growing-negative fixed point
-    # of its own making.  This anchor adds a critic loss term on REAL replayed
-    # transitions — a TD-λ target built from the buffer's REAL rewards and the
-    # slow target-value bootstrap on the REAL latents — so the critic is pinned
-    # to genuine reward variance and cannot float free.  ``coef`` weights the
-    # anchor vs the imagined critic loss.  Set ``critic_replay_anchor_coef=0.0``
-    # to disable (legacy pure-imagination critic).
-    # Default 0.0 = p117 recipe: grounding is done by the MC term below, not
-    # this anchor (promoted 2026-06-14; was 0.5).
-    critic_replay_anchor_coef: float = 0.0
-
-    # ---- B : long-horizon critic-anchor grounding (P85, 2026-06-04) ----
-    # The replay anchor above computes its TD-λ target over the FULL real
-    # context (``Treal = seq_len`` steps), which spans MANY plant time
-    # constants — but it reuses the myopic imagination ``gae_lambda`` (0.90)
-    # in its backward recursion, giving it an effective credit horizon of
-    # only ~1/(1-γλ) ≈ 10 steps.  A constraint-riding limit cycle whose
-    # period (~40 steps) EXCEEDS that horizon is therefore invisible to the
-    # critic target even though the real buffer data contains several full
-    # cycles: the delayed overshoot a too-aggressive action causes is
-    # down-weighted to ~1 % and never co-occurs with its cause in the
-    # value target.  ``critic_anchor_lambda`` decouples the ANCHOR's λ from
-    # the imagination λ so the anchor can use a near-Monte-Carlo
-    # return-to-go (λ→1) over the real sequence — injecting the FULL
-    # realised multi-cycle cost into the critic target, GROUNDED IN REAL
-    # DATA (not a long WM rollout).  The actor still trains purely on H-step
-    # imagination; only the critic's real-grounding horizon changes, so the
-    # value bootstrap V(s_H) the actor reads becomes calibrated to the
-    # long-horizon cost.  ``None`` (default) ⇒ fall back to ``gae_lambda``
-    # (exact legacy behaviour).  Set ~0.97–1.0 to engage.  Does NOT touch
-    # the cascade-sensitive imagination λ.
-    critic_anchor_lambda: Optional[float] = None
-    # Raise the anchor's pull when its long-horizon target must overcome the
-    # myopic imagined critic loss that keeps dragging V back to a ~10-step
-    # estimate.  ``None`` ⇒ use ``critic_replay_anchor_coef`` unchanged.
-    critic_anchor_coef_long: Optional[float] = None
-    # ---- #1 (P88, 2026-06-05): critic real-grounding rebalance ----
-    # Weight on the IMAGINED critic CE.  The cascade through-line is that the
-    # critic regresses almost entirely on its own imagined bootstrap
-    # (critic_target_v_r->0.97, critic_rew_to_tgt_var->0.001 = reward <0.1% of
-    # target variance) -> a self-referential pessimistic fixed point that
-    # freezes the actor.  Down-weighting the imagined CE (<1.0) lets the
-    # REAL-return replay anchor (``critic_replay_anchor_coef`` /
-    # ``critic_anchor_coef_long`` with ``critic_anchor_lambda``->1.0 = near-MC
-    # return-to-go over the real buffer) DOMINATE the critic target, so the
-    # value is grounded in realised economics instead of model fiction.  Pairs
-    # with #2 (latent overshooting): once the WM is accurate at long H the
-    # critic trained on REAL states also values IMAGINED states correctly
-    # (value-equivalence).  ``1.0`` = legacy (imagined-primary).  Env
-    # ``DREAMER_CRITIC_IMAG_LOSS_COEF``.
-    # Default 0.3 = p117 recipe: let the MC grounding term dominate the critic
-    # target so it can't self-inflate (promoted 2026-06-14; was 1.0).
-    critic_imag_loss_coef: float = 0.3
+    # Imagination-era critic knobs REMOVED (never read by
+    # ``_realsim_actor_critic_step``): ``critic_imag_loss_coef``,
+    # ``critic_replay_anchor_coef``, ``critic_anchor_lambda``,
+    # ``critic_anchor_coef_long``.  Real-sim grounding is the on-policy
+    # λ-return + diverse replay ``critic_batch`` + MC term below.
 
     # mbrl2 real-sim (p04, 2026-07-09): Monte-Carlo GROUNDING weight for the
     # real-sim actor-critic critic.  The critic target is the λ-return CE plus
@@ -588,14 +647,6 @@ class TrainConfig:
     # keeps correctly penalising the oscillation's violations → the actor LEARNS
     # smooth control from the objective (no move penalty needed).
     critic_mc_grounding_coef: float = 2.0
-
-    # When True, cap the MC return with a single discounted tail bootstrap
-    # ``γ^N·V_target(s_N)`` to remove the truncated-horizon bias; when False
-    # (default) the return is PURE MC (truncated at the segment end).  At
-    # ``seq_len`` = 128 / γ = 0.97 the truncation bias γ^128 ≈ 0.02 is
-    # negligible, so pure MC is the cleaner, fully-grounded default.  Env
-    # ``DREAMER_CRITIC_MC_TAIL_BOOTSTRAP``.
-    critic_mc_tail_bootstrap: bool = False
 
     # ---- MV / limit consistency (P86, 2026-06-05) ----
     # (1) Action→MV mapping basis.  The normalised actor action is mapped to an
@@ -632,6 +683,34 @@ class TrainConfig:
     # only their nominal starting value.  Set False (``DREAMER_RUNTIME_SETPOINT
     # _VARIATION=0``) only to freeze active≡base for a no-limit-step ablation.
     runtime_setpoint_variation: bool = True
+    # Operator-limit / target step size as a fraction of the base span.
+    # APCEnv constructs ``RuntimeSetpointConfig`` with dataclass defaults
+    # **0.15 / 0.20** (do **not** switch to ``auto_derive``: τ-derived
+    # change counts / ramp are not test_sim identity).  Leftover
+    # ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` ignored (P90-live).
+    runtime_setpoint_bounds_jitter_frac: float = 0.15
+    runtime_setpoint_target_jitter_frac: float = 0.20
+    # Remaining RuntimeSetpointConfig schedule knobs (identity 1/2, 0.10,
+    # 3, 0.05).  Were dataclass-only so env-free ``run_plan`` could not
+    # A/B them.  ``auto_derive`` still sizes change-count from τ — that
+    # is a later sim-adaptive A/B, not env-free identity (test_sim 1–2).
+    runtime_setpoint_bounds_changes_min: int = 1
+    runtime_setpoint_bounds_changes_max: int = 2
+    runtime_setpoint_target_changes_min: int = 1
+    runtime_setpoint_target_changes_max: int = 2
+    runtime_setpoint_ramp_duration_frac: float = 0.10
+    runtime_setpoint_curriculum_warmup_frac: float = 0.10
+    runtime_setpoint_n_magnitude_strata: int = 3
+    runtime_setpoint_target_inside_margin_frac: float = 0.05
+    # Per-CV rolling int_err / Δcv / var appended to aug-obs (P37 ON).
+    # ``DREAMER_DERIVED_OBSERVABLES=0`` via ``_cfg_from_env`` restores the
+    # legacy obs layout (different ``obs_dim`` — do not mix with an ON
+    # checkpoint).  Login leftover without ``_cfg_from_env`` is ignored.
+    derived_observables: bool = True
+    # Rolling window in agent steps.  Sentinel 0 = auto
+    # ``round(2·τ/sample_rate)`` clamped to ``[8, 128]``.  A/B only via
+    # ``DREAMER_DERIVED_OBS_WINDOW`` (``ENV_OVERRIDES``).
+    derived_observables_window: int = 0
 
     # ---- WM disturbance-estimator head (P87, 2026-06-05) ----
     # ML analogue of an APC disturbance observer / "prediction-error
@@ -742,6 +821,14 @@ class TrainConfig:
     # d_t is NORMALIZED obs space → the loss divides the target by the running CV
     # obs-norm std (threaded as ``cfg._cv_obs_std``).  0.0 = off (byte-identical).
     # ``DREAMER_DOB_GROUND_COEF``.
+    # P25 RCA: the replay buffer MUST store ``n_dist = n_cv`` whenever this
+    # is >0 OR the DOB is on — do not key storage off ``disturbance_head_dim``
+    # (that field is forced 0 when DOB replaces the head).
+    # P66 EXIT: per-sequence var-skip **REVERT / FALSIFIED** as DOB-amp
+    # (pred_std 0.252 vs P64 0.608; det_r 0.264 vs 0.352).  Mean MSE over
+    # all sequences (P64 identity).  P65 flush of the P1 ring is REVERTED.
+    # P89: high-pass the residual (val detrend window) so raw DC drift
+    # does not dominate the MSE that should train dynamic tracking.
     dob_ground_coef: float = 0.0
 
     # ---- Staged clean->disturbance curriculum (2026-06-12) ----
@@ -782,26 +869,22 @@ class TrainConfig:
     # against the NOMINAL plant (eval disables DR), forcing the categorical
     # latent to model a gain DISTRIBUTION ⇒ a systematically ATTENUATED
     # identified gain (the cross-run ~0.85 'ceiling').  When True the curriculum
-    # turns DR OFF for the seed collection + P1 (clean WM id) + P2 (DOB id).  As
-    # of Stage A (p135) DR STAYS OFF for P3 too — the actor's loop-gain
-    # robustness now comes from IMAGINATION-time gain randomization
-    # (actor_imag_gain_random_frac) rather than REAL-data DR, which created a
-    # train/imagination mismatch (p134 actor regression: the real loop gain
-    # varied ±frac but the actor imagined on the nominal frozen WM).  Textbook
-    # system-ID: identify the plant clean, then design a robust controller
-    # (robustness injected in imagination).  Sim-agnostic (toggles the existing
-    # randomizer).  ``DREAMER_CURRICULUM_WM_ID_DR_OFF``.
+    # turns DR OFF for the seed collection + P1 (clean WM id) + P2 (DOB id).
+    # mbrl2 real-sim: DR turns ON at P2→P3 (``set_domain_randomization(True)``)
+    # so the actor sees loop-gain robustness on the true simulator, not a
+    # deleted imagination gain-rand.  Textbook system-ID: identify the plant
+    # clean, then train a robust controller.  Sim-agnostic (toggles the
+    # existing randomizer).  ``DREAMER_CURRICULUM_WM_ID_DR_OFF``.
     curriculum_wm_id_dr_off: bool = True
 
 
-    # ---- World-model backbone (P68, 2026-05-30) ----
-    # ``'rssm'`` (DreamerV3 recurrent state-space model) is the new
-    # default: its deterministic GRU core can learn a held-action fixed
-    # point ``h* = f(h*, z*, a)`` — the structural property the
-    # SF-transformer lacked (``wm_pred_converges_under_constant_action``
-    # pinned at 0.0 across P64/P66/P67, the upstream cause of the
-    # bootstrap-cascade that every critic/reward-side fix failed to break).
-    # ``'sf_transformer'`` selects the original V4 shortcut-forcing WM.
+    # ---- World-model backbone (P68 RSSM / P77–P78 TSSM opt-in) ----
+    # ``'rssm'`` is the P64/P79 env-free default: DreamerV3 GRU observer.
+    # ``'tssm'`` (transformer-SSM over the lookback) was P77/P78 env-free;
+    # consecutive family FALSIFIED as freeze / GAIN-READY (Markovian then
+    # rest-IC KV-continue).  Opt in ``DREAMER_WORLD_MODEL_TYPE=tssm``.
+    # ``'sf_transformer'`` is the original V4 shortcut-forcing WM (no
+    # held-action fixed point).
     world_model_type: str = 'rssm'
     rssm_deter_dim: int = 512          # GRU hidden (paper Medium)
     rssm_n_categoricals: int = 32      # paper
@@ -809,11 +892,16 @@ class TrainConfig:
     rssm_embed_dim: int = 256
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01          # paper 1% uniform mixture
-    # Latent type (2026-08-12): 'categorical' (DreamerV3) or 'deterministic' (a
-    # continuous tanh latent, NO variational KL — no quantization, so the CV/DV
-    # gain is not attenuated).  Deterministic uses the joint-embedding predict-
-    # next-latent MSE (coef below) for prior/posterior imagination consistency.
-    rssm_latent_type: str = 'categorical'
+    # Latent type (2026-08-12): 'deterministic' (continuous tanh, NO variational
+    # KL — no quantization, so the CV/DV gain is not attenuated) or
+    # 'categorical' (DreamerV3, opt-in).  Deterministic uses the joint-embedding
+    # predict-next-latent MSE (coef below) for prior/posterior consistency.
+    # P26/P28 set this via DREAMER_RSSM_LATENT_TYPE; the TrainConfig default
+    # stayed 'categorical', so env-free P29 silently dropped it (recon stuck
+    # ~0.49, kl_loss pinned at free_bits, joint_embed≡0 vs P26 recon <0.02).
+    # Default is now the north-star / P26 observer.  Opt in to V3 with
+    # DREAMER_RSSM_LATENT_TYPE=categorical.
+    rssm_latent_type: str = 'deterministic'
     rssm_latent_noise: float = 0.0       # reparam noise on deterministic latent (regularizer)
     rssm_joint_embed_coef: float = 1.0   # deterministic-latent consistency weight
     rssm_free_bits: float = 0.5        # p117 recipe (promoted 2026-06-14; paper=1.0)
@@ -850,9 +938,111 @@ class TrainConfig:
     # supervisor that pins the subdominant DV gain).  Resolved >0 only when the
     # continuous gain channel is on AND the identified gains are available.
     gain_match_coef: float = 0.0
-    gain_match_len: int = 0            # K step-response rollout steps (= horizon)
+    gain_match_len: int = 0            # K FD steps; <=0 auto = control H
+    # Held prior-roll BEFORE the FD (P44).  Dataclass ``-1`` = off
+    # (P43 identity: FD from the replay posterior).  ``0`` = auto
+    # ``horizon`` (A/B only).  P44 env-free auto=H storm **2/2 @iter 66**
+    # (G_pred≈0, CAPPED 0.76@DV) → REVERT default off.  The TM probe's
+    # default window is ``wm_tf_horizon(H) = max(80, 4·H)`` (test_sim
+    # 220).  **P67 CAPPED GAIN_NOT_READY 0.80@DV:** teacher K auto =
+    # 4H **REVERT** to control H (jsonl ×1 at 220 ≠ TM DC; P64 at K=H
+    # PASS 0.91@DV).  Explicit ``DREAMER_GAIN_MATCH_LEN=220`` A/B.
+    # Matching 4H *settle* (S=H_tf) is still not a retry of S=H.
+    # P43 Huber ~1e-4 from PRBS
+    # posteriors while the rest-then-step probe stays ~0.75@DV.  P43 DV
+    # @H ×0.849 vs ss ×0.740 is a real 4H-asymptote gap (MV @H≈ss); do
+    # not cite "@H≈ss" for DV.  Gradful (P25: detaching the gain-match
+    # roll kills DC).  Extra cost is one ``Bm×S`` roll vs the FD's
+    # ``(n_mv+n_dv)·Bm×K`` (rest-pre; PRBS fallback still
+    # ``(1+n_mv+n_dv)·Bm×K``).  ``DREAMER_GAIN_MATCH_SETTLE_LEN``.
+    gain_match_settle_len: int = -1
+    # P45 EXIT PROMOTE: TM-protocol rest IC.  Collect real held-OP lookbacks
+    # (noise-free const-action), teacher-force ``rollout_observed``
+    # (gradful; P25), then FD from that posterior.  Isolation **loss**
+    # stays 0.  Real rest replaces the P44 WM-held settle of a PRBS
+    # start (P44 EXIT: S=H storm 2/2, val DV ss/@H ×0.751/×0.842,
+    # freeze last_ok 57).  **P45 EXIT PROMOTE** default True: first
+    # GAIN-READY freeze since P40–P44 0.75@DV (gate 0.86@DV; val MV
+    # ss/@H ×0.877/×0.887, DV ×0.815/×0.875).  **P68:** rest-IC Huber
+    # baseline is last rest-obs CV (TM ``pre``), not held-K WM pred
+    # (P67 CAPPED 0.80@DV / val MV ×1.35; jsonl ×1 ≠ TM vs rest-pre).
+    # ``DREAMER_GAIN_MATCH_REST_IC=0``
+    # reverts to PRBS-posterior FD.  Collect settle = max(H, lookback)
+    # — **not** ``wm_tf_horizon``.  Encode ``L`` is
+    # ``gain_match_rest_ic_len`` (P57 EXIT **REVERT** default ``0`` =
+    # lookback; ``-1`` A/B last ``max(K, 2τ/sr)`` of settle).
+    gain_match_rest_ic: bool = True
+    # Identity speed: CUDA-graph the rest-IC ``last_only`` T-loop (static
+    # cached obs/act, ``sample=False``, full BPTT).  RSSM only (TSSM
+    # kv-cache grows).  Capture is warmed **outside** the P1 WM autocast
+    # loop; in-loop never captures (P55: parent autocast cache rejected
+    # ``make_graphed_callables`` and ``_rest_ic_cg_fail`` pinned eager
+    # ``t_wm`` ~127 s).  The graphed callable is ``_RestICGraphModule``
+    # so RSSM ``parameters`` / ``named_parameters`` / ``buffers`` /
+    # ``named_buffers`` are the capture surface (P56: a nested
+    # function had empty ``parameters()`` → ``grad requires non-empty
+    # inputs``; overriding only ``parameters()`` left
+    # ``named_parameters()`` / ``buffers()`` empty).  Capture-fail /
+    # CPU stay eager.  VRAM <512 MiB skip does **not** pin
+    # ``_rest_ic_cg_fail`` (warmup retries once after ``empty_cache``).
+    # Opt out ``DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0``.  Capture
+    # suppresses leftover AccumulateGrad stream-mismatch across
+    # ``make_graphed_callables``, the GRU-grad canary, **and** every
+    # live WM backward while the graph is held (P59: P58 restored
+    # the flag after canary; first ``world_model_loss`` backward
+    # still printed the one-shot UserWarning).  Release restores it.
+    gain_match_rest_ic_cuda_graph: bool = True
+    # Encode length of the rest lookback.  Collect settle stays
+    # ``max(H, lookback)`` so the plant reaches SS; ``L`` is the **last**
+    # frames fed to the GRU.  **P57 EXIT REVERT** default ``0`` =
+    # lookback (test_sim 128, reset→SS in the IC): val MV ss/@H
+    # **×0.715 / ×0.712** vs P56 lookback **×0.765 / ×0.760** vs P53
+    # **×0.900 / ×0.898**.  Live gate 0.93@MV did not survive val TM
+    # (compounding open-loop ×0.632).  Actor still P53-class
+    # (−14 vs −97 9/9) — not an observer win.  Sentinel ``-1`` A/B =
+    # last ``max(K, round(2·τ/sr))`` when identifier τ is present
+    # (test_sim L=55); missing τ keeps lookback (no 50 s fake).
+    # ``>0`` = exact.  Do **not** set settle to ``wm_tf_horizon``.
+    # ``DREAMER_GAIN_MATCH_REST_IC_LEN``.
+    gain_match_rest_ic_len: int = 0
     gain_match_max_starts: int = 6
-    gain_match_step: float = 1.0       # Δinput (normalized) for the FD probe
+    # Δinput (normalized) for the FD probe.  ``<=0`` auto =
+    # ``wm_tf_step_frac`` (P59 RCA / P60): teacher Huber at Δu=1.0 pinned
+    # jsonl ``*_ratio`` ~×1 while live/val TM measures G(Δu=0.4).  GRU is
+    # nonlinear ⇒ G(1) ≠ G(0.4).  Explicit
+    # ``DREAMER_GAIN_MATCH_STEP=1.0`` A/B's the old teacher.
+    gain_match_step: float = 0.0
+    # P61: cube-clip held FD a/dv to ``[-1, 1]`` and reverse the per-start
+    # step if clip would shrink ``|Δu|`` (step-settle reverse-before-reclip;
+    # TM ``compute_transfer_matrix`` skip-noop + realized ΔMV).  Huber
+    # divides by the *applied* Δu, not the commanded step.  Identity when
+    # rest+step is interior (test_sim 0.6+0.4 sits on the cube edge;
+    # ``op_band+step>1`` on other plants used to silently deflate G).
+    # ``DREAMER_GAIN_MATCH_CLIP_REALIZED=0`` restores P60 commanded-step.
+    gain_match_clip_realized: bool = True
+    # Huber is ABSOLUTE (P26 observer, MV ×0.97).  P27 relative Huber
+    # (``(g-tgt)/|tgt|``) gave the subdominant DV ~5× the MV gradient and
+    # exploded full-BPTT at P1 iter 50 — the A/B path was removed, not
+    # kept as opt-in.  Do not re-add ``gain_match_relative``.
+    # Huber β for the gain-match residual (WM-norm gain units).  1.0 matches
+    # the P24–P28 env default.  ``<=0`` = auto at resolve-time: median |tgt|
+    # (sim-adaptive; only when ``gain_match_huber_per_input`` is False —
+    # median of {2.62, 0.51} ≈ 1.56 does not equalize).
+    # ``DREAMER_GAIN_MATCH_HUBER_BETA``.
+    gain_match_huber_beta: float = 1.0
+    # Per-element Huber β = |tgt_ij| (P43).  L1 saturation is still ±1
+    # (same as abs Huber for large errors) so this is NOT relative Huber
+    # (P27 residual ``(g-tgt)/|tgt|`` → L1 grad 1/|tgt|).  A 25% DV miss
+    # stays in the L2 region scaled with |G|.  Isolation-off moved |tgt|
+    # drowning (test_sim MV 2.62 vs DV 0.51) into this sole DC supervisor.
+    # ``DREAMER_GAIN_MATCH_HUBER_PER_INPUT=0`` = scalar β.
+    gain_match_huber_per_input: bool = True
+    # Isolation / ss-match TBPTT stride (GRU ``h`` only, ``keep_c``).  Never
+    # cuts inside the settled SS-match window.  Dataclass 16 is the P24/P25
+    # test_sim point (16 of K≈55).  ``_resolve_aux_tbptt_steps`` replaces the
+    # default with ``max(8, round(K/3.5))`` so fast/slow plants scale; explicit
+    # ``DREAMER_AUX_TBPTT_STEPS`` wins.  ``<=0`` always auto.
+    aux_tbptt_steps: int = 16
     # Resolved gain targets (WM/normalized units): per-input rows of n_cv gains.
     # ``*_kinds``/``*_idx`` map each row to an action col (mv) or dv-vector col.
     gain_match_mv_target: Tuple[Tuple[float, ...], ...] = ()
@@ -860,6 +1050,14 @@ class TrainConfig:
     # Gain-channel persistence: a light L2 on the step-to-step change of the
     # gain block (the gain is a per-episode CONSTANT, so it should not wander).
     # p08 (2026-07-10): 0.0→0.1 (enabled now that the gain channel is default-on).
+    # P73: the same coef also L2-pins OL gain-c at teacher K to sg(rest-IC
+    # MEAN G). Posterior Δ persist does not constrain ``img_rollout`` prior G.
+    # P79 EXIT: rssm KEEP; identity missed P64 freeze 0.91@DV (P79 0.81@DV
+    # last_ok 81 GAIN-READY, actor VALID, loses to P64). P64 predates OL persist.
+    # P80 EXIT REVERT: default 0.1→0.0 FALSIFIED as P64 freeze-DV/TM/champ
+    # (freeze 0.87@DV still short of 0.91; val MV ×0.723 vs P79 ×0.923;
+    # 1step→OL ×0.735 vs P79 ×0.840; paired −35 vs P79 −10.57 / P64 −4.54).
+    # Persist-off regressed P79 TM to P73-class. Restore 0.1. Do not persist N+1.
     cont_gain_persist_coef: float = 0.1
     # ---- MIMO self-supervised per-INPUT isolation (2026-07-10) ----
     # The DATA-DRIVEN generalisation of C(1) gain-match: on isolated-excitation
@@ -870,10 +1068,16 @@ class TrainConfig:
     # point) and INPUT-SYMMETRIC (MV or DV — the loss never looks at which input
     # it is).  ``sample=False`` routes the gradient into the continuous gain
     # channel (bypassing the categorical bottleneck that attenuates SUBDOMINANT
-    # inputs).  Auto-enabled (coef→0.5, len→horizon) when the cont gain channel
-    # is on AND isolated episodes exist.  ``DREAMER_WM_INPUT_ISOLATION_COEF``.
+    # inputs).  Env-free default is **off** (P40): P08 auto-enabled
+    # isolation=1 whenever cont-gain was on; P26 jsonl confirms that
+    # auto-enable ran (``wm_input_isolation_loss`` 1.44 at iter 1 — the
+    # on-disk ``run_plan`` 0.0 was the pre-rewrite dump).  P28+ whole-
+    # episode isolation + first-class ss-match then drowned DV (P26
+    # ×0.87 → P32–P39 ×0.66–0.70).  Gain-match (identified G, per-input
+    # FD Huber) is the DC supervisor.  Opt in
+    # ``DREAMER_WM_INPUT_ISOLATION_COEF`` (len/settle auto-fill).
     wm_input_isolation_coef: float = 0.0
-    wm_input_isolation_len: int = 0    # K-step prior rollout (auto = horizon)
+    wm_input_isolation_len: int = 0    # K-step prior rollout (auto = horizon when isolation on)
     # ---- Self-supervised STEADY-STATE (DC-gain) match (2026-08-03, p08 RCA) ----
     # The isolation loss's per-step trajectory MSE is TRANSIENT-dominated, so it
     # under-determines the DC (steady-state) gain → both WM gains SHRANK (p08:
@@ -882,16 +1086,50 @@ class TrainConfig:
     # timing-INSENSITIVE, so it pins the DC gain WITHOUT the identified value
     # (nonlinear / black-box safe, local per operating point).  It is the
     # self-supervised generalisation of C(1) gain-match; fed by dedicated
-    # long-hold isolated SETTLE episodes.  Auto-enabled with isolation.
-    # ``DREAMER_WM_SS_MATCH_COEF``.
+    # long-hold isolated SETTLE episodes.  Stays off unless isolation is
+    # opted in (``DREAMER_WM_SS_MATCH_COEF``).  P08 auto-enable 3.0 is
+    # the same teacher that drowned DV on P32–P39.
     wm_ss_match_coef: float = 0.0
-    wm_ss_match_window_frac: float = 0.34   # terminal fraction of K used as the SS window
+    # Terminal fraction of K used as the SS window.  Isolation off
+    # env-free (P40).  In ``ENV_OVERRIDES`` (identity 0.34).
+    wm_ss_match_window_frac: float = 0.34
     # Option 1 (2026-08-17): weight the DC-gain match by how SETTLED each seq's
     # REAL CV window is (exp(-Var/ss_var), normalized units) so the per-input
     # steady-state gain is identified ONLY from settled data — undilutes the
     # signal a mixed PRBS+settle isolation batch drowns.  0 = off (unweighted).
     wm_ss_match_settle_var: float = 0.0
-    wm_isolation_settle_episodes: int = 0   # dedicated long-hold isolated settle eps (auto)
+    wm_isolation_settle_episodes: int = 0   # long-hold settle eps PER isolated input (auto 24)
+    # Isolation / ss-match is ABSOLUTE MSE (P33).  Inverse-variance reweight
+    # (``wm_isolation_var_norm``) skip-stormed P1 three formulas (P34 AM/HM
+    # explode, P35 quiet-hold, P36 33× DV) — same class as P27 relative
+    # Huber.  The A/B path was removed, not kept as opt-in.  Do not re-add
+    # ``wm_isolation_var_norm`` / ``DREAMER_WM_ISOLATION_VAR_NORM``.
+    # Equalize isolation |ΔCV| SNR via excitation (P33 RCA):
+    # ``Δu_i ∝ 1/|G_i|`` from gain-match WM-norm targets, then
+    # ``level*scale`` clipped to ±1.  Linspace is ``±op_band`` so the
+    # *applied* edge |Δu| is ``min(1, op_band·scale)``.  Scale is
+    # **floored at 1.0** (P38 RCA): never shrink the strong-|G|
+    # teacher below op-band.  P38 match-at-``g_min`` (no floor) gave
+    # test_sim MV edge |Δu| 0.19 vs P37 0.60 → gmatch stuck 1.30,
+    # storm 2/2, CAPPED GAIN_NOT_READY 0.01@DV.  Floor keeps MV at
+    # P37 SNR and still boosts the weak input up to the cube
+    # (test_sim DV edge |Δu| 1.0 vs P37 0.60).  Abs MSE on
+    # isomorphic |Δu| drowns the weak-|G| input (|tgt| MV 2.82 vs
+    # DV 0.49 → P32/P33/P37 freeze DV ×0.66–0.71).  This is DATA
+    # amplitude, not a loss reweight.  Equal-|G| plants keep the
+    # op-band linspace.  Opt out ``DREAMER_WM_ISOLATION_DCV_MATCH=0``
+    # for isomorphic |Δu| (P37 P1 form).
+    wm_isolation_dcv_match: bool = True
+    # Unitless isolation-scale floor (P38 RCA).  1.0 = never shrink the
+    # strong-|G| teacher below op-band.  0 = P38 match-at-``g_min``
+    # (FALSIFIED: MV edge |Δu| 0.19, storm 2/2, val DV ×0.007).
+    # Cube still clips applied |Δu| to 1.  When |G_max|/|G_min| >
+    # 1/op_band, |ΔCV| cannot equalize without shrinking the strong
+    # teacher or exceeding the cube — floor 1.0 leaves residual
+    # |ΔCV| imbalance (test_sim ~5.8 > 1.67).  P39 CAPPED 0.70@DV.
+    # Audit ``run_plan.isolation_dcv_scales.equalize_possible`` /
+    # ``g_ratio`` / ``smax``.  ``DREAMER_WM_ISOLATION_DCV_MIN_SCALE``.
+    wm_isolation_dcv_min_scale: float = 1.0
     # C(2) disturbance-matching (p138 RCA): supervise the cont DISTURBANCE
     # channel's posterior mean toward the recorded true hidden load so it
     # actually ENCODES the unmeasured disturbance (the inherent amortized-Kalman
@@ -931,15 +1169,14 @@ class TrainConfig:
     dv_as_input: bool = True
     dv_dim: int = 0
     dv_indices: Tuple[int, ...] = ()
-    # DV→decoder+heads FEEDFORWARD (2026-06-19, p129 RCA).  Route the measured
-    # DV directly into the WM decoder AND the reward/value/policy heads (in
-    # addition to the transition), so the CV reconstruction ``g(h, z, dv)`` has
-    # a DIRECT ∂CV/∂dv path that SKIPS the categorical bottleneck where the
-    # DV→CV gain was dying (p129 DV posterior-prior decomp: real→post ×0.77,
-    # post→1step ×1.00 — the loss is the autoencoder, not data/excitation), and
-    # the actor finally SEES the disturbance in imagination (fixes the passive
-    # actor).  Sim-adaptive: no-op when the plant has no measured DV (dv_dim=0).
-    # Backbone-agnostic (RSSM + TSSM).  Opt out with DREAMER_DV_FEEDFORWARD=0.
+    # DV in the head-facing feat (2026-06-19, p129; decoder half OFF p146).
+    # Measured DV is concatenated onto reward/value/policy ``feat`` so the
+    # actor sees the load.  Decoder feedforward is a *separate* knob
+    # (``dv_decoder_feedforward``, default False): a memoryless dv_t→CV_t
+    # path that skipped GRU dead-time and biased DV DC-gain low.  Do not
+    # special-case DV in the decoder; ``dv_as_input`` + gain-match is the
+    # symmetric MV/DV path.  No-op when the plant has no measured DV
+    # (dv_dim=0).  Opt out with DREAMER_DV_FEEDFORWARD=0.
     dv_feedforward: bool = True
     # DV→DECODER half of the feedforward (2026-08-06, p146 RCA).  Keep the DV in
     # the head feat (actor sees the load) but REMOVE the memoryless dv_t→CV_t
@@ -976,23 +1213,6 @@ class TrainConfig:
     tssm_n_layers: int = 4
     tssm_n_heads: int = 8
     tssm_max_seq_len: int = 256
-    # P70 (2026-05-30) imagination steady-state fixes.  The trained RSSM
-    # prior map CONTRACTS to a fixed point under a held action (offline
-    # probe: deterministic-mode tail_std ~0.01), but per-step categorical
-    # RE-sampling in imagination re-injects ~0.84 nats/group of latent
-    # noise every step → the reward head (≈quadratic CV penalty) sees a
-    # curvature·Var positive penalty bias on EVERY imagined step → too-
-    # negative imagined returns → critic pessimism → return_scale runaway
-    # → bootstrap cascade (flat MV).  Opt-in mitigation:
-    #   ``rssm_imag_latent_mode``: roll the imagined PRIOR with the
-    #       categorical MODE (argmax, sample=False) instead of a sample —
-    #       removes the per-step jitter so the reward head sees the
-    #       settled mean latent.  Actor exploration still comes from the
-    #       policy's own action sampling (TD-MPC2-style deterministic
-    #       latent + stochastic action).  Default True = p117 recipe: removes the
-    #       per-step imagined-latent jitter that biases imagined returns negative
-    #       and feeds the cascade (promoted 2026-06-14; paper-faithful = False).
-    rssm_imag_latent_mode: bool = True
     # Buffer seeding (P0 cold-start fix, 2026-05-05; expanded 2026-05-06).
     # Replace the two random-action seed episodes with ``baseline_seed_episodes``
     # of small-noise actions around mid-MV.  Stays in-bounds on cliff-shaped
@@ -1003,6 +1223,21 @@ class TrainConfig:
     # diagnosed in run_p0adapt.
     baseline_seed_episodes: int = 16
     baseline_seed_action_std: float = 0.05
+    # Unitless fraction of normalised action for stratified baseline-seed
+    # centres.  Env-free 0.6 matches the historical
+    # ``min(0.6, prbs_seed_op_band)`` default (PRBS default 0.95).
+    # When not explicitly overridden, still capped at the PRBS band so a
+    # tighter PRBS envelope cannot leave baseline centres outside it.
+    # Was ``os.environ.get('DREAMER_BASELINE_SEED_OP_BAND')`` inside
+    # ``train()`` (worked, but invisible in ``run_plan``).
+    baseline_seed_op_band: float = 0.6
+    # Seed-σ formula inputs (``σ = clip(frac·cv_w/mv_auth, 0.01, cap)``).
+    # Were ``os.environ.get('SEED_TARGET_CV_FRAC'/'SEED_SIGMA_CAP')``
+    # inside ``auto_tune_seed_buffer`` (worked, missing from
+    # ``run_plan``). Unitless. Leftover names are **not** read
+    # (P87-live; TrainConfig + ``DREAMER_SEED_*`` only).
+    seed_target_cv_frac: float = 0.20
+    seed_sigma_cap: float = 0.30
     random_seed_episodes: int = 6
     # Structured PRBS-style exploration episodes for WM coverage breadth
     # (2026-05-08, run_p7 RCA).  Drives MV across the operating band
@@ -1034,7 +1269,8 @@ class TrainConfig:
     # time constant) rather than just the early transient slope.
     # Floor 8, cap T/4 so each episode still contains ≥ 4 segments.
     # Sentinel 0 means "use auto-derived" — any positive value
-    # overrides.
+    # overrides.  In ``ENV_OVERRIDES`` so A/B is not silently dropped
+    # (auto-tune honours ``_explicit_fields``).
     prbs_seed_segment_steps: int = 0
     # PRBS segment-length MIN (agent steps).  When > 1 and
     # < prbs_seed_segment_steps, each PRBS segment's hold time is
@@ -1047,6 +1283,12 @@ class TrainConfig:
     # system-ID remedy.  Auto-derived in ``auto_tune_seed_buffer``
     # to ``max(2, round(τ / (3 sr)))``.  Sentinel 0 = use auto.
     prbs_seed_segment_steps_min: int = 0
+    # Clip floors for the PRBS segment formula (agent steps, not
+    # engineering units).  Were ``os.environ.get('PRBS_SEG_MIN' /
+    # 'PRBS_SEG_MIN_FLOOR')`` (worked, missing from ``run_plan``).
+    # Leftover names are **not** read (P87-live; A/B ``DREAMER_PRBS_SEG_MIN*``).
+    prbs_seg_min: int = 8
+    prbs_seg_min_floor: int = 2
     # Constant-action seed episodes (2026-05-21, p31 RCA).  Holds the
     # action perfectly constant for the entire episode at a sampled
     # level in ``[-constant_action_seed_op_band, +constant_action_seed_op_band]``.
@@ -1058,7 +1300,10 @@ class TrainConfig:
     # diagnostic: real plant converges 75–88%, WM 0% under constant
     # action).  10 full-length constant-action episodes give the WM
     # explicit steady-state coverage at a stratified spread of operating
-    # points.  Set to 0 to disable.
+    # points.  Set to 0 to disable.  Scalar level broadcasts to every
+    # MV (test_sim n_mv=1).  MIMO uses independent per-MV permutations
+    # of the same linspace (``_per_mv_hold_rows``) so joint SS is not
+    # only the all-MVs-equal diagonal; episode count stays this sentinel.
     constant_action_seed_episodes: int = 40
     # Operating-band fraction for the constant-action seed.  Narrower
     # than ``prbs_seed_op_band`` (0.95) on purpose: at the very edges of
@@ -1088,7 +1333,8 @@ class TrainConfig:
     # readout; max keeps the step in a regime where the plant doesn't
     # saturate at one end.  ``u₀`` is stratified over op_band as before;
     # ``u₁ = clip(u₀ + Δ, -1, 1)`` with Δ uniformly sampled from
-    # ``±[step_seed_delta_min, step_seed_delta_max]``.
+    # ``±[step_seed_delta_min, step_seed_delta_max]``.  In
+    # ``ENV_OVERRIDES`` (identity; ``single_run`` used to drop A/B).
     step_seed_delta_min: float = 0.20
     step_seed_delta_max: float = 0.60
     # Fraction of the episode used for the pre-step hold (settling
@@ -1096,6 +1342,7 @@ class TrainConfig:
     # ep_len=1220 ≈ 7 settling times at τ=53/sr=4 (τ_steps≈13) — well
     # past the SS for u₀.  Leaves 1098 steps post-step for the new
     # settling, ~84 settling times → ample long-horizon SS coverage.
+    # In ``ENV_OVERRIDES`` (identity 0.05 / 0.20).
     step_seed_prefix_frac_min: float = 0.05
     step_seed_prefix_frac_max: float = 0.20
     # ---- APC step-test seed (P51 design, 2026-05-25) ----
@@ -1137,7 +1384,8 @@ class TrainConfig:
     # every DV gets balanced isolated-step coverage).  The remainder
     # are picked uniformly at random across all DV channels — covers
     # cross-DV cases.  0.7 = strong stratification while still seeing
-    # the off-primary DVs.
+    # the off-primary DVs.  Analogous MV events use ``primary_mv_pos``
+    # (one MV per event; test_sim n_mv=1 identity).
     step_test_primary_dv_bias: float = 0.7
     # ---- DV-PRBS seed episodes (2026-06-14, p121 DV-gain RCA) ----
     # The DV analogue of the MV's ``collect_prbs_episode``: hold the MV and
@@ -1161,6 +1409,34 @@ class TrainConfig:
     # (≈0.79–0.84) vs the well-excited MV; a larger sweep raises Var(DV) further
     # (less errors-in-variables dilution) + covers more nonlinear operating points.
     dv_prbs_op_frac: float = 0.8
+    # ---- P1 re-inject cadence (sim-adaptive; P28 follow-up 5) ----
+    # Dataclass 20/20/10/20 are the test_sim sentinels (ep_len≈1220,
+    # 400k-step buffer, 5 eps/iter → ~66-iter FIFO lap).  ``_resolve_
+    # inject_cadence`` replaces them with ``round(frac × lap)`` so a
+    # longer-τ plant (fewer episodes in the same step-cap) injects more
+    # often and a faster plant less often.  Episode length is already
+    # ``k·(τ+θ)``, so this is f(buffer turnover / τ) with no engineering
+    # units.  ``0`` disables.  Explicit ``DREAMER_*_INJECT_EVERY`` wins.
+    # Inject N (P28 follow-up 6): dataclass 5/2/2/3 are test_sim sentinels
+    # (1 MV + 1 DV).  ``_resolve_inject_cadence`` replaces them with
+    # ``max(sentinel, f(n_mv, n_dv))`` so a MIMO plant gets ≥1 episode per
+    # input channel per shot (step-test) and ≥1 MV-hold per DV-PRBS sweep.
+    # Explicit ``DREAMER_*_INJECT_N`` wins.  ``0`` disables.
+    const_action_inject_every: int = 20
+    const_action_inject_n: int = 5
+    const_action_inject_in_p2: bool = False
+    const_action_inject_in_p3: bool = False
+    step_test_inject_every: int = 20
+    step_test_inject_n: int = 2
+    step_test_inject_in_p2: bool = False
+    step_test_inject_in_p3: bool = False
+    dv_prbs_inject_every: int = 10
+    dv_prbs_inject_n: int = 2
+    dv_prbs_inject_in_p2: bool = False
+    dv_prbs_inject_in_p3: bool = False
+    expert_inject_every: int = 20
+    expert_inject_n: int = 3
+    expert_inject_in_p3: bool = True
     # P2 BC bootstrap weight.  Default 0 because we have no offline expert
     # data — random-action episodes from P1 collection are uniform, so a
     # non-zero bc_scale clones uniform → uniform prior_policy → PMPO KL
@@ -1186,10 +1462,33 @@ class TrainConfig:
     # auto-set to ``expert_bc_scale`` (cloning is MASKED to expert steps only).
     expert_type: str = 'static'
     expert_bc_scale: float = 0.15     # bc_scale applied when expert populates buffer
+    # P45–P49 RCA: P1/P2 Gaussian NLL BC pins last-Linear log_std to
+    # σ_min (P49 first P3 entropy −0.283 = H(σ_min) at ratio 1.2; P2
+    # ``bc_loss`` ≈ −1 is a peaked NLL). P3 ``expert_bc_p3_loss`` is
+    # already MSE-on-μ so it does not fight σ. Align P1/P2 to that
+    # form: clone μ, leave σ at ``policy_init_log_std``. Expert BC is
+    # a mean launchpad, not a variance teacher. Opt out
+    # ``DREAMER_BC_MEAN_ONLY=0`` (legacy NLL).
+    bc_mean_only: bool = True
     expert_seed_episodes: int = 24    # expert-driven seed episodes added in P1
     expert_action_jitter: float = 0.03  # Gaussian σ around expert action (norm units)
     expert_keep_schedule: bool = True   # demonstrate under curriculum disturbances
     expert_use_ss_samples: bool = True  # fit/train from a fresh steady-state sweep
+    # Move-law (unitless fractions / counts).  Were leftover
+    # ``DREAMER_EXPERT_*`` ``os.environ.get`` inside ``apc_expert``
+    # (worked, missing from ``run_plan``).  Identity defaults match
+    # the constructor fallbacks.  A/B only via ``DREAMER_EXPERT_*``
+    # (``ENV_OVERRIDES`` / ``_cfg_from_env``).  Login leftover without
+    # ``_cfg_from_env`` is ignored.
+    expert_move_frac: float = 0.30
+    expert_backoff_frac: float = 0.12
+    expert_econ_frac: float = 0.02
+    expert_loop_gain: float = 0.6
+    expert_ridge_frac: float = 0.05
+    expert_feas_scale: float = 0.02
+    expert_econ_scale: float = 1.0
+    expert_opt_iters: int = 40
+    expert_opt_lr: float = 0.1
 
     # ----- P83: decaying P3 expert-BC anchor (anti-reversion) -----
     # P79/P80/P81b all show the SAME late-P3 reversion: the deterministic
@@ -1218,13 +1517,6 @@ class TrainConfig:
     # the anchor evaporated).  Decay is 1→floor so the early warmstart is
     # unchanged; a 0.1 LATE-P3 floor re-anchors the policy to arrest the drift.
     expert_bc_p3_floor: float = 0.1
-    # TD3+BC return-scale normalisation (Fujimoto 2021).  OPT-IN (default
-    # off): REINFORCE already divides the advantage by return_scale, so the
-    # PG gradient on μ is already O(1) regardless of scale and a fixed-weight
-    # MSE-on-μ BC is already proportionate.  Enable only if the logged
-    # bc_p3/pg grad ratio shows the anchor being drowned as return_scale
-    # grows (then bc_weight_eff = w * advantage_clip / max(return_scale,1)).
-    expert_bc_p3_adaptive_scale: bool = False
     # ---- (BC learning-vs-crutch tracking, 2026-06-09) ----
     # Diagnostic: is the actor LEARNING beyond the expert, or just being held
     # at the expert by the permanent BC floor (expert_bc_p3_floor)?  When
@@ -1298,8 +1590,79 @@ class TrainConfig:
     #      default 0.0:0.4) so the WM learns base dynamics + the attractor
     #      first.  P3 always full noise (robust rejection).  Set False / ramp
     #      "1.0:1e-6" for legacy full-noise-from-step-0.
+    # Isolation/ss-match settle (P28 follow-up 8) uses the same gate:
+    # long-hold per-input episodes must also be noise-free or process OU
+    # + measurement noise confound DC-gain (errors-in-variables / never
+    # truly settled — the same P89 RCA, now on the buffer that actually
+    # trains ``wm_ss_match``).
     clean_steady_seeds: bool = True
     process_noise_curriculum: bool = True
+    # Noise / hidden-load schedule. Identity defaults. Strings are
+    # unitless ``start:reach`` / ``lo:hi`` / CSV weights.
+    # ``hidden_ou_prob_max < 0`` = follow ``disturbance_prob_wm``.
+    # A/B via ``ENV_OVERRIDES`` / ``_cfg_from_env`` only (P92-live
+    # leftover helper dual-read REMOVED).
+    process_noise_amp_ramp: str = '0.0:0.4'
+    hidden_disturbance: bool = True
+    hidden_ou_amp_ramp: str = '0.1:0.4'
+    # P1 plant-ID cap.  P2/P3 use ``hidden_ou_amp_max_scale_p3`` (P64:
+    # Kalman ID at deployment amp while g is frozen).  Do not raise this
+    # with P2 — P1 has no DOB (p112 omitted-variable).  Opt out of P2
+    # mapping is a code revert, not this field.
+    hidden_ou_amp_max_scale: float = 0.2
+    hidden_ou_amp_max_scale_p3: float = 1.0
+    hidden_ou_amp_jitter: str = '0.6:1.6'
+    hidden_ou_drift_frac: float = 0.4
+    disturbance_prob_agent: float = 0.3
+    disturbance_prob_p2: float = 0.2
+    disturbance_prob_wm: float = 0.10
+    hidden_ou_prob_p3_ramp_reach: float = 0.5
+    hidden_ou_prob_p2_ramp_reach: float = 0.5
+    hidden_ou_prob_min: float = 0.05
+    hidden_ou_prob_max: float = -1.0
+    hidden_ou_prob_target_score: float = 2.0
+    hidden_dist_settle_n_tau: float = 4.0
+    hidden_dist_max_events: int = 6
+    hidden_dist_p_isolated: float = 0.5
+    hidden_dist_p_revert: float = 0.7
+    hidden_dist_shape_weights: str = '0.5,0.3,0.2'
+    hidden_dist_spread: bool = True
+    hidden_dist_tau_frac: str = '0.5:1.0'
+    hidden_dist_deadtime_frac: str = '0.5:1.5'
+    # Plant SNR (process OU + measurement).  Were leftover ``SIM_OU_*`` /
+    # ``SIM_MEAS_*`` / ``SIM_NOISE_ADAPTIVE`` in ``build_noise_config``.
+    # Identity.  TrainConfig + ``DREAMER_SIM_*`` only (P91-live leftover
+    # ``SIM_*`` ignored).  ``SIM_NOISE_CONFIG_JSON`` stays env-only (path).
+    sim_noise_adaptive: bool = True
+    sim_ou_sigma_frac: float = 0.008
+    sim_ou_gain_cv: float = 0.15
+    sim_ou_gain_dv: float = 0.60
+    sim_meas_noise_cv_frac: float = 0.005
+    sim_meas_noise_dv_frac: float = 0.010
+    # Runtime wrapper (seed / jitter / enable / DR).  Were leftover
+    # ``SIM_NOISE_SEED`` / ``SIM_NOISE_JITTER_PCT`` /
+    # ``SIM_DOMAIN_RANDOMIZATION``.  Identity.  TrainConfig +
+    # ``DREAMER_SIM_*`` only (P91-live leftover ``SIM_*`` ignored).
+    # SysID ``clean_mode`` writes ``DREAMER_SIM_*``.
+    sim_noise_enabled: bool = True
+    sim_noise_seed: str = ''
+    sim_noise_jitter_pct: float = 0.20
+    sim_domain_randomization: bool = True
+    sim_domain_randomization_seed: str = ''
+    # Runtime DR magnitude.  Sentinel <0 = identifier-derived bake
+    # (test_sim ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT``
+    # ignored (P91-live).  Explicit ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``.
+    sim_param_randomization_pct: float = -1.0
+    # Operator-event schedule (measured DV steps).  TrainConfig +
+    # ``DREAMER_DISTURBANCE_*``.  Leftover ``AGENT_DISTURBANCE_*`` is
+    # **not** read (P82-live; login silent A/B).  ``settle_steps=0`` =
+    # identifier-derived.  Unused AGENT_* helpers (curriculum /
+    # progressive / sat-monitor / intensity / init-offset) were never
+    # called and are removed.
+    disturbance_authority_frac: float = 0.65
+    disturbance_recovery_frac: float = 0.20
+    disturbance_settle_steps: int = 0
+    disturbance_quiet_frac: float = 0.12
 
     # ---- (P90, 2026-06-06) freeze WM after P1 (critic/WM coherence) ----
     # The WM's held-action fixed point is UNSTABLE — it converges mid-P1 then
@@ -1341,7 +1704,14 @@ class TrainConfig:
     # ``coef=0`` = OFF (legacy / paper-faithful).  Cost ~ O(B·max_starts·len)
     # GRU steps.  Env DREAMER_WM_OVERSHOOT_{COEF,LEN,MAX_STARTS}.
     # Default 0.3 = p117 recipe: the open-loop compounding lever (promoted
-    # 2026-06-14; was 0.0).  ``wm_overshoot_len`` is set = horizon in single_run.
+    # 2026-06-14; was 0.0).  ``wm_overshoot_len`` auto-tunes to H in
+    # ``auto_tune_seed_buffer``.
+    # P86 EXIT REVERT: CV-only overshoot overgained 5-level rest-IC OPs
+    # (freeze 0.40 then 3.36@MV). All-obs + ``_recon_channel_weights`` KEEP.
+    # P87: stop-grad the overshoot **start** (posterior h/z/c). Encoder
+    # recon already owns 1-step; live start-state grads let the encoder
+    # absorb the K-step residual so TM OL still contracts (P85 1-step
+    # faithful / 1step→OL ×0.697). No new knob.
     # (p143 TESTED coef 0.5 + tail_power 1.0 to fix the categorical MV@H slow-
     # rise; the calibrated transfer matrix on wm_best showed it made MV@H WORSE
     # 0.86->0.68 (de-emphasising the settled tail where the MV gain compounds)
@@ -1377,21 +1747,20 @@ class TrainConfig:
     # convergence under a held action at H_train).  This term ACTIVELY CREATES
     # the held condition: from strided starts it rolls the PRIOR forward ``len``
     # steps under the action HELD CONSTANT (``sample=True`` straight-through so
-    # the stochastic prior is trained), then penalises the NET DRIFT of the
-    # deterministic state ``h`` between an early post-transient window and the
-    # final window — "once you stop changing the action, you must stop moving".
-    # GAIN-NEUTRAL by construction (penalises tail DISPLACEMENT, not magnitude;
-    # the transient ``[0, settle)`` is unconstrained so overshoot/recon still set
-    # the gain) and RSSM-only (the SF backbone uses its native sf_bootstrap plus
-    # the ``_sf_steady_consistency`` anchor).  ``coef=0`` = OFF.  Env
-    # DREAMER_WM_HELD_ROLLOUT_{COEF,LEN,SETTLE_FRAC,WIN,MAX_STARTS,GATE_RECON}.
-    # Default coef 0.5 / max_starts 8 = p117 recipe: the held-action steady-state
-    # lever that kills multi-step compounding drift (promoted 2026-06-14; were
-    # 0.0 / 12).  ``wm_held_rollout_len`` is set = horizon in single_run.
+    # the stochastic prior is trained), then penalises decoded-CV late−early
+    # (P62 space KEEP; P63 1step→K FO magnitude REVERT — recon stuck ~0.5,
+    # skip-storm 2/2, GAIN_NOT_READY 9.75@MV, P3 skipped).  Early window
+    # starts at ``K//2`` (identity vs removed ``settle_frac=0.5``).  Gain-
+    # neutral: overshoot/gain-match still set G.  RSSM-only (SF uses
+    # sf_bootstrap + ``_sf_steady_consistency``).  ``coef=0`` = OFF.  Env
+    # DREAMER_WM_HELD_ROLLOUT_{COEF,LEN,WIN,MAX_STARTS,GATE_RECON}.
+    # Default coef 0.5 / max_starts 8.
+    # ``wm_held_rollout_len`` auto-tunes to H in ``auto_tune_seed_buffer``.
+    # ``wm_held_rollout_win`` clamps to ``(K-1)//4`` so the two windows
+    # cannot overlap (identity 8 at K=55).
     wm_held_rollout_coef: float = 0.5
     wm_held_rollout_len: int = 64          # K prior steps under the HELD action
-    wm_held_rollout_settle_frac: float = 0.5   # early window starts at frac·K
-    wm_held_rollout_win: int = 8           # window length for drift averaging
+    wm_held_rollout_win: int = 8           # window length; clamped to (K-1)/4 at use (identity 8 at K=55)
     wm_held_rollout_max_starts: int = 8    # cap start positions (stride) for cost
     wm_held_rollout_gate_recon: float = 0.1    # soft recon-fidelity ramp gate
 
@@ -1418,17 +1787,8 @@ class TrainConfig:
     # MTP compute.  Override via DREAMER_MTP_LENGTH.
     mtp_length: int = 8               # paper default (P41 RCA)
 
-    # ----- PMPO (Phase 3) -----
-    # alpha=0.7 (paper default).  alpha=0.5 caused near-perfect
-    # cancellation between positive and negative-advantage gradient
-    # branches whenever the actor sampled the same action repeatedly
-    # within a trajectory (which is the failure mode we observed).
-    pmpo_alpha: float = 0.7
-    # PMPO KL-to-prior weight.  Lowered from the paper's 0.1 because the
-    # prior_policy snapshot at start of P3 is taken from a near-uniform
-    # policy (no expert BC), so a stronger KL pull would freeze the
-    # policy at uniform.  0.01 lets the advantage signal dominate.
-    pmpo_beta: float = 0.01
+    # ``pmpo_alpha`` / ``pmpo_beta`` REMOVED (unused after ``pmpo_loss``).
+    # ``train()`` still refuses ``actor_loss_type≠reinforce``.
 
     # ----- Returns -----
     # 2026-05-24 (P48 RCA): structural γ/H mismatch caused the recurring
@@ -1522,6 +1882,79 @@ class TrainConfig:
     # couples to the actor, so P3 doesn't open with a self-inflating critic
     # (promoted 2026-06-14; paper co-trains from P3 start = 0).
     p3_critic_warmup_iters: int = 10
+    # P93: first N P3 iters train the critic only (actor frozen at the
+    # P3-entry snapshot).  LIVE default 10.  The old p3_critic_stability_*
+    # gate was removed 2026-05-20; this freeze was not.
+    # P45 RCA / P46: P1/P2 expert-BC pins the Gaussian log_std residual
+    # at ``σ_min`` (P45 P3 iter 137 entropy = h_floor −0.363). Critic
+    # warmup then collects railed on-policy episodes (mv_viol thousands);
+    # actor unfreeze explodes REINFORCE and ``critic_rew_to_tgt_var``
+    # 0.08→0.0004.  At P3 entry, zero the log_std half of the last
+    # Linear so σ = auto-tuned ``policy_init_log_std``; leave μ (BC
+    # launchpad) intact.  Also zero Adam log_std-row moments so P2 NLL
+    # momentum cannot re-collapse σ at the first unfreeze step.  Default
+    # False (P46/P47 KEEP-AS-OVERRIDE; opening σ was not sufficient).
+    # P50 prevents the pin with ``bc_mean_only`` instead of undoing it.
+    # Opt in ``DREAMER_P3_RESET_LOG_STD=1``.  Do not stack critic knobs.
+    p3_reset_log_std: bool = False
+    # P50 EXIT: μ-only opened σ (first P3 ent −0.107) then unfreeze
+    # REINFORCE still yanked log_std (169: −0.107→−0.268, logp_std
+    # 0.56→54). Detach log_std in P3 ``log_prob_of`` / entropy so
+    # REINFORCE + η train μ only; σ stays at the P3-entry value
+    # (P51 live: ent ~−0.10, no −0.268 yank; μ still rails).
+    # Discrete policy ignores this (no Gaussian). Opt out
+    # ``DREAMER_P3_STOP_GRAD_LOG_STD=0``. Not ``p3_reset_log_std``.
+    p3_stop_grad_log_std: bool = True
+    # P51 EXIT: stop-grad KEEP as unfreeze-yank + non-sticky floor
+    # (147 held; 315 −0.282 then recovered) but **FALSIFIED as cascade
+    # lever**. Frozen-σ REINFORCE still rails μ: unfreeze 147
+    # ``actor_logp_std`` 0.54→38 (mean −26), @315 mean −227; mvv 19k@161
+    # / 681k@361; rtgt 0.046→0.00015. ``advantage_clip=8`` and
+    # ``actor_grad_clip=10`` already saturate (147 gnorm 9.65) but each
+    # step still shoves μ toward the tanh rail via (u−μ)/σ². Clamp the
+    # REINFORCE logp used in ``-(adv * logp)`` so railed (u,μ) pairs
+    # contribute ~0 μ-grad (BC can still pull). Value is **nats per
+    # action dim** (unitless); summed ``log_prob_of`` is clamped at
+    # ``clip * n_mv`` (``_p3_logp_clip_bound``). 1-MV test_sim is
+    # identity with a scalar 8. Healthy 1-MV warmup logp is ~0.65±0.54,
+    # so 8 matches ``advantage_clip`` and does not bind in-support.
+    # P52 EXIT: clamp KEEP as delayed first-unfreeze bound (147
+    # unclipped std 6.11 / actor −0.77 vs P51 38 / −4.66) but
+    # **FALSIFIED as cascade lever**. In-support (|logp|<8) SGD still
+    # walks μ (~18 iters → std 80.8@165); val −377 vs −87 FAIL.
+    # Next is a μ-walk limiter, not a tighter clip. 0 = unclipped (P51).
+    # Opt out ``DREAMER_P3_LOGP_CLIP=0``. p136 actor-KL TR **REMOVED**.
+    p3_logp_clip: float = 8.0
+    # P53: PPO-style ratio clip vs a **frozen unfreeze-μ snapshot**
+    # (first ``_realsim_actor_critic_step``; critic warmup does not
+    # step the actor, so this is the P3-entry / unfreeze μ).
+    # ``ratio = exp(logp − logp_old)``; surrogate
+    # ``min(ratio·adv, clip(ratio, 1−ε, 1+ε)·adv)``. Stops in-support
+    # ``(u−μ)/σ²`` SGD once π has walked outside ε of the snapshot.
+    # Not a lag-copy of the collector (1 update/batch ⇒ ratio≡1).
+    # Not ``logp.detach()`` as old (same-forward ⇒ ratio≡1). p136
+    # actor-KL TR **REMOVED**. ε≤0 disables (identity REINFORCE + P52
+    # logp clip). Default 0.2. Opt out ``DREAMER_P3_MU_RATIO_CLIP=0``.
+    p3_mu_ratio_clip: float = 0.2
+    # P53 freeze-forever (N=0). Window = N ×
+    # ``phase3_train_steps_per_iter`` inner AC steps. P54 extra P3
+    # with freeze-forever was a **ceiling** (``clip_frac`` 0.42→0.11,
+    # val **−26 vs −101** lost to P53 **−13**). **P55 EXIT FALSIFIED
+    # N=1**: recopying the ε=0.2 ball onto last-iter μ each collect is
+    # a 20%/iter compounding walk (logp_std 0.67→18.8, val **−87 vs
+    # −78 FAIL 5/9**). Keep ε=0.2. Slow recopy is A/B-only via
+    # ``DREAMER_P3_MU_RATIO_REFRESH`` (do not promote N>0).
+    p3_mu_ratio_refresh_iters: int = 0
+    # P26 RCA / P27: TD3-style min-of-N twohot critics.  A single twohot +
+    # λ-bootstrap lets V inflate the λ-target → return_scale EMA tracks the
+    # growing spread → advantage dies (P26: 1.19→49.5 cap, rew_to_tgt_var
+    # 0.041→0.00015, entropy collapse, MV chatter at the high limit).  2 =
+    # min-of-2 (TD3); 1 = paper single head.  ``DREAMER_N_CRITICS``.
+    n_critics: int = 2
+    # Freeze the return-scale EMA after critic warmup so it cannot chase a
+    # growing bootstrap spread.  Warmup still updates the scale.  Default ON.
+    # ``DREAMER_RETURN_SCALE_FREEZE_AFTER_WARMUP=0`` to disable.
+    return_scale_freeze_after_warmup: bool = True
     # ---- (P93, 2026-06-06) protect the WM trunk from agent grads in P2 ----
     # At P1→P2 the BC + reward-MTP losses (agent_finetune_loss, read off
     # ``agent_hid`` = the dynamics' own feature) are added; their gradient
@@ -1535,16 +1968,9 @@ class TrainConfig:
     # 2026-06-14; was False).  DREAMER_WM_TRUNK_STOPGRAD_IN_P2.
     wm_trunk_stopgrad_in_p2: bool = True
 
-    # NOTE: ``p3_critic_warmup_iters`` and the ``p3_critic_stability_*``
-    # gate (introduced 2026-05-06 and 2026-05-08) were removed on
-    # 2026-05-20 along with the entropy-decay belt.  They were
-    # short-budget symptom fixes: at 600k env steps a freshly-init
-    # critic produced noisy advantages for a few iters before settling
-    # and we papered over it by freezing the actor.  With the budget
-    # bumped to 1M (paper's control-task minimum) the critic settles
-    # naturally during normal training; the freeze just wasted P3
-    # iters that the actor needs.
-
+    # NOTE: the ``p3_critic_stability_*`` gate (2026-05-06/08) was
+    # removed 2026-05-20.  ``p3_critic_warmup_iters`` itself is still
+    # the P3 actor-freeze (default 10).
 
     # NOTE: the adaptive σ-saturation entropy-decay belt (2026-05-08
     # → 2026-05-20) was removed.  Paper (DreamerV3/V4) uses a constant
@@ -1587,6 +2013,13 @@ class TrainConfig:
     # collapse and never accumulates a long enough consecutive streak,
     # so the legacy patience-based detector never trips.
     early_stop_entropy_collapse_frac: float = 0.20
+    # P53 RCA: a 0.20-*nat* floor margin is larger than the whole
+    # allowed σ band when ``sigma_min_ratio=1.2`` (log(1.2)≈0.182), so
+    # H(σ_max)≈H(σ_init) sat *below* the trip and frozen-σ P3 died on
+    # ``adv_corr<0.05``.  Unitless fraction of ``H(σ_max)−H(σ_min)``
+    # above the floor (0.25 = bottom quartile).  ≤0 → legacy
+    # ``frac * H(σ=1)`` only.  ``DREAMER_ES_ENT_FLOOR_FRAC``.
+    early_stop_entropy_collapse_floor_frac: float = 0.25
     early_stop_entropy_collapse_window_iters: int = 30
     early_stop_entropy_collapse_min_frac_below: float = 0.70
     # Performance gate (Fix B, 2026-06-22): an entropy-near-floor window is only
@@ -1626,12 +2059,62 @@ class TrainConfig:
     # actor or critic gradient is unrecoverable in this run).
     early_stop_grad_skip_window_iters: int = 100
     early_stop_grad_skip_max: int = 5
-    # P1 mid-check: at the P1→P2 transition, require ``sf_loss`` to have
-    # dropped at least ``min_drop_frac`` from its initial value.  If not,
-    # WM never learned dynamics; flag the trial so the BO score reflects
-    # this (we still let it run — P3 plateau will catch it).  Set to 0.0
-    # to disable.
-    early_stop_p1_min_sf_drop_frac: float = 0.10
+    # P27 RCA / P28: a P1 skip-storm is usually a *recoverable* full-BPTT
+    # blow-up of the gain-match roll (P24/P27), not an unrecoverable NaN in
+    # the actor.  Restore the last skip-free P1 observer (``wm_last_ok.pt``)
+    # whose recon is still within ``skip_storm_last_ok_recon_ratio`` × the
+    # best recon — NOT the fidelity-peak ``wm_best.pt``, which can freeze a
+    # lucky early spike and discard late-P1 excitation (P27: iter 49 was
+    # still healthy).  Falls back to ``wm_best`` if no last-ok snapshot
+    # exists.  Then reset ``opt_world``.  P30 capped P1 on the *first*
+    # storm and froze an under-trained observer (iter 18 of ~90).  Default
+    # ``skip_storm_p1_cap_after=2`` continues original P1 **and** the
+    # quality-gate extension on the first recovery; storm 2 still
+    # ``_force_p1_cap_at`` (closes extension → P2).  P32 closed extension
+    # on storm 1 and CAPPED GAIN_NOT_READY(worst=0.71@DV) with healthy
+    # recon — P26/P31 needed that extension past ~iter 75.  P2/P3
+    # skip-storms still abort.  Set 0 to keep the P27 abort behaviour.
+    skip_storm_recover_p1: bool = True
+    # Unitless recon-health band for ``wm_last_ok`` (sim-agnostic).  P27
+    # exploded 0.004 → 0.50 (~125×); 5× still accepts mild recon jitter
+    # and rejects a skip-storm detonation.  P31 also uses this ratio at
+    # the P1→P2 freeze so a single huge-grad step that never trips
+    # skip-storm cannot freeze exploded g.  P37 GPU-confirmed: extra-P1
+    # iter 88 gnorm 62.4 applied (skip 0; threshold 1e4), recon 0.003→0.85
+    # through cap, then restored last-ok iter 87 (0.71@DV).  Do not lower
+    # the skip threshold — wrap blips (P37 iter 19 gnorm ~9.5) recover.
+    # ``DREAMER_SKIP_STORM_LAST_OK_RECON_RATIO``.
+    skip_storm_last_ok_recon_ratio: float = 5.0
+    # P40: extra-P1 silent detonation (recon 0.48, skip 0) then recovered
+    # below the 5× snapshot band and *overwrote* last-ok 83→104. Cap
+    # recon was healthy so detonated-freeze did not restore 83.
+    # Lock last-ok when recon exceeds this × best (default 20 = 4× the
+    # snapshot band). Wrap jitter stays below it; skip-storm restore
+    # unlocks so post-storm healthy P1 can snapshot again.
+    # P48: original-P1 wrap recovery also unlocks (freeze restored 24
+    # after a recovered 43× wrap and discarded live 0.89@DV). Extra-P1
+    # recovered basin stays locked (P40). ``DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO``.
+    skip_storm_last_ok_lock_ratio: float = 20.0
+    # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first
+    # (keep extension) then cap.  ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
+    skip_storm_p1_cap_after: int = 2
+    # P28 GPU RCA: fidelity-peak ``wm_best`` is gain-blind.  Restoring it
+    # at P1→P2 on a *healthy* P1 discarded 37 late-P1 iters (val MV ×0.52
+    # vs P26 ×0.97, which skipped only because gap < min_gap).  Default
+    # OFF: freeze end-of-P1 ``g``.  Skip-storm last-ok still blocks a
+    # reload if this is opted back on.  ``DREAMER_WM_BEST_RESTORE_AT_P2=1``.
+    wm_best_restore_at_p2: bool = False
+    # P90: full-model reload at P2→P3.  Default OFF (wipes P2 reward/BC).
+    wm_best_restore_at_p3: bool = False
+    # Skip the boundary reload when ``total_iters - wm_best_iter`` is below
+    # this (wm_best ≈ current).  ``DREAMER_WM_BEST_RESTORE_MIN_GAP``.
+    wm_best_restore_min_gap: int = 10
+    # Hard constraint: do not train the actor on a GAIN_NOT_READY freeze
+    # (or skip-storm ``wm_best`` fallback) and call it an actor experiment.
+    # Default ON skips P3; P2 still trains DOB/reward on the frozen
+    # observer and validation still runs.  ``DREAMER_SKIP_INVALID_P3=0``
+    # keeps the old warn-and-train-anyway path.
+    skip_invalid_p3: bool = True
     # P2 mid-check: at the P2→P3 transition, require ``reward_mtp_loss``
     # to be below this absolute value (random-baseline ≈ log(255) ≈ 5.5
     # for default twohot 255-bin head; 4.5 is "started learning").
@@ -1645,11 +2128,16 @@ class TrainConfig:
     # gates that can extend each phase up to ``max_extension`` × budget.
     #
     # P1 gate: at the P1 env-step budget, only transition to P2 if
-    #   (a) ``wm_score_ema >= p1_gate_wm_ema_min``  AND
-    #   (b) ``wm_score_ema`` has been within ±``plateau_frac`` of
-    #       ``wm_score_ema_best`` for ≥ ``plateau_probes`` probes
-    #       (i.e. it's plateaued at a healthy level, not just stalled
-    #       at a low one).
+    #   (a) the *recent* fidelity EMA (last ``plateau_probes``) is
+    #       ``>= p1_gate_wm_ema_min``  AND
+    #   (b) the observer GAIN probe is in ``[gain_ready_lo, gain_ready_hi]``.
+    # Do **not** require recent EMA to return to the all-time
+    # ``wm_score_ema_best``.  That peak is a warmup spike (P40 iter-10
+    # 6.541, gain_fid=0.903 with recon already 0.005 so the recon-gate
+    # is fully open). Late-P1 never matches it → ``not_plateaued``
+    # EXTEND → extra-P1 detonation (P37 iter 88; P40 iter 84, gnorm 2.5,
+    # skip-storm silent). Extra P1 is FALSIFIED as a DV lever. Floor +
+    # gain probe are the quality gate; local-flat is logged not required.
     # Else extend P1 by 10 % of budget and re-check at next probe, up
     # to a hard cap of ``(1+max_extension)`` × ``phase1_env_steps``.
     # Set ``p1_gate_wm_ema_min=0.0`` to disable.
@@ -1657,6 +2145,35 @@ class TrainConfig:
     p1_gate_plateau_frac: float = 0.05
     p1_gate_plateau_probes: int = 3
     p1_gate_max_extension: float = 1.0
+    # P1→P2 observer GAIN-readiness probe (p20).  Unitless DC-gain band
+    # and noise/sign-flip limits — already sim-agnostic; promoted so they
+    # appear in run_plan.json instead of silent os.environ.  ``p1_gain_gate``
+    # off skips the probe (fidelity-only freeze — not for actor experiments).
+    # When live recon is > ``skip_storm_last_ok_recon_ratio`` × best, the
+    # probe runs on last-ok (P50 wrap-adjacent MV ×1.37 EXTEND), then
+    # restores live weights. Healthy-recon gates are unchanged.
+    p1_gain_gate: bool = True
+    gain_ready_lo: float = 0.80
+    gain_ready_hi: float = 1.30
+    gain_ready_levels: int = 5
+    gain_ready_noise_max: float = 3.0
+    gain_ready_flip_max: int = 1
+    wm_best_gain_gate: bool = True
+    # WM-fidelity probe / wm_best score (unitless mix).  Cadence and
+    # patience stay in *iters* (one WM update ≈ one iter); inject EVERY
+    # is the one that had to become f(buffer lap).  Promoted from
+    # os.environ so A/B lands in run_plan.json.
+    wm_fidelity_ema_alpha: float = 0.5
+    wm_fidelity_warmup_iters: int = 40
+    wm_fidelity_patience_iters: int = 40
+    wm_fidelity_conv_probe: bool = True
+    wm_fidelity_conv_weight: float = 1.0
+    wm_fidelity_recon_weight: float = 3.0
+    wm_fidelity_gain_weight: float = 3.0
+    wm_fidelity_gain_gate_recon: float = 0.15
+    wm_probe_every_iters: int = 10
+    horizon_r_floor: float = 0.40
+    wm_converge_eps_std: float = 0.05
 
     # P2 gate: same idea, on ``reward_mtp_loss``.  In this codebase the
     # critic head only trains in P3 — P2 is WM + reward-MTP head only
@@ -1696,9 +2213,30 @@ class TrainConfig:
     # warmup, etc.) without throwing away weights.  Empty = cold start.
     init_from_ckpt: str = ''
 
-    # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1) -----
+    # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1 opt-in) -----
+    # ``auto`` = SDPA on CUDA / manual on CPU (CausalAttention).  Canonical
+    # override is ``DREAMER_ATTN_IMPL``; leftover ``DREAMER_FAST_ATTN``
+    # maps to the same field (was CLI-only / constructor-env, so
+    # ``single_run`` silently dropped ATTN_IMPL).
     attn_impl: str = 'auto'          # 'auto'|'manual'|'sdpa'
-    compile_mode: str = ''           # '' (off) | 'default' | 'reduce-overhead' | 'max-autotune'
+    # '' = eager (P26/P28 observer). Opt in: DREAMER_COMPILE=1 /
+    # DREAMER_COMPILE_MODE=default|reduce-overhead|max-autotune.
+    compile_mode: str = ''
+    # GPU-calib WM-only probe overhead (actor/critic/opt + P3 headroom).
+    # Was leftover ``DREAMER_WM_OVERHEAD`` in ``single_run`` (worked,
+    # missing from ``run_plan``).  Identity 1.30.  ``gpu_probe_knobs()``
+    # reads this default (plus leftover env) so changing it sizes B.
+    wm_overhead: float = 1.30
+    # GPU-calib VRAM budget + hard ceiling.  Were leftover
+    # ``DREAMER_TARGET_UTIL`` / ``DREAMER_MAX_BS`` in gpu_calibrate
+    # (worked, missing from ``run_plan``).  Identity 0.80 / 512.
+    # ``gpu_probe_knobs()`` is the probe source of truth.  Explicit
+    # ``pick_batch_size_empirical`` args beat leftover env (P92-live).
+    # ``DREAMER_BATCH_SIZE``
+    # pins ``batch_size`` and skips the probe.  Leftover ``OBJ_BATCH_SIZE``
+    # is **not** read (P87-live; login leftover was a silent A/B).
+    gpu_target_util: float = 0.80
+    gpu_max_bs: int = 512
 
     # ----- Resolved at build-time -----
     obs_dim: int = 0
@@ -1710,6 +2248,102 @@ class TrainConfig:
 # ---------------------------------------------------------------------------
 # Env wrapper — stacks state + aug-obs, builds lookback window, computes reward
 # ---------------------------------------------------------------------------
+
+def _cfg_or_env(cfg, field: str, env_key: str, default, cast=float):
+    """TrainConfig field, else leftover env-var, else default.
+
+    ``user_set`` is True when the field is in ``_explicit_fields`` or
+    the env-var is present (P62 adaptive clip must not override an
+    explicit ``DREAMER_REWARD_RAW_CLIP_MIN``).  Pass ``DREAMER_*``
+    keys (P87-live: leftover ``SEED_*`` / ``PRBS_SEG_MIN*`` /
+    ``PMPO_ENTROPY_*`` are ignored).
+    """
+    explicit = set(getattr(cfg, '_explicit_fields', set()) or set()) \
+        if cfg is not None else set()
+    if field in explicit:
+        try:
+            return cast(getattr(cfg, field)), True
+        except Exception:
+            return cast(default), True
+    raw = os.environ.get(env_key)
+    if raw not in (None, ''):
+        try:
+            return cast(raw), True
+        except Exception:
+            pass
+    try:
+        val = getattr(cfg, field, default) if cfg is not None else default
+        return cast(val), False
+    except Exception:
+        return cast(default), False
+
+
+def _cfg_or_env_float(cfg, field: str, env_key: str, default: float
+                     ) -> Tuple[float, bool]:
+    """Float wrapper for ``_cfg_or_env`` (reward clip/cal call sites)."""
+    v, user = _cfg_or_env(cfg, field, env_key, default, float)
+    return float(v), bool(user)
+
+
+def _runtime_setpoint_config_from_cfg(cfg) -> RuntimeSetpointConfig:
+    """APCEnv ``RuntimeSetpointConfig`` from TrainConfig (test_sim identity).
+
+    Do **not** call ``auto_derive`` (τ-derived change-count / ramp would
+    not be env-free identity).  Jitter reads
+    ``DREAMER_RUNTIME_SETPOINT_*_JITTER_FRAC`` (leftover
+    ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` ignored; P90-live).
+    """
+    def _i(field: str, env_key: str, default: int) -> int:
+        v, _ = _cfg_or_env(cfg, field, env_key, default, int)
+        return int(v)
+
+    def _f(field: str, env_key: str, default: float) -> float:
+        v, _ = _cfg_or_env_float(cfg, field, env_key, default)
+        return float(v)
+
+    bmin = max(0, _i(
+        'runtime_setpoint_bounds_changes_min',
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MIN', 1))
+    bmax = max(bmin, _i(
+        'runtime_setpoint_bounds_changes_max',
+        'DREAMER_RUNTIME_SETPOINT_BOUNDS_CHANGES_MAX', 2))
+    tmin = max(0, _i(
+        'runtime_setpoint_target_changes_min',
+        'DREAMER_RUNTIME_SETPOINT_TARGET_CHANGES_MIN', 1))
+    tmax = max(tmin, _i(
+        'runtime_setpoint_target_changes_max',
+        'DREAMER_RUNTIME_SETPOINT_TARGET_CHANGES_MAX', 2))
+    ramp = float(np.clip(_f(
+        'runtime_setpoint_ramp_duration_frac',
+        'DREAMER_RUNTIME_SETPOINT_RAMP_DURATION_FRAC', 0.10), 0.0, 1.0))
+    warm = float(np.clip(_f(
+        'runtime_setpoint_curriculum_warmup_frac',
+        'DREAMER_RUNTIME_SETPOINT_CURRICULUM_WARMUP_FRAC', 0.10), 0.0, 1.0))
+    strata = max(0, _i(
+        'runtime_setpoint_n_magnitude_strata',
+        'DREAMER_RUNTIME_SETPOINT_N_MAGNITUDE_STRATA', 3))
+    inside = float(np.clip(_f(
+        'runtime_setpoint_target_inside_margin_frac',
+        'DREAMER_RUNTIME_SETPOINT_TARGET_INSIDE_MARGIN_FRAC', 0.05),
+        0.0, 0.45))
+    return RuntimeSetpointConfig(
+        bounds_enabled=bool(getattr(cfg, 'runtime_setpoint_variation', True)),
+        bounds_jitter_fraction=float(np.clip(_cfg_or_env_float(
+            cfg, 'runtime_setpoint_bounds_jitter_frac',
+            'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC', 0.15)[0],
+            0.05, 0.45)),
+        target_jitter_fraction=float(np.clip(_cfg_or_env_float(
+            cfg, 'runtime_setpoint_target_jitter_frac',
+            'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC', 0.20)[0],
+            0.05, 0.45)),
+        bounds_changes_per_episode=(bmin, bmax),
+        target_changes_per_episode=(tmin, tmax),
+        ramp_duration_fraction=ramp,
+        curriculum_warmup_fraction=warm,
+        n_magnitude_strata=strata,
+        target_inside_margin_frac=inside,
+    )
+
 
 class APCEnv:
     """Slim env wrapper around the carryover simulator.
@@ -1725,6 +2359,13 @@ class APCEnv:
         self.rng = rng
         self.sim = create_sim(episode_length=cfg.episode_length,
                               sample_rate=cfg.sample_rate)
+        # Factory wrap has no TrainConfig (phase 1a).  Re-apply runtime
+        # knobs here so dataclass defaults / ENV_OVERRIDES actually
+        # reach jitter / enable.  Identity when they match wrap-time
+        # env (0.20 / on).  Does not re-seed.
+        _apply = getattr(self.sim, 'apply_runtime_knobs', None)
+        if callable(_apply):
+            _apply(cfg)
         self.meta = resolve_sim_metadata(self.sim)
         self.action_dim = int(self.meta['action_dim'])
         self.state_dim = int(self.meta['state_dim'] or 0)
@@ -1805,14 +2446,10 @@ class APCEnv:
             base_cv_bounds=cvb,
             base_cv_targets=cv_targets,
             cv_target_enabled=cv_target_enabled,
-            cfg=RuntimeSetpointConfig(
-                # P86: allow training/validation on a single consistent limit
-                # set (active ≡ base) by disabling mid-episode limit-step
-                # variation.  Default True preserves the legacy operator-limit
-                # tracking curriculum.
-                bounds_enabled=bool(getattr(
-                    self.cfg, 'runtime_setpoint_variation', True)),
-            ),
+            # P86: variation ON teaches operator-limit tracking.  Do **not**
+            # call ``auto_derive`` (τ-derived change-count / ramp are not
+            # env-free identity).  Schedule knobs are TrainConfig.
+            cfg=_runtime_setpoint_config_from_cfg(self.cfg),
             mv_norm_bounds=np.asarray(self.mv_norm_ranges, dtype='float32')
                 if self.mv_norm_ranges else np.zeros((0, 2), dtype='float32'),
             cv_norm_bounds=np.asarray(self.cv_norm_ranges, dtype='float32')
@@ -1824,12 +2461,12 @@ class APCEnv:
         # ---- Derived observable block (Stage B, 2026-05-21) ---------------
         # Belief-state augmentation: cheap per-CV rolling statistics
         # (mean tracking error, Δcv, variance) appended to the
-        # augmented-obs block.  OFF by default; enable via
-        # ``DREAMER_DERIVED_OBSERVABLES=1``.  When ON, ``aug_obs_dim``
-        # grows by ``3 * n_cv`` and the running obs normalizer auto-
-        # adapts (features are bounded by construction).
+        # augmented-obs block.  Default ON (`derived_observables`);
+        # disable via ``DREAMER_DERIVED_OBSERVABLES=0``.  When ON,
+        # ``aug_obs_dim`` grows by ``3 * n_cv`` and the running obs
+        # normalizer auto-adapts (features are bounded by construction).
         self._derived_features: Optional[DerivedFeatures] = None
-        if derived_observables_enabled():
+        if derived_observables_enabled(self.cfg):
             n_cv = int(len(self.cv_indices))
             self._derived_features = DerivedFeatures(
                 n_cv=n_cv,
@@ -1837,6 +2474,7 @@ class APCEnv:
                     tau=(self._resolve_plant_timing()[0] or None),
                     sample_rate=float(getattr(self.cfg, 'sample_rate', 1.0)
                                        or 1.0),
+                    cfg=self.cfg,
                 ),
             )
             self.aug_obs_dim += int(self._derived_features.feat_dim)
@@ -1848,7 +2486,7 @@ class APCEnv:
         # accumulator is normalised by the windup cap to [0, 1].  CV-only.
         from utils.objective_runtime import resolve_integral_config
         self._integral_enabled, _intg_coef, self._integral_windup = \
-            resolve_integral_config(self.obj_spec)
+            resolve_integral_config(self.obj_spec, cfg=self.cfg)
         n_cv_intg = int(len(self.cv_indices))
         self._integral_cv = np.zeros(n_cv_intg, dtype='float32')
         if self._integral_enabled:
@@ -1910,24 +2548,15 @@ class APCEnv:
         # -1e6 / +1e18 clip is a runaway-bug safety net, not a routine
         # censor; ``_reward_clip_warned`` emits a one-shot warning if
         # it ever triggers so we notice silent saturation.
-        try:
-            self._reward_clip_min: float = float(
-                os.environ.get('DREAMER_REWARD_RAW_CLIP_MIN', '-1e6'))
-        except Exception:
-            self._reward_clip_min = -1e6
-        try:
-            self._reward_clip_max: float = float(
-                os.environ.get('DREAMER_REWARD_RAW_CLIP_MAX', '1e18'))
-        except Exception:
-            self._reward_clip_max = 1e18
+        self._reward_clip_min, self._reward_clip_min_user_set = (
+            _cfg_or_env_float(cfg, 'reward_raw_clip_min',
+                              'DREAMER_REWARD_RAW_CLIP_MIN', -1e6))
+        self._reward_clip_max, _ = (
+            _cfg_or_env_float(cfg, 'reward_raw_clip_max',
+                              'DREAMER_REWARD_RAW_CLIP_MAX', 1e18))
         self._reward_clip_warned: bool = False
-        # P62 (2026-05-28): track whether the negative-tail clip was set
-        # explicitly by the user (DREAMER_REWARD_RAW_CLIP_MIN in env)
-        # vs left at the default -1e6.  The post-calibration adaptive
-        # setter (see ``train`` after ``calibrate_reward_scale``) only
-        # overrides this when the user did NOT set it explicitly.
-        self._reward_clip_min_user_set: bool = (
-            'DREAMER_REWARD_RAW_CLIP_MIN' in os.environ)
+        # P62 (2026-05-28): adaptive clip only overrides when the user
+        # did NOT set the min explicitly (TrainConfig field or env).
 
         # ---- A' : potential-based reward shaping state ------------------
         # Dense band-keeping shaping (see TrainConfig.reward_shaping_coef).
@@ -2101,8 +2730,12 @@ class APCEnv:
         return vec
 
     def _dv_lowpass_alpha(self) -> float:
-        """EMA coefficient for the measured-DV low-pass (0 = OFF).  Auto-derived
-        once from the plant τ (tau_dom/sr/4, clip [2,12] samples)."""
+        """EMA coefficient for the measured-DV low-pass.
+
+        ``dv_lowpass_tau``: ``0`` = AUTO (plant τ/sr/4, clip [2, 12]
+        samples); ``<0`` turns it off; ``>0`` is an explicit τ in
+        samples.  Cached after the first call.
+        """
         a = getattr(self, '_dv_lp_alpha_cached', -1.0)
         if a >= 0.0:
             return a
@@ -2171,20 +2804,81 @@ class APCEnv:
             self._update_obs_norm(raw)
         return self._normalize_obs(raw)
 
+    def obs_channel_meta(self) -> List[Dict[str, object]]:
+        """Names + kinds for the concatenated obs vector (state + aug + derived).
+
+        SNR / recon diagnostics used to log ``obs[i]`` and treat constant
+        setpoint/bound channels as −120 dB 'noise' (P39: obs[8]/obs[9]).
+        """
+        sv = [str(x) for x in (self.meta.get('state_variables') or [])]
+        mv_idx = {int(x) for x in (self.meta.get('mv_indices') or [])
+                  if x is not None}
+        cv_idx = {int(x) for x in self.cv_indices}
+        dv_idx = {int(x) for x in self.dv_indices}
+        out: List[Dict[str, object]] = []
+        for i in range(int(self.state_dim)):
+            name = sv[i] if i < len(sv) else f'state[{i}]'
+            if i in cv_idx:
+                role = 'cv'
+            elif i in dv_idx:
+                role = 'dv'
+            elif i in mv_idx:
+                role = 'mv'
+            else:
+                role = 'state'
+            out.append({'name': name, 'kind': 'state', 'role': role})
+        n_mv = int(getattr(self.setpoint_mgr, 'n_mv', 0) or 0)
+        n_cv = int(getattr(self.setpoint_mgr, 'n_cv', 0) or 0)
+        for i in range(n_mv):
+            out.append({'name': f'MV{i}_lo', 'kind': 'aug_bounds',
+                        'role': 'mv_bound'})
+            out.append({'name': f'MV{i}_hi', 'kind': 'aug_bounds',
+                        'role': 'mv_bound'})
+        for i in range(n_cv):
+            out.append({'name': f'CV{i}_lo', 'kind': 'aug_bounds',
+                        'role': 'cv_bound'})
+            out.append({'name': f'CV{i}_hi', 'kind': 'aug_bounds',
+                        'role': 'cv_bound'})
+            out.append({'name': f'CV{i}_tgt', 'kind': 'aug_bounds',
+                        'role': 'cv_tgt'})
+            out.append({'name': f'CV{i}_tgt_on', 'kind': 'aug_bounds',
+                        'role': 'cv_tgt'})
+        if self._derived_features is not None:
+            for i in range(int(self._derived_features.n_cv)):
+                out.append({'name': f'CV{i}_int_err', 'kind': 'derived',
+                            'role': 'derived'})
+                out.append({'name': f'CV{i}_dcv', 'kind': 'derived',
+                            'role': 'derived'})
+                out.append({'name': f'CV{i}_var', 'kind': 'derived',
+                            'role': 'derived'})
+        if self._integral_enabled:
+            for i in range(len(self.cv_indices)):
+                out.append({'name': f'CV{i}_integral', 'kind': 'integral',
+                            'role': 'integral'})
+        while len(out) < int(self.obs_dim):
+            j = len(out)
+            out.append({'name': f'obs[{j}]', 'kind': 'unknown',
+                        'role': 'unknown'})
+        return out[:int(self.obs_dim)]
+
+    @property
+    def obs_channel_names(self) -> List[str]:
+        return [str(p['name']) for p in self.obs_channel_meta()]
+
     def _resolve_plant_timing(self) -> "tuple[float, float]":
         """Resolve ``(tau_dominant, dead_time)`` in plant time units.
 
-        ``TrainConfig`` carries NO plant-timing fields, so reading
-        ``cfg.tau`` / ``cfg.dead_time`` always yielded 0.0 — which collapsed
-        the hidden-disturbance schedule to a 1-sample timescale (settle≈4):
-        ``ou_drift`` became α=1 white noise and step/ramp events became
-        sub-settling spikes crammed into the first ~50 steps (front-loaded,
-        high-frequency, never reaching steady state).  Both ``single_run.py``
-        and ``evaluation.validate`` export the identified plant timing as
-        ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME`` env vars, so
-        source from there (with the legacy ``SIM_`` prefix and the sim's own
-        attributes as fallbacks).  Fixed 2026-06-08.
+        Prefer ``TrainConfig.identified_tau_dominant`` /
+        ``identified_dead_time`` (set by ``single_run`` / ``bo_runner``).
+        Fall back to leftover ``IDENTIFIED_TAU_DOMINANT`` /
+        ``IDENTIFIED_DEAD_TIME`` env (CLI / old paths), then the sim's
+        own attributes.  Cached per env (timing is static for a
+        ``single_run``).
         """
+        cached = getattr(self, '_plant_timing', None)
+        if cached is not None:
+            return cached
+
         def _envf(*names: str) -> float:
             for n in names:
                 v = str(os.environ.get(n, '')).strip()
@@ -2197,19 +2891,34 @@ class APCEnv:
                 if x > 0:
                     return x
             return 0.0
+
+        def _cfgf(*names: str) -> float:
+            cfg = getattr(self, 'cfg', None)
+            if cfg is None:
+                return 0.0
+            for n in names:
+                try:
+                    x = float(getattr(cfg, n, 0.0) or 0.0)
+                except Exception:
+                    x = 0.0
+                if x > 0:
+                    return x
+            return 0.0
+
         sim = getattr(self, 'sim', None)
-        tau = float(getattr(self.cfg, 'tau', 0.0) or 0.0)
+        tau = _cfgf('identified_tau_dominant', 'tau')
         if tau <= 0:
             tau = _envf('IDENTIFIED_TAU_DOMINANT', 'SIM_IDENTIFIED_TAU_DOMINANT')
         if tau <= 0 and sim is not None:
             tau = float(getattr(sim, 'tau_dominant', 0.0)
                         or getattr(sim, 'tau', 0.0) or 0.0)
-        dead = float(getattr(self.cfg, 'dead_time', 0.0) or 0.0)
+        dead = _cfgf('identified_dead_time', 'dead_time')
         if dead <= 0:
             dead = _envf('IDENTIFIED_DEAD_TIME', 'SIM_IDENTIFIED_DEAD_TIME')
         if dead <= 0 and sim is not None:
             dead = float(getattr(sim, 'dead_time', 0.0) or 0.0)
-        return float(tau), float(dead)
+        self._plant_timing = (float(tau), float(dead))
+        return self._plant_timing
 
     def set_domain_randomization(self, enabled: bool) -> bool:
         """Toggle the sim's per-episode domain randomizer (output gain/bias/
@@ -2265,13 +2974,14 @@ class APCEnv:
             rng=self.rng,
             intensity=intensity,
             sim=self.sim,
+            cfg=self.cfg,
         )
         # Per-episode hidden OU disturbance.  Bernoulli toggle gated
         # by phase-aware prob (P1/P2: 0.3, P3: 0.5).  Set force=True
         # in validation to always build.
         prob = (self._disturbance_prob_override
                 if self._disturbance_prob_override is not None
-                else get_phase_disturbance_prob(phase=1))
+                else get_phase_disturbance_prob(phase=1, cfg=self.cfg))
         tau_dom, dead_time = self._resolve_plant_timing()
         sample_rate = float(getattr(self.cfg, 'sample_rate', 1.0) or 1.0)
         self._hidden_disturbance = maybe_build_hidden_disturbance(
@@ -2285,6 +2995,7 @@ class APCEnv:
             phase=int(self._current_phase),
             dead_time=dead_time,
             episode_length=int(self.cfg.episode_length),
+            cfg=self.cfg,
         )
         # P89 noise-amplitude curriculum: ramp process+measurement noise from
         # ~0 at progress=0 to full by ~40 % (P1), full in P3.  Applied every
@@ -2292,7 +3003,8 @@ class APCEnv:
         # steady-state seeds override this to 0.0 after their own reset().
         if bool(getattr(self.cfg, 'process_noise_curriculum', True)):
             self.set_sim_noise_scale(noise_curriculum_scale(
-                float(self._training_progress), int(self._current_phase)))
+                float(self._training_progress), int(self._current_phase),
+                cfg=self.cfg))
         else:
             self.set_sim_noise_scale(1.0)
         # Fresh per-episode trace for the WM disturbance-estimator head target.
@@ -2531,6 +3243,7 @@ class APCEnv:
             prev_cv_violation_per_channel=self._prev_cv_violation_per_channel,
             prev_integral_cv_per_channel=self._integral_cv,
             prev_prev_control=self._prev_prev_control,
+            cfg=self.cfg,
         )
         raw_reward = float(comps['reward'])
         # Apply raw clip BEFORE scaling so calibration (which percentile-
@@ -2617,9 +3330,1726 @@ class APCEnv:
         return self._window.copy(), reward, done, info
 
 
+def _force_p1_cap_at(total_env_steps: int) -> Tuple[int, int, int]:
+    """End P1 now and close the quality-gate extension budget.
+
+    P28 skip-storm recovery originally set ``p1 = total_env_steps`` and
+    ``p1_ext_steps = 0`` but left ``p1_gate_max_ext_steps`` at the original
+    (often 1× P1) cap.  The next P1→P2 gate then saw unused headroom and
+    EXTENDED P1, re-running full-BPTT gain-match on the restored weights
+    (the exploding term) instead of Stage 2 (curriculum freezes ``g``).
+    Closing the extension cap forces the CAPPED branch → P2.
+
+    Returns ``(p1, p1_ext_steps, p1_gate_max_ext_steps)``.
+    """
+    return int(total_env_steps), 0, 0
+
+
+def _skip_storm_should_continue_p1(storm_n: int, cap_after: int) -> bool:
+    """True if this 1-indexed P1 skip-storm should keep the original P1 budget.
+
+    ``cap_after=1`` is the P30 policy (cap on first storm). Default 2
+    continues the first recovery (P1 budget **and** extension) and
+    caps the second so a repeated explosion still exits to Stage 2.
+    """
+    return int(storm_n) < max(1, int(cap_after))
+
+
+def _skip_storm_continue_p1(
+        p1: int, p1_ext_steps: int = 0,
+        p1_gate_max_ext_steps: int = 0) -> Tuple[int, int, int]:
+    """Keep original P1 budget AND quality-gate extension.
+
+    P30 restored last-ok then ``_force_p1_cap_at`` set ``p1`` to the
+    storm iter (~18), throwing away the remaining original budget
+    (P26 needed ~90).  P32 continued original P1 after storm 1 but
+    closed extension (``p1_gate_max_ext_steps=0``), so the first
+    P1→P2 gate CAPPED GAIN_NOT_READY(worst=0.71@DV) with healthy
+    recon — P26/P31 needed that extension past ~iter 75.  Storm 2
+    still ``_force_p1_cap_at`` (close extension so a cap-now cannot
+    re-open the next-iter gate — P28).
+    """
+    return int(p1), int(p1_ext_steps), int(p1_gate_max_ext_steps)
+
+
+def _wm_fidelity_es_suppressed_frozen_g(g_trainable: bool) -> bool:
+    """P2 curriculum freezes ``g``; a gain-blind probe cannot improve."""
+    return not bool(g_trainable)
+
+
+def _p1_fidelity_local_plateau(
+        history: List[Tuple[int, float]],
+        *,
+        n_probes: int,
+        plateau_frac: float,
+        ema_min: float,
+) -> Tuple[bool, bool, float, float]:
+    """Recent-floor + local-flat diagnostics for the P1→P2 fidelity gate.
+
+    Returns ``(recent_ok, local_flat, recent_max, band)``.
+
+    * ``recent_ok`` — last ``n_probes`` EMAs exist and their max is
+      ``>= ema_min``.  **This** is the P1 floor (HEAD): a warmup all-time
+      best does not count.
+    * ``local_flat`` — those EMAs sit within ``band`` of *their* max.
+      Band is ``max(plateau_frac × recent_max, 2 × σ(last 2K))`` (P57
+      noise-adaptive).  Logged only — extra P1 must not wait for a
+      return to ``wm_score_ema_best`` (P40 RCA).
+
+    P40: ``wm_ema_best=6.541`` at iter 10. Iter-82 gate printed
+    ``not_plateaued`` and extended; iter 84 recon 0.48 / last_ok 83 /
+    gnorm 2.51 / skip still 7. Isolation-off did not cause that —
+    extra P1 after a healthy original budget did.
+    """
+    n = max(1, int(n_probes))
+    if len(history) < n:
+        return False, False, float('-inf'), 0.0
+    recent = history[-n:]
+    scores = [float(e) for _, e in recent]
+    recent_max = max(scores)
+    recent_ok = bool(math.isfinite(recent_max) and recent_max >= float(ema_min))
+    noise_window = history[-max(n * 2, 4):]
+    noise_vals = [float(e) for _, e in noise_window]
+    noise_std = (float(np.std(noise_vals)) if len(noise_vals) >= 2 else 0.0)
+    band = max(1e-6, float(plateau_frac) * max(recent_max, 0.0),
+               2.0 * noise_std)
+    local_flat = bool(
+        recent_ok and all(abs(s - recent_max) <= band for s in scores))
+    return recent_ok, local_flat, float(recent_max), float(band)
+
+
+def _recon_still_healthy(recon: float, recon_best: Optional[float],
+                         ratio: float = 5.0) -> bool:
+    """True if ``recon`` is finite and not a skip-storm detonation vs best.
+
+    Scale-invariant (ratio of WM-norm recon, not engineering units).  A
+    missing / non-positive best accepts any finite recon so the first
+    P1 snapshot always lands.
+    """
+    try:
+        r = float(recon)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(r) or r < 0.0:
+        return False
+    if recon_best is None:
+        return True
+    try:
+        b = float(recon_best)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(b) or b <= 0.0:
+        return True
+    return r <= float(ratio) * b
+
+
+def _should_unlock_last_ok_after_skip_storm(
+        *,
+        continue_p1: bool,
+        restored_gain_ready: Optional[bool],
+) -> bool:
+    """Unlock last-ok after skip-storm restore unless the snapshot is GAIN-READY.
+
+    P91: storm 1 restored last_ok **31** (teacher MV ×0.999 DV ×0.989),
+    unlocked, last_ok walked to **44**, storm 2 froze 44 at 5-level
+    **0.76@DV** (GAIN_NOT_READY; ``[p3-skip]``). Teacher jsonl at 44 was
+    still ×0.95 — recon-healthy last_ok is gain-blind vs the 5-level
+    probe.
+
+    P45/P49 skip-storm unlock **KEEP** when the restored basin is *not*
+    GAIN-READY so last_ok can still advance (those freezes reached 77/82).
+    Cap-path unlock is identity (P1 ends). Probe fail (``None``)
+    fail-opens unlock. No new TrainConfig field.
+    """
+    if not continue_p1:
+        return True
+    return restored_gain_ready is not True
+
+
+def _should_lock_last_ok(
+        *,
+        recon: float,
+        recon_best: Optional[float],
+        lock_ratio: float,
+        has_last_ok: bool,
+        skip_storm_restored: bool,
+        already_locked: bool,
+        extra_p1: bool = False,
+        gain_ready_locked: bool = False,
+) -> bool:
+    """Lock last-ok after a silent recon spike so recovery cannot overwrite it.
+
+    P40: extra-P1 iter 84 recon 0.48 / skip 0 (skip-storm silent). Recovery
+    iter 98 recon 0.0068 < 5× best overwrote last-ok 83→104. Iter 104
+    CAPPED with healthy recon so detonated-freeze did **not** restore 83.
+    Recovered extra-P1 stays locked (``extra_p1=True``).
+
+    Skip-storm restore **unlocks** when the restored snapshot is not
+    GAIN-READY (post-restore healthy P1 should resume snapshots — P40
+    storm 1/2 @65 then last-ok 66+; P45/P49). A GAIN-READY restore
+    **stays locked** (``gain_ready_locked``; P91 last_ok 31→44 walk).
+    Wrap jitter at ~5–10× best must **not** lock (lock_ratio default 20).
+    Unitless recon/recon.
+
+    P41 live (original P1, not extra-P1): iter 57 recon 0.0887 / skip 0
+    / gnorm 1.99 (42× best 0.0021) then recovered 0.0098 < 5× overwrote
+    last-ok 56→64. Iter 58 of that spike had skip 1 — lock must not
+    require a skip-free iter or a 0.48-class extra-P1 only.
+
+    P48 freeze: original-P1 wrap iter 25 recon 0.145 (43×) locked 24;
+    recon recovered iter 26 but the lock never unlocked, so freeze
+    restored 24 (0.81@DV) and discarded live gate 0.89@DV at iter 82.
+    Original-P1 wrap recovery (``already_locked`` and recon back below
+    ``lock_ratio``, ``extra_p1=False``, not gain-ready-locked) **unlocks**
+    so last-ok can advance. Extra-P1 recovered basin stays locked (P40).
+    """
+    if skip_storm_restored:
+        return bool(gain_ready_locked)
+    if already_locked:
+        if extra_p1 or gain_ready_locked:
+            return True
+        try:
+            r = float(recon)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(r):
+            return True
+        if _recon_still_healthy(r, recon_best, lock_ratio):
+            return False
+        return True
+    if not has_last_ok:
+        return False
+    try:
+        r = float(recon)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(r):
+        return False
+    return not _recon_still_healthy(r, recon_best, lock_ratio)
+
+
+def _should_restore_last_ok_at_p1_freeze(
+        *,
+        recon: float,
+        recon_best: Optional[float],
+        ratio: float,
+        has_last_ok: bool,
+        last_ok_locked: bool = False,
+) -> bool:
+    """True if P1→P2 would freeze detonated weights and last-ok exists.
+
+    P31: skip-storm needs ``> early_stop_grad_skip_max`` skips in the
+    window (default 5/100). A single huge-grad step (iter 95 recon
+    0.0035→0.71, ``wm_grad_norm`` 66, skip 2→3) did not trip it. The
+    quality-gate CAPPED then froze exploded ``g`` into P2 (cap-time DV
+    ×0.08 vs healthy late-P1). Same last-ok snapshot as skip-storm, at
+    the freeze boundary. Scale-invariant (recon/recon).
+
+    P40: a locked last-ok means extra-P1 detonated then *recovered*.
+    Freeze-iter recon can look healthy — still restore the pre-spike
+    snapshot (recovered extra-P1 is a different basin; extra P1 is
+    FALSIFIED as a DV lever).
+    """
+    if not has_last_ok:
+        return False
+    if last_ok_locked:
+        return True
+    return not _recon_still_healthy(recon, recon_best, ratio)
+
+
+def _should_probe_gain_on_last_ok(
+        *,
+        recon: float,
+        recon_best: Optional[float],
+        ratio: float,
+        has_last_ok: bool,
+) -> bool:
+    """True when a live gain-probe would measure wrap/detonated weights.
+
+    P50: gate 82 recon 0.0283 = 19× best (wrap-adjacent, just under the
+    20× lock) reported MV ×1.37 and EXTENDed extra-P1. Extra-P1
+    detonated iter 89 (recon 0.63). Gate 94 probed exploded g (recon
+    0.107, skip 1, spread×6.1, 3 signflips) → 0.69@DV. Extra P1 is
+    FALSIFIED as a DV lever (P41). The last-ok snapshot is the
+    observer the freeze already restores when recon is unhealthy
+    (P31 detonated-freeze). Identity when recon is healthy (P45–P49
+    first-gate path). Scale-invariant recon/recon.
+    """
+    if not has_last_ok:
+        return False
+    return not _recon_still_healthy(recon, recon_best, ratio)
+
+
+def _wm_recon_scalar(wm_losses: Optional[dict]) -> float:
+    """Current-iter recon as float; NaN if missing (treat as detonated)."""
+    if not wm_losses:
+        return float('nan')
+    try:
+        v = wm_losses.get('recon_loss')
+        if v is None:
+            return float('nan')
+        return float(v.detach().item() if torch.is_tensor(v) else v)
+    except Exception:
+        return float('nan')
+
+
+def _skip_storm_restore_ckpt(
+        last_ok: Optional[Path],
+        wm_best: Optional[Path],
+) -> Tuple[Optional[Path], str]:
+    """Prefer last healthy applied P1 step over fidelity-peak ``wm_best``.
+
+    ``wm_best`` is a gain-blind / noise-led EMA of correlation+std-ratio.
+    Restoring it on a skip-storm can freeze a lucky early spike and
+    discard late-P1 excitation that was still healthy (P27 iter 49).
+    """
+    if last_ok is not None:
+        p = Path(last_ok)
+        if p.exists():
+            return p, 'wm_last_ok'
+    if wm_best is not None:
+        p = Path(wm_best)
+        if p.exists():
+            return p, 'wm_best'
+    return None, 'none'
+
+
+def _should_warm_restore_wm_best(
+        *,
+        restore_enabled: bool,
+        skip_storm_recovered: bool,
+        wm_best_iter: int,
+        total_iters: int,
+        min_gap: int,
+        wm_best_exists: bool,
+        last_ok_on_model: bool = False,
+) -> bool:
+    """Whether to reload ``wm_best.pt`` at a phase boundary.
+
+    Default OFF (P28 GPU RCA: gain-blind fidelity peak).  After a P1
+    skip-storm last-ok restore the next iter IS the P1→P2 transition —
+    reloading ``wm_best`` would overwrite last-ok even if this flag is
+    opted back on.  P31 detonated-freeze last-ok is the same: do not
+    overwrite with the gain-blind peak.
+    """
+    if skip_storm_recovered or last_ok_on_model:
+        return False
+    if not restore_enabled or not wm_best_exists:
+        return False
+    if int(wm_best_iter) <= 0:
+        return False
+    return (int(total_iters) - int(wm_best_iter)) >= int(min_gap)
+
+
+def _actor_experiment_valid(*,
+                            skip_storm_source: Optional[str],
+                            gain_not_ready_capped: bool) -> bool:
+    """P3 is only an actor experiment if the frozen observer is gain-ready.
+
+    Hard constraint: do not train the actor on a GAIN_NOT_READY freeze
+    *and call it an actor experiment*.  Skip-storm fallback to
+    ``wm_best`` is the lucky-spike path — also invalid.  Restoring
+    ``wm_last_ok`` (late healthy P1) is valid unless the gain probe
+    also capped GAIN_NOT_READY.
+    """
+    if gain_not_ready_capped:
+        return False
+    if skip_storm_source == 'wm_best':
+        return False
+    return True
+
+
+def _should_skip_invalid_p3(*, actor_valid: bool, skip_enabled: bool) -> bool:
+    """Default-on: do not spend GPU on an invalid actor (P28/P29).
+
+    P29 CAPPED P1 as ``not_plateaued`` after an earlier ``gain_not_ready``
+    (DC 3.05@MV) and still entered hours of P3.  When the freeze is not
+    gain-ready, skip P3; observer validation still runs on ``final.pt``.
+    Opt out with ``DREAMER_SKIP_INVALID_P3=0``.
+    """
+    return (not bool(actor_valid)) and bool(skip_enabled)
+
+
+def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
+    """Isolation / ss-match TBPTT stride from the rollout length K.
+
+    P24/P25 used 16 of K≈55 (one detach per ~τ of a 4τ settle).  That ratio
+    is unitless: ``max(8, round(K / 3.5))``.  Explicit
+    ``DREAMER_AUX_TBPTT_STEPS`` (``_explicit_fields``) or any in-code value
+    other than the dataclass default 16 is left alone.  ``<=0`` always auto.
+    Isolation still never TBPTT inside the SS-match window (``keep_c``).
+    """
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    cur = int(getattr(cfg, 'aux_tbptt_steps', 16) or 0)
+    if cur > 0 and (
+            'aux_tbptt_steps' in explicit or cur != 16):
+        return cur
+    # Isolation TBPTT follows isolation K (or control H).  Do not follow
+    # teacher FD ``gain_match_len`` (P67 4H CAPPED; TBPTT is not that A/B).
+    k = int(getattr(cfg, 'wm_input_isolation_len', 0) or 0)
+    if k <= 0:
+        k = int(getattr(cfg, 'horizon', 15) or 15)
+    auto = max(8, int(round(float(max(1, k)) / 3.5)))
+    cfg.aux_tbptt_steps = int(auto)
+    return int(auto)
+
+
+def _resolve_gain_match_step(cfg: 'TrainConfig') -> float:
+    """P60: sentinel ``<=0`` → ``wm_tf_step_frac`` so teacher Δu matches val TM.
+
+    P59: rest-IC + last_only K already shared the TM IC/path, but the
+    teacher still stepped Δu=1.0 while ``compute_transfer_matrix`` uses
+    ``wm_tf_step_frac=0.4``.  jsonl Huber ``*_ratio`` ~×1 at freeze was
+    G(1.0); live gate 0.88@DV / val MV ×0.876 were G(0.4).  Writes the
+    resolved value back onto ``cfg`` (idempotent).  Clamp ``(1e-3, 1.0)``.
+    """
+    raw = float(getattr(cfg, 'gain_match_step', 0.0) or 0.0)
+    if raw > 0.0:
+        step = float(np.clip(raw, 1e-3, 1.0))
+    else:
+        tf = float(getattr(cfg, 'wm_tf_step_frac', 0.4) or 0.4)
+        step = float(np.clip(tf, 1e-3, 1.0))
+    cfg.gain_match_step = step
+    return step
+
+
+def _held_rollout_win(K: int, win: int = 8) -> int:
+    """Held-rollout window that fits two non-overlapping late−early slices.
+
+    P62 stationarity needs ``win < K/4``.  Dataclass default 8 is identity
+    at test_sim ``K=H=55`` (cap 13).  On a fast plant ``K=15``, win=8 used
+    to empty the loss; clamp to ``(K-1)//4`` (unitless).  ``win<=0``
+    auto-picks ``max(2, round(K/7))``.
+    """
+    K = max(4, int(K))
+    # Keep the P62 ``(K-1)//4`` cap (identity at test_sim).  K=55 → cap 13.
+    cap = max(1, (K - 1) // 4)
+    w = int(win)
+    if w <= 0:
+        w = max(2, int(round(float(K) / 7.0)))
+    return max(1, min(w, cap))
+
+
+def _field_is_explicit(cfg: 'TrainConfig', field: str) -> bool:
+    """True when ``single_run`` / ``_cfg_from_env`` recorded an env override."""
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _auto_if_unset(cfg: 'TrainConfig', field: str, value) -> bool:
+    """Apply a proven auto-enable when the field is a ``<=0`` sentinel.
+
+    Env-override ``0`` is honoured (``_explicit_fields``) so A/B disable
+    actually disables — the P19/P26 DOB-ground auto-enable used to ignore
+    ``DREAMER_DOB_GROUND_COEF=0`` and re-arm grounding.
+    """
+    if _field_is_explicit(cfg, field):
+        return False
+    cur = getattr(cfg, field, 0)
+    try:
+        unset = float(cur or 0) <= 0.0
+    except (TypeError, ValueError):
+        unset = not bool(cur)
+    if not unset:
+        return False
+    setattr(cfg, field, value)
+    return True
+
+
+def _isolation_teacher_on(cfg: 'TrainConfig') -> bool:
+    """True when isolation trajectory or ss-match DC loss is active."""
+    return (
+        float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) > 0.0
+        or float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) > 0.0)
+
+
+def _promote_isolation_aux(cfg: 'TrainConfig') -> bool:
+    """Fill isolation length / settle only when the teacher is opted in.
+
+    P08 auto-enabled isolation=1 / ss_match=3 whenever the cont-gain
+    channel was on.  P26 jsonl shows that auto-enable *did* run
+    (``wm_input_isolation_loss`` 1.44 at iter 1); the on-disk
+    ``run_plan`` 0.0 was the pre-rewrite dump.  P28+ whole-episode
+    holds + first-class ss-match then drowned DV (P26 ×0.87 → P32–P39
+    ×0.66–0.70).  Env-free default is gain-match only.  Opt in
+    ``DREAMER_WM_INPUT_ISOLATION_COEF`` / ``DREAMER_WM_SS_MATCH_COEF``.
+    """
+    if not _isolation_teacher_on(cfg):
+        return False
+    if float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) > 0.0:
+        _auto_if_unset(
+            cfg, 'wm_input_isolation_len',
+            int(getattr(cfg, 'horizon', 15) or 15))
+    if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) > 0.0:
+        _auto_if_unset(cfg, 'wm_ss_match_settle_var', 0.05)
+    _auto_if_unset(cfg, 'wm_isolation_settle_episodes', 24)
+    return True
+
+
+def _resolve_compile_mode(cfg: 'TrainConfig') -> str:
+    """Return a ``torch.compile`` mode, or ``''`` for eager.
+
+    ``TrainConfig.compile_mode=''`` is OFF.  A 2026-06-05 leftover treated
+    empty as default-on unless ``DREAMER_COMPILE=0``.  Env-free P29 therefore
+    compiled while P26/P28 (observer win) passed ``DREAMER_COMPILE=0`` and
+    stayed eager — the same silent-drop class as ``rssm_latent_type``.
+    Opt in with ``DREAMER_COMPILE=1`` / ``DREAMER_COMPILE_MODE=default``.
+    Precedence: explicit ``compile_mode`` (incl. whitelist
+    ``DREAMER_COMPILE_MODE`` / ``DREAMER_COMPILE``) over a direct
+    ``DREAMER_COMPILE_MODE`` env read over ``DREAMER_COMPILE`` over eager.
+    """
+    off = {'', '0', 'off', 'false', 'none', 'no'}
+    on = {'1', 'true', 'yes'}
+    cm = str(getattr(cfg, 'compile_mode', None) or '').strip().lower()
+    if _field_is_explicit(cfg, 'compile_mode'):
+        if cm in off:
+            return ''
+        return 'default' if cm in on else cm
+    if cm not in off:
+        return 'default' if cm in on else cm
+    # Direct env read so tests / CLI that skip apply_dreamer_env_overrides
+    # still opt in.  MODE before COMPILE (explicit mode wins).
+    env_mode = os.environ.get('DREAMER_COMPILE_MODE', '').strip().lower()
+    if env_mode and env_mode not in off:
+        return 'default' if env_mode in on else env_mode
+    env_cm = os.environ.get('DREAMER_COMPILE', '').strip().lower()
+    if env_cm in off:
+        return ''
+    if env_cm in on:
+        return 'default'
+    return env_cm
+
+
+def _host_cpu_count() -> int:
+    """CPUs actually available to this process (cgroup / affinity aware)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+        if n > 0:
+            return int(n)
+    except Exception:
+        pass
+    return int(os.cpu_count() or 4)
+
+
+def _limit_blas_threads(n: int) -> str:
+    """Cap already-loaded OpenBLAS/MKL so numpy collect doesn't fight PyTorch.
+
+    Numpy's manylinux wheel (``scipy-openblas64``, ``MAX_THREADS=64`` on this
+    host) ignores ``OMP_NUM_THREADS`` after import.  Best-effort: known
+    ``set_num_threads`` symbols on loaded BLAS libs + env for later imports.
+    Returns a short tag for the ``[runtime]`` banner.  Never raises.
+    """
+    n = max(1, int(n))
+    for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+        os.environ.setdefault(key, str(n))
+    tags: List[str] = []
+    try:
+        import mkl  # type: ignore
+        mkl.set_num_threads(n)
+        tags.append('mkl')
+    except Exception:
+        pass
+    try:
+        import ctypes
+        syms = (
+            'scipy_openblas_set_num_threads64_',
+            'scipy_openblas_set_num_threads_64_',
+            'openblas_set_num_threads',
+        )
+        seen = set()
+        maps = '/proc/self/maps'
+        if os.path.exists(maps):
+            with open(maps) as fh:
+                for line in fh:
+                    if '.so' not in line:
+                        continue
+                    path = line.rsplit(' ', 1)[-1].strip()
+                    if (path in seen or not path.startswith('/')
+                            or ('blas' not in path.lower()
+                                and 'mkl' not in path.lower())):
+                        continue
+                    seen.add(path)
+                    try:
+                        lib = ctypes.CDLL(path)
+                    except Exception:
+                        continue
+                    for sym in syms:
+                        fn = getattr(lib, sym, None)
+                        if fn is None:
+                            continue
+                        try:
+                            fn.argtypes = [ctypes.c_int]
+                            fn(n)
+                            tags.append(path.rsplit('/', 1)[-1].split('-', 1)[0]
+                                        .split('.', 1)[0])
+                        except Exception:
+                            continue
+                        break
+    except Exception:
+        pass
+    return ','.join(tags) if tags else 'env'
+
+
+def _configure_runtime_threads(device: torch.device) -> Tuple[int, str]:
+    """Cap PyTorch intra-op + BLAS threads so the plant sim keeps CPU.
+
+    GPU training is kernel-bound; the default intra-op = all cores
+    starves the CPU simulator.  P29 compiled with 20 inductor workers
+    on a 20-core host: collect 22.6 s vs P28 eager 17.6 s.  Adaptive
+    to this host's affinity (cgroup / ``sched_getaffinity``).
+    """
+    ncpu = _host_cpu_count()
+    if device.type == 'cuda':
+        nth = max(1, min(8, ncpu // 4 or 1))
+    else:
+        nth = max(1, ncpu)
+    try:
+        torch.set_num_threads(nth)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(max(1, min(4, nth)))
+    except Exception:
+        pass
+    blas = _limit_blas_threads(nth)
+    return nth, blas
+
+
+def _numpy_dtype_to_torch(dt) -> torch.dtype:
+    """Map a numpy dtype to torch without constructing a tensor."""
+    dt = np.dtype(dt)
+    if dt == np.float32:
+        return torch.float32
+    if dt == np.float64:
+        return torch.float64
+    if dt == np.int64:
+        return torch.int64
+    if dt == np.int32:
+        return torch.int32
+    if dt == np.bool_ or dt == np.dtype(bool):
+        return torch.bool
+    return torch.from_numpy(np.zeros((), dtype=dt)).dtype
+
+
+def _batch_np_to_device(batch_np: Dict, device: torch.device,
+                        slot: str = 'replay',
+                        keys: Optional[Tuple[str, ...]] = None,
+                       ) -> Dict[str, torch.Tensor]:
+    """Host→device for a numpy replay sample.
+
+    CUDA: reuse pinned host + GPU dest **per slot**.  The previous path
+    called ``pin_memory()`` on a fresh CPU tensor every inner step
+    (~100×/iter at P1) then discarded it.  Same-slot dest reuse is after
+    the previous step's backward.  Distinct slots (``replay`` / ``iso`` /
+    ``critic``) keep live graphs from aliasing: P3 actor on-policy and
+    critic replay would otherwise share ``obs`` dest.  Host buffers are
+    also per-slot so a non-blocking H2D cannot race a later copy into the
+    same pinned page.  Host-adaptive: CPU path is a contiguous copy
+    (no pin).  Identity values.
+
+    ``keys`` copies only those names that exist in ``batch_np``.
+    ``_replay_h2d_keys`` / ``_p1_wm_h2d_keys`` pick the inner-graph
+    subset (never leftover ``cont``; ``dist`` only when the WM indexes
+    it; ``rew`` when MTP / P3 AC is in the graph; P3 on-policy skips
+    ``expert``).  ``TrajectoryBuffer.sample(..., keys=)`` skips the
+    same leftover host fancy-index.  ``None`` = all keys.
+    """
+    out: Dict[str, torch.Tensor] = {}
+    cuda = device.type == 'cuda'
+    host_cache = getattr(_batch_np_to_device, '_host', None)
+    gpu_cache = getattr(_batch_np_to_device, '_gpu', None)
+    if host_cache is None:
+        host_cache = {}
+    if gpu_cache is None:
+        gpu_cache = {}
+    if cuda:
+        _batch_np_to_device._host = host_cache  # type: ignore[attr-defined]
+        _batch_np_to_device._gpu = gpu_cache  # type: ignore[attr-defined]
+    slot_s = str(slot or 'replay')
+    want = None if keys is None else set(keys)
+    for k, v in batch_np.items():
+        if want is not None and k not in want:
+            continue
+        arr = np.ascontiguousarray(v)
+        if not cuda:
+            out[k] = torch.from_numpy(arr.copy())
+            continue
+        tdt = _numpy_dtype_to_torch(arr.dtype)
+        shape = tuple(int(x) for x in arr.shape)
+        hkey = (slot_s, k, shape, str(tdt))
+        gkey = (slot_s, k, shape, str(tdt), str(device))
+        host = host_cache.get(hkey)
+        if (host is None or tuple(host.shape) != shape
+                or host.dtype != tdt):
+            try:
+                host = torch.empty(shape, dtype=tdt, pin_memory=True)
+            except Exception:
+                host = None
+            if host is None:
+                t = torch.from_numpy(arr)
+                out[k] = t.to(device, non_blocking=True)
+                continue
+            host_cache[hkey] = host
+        np.copyto(host.numpy(), arr, casting='no')
+        gpu = gpu_cache.get(gkey)
+        if (gpu is None or tuple(gpu.shape) != shape
+                or gpu.dtype != tdt or gpu.device != device):
+            gpu = torch.empty(shape, dtype=tdt, device=device)
+            gpu_cache[gkey] = gpu
+        gpu.copy_(host, non_blocking=True)
+        out[k] = gpu
+    return out
+
+
+def _is_rssm_interface(model) -> bool:
+    """RSSM and TSSM share ``rollout_observed`` / ``img_rollout`` / ``decode``."""
+    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+
+
+def _warmup_p3_collect_serve_graph(model, device, cfg) -> None:
+    """Capture frozen-RSSM B=1 serve graph after DOB is live.
+
+    Lazy capture on the first ``collect_episode`` is identity, but the
+    8-episode on-policy prefill then pays capture latency. Warm at P3
+    entry (phased + joint) so ``dob_live`` matches P3 serve. TSSM/CPU
+    no-op. Recapture if ``dob_live`` flips.
+    """
+    if not _is_rssm_interface(model):
+        return
+    if getattr(device, 'type', '') != 'cuda':
+        return
+    from models.dreamer_v4_rssm import warmup_collect_serve_cuda_graph
+    cg = warmup_collect_serve_cuda_graph(
+        model.dynamics, device, int(cfg.obs_dim), int(cfg.action_dim))
+    if cg is not None:
+        print('[p3] collect serve CUDA graph warmed '
+              '(B=1 frozen RSSM stream_serve_step)', flush=True)
+
+
+def _cv_obs_std_tensor(cfg: 'TrainConfig', ds: torch.Tensor
+                       ) -> Optional[torch.Tensor]:
+    """Cached device tensor of running CV obs-norm std (DOB-ground units).
+
+    Rebuilding ``torch.tensor(list(cvs))`` every WM step was a host→device
+    sync on the P2 inner loop (same class as the gain-match tgt cache).
+    """
+    cvs = getattr(cfg, '_cv_obs_std', None)
+    if cvs is None or len(cvs) != int(ds.shape[-1]):
+        return None
+    key = (tuple(float(x) for x in cvs), str(ds.device), str(ds.dtype),
+           int(ds.shape[-1]))
+    cached = getattr(cfg, '_cv_obs_std_t', None)
+    if cached is None or cached[0] != key:
+        t = torch.tensor(list(cvs), device=ds.device,
+                         dtype=ds.dtype).clamp_min(1e-6)
+        cfg._cv_obs_std_t = (key, t)  # type: ignore[attr-defined]
+        return t
+    return cached[1]
+
+
+def _clone_module_state(model: torch.nn.Module, device: torch.device
+                        ) -> Dict[str, torch.Tensor]:
+    """In-process skip-storm snapshot. GPU clone (no H2D sync); CPU if OOM."""
+    try:
+        return {k: v.detach().clone() for k, v in model.state_dict().items()}
+    except RuntimeError as exc:
+        if device.type != 'cuda' or 'out of memory' not in str(exc).lower():
+            raise
+        torch.cuda.empty_cache()
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def _refresh_module_state(
+        dst: Optional[Dict[str, torch.Tensor]],
+        model: torch.nn.Module, device: torch.device
+        ) -> Dict[str, torch.Tensor]:
+    """Reuse last-ok tensor storage (``copy_``) instead of a fresh 45 MB clone.
+
+    Same weights as ``_clone_module_state``.  First call (``dst is None``)
+    allocates; later P1 iters overwrite in place.  If a previous snapshot
+    spilled to CPU, keep copying on CPU.  Host-adaptive: no extra threads.
+    """
+    if dst is None:
+        return _clone_module_state(model, device)
+    sd = model.state_dict()
+    sample = next(iter(dst.values()), None)
+    spill_cpu = (sample is not None and sample.device.type == 'cpu'
+                 and device.type == 'cuda')
+    try:
+        for k, v in sd.items():
+            src = v.detach()
+            if spill_cpu:
+                src = src.cpu()
+            old = dst.get(k)
+            if (old is not None and old.shape == src.shape
+                    and old.dtype == src.dtype
+                    and old.device == src.device):
+                old.copy_(src)
+            else:
+                dst[k] = src.clone()
+        for k in list(dst.keys()):
+            if k not in sd:
+                del dst[k]
+        return dst
+    except RuntimeError as exc:
+        if device.type != 'cuda' or 'out of memory' not in str(exc).lower():
+            raise
+        torch.cuda.empty_cache()
+        return {k: v.detach().cpu().clone() for k, v in sd.items()}
+
+
+def _persist_last_ok_ckpt(
+        path: Path,
+        last_ok_sd: Optional[Dict[str, torch.Tensor]],
+        cfg: 'TrainConfig',
+        obs_norm,
+        last_ok_iter: int,
+) -> bool:
+    """Best-effort ``wm_last_ok.pt``.  RAM snapshot stays source of truth.
+
+    P42: lock fired at iter 67 but the pre-spike weights lived only in
+    RAM until skip-storm or P1→P2 freeze wrote the file.  A crash after
+    lock would lose the snapshot the freeze is supposed to restore.
+    Write once when the lock fires (same blob freeze/storm already
+    save).  Objective unchanged.
+    """
+    if last_ok_sd is None or path is None:
+        return False
+    try:
+        torch.save({
+            'model': last_ok_sd,
+            'cfg': asdict(cfg),
+            'obs_norm': obs_norm,
+            'iter': int(last_ok_iter),
+        }, path)
+        return True
+    except Exception:
+        return False
+
+
+def _wm_need_logged_aux(will_log: bool, step_i: int, n_inner: int) -> bool:
+    """True on the last inner step of a logged iter (jsonl / BC diag).
+
+    ``will_log`` is ``(total_iters+1) % log_every == 0`` so it lines up
+    with the post-increment ``total_iters % log_every`` jsonl write.
+    """
+    return bool(will_log) and int(step_i) + 1 == int(n_inner)
+
+
+def _p1_need_agent_finetune(rmtp_weight: float, will_log: bool,
+                            step_i: int, n_inner: int) -> bool:
+    """P1 MTP is in ``total_loss`` only when ``reward_scale_loss_p1>0``.
+
+    Paper default 0: the P1 ``agent_finetune_loss`` forward was discarded
+    (``total_loss = wm_total``) yet still ran 100× per iter.  Skip it
+    except the last inner step of a logged iter so jsonl ``bc`` /
+    ``reward_mtp`` still come from that step.  Objective unchanged.
+    """
+    if float(rmtp_weight or 0.0) != 0.0:
+        return True
+    return _wm_need_logged_aux(will_log, step_i, n_inner)
+
+
+# Unitless load-variance gate for dist_match (batch var).  Below this
+# the target is d≡0 / quiet.  Same 1e-3 as the historical skip; do not
+# /dvar (would rescale the loss).  P66 per-seq ``dob_ground`` skip at
+# this gate was REVERTED (FALSIFIED as DOB-amp).  jsonl
+# ``dob_ground_keep_frac`` is 1.0 when grounding fires (no skip).
+_DIST_TARGET_VAR_GATE = 1e-3
+
+
+def _dob_ground_hp_window(cfg: 'TrainConfig', T: int) -> int:
+    """Val-protocol high-pass width for ``dob_ground``, clipped to the WM window.
+
+    Same formula as disturbance-prediction detrend: ``round(mult × H)``
+    with ``disturbance_detrend_settle_mult`` (default 4).  Training
+    sequences are ``seq_len`` (test_sim 128) so the window is
+    ``min(4H, T)`` — on test_sim that is **T** (per-crop DC removal).
+    ``0`` disables the high-pass (raw MSE; ``mult<=0`` or ``H<1``).
+    No new TrainConfig field.
+    """
+    T = int(T)
+    if T < 2:
+        return 0
+    H = int(getattr(cfg, 'horizon', 0) or 0)
+    mult = float(getattr(cfg, 'disturbance_detrend_settle_mult', 4.0) or 0.0)
+    if H < 1 or mult <= 0.0:
+        return 0
+    w = int(round(mult * float(H)))
+    if w <= 1:
+        return 0
+    return int(min(T, w))
+
+
+def _highpass_bt(x: torch.Tensor, w: int) -> torch.Tensor:
+    """``x - MA(x, w)`` matching ``evaluation.wm_disturbance_prediction``.
+
+    ``x`` is ``(B, T, C)``. ``w<=1`` is identity (val MA is zeros).
+    ``w>=T`` subtracts the per-(B, C) mean.  Centered edge-padded MA
+    otherwise.  Differentiable in ``x``.
+    """
+    w = int(w)
+    if w <= 1:
+        return x
+    B, T, C = x.shape
+    xf = x.float()
+    if w >= T:
+        return xf - xf.mean(dim=1, keepdim=True)
+    pad = w // 2
+    xt = xf.transpose(1, 2).reshape(B * C, 1, T)
+    xt = F.pad(xt, (pad, pad), mode='replicate')
+    k = xt.new_full((1, 1, w), 1.0 / float(w))
+    ma = F.conv1d(xt, k, padding=0)
+    L = int(ma.shape[-1])
+    if L > T:
+        extra = L - T
+        ma = ma[..., extra // 2: extra // 2 + T]
+    elif L < T:
+        ma = F.pad(ma, (0, T - L))
+    ma = ma.reshape(B, C, T).transpose(1, 2)
+    return xf - ma
+
+
+def _wm_need_dist_target(model, cfg: 'TrainConfig') -> bool:
+    """True when ``world_model_loss`` actually indexes ``batch['dist']``.
+
+    Env-free Stage-1: ``dob_active=False``, ``dist_match_coef=0``,
+    ``disturbance_head_dim=0`` (DOB retires the P87 head) → False.
+    P2 Kalman ground / A/B dist-match / live head still need the copy.
+    P25: do not key this off ``disturbance_head_dim`` alone.
+    """
+    dyn = getattr(model, 'dynamics', None)
+    dob_live = bool(getattr(dyn, 'dob_enabled', False)
+                    and getattr(dyn, 'dob_active', False))
+    dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
+    if dob_live and dgc > 0.0:
+        return True
+    dm = float(getattr(cfg, 'dist_match_coef', 0.0) or 0.0)
+    n_dist = int(getattr(dyn, 'cont_dist_dim', 0) or 0)
+    if dm > 0.0 and n_dist > 0:
+        return True
+    return _wm_need_dist_head_loss(model, cfg)
+
+
+def _wm_need_dist_head_loss(model, cfg: 'TrainConfig') -> bool:
+    """True when a live P87 head would consume ``batch['dist']``.
+
+    H2D gate only.  ``_rssm_world_model_loss`` / ``world_model_loss``
+    always call ``_disturbance_head_loss`` (P79/P82-pid graph).  The
+    helper early-returns zeros when the head is None.  P82-live skip
+    of that call was **not** on the GAIN-READY P82 process (sha
+    ``04854e0``); P83/P84 skipped it and CAPPED.  Do not key this off
+    ``disturbance_head_dim`` alone — a live module is the gate.
+    """
+    dist_head = getattr(model, 'disturbance', None)
+    dist_coef = float(getattr(cfg, 'disturbance_loss_scale', 0.0) or 0.0)
+    return dist_head is not None and dist_coef > 0.0
+
+
+def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
+                     need_expert: Optional[bool] = None
+                     ) -> Tuple[str, ...]:
+    """Replay sample/H2D names the inner graph actually indexes.
+
+    Leftover Dreamer ``cont`` is never copied (λ-returns ignore terminals
+    inside a window).  ``dist`` only when ``_wm_need_dist_target`` (P2
+    dob-ground).  P3 observer re-encodes from ``obs`` so ``dist`` stays
+    off.  ``rew`` when MTP or P3 AC is in the graph.  ``expert`` follows
+    ``need_rew_expert`` unless ``need_expert`` overrides: P3 on-policy
+    actor uses ``obs/act/rew`` only (``expert_bc_p3_loss`` reads the
+    critic replay slot).
+    """
+    keys: List[str] = ['obs', 'act']
+    if need_dist:
+        keys.append('dist')
+    if need_rew_expert:
+        keys.append('rew')
+        if need_expert is None or need_expert:
+            keys.append('expert')
+    elif need_expert:
+        keys.append('expert')
+    return tuple(keys)
+
+
+def _p1_wm_h2d_keys(need_dist: bool) -> Tuple[str, ...]:
+    """P1 WM H2D names when MTP is not in the graph.
+
+    ``rew``/``expert`` stay off (paper ``reward_scale_loss_p1=0``).
+    ``dist`` only when ``_wm_need_dist_target``.
+    """
+    return _replay_h2d_keys(need_dist, need_rew_expert=False)
+
+
+def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
+    """Rewrite ``run_plan.json → config`` after train.py auto-enables.
+
+    ``single_run`` dumps dataclass defaults *before* isolation / DOB-ground /
+    gain-match promotions.  Env-free P29's plan still said
+    ``rssm_latent_type=categorical`` and ``gain_match_coef=0`` while training
+    used the auto-enabled recipe — the same class of silent-drop that missed
+    the latent-type default.  Call after the last promotion (gain-match).
+    P60: resolve ``gain_match_step`` sentinel so the dump stores 0.4 not 0.0.
+    P67 REVERT: resolve ``gain_match_len`` sentinel so the dump stores
+    control H (not 0, not ``wm_tf_horizon``).
+    """
+    _resolve_gain_match_step(cfg)
+    _auto_gain_match_len(cfg)
+    out = Path(getattr(cfg, 'out_dir', None) or '.')
+    plan_path = out / 'run_plan.json'
+    if not plan_path.exists():
+        return
+    _dcv = _isolation_dcv_scale_payload(cfg)
+    try:
+        with open(plan_path) as f:
+            plan = json.load(f)
+        plan['config'] = asdict(cfg)
+        plan['isolation_dcv_scales'] = _dcv
+        with open(plan_path, 'w') as f:
+            json.dump(plan, f, indent=2, default=str)
+    except Exception as exc:  # noqa: BLE001
+        print(f'[resolved-cfg] WARN could not rewrite run_plan.json: {exc!r}',
+              flush=True)
+        return
+    _span = ''
+    _iso_on = _isolation_teacher_on(cfg)
+    if _iso_on and _dcv.get('g_ratio') is not None:
+        _span = (
+            f"g_ratio={float(_dcv['g_ratio']):.3g} "
+            f"smax={_dcv.get('smax')} "
+            f"equalize={_dcv.get('equalize_possible')} "
+        )
+    if _iso_on:
+        _iso_txt = (
+            f"iso_dcv={_dcv['on']} "
+            f"min_scale={_dcv.get('min_scale', 1.0)} "
+            f"mv={['%.3g' % x for x in _dcv['mv']]} "
+            f"dv={['%.3g' % x for x in _dcv['dv']]} "
+            f"edge_du_mv={['%.3g' % x for x in (_dcv.get('edge_du_mv') or ())]} "
+            f"edge_du_dv={['%.3g' % x for x in (_dcv.get('edge_du_dv') or ())]} "
+            f"{_span}"
+        )
+    else:
+        # Env-free P40: dcv_match default True is inert while isolation is off.
+        _iso_txt = 'iso_dcv=off '
+    _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
+    from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
+    _gru_zb = float(_gru_zbias_fn(_h_zb))
+    _hpw = _dob_ground_hp_window(cfg, int(getattr(cfg, 'seq_len', 0) or 0))
+    print(
+        '[resolved-cfg] '
+        f"wm={getattr(cfg, 'world_model_type', 'rssm')} "
+        f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
+        f"restore_p2={bool(getattr(cfg, 'wm_best_restore_at_p2', False))} "
+        f"gain_match={float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0):.3g} "
+        f"dob_ground={float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0):.3g} "
+        f"dob_reg={float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0):.3g} "
+        f"isolation={float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0):.3g} "
+        f"ss_match={float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0):.3g} "
+        f"{_iso_txt}"
+        f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
+        f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
+        f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
+        f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
+        f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
+        f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
+        f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
+        f"gmatch_len={int(getattr(cfg, 'gain_match_len', 0) or 0)} "
+        f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
+        f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
+        f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
+        f"gmatch_rest_L={_gain_match_rest_window(cfg)[1]} "
+        f"gmatch_rest_cg={bool(getattr(cfg, 'gain_match_rest_ic_cuda_graph', True))} "
+        f"p3_sigreset={bool(getattr(cfg, 'p3_reset_log_std', False))} "
+        f"bc_mean={bool(getattr(cfg, 'bc_mean_only', True))} "
+        f"p3_sglogstd={bool(getattr(cfg, 'p3_stop_grad_log_std', True))} "
+        f"p3_logpclip={float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0):g} "
+        f"p3_muratio={float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0):g} "
+        f"p3_murefresh={int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)} "
+        f"es_ent_floor={float(getattr(cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0):g} "
+        f"held_cv=True "
+        f"ov_sgstart=True "
+        f"gru_zbias={_gru_zb:.3g} "
+        f"dob_hp={_hpw} "
+        f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
+        f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
+        f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
+        f"compile={_resolve_compile_mode(cfg) or 'eager'}",
+        flush=True,
+    )
+
+
+def _buffer_lap_iters(cfg: 'TrainConfig') -> float:
+    """Iters to FIFO-lap the replay buffer (episode-major ring).
+
+    ``capacity_steps / (episode_length × ep_per_iter)``.  Episode length
+    is already ``k·(τ+θ)`` (``derive_episode_length``), so this is
+    f(buffer turnover / τ) with no engineering units.  test_sim:
+    400k / (1220 × 5) ≈ 65.6 iters (the "~65 iters worth" in the P39
+    eviction RCA).
+    """
+    cap = max(1, int(getattr(cfg, 'buffer_capacity_steps', 400_000)
+                     or 400_000))
+    ep_len = max(1, int(getattr(cfg, 'episode_length', 1) or 1))
+    epi = max(1, int(getattr(cfg, 'ep_per_iter', 5) or 5))
+    return float(cap) / float(ep_len * epi)
+
+
+def _resolve_one_inject_every(
+        cfg: 'TrainConfig', field: str, sentinel: int, auto: int) -> int:
+    """Keep 0=off, explicit/non-sentinel, else the buffer-lap auto value."""
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    cur = int(getattr(cfg, field, sentinel) or 0)
+    if cur <= 0:
+        setattr(cfg, field, 0)
+        return 0
+    if field in explicit or cur != int(sentinel):
+        return cur
+    auto_i = max(5, int(auto))
+    setattr(cfg, field, int(auto_i))
+    return int(auto_i)
+
+
+def _resolve_one_inject_n(
+        cfg: 'TrainConfig', field: str, sentinel: int, auto: int) -> int:
+    """Keep 0=off, explicit/non-sentinel, else the per-channel auto value."""
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    cur = int(getattr(cfg, field, sentinel) or 0)
+    if cur <= 0:
+        setattr(cfg, field, 0)
+        return 0
+    if field in explicit or cur != int(sentinel):
+        return cur
+    auto_i = max(1, int(auto))
+    setattr(cfg, field, int(auto_i))
+    return int(auto_i)
+
+
+def _resolve_inject_cadence(
+        cfg: 'TrainConfig', *, n_mv: int = 1, n_dv: int = 1,
+        log: bool = False) -> Dict[str, int]:
+    """Scale P1 re-inject EVERY from buffer-lap and N from n_mv/n_dv.
+
+    Cadence (follow-up 5): const / step-test / expert = 0.30 of a lap →
+    20 of ~66 on test_sim (~3 injects per FIFO lap, the P39 dilution
+    fix).  DV-PRBS: 0.15 of a lap → 10 of ~66, also capped at
+    ``wm_fidelity_warmup_iters/4`` so ≥4 injects land before a typical
+    early ``wm_best`` (p122).
+
+    Count (follow-up 6): dataclass 5/2/2/3 are the test_sim sentinels
+    (1 MV + 1 DV).  Auto:
+      * const  ``max(5, n_mv+n_dv)``  — operating-point sweep
+      * step-test ``max(2, n_mv+n_dv)`` — ≥1 episode per input channel
+      * DV-PRBS ``max(2, n_mv)`` — MV-hold levels while sweeping all DVs
+      * expert ``max(3, n_mv)`` — demos scale with actuators
+    Distillation (4 MV + 1 DV) becomes 5/5/4/4.  Explicit
+    ``DREAMER_*_INJECT_{EVERY,N}`` wins.  ``0`` disables.
+    """
+    lap = _buffer_lap_iters(cfg)
+    warmup = max(1, int(getattr(cfg, 'wm_fidelity_warmup_iters', 40) or 40))
+    n_mv_i = max(0, int(n_mv or 0))
+    n_dv_i = max(0, int(n_dv or 0))
+    n_in = n_mv_i + n_dv_i
+    const_auto = int(round(lap * 0.30))
+    dv_auto = min(int(round(lap * 0.15)), max(5, warmup // 4))
+    out = {
+        'lap_iters': int(round(lap)),
+        'n_mv': n_mv_i,
+        'n_dv': n_dv_i,
+        'const_action_inject_every': _resolve_one_inject_every(
+            cfg, 'const_action_inject_every', 20, const_auto),
+        'step_test_inject_every': _resolve_one_inject_every(
+            cfg, 'step_test_inject_every', 20, const_auto),
+        'dv_prbs_inject_every': _resolve_one_inject_every(
+            cfg, 'dv_prbs_inject_every', 10, dv_auto),
+        'expert_inject_every': _resolve_one_inject_every(
+            cfg, 'expert_inject_every', 20, const_auto),
+        'const_action_inject_n': _resolve_one_inject_n(
+            cfg, 'const_action_inject_n', 5, max(5, n_in)),
+        'step_test_inject_n': _resolve_one_inject_n(
+            cfg, 'step_test_inject_n', 2, max(2, n_in)),
+        'dv_prbs_inject_n': _resolve_one_inject_n(
+            cfg, 'dv_prbs_inject_n', 2, max(2, n_mv_i)),
+        'expert_inject_n': _resolve_one_inject_n(
+            cfg, 'expert_inject_n', 3, max(3, n_mv_i)),
+    }
+    if log:
+        print(
+            f'[inject-cadence] buffer lap={lap:.1f} iters '
+            f'(cap={int(cfg.buffer_capacity_steps)} / '
+            f'ep_len={int(cfg.episode_length)} / '
+            f'ep_per_iter={int(cfg.ep_per_iter)}); '
+            f'n_mv={n_mv_i} n_dv={n_dv_i}; '
+            f'const/step/expert every={out["const_action_inject_every"]}/'
+            f'{out["step_test_inject_every"]}/{out["expert_inject_every"]} '
+            f'n={out["const_action_inject_n"]}/'
+            f'{out["step_test_inject_n"]}/{out["expert_inject_n"]} '
+            f'dv-prbs every={out["dv_prbs_inject_every"]} '
+            f'n={out["dv_prbs_inject_n"]} '
+            f'(test_sim sentinels every 20/20/10/20 n 5/2/2/3; 0=off)',
+            flush=True)
+    return out
+
+
+def _hold_other_action_dims(
+        targets: np.ndarray, isolate_dim: Optional[int],
+        hold_level: float = 0.0) -> np.ndarray:
+    """Freeze non-isolated MV channels so isolation/ss-match is unconfounded.
+
+    ``targets`` is ``(n_seg, n_mv)``.  ``isolate_dim is None`` is a no-op
+    (legacy MIMO PRBS).  test_sim ``n_mv=1`` is unchanged: the only
+    column is copied through.
+    """
+    if isolate_dim is None or targets.size == 0:
+        return targets
+    i = int(isolate_dim)
+    a = int(targets.shape[-1])
+    if i < 0 or i >= a:
+        return targets
+    hold = float(np.clip(hold_level, -1.0, 1.0))
+    out = np.full_like(targets, hold)
+    out[:, i] = targets[:, i]
+    return out
+
+
+def _as_hold_action(level: float | np.ndarray, action_dim: int) -> np.ndarray:
+    """Normalized hold vector.  Scalar broadcasts (test_sim n_mv=1)."""
+    a = max(1, int(action_dim or 1))
+    x = np.asarray(level, dtype='float32').reshape(-1)
+    if x.size <= 1:
+        v = float(x.item()) if x.size == 1 else float(level)
+        return np.full((a,), float(np.clip(v, -1.0, 1.0)), dtype='float32')
+    out = np.zeros((a,), dtype='float32')
+    n = min(int(x.size), a)
+    out[:n] = np.clip(x[:n], -1.0, 1.0)
+    return out
+
+
+def _step_test_mv_index(n_action: int, primary_mv_pos: int = -1) -> int:
+    """Which MV to step in a step-test event.  ``n_action<=1`` → 0 (test_sim)."""
+    n = max(1, int(n_action or 1))
+    if n <= 1:
+        return 0
+    j = int(primary_mv_pos)
+    if 0 <= j < n:
+        return j
+    return 0
+
+
+def _per_mv_hold_rows(
+        levels: np.ndarray, n_mv: int, action_dim: int,
+        rng: np.random.Generator) -> Optional[np.ndarray]:
+    """Independent per-MV stratified holds, or None to keep scalar ``levels[i]``.
+
+    Const-action / step-settle used to copy one linspace level onto **every**
+    MV (the OP-space diagonal).  Isolation settle already covers per-input
+    holds.  Joint SS coverage on MIMO needs combinations, not all-MVs-equal.
+    ``n_mv<=1`` returns None so test_sim keeps the existing scalar path
+    (same RNG, same episodes).  MIMO: each column is a permutation of the
+    already-jittered 1-D linspace — same marginals, Latin-hypercube-ish
+    joints.  Episode **count** is unchanged (still the test_sim sentinel).
+    """
+    lv = np.asarray(levels, dtype='float32').reshape(-1)
+    n_eps = int(lv.size)
+    n_mv_i = max(0, int(n_mv or 0))
+    a = max(1, int(action_dim or n_mv_i or 1))
+    if n_mv_i <= 1 or a <= 1 or n_eps <= 0:
+        return None
+    rows = np.empty((n_eps, a), dtype='float32')
+    n_fill = min(n_mv_i, a)
+    for j in range(n_fill):
+        rows[:, j] = lv[rng.permutation(n_eps)]
+    if a > n_fill:
+        rows[:, n_fill:] = 0.0
+    return rows
+
+
+def _env_n_mv(env: 'APCEnv') -> int:
+    sim = getattr(env, 'sim', None)
+    n = int(len(getattr(sim, 'mv_indices', []) or []) or 0)
+    if n > 0:
+        return n
+    return max(1, int(getattr(env, 'action_dim', 1) or 1))
+
+
+def _isolation_settle_counts(
+        n_mv: int, n_dv: int, n_per: int) -> Tuple[int, int]:
+    """Isolated-settle episode counts. ``n_per`` is per input (test_sim 24)."""
+    n = max(0, int(n_per or 0))
+    return max(0, int(n_mv or 0)) * n, max(0, int(n_dv or 0)) * n
+
+
+def _isolation_buf_capacity(
+        *, n_mv: int, n_dv: int, n_settle_per: int) -> int:
+    """Ring-buffer width for isolation/ss-match **settle** episodes.
+
+    P28 follow-up 8: this buffer trains per-input isolation + ss-match.
+    Size it to the isolated-settle count only.  Follow-up 7 used
+    ``max(baseline + dv_prbs + 8, settle)`` so test_sim dataclass 16+24+8
+    equalled 24+24.  After ``auto_tune_seed_buffer`` baseline is ~26 on
+    test_sim, the cap grew to 58, and wrap kept ~10 confounded all-DV
+    PRBS episodes in front of the 48 settle — MIMO-mixture gradients on
+    the DC-gain objective.  Ordinary PRBS / all-DV PRBS stay in the
+    main replay buffer (WM coverage); they are not isolation data.
+    test_sim stays 48; distillation 4+1 stays 120.
+    """
+    n_mv_s, n_dv_s = _isolation_settle_counts(n_mv, n_dv, n_settle_per)
+    return max(4, n_mv_s + n_dv_s)
+
+
+def _seq_len_for_k_parts(seq_len: int, k: int, episode_length: int) -> int:
+    """``max(seq_len, K+1)`` capped at the episode (DC-gain window)."""
+    seq = max(2, int(seq_len or 64))
+    need = max(seq, int(k) + 1)
+    cap = max(2, int(episode_length or need))
+    return int(min(need, cap))
+
+
+def _seq_len_for_k(cfg: 'TrainConfig', k: int) -> int:
+    return _seq_len_for_k_parts(
+        int(getattr(cfg, 'seq_len', 64) or 64),
+        int(k),
+        int(getattr(cfg, 'episode_length', 0) or 0))
+
+
+def _isolation_sample_seq_len(cfg: 'TrainConfig') -> int:
+    """Window length so isolation/ss-match can roll K steps to SS.
+
+    Isolation K auto-tunes to H.  WM ``seq_len`` is a separate context
+    derivation and can be < K (slow plant, or ``DREAMER_SEQ_LEN`` pin).
+    ``K = min(isolation_len, T-1)`` then never reaches the settle window
+    and ``settle_var`` starves DC-gain — the same symptom follow-up 9
+    fixed for intra-episode PRBS, but for *window length*.  Use
+    ``max(seq_len, K+1)`` capped at the episode.  test_sim
+    (seq_len ≥ 64, H≈55) is unchanged.
+    """
+    k = int(getattr(cfg, 'wm_input_isolation_len', 0)
+            or getattr(cfg, 'horizon', 15) or 15)
+    return _seq_len_for_k(cfg, k)
+
+
+def _wm_train_seq_len(cfg: 'TrainConfig') -> int:
+    """P1/P2 main-replay window so overshoot / gain-match can roll K to SS.
+
+    Follow-up 10 grew *isolation_buf* samples to ``max(seq_len, K+1)``.
+    The MAIN WM batch still used ``cfg.seq_len``, so overshoot
+    (``K = min(K, T-1)``, needs future obs) truncated the identified
+    settling length when ``H >= seq_len`` (slow plant or
+    ``DREAMER_SEQ_LEN`` pin) — P25-family (forward Huber tiny,
+    transfer-matrix DC dead).  Gain-match no longer truncates open-loop
+    ``K`` to ``T-1`` (held a/dv from the start; rest-IC FD rolls from
+    the rest cache).  Do **not** grow T to ``gain_match_len`` (P67
+    4H teacher CAPPED; encode T stays lookback; GPU probe sizes from
+    ``horizon``).  P3
+    on-policy stays ``seq_len``.  test_sim (seq_len=128, H=55) is
+    unchanged.
+    """
+    k = max(
+        int(getattr(cfg, 'wm_overshoot_len', 0) or 0),
+        int(getattr(cfg, 'horizon', 15) or 15),
+    )
+    return _seq_len_for_k(cfg, k)
+
+
+def wm_train_seq_len_for_plant(seq_len: int, horizon: int,
+                               episode_length: int) -> int:
+    """GPU-probe T matching P1/P2 WM samples (K auto-tunes to H)."""
+    return _seq_len_for_k_parts(int(seq_len), int(horizon), int(episode_length))
+
+
+def _dynamics_g_trainable(model: 'DreamerV4') -> bool:
+    """True iff the plant model ``g`` (not DOB A,K) still takes gradients.
+
+    Gate for g-only aux (isolation extra unroll, overshoot, held-rollout,
+    full-BPTT gain-match).  DOB-curriculum P2 freezes encoder/decoder/GRU/
+    cont-gain; those K-step prior rolls cannot update frozen params and
+    are ~73% of the WM step (P28 follow-up 11).
+    """
+    dyn = getattr(model, 'dynamics', None)
+    if dyn is None:
+        return False
+    dob_names = ('dob_log_decay', 'dob_log_gain')
+    for n, p in dyn.named_parameters():
+        if n in dob_names:
+            continue
+        if p.requires_grad:
+            return True
+    return False
+
+
+def _dv_isolation_delta(isolated_level: Optional[float], span: float) -> float:
+    """Engineering DV step in MV-action units: ±1 ↔ ±half-span.
+
+    P28 follow-up 9 multiplied ``isolated_level`` by ``dv_prbs_op_frac``
+    (the ordinary all-DV PRBS band).  Isolation linspace is already in
+    ``[-constant_action_seed_op_band, +…]`` like the isolated MV, so the
+    extra op_frac shrank |ΔDV| vs |ΔMV| → smaller |ΔCV| → absolute
+    isolation/ss-match MSE under-trained DV (same family as abs-Huber
+    on unequal |tgt|).  Ordinary DV-PRBS still uses ``dv_prbs_op_frac``.
+    ``wm_isolation_dcv_match`` scales ``isolated_level`` at the caller
+    (``Δu ∝ 1/|G|``); this helper stays isomorphic.
+    """
+    frac = 0.0 if isolated_level is None else float(
+        np.clip(isolated_level, -1.0, 1.0))
+    return float(frac * 0.5 * abs(float(span)))
+
+
+def _gain_col_rms(rows) -> List[float]:
+    """Per-input RMS |G| across CVs from ``gain_match_*_target`` tuples."""
+    out: List[float] = []
+    for row in (rows or ()):
+        if row is None:
+            out.append(0.0)
+            continue
+        if np.ndim(row) == 0:
+            xs = [abs(float(row))]
+        else:
+            xs = [abs(float(x)) for x in row]
+        xs = [x for x in xs if np.isfinite(x)]
+        if not xs:
+            out.append(0.0)
+        else:
+            out.append(float(np.sqrt(np.mean(np.square(xs)))))
+    return out
+
+
+def _scale_isolation_level(level: float, scale: float) -> float:
+    """Clip ``level * scale`` to the normalized-action cube."""
+    return float(np.clip(float(level) * float(scale), -1.0, 1.0))
+
+
+def _isolation_edge_du(scale: float, op_band: float) -> float:
+    """Applied |Δu| at the isolation linspace edge (after cube clip).
+
+    Scales in ``run_plan`` are multipliers on ``isolated_level ∈
+    [−op_band, +op_band]``.  ``scale>1`` does **not** mean |Δu|>1.
+    """
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
+    return float(np.clip(a0 * abs(float(scale)), 0.0, 1.0))
+
+
+def _isolation_dcv_floor(cfg: 'TrainConfig') -> float:
+    raw_floor = getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)
+    try:
+        return max(0.0, float(raw_floor))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _record_isolation_dcv_span(
+        cfg: 'TrainConfig', op_band: float,
+        mv_g: Optional[List[float]] = None,
+        dv_g: Optional[List[float]] = None,
+) -> None:
+    """Stash unitless |G| span for run_plan audit (does not change scales)."""
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
+    smax = 1.0 / a0
+    cfg._isolation_dcv_smax = smax  # type: ignore[attr-defined]
+    cfg._isolation_dcv_g_ratio = None  # type: ignore[attr-defined]
+    cfg._isolation_dcv_equalize_possible = None  # type: ignore[attr-defined]
+    if not _cfg_on(cfg, 'wm_isolation_dcv_match', True):
+        return
+    if mv_g is None or dv_g is None:
+        return
+    g_all = [g for g in list(mv_g) + list(dv_g) if g > 1e-6]
+    if len(g_all) < 2:
+        return
+    g_min = float(min(g_all))
+    g_max = float(max(g_all))
+    ratio = g_max / max(g_min, 1e-12)
+    cfg._isolation_dcv_g_ratio = float(ratio)  # type: ignore[attr-defined]
+    if ratio < 1.05:
+        cfg._isolation_dcv_equalize_possible = True  # type: ignore[attr-defined]
+        return
+    floor = _isolation_dcv_floor(cfg)
+    # Floor 0 can equalize by shrinking the strong teacher (P38 FALSIFIED).
+    # Floor 1.0 can equalize only when ratio ≤ smax (cube headroom).
+    cfg._isolation_dcv_equalize_possible = bool(  # type: ignore[attr-defined]
+        floor <= 0.0 or ratio <= smax * 1.001)
+
+
+def _isolation_dcv_scales(
+        cfg: 'TrainConfig', n_mv: int, n_dv: int, op_band: float,
+) -> Tuple[List[float], List[float]]:
+    """Per-input multipliers so isolation |G_i|·|u_i| match at the linspace edge.
+
+    Abs isolation/ss-match MSE drowns the weak-|G| input when |Δu| is
+    MV-action-isomorphic (P33 |tgt| 2.82 vs 0.49 → val DV ×0.66).  Inv-var
+    reweight DISCARDED (P34–P36).  Scale ``Δu_i ∝ 1/|G_i|`` from WM-norm
+    gain-match targets; ``level*scale`` is clipped to ±1.  Scale is
+    floored at ``wm_isolation_dcv_min_scale`` (default 1.0) so the
+    strong-|G| teacher stays at op-band (P38 match-at-``g_min`` starved
+    MV: edge |Δu| 0.19 vs P37 0.60 → storm 2/2 CAPPED 0.01@DV).  Weak
+    input may use cube headroom (``smax = 1/op_band``).  When
+    ``|G_max|/|G_min| > 1/op_band``, |ΔCV| cannot equalize without
+    shrinking the strong teacher or exceeding the cube — the floor
+    leaves residual |ΔCV| imbalance (test_sim ~5.8 > 1.67; P39 CAPPED
+    0.70@DV).  Audit ``edge_du_* = min(1, op_band·scale)`` and
+    ``equalize_possible`` / ``g_ratio`` / ``smax``.  Equal-|G|
+    (max/min < 1.05) or a single input keeps the unscaled op-band
+    linspace.  Off (``wm_isolation_dcv_match=False``) or missing
+    targets → all 1s.  Scale values are unchanged by the span audit.
+    """
+    n_mv = max(0, int(n_mv or 0))
+    n_dv = max(0, int(n_dv or 0))
+    ones_mv = [1.0] * n_mv
+    ones_dv = [1.0] * n_dv
+    mv_g = _gain_col_rms(getattr(cfg, 'gain_match_mv_target', ()) or ())
+    dv_g = _gain_col_rms(getattr(cfg, 'gain_match_dv_target', ()) or ())
+    while len(mv_g) < n_mv:
+        mv_g.append(0.0)
+    while len(dv_g) < n_dv:
+        dv_g.append(0.0)
+    mv_g = mv_g[:n_mv]
+    dv_g = dv_g[:n_dv]
+    _record_isolation_dcv_span(cfg, op_band, mv_g, dv_g)
+    if not _cfg_on(cfg, 'wm_isolation_dcv_match', True):
+        return ones_mv, ones_dv
+    g_all = [g for g in mv_g + dv_g if g > 1e-6]
+    if len(g_all) < 2:
+        return ones_mv, ones_dv
+    g_min = float(min(g_all))
+    g_max = float(max(g_all))
+    if g_max / max(g_min, 1e-12) < 1.05:
+        return ones_mv, ones_dv
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
+    smax = 1.0 / a0
+    floor = _isolation_dcv_floor(cfg)
+
+    def _sc(gs: List[float]) -> List[float]:
+        out: List[float] = []
+        for g in gs:
+            if g <= 1e-6:
+                out.append(1.0)
+            else:
+                # Floor 1.0 = never shrink below op-band (P38 RCA).
+                # 0 = match-at-g_min (P38 FALSIFIED).
+                out.append(float(np.clip(g_min / (g * a0), floor, smax)))
+        return out
+
+    return _sc(mv_g), _sc(dv_g)
+
+
+def _stash_isolation_dcv_scales(
+        cfg: 'TrainConfig', mv_sc: List[float], dv_sc: List[float],
+        op_band: float = 0.6) -> None:
+    """Persist resolved Δu scales + applied edge |Δu| for run_plan audit."""
+    a0 = float(np.clip(float(op_band), 1e-3, 1.0))
+    cfg._isolation_dcv_mv_scale = tuple(float(x) for x in mv_sc)  # type: ignore[attr-defined]
+    cfg._isolation_dcv_dv_scale = tuple(float(x) for x in dv_sc)  # type: ignore[attr-defined]
+    cfg._isolation_dcv_op_band = a0  # type: ignore[attr-defined]
+
+
+def _isolation_dcv_scale_payload(cfg: 'TrainConfig') -> Dict[str, object]:
+    """Audit dict: multipliers AND applied edge |Δu| (after cube clip)."""
+    mv = [float(x) for x in (
+        getattr(cfg, '_isolation_dcv_mv_scale', ()) or ())]
+    dv = [float(x) for x in (
+        getattr(cfg, '_isolation_dcv_dv_scale', ()) or ())]
+    op = float(getattr(cfg, '_isolation_dcv_op_band', 0.0) or 0.0)
+    min_scale = _isolation_dcv_floor(cfg)
+    out: Dict[str, object] = {
+        'on': bool(getattr(cfg, 'wm_isolation_dcv_match', True)),
+        'min_scale': min_scale,
+        'mv': mv,
+        'dv': dv,
+    }
+    if op > 0.0:
+        out['op_band'] = op
+        out['edge_du_mv'] = [_isolation_edge_du(s, op) for s in mv]
+        out['edge_du_dv'] = [_isolation_edge_du(s, op) for s in dv]
+    g_ratio = getattr(cfg, '_isolation_dcv_g_ratio', None)
+    if g_ratio is not None:
+        out['g_ratio'] = float(g_ratio)
+    smax = getattr(cfg, '_isolation_dcv_smax', None)
+    if smax is not None:
+        out['smax'] = float(smax)
+    eq = getattr(cfg, '_isolation_dcv_equalize_possible', None)
+    if eq is not None:
+        out['equalize_possible'] = bool(eq)
+    return out
+
+
+def _gain_match_targets_ready(cfg: 'TrainConfig') -> bool:
+    mv = getattr(cfg, 'gain_match_mv_target', None) or ()
+    dv = getattr(cfg, 'gain_match_dv_target', None) or ()
+    return bool(mv) or bool(dv)
+
+
+def _maybe_resolve_gain_match_targets(env: 'APCEnv', cfg: 'TrainConfig') -> bool:
+    """Resolve WM-norm |G| before isolation-settle (for dcv_match scales only).
+
+    Isolation settle is late in seed fill (after PRBS / const / step-test /
+    DV-PRBS) so Welford obs-norm is already on the operational buffer.
+    This must NOT skip the post-seed re-resolve: isolation + expert still
+    update cv_std (P37 freeze point). Failure leaves scales at 1.
+    """
+    if _gain_match_targets_ready(cfg):
+        return True
+    try:
+        _resolve_gain_match_targets(env, cfg, log_label='pre-iso targets')
+    except Exception as exc:
+        print(f'[gain-match] pre-iso FAILED ({exc!r}); '
+              f'isolation dcv scales stay 1', flush=True)
+        return False
+    return _gain_match_targets_ready(cfg)
+
+
+def _maybe_clean_steady_seed(env: 'APCEnv', cfg: 'TrainConfig') -> None:
+    """P89: noise-free held-action / isolation-settle seeds (override after reset)."""
+    if bool(getattr(cfg, 'clean_steady_seeds', True)):
+        env.set_sim_noise_scale(0.0)
+
+
+def _cfg_on(cfg: 'TrainConfig', name: str, default: bool = True) -> bool:
+    """Bool cfg field; strings like ``'0'``/``'off'`` count as False."""
+    v = getattr(cfg, name, default)
+    if isinstance(v, str):
+        return str(v).strip().lower() not in ('0', 'off', 'false', 'no', '')
+    return bool(v)
+
+
+def _require_realsim_actor(cfg: 'TrainConfig') -> None:
+    """Imagination actor is deleted; P3 is ``_realsim_actor_critic_step``.
+
+    A leftover ``DREAMER_ACTOR_SOURCE=imagination`` used to skip
+    ``onpol_buf`` and train the actor on shared replay (p01 MV-chatter).
+    Fail loud instead of a false A/B.  ``DREAMER_ACTOR_LOSS=pmpo`` is
+    the same class: ``run_plan`` would change while
+    ``_realsim_actor_critic_step`` still inlines REINFORCE + μ-ratio.
+    PMPO prior-refresh knobs are **REMOVED** (same false A/B).
+    """
+    src = str(getattr(cfg, 'actor_train_source', 'realsim') or 'realsim')
+    src = src.strip().lower()
+    if src not in ('realsim', ''):
+        raise RuntimeError(
+            f'actor_train_source={src!r} is not supported; '
+            'imagination actor is deleted (P3 is _realsim_actor_critic_step)')
+    kind = str(getattr(cfg, 'actor_loss_type', 'reinforce') or 'reinforce')
+    kind = kind.strip().lower()
+    if kind not in ('reinforce', ''):
+        raise RuntimeError(
+            f'actor_loss_type={kind!r} is not wired in '
+            '_realsim_actor_critic_step (always REINFORCE + μ-ratio); '
+            'DREAMER_ACTOR_LOSS would be a false A/B')
+
+
+def _isolation_seq_is_mv(act: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """(B,) bool: isolated-MV hold (action energy) vs isolated-DV (action≈0).
+
+    Isolation settle writes whole-episode MV holds (``action_std=0``) or
+    DV steps with MV held at 0.  Used only to split detached isolation
+    traj extras — does not change the loss.
+    """
+    return act.detach().pow(2).mean(dim=(1, 2)) > float(eps)
+
+
+def _snr_moving_average(arr: np.ndarray, window: int
+                        ) -> Tuple[np.ndarray, np.ndarray]:
+    """Valid moving-average trend + residual. ``arr`` is (T, C)."""
+    w = int(window)
+    t, _c = arr.shape
+    cs = np.concatenate(
+        [np.zeros((1, arr.shape[1]), dtype=arr.dtype),
+         np.cumsum(arr, axis=0)], axis=0)
+    trend = (cs[w:] - cs[:-w]) / float(w)
+    aligned = arr[w - 1:, :]
+    return trend, aligned - trend
+
+
+def _snr_build_report(
+        arr: np.ndarray, window: int, tau_dom: float, sample_rate: int,
+        channel_meta: List[Dict[str, object]],
+        measured_idx: List[int],
+) -> Dict[str, object]:
+    """Per-channel SNR. Summary/WARN use measured CV+DV, not constant aug."""
+    trend, detail = _snr_moving_average(arr, int(window))
+    signal_var = np.var(trend, axis=0)
+    noise_var = np.var(detail, axis=0)
+    snr_per_ch = signal_var / np.maximum(noise_var, 1e-12)
+    snr_db = 10.0 * np.log10(np.maximum(snr_per_ch, 1e-12))
+    n_ch = int(arr.shape[1])
+    per_channel: List[Dict[str, object]] = []
+    for i in range(n_ch):
+        meta = channel_meta[i] if i < len(channel_meta) else {}
+        sig = float(np.sqrt(signal_var[i]))
+        noi = float(np.sqrt(noise_var[i]))
+        constant = bool(sig < 1e-12 and noi < 1e-12)
+        per_channel.append({
+            'index': int(i),
+            'name': str(meta.get('name') or f'obs[{i}]'),
+            'kind': str(meta.get('kind') or 'unknown'),
+            'role': str(meta.get('role') or 'unknown'),
+            'signal_std': sig,
+            'noise_std': noi,
+            'snr': float(snr_per_ch[i]),
+            'snr_db': float(snr_db[i]),
+            'constant': constant,
+        })
+    meas_set = {int(x) for x in measured_idx}
+    meas = [p for p in per_channel
+            if int(p['index']) in meas_set and not bool(p['constant'])]
+    scope = 'measured_cv_dv'
+    if not meas:
+        meas = [p for p in per_channel
+                if p.get('kind') == 'state' and not bool(p['constant'])]
+        scope = 'state_nonconstant'
+    if not meas:
+        meas = [p for p in per_channel if not bool(p['constant'])]
+        scope = 'nonconstant'
+    if meas:
+        vals = np.asarray([float(p['snr_db']) for p in meas], dtype='float64')
+        snr_min = float(vals.min())
+        snr_med = float(np.median(vals))
+        snr_max = float(vals.max())
+    else:
+        snr_min = float(snr_db.min())
+        snr_med = float(np.median(snr_db))
+        snr_max = float(snr_db.max())
+        scope = 'all'
+    const_ch = [p for p in per_channel if bool(p['constant'])]
+    return {
+        'window_steps': int(window),
+        'tau_dom': float(tau_dom),
+        'sample_rate': int(sample_rate),
+        'summary_scope': scope,
+        'per_channel': per_channel,
+        'snr_db_min': snr_min,
+        'snr_db_median': snr_med,
+        'snr_db_max': snr_max,
+        'constant_n': int(len(const_ch)),
+        'constant_names': [str(p['name']) for p in const_ch],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Replay buffer — episode-major
 # ---------------------------------------------------------------------------
+
+def _replay_n_dist(cfg: 'TrainConfig', env: Optional['APCEnv'] = None) -> int:
+    """Hidden-load target width stored in the WM replay buffer.
+
+    P25 RCA: when the neural-Kalman DOB is on, ``disturbance_head_dim`` is
+    forced to 0 (the read-out head is retired so it cannot echo ``d_t``).
+    Keying the buffer on that field then stored ``n_dist=0`` →
+    ``batch['dist']`` was missing → ``dob_ground`` was identically 0 for
+    every P2 iter (P19 and P25).  Store ``n_cv`` whenever the DOB is on
+    or grounding is requested, otherwise the (optional) head width.
+    Sim-agnostic: ``n_cv`` comes from the env / ``cv_obs_indices``.
+    """
+    n_head = int(getattr(cfg, 'disturbance_head_dim', 0) or 0)
+    n_cv = 0
+    if env is not None:
+        n_cv = len(getattr(env, 'cv_indices', ()) or ())
+    if n_cv <= 0:
+        n_cv = len(getattr(cfg, 'cv_obs_indices', ()) or ())
+    ground_on = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) > 0.0
+    dob_on = bool(getattr(cfg, 'dob_enabled', False))
+    if n_head > 0:
+        return n_head
+    if (ground_on or dob_on) and n_cv > 0:
+        return int(n_cv)
+    return 0
+
 
 class TrajectoryBuffer:
     def __init__(self, capacity_eps: int, episode_length: int,
@@ -2674,8 +5104,12 @@ class TrajectoryBuffer:
         self.act[i] = act
         self.rew[i] = rew
         self.cont[i] = cont
-        self.expert[i] = (expert if expert is not None
-                          else np.zeros(self.T, dtype='float32'))
+        # In-place fill: leftover ``np.zeros(T)`` every non-expert
+        # episode was a host alloc the inner graph never needed.
+        if expert is not None:
+            self.expert[i] = expert
+        else:
+            self.expert[i] = 0.0
         if self.dist is not None:
             if dist is None and self._dist_source is not None:
                 try:
@@ -2693,7 +5127,18 @@ class TrajectoryBuffer:
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
-    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator
+    def clear(self) -> None:
+        """Drop stored episodes (keep allocated tensors).
+
+        ``sample`` still raises on an empty buffer.  Not used at the
+        P1→P2 latch (P65 flush FALSIFIED: starving the ring for Kalman
+        ID).  Kept for tests / explicit resets.
+        """
+        self.filled = 0
+        self.write = 0
+
+    def sample(self, batch_size: int, seq_len: int, rng: np.random.Generator,
+               keys: Optional[Tuple[str, ...]] = None
                ) -> Dict[str, np.ndarray]:
         if self.filled == 0:
             raise ValueError("empty buffer")
@@ -2703,28 +5148,28 @@ class TrajectoryBuffer:
             starts = np.zeros(batch_size, dtype=np.int64)
         else:
             starts = rng.integers(0, max_start + 1, size=batch_size)
-        out_obs = np.zeros((batch_size, seq_len, self.obs_dim),
-                           dtype='float32')
-        out_act = np.zeros((batch_size, seq_len, self.action_dim),
-                           dtype='float32')
-        out_rew = np.zeros((batch_size, seq_len), dtype='float32')
-        out_cont = np.zeros((batch_size, seq_len), dtype='float32')
-        out_expert = np.zeros((batch_size, seq_len), dtype='float32')
-        out_dist = (np.zeros((batch_size, seq_len, self.n_dist), dtype='float32')
-                    if self.dist is not None else None)
-        for b in range(batch_size):
-            s = starts[b]
-            out_obs[b] = self.obs[ep_idx[b], s:s + seq_len]
-            out_act[b] = self.act[ep_idx[b], s:s + seq_len]
-            out_rew[b] = self.rew[ep_idx[b], s:s + seq_len]
-            out_cont[b] = self.cont[ep_idx[b], s:s + seq_len]
-            out_expert[b] = self.expert[ep_idx[b], s:s + seq_len]
-            if out_dist is not None:
-                out_dist[b] = self.dist[ep_idx[b], s:s + seq_len]
-        out = {'obs': out_obs, 'act': out_act, 'rew': out_rew,
-               'cont': out_cont, 'expert': out_expert}
-        if out_dist is not None:
-            out['dist'] = out_dist
+        # Fancy-index the (episode, time) windows.  Same slices as the
+        # old Python ``for b`` copy; host-adaptive (no extra threads).
+        # ``keys`` skips leftover channels the inner graph never reads
+        # (``cont`` every phase; P1 ``dist``/``rew``/``expert``; P3 actor
+        # ``expert``).  RNG draws happen first so a subset is identity
+        # vs a full sample at the same seed.
+        t_idx = starts[:, None] + np.arange(int(seq_len), dtype=np.int64)
+        ep = ep_idx[:, None]
+        want = None if keys is None else set(keys)
+        out: Dict[str, np.ndarray] = {}
+        if want is None or 'obs' in want:
+            out['obs'] = self.obs[ep, t_idx]
+        if want is None or 'act' in want:
+            out['act'] = self.act[ep, t_idx]
+        if want is None or 'rew' in want:
+            out['rew'] = self.rew[ep, t_idx]
+        if want is None or 'cont' in want:
+            out['cont'] = self.cont[ep, t_idx]
+        if want is None or 'expert' in want:
+            out['expert'] = self.expert[ep, t_idx]
+        if self.dist is not None and (want is None or 'dist' in want):
+            out['dist'] = self.dist[ep, t_idx]
         return out
 
 
@@ -2733,6 +5178,52 @@ class TrajectoryBuffer:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _collect_random_episode(env: APCEnv, cfg: TrainConfig
+                            ) -> Dict[str, np.ndarray]:
+    """P1/P2 random collect: numpy-only (no RSSM / policy / torch).
+
+    ``collect_episode(..., random_action=True)`` never reads the posterior
+    (WM teacher-forces from replay).  Keep this path off the GPU so the
+    A10 P1 loop and CPU smokes do not pay ``episode_length`` kernel
+    launches or an unused SF ``a_history`` concat.  Same buffers as
+    ``collect_episode``.
+    """
+    obs_window = env.reset(exploration=True)
+    T, D = cfg.episode_length, env.obs_dim
+    obs_buf = np.zeros((T, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window[-1]
+        a_np = env.rng.uniform(-1.0, 1.0,
+                                size=(env.action_dim,)).astype('float32')
+        next_window, reward, done, _ = env.step(a_np)
+        act_buf[t] = a_np
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
+def _resolve_baseline_seed_op_band(cfg: 'TrainConfig', prbs_op_band: float
+                                   ) -> float:
+    """Stratified baseline-seed centres: unitless fraction of action.
+
+    Explicit ``DREAMER_BASELINE_SEED_OP_BAND`` / field override wins.
+    Otherwise ``min(baseline_seed_op_band, prbs_op_band)`` so a tighter
+    PRBS envelope cannot leave baseline centres outside the excited band
+    (historical ``os.environ.get(..., min(0.6, prbs))``).
+    """
+    band = float(getattr(cfg, 'baseline_seed_op_band', 0.6) or 0.6)
+    explicit = getattr(cfg, '_explicit_fields', set()) or set()
+    if 'baseline_seed_op_band' in explicit:
+        return band
+    return min(band, float(prbs_op_band))
+
+
 def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
                     cfg: TrainConfig, *, random_action: bool = False,
                     deterministic: bool = False) -> Dict[str, np.ndarray]:
@@ -2745,8 +5236,13 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
          (slight context noise) and d=d_min; read the agent-register
          hidden state at the latest time slot.
       3. Sample (or argmax) the action from the policy head.
+
+    P1/P2 ``random_action=True`` is numpy-only (see
+    ``_collect_random_episode``).
     """
-    obs_window = env.reset(exploration=random_action)
+    if random_action:
+        return _collect_random_episode(env, cfg)
+    obs_window = env.reset(exploration=False)
     T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
     # Phase 2 (2026-05-24): replay storage is per-step ``(T, D)`` only;
     # the L-length sliding window persists in ``obs_window`` for the
@@ -2756,15 +5252,18 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
 
-    a_history = np.zeros((L, env.action_dim), dtype='float32')
-    d_min = 1.0 / cfg.k_max
-    # Past τ must land in the trained grid.  sample_tau_d emits
-    # τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max, so the maximum trained
-    # τ value is (k_max-1)/k_max.  Using cfg.tau_ctx=0.1 (τ=0.9) with
-    # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
-    tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
-
-    _is_rssm = getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+    _is_rssm = _is_rssm_interface(model)
+    # SF lookback context (unused on RSSM/TSSM — GRU/token state carries it).
+    a_history = None
+    d_min = tau_ctx_val = None
+    if not _is_rssm:
+        a_history = np.zeros((L, env.action_dim), dtype='float32')
+        d_min = 1.0 / cfg.k_max
+        # Past τ must land in the trained grid.  sample_tau_d emits
+        # τ ∈ {0, 1/k, …, (k-1)/k} for k ≤ k_max, so the maximum trained
+        # τ value is (k_max-1)/k_max.  Using cfg.tau_ctx=0.1 (τ=0.9) with
+        # k_max=4 (max trained τ=0.75) is OOD → dynamics output garbage.
+        tau_ctx_val = 1.0 - max(float(cfg.tau_ctx), 1.0 / float(cfg.k_max))
     # RSSM streaming inference: carry a running recurrent state across the
     # episode.  Each step advances the posterior with (prev_action, obs)
     # and the posterior feature drives the policy — the GRU holds the
@@ -2780,80 +5279,89 @@ def collect_episode(env: APCEnv, model: DreamerV4, device: torch.device,
     # host→device every step — that removes one transfer per step.  The
     # single device→host ``.cpu()`` of the chosen action is unavoidable
     # because the simulator runs on CPU/numpy.
-    with torch.inference_mode():
+    #
+    # P1/P2 ``random_action=True`` is handled above (numpy-only).  P3
+    # on-policy streams the posterior with measured DV + Kalman so the
+    # served ``feat`` matches ``_realsim_actor_critic_step`` re-encode.
+    # Frozen-RSSM CUDA-graphs that B=1 serve (policy stays eager).
+    from models.dreamer_v4_rssm import (
+        alloc_pinned_obs_host, copy_obs_row, stream_serve_step,
+        get_collect_serve_cuda_graph)
+    # One autocast region for the episode (not per step).  RSSM obs is a
+    # persistent GPU row — no per-step ``from_numpy().to().unsqueeze``.
+    # Pinned host staging makes the H2D non-blocking (identity values).
+    _use_cuda_amp = (device.type == 'cuda')
+    with torch.inference_mode(), torch.amp.autocast(
+            device_type=device.type, dtype=torch.bfloat16,
+            enabled=_use_cuda_amp):
         _rssm_state = (model.dynamics.initial_state(1, device)
                        if _is_rssm else None)
         _rssm_prev_a = (torch.zeros(1, env.action_dim, device=device)
                         if _is_rssm else None)
+        _o = (torch.empty(1, D, device=device, dtype=torch.float32)
+              if _is_rssm else None)
+        _o_host = (alloc_pinned_obs_host(device, D) if _is_rssm else None)
+        # Frozen-RSSM P3 collect is B=1 kernel-launch bound (~3 ms/step).
+        # CUDA-graph the observer serve; policy stays eager (σ sample).
+        _serve_cg = None
+        if _is_rssm and _rssm_state is not None:
+            _serve_cg = get_collect_serve_cuda_graph(
+                model.dynamics, _rssm_state, device, D, env.action_dim)
+            if _serve_cg is not None:
+                _serve_cg.reset(_rssm_state)
 
         for t in range(T):
             obs_buf[t] = obs_window[-1]
-            if random_action:
-                a_np = env.rng.uniform(-1.0, 1.0,
-                                        size=(env.action_dim,)).astype('float32')
-                if _is_rssm:
-                    # Advance the posterior even on random actions so the
-                    # recurrent state stays consistent if a later step is
-                    # policy-driven (mixed-mode collection).
-                    with torch.amp.autocast(device_type=device.type,
-                                             dtype=torch.bfloat16,
-                                             enabled=(device.type == 'cuda')):
-                        _o = torch.from_numpy(
-                            obs_window[-1]).to(device).unsqueeze(0)
-                        _emb = model.dynamics.embed(_o)
-                        _post, _ = model.dynamics.obs_step(
-                            _rssm_state, _rssm_prev_a, _emb, sample=True)
-                    _rssm_state = _post
-                    # Random action originates on host; the (1, A) host→device
-                    # copy is negligible and necessary (no device tensor yet).
-                    _rssm_prev_a = torch.from_numpy(
-                        a_np).to(device).unsqueeze(0)
-            elif _is_rssm:
-                with torch.amp.autocast(device_type=device.type,
-                                         dtype=torch.bfloat16,
-                                         enabled=(device.type == 'cuda')):
-                    _o = torch.from_numpy(obs_window[-1]).to(device).unsqueeze(0)
-                    _emb = model.dynamics.embed(_o)
-                    # mbrl2 real-sim: advance the posterior with the MODE
-                    # (sample=False) when the POLICY drives.  The actor is TRAINED
-                    # on the mode belief (``_realsim_actor_critic_step`` re-encodes
-                    # with sample=False) and LQG separation puts control on the
-                    # OPTIMAL STATE ESTIMATE — so acting on a SAMPLED belief here is
-                    # a train/inference mismatch that injects latent-sampling noise
-                    # into the MV (part of the p01 chatter, esp. at deterministic
-                    # eval).  Random-exploration collection above keeps sample=True
-                    # (diverse latents for WM training).
-                    _post, _ = model.dynamics.obs_step(
-                        _rssm_state, _rssm_prev_a, _emb, sample=False)
-                    action_t, _, _ = model.policy(_post.feat,
+            if _is_rssm:
+                # Certainty-equivalent (sample=False) belief: the actor
+                # trains on the mode (``_realsim_actor_critic_step``) and
+                # LQG control acts on the optimal state estimate.  A
+                # sampled belief injects latent noise into the MV (p01
+                # chatter).  ``stream_serve_step`` threads measured DV
+                # into the GRU and Kalman ``d_t`` when DOB is live —
+                # same feat the frozen observer uses at train time.
+                if _serve_cg is not None:
+                    copy_obs_row(_serve_cg.obs, obs_window[-1], _o_host)
+                    feat = _serve_cg.replay()
+                    action_t, _, _ = model.policy(
+                        feat, deterministic=deterministic)
+                    _serve_cg.prev_a.copy_(
+                        action_t.detach().to(
+                            dtype=_serve_cg.prev_a.dtype).reshape(1, -1))
+                else:
+                    copy_obs_row(_o, obs_window[-1], _o_host)
+                    _rssm_state = stream_serve_step(
+                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                        sample=False)
+                    action_t, _, _ = model.policy(_rssm_state.feat,
                                                    deterministic=deterministic)
+                    # Reuse the on-device action for the next GRU step —
+                    # ``copy_`` into the static prev-action (no rebind;
+                    # the .cpu() below already paid the env.step sync).
+                    _rssm_prev_a.copy_(
+                        action_t.detach().to(
+                            dtype=_rssm_prev_a.dtype).reshape(1, -1))
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-                _rssm_state = _post
-                # Reuse the on-device action for the next GRU step — no
-                # host→device round-trip (the .cpu() above already paid the
-                # only unavoidable sync for env.step).
-                _rssm_prev_a = action_t.detach().float().reshape(1, -1)
             else:
                 ow = torch.from_numpy(obs_window).to(device)            # (L, D)
                 a_ctx = torch.from_numpy(a_history).to(device)           # (L, A)
-                with torch.amp.autocast(device_type=device.type,
-                                         dtype=torch.bfloat16,
-                                         enabled=(device.type == 'cuda')):
-                    z_ctx = model.tokenizer.encode(ow).unsqueeze(0)     # (1, L, z)
-                    tau = torch.full((1, L), tau_ctx_val, device=device,
-                                      dtype=z_ctx.dtype)
-                    d = torch.full((1, L), d_min, device=device,
-                                    dtype=z_ctx.dtype)
-                    out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
-                    agent_hid = out['agent_hid'][:, -1]                  # (1, D)
-                    action_t, _, _ = model.policy(agent_hid,
-                                                    deterministic=deterministic)
+                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)     # (1, L, z)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]                  # (1, D)
+                action_t, _, _ = model.policy(agent_hid,
+                                                deterministic=deterministic)
                 a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
             next_window, reward, done, _ = env.step(a_np)
             act_buf[t] = a_np
             rew_buf[t] = reward
             cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
-            a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
+            if a_history is not None:
+                a_history = np.concatenate(
+                    [a_history[1:], a_np[None, :]], axis=0)
             obs_window = next_window
             if done:
                 break
@@ -2905,12 +5413,69 @@ def collect_baseline_episode(env: APCEnv, cfg: TrainConfig, *,
     return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
 
 
+def _isolated_hold_action(
+        n_mv: int, isolate_dim: Optional[int],
+        hold_level: float, isolated_level: Optional[float],
+) -> np.ndarray:
+    """Constant MV command for isolation-settle: one input at ``isolated_level``.
+
+    Other actuators stay at ``hold_level`` (default 0).  SISO (n_mv=1) is
+    just the isolated level.  ``isolated_level is None`` holds the
+    isolated dim at 0.
+    """
+    a = int(max(0, n_mv))
+    hold = float(np.clip(hold_level, -1.0, 1.0))
+    out = np.full((a,), hold, dtype='float32')
+    if a == 0:
+        return out
+    lvl = 0.0 if isolated_level is None else float(isolated_level)
+    lvl = float(np.clip(lvl, -1.0, 1.0))
+    if isolate_dim is None:
+        out[:] = lvl
+        return out
+    i = int(isolate_dim)
+    if 0 <= i < a:
+        out[i] = lvl
+    return out
+
+
+def _collect_held_action_episode(
+        env: 'APCEnv', cfg: 'TrainConfig', obs_window: np.ndarray,
+        action: np.ndarray) -> Dict[str, np.ndarray]:
+    """Run ``episode_length`` steps at a constant action (already reset)."""
+    T, D = int(cfg.episode_length), env.obs_dim
+    a_np = np.asarray(action, dtype='float32').reshape(-1)
+    if a_np.size != env.action_dim:
+        held = np.zeros((env.action_dim,), dtype='float32')
+        n = min(int(a_np.size), int(env.action_dim))
+        held[:n] = a_np[:n]
+        a_np = held
+    np.clip(a_np, -1.0, 1.0, out=a_np)
+    obs_buf = np.zeros((T, D), dtype='float32')
+    act_buf = np.zeros((T, env.action_dim), dtype='float32')
+    rew_buf = np.zeros(T, dtype='float32')
+    cont_buf = np.ones(T, dtype='float32')
+    for t in range(T):
+        obs_buf[t] = obs_window[-1]
+        next_window, reward, done, _ = env.step(a_np)
+        act_buf[t] = a_np
+        rew_buf[t] = reward
+        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
+        obs_window = next_window
+        if done:
+            break
+    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+
+
 def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                           action_std: float = 0.05,
                           n_segments: Optional[int] = None,
                           op_band: float = 0.95,
                           n_strata: Optional[int] = None,
                           long_hold: bool = False,
+                          isolate_dim: Optional[int] = None,
+                          hold_level: float = 0.0,
+                          isolated_level: Optional[float] = None,
                           ) -> Dict[str, np.ndarray]:
     """Collect one episode that PRBS-toggles MV across the operating band.
 
@@ -2930,28 +5495,64 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     across the full range, including near boundaries (which uniform
     sampling under-covers when #segments per episode is small).
 
+    ``isolate_dim`` (P28 follow-up 7): sweep only that MV and hold every
+    other actuator at ``hold_level``.  ``long_hold`` is the isolation-
+    settle path (P28 follow-up 9): a **whole-episode constant hold** of
+    the isolated input at ``isolated_level`` (others at ``hold_level``),
+    curriculum DV + hidden OU off, process/measurement noise off when
+    ``clean_steady_seeds`` is on, **action_std forced to 0**.  Follow-up
+    8 still PRBS-stepped inside the episode (seg capped at T/4, ~11
+    holds of 2K on test_sim) and dithered the isolated MV with
+    ``baseline_seed_std`` — random seq_len windows from isolation_buf
+    straddled steps (~half) so ``wm_ss_match``'s settle_var gate starved
+    the DC-gain term, and ``_st_levels`` was wired to *other* MVs
+    (no-op on test_sim n_mv=1).  ``isolate_dim is None`` keeps legacy
+    MIMO PRBS (test_sim n_mv=1 ordinary PRBS is unchanged).
+
     Returns the same dict shape as ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
-    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    # Isolation / long-hold settle must not share the curriculum DV
+    # schedule or hidden OU that ``reset()`` just installed — those
+    # confound ss-match (CV motion attributed to the swept MV).
+    # ``collect_constant_action_episode`` / ``collect_dv_prbs_episode``
+    # already suppress both.  Ordinary PRBS seeds keep the curriculum.
+    if long_hold or isolate_dim is not None:
+        env._schedule = []
+        env._hidden_disturbance = None
+    if long_hold:
+        _maybe_clean_steady_seed(env, cfg)
+        a_hold = _isolated_hold_action(
+            int(env.action_dim), isolate_dim, hold_level, isolated_level)
+        return _collect_held_action_episode(env, cfg, obs_window, a_hold)
+    T, D = cfg.episode_length, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
     # Segment length: prefer cfg-supplied (auto-derived from plant
     # timing in auto_tune_seed_buffer ⇒ (θ + 4τ)/sr ≈ 98% settling
-    # time).  Fall back to env-var SIM_IDENTIFIED_TAU_DOMINANT for
-    # back-compat (old runs) and finally to a generous T/12 default
-    # (only triggers when neither plant timing nor cfg is available).
+    # time).  Fall back to ``cfg.identified_tau_dominant`` then leftover
+    # ``IDENTIFIED_TAU_DOMINANT`` / ``SIM_IDENTIFIED_TAU_DOMINANT`` and
+    # finally to a generous T/12 default.
     seg_cfg = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
     if seg_cfg > 0:
         seg_max = max(8, min(seg_cfg, T // 4))
     else:
         sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
-        tau_dom_env = float(os.environ.get(
-            'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
-        if tau_dom_env > 0:
-            seg_max = max(8, int(round(4.0 * tau_dom_env / sr)))
+        tau_dom = 0.0
+        try:
+            tau_dom = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+        except Exception:
+            tau_dom = 0.0
+        if tau_dom <= 0:
+            tau_dom = float(os.environ.get(
+                'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
+        if tau_dom <= 0:
+            tau_dom = float(os.environ.get(
+                'IDENTIFIED_TAU_DOMINANT', '0') or 0)
+        if tau_dom > 0:
+            seg_max = max(8, int(round(4.0 * tau_dom / sr)))
             seg_max = min(seg_max, T // 4)
         else:
             seg_max = max(8, T // 12)
@@ -2962,11 +5563,6 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     # leaves the WM compounding-error blind.
     seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
     seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
-    if long_hold:                       # dedicated isolated SETTLE episode
-        _iso_len = int(getattr(cfg, 'wm_input_isolation_len', 0)
-                       or getattr(cfg, 'horizon', 15) or 15)
-        seg_max = min(max(seg_max, 2 * _iso_len), max(8, T // 4))
-        seg_min = seg_max               # uniform long holds → full steady state
     multi_timescale = (seg_min < seg_max)
     if multi_timescale:
         # Pre-roll segment lengths log-uniformly; expand episode in
@@ -3038,6 +5634,10 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
         targets = env.rng.uniform(-op, +op,
                                     size=(n_seg_int, A)
                                     ).astype('float32')
+    # One-input isolation (P28 follow-up 7): hold every other MV so
+    # ss-match / isolation see ∂CV/∂u_i undiluted.  No-op when
+    # isolate_dim is None or A=1 (test_sim).
+    targets = _hold_other_action_dims(targets, isolate_dim, hold_level)
     # Build per-step segment-index map from variable seg_lens.
     seg_index_for_t = np.zeros(T, dtype='int32')
     for k in range(n_seg_int):
@@ -3052,6 +5652,12 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
         center = targets[seg_idx]
         noise = env.rng.normal(0.0, float(action_std),
                                  size=(env.action_dim,)).astype('float32')
+        if isolate_dim is not None:
+            _mask = np.zeros(env.action_dim, dtype='float32')
+            _i = int(isolate_dim)
+            if 0 <= _i < env.action_dim:
+                _mask[_i] = 1.0
+            noise = noise * _mask
         a_np = (center + noise).astype('float32')
         np.clip(a_np, -1.0, 1.0, out=a_np)
         next_window, reward, done, _ = env.step(a_np)
@@ -3065,7 +5671,7 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
-                                      action_level: float,
+                                      action_level: float | np.ndarray,
                                       ) -> Dict[str, np.ndarray]:
     """Collect one episode driven by a single, perfectly constant action.
 
@@ -3081,24 +5687,22 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     The curriculum disturbance schedule is **suppressed** for these
     episodes (``env._schedule = []``) so the WM sees a clean settled
     response — a CV/DV step partway through would defeat the purpose.
-    Domain randomization, OU process noise, and measurement noise remain
-    active (DR fires in ``sim.reset()`` upstream of the schedule build,
-    so it is untouched; OU/measurement live in the ``SimNoiseWrapper``
-    and are independent of ``_schedule``).  This is sim-agnostic:
+    Hidden OU is also cleared.  Default ``clean_steady_seeds`` then
+    disables process OU + measurement noise (P89); opt out
+    ``DREAMER_CLEAN_STEADY_SEEDS=0``.  Domain randomization is gated
+    off in P1/P2 independently of this collect path.  Sim-agnostic:
     ``APCEnv._schedule`` is the single hook used by every simulator.
 
     ``action_level`` is in the env's normalized action space and is
-    clipped to ``[-1, 1]``.  Returns the same dict shape as
+    clipped to ``[-1, 1]``.  A scalar broadcasts to every MV (test_sim
+    n_mv=1).  A vector sets each MV independently (MIMO OP hypercube;
+    see ``_per_mv_hold_rows``).  Returns the same dict shape as
     ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
-    # Clear curriculum disturbance schedule so this seed is a clean
-    # held-action steady-state probe.  DR + OU + measurement noise stay
-    # active EXCEPT the hidden (truly-unmeasured) OU disturbance, which
-    # would corrupt the steady-state target the WM is meant to learn
-    # from this episode (P43, 2026-05-23 audit finding: const_action
-    # was firing hidden OU in 12.5 % of episodes, contaminating the SS
-    # signal).  Sim-agnostic: ``_hidden_disturbance`` lives on APCEnv.
+    # Clear curriculum DV schedule + hidden OU (P43: const_action used
+    # to fire hidden OU in 12.5% of episodes).  P89 then zeros process
+    # OU + measurement when ``clean_steady_seeds`` (default).
     env._schedule = []
     env._hidden_disturbance = None
     # P89 Fix A: make this held-action steady-state seed fully NOISE-FREE
@@ -3107,16 +5711,13 @@ def collect_constant_action_episode(env: APCEnv, cfg: TrainConfig, *,
     # held-action fixed point because EVERY training trajectory (incl. these
     # seeds) carried persistent OU + measurement noise so the plant never
     # truly settled.  Off-switch: DREAMER_CLEAN_STEADY_SEEDS=0.
-    if bool(getattr(cfg, 'clean_steady_seeds', True)):
-        env.set_sim_noise_scale(0.0)
-    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    _maybe_clean_steady_seed(env, cfg)
+    T, D = cfg.episode_length, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
-    a_const = np.full((env.action_dim,),
-                       float(np.clip(action_level, -1.0, 1.0)),
-                       dtype='float32')
+    a_const = _as_hold_action(action_level, env.action_dim)
     for t in range(T):
         obs_buf[t] = obs_window[-1]
         next_window, reward, done, _ = env.step(a_const)
@@ -3213,8 +5814,8 @@ def collect_expert_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
-                                  action_start: float,
-                                  action_end: float,
+                                  action_start: float | np.ndarray,
+                                  action_end: float | np.ndarray,
                                   switch_step: int,
                                   ) -> Dict[str, np.ndarray]:
     """Collect a step-and-settle episode for WM seeding (P42 design).
@@ -3237,10 +5838,12 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
         plant changes despite the action being held.
 
     Curriculum disturbance schedule is suppressed (``env._schedule = []``)
-    so the step's effect is unambiguous; DR + OU + measurement noise
-    remain active.  Sim-agnostic via ``APCEnv._schedule``.
+    so the step's effect is unambiguous. Hidden OU is cleared. Default
+    ``clean_steady_seeds`` disables process/measurement noise (P89).
+    Sim-agnostic via ``APCEnv._schedule``.
 
     Both ``action_start`` and ``action_end`` are clipped to ``[-1, 1]``.
+    Scalars broadcast to every MV; vectors set each MV independently.
     Returns the same dict shape as ``collect_episode``.
     """
     obs_window = env.reset(exploration=True)
@@ -3251,19 +5854,14 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
     env._hidden_disturbance = None
     # P89 Fix A: noise-free so the step transient + settled tail give the WM
     # clean gain + fixed-point supervision (DREAMER_CLEAN_STEADY_SEEDS=0 off).
-    if bool(getattr(cfg, 'clean_steady_seeds', True)):
-        env.set_sim_noise_scale(0.0)
-    T, L, D = cfg.episode_length, cfg.lookback, env.obs_dim
+    _maybe_clean_steady_seed(env, cfg)
+    T, D = cfg.episode_length, env.obs_dim
     obs_buf = np.zeros((T, D), dtype='float32')
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
     rew_buf = np.zeros(T, dtype='float32')
     cont_buf = np.ones(T, dtype='float32')
-    a_start = np.full((env.action_dim,),
-                       float(np.clip(action_start, -1.0, 1.0)),
-                       dtype='float32')
-    a_end = np.full((env.action_dim,),
-                     float(np.clip(action_end, -1.0, 1.0)),
-                     dtype='float32')
+    a_start = _as_hold_action(action_start, env.action_dim)
+    a_end = _as_hold_action(action_end, env.action_dim)
     sw = int(np.clip(switch_step, 1, T - 1))
     for t in range(T):
         a_t = a_start if t < sw else a_end
@@ -3279,7 +5877,8 @@ def collect_step_settle_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
-                                  u0: float) -> Tuple[float, int]:
+                                  u0: float | np.ndarray
+                                  ) -> Tuple[float | np.ndarray, int]:
     """Sample ``(u1, switch_step)`` for a step-and-settle episode.
 
     ``u1`` is ``u0 + Δ`` with ``|Δ| ∈ [step_seed_delta_min, max]`` and
@@ -3287,6 +5886,10 @@ def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
     shrink the step below ``step_seed_delta_min``, the sign is
     reversed before re-clipping (keeps the step magnitude meaningful
     even when ``u0`` is near the operating-band edge).
+
+    A vector ``u0`` (MIMO independent holds) gets an independent Δ per
+    MV and one shared ``switch_step``.  Scalar ``u0`` is the test_sim
+    path and keeps the original RNG order.
 
     ``switch_step`` is uniformly sampled from
     ``int(prefix_frac * episode_length)`` with
@@ -3296,11 +5899,24 @@ def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
     d_max = float(cfg.step_seed_delta_max)
     if d_max < d_min:
         d_min, d_max = d_max, d_min
-    mag = float(rng.uniform(d_min, d_max))
-    sign = 1.0 if rng.uniform() < 0.5 else -1.0
-    u1 = float(np.clip(u0 + sign * mag, -1.0, 1.0))
-    if abs(u1 - u0) < d_min:
-        u1 = float(np.clip(u0 - sign * mag, -1.0, 1.0))
+
+    def _one_u1(u0f: float) -> float:
+        mag = float(rng.uniform(d_min, d_max))
+        sign = 1.0 if rng.uniform() < 0.5 else -1.0
+        u1 = float(np.clip(u0f + sign * mag, -1.0, 1.0))
+        if abs(u1 - u0f) < d_min:
+            u1 = float(np.clip(u0f - sign * mag, -1.0, 1.0))
+        return u1
+
+    u0_arr = np.asarray(u0, dtype='float32').reshape(-1)
+    if isinstance(u0, np.ndarray) and u0_arr.size > 1:
+        u1 = np.asarray([_one_u1(float(u)) for u in u0_arr], dtype='float32')
+    else:
+        if isinstance(u0, np.ndarray):
+            u0f = float(u0_arr.item()) if u0_arr.size == 1 else 0.0
+        else:
+            u0f = float(u0)
+        u1 = _one_u1(u0f)
     pf_min = float(cfg.step_seed_prefix_frac_min)
     pf_max = float(cfg.step_seed_prefix_frac_max)
     if pf_max < pf_min:
@@ -3312,26 +5928,28 @@ def _sample_step_settle_params(rng: np.random.Generator, cfg: TrainConfig,
 
 
 def _seed_one_const_or_step(env: APCEnv, cfg: TrainConfig, *,
-                              level: float, do_step: bool,
+                              level: float | np.ndarray, do_step: bool,
                               ) -> Dict[str, np.ndarray]:
     """Dispatch one constant-action OR step-and-settle seed episode.
 
     Used by the initial seed loop and the P1 periodic injection block
     so the const-vs-step allocation is identical in both code paths.
+    ``level`` is a scalar (test_sim) or a per-MV vector (MIMO).
     """
     if do_step:
-        u1, sw = _sample_step_settle_params(env.rng, cfg, float(level))
+        u1, sw = _sample_step_settle_params(env.rng, cfg, level)
         return collect_step_settle_episode(env, cfg,
-                                             action_start=float(level),
+                                             action_start=level,
                                              action_end=u1,
                                              switch_step=sw)
     return collect_constant_action_episode(env, cfg,
-                                             action_level=float(level))
+                                             action_level=level)
 
 
 def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
-                                initial_level: float,
+                                initial_level: float | np.ndarray,
                                 primary_dv_pos: int = -1,
+                                primary_mv_pos: int = -1,
                                 ) -> Dict[str, np.ndarray]:
     """APC-style step-test seed episode (P51 design, 2026-05-25).
 
@@ -3378,7 +5996,12 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
         each event's response is unambiguous (P43 SS-fidelity logic).
 
     ``initial_level`` is in normalized action space; clipped to [-1, 1].
-    Returns the same dict shape as ``collect_episode``.
+    A scalar broadcasts to every MV (test_sim n_mv=1, same RNG).  A
+    vector sets each MV independently (MIMO held baseline; see
+    ``_per_mv_hold_rows``).  Each MV *event* steps **one** MV
+    (``primary_mv_pos`` round-robin, else dim 0) so MIMO gains stay
+    isolated — broadcasting the same Δ onto every MV was the OP-space
+    diagonal.  Returns the same dict shape as ``collect_episode``.
     """
     from utils.training_disturbance import (_load_identifier_context,
                                               _channel_catalog)
@@ -3456,7 +6079,7 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
     u_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
 
     act_buf = np.zeros((T, env.action_dim), dtype='float32')
-    cur_u = float(np.clip(initial_level, -1.0, 1.0))
+    cur_u = _as_hold_action(initial_level, env.action_dim)
     last_t = 0
     dv_schedule: List[Dict] = []
     mv_event_count = 0
@@ -3466,15 +6089,18 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
         if start > last_t:
             act_buf[last_t:start, :] = cur_u
         if kind == 'mv':
-            # Step the action: pick magnitude and a sign that keeps u in
-            # the operating band when possible.
+            # Step ONE MV (test_sim: the only dim).  Same mag/sign RNG
+            # as the scalar path; MIMO round-robin via primary_mv_pos
+            # does not consume extra RNG.
             mag = float(rng.uniform(u_min, u_max))
             sign = +1.0 if rng.random() < 0.5 else -1.0
-            cand = cur_u + sign * mag
+            j = _step_test_mv_index(cur_u.size, primary_mv_pos)
+            u = float(cur_u[j])
+            cand = u + sign * mag
             if abs(cand) > u_band:
                 sign = -sign   # flip toward the centre
-                cand = cur_u + sign * mag
-            cur_u = float(np.clip(cand, -1.0, 1.0))
+                cand = u + sign * mag
+            cur_u[j] = float(np.clip(cand, -1.0, 1.0))
             mv_event_count += 1
         else:
             # DV step: pick a channel and a magnitude in the channel's
@@ -3534,7 +6160,9 @@ def collect_step_test_episode(env: APCEnv, cfg: TrainConfig, *,
 
 
 def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
-                            long_hold: bool = False) -> List[Dict]:
+                            long_hold: bool = False,
+                            isolate_dv_idx: Optional[int] = None,
+                            isolated_level: Optional[float] = None) -> List[Dict]:
     """Full-range, multi-timescale, stratified DV-PRBS disturbance schedule.
 
     Schedule-construction core shared by the DV-PRBS SEED episodes
@@ -3545,6 +6173,13 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
     (``delta_k = L_k − L_{k−1}``) so the accumulated offset tracks the
     stratified level sequence.  Returns an empty list when the sim has no
     measured-DV channels (caller leaves the existing schedule untouched).
+
+    ``long_hold`` (P28 follow-up 9/10): one step at t=0 to
+    ``isolated_level × (span/2)`` on the isolated DV, then hold for the
+    rest of the episode (DC-gain settle).  ``isolated_level`` is the
+    same normalized [-1, 1] units as MV action (seed linspace uses
+    ``constant_action_seed_op_band``).  Follow-up 10 dropped the extra
+    ``dv_prbs_op_frac`` factor so |ΔDV| matches |ΔMV| in half-span units.
 
     Why (RC-W1, p119–p127 DV-gain RCA): the WM's DV→CV gain is identified on
     the SLOW on-policy FEED motion (≈0.29 std OU) plus only ~1-5 sparse step
@@ -3558,8 +6193,35 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
     from utils.training_disturbance import _channel_catalog
     T = int(cfg.episode_length)
     dv_chs = list(_channel_catalog(env.sim).get('dv', []))
+    if isolate_dv_idx is not None:
+        i = int(isolate_dv_idx)
+        dv_chs = [dv_chs[i]] if 0 <= i < len(dv_chs) else []
     if not dv_chs:
         return []
+    if long_hold:
+        # Whole-episode hold at isolated_level (DC-gain).  One step at t=0;
+        # delta=0 (level 0) is a valid baseline hold — emit nothing.
+        # MV-action-isomorphic: isolated_level ±1 ↔ ±half-span (follow-up 10).
+        dv_schedule: List[Dict] = []
+        for ch in dv_chs:
+            b = ch.get('bounds')
+            span = (float(b[1]) - float(b[0])) if (isinstance(b, list)
+                                                    and len(b) >= 2) else 1.0
+            delta = _dv_isolation_delta(isolated_level, span)
+            if abs(delta) < 1e-9:
+                continue
+            dv_schedule.append({
+                'name': f"dv_iso_{ch.get('name', ch.get('pos', '?'))}_t0",
+                'target_group': 'dv',
+                'target_pos': int(ch.get('pos', 0)),
+                'start': 0,
+                'duration': 1,
+                'shape': 'step',
+                'delta': delta,
+                'source': 'dv_isolation_settle',
+                '_applied': False,
+            })
+        return dv_schedule
     # ----- Multi-timescale segment lengths (mirror collect_prbs_episode) -
     # seg_max ≈ (θ+4τ)/sr (settling time, from auto_tune_seed_buffer) so the
     # DV settles at each level (steady-state gain identifiable); seg_min ≈
@@ -3568,11 +6230,6 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
     seg_max = max(8, min(seg_max if seg_max > 0 else T // 12, T // 4))
     seg_min_cfg = int(getattr(cfg, 'prbs_seed_segment_steps_min', 0) or 0)
     seg_min = max(2, min(seg_min_cfg, seg_max - 1)) if seg_min_cfg > 1 else seg_max
-    if long_hold:                       # dedicated isolated SETTLE episode
-        _iso_len = int(getattr(cfg, 'wm_input_isolation_len', 0)
-                       or getattr(cfg, 'horizon', 15) or 15)
-        seg_max = min(max(seg_max, 2 * _iso_len), max(8, T // 4))
-        seg_min = seg_max
     # Pre-roll segment start times (log-uniform multi-timescale).
     seg_starts: List[int] = []
     t = 0
@@ -3636,6 +6293,8 @@ def _build_dv_prbs_schedule(env: 'APCEnv', cfg: TrainConfig,
 def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
                              mv_level: float = 0.0,
                              long_hold: bool = False,
+                             isolate_dv_idx: Optional[int] = None,
+                             isolated_level: Optional[float] = None,
                              ) -> Dict[str, np.ndarray]:
     """DV-PRBS seed episode (2026-06-14): the DV analogue of
     ``collect_prbs_episode``.  Holds the MV at a (stratified) operating
@@ -3673,15 +6332,20 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
 
     Falls back to an MV-hold episode when the sim has no DV channels.
     ``mv_level`` (normalized action space) sets the held MV operating
-    point; vary it across the seed batch for MV-level coverage.  Returns
+    point; vary it across the seed batch for MV-level coverage.
+    ``long_hold`` + ``isolate_dv_idx`` is the isolation-settle path
+    (P28 follow-up 9/10): one DV, **one step at t=0** to
+    ``isolated_level × (span/2)`` then hold, MV held at ``mv_level``
+    (seed uses 0 so ∂CV/∂DV is unconfounded), hidden OU off,
+    ``clean_steady_seeds`` zeros process/measurement noise.  Returns
     the same dict shape as ``collect_episode``.
     """
     from utils.training_disturbance import _channel_catalog
-    T = int(cfg.episode_length)
-    D = env.obs_dim
     obs_window = env.reset(exploration=True)
     env._schedule = []
     env._hidden_disturbance = None
+    if long_hold:
+        _maybe_clean_steady_seed(env, cfg)
 
     channels = _channel_catalog(env.sim)
     dv_chs = list(channels.get('dv', []))
@@ -3691,40 +6355,17 @@ def collect_dv_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     u_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
     cur_u = float(np.clip(mv_level, -u_band, u_band))
     cur_u = float(np.clip(cur_u, -1.0, 1.0))
-    act_buf = np.full((T, env.action_dim), cur_u, dtype='float32')
+    held = np.full((env.action_dim,), cur_u, dtype='float32')
 
-    if not has_dv:
-        # No DV channels → just run the held-MV episode (still useful as a
-        # steady-state MV anchor; matches collect_constant semantics).
-        obs_buf = np.zeros((T, D), dtype='float32')
-        rew_buf = np.zeros(T, dtype='float32')
-        cont_buf = np.ones(T, dtype='float32')
-        for t in range(T):
-            obs_buf[t] = obs_window[-1]
-            obs_window, reward, done, _ = env.step(act_buf[t])
-            rew_buf[t] = reward
-            cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
-            if done:
-                break
-        return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
-
-    # Full-range, multi-timescale, stratified DV-PRBS schedule (shared
-    # builder; byte-identical excitation statistics to the R1a Stage-1
-    # on-policy DV excitation in ``APCEnv.reset``).
-    env._schedule = _build_dv_prbs_schedule(env, cfg, long_hold=long_hold)
-
-    # ----- Run the episode (MV held, DV swept by the schedule) ----------
-    obs_buf = np.zeros((T, D), dtype='float32')
-    rew_buf = np.zeros(T, dtype='float32')
-    cont_buf = np.ones(T, dtype='float32')
-    for t in range(T):
-        obs_buf[t] = obs_window[-1]
-        obs_window, reward, done, _ = env.step(act_buf[t])
-        rew_buf[t] = reward
-        cont_buf[t] = 0.0 if done and t == T - 1 else 1.0
-        if done:
-            break
-    return {'obs': obs_buf, 'act': act_buf, 'rew': rew_buf, 'cont': cont_buf}
+    if has_dv:
+        # Full-range, multi-timescale, stratified DV-PRBS (shared builder;
+        # byte-identical to the R1a Stage-1 on-policy DV excitation).
+        env._schedule = _build_dv_prbs_schedule(
+            env, cfg, long_hold=long_hold, isolate_dv_idx=isolate_dv_idx,
+            isolated_level=isolated_level)
+    # MV held; DV either absent (steady-state MV anchor) or swept by
+    # the schedule.  Same constant-action stepper as isolation settle.
+    return _collect_held_action_episode(env, cfg, obs_window, held)
 
 
 # ---------------------------------------------------------------------------
@@ -3760,32 +6401,64 @@ def _adaptive_return_cap(cfg: TrainConfig) -> Optional[float]:
     return k * B / denom
 
 
-def _critic_anchor_lambda(cfg: TrainConfig) -> float:
-    """Option (B): the λ used by the REPLAY critic anchor's TD-λ recursion.
+def _lambda_discount_weights(t_len: int, alpha: float, device, dtype
+                             ) -> torch.Tensor:
+    """Reuse ``α^{0..T-1}`` for the TD-λ reverse-cumsum. Identity; do not write.
 
-    Defaults to the imagination ``gae_lambda`` (exact legacy behaviour) when
-    ``critic_anchor_lambda`` is unset.  Setting it ~0.97–1.0 turns the anchor
-    into a near-Monte-Carlo return-to-go over the real context so the critic
-    target sees the FULL long-horizon (multi-cycle) cost contained in the real
-    buffer data.  Decoupled from the cascade-sensitive imagination λ.
-    Clamped to [0, 1].
+    P3 calls ``_lambda_returns`` 2–4× per inner step (on-policy λ, MC λ=1,
+    optional replay λ+MC) with a static ``seq_len`` after auto-tune.
+    ``arange`` + ``pow`` were rebuilt every call.  Shape dict on this
+    function (no Module owner).  Host-adaptive.
     """
-    v = getattr(cfg, 'critic_anchor_lambda', None)
-    if v is None:
-        return float(getattr(cfg, 'gae_lambda', 0.95))
-    return float(max(0.0, min(1.0, float(v))))
+    key = (int(t_len), float(alpha), str(device), str(dtype))
+    store = getattr(_lambda_discount_weights, '_cache', None)
+    if not isinstance(store, dict):
+        store = {}
+        _lambda_discount_weights._cache = store  # type: ignore[attr-defined]
+    w = store.get(key)
+    if w is None:
+        expo = torch.arange(int(t_len), device=device, dtype=dtype)
+        w = float(alpha) ** expo
+        store[key] = w
+    return w
 
 
-def _critic_anchor_coef(cfg: TrainConfig) -> float:
-    """Option (B): the anchor weight, optionally raised above the base
-    ``critic_replay_anchor_coef`` so the long-horizon real target can overcome
-    the myopic imagined critic loss.  ``critic_anchor_coef_long=None`` ⇒ use
-    the base coef unchanged (legacy)."""
-    base = float(getattr(cfg, 'critic_replay_anchor_coef', 0.0) or 0.0)
-    long = getattr(cfg, 'critic_anchor_coef_long', None)
-    if long is None:
-        return base
-    return float(max(0.0, float(long)))
+def _lambda_returns(rew: torch.Tensor, v: torch.Tensor,
+                    gamma: float, lam: float,
+                    ret_cap: Optional[float] = None) -> torch.Tensor:
+    """Truncated TD-λ returns. Last step is V (no ``r_T``).
+
+    ``lam=1`` is pure Monte-Carlo (``r_t + γ r_{t+1}`` … ``V_T``).
+    Reverse scan is one weighted ``cumsum`` (T sequential kernel
+    launches → 1).  Identity vs the sequential recurrence
+    ``R_t = r_t + γ[(1-λ)V_{t+1} + λ R_{t+1}]``, ``R_{T-1}=V_{T-1}``.
+    Host-adaptive: no extra threads / plant units.
+    """
+    if ret_cap is not None:
+        v = v.clamp(-float(ret_cap), float(ret_cap))
+    g = float(gamma)
+    l = float(lam)
+    t_len = int(v.shape[1])
+    if t_len <= 1:
+        out = v.detach()
+        if ret_cap is not None:
+            out = out.clamp(-float(ret_cap), float(ret_cap))
+        return out
+    # R_t = u_t + (γλ) R_{t+1} with u_t = r_t + γ(1-λ) V_{t+1},
+    # u_{T-1} = V_{T-1}.  Weighted reverse-cumsum: R_t = Σ_k α^{k-t} u_k.
+    u = torch.empty_like(v)
+    u[:, :-1] = rew[:, :-1] + (g * (1.0 - l)) * v[:, 1:]
+    u[:, -1] = v[:, -1]
+    alpha = g * l
+    if abs(alpha) < 1e-12:
+        out = u.detach()
+    else:
+        w = _lambda_discount_weights(t_len, alpha, v.device, v.dtype)
+        c = (u * w).flip(1).cumsum(dim=1).flip(1)
+        out = (c / w).detach()
+    if ret_cap is not None:
+        out = out.clamp(-float(ret_cap), float(ret_cap))
+    return out
 
 
 def _steady_held_mask(obs: torch.Tensor, act: torch.Tensor,
@@ -3810,9 +6483,37 @@ def _steady_held_mask(obs: torch.Tensor, act: torch.Tensor,
     return held * settled
 
 
+def _openloop_c0(rssm, f0: torch.Tensor,
+                 c_mean: Optional[torch.Tensor] = None,
+                 starts: Optional[torch.Tensor] = None
+                 ) -> Optional[torch.Tensor]:
+    """Posterior continuous latent at open-loop start states.
+
+    P28 follow-up 14 / p20: ``img_step``'s first GRU consumes ``prev.c``.
+    ``rollout_observed(sample=True)`` packs the reparameterized *sample*
+    into feat, so slicing c from feat trains ``E[f(c_sampled)]``. Isolation,
+    the actor, and the transfer matrix start from the posterior MEAN
+    (``sample=False``). ``cont_gain_deterministic_roll`` already rolls
+    *subsequent* gain at the prior mean — this fills the first-step hole.
+
+    ``c_mean`` is ``(B, T, cont_dim)`` from ``cont['post_mean']``. ``starts``
+    indexes time. When ``c_mean`` is omitted, fall back to the feat c-slice
+    (direct unit-test calls / no-cont models).
+    """
+    cd = int(getattr(rssm, 'cont_dim', 0) or 0)
+    if cd <= 0:
+        return None
+    if c_mean is not None:
+        c = c_mean if starts is None else c_mean[:, starts]
+        return c.reshape(-1, cd)
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    return f0[..., _ze:_ze + cd].reshape(-1, cd)
+
+
 def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
                               obs: torch.Tensor, act: torch.Tensor,
                               cfg: TrainConfig,
+                              c_mean: Optional[torch.Tensor] = None,
                               ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Option (b), RSSM: held-action one-step fixed-point penalty.
 
@@ -3827,7 +6528,7 @@ def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
     mask = _steady_held_mask(obs, act, cfg)
     if mask is None or float(mask.sum()) <= 0.0:
         return zero, {'wm_steady_held_frac': 0.0}
-    from models.dreamer_v4_rssm import RSSMState
+    from models.dreamer_v4_rssm import RSSMState, cached_zeros_btd
     rssm = model.dynamics
     B, T = obs.shape[:2]
     f = feats[:, :-1]                                  # (B, T-1, F)
@@ -3838,13 +6539,20 @@ def _rssm_steady_consistency(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z_flat = f[..., rssm.deter_dim:_ze]
     z = z_flat.reshape(Bm, rssm.n_categoricals, rssm.n_classes)
+    # Follow-up 12/14: start from posterior c (mean when supplied) and
+    # pass the measured DV — img_step zero-fills both when omitted, which
+    # is a different GRU path than overshoot / isolation / the actor.
+    t_idx = torch.arange(T - 1, device=device)
+    c = _openloop_c0(rssm, f, c_mean=c_mean, starts=t_idx)
+    dv_next = (obs[:, 1:].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+               if getattr(rssm, 'dv_dim', 0) > 0 else None)
+    z_logits = cached_zeros_btd(
+        rssm, Bm, rssm.n_categoricals, rssm.n_classes,
+        f.dtype, device, attr='_img_zlogits_zeros')
     state = RSSMState(
-        h=h,
-        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                             device=device, dtype=f.dtype),
-        z=z)
+        h=h, z_logits=z_logits, z=z, c=c)
     a_next = act[:, 1:].reshape(Bm, -1)                # action driving t+1
-    nxt = rssm.img_step(state, a_next, sample=False)
+    nxt = rssm.img_step(state, a_next, dv=dv_next, sample=False)
     pred_obs = rssm.decode(nxt.feat).reshape(B, T - 1, -1)
     tgt = obs[:, 1:].detach()
     se = (pred_obs - tgt).pow(2).mean(dim=-1)          # (B, T-1)
@@ -3993,24 +6701,24 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
                                obs: torch.Tensor, act: torch.Tensor,
                                cfg: TrainConfig,
                                recon_loss: Optional[torch.Tensor] = None,
+                               c_mean: Optional[torch.Tensor] = None,
                                ) -> Tuple[torch.Tensor, float]:
-    """Option #2 (P88): multi-step LATENT OVERSHOOTING — open-loop prior
-    rollout accuracy.
+    """Latent overshooting — open-loop prior rollout accuracy (PlaNet).
 
     Dreamer-v3 trains the prior only ONE step ahead (the KL term), so the
-    open-loop imagination rollout the actor depends on accumulates error every
-    step and per-offset WM fidelity decays fast (r 0.74@H13 -> 0.52@H55).  This
-    is the PlaNet/Dreamer-v1 "latent overshooting" objective (v2/v3 dropped it
-    because 1-step sufficed for Atari): from a strided set of start positions
-    ``t`` we reconstruct the posterior state, roll the PRIOR forward ``K`` steps
-    under the REAL actions ``a_{t+1..t+K}`` WITH NO OBSERVATIONS, decode each
-    predicted feature and penalise ``MSE(decode, obs_{t+1..t+K})``.  This
-    directly trains the gru+prior+decoder for accurate MULTI-step prediction —
-    what makes a long imagination horizon H legitimately usable instead of
-    leaning on the WM's weakest capability.
+    open-loop imagination rollout accumulates error every step.  From a
+    strided set of start positions ``t`` we reconstruct the posterior
+    state, roll the PRIOR forward ``K`` steps under the REAL actions
+    ``a_{t+1..t+K}`` WITH NO OBSERVATIONS, decode, and penalise all-obs
+    ``MSE(decode, obs_{t+1..t+K})`` with ``_recon_channel_weights``
+    (P86 CV-only **REVERT**).  Tail ``(k/K)^p`` KEEP.  P87 KEEP:
+    **stop-grad the start** ``(h, z, c0)`` so the K-step prior/decoder
+    must carry DC (freeze vs P86 CAPPED; **FALSIFIED as compounding** —
+    val 1step→OL ×0.733 vs P79 ×0.840).
 
-    RSSM-only; returns ``(0, 0.0)`` for the SF-transformer backbone (its
-    shortcut-forcing loss is the native multi-step-prediction mechanism).
+    RSSM-interface (rssm + tssm); returns ``(0, 0.0)`` for the SF-transformer
+    backbone (its shortcut-forcing loss is the native multi-step-prediction
+    mechanism).
     Cost ~ O(B · n_starts · K) GRU steps; ``n_starts`` capped via a stride by
     ``wm_overshoot_max_starts`` so the term is bounded.  ``sample=True`` so the
     straight-through categorical grad trains the PRIOR (sample=False would give
@@ -4022,9 +6730,8 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     zero = torch.zeros((), device=device, dtype=obs.dtype)
     if coef <= 0.0 or K < 1:
         return zero, 0.0
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
+    if not _is_rssm_interface(model):
         return zero, 0.0
-    from models.dreamer_v4_rssm import RSSMState
     rssm = model.dynamics
     B, T = obs.shape[:2]
     K = min(K, T - 1)
@@ -4033,55 +6740,61 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
         return zero, 0.0
     max_starts = max(1, int(getattr(cfg, 'wm_overshoot_max_starts', 24) or 24))
     stride = max(1, n_valid // max_starts)
-    starts = torch.arange(0, n_valid, stride, device=device)      # (S,)
+    starts, idx = _cached_time_gather_idx(cfg, n_valid, stride, K, device)
     S = int(starts.numel())
     f0 = feats[:, starts]                                         # (B, S, F)
+    # P87: stop-grad the overshoot START. Encoder/recon already sees
+    # 1-step; a live start lets the encoder absorb the K-step residual
+    # so TM rest-IC OL still contracts (P85 1-step faithful / OL short).
+    # GRU + prior + decoder keep the graph. Detach ``c0`` too — live
+    # ``c_mean`` would leak the posterior through the first GRU step.
+    f0 = f0.detach()
     Bm = B * S
     h = f0[..., :rssm.deter_dim].reshape(Bm, -1)
     # Scope 2: slice EXACTLY the stochastic block (exclude any DOB d-tail).
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
+    # Posterior continuous gain (feat = [h, z, (c), (dv), (d)]).  Follow-up
+    # 12 threaded c so img_rollout no longer zero-fills; follow-up 14 uses
+    # the posterior MEAN when supplied so the first GRU step matches
+    # isolation / actor / transfer-matrix (sample=False), not E[f(c_sampled)].
+    c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
+    if c0 is not None:
+        c0 = c0.detach()
+    if not getattr(cfg, '_overshoot_sgstart_logged', False):
+        print('[overshoot] stop-grad start (P87; 1step→OL; all-obs MSE)',
+              flush=True)
+        cfg._overshoot_sgstart_logged = True  # type: ignore[attr-defined]
     # Per-step REAL action + DV sequences for k=1..K (gathered ONCE).
-    k_off = torch.arange(1, K + 1, device=device)                 # (K,)
-    idx = starts.view(S, 1) + k_off.view(1, K)                    # (S, K) time idx
+    # Advanced-index obs once (B,S,K,D) — reuse for DV slice and MSE target
+    # (was two gathers per WM inner).
     a_all = act[:, idx].reshape(Bm, K, -1)                        # (Bm, K, A)
-    dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
+    obs_win = obs[:, idx]                                         # (B, S, K, D)
+    dv_all = (obs_win.index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
               if getattr(rssm, 'dv_dim', 0) > 0 else None)         # (Bm,K,dv)|None
-    # COMPILED prior rollout (whole K-step img_step loop = ONE graph) + ONE
-    # batched decode (the per-step decode was the launch-bound killer, exactly
-    # what rollout_observed hoists out).
-    roll_feats = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True)  # (Bm,K,F)
-    preds = rssm.decode(roll_feats).reshape(B, S, K, -1)          # (B, S, K, D)
-    total = zero
-    # Steady-state TAIL weighting (2026-06-20, p131 RCA).  The open-loop gain
-    # contraction (decomp 1step→openloop ×0.876; probe: sampled open-loop gain
-    # 0.79 vs real, and sample=False is WORSE 0.32 → the gain lives in the
-    # learned SAMPLED prior, the loss is weak supervision NOT a sampling EIV) is
-    # a STEADY-STATE / DC-gain phenomenon: the 1-step prior is faithful (×1.001)
-    # but the gain compounds away over the rollout.  A UNIFORM ``/K`` mean
-    # dilutes the settled tail to ~1/K weight, so the DC gain (where the
-    # contraction lives) is under-supervised.  Weight step ``k`` by
-    # ``(k/K)^tail_power`` (a smooth low-frequency / DC emphasis) and normalise
-    # by Σw — bounded magnitude (still a weighted mean, no term inflation) so it
-    # cannot destabilise the WM, but it concentrates the gain gradient on the
-    # steady-state (p=2 → the last step gets ~3× its uniform weight, the noisy
-    # early transient less — which the 1-step recon/KL already cover).
-    # ``tail_power=0`` recovers the exact uniform mean.  Sim-agnostic (unitless
-    # step fraction), backbone-agnostic.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
-    tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 0.0) or 0.0)
-    wsum = 0.0
-    # Per-step CV-weighted MSE on the PRE-DECODED rollout (no per-step decode /
-    # img_step launches now — those are batched above).  The CV-weight (p124)
-    # keeps the small-variance CV step-response from being drowned by the
-    # high-variance MV/DV channels so the open-loop gain stays supervised.
-    for ki in range(K):
-        pred = preds[:, :, ki]                                    # (B, S, D)
-        tgt = obs[:, idx[:, ki]].detach()                        # (B, S, D)
-        w_k = (float(ki + 1) / float(K)) ** tail_power if tail_power > 0.0 else 1.0
-        total = total + w_k * _weighted_recon_mse(pred, tgt, cfg)
-        wsum += w_k
-    loss = total / max(wsum, 1e-8)
+    # Decoder is a pointwise MLP, so per-step ``decode(feat_k)`` ≡ batched
+    # ``decode(stack(feat))``.  ``out='obs'`` skips the unused (Bm, K, F)
+    # stack (P40 GPU-occupied: A10 peak ~16.6 GB; F-stack is ~2 GB at
+    # B=128 / starts=24 / K=55).  GRU recurrence is identical.
+    preds = rssm.img_rollout(h, z, a_all, dvs=dv_all, sample=True,
+                             c0=c0, out='obs').reshape(B, S, K, -1)  # (B,S,K,D)
+    tgt = obs_win.detach()                                        # (B, S, K, D)
+    # P86 EXIT REVERT: all-obs + channel weights (CV-only overgained
+    # 5-level OPs). Tail (k/K)^p KEEP (p143 p=1 mid-rise HURT; not
+    # last-only). Steady-state TAIL weighting (2026-06-20, p131 RCA):
+    # open-loop gain dies in compounding — a DC phenomenon — but a
+    # UNIFORM ``/K`` mean dilutes the settled tail.  Weight step ``k``
+    # by ``(k/K)^tail_power`` and normalise by Σw.  ``tail_power=0`` is
+    # uniform.  ``DREAMER_WM_OVERSHOOT_TAIL_POWER``.
+    se = (preds.float() - tgt.float()).pow(2)
+    ch_w = _recon_channel_weights(cfg, int(preds.shape[-1]),
+                                  preds.device, torch.float32)
+    if ch_w is not None:
+        se = se * ch_w.view(*([1] * (se.dim() - 1)), -1)
+    mse_k = se.mean(dim=(0, 1, 3))                                # (K,)
+    wk = _overshoot_tail_wk(cfg, K, mse_k.device, mse_k.dtype)
+    loss = (mse_k * wk).sum() / wk.sum().clamp_min(1e-8)
     # Soft recon-fidelity gate: ramp the term in only as 1-step recon converges
     # (early P1 the WM can't predict multi-step; an ungated term would swamp the
     # encoder/decoder).  ``gate_recon<=0`` disables.
@@ -4092,12 +6805,94 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
     return loss, float(S)
 
 
+def _cached_arange_1k(owner, K: int, device, dtype=None,
+                      attr: str = '_arange_1k') -> torch.Tensor:
+    """Reuse ``torch.arange(1, K+1)``. Identity; do not write in-place.
+
+    Overshoot gather + tail weights rebuild this every WM inner (100×/iter).
+    Store is a shape dict: overshoot ``K`` vs isolation ``K`` can differ.
+    """
+    key = (int(K), str(device), 'long' if dtype is None else str(dtype))
+    store = getattr(owner, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(owner, attr, store)
+    t = store.get(key)
+    if t is None:
+        if dtype is None:
+            t = torch.arange(1, int(K) + 1, device=device)
+        else:
+            t = torch.arange(1, int(K) + 1, device=device, dtype=dtype)
+        store[key] = t
+    return t
+
+
+def _cached_strided_arange(owner, stop: int, stride: int, device,
+                           attr: str = '_strided_arange') -> torch.Tensor:
+    """Reuse ``torch.arange(0, stop, stride)``. Identity; do not write in-place.
+
+    Overshoot / isolation / held start indices are static after auto-tune
+    (T, K, max_starts) but were rebuilt every WM inner (100×/iter).
+    """
+    key = (int(stop), int(stride), str(device))
+    store = getattr(owner, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(owner, attr, store)
+    t = store.get(key)
+    if t is None:
+        t = torch.arange(0, int(stop), int(stride), device=device)
+        store[key] = t
+    return t
+
+
+def _cached_time_gather_idx(owner, n_valid: int, stride: int, K: int, device,
+                            attr: str = '_time_gather_idx'):
+    """``starts`` and ``starts[:,None] + arange(1, K+1)`` for obs/act gather.
+
+    Overshoot + isolation rebuild this every WM inner.  Shape dict: the
+    two losses can differ in ``K`` / stride.  Do not write ``idx`` in-place.
+    """
+    key = (int(n_valid), int(stride), int(K), str(device))
+    store = getattr(owner, attr, None)
+    if not isinstance(store, dict):
+        store = {}
+        setattr(owner, attr, store)
+    hit = store.get(key)
+    if hit is not None:
+        return hit
+    starts = _cached_strided_arange(owner, n_valid, stride, device)
+    k_off = _cached_arange_1k(owner, K, device)
+    idx = starts.view(-1, 1) + k_off.view(1, -1)
+    store[key] = (starts, idx)
+    return starts, idx
+
+
+def _overshoot_tail_wk(cfg: 'TrainConfig', K: int, device,
+                       dtype) -> torch.Tensor:
+    """``(k/K)^p`` tail weights. Identity vs rebuild; do not write in-place."""
+    tail_power = float(getattr(cfg, 'wm_overshoot_tail_power', 2.0) or 0.0)
+    key = (int(K), float(tail_power), str(device), str(dtype))
+    cached = getattr(cfg, '_overshoot_wk', None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    if tail_power > 0.0:
+        k_idx = _cached_arange_1k(cfg, K, device, dtype)
+        wk = (k_idx / float(K)) ** tail_power
+    else:
+        wk = torch.ones(int(K), device=device, dtype=dtype)
+    cfg._overshoot_wk = (key, wk)  # type: ignore[attr-defined]
+    return wk
+
+
 def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
                                         obs: torch.Tensor, act: torch.Tensor,
                                         cfg: TrainConfig,
                                         recon_loss: Optional[torch.Tensor] = None,
-                                        ) -> Tuple[torch.Tensor, float]:
-    """Option (b2, P89): multi-step HELD-ACTION rollout stationarity.
+                                        c_mean: Optional[torch.Tensor] = None,
+                                        ) -> Tuple[torch.Tensor, float,
+                                                   Dict[str, torch.Tensor]]:
+    """Option (b2, P89 / P62): multi-step HELD-ACTION decode-CV stationarity.
 
     Complements the 1-step ``_rssm_steady_consistency`` (which only fires on the
     rare naturally held+settled replay steps — p88c held_frac≈0.84%) by ACTIVELY
@@ -4105,40 +6900,46 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     reconstruct the posterior RSSMState, hold the action at ``a_t`` CONSTANT and
     roll the PRIOR forward ``K`` steps (``sample=True`` straight-through so the
     stochastic prior receives gradient), then penalise the NET DRIFT of the
-    deterministic state ``h`` between an early post-transient window
-    ``[s, s+win)`` (``s = settle_frac·K``) and the final window ``[K-win, K)``.
+    **decoded CV** between an early post-transient window ``[s, s+win)``
+    (``s = K//2``, identity vs removed ``settle_frac=0.5``) and the final
+    window ``[K-win, K)``.
 
-    Rationale: the steady-state diagnostic shows the WM imagination DRIFTS under
-    a held action (0% convergence) instead of reaching a fixed point.  Measuring
-    the net displacement of ``h`` between two late windows (a) averages out the
-    categorical sampling noise, (b) is GAIN-NEUTRAL — it constrains only the
-    tail DISPLACEMENT, never the response magnitude, and leaves the transient
-    ``[0, s)`` free so the overshoot/recon terms still set the gain — and (c) is
-    scale-robust (normalised by the rollout's own ``h`` std).  RSSM-only;
-    returns ``(0, 0.0)`` for the SF backbone.  Cost ~ O(B·max_starts·K) GRU
-    steps, bounded by ``wm_held_rollout_max_starts``.  ``sample=True`` so the
-    straight-through categorical grad trains the PRIOR (the drift source).
+    P63 EXIT REVERT: 1step→K FO·sg(Δ1) detonated P1 (recon stuck ~0.5,
+    held Huber ~3–7 vs P62 1.5e-4, skip-storm 2/2, GAIN_NOT_READY 9.75@MV).
+    FO~13 on unsettled replay starts amplified 1-step noise; the term
+    dominated recon.  Late−early is gain-neutral (KEEP decode-CV space)
+    and silent as a compounding supervisor — that is the P62 verdict, not
+    a reason to leave a detonating loss as default.  RSSM-interface
+    (rssm + tssm); returns ``(0, 0.0, {})`` for the SF backbone.
+    jsonl extras (no extra forward): ``wm_held_rollout_scale`` (CV std in
+    the loss denom) and ``wm_held_cv_drift`` (|late−early| mean).
     """
     coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
     K = int(getattr(cfg, 'wm_held_rollout_len', 0) or 0)
     device = obs.device
     zero = torch.zeros((), device=device, dtype=obs.dtype)
+    empty: Dict[str, torch.Tensor] = {}
     if coef <= 0.0 or K < 4:
-        return zero, 0.0
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
-        return zero, 0.0
-    from models.dreamer_v4_rssm import RSSMState
+        return zero, 0.0, empty
+    if not _is_rssm_interface(model):
+        return zero, 0.0, empty
     rssm = model.dynamics
     B, T = obs.shape[:2]
-    win = max(1, int(getattr(cfg, 'wm_held_rollout_win', 8) or 8))
-    s = int(float(getattr(cfg, 'wm_held_rollout_settle_frac', 0.5) or 0.5) * K)
-    # keep the two averaging windows non-overlapping inside [0, K)
+    _win_req = int(getattr(cfg, 'wm_held_rollout_win', 8) or 8)
+    win = _held_rollout_win(K, _win_req)
+    if (win != _win_req
+            and not getattr(cfg, '_held_rollout_win_logged', False)):
+        print(f'[held-rollout] win {_win_req}→{win} (K={K} cap (K-1)/4; '
+              f'test_sim K=55 stays 8)', flush=True)
+        cfg._held_rollout_win_logged = True  # type: ignore[attr-defined]
+    s = K // 2
     s = max(win, min(s, K - 2 * win))
     if s < win or K - win <= s + win:
-        return zero, 0.0
-    max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 12) or 12))
+        return zero, 0.0, empty
+    max_starts = max(1, int(getattr(cfg, 'wm_held_rollout_max_starts', 8) or 8))
     stride = max(1, T // max_starts)
-    starts = torch.arange(0, T, stride, device=device)            # (S,)
+    starts = _cached_strided_arange(
+        cfg, T, stride, device, attr='_held_starts')              # (S,)
     S = int(starts.numel())
     f0 = feats[:, starts]                                         # (B, S, F)
     Bm = B * S
@@ -4147,6 +6948,7 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     _ze = rssm.deter_dim + rssm.stoch_flat_dim
     z = f0[..., rssm.deter_dim:_ze].reshape(
         Bm, rssm.n_categoricals, rssm.n_classes)
+    c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
     a_hold = act[:, starts].reshape(Bm, -1).detach()              # HELD action a_t
     # DV-as-input: hold the measured DV CONSTANT at its start value across the
     # rollout too — so this probes true held-(action+DV) stationarity and the
@@ -4154,26 +6956,71 @@ def _wm_held_rollout_stationarity_loss(model: DreamerV4, feats: torch.Tensor,
     dv_hold = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
                .detach()
                if getattr(rssm, 'dv_dim', 0) > 0 else None)
-    # HELD action + DV constant across the rollout: broadcast to K so the whole
-    # loop runs through the COMPILED img_rollout (one graph, no per-step launch).
     a_hold_seq = a_hold.unsqueeze(1).expand(Bm, K, a_hold.shape[-1])   # (Bm,K,A)
     dv_hold_seq = (dv_hold.unsqueeze(1).expand(Bm, K, dv_hold.shape[-1])
                    if dv_hold is not None else None)
-    roll_feats = rssm.img_rollout(h, z, a_hold_seq, dvs=dv_hold_seq,
-                                  sample=True)                    # (Bm, K, F)
-    Hroll = roll_feats[..., :rssm.deter_dim]                      # (Bm, K, deter)
-    h_scale = Hroll.detach().std().clamp_min(1e-3)
-    early = Hroll[:, s:s + win].mean(dim=1)                      # (B*S, deter)
-    late = Hroll[:, K - win:].mean(dim=1)                        # (B*S, deter)
-    loss = ((late - early) / h_scale).pow(2).mean()
-    # Soft recon-fidelity gate (mirror overshoot): ramp the term in only as
-    # 1-step recon converges so an untrained decoder/prior is not destabilised
-    # early in P1.  ``gate_recon<=0`` disables.
+    if not getattr(cfg, '_held_rollout_cv_logged', False):
+        print('[held-rollout] decode-CV stationarity (P62; not GRU h; '
+              'P63 magnitude REVERT)',
+              flush=True)
+        cfg._held_rollout_cv_logged = True  # type: ignore[attr-defined]
+    Oroll = rssm.img_rollout(h, z, a_hold_seq, dvs=dv_hold_seq,
+                             sample=True, c0=c0, out='obs')        # (Bm, K, D)
+    cv_idx = getattr(rssm, 'cv_index_t', None)
+    if (cv_idx is not None and int(getattr(rssm, 'n_cv', 0) or 0) > 0
+            and int(cv_idx.numel()) > 0):
+        tail = Oroll.index_select(-1, cv_idx)                     # (Bm, K, n_cv)
+    else:
+        tail = Oroll
+    scale = tail.detach().std().clamp_min(1e-3)
+    early = tail[:, s:s + win].mean(dim=1)
+    late = tail[:, K - win:].mean(dim=1)
+    delta = late - early
+    loss = (delta / scale).pow(2).mean()
+    extras: Dict[str, torch.Tensor] = {
+        'wm_held_rollout_scale': scale.detach(),
+        'wm_held_cv_drift': delta.detach().abs().mean(),
+    }
     thr = float(getattr(cfg, 'wm_held_rollout_gate_recon', 0.0) or 0.0)
     if thr > 0.0 and recon_loss is not None:
         gate = torch.clamp(thr / recon_loss.detach().clamp_min(1e-6), max=1.0)
         loss = gate * loss
-    return loss, float(S)
+    return loss, float(S), extras
+
+
+def _recon_channel_weights(cfg: TrainConfig, n_ch: int, device,
+                           dtype) -> Optional[torch.Tensor]:
+    """Per-channel recon weights, or ``None`` for uniform ``F.mse_loss``.
+
+    CV (and optional DV) up-weighting is renormalised to mean 1.0 so the
+    overall recon magnitude is unchanged.  ``None`` ⇔ identity path.
+
+    Env-free ``wm_recon_cv_weight=6`` rebuilt ``ones(D)`` + index H2D +
+    ``sum`` on every recon and overshoot inner (100×/iter).  Cache the
+    mean-1 vector on ``cfg`` (same class as ``_cv_obs_std_t``).
+    """
+    cv_w = float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0)
+    cv_idx = tuple(int(i) for i in (getattr(cfg, 'cv_obs_indices', ()) or ()))
+    dv_w = float(getattr(cfg, 'wm_recon_dv_weight', 1.0))
+    dv_idx = tuple(int(i) for i in (getattr(cfg, 'dv_indices', ()) or ()))
+    dv_active = (dv_w != 1.0 and len(dv_idx) > 0)
+    if (cv_w == 1.0 or not cv_idx) and not dv_active:
+        return None
+    key = (int(n_ch), str(device), str(dtype), float(cv_w), cv_idx,
+           float(dv_w), dv_idx)
+    cached = getattr(cfg, '_recon_ch_w', None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    w = torch.ones(int(n_ch), device=device, dtype=dtype)
+    valid_cv = [i for i in cv_idx if 0 <= i < n_ch]
+    if cv_w != 1.0 and valid_cv:
+        w[torch.tensor(valid_cv, device=device, dtype=torch.long)] = cv_w
+    valid_dv = [i for i in dv_idx if 0 <= i < n_ch]
+    if dv_active and valid_dv:
+        w[torch.tensor(valid_dv, device=device, dtype=torch.long)] = dv_w
+    w = w * (float(w.numel()) / w.sum().clamp_min(1e-8))
+    cfg._recon_ch_w = (key, w)  # type: ignore[attr-defined]
+    return w
 
 
 def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
@@ -4191,50 +7038,1099 @@ def _weighted_recon_mse(recon: torch.Tensor, target: torch.Tensor,
     shifts toward the CV.  ``cv_weight == 1.0`` or no CV indices ⇒ byte-for-byte
     ``F.mse_loss`` (identity = p106-baseline).  Backbone-agnostic.
     """
-    cv_w = float(getattr(cfg, 'wm_recon_cv_weight', 1.0) or 1.0)
-    cv_idx = tuple(getattr(cfg, 'cv_obs_indices', ()) or ())
-    dv_w = float(getattr(cfg, 'wm_recon_dv_weight', 1.0))
-    dv_idx = tuple(getattr(cfg, 'dv_indices', ()) or ())
-    dv_active = (dv_w != 1.0 and len(dv_idx) > 0)
-    if (cv_w == 1.0 or not cv_idx) and not dv_active:
+    w = _recon_channel_weights(cfg, int(target.shape[-1]),
+                               target.device, torch.float32)
+    if w is None:
         return F.mse_loss(recon, target)
-    D = int(target.shape[-1])
-    w = torch.ones(D, device=target.device, dtype=torch.float32)
-    valid_cv = [int(i) for i in cv_idx if 0 <= int(i) < D]
-    if cv_w != 1.0 and valid_cv:
-        w[torch.tensor(valid_cv, device=target.device, dtype=torch.long)] = cv_w
-    valid_dv = [int(i) for i in dv_idx if 0 <= int(i) < D]
-    if dv_active and valid_dv:
-        w[torch.tensor(valid_dv, device=target.device, dtype=torch.long)] = dv_w
-    w = w * (float(w.numel()) / w.sum().clamp_min(1e-8))  # renorm: mean→1.0
     se = (recon.float() - target.float()).pow(2)           # (..., D)
     return (se * w).mean()
 
 
+def _smooth_l1_gain_match(
+        pred: torch.Tensor, tgt: torch.Tensor, beta: float = 1.0,
+        per_input: bool = False,
+        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Gain-match Huber on ``G = ΔCV/Δu``.
+
+    ``per_input=False``: ``F.smooth_l1_loss`` with scalar ``beta`` (P26
+    abs Huber identity).  ``per_input=True``: β_ij = |tgt_ij| (clamped
+    ≥1e-6).  PyTorch smooth-L1: ``0.5 e²/β`` if ``|e|<β`` else
+    ``|e|-0.5β``.  L1 saturation is still ±1 per element — **not**
+    relative Huber (P27 divides the residual by |tgt| before Huber, so
+    the L1 grad is 1/|tgt|).  Mean reduction matches ``smooth_l1_loss``.
+    ``mask`` (broadcast to ``pred``): drop no-op starts whose realized
+    ``|Δu|`` is ~0 after cube-clip (P61).  ``None`` = all valid.
+    """
+    if per_input:
+        e = pred - tgt
+        b = tgt.abs().clamp_min(1e-6)
+        abs_e = e.abs()
+        quadratic = 0.5 * e.square() / b
+        linear = abs_e - 0.5 * b
+        el = torch.where(abs_e < b, quadratic, linear)
+    else:
+        el = F.smooth_l1_loss(
+            pred, tgt, beta=max(1e-6, float(beta)), reduction='none')
+    if mask is None:
+        return el.mean()
+    w = mask.to(dtype=el.dtype).expand_as(el)
+    return (el * w).sum() / w.sum().clamp_min(1.0)
+
+
+def _gain_match_tgt_tensor(g_wm: torch.Tensor, tgts, owner=None):
+    """``(n_in, n_cv)`` teacher G. Identity vs rebuild; do not write.
+
+    Huber + jsonl ``*_ratio`` rebuilt this from Python lists every
+    logged WM inner (and Huber three times: total/MV/DV).  Shape dict
+    on ``owner`` (cfg) or on this function.
+    """
+    if not tgts:
+        return None
+    key = (tuple(tuple(float(x) for x in row) for row in tgts),
+           str(g_wm.device), str(g_wm.dtype))
+    if owner is not None:
+        store = getattr(owner, '_gain_match_tgt_t', None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(owner, '_gain_match_tgt_t', store)
+    else:
+        store = getattr(_gain_match_tgt_tensor, '_store', None)
+        if not isinstance(store, dict):
+            store = {}
+            _gain_match_tgt_tensor._store = store  # type: ignore[attr-defined]
+    t = store.get(key)
+    if t is None:
+        t = torch.tensor([list(row) for row in tgts],
+                         device=g_wm.device, dtype=g_wm.dtype)
+        store[key] = t
+    return t
+
+
+def _gain_match_pred_over_tgt(
+        g_wm: torch.Tensor, tgts, owner=None) -> torch.Tensor:
+    """Mean ``G_pred / G_tgt`` over finite targets (no extra FD).
+
+    P43 Huber ~1e-4 while TM DV stayed ×0.74 — jsonl Huber is 0 at a
+    matching IC, so it cannot show a rest-step miss.  Sign-aware (test_sim
+    MV tgt is negative).  Empty / all-tiny tgts → 0.
+    """
+    if not tgts:
+        return g_wm.new_zeros(())
+    tgt = _gain_match_tgt_tensor(g_wm, tgts, owner)
+    tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
+                      g_wm.shape[-1]).expand_as(g_wm)
+    ok = tgt_b.abs() >= 1e-6
+    den = torch.where(ok, tgt_b, torch.ones_like(tgt_b))
+    n = ok.to(g_wm.dtype).sum().clamp_min(1.0)
+    return torch.where(ok, g_wm / den, torch.zeros_like(g_wm)).sum() / n
+
+
+def _cube_plus_would_clip(
+        base: torch.Tensor, n_ch: int, step: float,
+        lo: float = -1.0, hi: float = 1.0) -> torch.Tensor:
+    """``(n_ch, Bm)`` True where ``+step`` on channel ``j`` shrinks ``|Δ|``.
+
+    Same predicate ``_cube_step_held`` uses for reverse.  ``du_frac≈1``
+    does **not** mean clip is a no-op: reverse restores ``|Δu|``.  jsonl
+    ``gain_match_clip_frac`` is the mean of this mask (P61 observability).
+    """
+    Bm = int(base.shape[0])
+    n_ch = int(n_ch)
+    if n_ch <= 0:
+        return base.new_zeros(0, Bm, dtype=torch.bool)
+    idx = torch.arange(n_ch, device=base.device)
+    r_plus = (base[:, idx] + float(step)).clamp(lo, hi) - base[:, idx]
+    return (r_plus.abs() + 1e-6 < abs(float(step))).transpose(0, 1)
+
+
+def _gain_match_clip_frac_t(
+        a_base: torch.Tensor, dv0: Optional[torch.Tensor],
+        n_mv: int, n_dv: int, step: float, *,
+        clip_realized: bool) -> torch.Tensor:
+    """Mean reverse-mask over MV+DV FD starts.  0 when clip is off."""
+    if not clip_realized:
+        return a_base.new_zeros(())
+    parts = []
+    if int(n_mv) > 0:
+        parts.append(_cube_plus_would_clip(a_base, n_mv, step).reshape(-1))
+    if int(n_dv) > 0 and dv0 is not None:
+        parts.append(_cube_plus_would_clip(dv0, n_dv, step).reshape(-1))
+    if not parts:
+        return a_base.new_zeros(())
+    return torch.cat(parts).to(dtype=a_base.dtype).mean()
+
+
+def _cube_step_held(
+        base: torch.Tensor, n_ch: int, step: float,
+        lo: float = -1.0, hi: float = 1.0) -> torch.Tensor:
+    """One cube-clipped (or reversed) unit step per channel.
+
+    ``base`` is ``(Bm, D)``.  Returns ``(n_ch, Bm, D)``.  Tries ``+step``
+    on channel ``j`` then ``clamp(lo, hi)``; if that shrinks ``|Δ|``
+    below the commanded ``|step|``, uses ``−step`` (step-settle
+    reverse-before-reclip; TM skip-noop).  ``n_ch==0`` → empty.
+    """
+    Bm, D = base.shape
+    n_ch = int(n_ch)
+    if n_ch <= 0:
+        return base.new_zeros(0, Bm, D)
+    idx = torch.arange(n_ch, device=base.device)
+    eye = base.new_zeros(n_ch, D)
+    eye[idx, idx] = 1.0
+    delta = float(step) * eye
+    plus = (base.unsqueeze(0) + delta.unsqueeze(1)).clamp(lo, hi)
+    minus = (base.unsqueeze(0) - delta.unsqueeze(1)).clamp(lo, hi)
+    use_minus = _cube_plus_would_clip(base, n_ch, step, lo, hi)
+    return torch.where(use_minus.unsqueeze(-1), minus, plus)
+
+
+def _gain_match_fd_held(
+        a_base: torch.Tensor, dv0: Optional[torch.Tensor],
+        n_mv: int, n_dv: int, step: float,
+        *, clip_realized: bool = False,
+        include_held: bool = True,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Baseline + one unit step per MV then per DV (broadcast, no clone-loop).
+
+    ``a_held`` is ``(1+n_mv+n_dv, Bm, A)`` when ``include_held`` (PRBS /
+    held-K ``cv_base``); rest-pre Huber skips the unused held row so the
+    stack is ``(n_mv+n_dv, Bm, A)``.  ``dv_held`` matches or is ``None``.
+    Identity with stacking ``[a_base, a_base+e_j, …]`` /
+    ``[dv0, dv0, …, dv0+e_k]`` when held is included.
+
+    ``clip_realized`` (P61): clamp held a/dv to ``[-1, 1]`` and reverse
+    a per-start step that the cube would shrink.  Off = P60 commanded
+    (no clamp; may leave the cube).
+    """
+    n_mv = int(n_mv)
+    n_dv = int(n_dv)
+    off = 1 if include_held else 0
+    if clip_realized:
+        a_parts = ([a_base.unsqueeze(0)] if include_held else [])
+        if n_mv:
+            a_parts.append(_cube_step_held(a_base, n_mv, step))
+        if n_dv:
+            a_parts.append(a_base.unsqueeze(0).expand(n_dv, -1, -1).contiguous())
+        a_held = torch.cat(a_parts, dim=0) if a_parts else a_base.new_zeros(
+            0, *a_base.shape)
+        if dv0 is None:
+            return a_held, None
+        dv_parts = ([dv0.unsqueeze(0)] if include_held else [])
+        if n_mv:
+            dv_parts.append(
+                dv0.unsqueeze(0).expand(n_mv, -1, -1).contiguous())
+        if n_dv:
+            dv_parts.append(_cube_step_held(dv0, n_dv, step))
+        if not dv_parts:
+            return a_held, dv0.new_zeros(0, *dv0.shape)
+        return a_held, torch.cat(dv_parts, dim=0)
+    n_rolls = off + n_mv + n_dv
+    da = a_base.new_zeros(n_rolls, a_base.shape[-1])
+    if n_mv:
+        _i = torch.arange(n_mv, device=a_base.device)
+        da[_i + off, _i] = step
+    a_held = a_base.unsqueeze(0) + da.unsqueeze(1)
+    if dv0 is None:
+        return a_held, None
+    dd = dv0.new_zeros(n_rolls, dv0.shape[-1])
+    if n_dv:
+        _j = torch.arange(n_dv, device=dv0.device)
+        dd[_j + off + n_mv, _j] = step
+    return a_held, dv0.unsqueeze(0) + dd.unsqueeze(1)
+
+
+def _gain_match_realized_du(
+        a_held: torch.Tensor, dv_held: Optional[torch.Tensor],
+        n_mv: int, n_dv: int,
+        *, include_held: bool = True,
+        a_base: Optional[torch.Tensor] = None,
+        dv0: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Signed applied Δu of each FD roll vs held baseline.  ``(n_in, Bm)``.
+
+    TM ``compute_transfer_matrix`` divides ΔCV by realized ΔMV, not the
+    commanded step (p136).  Unclipped ``a_base+step`` → identity ``step``.
+    Rest-pre (``include_held=False``) subtracts ``a_base``/``dv0`` — the
+    unused held row is not in ``a_held``.
+    """
+    n_mv = int(n_mv)
+    n_dv = int(n_dv)
+    Bm = a_held.shape[1]
+    off = 1 if include_held else 0
+    a0 = a_held[0] if include_held else a_base
+    dv_b = dv_held[0] if include_held else dv0
+    parts = []
+    if n_mv:
+        # roll ``off+j`` steps channel ``j``.  Diagonal (not ``stack`` of
+        # mismatched advanced-index shapes): ``n_mv=1`` used to
+        # broadcast ``(1,Bm)-(Bm,1)`` → ``(Bm,Bm)``.
+        stepped = a_held[off:off + n_mv, :, :n_mv]
+        du_mv = stepped.diagonal(dim1=0, dim2=2).transpose(0, 1)
+        parts.append(du_mv - a0[:, :n_mv].transpose(0, 1))
+    if n_dv and dv_held is not None:
+        stepped = dv_held[off + n_mv:off + n_mv + n_dv, :, :n_dv]
+        du_dv = stepped.diagonal(dim1=0, dim2=2).transpose(0, 1)
+        parts.append(du_dv - dv_b[:, :n_dv].transpose(0, 1))
+    if not parts:
+        return a_held.new_zeros(0, Bm)
+    return torch.cat(parts, dim=0)
+
+
+def _gain_match_fd_action_seq(
+        a_base: torch.Tensor, dv0: Optional[torch.Tensor],
+        n_mv: int, n_dv: int, step: float, K: int, Bm: int,
+        *, cache_owner=None, cache_key=None,
+        clip_realized: bool = False,
+        include_held: bool = True,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+                   torch.Tensor, torch.Tensor]:
+    """Held FD actions expanded to ``(n_rolls·Bm, K, *)``.
+
+    Rest-IC ``a_base``/``dv0`` are the last rest frame (static).  Cache
+    when ``cache_key`` is set.  PRBS-posterior starts change every
+    batch — leave ``cache_key=None``.  Dropped with the rest-IC graph
+    at g freeze.  ``clip_realized`` / ``include_held`` are part of the
+    cache key (caller).  Rest-pre Huber skips the unused held roll.
+
+    Also returns realized ``du`` ``(n_in, Bm)`` and ``clip_frac`` (mean
+    reverse-mask).  Both are functions of the held rest — cache them
+    with ``a_seq`` (100×/iter identity vs recomputing on a cache hit).
+    """
+    if cache_owner is not None and cache_key is not None:
+        cached = getattr(cache_owner, '_gain_match_fd_seq', None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1], cached[2], cached[3], cached[4]
+    a_held, dv_held = _gain_match_fd_held(
+        a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized,
+        include_held=include_held)
+    n_rolls = int(a_held.shape[0])
+    a_seq = (a_held.unsqueeze(2)
+             .expand(n_rolls, Bm, K, a_held.shape[-1])
+             .reshape(n_rolls * Bm, K, a_held.shape[-1])
+             .contiguous())
+    dv_seq = None
+    if dv_held is not None:
+        dv_seq = (dv_held.unsqueeze(2)
+                  .expand(n_rolls, Bm, K, dv_held.shape[-1])
+                  .reshape(n_rolls * Bm, K, dv_held.shape[-1])
+                  .contiguous())
+    du = _gain_match_realized_du(
+        a_held, dv_held, n_mv, n_dv, include_held=include_held,
+        a_base=a_base, dv0=dv0)
+    clip_frac = _gain_match_clip_frac_t(
+        a_base, dv0, n_mv, n_dv, step, clip_realized=clip_realized)
+    if cache_owner is not None and cache_key is not None:
+        cache_owner._gain_match_fd_seq = (  # type: ignore[attr-defined]
+            cache_key, a_seq, dv_seq, du, clip_frac)
+    return a_seq, dv_seq, du, clip_frac
+
+
+def _gain_match_state_from_feat(rssm, feat: torch.Tensor):
+    """Unpack ``img_rollout`` last feat into ``(h, z, c)`` for a follow-on roll.
+
+    Layout is ``[h, z_flat, (c), (dv), (d.detach())]``.  The follow-on
+    ``img_rollout`` takes DV via ``dvs`` and starts ``d=None`` (P1
+    ``d_t≡0``; gain-match is skipped when g is frozen in P2).
+    """
+    _ze = rssm.deter_dim + rssm.stoch_flat_dim
+    h = feat[..., :rssm.deter_dim].contiguous()
+    z = feat[..., rssm.deter_dim:_ze].reshape(
+        feat.shape[0], rssm.n_categoricals, rssm.n_classes).contiguous()
+    cd = int(getattr(rssm, 'cont_dim', 0) or 0)
+    c = feat[..., _ze:_ze + cd].contiguous() if cd > 0 else None
+    return h, z, c
+
+
+def _gain_match_held_settle(
+        rssm, h0: torch.Tensor, z0: torch.Tensor,
+        c0: Optional[torch.Tensor], a_base: torch.Tensor,
+        dv0: Optional[torch.Tensor], settle: int):
+    """Gradful held prior-roll of ``settle`` steps at the start's a/dv.
+
+    P44: damps GRU transients so the FD starts from a held OP, not a
+    mid-PRBS posterior.  This is *not* the TM protocol (TM settles the
+    *real* env for ``H_tf=4H`` then encodes that lookback).  P25: do not
+    detach — TBPTT on the gain-match path kills DC-gain.
+    ``settle < 2`` is a no-op (P43 identity).
+    """
+    if int(settle) < 2:
+        return h0, z0, c0
+    Bm = h0.shape[0]
+    S = int(settle)
+    a_set = (a_base.unsqueeze(1).expand(Bm, S, a_base.shape[-1])
+             .contiguous())
+    dv_set = None
+    if dv0 is not None:
+        dv_set = (dv0.unsqueeze(1).expand(Bm, S, dv0.shape[-1])
+                  .contiguous())
+    last = rssm.img_rollout(
+        h0, z0, a_set, dvs=dv_set, sample=False, c0=c0,
+        last_only=True, out='feat')
+    return _gain_match_state_from_feat(rssm, last)
+
+
+def _gain_match_rest_window(cfg: 'TrainConfig') -> Tuple[int, int]:
+    """Real-rest collect settle + encode length (not ``wm_tf_horizon``).
+
+    ``settle = max(H, lookback)`` so the captured window is already at
+    SS.  Encode ``L`` is the **last** frames of that settle.  Default
+    ``gain_match_rest_ic_len=0``: ``L=lookback`` (P57 EXIT REVERT;
+    P45–P56).  Sentinel ``-1`` A/B: ``L = min(lookback, max(K, 2τ/sr))``
+    when identifier τ is present; missing τ keeps lookback (no 50 s
+    fake).  ``>0`` = exact.
+    TM default settle is ``wm_tf_horizon(H)=max(80,4H)`` — matching
+    that is a *later* A/B, not this knob.
+    """
+    h = max(1, int(getattr(cfg, 'horizon', 15) or 15))
+    l_cap = max(2, int(getattr(cfg, 'lookback', 0)
+                       or getattr(cfg, 'seq_len', 8) or 8))
+    settle = max(h, l_cap)
+    k = max(1, int(getattr(cfg, 'gain_match_len', 0) or 0) or h)
+    cfg_len = int(getattr(cfg, 'gain_match_rest_ic_len', 0))
+    if cfg_len > 0:
+        L = min(l_cap, cfg_len)
+    elif cfg_len == 0:
+        L = min(l_cap, settle)
+    else:
+        tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+        sr = max(float(getattr(cfg, 'sample_rate', 1) or 1), 1e-6)
+        if tau > 0.0:
+            two_tau = max(2, int(round(2.0 * tau / sr)))
+            L = min(l_cap, max(k, two_tau))
+        else:
+            L = min(l_cap, settle)
+    L = max(2, min(int(L), settle, l_cap))
+    return settle, L
+
+
+def _gain_match_rest_ic_tensors(
+        cfg: 'TrainConfig', device, dtype
+        ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Device cache of rest lookbacks.  Busts when numpy source changes."""
+    obs = getattr(cfg, '_gain_match_rest_obs', None)
+    act = getattr(cfg, '_gain_match_rest_act', None)
+    if obs is None or act is None:
+        return None, None
+    key = (id(obs), id(act), str(device), str(dtype))
+    cache = getattr(cfg, '_gain_match_rest_dev', None)
+    if cache is None or cache[0] != key:
+        o = torch.as_tensor(np.ascontiguousarray(obs), dtype=dtype)
+        a = torch.as_tensor(np.ascontiguousarray(act), dtype=dtype)
+        if getattr(device, 'type', '') == 'cuda':
+            o = o.pin_memory().to(device, non_blocking=True)
+            a = a.pin_memory().to(device, non_blocking=True)
+        else:
+            o = o.to(device=device)
+            a = a.to(device=device)
+        if o.ndim != 3 or a.ndim != 3 or o.shape[0] != a.shape[0]:
+            return None, None
+        cfg._gain_match_rest_dev = (key, o, a)  # type: ignore[attr-defined]
+        return o, a
+    return cache[1], cache[2]
+
+
+def _rest_ic_c_from_state(state, obs: torch.Tensor) -> torch.Tensor:
+    """Last rest-IC continuous latent (posterior MEAN when present)."""
+    c = state.c_mean if getattr(state, 'c_mean', None) is not None else state.c
+    if c is None:
+        c = obs.new_zeros(obs.shape[0], 0)
+    return c
+
+
+def _rest_ic_last_state(rssm, obs: torch.Tensor, act: torch.Tensor):
+    """Last rest-IC ``rollout_observed`` state (eager; keeps TSSM KV)."""
+    _, _, _, state, *_ = rssm.rollout_observed(
+        obs, act, sample=False, store_aux=False, last_only=True,
+        return_feats=False)
+    return state
+
+
+def _rest_ic_last_tensors(rssm, obs: torch.Tensor, act: torch.Tensor):
+    """Last ``h/z/c_mean`` of a rest-IC ``last_only`` encode (eager).
+
+    Graph capture still unpacks this triple (RSSM).  TSSM gain-match
+    uses ``_rest_ic_last_state`` so the FD can continue ``kv_cache``
+    (P77 RCA: Markovian ``img_rollout(h,z)`` pinned jsonl ×1 while
+    5-level TM / probe were cached).
+    """
+    state = _rest_ic_last_state(rssm, obs, act)
+    return state.h, state.z, _rest_ic_c_from_state(state, obs)
+
+
+def _expand_dyn_state(state, n: int):
+    """Tile batch dim 0 ``n`` times for stacked gain-match FD rolls.
+
+    Identity at ``n<=1``.  TSSM KV tensors are ``(B, heads, pos, hd)``;
+    ``pos`` is a token count (not tiled).  RSSM has no ``kv_cache``.
+    """
+    n = int(n)
+    if state is None or n <= 1:
+        return state
+
+    def _rep(t):
+        if t is None or not torch.is_tensor(t):
+            return t
+        return (t.unsqueeze(0).expand(n, *t.shape)
+                .reshape(n * int(t.shape[0]), *t.shape[1:]).contiguous())
+
+    kw = {}
+    for f in fields(type(state)):
+        val = getattr(state, f.name)
+        if f.name == 'pos':
+            kw[f.name] = int(val or 0)
+        elif f.name == 'kv_cache':
+            kw[f.name] = (None if val is None
+                          else [(_rep(k), _rep(v)) for k, v in val])
+        else:
+            kw[f.name] = _rep(val)
+    return type(state)(**kw)
+
+
+def _amp_parent_autocast_on(device_type: str = 'cuda') -> bool:
+    """True when a live autocast region would reject CUDA-graph capture.
+
+    P55: ``make_graphed_callables`` inside ``world_model_loss`` bf16
+    autocast (``cache_enabled=True``) raised and ``_rest_ic_cg_fail``
+    pinned the eager T-loop for the whole run.  In-loop must replay a
+    warmed graph or stay eager — never capture, never pin fail.
+    """
+    try:
+        return bool(torch.is_autocast_enabled(device_type))
+    except TypeError:
+        return bool(torch.is_autocast_enabled())
+
+
+def _rest_ic_can_cuda_graph(rssm, obs: torch.Tensor, cfg: 'TrainConfig') -> bool:
+    """CUDA-graph rest-IC is RSSM + CUDA + static T≥8.  TSSM kv-cache grows."""
+    if not _cfg_on(cfg, 'gain_match_rest_ic_cuda_graph', True):
+        return False
+    if getattr(getattr(obs, 'device', None), 'type', '') != 'cuda':
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if not hasattr(torch.cuda, 'make_graphed_callables'):
+        return False
+    if type(rssm).__name__ != 'RSSMDynamics':
+        return False
+    if bool(getattr(rssm, '_rest_ic_cg_fail', False)):
+        return False
+    if int(obs.shape[1]) < 8:
+        return False
+    return True
+
+
+def _rest_ic_graph_key(rssm, obs: torch.Tensor, act: torch.Tensor):
+    return (
+        tuple(obs.shape), tuple(act.shape), str(obs.dtype), str(act.dtype),
+        str(obs.device), bool(getattr(rssm, 'dob_active', False)),
+        bool(getattr(rssm, 'dob_enabled', False)),
+        bool(getattr(rssm, '_cont_post_uses_innov', False)),
+    )
+
+
+def _rssm_param_grad_snapshot(rssm):
+    """Clone in-flight ``.grad`` so a CUDA-graph canary cannot wipe them.
+
+    Capture is normally the first rest-IC forward (grads are None).  If
+    capture is ever moved later in a WM step, ``zero_grad`` would drop
+    the live graph.  Restore is identity when every grad was None.
+    """
+    out = []
+    for p in rssm.parameters():
+        g = p.grad
+        out.append((p, None if g is None else g.detach().clone()))
+    return out
+
+
+def _rssm_param_grad_restore(snap) -> None:
+    for p, g in snap:
+        p.grad = g
+
+
+class _RestICGraphModule(torch.nn.Module):
+    """Adapter so ``make_graphed_callables`` records RSSM param backward.
+
+    A nested function has empty ``parameters()``, so the capture
+    ``autograd.grad`` input surface is only ``sample_args``.  P56 warmup
+    (pid **110246**): those copies lacked ``requires_grad`` →
+    ``ValueError: grad requires non-empty inputs`` and
+    ``_rest_ic_cg_fail`` pinned the eager T-loop (``t_wm`` ~123 s).
+    Marking copies ``requires_grad_(True)`` would un-empty that list
+    but still omit GRU params from the recorded backward (canary
+    ``gru_g==0`` → eager).  This Module yields RSSM
+    ``parameters`` / ``named_parameters`` / ``buffers`` /
+    ``named_buffers`` without re-parenting ``model.dynamics``
+    (``object.__setattr__``).  Torch 2.12 capture uses
+    ``tuple(c.parameters())`` **and** asserts every ``c.buffers()``
+    item has ``requires_grad=False``.  Overriding only
+    ``parameters()`` left the default ``named_parameters()`` /
+    ``buffers()`` empty (they walk ``_parameters`` / ``_modules``,
+    which stay empty).  Last-only encode skips prior/decoder; capture
+    uses ``allow_unused_input=True``.
+    """
+
+    def __init__(self, rssm):
+        super().__init__()
+        object.__setattr__(self, '_rssm', rssm)
+
+    def parameters(self, recurse: bool = True):
+        yield from self._rssm.parameters(recurse=recurse)
+
+    def named_parameters(self, *args, **kwargs):
+        yield from self._rssm.named_parameters(*args, **kwargs)
+
+    def buffers(self, recurse: bool = True):
+        yield from self._rssm.buffers(recurse=recurse)
+
+    def named_buffers(self, *args, **kwargs):
+        yield from self._rssm.named_buffers(*args, **kwargs)
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor):
+        return _rest_ic_last_tensors(self._rssm, obs, act)
+
+
+def _rest_ic_note_capture_miss(rssm, pin_fail: bool) -> None:
+    """Pin eager only on structural capture fail, not transient VRAM skip.
+
+    ``_rest_ic_cg_fail`` disables CUDA-graph for the whole run.  A
+    <512 MiB free skip at warmup is host-adaptive (empty_cache retry);
+    pinning it would freeze the 124 s T-loop even after P3-bound VRAM
+    is free.  Capture exceptions / empty surface / GRU-canary still pin.
+    """
+    if pin_fail:
+        rssm._rest_ic_cg_fail = True  # type: ignore[attr-defined]
+
+
+_REST_IC_STREAM_WARN = {
+    'fn': None,
+    'prev': True,
+    'armed': False,
+}
+
+
+def _arm_rest_ic_stream_mismatch_warn(suppress: bool) -> None:
+    """Keep capture-stream AccumulateGrad quiet while rest-IC graph is live.
+
+    ``make_graphed_callables`` warms up on a side stream.  Those
+    AccumulateGrad nodes stay alive on the graphed backward, so the
+    **first live WM backward** (P59 STAGE-1 iter 1) still printed the
+    one-shot UserWarning after P58 restored the flag at canary end.
+    Training identity.  Host-adaptive (missing API is a no-op).
+    Idempotent.  Release (g freeze) restores the previous flag.
+    """
+    warn_fn = getattr(
+        torch.autograd.graph,
+        'set_warn_on_accumulate_grad_stream_mismatch', None)
+    if suppress:
+        if _REST_IC_STREAM_WARN['armed']:
+            return
+        prev = True
+        if warn_fn is not None:
+            try:
+                prev = warn_fn(False)
+            except TypeError:
+                warn_fn(False)
+                prev = True
+        _REST_IC_STREAM_WARN.update(fn=warn_fn, prev=prev, armed=True)
+        return
+    if not _REST_IC_STREAM_WARN['armed']:
+        return
+    fn = _REST_IC_STREAM_WARN['fn']
+    prev = _REST_IC_STREAM_WARN['prev']
+    if fn is not None:
+        try:
+            if prev is None:
+                fn(True)
+            else:
+                fn(bool(prev))
+        except TypeError:
+            fn(True)
+    _REST_IC_STREAM_WARN['armed'] = False
+
+
+@contextmanager
+def _suppress_accumulate_grad_stream_warn():
+    """Hide leftover-AccumulateGrad stream mismatch around rest-IC capture.
+
+    P57 wrapped only ``make_graphed_callables``; P58 still printed the
+    one-shot UserWarning on the GRU-grad canary ``backward`` after that
+    ``finally`` restored the flag.  Cover capture **and** canary.
+    The live WM loop is covered by ``_arm_rest_ic_stream_mismatch_warn``
+    until graph release (P59).  Training identity.  Host-adaptive
+    (missing API → warnings filter).
+    """
+    warn_fn = getattr(
+        torch.autograd.graph,
+        'set_warn_on_accumulate_grad_stream_mismatch', None)
+    prev = True
+    if warn_fn is not None:
+        try:
+            prev = warn_fn(False)
+        except TypeError:
+            warn_fn(False)
+            prev = True
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='The AccumulateGrad node',
+            category=UserWarning,
+        )
+        try:
+            yield
+        finally:
+            if warn_fn is not None:
+                try:
+                    if prev is None:
+                        warn_fn(True)
+                    else:
+                        warn_fn(bool(prev))
+                except TypeError:
+                    warn_fn(True)
+
+
+def _capture_rest_ic_cuda_graph(
+        rssm, obs: torch.Tensor, act: torch.Tensor
+        ) -> Tuple[Optional[object], bool]:
+    """Capture full-BPTT rest-IC.  ``(graphed, pin_fail)``.
+
+    ``graphed`` is the callable on success.  ``pin_fail`` True means
+    do not retry this pid (structural).  VRAM skip is
+    ``(None, False)``.  Do not use raw CUDAGraph (no backward).
+    """
+    try:
+        free, _total = torch.cuda.mem_get_info(obs.device)
+        if int(free) < 512 * 1024 * 1024:
+            print('[gain-match] rest-ic CUDA graph skipped '
+                  f'(free VRAM {free / 1024 ** 2:.0f} MiB < 512)',
+                  flush=True)
+            return None, False
+    except Exception:
+        pass
+
+    wrapper = _RestICGraphModule(rssm)
+    # Graphed ``forward`` replays only while ``wrapper.training`` matches
+    # capture (torch 2.12).  RSSM is not a child, so Module default
+    # ``train()`` would not follow ``rssm.training``.  Capture during P1
+    # train; identity with RSSM.
+    wrapper.train(bool(rssm.training))
+    trainable = tuple(p for p in wrapper.parameters() if p.requires_grad)
+    if not trainable:
+        print('[gain-match] rest-ic CUDA graph skipped '
+              '(empty trainable capture surface); eager T-loop',
+              flush=True)
+        return None, True
+    if not all(b.requires_grad is False for b in wrapper.buffers()):
+        print('[gain-match] rest-ic CUDA graph skipped '
+              '(trainable buffer on capture surface); eager T-loop',
+              flush=True)
+        return None, True
+    # Eager WM steps run inside bf16 autocast (cache_enabled=True).
+    # ``make_graphed_callables`` rejects autocast cache (P55 first
+    # GPU capture inside ``world_model_loss``: RuntimeError … set
+    # cache_enabled=False).  Exit the parent region first — a nested
+    # cache_enabled=False alone still sees the parent's cache flag
+    # on some PyTorch builds — then re-enter bf16 with cache off so
+    # the recorded kernels match the training WM step.  Fail still
+    # falls back to the eager T-loop.
+    #
+    # Do **not** force ``requires_grad`` on obs/act copies: live
+    # rest-IC cache tensors do not require grad, and PyTorch
+    # requires sample_args to match the training loop.  GRU params
+    # come from ``named_parameters()``, not from the obs/act leaves.
+    #
+    # P58: leftover AccumulateGrad stream-mismatch UserWarning is the
+    # GRU-grad canary ``backward`` after capture warmup (P57 restored
+    # the flag in the capture ``finally``).  Drop in-flight grads +
+    # sync + gc before recording; suppress across capture **and**
+    # canary.  P59: first live WM backward still warned after that
+    # restore — arm the flag until graph release.
+    o_s = obs.detach()
+    a_s = act.detach()
+    saved_pre = _rssm_param_grad_snapshot(rssm)
+    rssm.zero_grad(set_to_none=True)
+    if obs.device.type == 'cuda':
+        torch.cuda.synchronize()
+    try:
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
+    with _suppress_accumulate_grad_stream_warn():
+        try:
+            with torch.amp.autocast(device_type=obs.device.type, enabled=False):
+                with torch.amp.autocast(
+                        device_type=obs.device.type, dtype=torch.bfloat16,
+                        enabled=True, cache_enabled=False):
+                    graphed = torch.cuda.make_graphed_callables(
+                        wrapper, (o_s, a_s), num_warmup_iters=2,
+                        allow_unused_input=True)
+        except Exception as e:
+            _rssm_param_grad_restore(saved_pre)
+            print('[gain-match] rest-ic CUDA graph capture failed '
+                  f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+            return None, True
+        _rssm_param_grad_restore(saved_pre)
+        # Canary: P25 class if the graph dropped BPTT through the GRU.
+        # Save/restore any in-flight grads (identity when all None).
+        saved = _rssm_param_grad_snapshot(rssm)
+        h = z = c = None
+        try:
+            rssm.zero_grad(set_to_none=True)
+            h, z, c = graphed(obs, act)
+            (h.float().square().mean()
+             + z.float().square().mean()
+             + c.float().square().mean()).backward()
+            gru_g = 0.0
+            for n, p in rssm.named_parameters():
+                if p.grad is not None and 'gru' in n:
+                    gru_g += float(p.grad.abs().sum())
+            rssm.zero_grad(set_to_none=True)
+            if gru_g <= 0.0:
+                print('[gain-match] rest-ic CUDA graph dropped GRU grad; '
+                      'eager T-loop', flush=True)
+                return None, True
+        except Exception as e:
+            rssm.zero_grad(set_to_none=True)
+            print('[gain-match] rest-ic CUDA graph canary failed '
+                  f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+            return None, True
+        finally:
+            del h, z, c
+            _rssm_param_grad_restore(saved)
+    # Capture-stream AccumulateGrad nodes stay on the graphed backward.
+    # Keep the mismatch warn off until g-freeze release (P59).
+    _arm_rest_ic_stream_mismatch_warn(True)
+    print(f'[gain-match] rest-ic CUDA graph captured N={int(obs.shape[0])} '
+          f'T={int(obs.shape[1])} (full-BPTT; opt out '
+          'DREAMER_GAIN_MATCH_REST_IC_CUDA_GRAPH=0)', flush=True)
+    return graphed, False
+
+
+def _rest_ic_encode_hzc(rssm, obs: torch.Tensor, act: torch.Tensor,
+                        cfg: 'TrainConfig'):
+    """Last ``h/z/c``; CUDA-graph when eligible, else eager T-loop."""
+    if not _rest_ic_can_cuda_graph(rssm, obs, cfg):
+        return _rest_ic_last_tensors(rssm, obs, act)
+    key = _rest_ic_graph_key(rssm, obs, act)
+    cache = getattr(rssm, '_rest_ic_cg', None)
+    if cache is not None and cache[0] == key:
+        return cache[1](obs, act)
+    # Never capture under a parent autocast (P55 pin).  Replay-miss
+    # here is eager for this step only — warmup captures outside.
+    if _amp_parent_autocast_on(str(getattr(obs.device, 'type', 'cuda'))):
+        return _rest_ic_last_tensors(rssm, obs, act)
+    graphed, pin_fail = _capture_rest_ic_cuda_graph(rssm, obs, act)
+    if graphed is None:
+        _rest_ic_note_capture_miss(rssm, pin_fail)
+        return _rest_ic_last_tensors(rssm, obs, act)
+    rssm._rest_ic_cg = (key, graphed)  # type: ignore[attr-defined]
+    return graphed(obs, act)
+
+
+def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
+    """Capture rest-IC CUDA graph outside the P1 WM autocast loop.
+
+    P55 pid **103504** captured on the first ``world_model_loss`` step
+    (parent autocast ``cache_enabled=True``).  ``make_graphed_callables``
+    rejected it and ``_rest_ic_cg_fail`` pinned the eager T-loop for the
+    whole run (``t_wm`` ~127 s).  Call after the rest cache exists and
+    Stage-1 ``dob_active`` is already False.  In-loop encode never
+    recaptures under autocast (eager that step, do not pin fail).
+    Warmup dtype matches the rest-cache numpy (replay batches are
+    float32).  CPU / opt-out / non-RSSM: no-op.  Transient VRAM skip
+    retries once after ``empty_cache`` (do not pin fail).
+    """
+    if rssm is None:
+        return
+    if not _cfg_on(cfg, 'gain_match_rest_ic', False):
+        return
+    if not _cfg_on(cfg, 'gain_match_rest_ic_cuda_graph', True):
+        return
+    if getattr(device, 'type', '') != 'cuda':
+        return
+    rest_np = getattr(cfg, '_gain_match_rest_obs', None)
+    if rest_np is None:
+        return
+    if hasattr(rssm, '_rest_ic_cg_fail'):
+        delattr(rssm, '_rest_ic_cg_fail')
+    if hasattr(rssm, '_rest_ic_cg'):
+        delattr(rssm, '_rest_ic_cg')
+    try:
+        dt = _numpy_dtype_to_torch(np.asarray(rest_np).dtype)
+    except Exception:
+        dt = torch.float32
+
+    def _try_warmup() -> None:
+        try:
+            _gain_match_rest_ic_state(rssm, cfg, device, dt)
+        except Exception as e:
+            print('[gain-match] rest-ic CUDA graph warmup failed '
+                  f'({type(e).__name__}: {e}); eager T-loop', flush=True)
+
+    _try_warmup()
+    if (hasattr(rssm, '_rest_ic_cg')
+            or bool(getattr(rssm, '_rest_ic_cg_fail', False))):
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print('[gain-match] rest-ic CUDA graph warmup retry after empty_cache',
+          flush=True)
+    _try_warmup()
+
+
+def _release_rest_ic_cuda_graph(rssm) -> bool:
+    """Drop the rest-IC CUDA graph after g freeze.
+
+    P2/P3 skip gain-match (``_g_live``).  The captured graph holds a
+    static lookback-T replay for the whole run; releasing it is
+    identity for training and host-adaptive (P3 needs the VRAM).
+    No-op when the pid never captured (P55 eager-fail pin).  Returns
+    True iff a graph object was dropped (caller may ``empty_cache``).
+    Restores the AccumulateGrad stream-mismatch warn (P59).
+    """
+    _arm_rest_ic_stream_mismatch_warn(False)
+    if rssm is None:
+        return False
+    released = hasattr(rssm, '_rest_ic_cg')
+    if released:
+        delattr(rssm, '_rest_ic_cg')
+    if hasattr(rssm, '_rest_ic_cg_fail'):
+        delattr(rssm, '_rest_ic_cg_fail')
+    # Rest-IC FD a_seq cache (static rest act/dv; not the graph).
+    if hasattr(rssm, '_gain_match_fd_seq'):
+        delattr(rssm, '_gain_match_fd_seq')
+    return bool(released)
+
+
+def _release_rest_ic_after_g_freeze(rssm) -> None:
+    """Release + ``empty_cache`` once when the WM core stops training."""
+    if not _release_rest_ic_cuda_graph(rssm):
+        return
+    print('[gain-match] rest-ic CUDA graph released (g frozen)',
+          flush=True)
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _gain_match_rest_ic_state(rssm, cfg: 'TrainConfig', device, dtype):
+    """Encode cached rest lookbacks → ``(h0, z0, c0, a_base, dv0, prev)``.
+
+    Teacher-forced posterior (TM ``_imagine_open_loop_rssm`` warm-start).
+    ``sample=False`` + last ``c_mean`` (follow-up 14).  ``store_aux=False``
+    skips unused logit stacks.  ``last_only=True`` + ``return_feats=False``
+    skips the unused T-stack **and** the last feat / Stage-1 zero-``d``
+    tail.  RSSM CUDA-graph still returns ``h/z/c`` only (``prev=None``:
+    GRU ``h`` is the history).  TSSM eager encode keeps ``kv_cache`` so
+    the FD can continue the lookback (P77 Markovian hole).  Stage-1
+    encode uses ``_posterior_step``.  None if the cache is empty.
+
+    CUDA: ``make_graphed_callables`` on ``_RestICGraphModule`` wrapping
+    the T-loop when ``gain_match_rest_ic_cuda_graph`` (default True),
+    RSSM, T≥8, and capture+GRU-grad canary succeed.  Capture is warmed
+    at train start outside the WM autocast loop (P55 in-loop capture
+    hit autocast cache).  A nested function is not a graph surface
+    (P56: empty ``parameters()``).  ``parameters`` / ``named_parameters``
+    / ``buffers`` / ``named_buffers`` must yield the RSSM (overriding
+    only ``parameters()`` left ``named_parameters()``/``buffers()``
+    empty).  Transient VRAM skip does **not** pin ``_rest_ic_cg_fail``
+    (warmup retries once after ``empty_cache``).  Raw ``CUDAGraph``
+    has no backward (P25).  TSSM / CPU / capture-fail stay on the
+    Python loop.
+
+    Do **not** concat rest rows into the main WM ``rollout_observed``
+    (``sample=True``): the GRU would see sampled ``c``, so ``h`` ≠ this
+    mean-c IC.  The extra cost is a second T-loop of skinny N=6 kernels
+    (launch-bound, N-independent); ``last_only`` does not skip the GRU.
+    """
+    o, a = _gain_match_rest_ic_tensors(cfg, device, dtype)
+    if o is None or a is None:
+        return None
+    prev = None
+    if _rest_ic_can_cuda_graph(rssm, o, cfg):
+        h0, z0, c0 = _rest_ic_encode_hzc(rssm, o, a, cfg)
+    else:
+        prev = _rest_ic_last_state(rssm, o, a)
+        h0, z0, c0 = prev.h, prev.z, _rest_ic_c_from_state(prev, o)
+        if getattr(prev, 'kv_cache', None) is None:
+            prev = None
+    # Last rest frame is static (encode weights are not).  Cache a_base /
+    # dv0 next to the device lookbacks — 100×/iter index_select identity.
+    adv_key = (id(o), id(a), int(getattr(rssm, 'dv_dim', 0) or 0))
+    adv = getattr(cfg, '_gain_match_rest_adv', None)
+    if adv is not None and adv[0] == adv_key:
+        a_base, dv0 = adv[1], adv[2]
+    else:
+        a_base = a[:, -1].contiguous()
+        dv0 = None
+        if int(getattr(rssm, 'dv_dim', 0) or 0) > 0:
+            dv0 = o[:, -1].index_select(-1, rssm.dv_index_t).contiguous()
+        cfg._gain_match_rest_adv = (  # type: ignore[attr-defined]
+            adv_key, a_base, dv0)
+    return h0, z0, c0, a_base, dv0, prev
+
+
+def collect_rest_lookback(
+        env: 'APCEnv', cfg: 'TrainConfig', action_level,
+        *, settle: int, lookback: int
+        ) -> Tuple[np.ndarray, np.ndarray]:
+    """Hold ``action_level`` for ``settle`` steps; return last ``lookback`` frames.
+
+    Matches TM ``_settle_capture``: quiet env, held action, **obs after
+    the step** (the action that drove the transition INTO ``obs[t]``),
+    tiled ``lookback_act``.  Training replay is obs-*before*-step;
+    rest-IC follows the TM rest-then-step gate, not the replay pairing.
+    Isolation loss is not used.  ``clean_steady_seeds`` still zeros
+    process/measurement noise (P89).
+    """
+    from tools.wm_steady_state_diagnostic import _quiet_env
+    S = max(2, int(settle))
+    L = max(2, min(int(lookback), S))
+    _quiet_env(env)
+    env.reset(exploration=False)
+    env._schedule = []
+    env._hidden_disturbance = None
+    _maybe_clean_steady_seed(env, cfg)
+    a_const = _as_hold_action(action_level, env.action_dim)
+    obs_hist: List[np.ndarray] = []
+    for _ in range(S):
+        ow, _, done, _ = env.step(a_const)
+        obs_hist.append(np.asarray(ow[-1], dtype='float32').copy())
+        if done:
+            env.reset(exploration=False)
+            env._schedule = []
+            env._hidden_disturbance = None
+            _maybe_clean_steady_seed(env, cfg)
+    obs_arr = np.stack(obs_hist, axis=0)
+    lookback_obs = obs_arr[-L:]
+    lookback_act = np.tile(
+        np.asarray(a_const, dtype='float32').reshape(-1), (L, 1))
+    return lookback_obs, lookback_act
+
+
+def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
+    """Seed-time real rest lookbacks for the TM-protocol teacher.
+
+    No-op when ``gain_match_rest_ic`` is off or a cache already exists.
+    Isolation teacher stays off — this is encode data for gain-match FD,
+    not ``_wm_input_isolation_loss``.
+    """
+    if not _cfg_on(cfg, 'gain_match_rest_ic', False):
+        return
+    if getattr(cfg, '_gain_match_rest_obs', None) is not None:
+        return
+    settle, L = _gain_match_rest_window(cfg)
+    n = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
+    op_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6) or 0.6)
+    rng = getattr(env, 'rng', None) or np.random.default_rng(0)
+    levels = np.linspace(-op_band, op_band, n, dtype='float32')
+    jit = rng.uniform(-0.05, 0.05, size=levels.shape).astype('float32')
+    levels = np.clip(levels + jit * op_band, -1.0, 1.0)
+    n_mv = _env_n_mv(env)
+    hold_rows = _per_mv_hold_rows(levels, n_mv, env.action_dim, rng)
+    obs_l: List[np.ndarray] = []
+    act_l: List[np.ndarray] = []
+    for i in range(n):
+        lvl = hold_rows[i] if hold_rows is not None else float(levels[i])
+        o, a = collect_rest_lookback(
+            env, cfg, lvl, settle=settle, lookback=L)
+        obs_l.append(o)
+        act_l.append(a)
+    cfg._gain_match_rest_obs = np.stack(obs_l, axis=0)  # type: ignore[attr-defined]
+    cfg._gain_match_rest_act = np.stack(act_l, axis=0)  # type: ignore[attr-defined]
+    cfg._gain_match_rest_dev = None  # type: ignore[attr-defined]
+    cfg._gain_match_rest_adv = None  # type: ignore[attr-defined]
+    from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
+    _len_cfg = int(getattr(cfg, 'gain_match_rest_ic_len', 0))
+    print(f'[gain-match] rest-ic N={n} L={L} settle={settle} '
+          f'rest_ic_len={_len_cfg} '
+          f'(TM-protocol real-rest tail encode; Huber baseline = last '
+          f'rest-obs CV / TM pre, not held-K; isolation loss stays 0; '
+          f'not wm_tf_horizon={_wm_tf_h(int(getattr(cfg, "horizon", 15) or 15))})',
+          flush=True)
+
+
 def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
-                        obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig
+                        obs: torch.Tensor, act: torch.Tensor, cfg: TrainConfig,
+                        c_mean: Optional[torch.Tensor] = None,
                         ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """C(1): finite-difference step-response asymptote gain-matching (RSSM).
 
-    From a strided set of posterior start states, roll the PRIOR forward ``K``
-    steps under (a) a HELD baseline action/DV and (b) a unit STEP in each input
-    channel.  The DIFFERENCE of the decoded CV at step ``K`` cancels the common
-    transient and isolates the WM's realized STEADY-STATE gain ``ΔCV/Δinput``;
-    we match it to the identified gain (in WM/normalized units).  The continuous
+    From a strided set of posterior start states, optionally hold a/dv for
+    ``gain_match_settle_len`` steps (P44: auto = control horizon; TM
+    probe settle is 4×horizon — see TrainConfig),
+    then roll the PRIOR forward ``K = gain_match_len`` steps (P67
+    REVERT: sentinel auto = control H; 4H CAPPED GAIN_NOT_READY 0.80@DV
+    vs P64 K=H PASS 0.91@DV; explicit ``DREAMER_GAIN_MATCH_LEN=220`` A/B)
+    under (a) a HELD baseline
+    action/DV and (b) a unit STEP in each input channel.
+
+    ``gain_match_rest_ic`` (P45 EXIT default): replace PRBS-posterior starts
+    with a teacher-forced encode of **real** rest lookbacks (TM
+    rest-then-step IC).  Isolation loss stays 0.  When the rest cache
+    is present, P44 WM-held settle is skipped (the lookback is already
+    rest).  **P68:** Huber ``ΔCV`` is decode(step_K) minus the last
+    rest-obs CV (TM ``pre``), not decode(held_K).  P67 last-only vs
+    held-K pinned identifier jsonl ×1 while val TM vs plant rest
+    stayed 0.80@DV / MV ×1.35.  PRBS-posterior fallback still uses
+    held-K.  Match the identified gain (WM/normalized units).  The continuous
     gain channel gives the WM the un-quantized capacity this loss grabs onto, so
     together they pin the subdominant DV gain the categorical attenuates.
 
+    Rest-pre skips the unused held-K ``img_rollout`` row (Huber does not
+    read ``decode(held_K)``).  PRBS-posterior fallback still rolls it.
+
+    **P69 REVERT:** stop-grad OL tail after teacher K was TBPTT-on-the
+    DC window (P24 class; CAPPED GAIN_NOT_READY 0.75@MV).  **P70
+    REVERT:** OL hold of gain-c after the first ``img_step`` detonated
+    (storm 2/2, DC ×−0.60@MV).  **P71 REVERT:** gain-c is a GRU / TSSM
+    token input again (G-out-of-recurrence freeze-failed 0.76@DV).
+    **P73 EXIT:** OL gain-c persist at teacher K **KEEP as last_ok-81
+    hygiene** / **FALSIFIED as compounding** (persist_rel 0.037 @81;
+    val 1step→OL ×0.761).  **P74 EXIT REVERT:** decoder
+    ``gain_cv_skip`` was a teacher-pin no-op (rms stalled 0.00387;
+    det_r 0.074; paired −48 vs −105, mv_viol 20).  **P75 EXIT REVERT:**
+    FOPDT rise teacher (rise Huber mass 1.4% at K=H; val 1step→OL
+    ×0.803 vs P64 ×0.85).  Dummy
+    ``gmatch_ol_tail=0`` banner **REMOVED** (P69 field was always 0).
+    **P76 EXIT REVERT:** RSSM GRU update-gate bias ``log(H/16)``
+    (keep-h stalled conv; freeze GAIN_NOT_READY 0.80@MV).  Last-step
+    DC Huber stays (P64/P73).  **P77 EXIT FALSIFIED** Markovian TSSM
+    rest-IC.  **P78 freeze FALSIFIED** KV-continue as GAIN-READY
+    (KEEP as attributed OL lift vs Markovian).  Consecutive TSSM family
+    closed.  Env-free observer is RSSM (``world_model_type='rssm'``;
+    ``DREAMER_WORLD_MODEL_TYPE=tssm`` opt-in).
+
     ``sample=False`` freezes the categorical at its argmax so the gain gradient
-    flows into the CONTINUOUS gain channel + decoder + GRU (not the categorical
+    flows into the CONTINUOUS gain channel + decoder (not the categorical
     we are trying to bypass).  RSSM + TSSM (the TSSM rolls from a fresh
     KV-cache); ``(0, {})`` for other backbones / when off.
+
+    P28 follow-up 13: ``K`` is the identified settling length, not
+    ``min(K, T-1)``.  The roll is open-loop held a/dv from the start
+    state — it does not need future obs in the window.  Truncating K to
+    the main-buffer ``seq_len`` was the same DC-gain miss isolation
+    follow-up 10 already plugged for ``isolation_buf``.
+
+    Eager (P31 default): RSSM/TSSM ``img_rollout`` stacks the baseline
+    + one step per MV/DV into a single roll (batch
+    ``Bm·(1+n_mv+n_dv)``; rest-pre skips the unused held row so
+    ``Bm·(n_mv+n_dv)``) so the K-step prior loop runs once.  **P76:**
+    last-step DC Huber (P75 FOPDT rise **REVERT**);
+    ``last_only=True, out='obs', return_state=True``.  Decoded-obs
+    last step is ~100× smaller than a feat stack.  ``return_state``
+    is the P73 OL gain-c persist IC.  Sequential ``img_step``
+    fallback REMOVED (both RSSM-interface backbones expose
+    ``img_rollout``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
     if float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0:
         return zero, diag
-    _wmt = getattr(model, 'world_model_type', 'sf_transformer')
-    if _wmt not in ('rssm', 'tssm'):
+    if not _is_rssm_interface(model):
         return zero, diag
     rssm = model.dynamics
     if int(getattr(rssm, 'cont_gain_dim', 0) or 0) <= 0 or rssm.n_cv <= 0:
@@ -4243,104 +8139,315 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     dv_target = list(getattr(cfg, 'gain_match_dv_target', ()) or ())
     if not mv_target and not dv_target:
         return zero, diag
-    if _wmt == 'tssm':
-        from models.transformer_ssm import TSSMState as _State
-    else:
-        from models.dreamer_v4_rssm import RSSMState as _State
     B, T = obs.shape[:2]
     K = int(getattr(cfg, 'gain_match_len', 0) or 0)
-    K = min(K, T - 1) if K > 0 else (T - 1)
+    if K <= 0:
+        K = T - 1
     if K < 2:
         return zero, diag
-    step = float(getattr(cfg, 'gain_match_step', 1.0) or 1.0)
-    max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
-    n_valid = T - K
-    if n_valid < 1:
-        return zero, diag
-    stride = max(1, n_valid // max_starts)
-    starts = torch.arange(0, n_valid, stride, device=obs.device)
-    S = int(starts.numel())
-    f0 = feats[:, starts]                                   # (B, S, F)
-    Bm = B * S
-    h0 = f0[..., :rssm.deter_dim].reshape(Bm, -1)
-    _ze = rssm.deter_dim + rssm.stoch_flat_dim
-    z0 = f0[..., rssm.deter_dim:_ze].reshape(
-        Bm, rssm.n_categoricals, rssm.n_classes)
-    c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
-          if rssm.cont_dim > 0 else None)
+    # Open-loop FD from start states: do NOT truncate K to T-1.
+    # Isolation windows grew to K+1 (follow-up 10); the MAIN replay
+    # batch still used seq_len, so ``min(K, T-1)`` + ``n_valid = T-K``
+    # never reached the identified settling length when H >= seq_len
+    # (P25-family: forward Huber tiny, transfer-matrix DC dead).  The
+    # roll holds a/dv from the start — no future obs needed.  When
+    # T > K keep the historical start restriction (test_sim T=64,
+    # K=55 → n_valid=9).  When T <= K roll the full K from every start.
+    # P60: do NOT ``or 1.0`` — dataclass sentinel 0.0 would silently
+    # become the P59 teacher (Δu=1) that disagrees with val TM 0.4.
+    step = _resolve_gain_match_step(cfg)
     cv_idx = rssm.cv_index_t
+    rest = None
+    if _cfg_on(cfg, 'gain_match_rest_ic', False):
+        rest = _gain_match_rest_ic_state(
+            rssm, cfg, obs.device, obs.dtype)
+        if rest is None and not getattr(
+                cfg, '_gain_match_rest_fallback_logged', False):
+            print('[gain-match] rest-ic cache empty; FD using PRBS starts '
+                  '(P45 confound if this is a rest-ic GPU job)',
+                  flush=True)
+            cfg._gain_match_rest_fallback_logged = True  # type: ignore[attr-defined]
+    if rest is not None:
+        # P45: TM-protocol IC (real rest encode).  Skip P44 WM-held
+        # settle of a PRBS start — the lookback *is* the rest.
+        h0, z0, c0, a_base, dv0 = rest[:5]
+        st0 = rest[5] if len(rest) > 5 else None
+        Bm = int(h0.shape[0])
+    else:
+        st0 = None
+        max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
+        n_valid = (T - K) if T > K else T
+        if n_valid < 1:
+            return zero, diag
+        stride = max(1, n_valid // max_starts)
+        starts = _cached_strided_arange(
+            cfg, n_valid, stride, obs.device, attr='_gmatch_starts')
+        S = int(starts.numel())
+        f0 = feats[:, starts]                                   # (B, S, F)
+        Bm = B * S
+        h0 = f0[..., :rssm.deter_dim].reshape(Bm, -1)
+        _ze = rssm.deter_dim + rssm.stoch_flat_dim
+        z0 = f0[..., rssm.deter_dim:_ze].reshape(
+            Bm, rssm.n_categoricals, rssm.n_classes)
+        # Follow-up 14: first GRU step of the FD roll must see posterior MEAN c
+        # (actor / TM / isolation path), not the sample packed into feat.
+        c0 = _openloop_c0(rssm, f0, c_mean=c_mean, starts=starts)
+        a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
+        dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
+               if getattr(rssm, 'dv_dim', 0) > 0 else None)
+        # P44: settle at the start's held a/dv BEFORE the FD so the *student*
+        # FD (matched to identified G, not a teacher FD) starts from a held
+        # OP instead of a PRBS posterior.  P43 Huber ~0 from replay starts
+        # while the rest-step probe stayed 0.75@DV.  Gradful (P25).
+        h0, z0, c0 = _gain_match_held_settle(
+            rssm, h0, z0, c0, a_base, dv0,
+            int(getattr(cfg, 'gain_match_settle_len', 0)))
 
-    def _state():
-        kw = dict(
-            h=h0.clone(),
-            z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                                 device=obs.device, dtype=f0.dtype),
-            z=z0.clone(), c=(c0.clone() if c0 is not None else None))
-        if _wmt == 'tssm':
-            kw.update(kv_cache=None, pos=0)   # roll from a fresh transformer ctx
-        return _State(**kw)
+    mv_tgts = []
+    for j, tgt_row in enumerate(mv_target):
+        if j >= a_base.shape[-1]:
+            break
+        mv_tgts.append(tgt_row)
+    dv_tgts = []
+    if dv0 is not None:
+        for j, tgt_row in enumerate(dv_target):
+            if j >= dv0.shape[-1]:
+                break
+            dv_tgts.append(tgt_row)
+    nterm = len(mv_tgts) + len(dv_tgts)
+    if nterm == 0:
+        return zero, diag
 
-    a_base = act[:, starts].reshape(Bm, -1)                 # (Bm, A)
-    dv0 = (obs[:, starts].index_select(-1, rssm.dv_index_t).reshape(Bm, -1)
-           if getattr(rssm, 'dv_dim', 0) > 0 else None)
-
-    def _roll(a_held, dv_held):
-        st = _state()
-        for _i in range(K):
-            st = rssm.img_step(st, a_held, dv=dv_held, sample=False)
-            # Truncated BPTT (p24 RCA): at gain≈1.0 the recurrence is marginally
-            # stable, so the gradient through the full K-step roll explodes
-            # (grad_norm→1e13/inf → grad-skip storm → P1 abort).  Detach every
-            # ``_tbptt`` steps to bound the BPTT path.  ``0`` = full BPTT.
-            if (_tbptt > 0 and _i < K - 1 and (_i + 1) % _tbptt == 0
-                    and hasattr(st, 'detach')):
-                st = st.detach()
-        return rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
-
-    _tbptt = int(os.environ.get('DREAMER_AUX_TBPTT_STEPS', '16') or 0)
-    cv_base = _roll(a_base, dv0)
-    total = zero
-    nterm = 0
     # HUBER not MSE (p23 RCA): the MSE gradient ∝ gain error is UNBOUNDED, so a
     # large transient gain swing (p23 coef 2.0: ×1.09→×2.42→×-5.61) produces an
     # exploding gradient that overshoots and DIVERGES.  smooth_l1 caps the
     # gradient at ±1 beyond ``beta`` → damps the oscillation to a stable pin.
-    _hb = float(os.environ.get('DREAMER_GAIN_MATCH_HUBER_BETA', '1.0') or 1.0)
-    for j, tgt_row in enumerate(mv_target):                # MV: step the action
-        if j >= a_base.shape[-1]:
-            break
-        a_step = a_base.clone()
-        a_step[:, j] = a_step[:, j] + step
-        g_wm = (_roll(a_step, dv0) - cv_base) / step        # (Bm, n_cv)
-        tgt = torch.tensor(list(tgt_row), device=obs.device, dtype=g_wm.dtype)
-        total = total + F.smooth_l1_loss(g_wm, tgt.expand_as(g_wm), beta=_hb)
-        nterm += 1
-    if dv0 is not None:
-        for j, tgt_row in enumerate(dv_target):            # DV: step the DV input
-            if j >= dv0.shape[-1]:
-                break
-            dv_step = dv0.clone()
-            dv_step[:, j] = dv_step[:, j] + step
-            g_wm = (_roll(a_base, dv_step) - cv_base) / step
-            tgt = torch.tensor(list(tgt_row), device=obs.device,
-                               dtype=g_wm.dtype)
-            total = total + F.smooth_l1_loss(g_wm, tgt.expand_as(g_wm), beta=_hb)
-            nterm += 1
-    if nterm == 0:
-        return zero, diag
-    loss = total / float(nterm)
+    # Absolute Huber (P26).  P27 relative ``(g-tgt)/|tgt|`` is DELETED — it
+    # exploded full-BPTT.  Trust TrainConfig (ENV_OVERRIDES + resolve-time
+    # auto).  Do NOT re-read ``DREAMER_GAIN_MATCH_HUBER_BETA`` here: env
+    # ``<=0`` (median |tgt|) would overwrite the resolved β and pass β=0
+    # into smooth_l1.  P43: per-input β = |tgt_ij| (L1 sat still ±1).
+    _hb = max(1e-6, float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 1.0))
+    _per = bool(getattr(cfg, 'gain_match_huber_per_input', False))
+    _clip = _cfg_on(cfg, 'gain_match_clip_realized', True)
+
+    def _huber_from_cv(cv_base, cv_step_stack, tgts, du_in):
+        # ``cv_step_stack`` (n_in, Bm, n_cv) last-step DC.  One mean
+        # Huber ≡ mean of per-input means (equal Bm×n_cv).  P27
+        # relative scale is gone.  P61: divide by realized Δu (TM
+        # p136), mask cube no-ops.  P75 FOPDT K-stack **REVERT**.
+        if not tgts:
+            return zero
+        den = du_in.unsqueeze(-1)
+        ok = den.abs() >= 1e-6
+        g_wm = (cv_step_stack - cv_base) / torch.where(
+            ok, den, torch.ones_like(den))
+        tgt = _gain_match_tgt_tensor(g_wm, tgts, cfg)
+        tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
+                         g_wm.shape[-1]).expand_as(g_wm)
+        return _smooth_l1_gain_match(
+            g_wm, tgt_b, beta=_hb, per_input=_per, mask=ok)
+
+    # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
+    # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
+    # gradient that pins transfer-matrix gain (forward loss still
+    # looks tiny; val MV stayed ×0.74).  Explosion defence for this
+    # path is Huber + ``wm_grad_skip_norm`` (P24/P25), not a detach.
+    # RSSM-interface always has ``img_rollout``; sequential ``img_step``
+    # K-loops (linear in n_mv+n_dv) were dead after P32 TSSM wiring.
+    n_mv_t = len(mv_tgts)
+    n_dv_t = len(dv_tgts)
+    # P68 rest-pre: plant rest is ``cv_base``.  The held-K decode is
+    # unused — skip that extra ``Bm×K`` prior roll (test_sim 3→2 rolls).
+    # PRBS fallback still needs held-K ``cv_base``.
+    o_rest = None
+    if rest is not None:
+        o_rest, _ = _gain_match_rest_ic_tensors(cfg, obs.device, obs.dtype)
+        if o_rest is None or int(o_rest.shape[0]) != int(Bm):
+            o_rest = None
+    skip_held = o_rest is not None
+    n_rolls = int(n_mv_t) + int(n_dv_t) + (0 if skip_held else 1)
+    cache_owner = None
+    cache_key = None
+    if rest is not None:
+        rest_act = getattr(cfg, '_gain_match_rest_act', None)
+        if rest_act is not None:
+            cache_owner = rssm
+            cache_key = (
+                id(rest_act), int(n_mv_t), int(n_dv_t), float(step),
+                int(K), int(Bm), str(a_base.device), str(a_base.dtype),
+                int(a_base.shape[-1]),
+                0 if dv0 is None else int(dv0.shape[-1]),
+                int(bool(_clip)), int(bool(skip_held)),
+            )
+    a_seq, dv_seq, du, clip_frac_t = _gain_match_fd_action_seq(
+        a_base, dv0, n_mv_t, n_dv_t, step, K, Bm,
+        cache_owner=cache_owner, cache_key=cache_key,
+        clip_realized=_clip, include_held=not skip_held)
+
+    def _repeat_starts(t):
+        return (t.unsqueeze(0).expand(n_rolls, *t.shape)
+                .reshape(n_rolls * Bm, *t.shape[1:]).contiguous())
+
+    h_b = _repeat_starts(h0)
+    z_b = _repeat_starts(z0)
+    c_b = _repeat_starts(c0) if c0 is not None else None
+    # P76: last-step DC Huber (P75 FOPDT K-stack REVERT).  Persist
+    # still reads ``return_state``.  Last obs is ~100× smaller than
+    # a feat stack.
+    # P78: TSSM continues rest-IC KV (teacher = TM cached dynamics).
+    # RSSM ``st0 is None`` → Markovian ``(h,z)`` identity (GRU ``h``
+    # already is the history).  Not P69 (no extra DC window).
+    st_b = None
+    if (st0 is not None
+            and getattr(st0, 'kv_cache', None) is not None):
+        max_len = int(getattr(rssm, 'max_seq_len', 0) or 0)
+        pos = int(getattr(st0, 'pos', 0) or 0)
+        if max_len > 0 and pos + int(K) > max_len:
+            if not getattr(cfg, '_gain_match_kv_overflow_logged', False):
+                print('[gain-match] rest-IC KV '
+                      f'pos={pos}+K={int(K)} exceeds '
+                      f'max_seq_len={max_len}; Markovian h/z fallback',
+                      flush=True)
+                cfg._gain_match_kv_overflow_logged = True  # type: ignore[attr-defined]
+        else:
+            st_b = _expand_dyn_state(st0, n_rolls)
+            if not getattr(cfg, '_gain_match_kv_logged', False):
+                print('[gain-match] TSSM OL continues rest-IC KV-cache '
+                      f'(pos={pos}+K={int(K)}; not Markovian h/z)',
+                      flush=True)
+                cfg._gain_match_kv_logged = True  # type: ignore[attr-defined]
+    roll_obs, st_k = rssm.img_rollout(
+        h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
+        last_only=True, out='obs', return_state=True,
+        prev_state=st_b)
+    cv_k = roll_obs.index_select(-1, cv_idx)
+    cv_k = cv_k.view(n_rolls, Bm, -1)
+    # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
+    # K-step held WM prediction.  Held-K compounding made P67 jsonl ×1
+    # while val TM vs rest-pre missed DC.  Rest-IC last obs is that
+    # ``pre`` (same cache as the encode).  PRBS fallback keeps held-K.
+    if skip_held:
+        cv_base = o_rest[:, -1].index_select(-1, cv_idx)
+        cv_steps = cv_k
+        if not getattr(cfg, '_gain_match_rest_pre_logged', False):
+            print('[gain-match] Huber baseline = rest last-obs CV '
+                  '(TM pre; not held-K)',
+                  flush=True)
+            cfg._gain_match_rest_pre_logged = True  # type: ignore[attr-defined]
+    else:
+        cv_base = cv_k[0]
+        cv_steps = cv_k[1:]
+    total = _huber_from_cv(
+        cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
+    loss = total
+    # P69 REVERT: OL tail Huber deleted (TBPTT-on-asymptote). Dummy jsonl
+    # keys REMOVED (P72-live; same class as ``wm_held_ol_ratio``).
+    # P73: posterior 1-step persist does not constrain OL
+    # ``cont_prior(h)``. Endpoint L2 toward sg(rest-IC MEAN G) at
+    # teacher K — not P69 extra K, not P70 hold in ``img_step``, not
+    # P71 routing. GRU still sees full c. Dist-c is not pinned.
+    gp_coef = float(getattr(cfg, 'cont_gain_persist_coef', 0.0) or 0.0)
+    n_gain = int(getattr(rssm, 'cont_gain_dim', 0) or 0)
+    c_tail = getattr(st_k, 'c', None)
+    if (gp_coef > 0.0 and n_gain > 0 and c_b is not None
+            and c_tail is not None):
+        cg_d = min(n_gain, int(c_tail.shape[-1]), int(c_b.shape[-1]))
+        persist_err = (c_tail[..., :cg_d] - c_b[..., :cg_d].detach()).pow(2)
+        loss = loss + gp_coef * persist_err.mean()
+        if bool(getattr(cfg, '_wm_need_logged_aux', True)):
+            with torch.no_grad():
+                denom = c_b[..., :cg_d].abs().mean().clamp_min(1e-6)
+                diag['gain_match_ol_persist_rel'] = (
+                    persist_err.mean().sqrt() / denom).detach()
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
+    # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
+    # (L1 sat ±1) is the loss change; the MV/DV split still shows
+    # per-channel Huber (abs mean used to drown |tgt| 2.62 vs 0.51).
+    # ``*_ratio`` = mean G_pred/G_tgt so Huber~0 cannot hide a 0.75@DV
+    # rest-step miss the way P43 jsonl did.
+    with torch.no_grad():
+        if bool(getattr(cfg, '_wm_need_logged_aux', True)):
+            den = du.unsqueeze(-1)
+            ok = den.abs() >= 1e-6
+            g_all = (cv_steps - cv_base) / torch.where(
+                ok, den, torch.ones_like(den))
+            diag['gain_match_du_frac'] = (
+                du.abs().mean() / max(abs(float(step)), 1e-6))
+            # Reverse restores |Δu|, so du_frac≈1 cannot tell whether
+            # the cube fired.  Mean of +step-would-clip (P61).
+            diag['gain_match_clip_frac'] = clip_frac_t.detach()
+            if n_mv_t:
+                diag['gain_match_mv_loss'] = _huber_from_cv(
+                    cv_base, cv_steps[:n_mv_t], mv_tgts, du[:n_mv_t])
+                diag['gain_match_mv_ratio'] = _gain_match_pred_over_tgt(
+                    g_all[:n_mv_t], mv_tgts, cfg)
+            if dv_tgts:
+                diag['gain_match_dv_loss'] = _huber_from_cv(
+                    cv_base, cv_steps[n_mv_t:], dv_tgts, du[n_mv_t:])
+                diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
+                    g_all[n_mv_t:], dv_tgts, cfg)
     return loss, diag
+
+
+def _rssm_tbptt_img_rollout(
+        rssm, h0: torch.Tensor, z0: torch.Tensor,
+        a_all: torch.Tensor, dv_all: Optional[torch.Tensor],
+        c0: Optional[torch.Tensor], *, sample: bool = False,
+        tbptt_steps: int = 0, ss_k0: Optional[int] = None,
+        ) -> torch.Tensor:
+    """K-step prior roll with isolation TBPTT (``h`` only, ``keep_c``).
+
+    Cut rule matches the old Python ``img_step`` loop (P25 RCA): after step
+    index ``k`` (0-based), detach when ``tbptt_steps>0`` and ``k < K-1`` and
+    ``(k+1) % tbptt_steps == 0`` and (if ``ss_k0`` is set) ``k < ss_k0-1``.
+    Never cuts inside the SS-match window.  Each chunk is one ``img_rollout``
+    so compile-on fuses the GRU loop; eager ``img_step`` count is unchanged.
+    """
+    K = int(a_all.shape[1])
+    if int(tbptt_steps) <= 0 or K < 2:
+        return rssm.img_rollout(h0, z0, a_all, dvs=dv_all,
+                                sample=sample, c0=c0)
+    chunks = []
+    prev = None
+    h, z, c = h0, z0, c0
+    k0 = 0
+    _tbptt = int(tbptt_steps)
+    while k0 < K:
+        k_cut = None
+        for k in range(k0, K):
+            if (k < K - 1 and (k + 1) % _tbptt == 0
+                    and (ss_k0 is None or k < int(ss_k0) - 1)):
+                k_cut = k
+                break
+        k1 = (k_cut + 1) if k_cut is not None else K
+        dv_ch = (dv_all[:, k0:k1] if dv_all is not None else None)
+        if prev is not None:
+            roll, st = rssm.img_rollout(
+                h, z, a_all[:, k0:k1], dvs=dv_ch, sample=sample,
+                prev_state=prev, return_state=True)
+        else:
+            roll, st = rssm.img_rollout(
+                h, z, a_all[:, k0:k1], dvs=dv_ch, sample=sample,
+                c0=c, return_state=True)
+        chunks.append(roll)
+        if k1 >= K:
+            break
+        prev = st.detach(keep_c=True)
+        h, z, c = prev.h, prev.z, prev.c
+        k0 = k1
+    return torch.cat(chunks, dim=1)
 
 
 def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
                              act: torch.Tensor, cfg: TrainConfig
-                             ) -> torch.Tensor:
+                             ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """MIMO self-supervised per-INPUT isolation (2026-07-10).
 
     The DATA-DRIVEN generalisation of ``_wm_gain_match_loss`` for NONLINEAR /
     black-box plants with no identified gains.  ``obs``/``act`` come from an
-    ISOLATED-EXCITATION episode (ONE input swept with PRBS, all others held) so
+    isolated-input SETTLE episode (one input at a stratified level, others
+    at 0: MV is a whole-episode hold, DV is a t=0 step — follow-up 9) so
     the CV movement is driven by that single input.  From a strided set of
     posterior start states we roll the PRIOR forward ``K`` steps under the REAL
     action + DV sequence, decode each step, and match the predicted CV
@@ -4352,35 +8459,46 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     ``sample=False`` freezes the categorical at its argmax so the gradient flows
     into the CONTINUOUS gain channel + decoder + GRU, bypassing the categorical
     bottleneck that attenuates SUBDOMINANT inputs (the same routing C(1)
-    gain-match uses).  RSSM-only; ``0`` for other backbones / when off.
+    gain-match uses).  The K-step prior is ``img_rollout`` with TBPTT applied
+    between chunks (``h``-only ``keep_c``, never inside the SS window) — same
+    cuts as the old Python ``img_step`` loop.  RSSM-interface (rssm + tssm);
+    ``0`` for other backbones / when off.
+
+    Returns ``(loss, extras)``.  ``loss`` is trajectory MSE + optional SS-match.
+    Default is abs mean (P33 / P36 RCA).  Inverse-variance reweight was
+    removed (P34–P36 skip-storm; same class as P27 relative Huber).
+    ``extras`` splits the folded DC-gain term (``wm_ss_match_loss``) and
+    detached MV vs DV traj (``wm_isolation_mv_traj`` / ``_dv_traj``;
+    action-energy mask, no extra forward).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
+    empty: Dict[str, torch.Tensor] = {}
     coef = float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0)
     if coef <= 0.0:
-        return zero
-    if getattr(model, 'world_model_type', 'sf_transformer') != 'rssm':
-        return zero
+        return zero, empty
+    if not _is_rssm_interface(model):
+        return zero, empty
     rssm = model.dynamics
     if rssm.n_cv <= 0:
-        return zero
-    from models.dreamer_v4_rssm import RSSMState
+        return zero, empty
     B, T = obs.shape[:2]
     K = int(getattr(cfg, 'wm_input_isolation_len', 0) or 0)
     K = min(K, T - 1) if K > 0 else (T - 1)
     if K < 2:
-        return zero
+        return zero, empty
     n_valid = T - K
     if n_valid < 1:
-        return zero
+        return zero, empty
     # Frozen-observer encode → posterior features (mode); detached start states
-    # (like gain-match: the gradient trains the prior/decoder/cont-gain roll, not
-    # the encoder — the un-cheatable open-loop path).
+    # so the gradient trains the prior/decoder/cont-gain roll, not the encoder.
+    # Gain-match does NOT detach (P26 full-BPTT through the encoder).
     with torch.no_grad():
-        feats, *_ = rssm.rollout_observed(obs, act, sample=False)
+        feats, *_ = rssm.rollout_observed(
+            obs, act, sample=False, store_aux=False)
     feats = feats.detach()
     max_starts = max(1, int(getattr(cfg, 'gain_match_max_starts', 6) or 6))
     stride = max(1, n_valid // max_starts)
-    starts = torch.arange(0, n_valid, stride, device=obs.device)
+    starts, idx = _cached_time_gather_idx(cfg, n_valid, stride, K, obs.device)
     S = int(starts.numel())
     f0 = feats[:, starts]                                     # (B, S, F)
     Bm = B * S
@@ -4391,17 +8509,11 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     c0 = (f0[..., _ze:_ze + rssm.cont_dim].reshape(Bm, -1)
           if rssm.cont_dim > 0 else None)
     cv_idx = rssm.cv_index_t
-    k_off = torch.arange(1, K + 1, device=obs.device)
-    idx = starts.view(S, 1) + k_off.view(1, K)                # (S, K) time idx
     a_all = act[:, idx].reshape(Bm, K, -1)                     # (Bm, K, A)
-    dv_all = (obs[:, idx].index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
+    obs_win = obs[:, idx]
+    dv_all = (obs_win.index_select(-1, rssm.dv_index_t).reshape(Bm, K, -1)
               if getattr(rssm, 'dv_dim', 0) > 0 else None)
-    cv_real = obs[:, idx].index_select(-1, cv_idx).reshape(Bm, K, -1).detach()
-    st = RSSMState(
-        h=h0.clone(),
-        z_logits=torch.zeros(Bm, rssm.n_categoricals, rssm.n_classes,
-                             device=obs.device, dtype=f0.dtype),
-        z=z0.clone(), c=(c0.clone() if c0 is not None else None))
+    cv_real = obs_win.index_select(-1, cv_idx).reshape(Bm, K, -1).detach()
     # Self-supervised STEADY-STATE (DC-gain) match: accumulate the terminal
     # settled window so we can match MEAN(pred) vs MEAN(real) — timing-insensitive
     # → pins the DC gain the transient-dominated per-step MSE under-shoots.
@@ -4409,39 +8521,95 @@ def _wm_input_isolation_loss(model: DreamerV4, obs: torch.Tensor,
     w_frac = float(getattr(cfg, 'wm_ss_match_window_frac', 0.34) or 0.34)
     ss_var = float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0)
     ss_k0 = K - max(1, int(round(min(max(w_frac, 0.05), 0.9) * K)))
-    total = zero
-    cv_pred_win = []
-    _tbptt = int(os.environ.get('DREAMER_AUX_TBPTT_STEPS', '16') or 0)
-    for k in range(K):
-        dvk = dv_all[:, k] if dv_all is not None else None
-        st = rssm.img_step(st, a_all[:, k], dv=dvk, sample=False)
-        cv_pred = rssm.decode(st.feat).index_select(-1, cv_idx)   # (Bm, n_cv)
-        total = total + (cv_pred - cv_real[:, k]).pow(2).mean()
-        if ss_coef > 0.0 and k >= ss_k0:
-            cv_pred_win.append(cv_pred)
-        # Truncated BPTT (p24 RCA): bound the gradient path so the marginally-
-        # stable gain≈1.0 recurrence can't explode over the full K-step roll.
-        if (_tbptt > 0 and k < K - 1 and (k + 1) % _tbptt == 0
-                and hasattr(st, 'detach')):
-            st = st.detach()
-    out = coef * (total / float(K))
-    if ss_coef > 0.0 and cv_pred_win:
-        pred_ss = torch.stack(cv_pred_win, dim=1).mean(dim=1)     # (Bm, n_cv)
-        real_win = cv_real[:, ss_k0:ss_k0 + len(cv_pred_win)]     # (Bm, W, n_cv)
+    _tbptt = int(getattr(cfg, 'aux_tbptt_steps', 16) or 0)
+    # Truncated BPTT (p24/p25 RCA): bound GRU ``h``, NEVER cut ``c``, NEVER
+    # cut inside the settled SS-match window.  Chunked ``img_rollout`` (same
+    # cuts) so compile-on fuses each chunk; eager img_step count unchanged.
+    roll_feats = _rssm_tbptt_img_rollout(
+        rssm, h0.clone(), z0.clone(), a_all, dv_all,
+        (c0.clone() if c0 is not None else None),
+        sample=False, tbptt_steps=_tbptt,
+        ss_k0=(ss_k0 if ss_coef > 0.0 else None))
+    # One decode of (Bm, K, F).  Pointwise MLP ⇒ same as K per-step
+    # decodes; mean_{Bm,K,CV} MSE ≡ mean_k mean_{Bm,CV} of the old loop.
+    # TBPTT still detaches ``h`` between chunks (feats keep their graphs).
+    cv_pred = rssm.decode(roll_feats).index_select(
+        -1, cv_idx)                                               # (Bm, K, n_cv)
+    err_b = (cv_pred - cv_real).pow(2).mean(dim=(1, 2))            # (Bm,)
+    extras: Dict[str, torch.Tensor] = {}
+    traj = coef * err_b.mean()
+    extras['wm_isolation_traj_loss'] = traj.detach()
+    # Detached MV vs DV split (no extra forward, no CUDA .any() sync).
+    # Isolation settle is mixed 50/50 on test_sim.  Action energy >0 ⇒
+    # isolated-MV hold.  Empty group → 0 (clamp_min on a zero count).
+    is_mv_bm = (_isolation_seq_is_mv(act).unsqueeze(1).expand(B, S)
+                .reshape(Bm))
+    mv_w = is_mv_bm.to(dtype=err_b.dtype)
+    dv_w = 1.0 - mv_w
+    extras['wm_isolation_mv_frac'] = mv_w.mean().detach()
+    extras['wm_isolation_mv_traj'] = (
+        coef * (err_b * mv_w).sum() / mv_w.sum().clamp_min(1.0)).detach()
+    extras['wm_isolation_dv_traj'] = (
+        coef * (err_b * dv_w).sum() / dv_w.sum().clamp_min(1.0)).detach()
+    out = traj
+    if ss_coef > 0.0 and ss_k0 < K:
+        pred_ss = cv_pred[:, ss_k0:].mean(dim=1)                  # (Bm, n_cv)
+        real_win = cv_real[:, ss_k0:]                             # (Bm, W, n_cv)
         ss_err = (pred_ss - real_win.mean(dim=1)).pow(2)         # (Bm, n_cv)
+        w_settle = None
         if ss_var > 0.0:
             # Option 1: only SETTLED sequences carry a DC-gain signal — weight by
             # exp(-Var(real CV window)/ss_var) so transient (PRBS) episodes don't
             # dilute the per-input steady-state match (undiluted, symmetric).
-            w = torch.exp(-real_win.var(dim=1) / ss_var)
-            ss = (ss_err * w).sum() / w.sum().clamp_min(1e-6)
+            w_settle = torch.exp(-real_win.var(dim=1) / ss_var)
+            extras['wm_ss_match_wmean'] = w_settle.mean().detach()
+        if w_settle is not None:
+            ss = (ss_err * w_settle).sum() / w_settle.sum().clamp_min(1e-6)
         else:
             ss = ss_err.mean()
-        out = out + coef * ss_coef * ss
-    return out
+        ss_term = coef * ss_coef * ss
+        extras['wm_ss_match_loss'] = ss_term.detach()
+        out = traj + ss_term
+    return out, extras
 
 
-def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
+def _auto_gain_match_settle_len(cfg: TrainConfig) -> int:
+    """Promote explicit ``0`` to ``horizon`` (control H).  ``<0`` stays off.
+
+    P44 env-free auto=H storm **2/2 @iter 66** (G_pred≈0, CAPPED 0.76@DV)
+    → default is ``-1`` (P43 FD-from-posterior).  ``DREAMER_GAIN_MATCH_SETTLE_LEN=0``
+    still means auto H.  The TM probe defaults to ``wm_tf_horizon(H)``
+    (test_sim 220).  P67 teacher FD K auto=4H CAPPED 0.80@DV → REVERT
+    to control H. Matching 4H *settle* is still not a retry of S=H.
+    Do not use ``or 0`` — that would treat ``-1`` as auto.  Mutates
+    ``cfg.gain_match_settle_len`` only when it was 0.
+    """
+    s = int(getattr(cfg, 'gain_match_settle_len', 0))
+    if s == 0:
+        s = int(getattr(cfg, 'horizon', 15) or 15)
+        cfg.gain_match_settle_len = s
+    return s
+
+
+def _auto_gain_match_len(cfg: TrainConfig) -> int:
+    """Sentinel ``<=0`` → control ``horizon`` (P26–P66 / P67 REVERT).
+
+    P67 auto = ``wm_tf_horizon`` (test_sim 220) CAPPED GAIN_NOT_READY
+    **0.80@DV** (gates 82/94/104). jsonl teacher ×1 at K=220 did not
+    pin live TM DC (P64 at K=H PASS **0.91@DV**). Extra-P1 overshot
+    MV (1.25/@H 1.39). Not P44 S=H. Explicit
+    ``DREAMER_GAIN_MATCH_LEN=220`` A/B's 4H. Mutates
+    ``cfg.gain_match_len``.
+    """
+    k = int(getattr(cfg, 'gain_match_len', 0) or 0)
+    if k > 0:
+        return k
+    cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
+    return int(cfg.gain_match_len)
+
+
+def _resolve_gain_match_targets(
+        env: 'APCEnv', cfg: TrainConfig, *, log_label: str = 'targets') -> None:
     """C(1): convert the identified steady-state gains (engineering units) into
     the WM's NORMALIZED units and store them on ``cfg`` for the gain-match loss.
 
@@ -4524,6 +8692,17 @@ def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
             for j, cvn in enumerate(cv_names)))
     cfg.gain_match_mv_target = tuple(mv_target)
     cfg.gain_match_dv_target = tuple(dv_target)
+    _per = bool(getattr(cfg, 'gain_match_huber_per_input', False))
+    # ``gain_match_huber_beta <= 0`` → median |target| (sim-adaptive).
+    # Only when per-input β is off: median of {2.62, 0.51} ≈ 1.56 ≈
+    # scalar β=1 and does not equalize.  Per-input uses |tgt_ij|.
+    if ((not _per)
+            and float(getattr(cfg, 'gain_match_huber_beta', 1.0) or 0.0)
+            <= 0.0):
+        _abs = [abs(x) for row in list(mv_target) + list(dv_target)
+                for x in row if abs(float(x)) > 1e-9]
+        cfg.gain_match_huber_beta = (
+            float(np.median(_abs)) if _abs else 1.0)
     # Respect an EXPLICIT disable (e.g. DREAMER_GAIN_MATCH_COEF=0 on a NONLINEAR
     # plant, where a single identified gain is wrong → rely on the self-supervised
     # wm_ss_match instead).  Only auto-enable when the coef was left at default.
@@ -4531,11 +8710,24 @@ def _resolve_gain_match_targets(env: 'APCEnv', cfg: TrainConfig) -> None:
     if ('gain_match_coef' not in _explicit
             and float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0) <= 0.0):
         cfg.gain_match_coef = 1.0
-    if int(getattr(cfg, 'gain_match_len', 0) or 0) <= 0:
-        cfg.gain_match_len = int(getattr(cfg, 'horizon', 15) or 15)
-    print(f'[gain-match] targets (WM-norm) mv={cfg.gain_match_mv_target} '
+    _auto_gain_match_len(cfg)
+    # 0 = auto TM settle (S=H).  Negative = off (P43 FD-from-posterior).
+    _auto_gain_match_settle_len(cfg)
+    _resolve_aux_tbptt_steps(cfg)
+    _resolve_gain_match_step(cfg)
+    _beta_mv = _gain_col_rms(cfg.gain_match_mv_target)
+    _beta_dv = _gain_col_rms(cfg.gain_match_dv_target)
+    print(f'[gain-match] {log_label} (WM-norm) mv={cfg.gain_match_mv_target} '
           f'dv={cfg.gain_match_dv_target} coef={cfg.gain_match_coef} '
-          f'len={cfg.gain_match_len}', flush=True)
+          f'len={cfg.gain_match_len} settle={cfg.gain_match_settle_len} '
+          f'step={cfg.gain_match_step:g} '
+          f'clip_realized={bool(getattr(cfg, "gain_match_clip_realized", True))} '
+          f'huber_beta={cfg.gain_match_huber_beta} '
+          f'huber_per_input={_per} '
+          f'huber_beta_mv={["%.3g" % x for x in _beta_mv]} '
+          f'huber_beta_dv={["%.3g" % x for x in _beta_dv]} '
+          f'aux_tbptt={cfg.aux_tbptt_steps}',
+          flush=True)
 
 
 def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
@@ -4556,16 +8748,30 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     rssm = model.dynamics
     feats, post_logits, prior_logits, _last, ds, cont = rssm.rollout_observed(
         obs_cur, act, sample=True)               # feats (B,T,F); ds (B,T,n_cv)|None
+    # P28 follow-up 14: open-loop aux (overshoot / held / gain-match /
+    # 1-step steady) start from posterior MEAN c.  sample=True packed the
+    # reparameterized sample into feat; recon still uses that sample.
+    _c_mean = (cont.get('post_mean') if cont is not None else None)
     recon = rssm.decode(feats)                    # (B, T, obs_dim) = g(feat)
     # DOB (neural Kalman filter): add the disturbance estimate d_t into the CV
     # channels so the recon target the decoder/dynamics ``g`` must fit becomes
     # ``obs - d_t`` — i.e. g learns the CLEAN input->CV response and d_t absorbs
     # the unmeasured load (de-confounds the omitted-variable gain attenuation).
+    # Stage-1 (``dob_active=False``) forces ``d_t≡0`` — skip the clone+add and
+    # the ground/reg terms (constant MSE of zeros vs load; no gradient).
     dob_on = bool(getattr(rssm, 'dob_enabled', False)) and ds is not None
-    if dob_on:
+    dob_live = dob_on and bool(getattr(rssm, 'dob_active', True))
+    if dob_live:
         recon = rssm.apply_dob(recon, ds)
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
-    latent_type = str(getattr(cfg, 'rssm_latent_type', 'categorical')).lower()
+    # P81/P82 prior-recon family REVERT (P82 EXIT): obs-space
+    # ``decode(prior)`` (live or stop-grad decoder) FALSIFIED as TM
+    # (P81 val MV ×0.768, P82 ×0.779 vs P79 ×0.923), did not keep the
+    # 1-step pin (P82 DV post→1step ×0.958 vs P81 ×0.966), and hurt
+    # DOB amp / actor econ. P2 Kalman still batched-decodes prior for ν.
+    # jsonl ``wm_prior_recon_loss`` stays 0 so old parsers do not None.
+    prior_recon_loss = torch.zeros((), device=feats.device)
+    latent_type = str(getattr(cfg, 'rssm_latent_type', 'deterministic')).lower()
     joint_embed_loss = torch.zeros((), device=feats.device)
     if latent_type == 'deterministic':
         # Deterministic continuous latent: NO variational KL — prior/posterior
@@ -4576,21 +8782,25 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         kl_diag = {}
         joint_embed_loss = rssm_joint_embed_loss(post_logits, prior_logits)
         je_coef = float(getattr(cfg, 'rssm_joint_embed_coef', 1.0) or 0.0)
-        wm_total = cfg.recon_scale * recon_loss + je_coef * joint_embed_loss
+        wm_total = (cfg.recon_scale * recon_loss
+                    + je_coef * joint_embed_loss)
     else:
         kl_loss, kl_diag = rssm_kl_loss(
             post_logits, prior_logits,
             free_bits=float(getattr(cfg, 'rssm_free_bits', 1.0)),
             dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
             repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
-        wm_total = cfg.recon_scale * recon_loss + kl_loss
+        wm_total = (cfg.recon_scale * recon_loss
+                    + kl_loss)
     # ----- continuous-latent KL (gain + disturbance channels) -----
     # The Gaussian analogue of the categorical KL: trains the prior to ROLL the
     # gain (persist) + disturbance (OU) forward so imagination carries them.
     cont_kl = torch.zeros((), device=feats.device)
     cont_gain_persist = torch.zeros((), device=feats.device)
     dist_match_loss = torch.zeros((), device=feats.device)
-    if cont is not None:
+    ck_scale = float(getattr(cfg, 'cont_kl_scale', 1.0) or 0.0)
+    if (cont is not None and ck_scale > 0.0
+            and cont.get('post_mean') is not None):
         from models.dreamer_v4_rssm import rssm_cont_kl_loss
         cont_kl, _cont_kl_diag = rssm_cont_kl_loss(
             cont['post_mean'], cont['post_std'],
@@ -4598,7 +8808,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             free_bits=float(getattr(cfg, 'cont_free_bits', 0.5)),
             dyn_w=float(getattr(cfg, 'rssm_kl_dyn_w', 0.5)),
             repr_w=float(getattr(cfg, 'rssm_kl_repr_w', 0.1)))
-        wm_total = wm_total + float(getattr(cfg, 'cont_kl_scale', 1.0)) * cont_kl
+        wm_total = wm_total + ck_scale * cont_kl
         # Gain-channel persistence: the gain block (first cont_gain_dim dims) is
         # a per-episode CONSTANT → penalise its step-to-step drift so the channel
         # holds a stable gain (separates it from the time-varying disturbance).
@@ -4610,14 +8820,14 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
             wm_total = wm_total + gp_coef * cont_gain_persist
         # ----- C(2) disturbance-matching: supervise c_dist = true OU load -----
         # The SYMMETRIC analogue of C(1) gain-matching for the DISTURBANCE
-        # block.  p138 RCA (DECISIVE probe tools/_probe_disturbance_localize):
-        # the unmeasured load is OBSERVABLE (the prior-CV INNOVATION tracks the
-        # true OU at det_r~0.37 = the DOB residual) but the WM posterior NEVER
-        # WRITES it into the latent (held-out probe on the full [h,z,c]=0.027,
-        # c_dist=0.06) because nothing supervises it: under CLOSED-LOOP control
-        # the controlled CV hides the load so recon is satisfied by [h,z] alone
-        # and the stop-grad read-out head is passive.  So c_dist stays a FREE OU
-        # (std~2.3) the decoder uses to inject open-loop DRIFT (the over-gain).
+        # block.  p138 RCA: the unmeasured load is OBSERVABLE (the prior-CV
+        # INNOVATION tracks the true OU at det_r~0.37 = the DOB residual) but
+        # the WM posterior NEVER WRITES it into the latent (held-out probe on
+        # the full [h,z,c]=0.027, c_dist=0.06) because nothing supervises it:
+        # under CLOSED-LOOP control the controlled CV hides the load so recon
+        # is satisfied by [h,z] alone and the stop-grad read-out head is
+        # passive.  So c_dist stays a FREE OU (std~2.3) the decoder uses to
+        # inject open-loop DRIFT (the over-gain).
         # FIX: pin the posterior disturbance mean to the recorded true load
         # (known in training, in the same normalized-CV units the decoder
         # consumes) so the posterior LEARNS the innovation->load inference (the
@@ -4638,7 +8848,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 dt = dt[..., :n_dist]
                 dvar = dt.float().var().clamp_min(1e-4)
                 # supervise only when the load is actually present (var>0)
-                if float(dvar) > 1e-3:
+                if float(dvar) > _DIST_TARGET_VAR_GATE:
                     dist_match_loss = (F.mse_loss(c_dist.float(), dt.float())
                                        / dvar)
                     wm_total = wm_total + dm_coef * dist_match_loss
@@ -4648,7 +8858,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # CV movement with g (the inputs) whenever it can, using d_t only for the
     # slow unmeasured load.  ``dob_reg_coef=0`` disables the prior.
     dob_reg = torch.zeros((), device=feats.device)
-    if dob_on:
+    if dob_live:
         dob_reg = ds.float().pow(2).mean()
         wm_total = wm_total + float(getattr(cfg, 'dob_reg_coef', 0.0) or 0.0) * dob_reg
 
@@ -4663,17 +8873,62 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # target batch['dist'] is in ENGINEERING CV units and d_t is NORMALIZED, so
     # divide by the running CV obs-norm std (threaded on cfg as _cv_obs_std).
     dob_ground = torch.zeros((), device=feats.device)
+    dob_ground_keep_frac = torch.zeros((), device=feats.device)
     dgc = float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0)
-    if dob_on and dgc > 0.0 and dist_target is not None:
-        dtgt = dist_target.to(ds.dtype)
-        if dtgt.shape == ds.shape:
-            cvs = getattr(cfg, '_cv_obs_std', None)
-            if cvs is not None and len(cvs) == int(ds.shape[-1]):
-                cv_std_t = torch.tensor(list(cvs), device=ds.device,
-                                        dtype=ds.dtype).clamp_min(1e-6)
-                dtgt = dtgt / cv_std_t
-            dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
-            wm_total = wm_total + dgc * dob_ground
+    if dob_live and dgc > 0.0:
+        if dist_target is None:
+            if not getattr(cfg, '_dob_ground_missing_warned', False):
+                print('[dob-ground] WARNING: dob_ground_coef>0 but batch has '
+                      'no dist target — grounding is a silent no-op.  The '
+                      'replay buffer must store n_dist=n_cv whenever DOB '
+                      'grounding is on (P25 RCA: keyed off disturbance_head_dim '
+                      'which is forced 0 when DOB replaces the head).',
+                      flush=True)
+                cfg._dob_ground_missing_warned = True  # type: ignore[attr-defined]
+        else:
+            dtgt = dist_target.to(device=ds.device, dtype=ds.dtype)
+            # Broadcast a missing trailing CV dim (T,) → (T, n_cv) and drop
+            # extra channels so a plant with any n_cv cannot silently skip.
+            if dtgt.dim() == ds.dim() - 1:
+                dtgt = dtgt.unsqueeze(-1)
+            if dtgt.shape[:2] == ds.shape[:2] and dtgt.shape[-1] != ds.shape[-1]:
+                if dtgt.shape[-1] == 1 and ds.shape[-1] > 1:
+                    dtgt = dtgt.expand_as(ds)
+                elif dtgt.shape[-1] > ds.shape[-1]:
+                    dtgt = dtgt[..., :ds.shape[-1]]
+            if dtgt.shape == ds.shape:
+                cv_std_t = _cv_obs_std_tensor(cfg, ds)
+                if cv_std_t is not None:
+                    dtgt = dtgt / cv_std_t
+                # P66 EXIT: per-seq var-skip FALSIFIED as DOB-amp (Kalman
+                # |d| did not grow; val pred_std 0.252 vs P64 0.608).
+                # Mean MSE over all sequences (P64 identity).  Mixed
+                # ring KEEP (P65 flush REVERT).  Do not /dvar.
+                # P89: high-pass both sides with the val detrend window
+                # ``min(4H, T)`` so slow drift (feedback-rejectable) does
+                # not dominate the MSE that should train det_r / AC amp.
+                # jsonl ``dob_ground_keep_frac`` is 1.0 when this
+                # term fires (observability; no skip).
+                _hpw = _dob_ground_hp_window(cfg, int(ds.shape[1]))
+                if _hpw > 1:
+                    if not getattr(cfg, '_dob_ground_hp_logged', False):
+                        print(
+                            f'[dob-ground] high-pass MA w={_hpw} '
+                            f'(min(4H,T); val detrend; P89)',
+                            flush=True)
+                        cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
+                    ds_hp = _highpass_bt(ds, _hpw)
+                    dt_hp = _highpass_bt(dtgt, _hpw)
+                    dob_ground = (ds_hp - dt_hp).pow(2).mean()
+                else:
+                    dob_ground = (ds.float() - dtgt.float()).pow(2).mean()
+                dob_ground_keep_frac = torch.ones((), device=ds.device)
+                wm_total = wm_total + dgc * dob_ground
+            elif not getattr(cfg, '_dob_ground_shape_warned', False):
+                print(f'[dob-ground] WARNING: dist_target shape {tuple(dtgt.shape)} '
+                      f'!= d_t shape {tuple(ds.shape)} — grounding skipped.',
+                      flush=True)
+                cfg._dob_ground_shape_warned = True  # type: ignore[attr-defined]
 
     # ----- (b) held-action steady-state consistency (RSSM) -----
     # P89 consolidation: the multi-step held-action ROLLOUT stationarity loss
@@ -4689,7 +8944,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     steady_held_frac = 0.0
     if steady_coef > 0.0 and not _held_active:
         steady_loss, steady_diag = _rssm_steady_consistency(
-            model, feats, obs_cur, act, cfg)
+            model, feats, obs_cur, act, cfg, c_mean=_c_mean)
         steady_held_frac = float(steady_diag.get('wm_steady_held_frac', 0.0))
         wm_total = wm_total + steady_coef * steady_loss
 
@@ -4699,6 +8954,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # policy reads the same feature) and regularising it toward the smooth
     # slow-OU target.  Scaled by a soft WM-fidelity gate so a not-yet-
     # converged decoder is not destabilised early in P1.
+    # Always call (P79 graph).  Env-free head is None so the helper
+    # returns zeros; P82-live skip of the call FALSIFIED as P79
+    # identity (P83/P84 CAPPED; P82-pid still called it).
     dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
         model, feats, dist_target, recon_loss, cfg)
     wm_total = wm_total + dist_term
@@ -4709,16 +8967,29 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # drift properties.  p03 RCA (2026-07-09): the OVERSHOOT loss is the
     # OPEN-LOOP GAIN supervisor — gating it to every-other step slipped the MV
     # gain (5.7%→12.3% rel-err) and let the DV compound open-loop, so run
-    # OVERSHOOT EVERY step now (the compiled ``img_rollout`` keeps it cheap).
-    # The HELD-rollout (drift/stationarity, less gain-critical) stays
-    # every-other for the residual speedup.
+    # OVERSHOOT EVERY step now (``img_rollout`` is one K-loop; compile-on
+    # fuses it, eager still avoids per-start Python).  Isolation TBPTT is
+    # the same ``img_rollout`` in chunks (``h``-only ``keep_c``).  The
+    # HELD-rollout (decode-CV late−early, P62 KEEP / P63 magnitude REVERT)
+    # stays every-other.
+    # Gain-match (full-BPTT FD) batches baseline+per-input into the same
+    # ``img_rollout`` so MIMO width does not multiply sequential K-loops.
+    # P28 follow-up 11: skip when g is frozen (DOB curriculum P2).  Same
+    # reason as isolation extra unroll (follow-up 10): these K-step prior
+    # rolls train encoder/decoder/GRU/cont-gain, which ``set_world_model_
+    # trainable(g=False)`` has frozen.  Full-BPTT gain-match is the same
+    # family (and more expensive: baseline + one roll per input).  P2
+    # still pays for recon + DOB ground/reg (A,K).  Cadence counter
+    # still ticks so a later unfreeze keeps every-other held.
+    _g_live = _dynamics_g_trainable(model)
     _wm_aux_n = int(getattr(model, '_wm_aux_step', 0)) + 1
     model._wm_aux_step = _wm_aux_n
     _run_held = (_wm_aux_n % 2 == 0)
     overshoot_coef = float(getattr(cfg, 'wm_overshoot_coef', 0.0) or 0.0)
-    if overshoot_coef > 0.0:
+    if overshoot_coef > 0.0 and _g_live:
         overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
-            model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+            model, feats, obs_cur, act, cfg, recon_loss=recon_loss,
+            c_mean=_c_mean)
     else:
         overshoot_loss = torch.zeros((), device=feats.device)
         overshoot_starts = 0.0
@@ -4726,9 +8997,11 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
 
     # ----- (b2, P89) multi-step held-action rollout stationarity (RSSM) -----
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
-    if _run_held and held_coef > 0.0:
-        held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
-            model, feats, obs_cur, act, cfg, recon_loss=recon_loss)
+    held_diag: Dict[str, torch.Tensor] = {}
+    if _run_held and held_coef > 0.0 and _g_live:
+        held_loss, _held_starts, held_diag = _wm_held_rollout_stationarity_loss(
+            model, feats, obs_cur, act, cfg, recon_loss=recon_loss,
+            c_mean=_c_mean)
     else:
         held_loss = torch.zeros((), device=feats.device)
     wm_total = wm_total + held_coef * held_loss
@@ -4739,12 +9012,17 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # the subdominant DV gain the categorical attenuates (the continuous gain
     # channel gives the WM the un-quantized CAPACITY this loss grabs onto).
     gm_coef = float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0)
-    gain_match_loss, gain_match_diag = _wm_gain_match_loss(
-        model, feats, obs_cur, act, cfg)
+    if gm_coef > 0.0 and _g_live:
+        gain_match_loss, gain_match_diag = _wm_gain_match_loss(
+            model, feats, obs_cur, act, cfg, c_mean=_c_mean)
+    else:
+        gain_match_loss = torch.zeros((), device=feats.device)
+        gain_match_diag = {}
     wm_total = wm_total + gm_coef * gain_match_loss
 
     losses: Dict[str, torch.Tensor] = {
         'recon_loss': recon_loss,
+        'wm_prior_recon_loss': prior_recon_loss.detach(),
         'sf_loss': torch.zeros((), device=feats.device),  # N/A for RSSM
         'kl_loss': kl_loss,
         'wm_total': wm_total,
@@ -4758,33 +9036,42 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=feats.device),
         'wm_held_rollout_loss': held_loss.detach(),
+        'wm_held_rollout_scale': held_diag.get(
+            'wm_held_rollout_scale', torch.zeros((), device=feats.device)),
+        'wm_held_cv_drift': held_diag.get(
+            'wm_held_cv_drift', torch.zeros((), device=feats.device)),
         'cont_kl': cont_kl.detach(),
         'cont_gain_persist': cont_gain_persist.detach(),
         'gain_match_loss': gain_match_loss.detach(),
         'dist_match_loss': dist_match_loss.detach(),
         'dob_reg': dob_reg.detach(),
         'dob_ground': dob_ground.detach(),
-        'dob_d_absmean': (ds.abs().mean().detach() if dob_on
+        'dob_ground_keep_frac': dob_ground_keep_frac.detach(),
+        'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
     }
     losses.update(kl_diag)
     losses.update(gain_match_diag)
     # Encoder-quality diagnostics on the posterior stochastic features.
-    with torch.no_grad():
-        # Scope 2: stochastic block only (exclude any DOB d-tail).
-        _ze = rssm.deter_dim + rssm.stoch_flat_dim
-        z_flat = feats[..., rssm.deter_dim:_ze]
-        obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
-        z_var_per_dim = z_flat.float().var(dim=(0, 1))
-        losses['encoder_var_ratio'] = (z_var_per_dim.mean() / obs_var).detach()
-        s_var = z_var_per_dim.sum().clamp_min(1e-12)
-        s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
-        losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
-        losses['z_dim'] = torch.tensor(float(z_flat.shape[-1]),
-                                        device=feats.device)
-        v_max = z_var_per_dim.max().clamp_min(1e-12)
-        losses['z_alive_dims'] = (
-            (z_var_per_dim > 0.01 * v_max).float().sum().detach())
+    # jsonl uses the last inner of a logged iter; skip the rest (var over
+    # B=128,T=128,1024 every WM step).  Default True so probes / direct
+    # callers still get the keys.
+    if bool(getattr(cfg, '_wm_need_enc_diag', True)):
+        with torch.no_grad():
+            # Scope 2: stochastic block only (exclude any DOB d-tail).
+            _ze = rssm.deter_dim + rssm.stoch_flat_dim
+            z_flat = feats[..., rssm.deter_dim:_ze]
+            obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
+            z_var_per_dim = z_flat.float().var(dim=(0, 1))
+            losses['encoder_var_ratio'] = (z_var_per_dim.mean() / obs_var).detach()
+            s_var = z_var_per_dim.sum().clamp_min(1e-12)
+            s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
+            losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
+            losses['z_dim'] = torch.tensor(float(z_flat.shape[-1]),
+                                            device=feats.device)
+            v_max = z_var_per_dim.max().clamp_min(1e-12)
+            losses['z_alive_dims'] = (
+                (z_var_per_dim > 0.01 * v_max).float().sum().detach())
     # z_clean here = posterior stochastic features (detached).
     # Scope 2: stochastic block only (exclude any DOB d-tail).
     return losses, feats[..., rssm.deter_dim:rssm.deter_dim
@@ -4811,7 +9098,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # ===== RSSM world-model branch =====
     # neural-apc-mbrl: 'tssm' (transformer-SSM) shares the RSSM-interface path
     # (feat=[h,z_flat], rollout_observed/img_step/decode) so it routes here too.
-    if getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm'):
+    if _is_rssm_interface(model):
         return _rssm_world_model_loss(model, obs_cur, act, cfg,
                                       dist_target=batch.get('dist'))
 
@@ -4862,6 +9149,7 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # Same auxiliary supervised head as the RSSM path, reading the agent-
     # register hidden state ``agent_hid`` (the feature the BC/reward heads
     # use).  Recon proxy for the fidelity gate is the tokenizer recon loss.
+    # Always call (P79 graph).  Env-free head is None → zeros.
     dist_term, dist_loss, dist_rmse = _disturbance_head_loss(
         model, agent_hid, batch.get('dist'), recon_loss, cfg)
 
@@ -4878,9 +9166,9 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     overshoot_loss, overshoot_starts = _wm_latent_overshoot_loss(
         model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
 
-    # ----- (b2, P89) held-action rollout stationarity — RSSM-ONLY (SF no-op) --
+    # ----- (b2, P89/P62) held-action decode-CV late−early — RSSM-ONLY (SF no-op) --
     held_coef = float(getattr(cfg, 'wm_held_rollout_coef', 0.0) or 0.0)
-    held_loss, _held_starts = _wm_held_rollout_stationarity_loss(
+    held_loss, _held_starts, held_diag = _wm_held_rollout_stationarity_loss(
         model, z_clean, obs_cur, act, cfg, recon_loss=recon_loss)
 
     losses: Dict[str, torch.Tensor] = {
@@ -4898,6 +9186,10 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'wm_overshoot_starts': torch.tensor(float(overshoot_starts),
                                             device=device),
         'wm_held_rollout_loss': held_loss.detach(),
+        'wm_held_rollout_scale': held_diag.get(
+            'wm_held_rollout_scale', torch.zeros((), device=device)),
+        'wm_held_cv_drift': held_diag.get(
+            'wm_held_cv_drift', torch.zeros((), device=device)),
     }
     # Encoder-quality diagnostic (2026-05-06): ratio of latent variance
     # to observation variance.  An encoder that "throws away
@@ -4908,25 +9200,26 @@ def world_model_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     #   - var_ratio ≪ 0.1 → encoder is collapsing (low-rank latent)
     #   - var_ratio ≈ 0.5–2.0 → healthy bottleneck
     #   - var_ratio ≫ 5     → encoder is over-amplifying (rare)
-    with torch.no_grad():
-        obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
-        z_var_per_dim = z_clean.float().var(dim=(0, 1))           # (Z,)
-        z_var = z_var_per_dim.mean()
-        losses['encoder_var_ratio'] = (z_var / obs_var).detach()
-        # Latent participation ratio (effective rank) — codebook health.
-        # If a handful of z-dims carry all the variance, the latent has
-        # collapsed and the dynamics module cannot express plant modes.
-        # PR = (sum var)^2 / sum(var^2);  PR == Z means all dims equal;
-        # PR == 1 means a single dim dominates.
-        s_var = z_var_per_dim.sum().clamp_min(1e-12)
-        s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
-        losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
-        losses['z_dim'] = torch.tensor(float(z_clean.shape[-1]),
-                                          device=z_clean.device)
-        # Count "alive" dims: variance > 1% of max-dim variance.
-        v_max = z_var_per_dim.max().clamp_min(1e-12)
-        losses['z_alive_dims'] = (
-            (z_var_per_dim > 0.01 * v_max).float().sum().detach())
+    if bool(getattr(cfg, '_wm_need_enc_diag', True)):
+        with torch.no_grad():
+            obs_var = obs_cur.float().var(dim=(0, 1)).mean().clamp_min(1e-8)
+            z_var_per_dim = z_clean.float().var(dim=(0, 1))           # (Z,)
+            z_var = z_var_per_dim.mean()
+            losses['encoder_var_ratio'] = (z_var / obs_var).detach()
+            # Latent participation ratio (effective rank) — codebook health.
+            # If a handful of z-dims carry all the variance, the latent has
+            # collapsed and the dynamics module cannot express plant modes.
+            # PR = (sum var)^2 / sum(var^2);  PR == Z means all dims equal;
+            # PR == 1 means a single dim dominates.
+            s_var = z_var_per_dim.sum().clamp_min(1e-12)
+            s_var2 = (z_var_per_dim.pow(2)).sum().clamp_min(1e-12)
+            losses['z_eff_rank'] = (s_var * s_var / s_var2).detach()
+            losses['z_dim'] = torch.tensor(float(z_clean.shape[-1]),
+                                              device=z_clean.device)
+            # Count "alive" dims: variance > 1% of max-dim variance.
+            v_max = z_var_per_dim.max().clamp_min(1e-12)
+            losses['z_alive_dims'] = (
+                (z_var_per_dim > 0.01 * v_max).float().sum().detach())
     losses.update({k: v for k, v in sf_diag.items()})
     return losses, z_clean.detach(), agent_hid
 
@@ -4940,6 +9233,9 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     ``agent_hid[t]`` and predict the next ``L`` actions and rewards
     ``(a_{t+1..t+L}, r_{t+1..t+L})``. Per the paper this is implemented as
     one head with ``L`` parallel output projections (shared trunk).
+
+    Default BC is MSE-on-μ (``cfg.bc_mean_only``) so cloning does not
+    train log_std. ``DREAMER_BC_MEAN_ONLY=0`` restores Gaussian NLL.
     """
     act = batch['act']                       # (B, T, A)
     rew = batch['rew']                       # (B, T)
@@ -4980,7 +9276,22 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # it.  ``batch['expert'][t]`` flags transitions produced by the APC expert;
     # only those anchor the policy mean.  When no expert steps are present in a
     # batch the BC term is exactly zero (no gradient).
-    if L_mtp_eff < model.policy.mtp_length:
+    # ``batch['expert']`` is always present (TrajectoryBuffer.sample always
+    # emits the channel — zeros for non-expert episodes).  Align with
+    # context positions t (predicting a_{t+1..t+L}); denom>=1 keeps the
+    # term well-defined (and exactly zero) when a batch has no expert steps.
+    em = batch['expert'][:, :T_ctx].reshape(-1).to(dtype=feat.dtype)
+    denom = em.sum().clamp_min(1.0)
+    # Default MSE-on-μ (P50): same form as P3 ``expert_bc_p3_loss``.
+    # Gaussian NLL trains log_std onto the near-deterministic expert and
+    # pins σ_min before P3 (P45–P49). Discrete policies have no mean head.
+    mean_only = (bool(getattr(cfg, 'bc_mean_only', True))
+                 and hasattr(model.policy, 'mean_of_mtp'))
+    if mean_only:
+        det = model.policy.mean_of_mtp(feat, L=L_mtp_eff)
+        se = ((det - fut_act.to(dtype=det.dtype)) ** 2).mean(dim=(-1, -2))
+        bc_loss = (se * em).sum() / denom
+    elif L_mtp_eff < model.policy.mtp_length:
         # Pad target with zeros so we can use logits_mtp; mask out the pad in loss.
         pad_act = torch.zeros(B * T_ctx,
                                model.policy.mtp_length - L_mtp_eff, A,
@@ -4988,18 +9299,11 @@ def agent_finetune_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
         fut_act_full = torch.cat([fut_act, pad_act], dim=1)
         bc_lp_full = model.policy.log_prob_of_mtp(feat, fut_act_full)
         bc_lp_pos = bc_lp_full[:, :L_mtp_eff].mean(dim=1)          # (BT,)
+        bc_loss = -(bc_lp_pos * em).sum() / denom
     else:
         bc_lp = model.policy.log_prob_of_mtp(feat, fut_act)        # (BT, L)
         bc_lp_pos = bc_lp.mean(dim=1)                              # (BT,)
-
-    # ``batch['expert']`` is always present (TrajectoryBuffer.sample always
-    # emits the channel — zeros for non-expert episodes), so the mask is the
-    # single BC code path.  Align it with context positions t (predicting
-    # a_{t+1..t+L}) and clone ONLY expert-flagged steps; denom>=1 keeps the
-    # term well-defined (and exactly zero) when a batch has no expert steps.
-    em = batch['expert'][:, :T_ctx].reshape(-1).to(bc_lp_pos.dtype)  # (BT,)
-    denom = em.sum().clamp_min(1.0)
-    bc_loss = -(bc_lp_pos * em).sum() / denom
+        bc_loss = -(bc_lp_pos * em).sum() / denom
 
     # Reward MTP (twohot CE over L future rewards)
     rew_logits_all = model.reward.forward_mtp(feat)           # (BT, L, K)
@@ -5069,14 +9373,227 @@ def expert_bc_p3_loss(model: DreamerV4, batch: Dict[str, torch.Tensor],
     return bc_loss, em.sum()
 
 
+def _pearson_r(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Scalar Pearson r. Constant inputs → 0 (denom clamp). P3 diag only."""
+    x = a.reshape(-1).float()
+    y = b.reshape(-1).float()
+    x = x - x.mean()
+    y = y - y.mean()
+    den = (x.norm() * y.norm()).clamp_min(1e-8)
+    return (x * y).sum() / den
+
+
+def _adv_action_corr(adv_raw: torch.Tensor, act_flat: torch.Tensor
+                     ) -> torch.Tensor:
+    """Mean |corr(advantage, action_i)| over action channels.
+
+    Vectorized identity of the old per-channel Python loop (P3 diag only;
+    imagination actor is deleted).  Empty action dim → 0.
+    """
+    a = act_flat.float()
+    if a.shape[-1] == 0:
+        return torch.zeros((), device=adv_raw.device, dtype=torch.float32)
+    adv_c = (adv_raw.float() - adv_raw.float().mean()).reshape(-1, 1)
+    a_c = a - a.mean(dim=0, keepdim=True)
+    den = (adv_c.norm() * a_c.norm(dim=0)).clamp_min(1e-8)
+    return ((adv_c * a_c).sum(dim=0) / den).abs().mean()
+
+
+def _row_adv_action_corr(row: Dict):
+    """Real-sim |corr(adv, action)|.
+
+    New logs write ``adv_action_corr`` only.  ``imag_adv_action_corr`` is
+    still read from pre-P65 jsonl (imagination-era alias).
+    """
+    v = row.get('adv_action_corr')
+    if v is None:
+        v = row.get('imag_adv_action_corr')
+    return v
+
+
+def _p3_logp_clip_bound(clip: float, n_act: int) -> float:
+    """Per-action-dim nats → clamp on the summed Gaussian logp.
+
+    ``p3_logp_clip`` is unitless nats **per MV** (P52 1-MV test_sim
+    default 8 matches ``advantage_clip``). Summed ``log_prob_of``
+    scales with ``action_dim``; clamp the sum at ``clip * n_act`` so
+    MIMO has the same in-support / rail split as 1-MV. ``n_act<=1`` is
+    identity with ``logp.clamp(-clip, clip)``. ``clip<=0`` disables
+    (returns 0).
+    """
+    c = float(clip or 0.0)
+    if c <= 0.0:
+        return 0.0
+    return c * float(max(1, int(n_act)))
+
+
+def _gaussian_entropy_nats(log_std: float, n_act: int) -> float:
+    """Independent-Gaussian H = n_act · (log σ + ½ log(2πe))."""
+    unit_g = 0.5 * math.log(2.0 * math.pi * math.e)
+    return float(max(1, int(n_act))) * (float(log_std) + unit_g)
+
+
+def _entropy_collapse_threshold(
+        cfg: 'TrainConfig',
+        n_act: int,
+        reference_entropy: float,
+        ) -> Optional[float]:
+    """P3 entropy-collapse trip, or ``None`` to skip (no distinguishable band).
+
+    P53 RCA: with ``sigma_min_ratio=1.2``, a 0.20-nat floor *margin*
+    (never a TrainConfig field) was larger than the allowed σ band
+    (``log(1.2)≈0.182``), so H(σ_max)≈H(σ_init) sat *below* the trip
+    (P53 thr=−0.083, open-σ ent=−0.101). Frozen-σ P3 then died on
+    ``adv_corr<0.05`` while entropy was at the designed operating
+    point.
+
+    Continuous: trip at ``H(σ_min) + floor_frac · (H(σ_max)−H(σ_min))``
+    (unitless; default 0.25 = bottom quartile). Still ``min``'d with
+    the legacy ``frac · H(σ=1)`` so the band check only *loosens*.
+    Discrete: legacy ``frac · log(K)``. ``floor_frac<=0`` → legacy
+    only. Tiny σ-band (ratio≈1) → ``None`` (p3_plateau still runs).
+    """
+    frac = float(getattr(cfg, 'early_stop_entropy_collapse_frac', 0.20))
+    legacy = frac * float(reference_entropy)
+    ptype = str(getattr(cfg, 'policy_type', 'continuous') or '').lower()
+    if ptype != 'continuous':
+        return float(legacy)
+    n = max(1, int(n_act or 1))
+    h_min = _gaussian_entropy_nats(
+        float(getattr(cfg, 'policy_log_std_min', -2.3)), n)
+    h_max = _gaussian_entropy_nats(
+        float(getattr(cfg, 'policy_log_std_max', 0.0)), n)
+    gap = h_max - h_min
+    if gap <= 1e-6:
+        return None
+    floor_frac = float(getattr(
+        cfg, 'early_stop_entropy_collapse_floor_frac', 0.25) or 0.0)
+    if floor_frac <= 0.0:
+        return float(legacy)
+    floor_frac = min(float(floor_frac), 0.99)
+    band_thr = h_min + floor_frac * gap
+    return float(band_thr if band_thr < legacy else legacy)
+
+
+def _p3_policy_logp(policy, feat: torch.Tensor, act: torch.Tensor,
+                    stop_grad_log_std: bool) -> torch.Tensor:
+    """Gaussian ``log_prob_of`` honours stop-grad σ; discrete ignores it."""
+    if stop_grad_log_std and hasattr(policy, 'dist_params'):
+        return policy.log_prob_of(feat, act, stop_grad_log_std=True)
+    return policy.log_prob_of(feat, act)
+
+
+def _p3_policy_logp_and_entropy(policy, feat: torch.Tensor, act: torch.Tensor,
+                                stop_grad_log_std: bool
+                                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One policy MLP pass → ``(logp, entropy)`` when the head supports it."""
+    fn = getattr(policy, 'log_prob_and_entropy', None)
+    if callable(fn):
+        if stop_grad_log_std and hasattr(policy, 'dist_params'):
+            return fn(feat, act, stop_grad_log_std=True)
+        return fn(feat, act)
+    logp = _p3_policy_logp(policy, feat, act, stop_grad_log_std)
+    if stop_grad_log_std and hasattr(policy, 'dist_params'):
+        entropy = policy.entropy(feat, stop_grad_log_std=True)
+    else:
+        entropy = policy.entropy(feat)
+    return logp, entropy
+
+
+def _p3_copy_policy_snapshot(policy) -> torch.nn.Module:
+    """Detached deepcopy used as PPO ``logp_old``. Not a registered child."""
+    snap = copy.deepcopy(policy)
+    snap.eval()
+    for p in snap.parameters():
+        p.requires_grad_(False)
+    return snap
+
+
+def _p3_load_policy_snapshot(snap: torch.nn.Module, policy) -> None:
+    """In-place weight copy into an existing snapshot.
+
+    Identity vs a fresh deepcopy for ``logp_old``.  P55 N=1 used to
+    allocate a new module each collect; ``load_state_dict`` reuses the
+    first snapshot's storage.  Host-adaptive (no extra CUDA alloc).
+    Snapshot stays eval / frozen.
+    """
+    snap.load_state_dict(policy.state_dict())
+
+
+def _p3_frozen_unfreeze_policy(model, cfg=None) -> torch.nn.Module:
+    """Detached deepcopy of ``model.policy`` for PPO ``logp_old``.
+
+    Default N=0 / ``cfg is None`` (P53 freeze-forever): taken once
+    at the first AC call (P3-entry μ). Critic warmup does not
+    ``opt_actor.step``, so that first call is the unfreeze snapshot.
+
+    N>0 (P55 FALSIFIED N=1; slow recopy is A/B): recopy live μ at
+    the first AC call of every N P3 iters via
+    ``_p3_load_policy_snapshot`` (in-place; identity vs a fresh
+    deepcopy). Window = N × ``phase3_train_steps_per_iter`` inner
+    steps so an epoch holds ``logp_old`` across the inner SGD, not
+    per-step (per-step recopy ⇒ ratio≈1). Warmup AC calls recopy
+    the same frozen actor (identity); the first unfreeze epoch still
+    clips vs unfreeze-μ.
+
+    Stored in a list so ``nn.Module.__setattr__`` does not register it
+    as a child (would leak into ``state_dict`` / ``parameters()``).
+    Never lag-copied *inside* an AC step. Not same-forward
+    ``logp.detach()`` (that forces ratio≡1).
+    """
+    refresh = 0
+    inner = 1
+    if cfg is not None:
+        refresh = int(getattr(cfg, 'p3_mu_ratio_refresh_iters', 0) or 0)
+        inner = max(1, int(getattr(
+            cfg, 'phase3_train_steps_per_iter', 8) or 1))
+    hold = getattr(model, '_p3_mu_ratio_hold', None)
+    age = int(getattr(model, '_p3_mu_ratio_ac_calls', 0) or 0)
+    if hold is None:
+        model._p3_mu_ratio_hold = [_p3_copy_policy_snapshot(model.policy)]
+        model._p3_mu_ratio_ac_calls = 1
+        return model._p3_mu_ratio_hold[0]
+    period = refresh * inner
+    if refresh > 0 and age > 0 and period > 0 and (age % period) == 0:
+        _p3_load_policy_snapshot(model._p3_mu_ratio_hold[0], model.policy)
+    model._p3_mu_ratio_ac_calls = age + 1
+    return model._p3_mu_ratio_hold[0]
+
+
+def _p3_mu_ratio_surrogate(
+        logp: torch.Tensor, logp_old: torch.Tensor, adv: torch.Tensor,
+        eps: float,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """PPO clip vs a frozen snapshot. ``eps<=0`` is identity REINFORCE.
+
+    Returns ``(surr, ratio, clip_mask)`` with ``surr`` the per-sample
+    term whose mean is negated for the actor loss (same sign as
+    ``adv * logp`` when disabled). ``ratio`` / ``clip_mask`` are
+    detached diagnostics.
+    """
+    e = float(eps or 0.0)
+    if e <= 0.0:
+        ones = torch.ones_like(logp)
+        zeros = torch.zeros_like(logp)
+        return adv * logp, ones, zeros
+    log_ratio = (logp - logp_old).clamp(-20.0, 20.0)
+    ratio = torch.exp(log_ratio)
+    surr1 = ratio * adv
+    surr2 = ratio.clamp(1.0 - e, 1.0 + e) * adv
+    surr = torch.min(surr1, surr2)
+    clipped = (ratio < (1.0 - e)) | (ratio > (1.0 + e))
+    return surr, ratio.detach(), clipped.float().detach()
+
+
 # ---------------------------------------------------------------------------
-# Phase 3 — Imagination training (PMPO + TD-λ)
+# Phase 3 — real-sim actor-critic (REINFORCE + TD-λ)
 # ---------------------------------------------------------------------------
 
 def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                                 cfg: TrainConfig,
                                 critic_batch: Optional[Dict[str, torch.Tensor]] = None,
                                 expert_bc_weight: float = 0.0,
+                                freeze_return_scale: bool = False,
                                 ) -> Dict[str, torch.Tensor]:
     """Phase 3 (real-sim mode): actor-critic on REAL-environment λ-returns.
 
@@ -5113,32 +9630,37 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # sample=False = the posterior MODE (certainty-equivalent belief), which is
     # deterministic + reproducible so the critic value and the actor log-prob
     # are evaluated on the SAME belief the control acts on.
+    # When the critic replay window matches (B,T,D/A), cat the batch dim
+    # and run ONE teacher-forced unroll (rows are independent).
+    _fc = None
+    _fuse_cb = (
+        critic_batch is not None
+        and critic_batch['obs'].shape[1] == T
+        and critic_batch['obs'].shape[-1] == obs.shape[-1]
+        and critic_batch['act'].shape[-1] == act.shape[-1])
     with torch.no_grad():
-        feats, _pl, _prl, _last, _ds, _cont = rssm.rollout_observed(
-            obs, act, sample=False)                      # (B, T, F)
+        if _fuse_cb:
+            feats_all, *_ = rssm.rollout_observed(
+                torch.cat([obs, critic_batch['obs']], 0),
+                torch.cat([act, critic_batch['act']], 0),
+                sample=False, store_aux=False)
+            feats = feats_all[:B]
+            _fc = feats_all[B:]
+        else:
+            feats, *_ = rssm.rollout_observed(
+                obs, act, sample=False, store_aux=False)
     feats = feats.detach()
     feat_flat = feats.reshape(B * T, -1)
 
-    # ----- critic value (grad) + slow-target bootstrap value (frozen) -----
-    value_logits = model.value(feat_flat)                # (B*T, n_bins)
+    # ----- critic value (grad) + slow-target bootstrap (min-of-N, P27) -----
     with torch.no_grad():
-        v_slow = model.target_value.expectation(
-            model.target_value(feat_flat)).reshape(B, T)
+        v_slow = model.critic_min_v(feat_flat, target=True).reshape(B, T)
 
     # ----- λ-returns from REAL rewards (same TD-λ recursion as imagination) --
     gamma = float(cfg.gamma)
     lam = float(cfg.gae_lambda)
     _ret_cap = _adaptive_return_cap(cfg)
-    if _ret_cap is not None:
-        v_slow = v_slow.clamp(-_ret_cap, _ret_cap)
-    returns = torch.zeros_like(v_slow)
-    returns[:, -1] = v_slow[:, -1]
-    for t in reversed(range(T - 1)):
-        bootstrap = (1.0 - lam) * v_slow[:, t + 1] + lam * returns[:, t + 1]
-        returns[:, t] = rew[:, t] + gamma * bootstrap
-    target_returns = returns.detach()
-    if _ret_cap is not None:
-        target_returns = target_returns.clamp(-_ret_cap, _ret_cap)
+    target_returns = _lambda_returns(rew, v_slow, gamma, lam, _ret_cap)
 
     # ----- CRITIC loss (twohot CE): ON-POLICY (advantage accuracy) + replay -----
     # p06 RCA (2026-07-10): the p05 buffer-split trained the critic ONLY on the
@@ -5152,24 +9674,26 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # (diversity — prevents the p03 corner-starvation inversion).  A correct
     # advantage lets the actor LEARN that bang-bang control is bad (no move
     # penalty needed).  MC-grounding (``critic_mc_grounding_coef``) on BOTH.
+    # P26 RCA / P27: every ensemble head is trained on the SAME target; the
+    # BOOTSTRAP and ADVANTAGE use min-of-N (TD3) so a single optimistic head
+    # cannot inflate the λ-return / return_scale.
     _mc_coef = float(getattr(cfg, 'critic_mc_grounding_coef', 0.0) or 0.0)
+    mc_parts: List[torch.Tensor] = []
 
-    def _critic_ce(vl, vslow, rew_b, Tb, lam_ret):
-        """twohot-CE to the λ-return + optional PURE-MC (λ=1) grounding."""
-        loss = model.value.loss(vl, lam_ret.reshape(-1)).mean()
+    def _critic_pack(feat, vslow, rew_b, lam_ret):
+        """One online-ensemble forward: λ CE + optional MC CE + min-of-N V."""
+        rmc = None
         if _mc_coef > 0.0:
-            rmc = torch.zeros_like(vslow)
-            rmc[:, -1] = vslow[:, -1]
-            for _tt in reversed(range(Tb - 1)):
-                rmc[:, _tt] = rew_b[:, _tt] + gamma * rmc[:, _tt + 1]
-            rmc = rmc.detach()
-            if _ret_cap is not None:
-                rmc = rmc.clamp(-_ret_cap, _ret_cap)
-            loss = loss + _mc_coef * model.value.loss(vl, rmc.reshape(-1)).mean()
-        return loss
+            rmc = _lambda_returns(rew_b, vslow, gamma, 1.0, _ret_cap)
+        ce, v, mc = model.critic_online_ce_and_min_v(feat, lam_ret, rmc)
+        if mc is not None:
+            mc_parts.append(mc.detach())
+            ce = ce + _mc_coef * mc
+        return ce, v
 
     # (a) ON-POLICY term — the distribution the advantage is evaluated on.
-    critic_loss = _critic_ce(value_logits, v_slow, rew, T, target_returns)
+    critic_loss, v_pred_flat = _critic_pack(
+        feat_flat, v_slow, rew, target_returns)
 
     # P83 expert-BC anchor accumulator (wired below on the seed-buffer batch,
     # which retains expert-flagged steps via the every-20-iter P3 expert inject).
@@ -5178,46 +9702,39 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # (b) DIVERSE replay term — anti-starvation diversity (skipped if no split).
     if critic_batch is not None:
-        with torch.no_grad():
-            _fc, _cpl, _cprl, _clast, _cds, _ccont = rssm.rollout_observed(
-                critic_batch['obs'], critic_batch['act'], sample=False)
+        if _fc is None:
+            with torch.no_grad():
+                _fc, *_ = rssm.rollout_observed(
+                    critic_batch['obs'], critic_batch['act'],
+                    sample=False, store_aux=False)
         Bc, Tc = critic_batch['obs'].shape[:2]
         feat_c = _fc.detach().reshape(Bc * Tc, -1)
         rew_c = critic_batch['rew'].float()
         with torch.no_grad():
-            v_slow_c = model.target_value.expectation(
-                model.target_value(feat_c)).reshape(Bc, Tc)
-            if _ret_cap is not None:
-                v_slow_c = v_slow_c.clamp(-_ret_cap, _ret_cap)
-        value_logits_c = model.value(feat_c)
-        ret_c = torch.zeros_like(v_slow_c)
-        ret_c[:, -1] = v_slow_c[:, -1]
-        for _tc in reversed(range(Tc - 1)):
-            _bc = (1.0 - lam) * v_slow_c[:, _tc + 1] + lam * ret_c[:, _tc + 1]
-            ret_c[:, _tc] = rew_c[:, _tc] + gamma * _bc
-        ret_c = ret_c.detach()
-        if _ret_cap is not None:
-            ret_c = ret_c.clamp(-_ret_cap, _ret_cap)
-        critic_loss = critic_loss + _critic_ce(
-            value_logits_c, v_slow_c, rew_c, Tc, ret_c)
-        # P83 FIX (p19 RCA, 2026-08-19): re-wire the P3 expert-BC anchor — it was
-        # DEAD CODE (expert_bc_p3_loss defined + unit-tested but NEVER called),
-        # so the P3 actor had NO anchor and diverged off the good BC-seeded
-        # policy once the critic advantage went noisy (return_scale runaway ->
-        # econ collapse worse than the open-loop baseline).  MSE-on-μ over the
-        # expert-flagged steps in the seed batch; grad reaches ONLY the policy
-        # (feat is detached inside expert_bc_p3_loss).
+            v_slow_c = model.critic_min_v(feat_c, target=True).reshape(Bc, Tc)
+        ret_c = _lambda_returns(rew_c, v_slow_c, gamma, lam, _ret_cap)
+        _ce_c, _ = _critic_pack(feat_c, v_slow_c, rew_c, ret_c)
+        critic_loss = critic_loss + _ce_c
+        # P83: P3 expert-BC is MSE-on-μ (does not fight σ). Grad reaches
+        # ONLY the policy (feat is detached inside expert_bc_p3_loss).
+        # P1/P2 ``agent_finetune_loss`` uses the same form when
+        # ``bc_mean_only`` (default).
         if expert_bc_weight > 0.0:
             bc_loss_p3, _n_exp = expert_bc_p3_loss(model, critic_batch, _fc)
             bc_term = expert_bc_weight * bc_loss_p3
 
     # ----- advantage + percentile return-scale normalisation — REUSED -----
+    # P26 RCA / P27: advantage baseline is min-of-N (same as the λ bootstrap)
+    # so an optimistic head cannot inflate A.  Freeze the EMA after warmup.
+    # ``v_pred`` is the online min-of-N from the CE logits (same MLP as
+    # ``critic_min_v(target=False)``; expectation is already ``no_grad``).
     with torch.no_grad():
-        v_pred = model.value.expectation(value_logits).reshape(B, T)
+        v_pred = v_pred_flat.reshape(B, T)
         adv_raw = target_returns - v_pred
         scale = model.update_return_scale(
             target_returns,
             abs_cap=float(getattr(cfg, 'return_scale_abs_cap', 500.0)),
+            freeze=bool(freeze_return_scale),
         ).clamp_min(1.0)
     adv_flat = (adv_raw / scale).reshape(-1)
     _adv_clip = float(getattr(cfg, 'advantage_clip', 0.0) or 0.0)
@@ -5227,39 +9744,77 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # ----- actor loss: REINFORCE on the TAKEN real action + entropy bonus -----
     act_flat = act.reshape(B * T, -1)
-    logp = model.policy.log_prob_of(feat_flat, act_flat)     # (B*T,)
-    entropy = model.policy.entropy(feat_flat)                # (B*T,)
+    # P50 EXIT / P51: stop-grad log_std so REINFORCE cannot yank σ
+    # (P50 unfreeze 169: ent −0.107→−0.268). Discrete heads have no
+    # ``dist_params`` and ignore the flag.
+    _sg_logstd = bool(getattr(cfg, 'p3_stop_grad_log_std', True))
+    logp, entropy = _p3_policy_logp_and_entropy(
+        model.policy, feat_flat, act_flat, _sg_logstd)
     ent_coef = float(getattr(cfg, 'pmpo_entropy_coef', 3e-4))
-    actor_loss = -(adv_flat * logp).mean() - ent_coef * entropy.mean() + bc_term
+    # P51 EXIT / P52: clamp REINFORCE logp so frozen-σ (u−μ)/σ² cannot
+    # explode μ (P51 147: logp mean −26 / std 38; @315 mean −227).
+    # Bound is per-action-dim nats × n_mv (1-MV identity). Diagnostics
+    # below keep the unclipped logp so a remaining rail is still
+    # visible. 0 disables (P51 unclipped).
+    _logp_clip = _p3_logp_clip_bound(
+        float(getattr(cfg, 'p3_logp_clip', 8.0) or 0.0),
+        int(act_flat.shape[-1]))
+    logp_pg = logp.clamp(-_logp_clip, _logp_clip) if _logp_clip > 0.0 else logp
+    # P52 EXIT / P53: in-support (|logp|<8) SGD still walks μ. PPO
+    # clip vs a frozen unfreeze snapshot zeros the PG once ratio is
+    # outside [1−ε, 1+ε]. ε≤0 keeps ``-(adv * logp_pg)``.
+    _mu_eps = float(getattr(cfg, 'p3_mu_ratio_clip', 0.2) or 0.0)
+    if _mu_eps > 0.0:
+        old_pol = _p3_frozen_unfreeze_policy(model, cfg)
+        with torch.no_grad():
+            logp_old = _p3_policy_logp(
+                old_pol, feat_flat, act_flat, _sg_logstd)
+            if _logp_clip > 0.0:
+                logp_old = logp_old.clamp(-_logp_clip, _logp_clip)
+        surr, ratio, clip_mask = _p3_mu_ratio_surrogate(
+            logp_pg, logp_old, adv_flat, _mu_eps)
+        actor_pg = -surr.mean()
+        _ratio_mean = ratio.mean()
+        _ratio_clip_frac = clip_mask.mean()
+    else:
+        actor_pg = -(adv_flat * logp_pg).mean()
+        _ratio_mean = torch.ones((), device=device)
+        _ratio_clip_frac = torch.zeros((), device=device)
+    actor_loss = actor_pg - ent_coef * entropy.mean() + bc_term
 
-    # ----- diagnostics (mirror the imagination keys the P3 logger reads) -----
+    # ----- diagnostics (real-sim; leftover imag/PMPO jsonl keys kept as aliases) -----
     with torch.no_grad():
         rew_var = rew.var().clamp_min(1e-8)
         tgt_var = target_returns.float().var().clamp_min(1e-8)
-        _adv_c = (adv_raw.float() - adv_raw.float().mean()).reshape(-1)
-        _corr = []
-        for _ai in range(act_flat.shape[-1]):
-            _a = act_flat[:, _ai].float()
-            _a_c = _a - _a.mean()
-            _den = (_adv_c.norm() * _a_c.norm()).clamp_min(1e-8)
-            _corr.append(((_adv_c * _a_c).sum() / _den).abs())
-        adv_action_corr = (torch.stack(_corr).mean()
-                           if _corr else torch.zeros((), device=device))
+        adv_action_corr = _adv_action_corr(adv_raw, act_flat)
+        pred_target_r = _pearson_r(v_pred, target_returns)
+        target_v_r = _pearson_r(target_returns, v_slow)
+        if mc_parts:
+            critic_mc_loss = mc_parts[0]
+            for _mc in mc_parts[1:]:
+                critic_mc_loss = critic_mc_loss + _mc
+        else:
+            critic_mc_loss = torch.zeros((), device=device)
+        pos_adv_frac = (adv_flat >= 0).float().mean()
     return {
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
         'entropy_mean': entropy.mean().detach(),
         'realsim_return_mean': target_returns.mean().detach(),
-        'imagined_return_mean': target_returns.mean().detach(),
         'realsim_reward_mean': rew.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
         'adv_global_std': adv_raw.std().detach(),
         'return_scale': scale.detach().squeeze(),
         'critic_rew_to_tgt_var': (rew_var / tgt_var).clamp_max(10.0).detach(),
-        'imag_adv_action_corr': adv_action_corr.detach(),
+        'critic_pred_target_r': pred_target_r.detach(),
+        'critic_target_v_r': target_v_r.detach(),
+        'critic_mc_loss': critic_mc_loss.detach(),
+        'adv_action_corr': adv_action_corr.detach(),
         'actor_logp_mean': logp.mean().detach(),
         'actor_logp_std': logp.std().detach(),
-        'pmpo_pos_frac': (adv_flat >= 0).float().mean().detach(),
+        'actor_ratio_mean': _ratio_mean.detach(),
+        'actor_ratio_clip_frac': _ratio_clip_frac.detach(),
+        'actor_pos_adv_frac': pos_adv_frac.detach(),
         'bc_loss': bc_loss_p3.detach(),
         'expert_bc_weight': torch.tensor(float(expert_bc_weight), device=device),
     }
@@ -5270,69 +9825,16 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 # ---------------------------------------------------------------------------
 
 def build_model(cfg: TrainConfig) -> DreamerV4:
-    model_cfg = DreamerV4Config(
-        obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
-        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
-        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
-        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
-        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
-        attn_impl=cfg.attn_impl,
-        n_action_bins=cfg.n_action_bins,
-        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
-        mtp_length=max(1, int(cfg.mtp_length)),
-        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
-        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
-        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
-        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
-        world_model_type=str(getattr(cfg, 'world_model_type', 'rssm')),
-        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
-        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
-        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
-        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
-        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
-        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-        rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
-        rssm_latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
-        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
-        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
-        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
-        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
-        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
-        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
-        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
-        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
-        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
-        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
-        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
-        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
-        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
-        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
-        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
-        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
-        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
-        cont_dist_deterministic_roll=bool(getattr(
-            cfg, 'cont_dist_deterministic_roll', True)),
-        cont_gain_deterministic_roll=bool(getattr(
-            cfg, 'cont_gain_deterministic_roll', True)),
-    )
-    model = DreamerV4(model_cfg)
-    # torch.compile — DEFAULT ON (2026-06-05).  Compiles the WM hot paths
-    # (RSSM rollout_observed + img_step; transformer dynamics + tokenizer);
-    # ``maybe_compile`` falls back to eager on any failure.  Precedence:
-    # ``cfg.compile_mode`` (``DREAMER_COMPILE_MODE``) > ``DREAMER_COMPILE`` env
-    # > default-on.  Disable with ``DREAMER_COMPILE=0`` / ``off`` / ``false``.
-    cm = (cfg.compile_mode or '').strip()
-    if cm.lower() in ('0', 'off', 'false', 'none', 'no'):
-        cm = ''                                   # explicit cfg/env-mode disable
-    elif not cm:
-        env_cm = os.environ.get('DREAMER_COMPILE', '').strip().lower()
-        if env_cm in ('0', 'off', 'false', 'no'):
-            cm = ''                               # explicitly disabled
-        elif env_cm and env_cm not in ('1', 'true', 'yes'):
-            cm = env_cm                           # explicit mode string
-        else:
-            cm = 'default'                        # DEFAULT ON (unset / 1 / true)
+    model = DreamerV4(dreamer_v4_config_from_train(cfg))
+    # torch.compile — DEFAULT OFF (P29 RCA).  TrainConfig ``compile_mode=''``
+    # is eager; a 2026-06-05 leftover treated empty as default-on unless
+    # ``DREAMER_COMPILE=0``, so env-free P29 compiled while P26/P28 (observer
+    # win) stayed eager.  Opt in: ``DREAMER_COMPILE=1`` /
+    # ``DREAMER_COMPILE_MODE=default``.  ``maybe_compile`` still falls back
+    # to eager on any failure.
+    cm = _resolve_compile_mode(cfg)
+    if cm and not str(getattr(cfg, 'compile_mode', '') or '').strip():
+        cfg.compile_mode = cm
     if cm:
         model.maybe_compile(mode=cm)
     return model
@@ -5360,7 +9862,7 @@ def _probe_wm_held_convergence(model, env, device, cfg: 'TrainConfig'):
     no-op there anyway).  Never fatal — any failure returns ``None`` and the
     score falls back to correlation-only.
     """
-    if getattr(model, 'world_model_type', 'sf_transformer') not in ('rssm', 'tssm'):
+    if not _is_rssm_interface(model):
         return None
     H = int(getattr(cfg, 'horizon', 15))
     if H < 8:
@@ -5396,7 +9898,7 @@ def _probe_wm_held_convergence(model, env, device, cfg: 'TrainConfig'):
         return None
     if got < L + H + 2:
         return None
-    eps_std = float(os.environ.get('DREAMER_WM_CONVERGE_EPS_STD', '0.05'))
+    eps_std = float(getattr(cfg, 'wm_converge_eps_std', 0.05) or 0.05)
     conv_flags: List[float] = []
     drifts: List[float] = []
     for i in range(n_starts):
@@ -5445,7 +9947,7 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     except Exception as e:
         print(f'[wm-fidelity-probe] import failed: {e!r}', flush=True)
         return None
-    r_floor = float(os.environ.get('DREAMER_HORIZON_R_FLOOR', '0.40'))
+    r_floor = float(getattr(cfg, 'horizon_r_floor', 0.40) or 0.40)
     r_floor = float(np.clip(r_floor, 0.0, 0.95))
     try:
         wm = _wm_kstep_rollout(model, env, device,
@@ -5522,8 +10024,7 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     # P89: held-action convergence companion (anti-drift) so the wm_best score
     # is not blind to imagination drift (the r-terms above are scale-invariant).
     # Gated (DREAMER_WM_FIDELITY_CONV_PROBE), RSSM-only, never fatal.
-    if os.environ.get('DREAMER_WM_FIDELITY_CONV_PROBE',
-                       '1').lower() not in ('0', 'off', 'false', 'no'):
+    if _cfg_on(cfg, 'wm_fidelity_conv_probe', True):
         try:
             _conv = _probe_wm_held_convergence(model, env, device, cfg)
         except Exception as e:
@@ -5536,6 +10037,39 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
                 f"{summary} conv={_conv['wm_converge_frac']:.2f} "
                 f"drift={_conv['tail_drift_mean']:.3f}")
     return result
+
+
+def _format_gain_probe_line(probe: dict) -> str:
+    """Compact P1-gate line: ss + @H per input + unbiased/noise."""
+    pairs = probe.get('ss_pairs') or []
+    ath_map = {n: r for n, r in (probe.get('ath_pairs') or [])}
+    bits = []
+    for n, r in pairs:
+        s = f'{n}={r:.2f}'
+        if n in ath_map:
+            s += f'/@H={ath_map[n]:.2f}'
+        bits.append(s)
+    pair_s = ' '.join(bits)
+    extra = (f" unbiased={bool(probe.get('unbiased'))}"
+             f" not_noisy={bool(probe.get('not_noisy'))}")
+    if probe.get('probed_last_ok'):
+        extra += f" last_ok_iter={probe.get('last_ok_iter')}"
+    if pair_s:
+        extra += f' pairs[{pair_s}]'
+    ath_lo, ath_hi = probe.get('atH_min'), probe.get('atH_max')
+    ath_s = ''
+    if ath_lo is not None and ath_hi is not None:
+        ath_s = f" @H[{float(ath_lo):.2f},{float(ath_hi):.2f}]"
+    return (
+        f"ready={probe.get('gain_ready')} "
+        f"DCgain_ratio[{probe['r_min']:.2f},{probe['r_max']:.2f}]"
+        f"{ath_s} "
+        f"worst={probe['worst_ratio']:.2f}@{probe['worst_input']} "
+        f"band={probe['band']} | noise: "
+        f"spread_x{probe['noise_worst']:.1f} "
+        f"signflips={probe['sign_flips']} "
+        f"({probe['n_checks']} inputs){extra}"
+    )
 
 
 def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
@@ -5562,8 +10096,7 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     the REAL plant's OWN spread, so a genuinely curved plant is allowed while
     excess WM variance is flagged).  Returns a diag dict or ``None`` (never fatal).
     """
-    _wmt = getattr(model, 'world_model_type', 'sf_transformer')
-    if _wmt not in ('rssm', 'tssm'):
+    if not _is_rssm_interface(model):
         return None
     try:
         from evaluation.wm_transfer_matrix import (
@@ -5571,9 +10104,9 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     except Exception as e:
         print(f'[gain-ready-probe] import failed: {e!r}', flush=True)
         return None
-    band_lo = float(os.environ.get('DREAMER_GAIN_READY_LO', '0.80'))
-    band_hi = float(os.environ.get('DREAMER_GAIN_READY_HI', '1.30'))
-    n_levels = int(os.environ.get('DREAMER_GAIN_READY_LEVELS', '5'))
+    band_lo = float(getattr(cfg, 'gain_ready_lo', 0.80))
+    band_hi = float(getattr(cfg, 'gain_ready_hi', 1.30))
+    n_levels = int(getattr(cfg, 'gain_ready_levels', 5) or 5)
     _dprob = getattr(env, '_disturbance_prob_override', None)
     obs_std = None
     try:
@@ -5604,19 +10137,20 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
             pass
 
     ss_ratios: List[Tuple[str, float]] = []   # aggregate DC-gain ratio (HARD gate)
-    ath_ratios: List[float] = []              # at-horizon ratio (diagnostic)
+    ath_pairs: List[Tuple[str, float]] = []   # at-horizon ratio (diagnostic)
     noises: List[float] = []                  # per-pair WM/real gain-spread (diag)
     flips = 0                                 # WM open-loop gain sign flips (diag)
 
     def _collect(res, tag):
         nonlocal flips
         for key, P in (res.get('pairs', {}) or {}).items():
+            name = f'{tag} {key}'
             sr = P.get('ss_gain_ratio_wm_over_real')
             if sr is not None and np.isfinite(sr):
-                ss_ratios.append((f'{tag} {key}', float(sr)))
+                ss_ratios.append((name, float(sr)))
             ar = P.get('gain_ratio_at_h')
             if ar is not None and np.isfinite(ar):
-                ath_ratios.append(float(ar))
+                ath_pairs.append((name, float(ar)))
             wm_ss = list((P.get('wm') or {}).get('ss_per_curve') or [])
             real_ss = list((P.get('real') or {}).get('ss_per_curve') or [])
             real_mean = float(P.get('real_ss_gain', 0.0) or 0.0)
@@ -5633,8 +10167,8 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     if not ss_ratios:
         return None
     srs = [r for _, r in ss_ratios]
-    noise_max = float(os.environ.get('DREAMER_GAIN_READY_NOISE_MAX', '3.0'))
-    flip_max = int(os.environ.get('DREAMER_GAIN_READY_FLIP_MAX', '1'))
+    noise_max = float(getattr(cfg, 'gain_ready_noise_max', 3.0))
+    flip_max = int(getattr(cfg, 'gain_ready_flip_max', 1) or 1)
     worst_noise = float(max(noises)) if noises else 0.0
     # READY = UNBIASED (every MV+DV DC-gain ratio in band) AND NOT-NOISY (the
     # deterministic open-loop gain is consistent across operating points: its
@@ -5650,11 +10184,100 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
         'unbiased': bool(unbiased), 'not_noisy': bool(not_noisy),
         'r_min': float(min(srs)), 'r_max': float(max(srs)),
         'worst_ratio': float(worst_ratio), 'worst_input': worst_name,
-        'atH_min': float(min(ath_ratios)) if ath_ratios else None,
-        'atH_max': float(max(ath_ratios)) if ath_ratios else None,
+        'atH_min': float(min(r for _, r in ath_pairs)) if ath_pairs else None,
+        'atH_max': float(max(r for _, r in ath_pairs)) if ath_pairs else None,
+        'ath_pairs': [(str(n), float(r)) for n, r in ath_pairs],
         'noise_worst': worst_noise, 'sign_flips': int(flips),
         'n_checks': int(len(srs)), 'band': [band_lo, band_hi],
         'noise_max': noise_max,
+        'ss_pairs': [(str(n), float(r)) for n, r in ss_ratios],
+    }
+
+
+def _load_module_state(
+        model: torch.nn.Module,
+        sd: Dict[str, torch.Tensor],
+        device: torch.device,
+) -> None:
+    """Load an in-process snapshot (GPU or CPU-spilled) onto ``model``."""
+    model.load_state_dict({k: v.to(device) for k, v in sd.items()})
+
+
+def _probe_observer_gain_ready_maybe_last_ok(
+        model, env, device, cfg: 'TrainConfig', *,
+        recon: float,
+        recon_best: Optional[float],
+        last_ok_sd: Optional[Dict[str, torch.Tensor]],
+        last_ok_iter: int,
+):
+    """Gain-probe live weights, or last-ok when live recon is detonated.
+
+    Always restores live weights after a last-ok probe.  A PASS still
+    freezes last-ok at P1→P2 via detonated-freeze (recon unhealthy).
+    Returns ``(probe, used_last_ok)``.  ``probe`` may be ``None``.
+    """
+    ratio = float(getattr(cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
+    use_last = _should_probe_gain_on_last_ok(
+        recon=recon, recon_best=recon_best, ratio=ratio,
+        has_last_ok=last_ok_sd is not None)
+    if not use_last:
+        return _probe_observer_gain_ready(model, env, device, cfg), False
+    assert last_ok_sd is not None
+    live = _clone_module_state(model, device)
+    try:
+        _load_module_state(model, last_ok_sd, device)
+        _best_s = (f'{float(recon_best):.4f}'
+                   if recon_best is not None else 'n/a')
+        print(f'[gain-ready-probe] last-ok iter {int(last_ok_iter)} '
+              f'(live recon {float(recon):.4f} > {ratio:g}× best '
+              f'{_best_s}) — not measuring wrap/detonated g',
+              flush=True)
+        probe = _probe_observer_gain_ready(model, env, device, cfg)
+        if probe is not None:
+            probe['probed_last_ok'] = True
+            probe['last_ok_iter'] = int(last_ok_iter)
+        return probe, True
+    finally:
+        _load_module_state(model, live, device)
+
+
+def _resolve_policy_sigma_bounds(cfg: 'TrainConfig', sigma_seed: float
+                                  ) -> Dict[str, float]:
+    """σ_max / σ_min from TrainConfig formula inputs.
+
+    Leftover ``SIGMA_MAX_*`` / ``SIGMA_MIN_RATIO_OF_MAX`` are **not**
+    read (P82-live).  Login leftovers were a silent A/B outside
+    ``ENV_OVERRIDES`` / ``run_plan`` (same class as
+    ``AGENT_DISTURBANCE_*``).  Tests / CLI that skip
+    ``apply_dreamer_env_overrides`` still opt in via ``DREAMER_SIGMA_*``.
+    ``sigma_min_ratio`` is the TrainConfig default (1.2).  Do **not**
+    floor at 1.3 — that leftover ``max(1.3, …)`` silently undid the p10
+    RCA and ignored ``DREAMER_SIGMA_MIN_RATIO`` (P45/P46/P47 env-free
+    entropy floor −0.363 = H(σ_max/1.3)).
+    """
+    sigma_seed = float(sigma_seed)
+    sigma_max_mult, _ = _cfg_or_env(
+        cfg, 'sigma_max_mult', 'DREAMER_SIGMA_MAX_OVER_SEED', 1.0, float)
+    sigma_max_floor, _ = _cfg_or_env(
+        cfg, 'sigma_max_floor', 'DREAMER_SIGMA_MAX_FLOOR', 0.10, float)
+    sigma_max_cap, _ = _cfg_or_env(
+        cfg, 'sigma_max_cap', 'DREAMER_SIGMA_MAX_CAP', 0.30, float)
+    sigma_min_ratio, _ = _cfg_or_env(
+        cfg, 'sigma_min_ratio', 'DREAMER_SIGMA_MIN_RATIO', 1.2, float)
+    sigma_min_ratio = max(1.01, float(sigma_min_ratio))
+    target_sigma_max = float(np.clip(
+        float(sigma_max_mult) * sigma_seed,
+        float(sigma_max_floor), float(sigma_max_cap)))
+    target_sigma_min = target_sigma_max / sigma_min_ratio
+    return {
+        'sigma_max_mult': float(sigma_max_mult),
+        'sigma_max_floor': float(sigma_max_floor),
+        'sigma_max_cap': float(sigma_max_cap),
+        'sigma_min_ratio': float(sigma_min_ratio),
+        'target_sigma_max': target_sigma_max,
+        'target_sigma_min': float(target_sigma_min),
+        'log_std_max': float(np.log(max(target_sigma_max, 1e-12))),
+        'log_std_min': float(np.log(max(target_sigma_min, 1e-12))),
     }
 
 
@@ -5774,16 +10397,19 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
         # MV range) to 0.20: simulation-agnostic (still scales with the
         # plant's identified gain & CV width) but covers 2× more of the
         # MV range so the WM sees clean step-response transitions
-        # across most of the operating band.  Override via env
-        # ``SEED_TARGET_CV_FRAC``.
-        target_frac = float(os.environ.get('SEED_TARGET_CV_FRAC', '0.20'))
+        # across most of the operating band.  Override via
+        # ``DREAMER_SEED_TARGET_CV_FRAC`` (leftover ``SEED_TARGET_CV_FRAC``
+        # ignored — P87-live).
+        target_frac, _ = _cfg_or_env(
+            cfg, 'seed_target_cv_frac', 'DREAMER_SEED_TARGET_CV_FRAC', 0.20, float)
         cv_w = float(np.mean(cv_widths))
         # Bumped 2026-05-08 (run_p7 RCA): cap raised 0.10 → 0.30 to give
         # low-MV-authority plants enough seed-buffer coverage breadth.
         # σ_max for the policy is now derived with its own independent
         # cap (see ``policy_log_std_max`` below) so the policy clamp
         # does not widen with this knob.
-        sigma_seed_cap = float(os.environ.get('SEED_SIGMA_CAP', '0.30'))
+        sigma_seed_cap, _ = _cfg_or_env(
+            cfg, 'seed_sigma_cap', 'DREAMER_SEED_SIGMA_CAP', 0.30, float)
         sigma = float(np.clip(target_frac * cv_w / mv_auth,
                                 0.01, sigma_seed_cap))
         sigma_source = (f'mv_authority(target_cv_frac={target_frac:.2f}, '
@@ -5886,35 +10512,17 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # 0.7×σ_seed.  This puts the policy clamp at the same scale the
     # seed buffer was collected with, aligning the actor's explore
     # band with the WM's training distribution.
-    # 2026-05-27 (P59 refactor): these formula inputs are now
-    # TrainConfig fields (``sigma_max_mult``, ``sigma_max_floor``,
-    # ``sigma_max_cap``) wired through ``ENV_OVERRIDES``.  Legacy
-    # ``DREAMER_SIGMA_MAX_*`` / ``SIGMA_MAX_*`` env-vars still honoured
-    # for back-compat but the canonical path is ``cfg.sigma_max_*``.
-    _legacy_mult_env = os.environ.get(
-        'DREAMER_SIGMA_MAX_OVER_SEED',
-        os.environ.get('SIGMA_MAX_OVER_SEED', None))
-    sigma_max_mult = float(_legacy_mult_env) if _legacy_mult_env is not None \
-        else float(getattr(cfg, 'sigma_max_mult', 1.0))
-    _legacy_floor_env = os.environ.get('SIGMA_MAX_FLOOR', None)
-    sigma_max_floor = float(_legacy_floor_env) if _legacy_floor_env is not None \
-        else float(getattr(cfg, 'sigma_max_floor', 0.10))
-    # Cap σ_max independently of the seed-σ cap so a wide seed-buffer
-    # exploration band does not propagate into a wide policy clamp.
-    # History: 0.20 → 0.30 on 2026-05-12 (p21 RCA: too tight for high-
-    # disturbance plants).  Lowered back 0.30 → 0.20 on 2026-05-18
-    # (p24 RCA: σ-saturation trap at 0.219 prevented critic learning).
-    # Restored 0.20 → 0.30 on 2026-05-19 (p26 RCA: reward-head fix
-    # removed the saturation-trap mechanism; σ-saturation is now
-    # benign).
-    _legacy_cap_env = os.environ.get(
-        'DREAMER_SIGMA_MAX_CAP',
-        os.environ.get('SIGMA_MAX_CAP', None))
-    sigma_max_cap = float(_legacy_cap_env) if _legacy_cap_env is not None \
-        else float(getattr(cfg, 'sigma_max_cap', 0.30))
-    target_sigma_max = float(np.clip(sigma_max_mult * sigma_seed,
-                                       sigma_max_floor, sigma_max_cap))
-    log_std_max_val = float(np.log(target_sigma_max))
+    # 2026-05-27 (P59 refactor): formula inputs are TrainConfig +
+    # ``ENV_OVERRIDES``.  Leftover ``SIGMA_MAX_*`` /
+    # ``SIGMA_MIN_RATIO_OF_MAX`` ignored (P82-live).  Cap history:
+    # 0.20→0.30 (p21) →0.20 (p24) →0.30 (p26).  ``sigma_min_ratio``
+    # default 1.2 (p10); do not floor 1.3.
+    _sig = _resolve_policy_sigma_bounds(cfg, sigma_seed)
+    sigma_max_mult = _sig['sigma_max_mult']
+    sigma_max_floor = _sig['sigma_max_floor']
+    sigma_max_cap = _sig['sigma_max_cap']
+    target_sigma_max = _sig['target_sigma_max']
+    log_std_max_val = _sig['log_std_max']
     out['policy_log_std_max'] = {
         'value': log_std_max_val,
         'source': f'clip({sigma_max_mult:.1f}*baseline_seed_action_std,'
@@ -5925,32 +10533,8 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     }
 
     # ---- policy_log_std_min (auto-derived from σ_max) ------------------
-    # When σ_max is tightened (e.g. 0.10 for rate-style controls), the
-    # dataclass default log_std_min = -2.3 (σ_min = 0.10) collides with
-    # σ_max — there's no room left for the actor to express a
-    # *confident* action.  Auto-derive log_std_min as
-    # ``log(σ_max / sigma_min_ratio)`` so the actor always has at
-    # least one decade of headroom to commit to a near-deterministic
-    # action when it has learned a good μ.
-    #
-    # 2026-05-10 (run_p11 RCA): σ_min_ratio=5 → σ_min = σ_max / 5 was
-    # too aggressive on tight σ_max regimes: under noisy critic
-    # advantage the policy collapsed all the way to σ_min, killing
-    # exploration and producing a near-constant deterministic actor
-    # (validation policy_dist std = 0.015 across 1220 steps).  Tighten
-    # to ratio=2.5 → σ_min = σ_max / 2.5 ≈ 40 % of σ_max.  This keeps
-    # the actor confident-enough (still > 1 decade below the V3
-    # paper's σ_max=1.0 reference) while preventing total exploration
-    # collapse when the critic has not stabilised.
-    # 2026-05-27 (P59 refactor): ``sigma_min_ratio`` is now a TrainConfig
-    # field (default 2.5).  Legacy ``SIGMA_MIN_RATIO_OF_MAX`` env-var
-    # still honoured for back-compat.
-    _legacy_ratio_env = os.environ.get('SIGMA_MIN_RATIO_OF_MAX', None)
-    sigma_min_ratio = max(1.3,
-        float(_legacy_ratio_env) if _legacy_ratio_env is not None
-        else float(getattr(cfg, 'sigma_min_ratio', 1.6)))
-    target_sigma_min = target_sigma_max / sigma_min_ratio
-    log_std_min_val = float(np.log(target_sigma_min))
+    sigma_min_ratio = _sig['sigma_min_ratio']
+    log_std_min_val = _sig['log_std_min']
     out['policy_log_std_min'] = {
         'value': log_std_min_val,
         'source': f'log(sigma_max/{sigma_min_ratio:.1f})='
@@ -5975,9 +10559,10 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     # auto-shrinks for plants whose σ_max is tighter. For test_sim
     # (σ_max=0.30) → η = 9e-5, matching the value found by manual
     # tuning in run_p7.
-    eta_v3_baseline = float(os.environ.get('PMPO_ENTROPY_COEF_BASELINE', '3e-4'))
-    sigma_v3_ref = max(1e-3,
-        float(os.environ.get('PMPO_ENTROPY_SIGMA_REF', '1.0')))
+    eta_v3_baseline, _ = _cfg_or_env(
+        cfg, 'pmpo_entropy_eta_v3', 'DREAMER_PMPO_ENTROPY_ETA_V3', 3e-4, float)
+    sigma_v3_ref = max(1e-3, float(_cfg_or_env(
+        cfg, 'pmpo_entropy_sigma_ref', 'DREAMER_PMPO_ENTROPY_SIGMA_REF', 1.0, float)[0]))
     eta_adaptive = eta_v3_baseline * (target_sigma_max / sigma_v3_ref)
     out['pmpo_entropy_coef'] = {
         'value': float(eta_adaptive),
@@ -6142,14 +10727,16 @@ def auto_tune_seed_buffer(env: 'APCEnv', cfg: TrainConfig
     if tau_plant > 0.0:
         ep_len = max(1, int(getattr(cfg, 'episode_length', 1)))
         seg_target = (theta_plant + 4.0 * tau_plant) / float(sr)
-        seg_min_pgate = int(os.environ.get('PRBS_SEG_MIN', '8'))
+        seg_min_pgate, _ = _cfg_or_env(
+            cfg, 'prbs_seg_min', 'DREAMER_PRBS_SEG_MIN', 8, int)
         seg_cap = max(seg_min_pgate + 1, ep_len // 4)
         seg_auto = int(np.clip(round(seg_target), seg_min_pgate, seg_cap))
         # Multi-timescale PRBS: fast hold ~ τ / 3 / sr.  This excites
         # the WM at the dominant pole's natural frequency so it learns
         # the *transient* dynamics (not just steady-state gain).
         # Floor 2 (need at least 2 steps for a settled action).
-        seg_min_floor = int(os.environ.get('PRBS_SEG_MIN_FLOOR', '2'))
+        seg_min_floor, _ = _cfg_or_env(
+            cfg, 'prbs_seg_min_floor', 'DREAMER_PRBS_SEG_MIN_FLOOR', 2, int)
         seg_min_target = (tau_plant / 3.0) / float(sr)
         seg_min_auto = int(np.clip(
             round(seg_min_target), seg_min_floor,
@@ -6290,6 +10877,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
                             target_mode: str = 'percentile',
                             target_percentile: float = 50.0,
                             target_percentile_value: float = 0.5,
+                            target_sym_mag: float = 6.0,
                             ) -> Dict[str, float]:
     """Empirically choose a per-step reward scale to match V4's twohot range.
 
@@ -6445,8 +11033,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     # the percentile-floor scale, so operating-region resolution
     # cannot regress.
     raw_abs_max = float(abs_arr.max()) if abs_arr.size else 0.0
-    target_sym_mag = float(
-        os.environ.get('DREAMER_REWARD_CAL_TARGET_SYM_MAG', '6.0'))
+    target_sym_mag = float(target_sym_mag)
     if raw_abs_max > 1e-8 and target_sym_mag > 0.0:
         scale_fill = (math.exp(target_sym_mag) - 1.0) / raw_abs_max
         scale = max(scale, min(scale_fill, max_scale))
@@ -6535,11 +11122,13 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
 # ---------------------------------------------------------------------------
 
 def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
-    """Plot a 2x3 diagnostic grid from train_log.jsonl.
+    """Plot a 3x3 diagnostic grid from train_log.jsonl.
 
-    Panels: (1) ema_return + return_window_mean, (2) WM losses (recon/sf),
-    (3) phase 2/3 losses (bc/reward_mtp/actor/critic), (4) entropy & adv_std,
-    (5) grad norms (w/a/c) + skip count, (6) violations.
+    Row 1: returns, WM losses, agent/RL losses.
+    Row 2: entropy/adv_std, grad norms, violations.
+    Row 3: P3 cascade axes (logp_std, μ-ratio clip, rew/tgt + vs-expert).
+    Imagination-only canaries do not apply; logp_std / clip_frac are
+    the real-sim μ-walk readouts (P52/P55).
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -6554,8 +11143,10 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
                 continue
     if not rows:
         return
+    log_path = Path(log_path)
+    out_path = Path(out_path)
     steps = [r.get('env_steps', 0) for r in rows]
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
+    fig, axes = plt.subplots(3, 3, figsize=(15, 11), sharex=True)
 
     ax = axes[0, 0]
     ax.plot(steps, [r.get('ema_return') for r in rows], label='ema_return', lw=1.0)
@@ -6582,21 +11173,31 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
     ax.set_title('World model losses')
 
     ax = axes[0, 2]
+    _agent_any = False
     for k, c in [('bc_loss', 'C0'), ('reward_mtp_loss', 'C1'),
                   ('actor_loss', 'C2'), ('critic_loss', 'C3')]:
         vals = [r.get(k) for r in rows]
         if any(v is not None for v in vals):
             ax.plot(steps, vals, label=k, lw=1.0, color=c)
-    ax.set_ylabel('Phase 2/3 losses'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            _agent_any = True
+    ax.set_ylabel('Phase 2/3 losses')
+    if _agent_any:
+        ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
     ax.set_title('Agent / RL losses')
 
     ax = axes[1, 0]
-    ax.plot(steps, [r.get('entropy_mean') for r in rows], label='entropy', lw=1.0)
+    ent = [r.get('entropy_mean') for r in rows]
+    advs = [r.get('adv_std_mean') for r in rows]
+    if any(v is not None for v in ent):
+        ax.plot(steps, ent, label='entropy', lw=1.0)
     ax2 = ax.twinx()
-    ax2.plot(steps, [r.get('adv_std_mean') for r in rows], color='C3',
-              label='adv_std', lw=1.0)
+    if any(v is not None for v in advs):
+        ax2.plot(steps, advs, color='C3', label='adv_std', lw=1.0)
     ax.set_ylabel('entropy'); ax2.set_ylabel('adv_std', color='C3')
-    ax.legend(loc='upper left', fontsize=8); ax.grid(alpha=0.3)
+    if any(v is not None for v in ent):
+        ax.legend(loc='upper left', fontsize=8)
+    ax.grid(alpha=0.3)
     ax.set_title('Policy entropy / advantage std')
 
     ax = axes[1, 1]
@@ -6623,7 +11224,43 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
     ax.grid(alpha=0.3)
     ax.set_title('Violations (per-iter mean)')
 
-    for ax in axes[1, :]:
+    ax = axes[2, 0]
+    logp = [r.get('actor_logp_std') for r in rows]
+    if any(v is not None for v in logp):
+        ax.plot(steps, logp, label='logp_std', lw=1.0, color='C1')
+        ax.legend(fontsize=8)
+    ax.set_ylabel('logp std'); ax.grid(alpha=0.3)
+    ax.set_title('μ-walk (actor_logp_std)')
+
+    ax = axes[2, 1]
+    clip = [r.get('actor_ratio_clip_frac') for r in rows]
+    rmean = [r.get('actor_ratio_mean') for r in rows]
+    if any(v is not None for v in clip):
+        ax.plot(steps, clip, label='clip_frac', lw=1.0, color='C2')
+    if any(v is not None for v in rmean):
+        ax.plot(steps, rmean, label='ratio_mean', lw=1.0, color='C0')
+    if any(v is not None for v in clip) or any(v is not None for v in rmean):
+        ax.legend(fontsize=8)
+    ax.set_ylabel('PPO ratio'); ax.grid(alpha=0.3)
+    ax.set_title('μ-ratio clip (P53/P55)')
+
+    ax = axes[2, 2]
+    rtgt = [r.get('critic_rew_to_tgt_var') for r in rows]
+    vsx = [r.get('agent_minus_expert_return') for r in rows]
+    if any(v is not None for v in rtgt):
+        ax.plot(steps, rtgt, label='rtgt', lw=1.0, color='C3')
+    ax.set_yscale('symlog', linthresh=1e-4)
+    ax.set_ylabel('rew/tgt var')
+    if any(v is not None for v in vsx):
+        ax2 = ax.twinx()
+        ax2.plot(steps, vsx, color='C0', label='vs_expert', lw=1.0)
+        ax2.set_ylabel('vs expert', color='C0')
+    if any(v is not None for v in rtgt):
+        ax.legend(loc='upper left', fontsize=8)
+    ax.grid(alpha=0.3)
+    ax.set_title('Cascade / vs expert')
+
+    for ax in axes[2, :]:
         ax.set_xlabel('env_steps')
     fig.tight_layout()
     fig.savefig(out_path, dpi=110)
@@ -6631,8 +11268,8 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
 
     # Companion CSV with the same series (one row per train_log row).
     # Lets downstream analysis (and humans without image vision) recover the
-    # panel data without re-parsing train_log.jsonl.  Columns mirror the six
-    # panels above + iter/phase for context.
+    # panel data without re-parsing train_log.jsonl.  Columns mirror the
+    # panels above + P3 cascade canaries.
     try:
         import csv
         csv_path = out_path.with_suffix('.csv')
@@ -6643,10 +11280,14 @@ def _save_training_diagnostics_plot(log_path: Path, out_path: Path) -> None:
             'bc_loss', 'reward_mtp_loss', 'actor_loss', 'critic_loss',  # panel 3
             'entropy_mean', 'adv_std_mean',                         # panel 4
             'wm_grad_norm', 'actor_grad_norm', 'critic_grad_norm',  # panel 5
+            'n_grad_skip', 'n_grad_skip_iter',
             'iter_cv_violation_mean', 'iter_mv_violation_mean',     # panel 6
-            # Critic-cascade canary (not plotted; essential for triage).
+            'actor_logp_std', 'actor_ratio_clip_frac', 'actor_ratio_mean',
             'critic_rew_to_tgt_var', 'critic_pred_target_r',
-            'critic_target_v_r', 'imagined_return_mean', 'return_scale',
+            'critic_target_v_r', 'critic_mc_loss',
+            'agent_minus_expert_return', 'actor_pos_adv_frac',
+            'adv_action_corr', 'return_scale',
+            'realsim_return_mean', 'realsim_reward_mean',
         ]
         with open(csv_path, 'w', newline='') as fh:
             w = csv.writer(fh)
@@ -6701,6 +11342,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             torch.set_float32_matmul_precision('high')
         except Exception:
             pass
+    _nth, _blas = _configure_runtime_threads(device)
+    print(f'[runtime] cpu_threads={_nth} host_cpus={_host_cpu_count()} '
+          f'device={device.type} blas={_blas}', flush=True)
+    _require_realsim_actor(cfg)
+    from workflow._plant_prepare import pin_eval_modules_at_launch
+    pin_eval_modules_at_launch()
 
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim
@@ -6767,25 +11414,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # gain_match still pins g, so d_t cleanly gets the load residual.
             cfg.cont_dist_dim = 0
             cfg.dist_match_coef = 0.0
-            # p08: auto-enable the self-supervised per-INPUT isolation loss (the
-            # nonlinear / black-box, no-known-gain generaliser) alongside the
-            # gain channel.  Input-symmetric; graceful no-op if no isolated eps.
-            if float(getattr(cfg, 'wm_input_isolation_coef', 0.0) or 0.0) <= 0.0:
-                cfg.wm_input_isolation_coef = 1.0  # opt1: 0.5→1.0 (per-input ID first-class)
-            if int(getattr(cfg, 'wm_input_isolation_len', 0) or 0) <= 0:
-                cfg.wm_input_isolation_len = int(getattr(cfg, 'horizon', 15) or 15)
-            # Option 1 (2026-08-17): elevate the STEADY-STATE (DC-gain) match to a
-            # FIRST-CLASS, CLEAN, SYMMETRIC per-input objective — the control-
-            # relevant target (Lambert objective-mismatch: recon likelihood is not
-            # correlated with control accuracy).  Strong weight + settledness-gate
-            # (settle_var, undilutes the DC signal) + more long-hold settle data,
-            # identical for every input (MV & DV) — no asymmetric feedforward.
-            if float(getattr(cfg, 'wm_ss_match_coef', 0.0) or 0.0) <= 0.0:
-                cfg.wm_ss_match_coef = 3.0  # opt1: 1.0→3.0 (DC gain = first-class)
-            if float(getattr(cfg, 'wm_ss_match_settle_var', 0.0) or 0.0) <= 0.0:
-                cfg.wm_ss_match_settle_var = 0.05  # settled-only DC-gain signal
-            if int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0) <= 0:
-                cfg.wm_isolation_settle_episodes = 24  # opt1: 8→24 (clean per-input settled data)
             # P19 (2026-08-18): GROUND the DOB d_t on the true load (KalmanNet-
             # style) so the observer TRACKS the disturbance instead of under-
             # reaching it (p18: d_t vs load r=0.42, ~0.3x amplitude → imagination
@@ -6793,9 +11421,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # baseline).  Direct A,K supervision is the STRUCTURAL fix for the
             # manual dob_gain_init amplitude tuning.  Drop dob_reg (the "d small"
             # prior fights the grounding; the grounded target IS the prior now).
-            if float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) <= 0.0:
-                cfg.dob_ground_coef = 2.0
-                cfg.dob_reg_coef = 0.0
+            # Honour explicit ``DREAMER_DOB_GROUND_COEF=0`` (A/B off).
+            if _auto_if_unset(cfg, 'dob_ground_coef', 2.0):
+                if not _field_is_explicit(cfg, 'dob_reg_coef'):
+                    cfg.dob_reg_coef = 0.0
             print(f'[cont-latent] GAIN-ONLY (DOB owns the disturbance): '
                   f'gain_dim={cfg.cont_gain_dim} '
                   f'(n_cv={_n_cv}×(n_mv={_n_mv}+n_dv={_n_dv})); cont disturbance '
@@ -6818,6 +11447,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f'dist_dim={cfg.cont_dist_dim} (DOB-free disturbance estimator); '
                   f'dist_match_coef={cfg.dist_match_coef}.',
                   flush=True)
+        # Isolation/ss-match stay TrainConfig 0 unless opted in (P40).
+        # Aux (len / settle / settle_var) auto-fill only when the
+        # teacher is on — no isolated-settle seed when env-free.
+        _promote_isolation_aux(cfg)
     else:
         cfg.cont_gain_dim = 0
         cfg.cont_dist_dim = 0
@@ -6880,23 +11513,28 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         pass
 
     # ---- Reward calibration (V4 reward head expects O(1) per-step rewards) ----
-    obj_scale_env = os.environ.get('OBJ_REWARD_SCALE', 'auto').strip().lower()
+    obj_scale_env, _ = _cfg_or_env(
+        cfg, 'obj_reward_scale', 'DREAMER_OBJ_REWARD_SCALE', 'auto', str)
+    obj_scale_env = str(obj_scale_env or 'auto').strip().lower()
     if obj_scale_env in ('', 'auto', '1', 'on', 'true'):
-        cal_mode = os.environ.get('DREAMER_REWARD_CAL_MODE',
-                                    'baseline').strip().lower() or 'baseline'
-        cal_target_mode = os.environ.get(
-            'DREAMER_REWARD_CAL_TARGET',
-            'percentile').strip().lower() or 'percentile'
+        cal_mode = str(getattr(cfg, 'reward_cal_mode', 'baseline')
+                       or 'baseline').strip().lower() or 'baseline'
+        cal_target_mode = str(getattr(cfg, 'reward_cal_target', 'percentile')
+                               or 'percentile').strip().lower() or 'percentile'
         try:
-            cal_target_pct = float(os.environ.get(
-                'DREAMER_REWARD_CAL_PCT', '95') or 95.0)
+            cal_target_pct = float(getattr(cfg, 'reward_cal_pct', 95.0) or 95.0)
         except Exception:
             cal_target_pct = 95.0
         try:
-            cal_target_pct_value = float(os.environ.get(
-                'DREAMER_REWARD_CAL_PCT_VAL', '0.5') or 0.5)
+            cal_target_pct_value = float(getattr(cfg, 'reward_cal_pct_val', 0.5)
+                                        or 0.5)
         except Exception:
             cal_target_pct_value = 0.5
+        try:
+            cal_target_sym_mag = float(getattr(cfg, 'reward_cal_target_sym_mag',
+                                            6.0) or 6.0)
+        except Exception:
+            cal_target_sym_mag = 6.0
         # Cover at least 2 episodes so the cohort is representative
         # (paper-aligned: V3 calibrates on rolling buffer of full episodes).
         ep_len = max(1, int(getattr(cfg, 'episode_length', 1500) or 1500))
@@ -6908,6 +11546,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             target_mode=cal_target_mode,
             target_percentile=cal_target_pct,
             target_percentile_value=cal_target_pct_value,
+            target_sym_mag=cal_target_sym_mag,
         )
         # Pop the obs trace before serialising — kept on the dict only
         # to feed the SNR diagnostic below; np.ndarray is not JSON-safe.
@@ -7018,6 +11657,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     target_mode=cal_target_mode,
                     target_percentile=cal_target_pct,
                     target_percentile_value=cal_target_pct_value,
+                    target_sym_mag=cal_target_sym_mag,
                 )
                 cal_post.pop('_obs_trace', None)
                 cal_post['reward_clip_asymmetry_threshold'] = cal[
@@ -7135,56 +11775,65 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             elif arr.ndim != 2:
                 raise ValueError(f'unexpected obs_trace ndim={arr.ndim}')
             sr = max(1, int(getattr(cfg, 'sample_rate', 1)))
-            tau_dom = float(os.environ.get(
-                'SIM_IDENTIFIED_TAU_DOMINANT', '50') or 50)
-            window = max(3, int(round(tau_dom / sr)))
+            # Plant τ from the identifier (not a leftover SIM_* env).
+            try:
+                tau_dom, _ = env._resolve_plant_timing()
+            except Exception:
+                tau_dom = 0.0
+            if tau_dom <= 0:
+                try:
+                    tau_dom = float(getattr(
+                        cfg, 'identified_tau_dominant', 0.0) or 0.0)
+                except Exception:
+                    tau_dom = 0.0
+            if tau_dom <= 0:
+                tau_dom = float(os.environ.get(
+                    'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
+            if tau_dom <= 0:
+                tau_dom = float(os.environ.get(
+                    'IDENTIFIED_TAU_DOMINANT', '0') or 0)
+            if tau_dom > 0:
+                window = max(3, int(round(float(tau_dom) / sr)))
+            else:
+                # No identified τ: unitless lookback/4 frames, not a
+                # 50-second plant default.
+                lb = int(getattr(cfg, 'lookback', 0) or 0)
+                window = max(3, (lb // 4) if lb > 0 else 8)
+                tau_dom = float(window * sr)
             if arr.shape[0] > window + 2:
-                trend = np.array([
-                    np.convolve(arr[:, c],
-                                  np.ones(window) / window, mode='valid')
-                    for c in range(arr.shape[1])
-                ]).T  # (T-window+1, obs_dim)
-                # Align lengths so detail is per-step (signal_var vs
-                # high-freq residual).
-                aligned = arr[window - 1:, :]
-                detail = aligned - trend
-                signal_var = np.var(trend, axis=0)
-                noise_var = np.var(detail, axis=0)
-                snr_per_ch = signal_var / np.maximum(noise_var, 1e-12)
-                snr_db = 10.0 * np.log10(np.maximum(snr_per_ch, 1e-12))
-                # Channel names if available; otherwise just indices.
-                ch_names = list(getattr(env, 'obs_channel_names', []) or [])
-                snr_report = {
-                    'window_steps': int(window),
-                    'tau_dom': float(tau_dom),
-                    'sample_rate': int(sr),
-                    'per_channel': [
-                        {
-                            'index': int(i),
-                            'name': (ch_names[i] if i < len(ch_names)
-                                       else f'obs[{i}]'),
-                            'signal_std': float(np.sqrt(signal_var[i])),
-                            'noise_std': float(np.sqrt(noise_var[i])),
-                            'snr': float(snr_per_ch[i]),
-                            'snr_db': float(snr_db[i]),
-                        }
-                        for i in range(arr.shape[1])
-                    ],
-                    'snr_db_min': float(snr_db.min()),
-                    'snr_db_median': float(np.median(snr_db)),
-                    'snr_db_max': float(snr_db.max()),
-                }
+                # Summary/WARN = measured CV+DV only.  Constant setpoint /
+                # bound channels used to show −120 dB and pollute min/median.
+                meta = []
+                try:
+                    meta = list(env.obs_channel_meta())
+                except Exception:
+                    meta = []
+                measured = [int(x) for x in (
+                    list(getattr(env, 'cv_indices', []) or [])
+                    + list(getattr(env, 'dv_indices', []) or []))]
+                snr_report = _snr_build_report(
+                    arr, window, float(tau_dom), int(sr), meta, measured)
+                meas_set = set(measured)
                 low_ch = [
                     p for p in snr_report['per_channel']
-                    if p['snr_db'] < 10.0
+                    if int(p['index']) in meas_set
+                    and not bool(p.get('constant'))
+                    and float(p['snr_db']) < 10.0
                 ]
                 summary = (f"SNR median={snr_report['snr_db_median']:+.1f}dB"
                            f" min={snr_report['snr_db_min']:+.1f}dB"
                            f" max={snr_report['snr_db_max']:+.1f}dB"
-                           f" window={window}step")
+                           f" window={window}step"
+                           f" scope={snr_report.get('summary_scope')}")
+                n_const = int(snr_report.get('constant_n') or 0)
+                if n_const:
+                    cnames = ','.join(
+                        str(n) for n in (
+                            snr_report.get('constant_names') or [])[:3])
+                    summary += f"  const={n_const} ({cnames})"
                 if low_ch:
-                    names = ','.join(p['name'] for p in low_ch[:3])
-                    summary += (f"  WARN: {len(low_ch)} ch <10dB "
+                    names = ','.join(str(p['name']) for p in low_ch[:3])
+                    summary += (f"  WARN: {len(low_ch)} measured ch <10dB "
                                   f"({names})")
                 print(f"[snr] {summary}", flush=True)
                 out_dir_pre = Path(cfg.out_dir or '.')
@@ -7270,13 +11919,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                    eps=1e-8, weight_decay=0.0)
 
     capacity_eps = max(1, cfg.buffer_capacity_steps // cfg.episode_length)
+    # P25 RCA: n_dist must be n_cv whenever the neural-Kalman needs a load
+    # target.  Do NOT key this off disturbance_head_dim (forced 0 when DOB
+    # replaces the head — that made P19/P25 grounding a silent no-op).
+    _n_dist = _replay_n_dist(cfg, env)
     buf = TrajectoryBuffer(capacity_eps, cfg.episode_length,
-                            cfg.obs_dim, cfg.action_dim,
-                            n_dist=int(getattr(cfg, 'disturbance_head_dim', 0) or 0))
-    # P87: bind the single training env so add_episode() can pull each
-    # episode's recorded hidden-disturbance trace (zero call-site edits).
+                            cfg.obs_dim, cfg.action_dim, n_dist=_n_dist)
+    # Bind the training env so add_episode() pulls each episode's recorded
+    # hidden-disturbance trace (zero call-site edits).
     if buf.dist is not None:
         buf._dist_source = env
+        print(f'[dob-ground] replay n_dist={_n_dist} '
+              f'(dob={bool(getattr(cfg, "dob_enabled", False))} '
+              f'ground_coef={float(getattr(cfg, "dob_ground_coef", 0.0) or 0.0):.3g} '
+              f'head_dim={int(getattr(cfg, "disturbance_head_dim", 0) or 0)})',
+              flush=True)
 
     # mbrl2 real-sim (2026-07-08): a SEPARATE rolling ON-POLICY buffer for the P3
     # actor-critic update.  Vanilla REINFORCE (``_realsim_actor_critic_step``) is
@@ -7286,23 +11943,32 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # MV-chatter RCA).  This ring buffer keeps ONLY the last
     # ``phase3_onpolicy_buffer_eps`` current-policy episodes (n_dist=0: the frozen
     # observer needs no disturbance target at P3).
-    onpol_buf = None
-    if str(getattr(cfg, 'actor_train_source', 'realsim')) == 'realsim':
-        _onpol_eps = max(2, int(getattr(cfg, 'phase3_onpolicy_buffer_eps', 16) or 16))
-        onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
-                                     cfg.obs_dim, cfg.action_dim, n_dist=0)
+    # On-policy P3 buffer (``_require_realsim_actor`` already ran).
+    _onpol_eps = max(2, int(getattr(cfg, 'phase3_onpolicy_buffer_eps', 16) or 16))
+    onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
+                                 cfg.obs_dim, cfg.action_dim, n_dist=0)
 
-    # MIMO per-INPUT isolation buffer (2026-07-10): holds the isolated-excitation
-    # seed episodes (MV-PRBS + DV-PRBS — ONE input swept, all others held) for the
-    # self-supervised ``_wm_input_isolation_loss`` (the nonlinear / black-box,
-    # no-known-gain generalisation of C(1) gain-match).  Input-symmetric: it holds
-    # every input's isolated episodes.  Populated at seed time.
+    # MIMO per-INPUT isolation buffer (2026-07-10 / P28 follow-up 9): holds
+    # ONLY the isolated whole-episode settle holds (one input at a
+    # stratified level, others at 0, action_std=0, process+meas noise off)
+    # that train ``_wm_input_isolation_loss`` / ``wm_ss_match``.  Ordinary
+    # MIMO PRBS and all-DV PRBS stay in the main replay buffer.  Env-free
+    # P40: skip alloc + seed when the teacher is off (gain-match only).
     isolation_buf = None
-    if bool(getattr(cfg, 'cont_latent_enabled', False)):
-        _iso_cap = max(4, int(getattr(cfg, 'baseline_seed_episodes', 8) or 8)
-                       + int(getattr(cfg, 'dv_prbs_seed_episodes', 0) or 0) + 8)
+    if (bool(getattr(cfg, 'cont_latent_enabled', False))
+            and _isolation_teacher_on(cfg)):
+        _n_mv_iso = int(len(getattr(env.sim, 'mv_indices', []) or []))
+        _n_dv_iso = int(len(getattr(env.sim, 'dv_indices', []) or []))
+        _n_settle_iso = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
+        _iso_cap = _isolation_buf_capacity(
+            n_mv=_n_mv_iso, n_dv=_n_dv_iso, n_settle_per=_n_settle_iso)
         isolation_buf = TrajectoryBuffer(_iso_cap, cfg.episode_length,
                                          cfg.obs_dim, cfg.action_dim, n_dist=0)
+        print(f'[isolation-buf] cap={_iso_cap} '
+              f'(settle-only; per_input={_n_settle_iso} → '
+              f'{_n_mv_iso}×{_n_settle_iso}+{_n_dv_iso}×{_n_settle_iso}; '
+              f'n_mv={_n_mv_iso} n_dv={_n_dv_iso})',
+              flush=True)
 
     out_dir = Path(cfg.out_dir or '.')
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -7319,9 +11985,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     print(f"# train start: {time.strftime('%Y-%m-%d %H:%M:%S')} "
           f"device={device.type} bs={cfg.batch_size} "
-          f"seq_len={cfg.seq_len} horizon={cfg.horizon} "
+          f"seq_len={cfg.seq_len} wm_train_T={_wm_train_seq_len(cfg)} "
+          f"horizon={cfg.horizon} "
           f"d_model={cfg.d_model} layers={cfg.n_layers} heads={cfg.n_heads} "
           f"z_dim={cfg.z_dim} lookback={cfg.lookback} "
+          f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
+          f"compile={_resolve_compile_mode(cfg) or 'eager'} "
+          f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
+          f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
           f"phases={p1}/{p2}/{p3}",
           flush=True)
 
@@ -7370,7 +12041,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     grad_skip_history: 'deque[Tuple[int, int]]' = deque(maxlen=512)  # (iter, skip_count)
     grad_skip_prev_total: int = 0
     early_stop_reason: Optional[str] = None
+    skip_storm_p1_recovered: bool = False
+    skip_storm_p1_n: int = 0
+    skip_storm_restore_source: Optional[str] = None
+    skip_storm_restore_iter: Optional[int] = None
+    wm_fid_es_frozen_g_logged: bool = False
+    p1_last_ok_ckpt_path: Optional[Path] = None
+    p1_last_ok_sd: Optional[Dict[str, torch.Tensor]] = None
+    p1_last_ok_iter: int = -1
+    p1_last_ok_locked: bool = False
+    p1_last_ok_gain_ready_locked: bool = False
+    p1_skip_storm_gain_ready: Optional[bool] = None
+    p1_skip_storm_gain_worst: Optional[float] = None
+    p1_recon_best: Optional[float] = None
+    p1_gain_not_ready_capped: bool = False
+    p1_detonated_freeze_restored: bool = False
     p1_initial_sf: Optional[float] = None
+    p1_initial_recon: Optional[float] = None
     p2_final_reward_mtp: Optional[float] = None
     mid_check_flags: List[str] = []
     # ----- WM fidelity tracking (2026-05-22, P37 RCA) -----
@@ -7396,20 +12083,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_score_ema: float = -1e18
     wm_score_ema_best: float = -1e18
     wm_score_ema_best_iter: int = -1
-    wm_score_ema_alpha = float(
-        os.environ.get('DREAMER_WM_FIDELITY_EMA_ALPHA', '0.5'))
+    wm_score_ema_alpha = float(getattr(cfg, 'wm_fidelity_ema_alpha', 0.5) or 0.5)
     # P2-relative ES: reset the "best" tracker on P1→P2 entry so the
     # P2 critic head gets a fair patience window from its own best,
     # not from an unreachable P1 best (P47 RCA: iter 50 in P2 was 30
     # iters past wm_best_iter=20 in P1 → instant trip on P2 entry).
     wm_es_p2_baseline_iter: int = -1
     wm_fidelity_warmup_iters = int(
-        os.environ.get('DREAMER_WM_FIDELITY_WARMUP_ITERS', '40'))
+        getattr(cfg, 'wm_fidelity_warmup_iters', 40) or 40)
     # P47 RCA: 20 → 40 iters (4 probes) so the EMA can stabilise across
     # the natural ±0.12 noise band.  Combined with EMA smoothing,
     # genuine multi-probe degradation still trips within ~50 iters.
     wm_fidelity_patience_iters = int(
-        os.environ.get('DREAMER_WM_FIDELITY_PATIENCE_ITERS', '40'))
+        getattr(cfg, 'wm_fidelity_patience_iters', 40) or 40)
     # ----- Phase-transition quality gates (P52 RCA, 2026-05-26) -----
     # ``phase{1,2}_env_steps`` become *lower bounds*; quality gates can
     # extend each phase up to ``(1+max_extension)`` × budget.  Gate
@@ -7463,12 +12149,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # steady-state behaviour even while its short-horizon next-state
     # loss continues to improve.  Periodically inject fresh const-action
     # episodes during P1 to keep the steady-state regime represented in
-    # the buffer.  Sim-agnostic: counts are env-tunable, action levels
-    # stratified within ``constant_action_seed_op_band``.
-    const_inject_every = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_EVERY', '20'))
-    const_inject_n = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_N', '5'))
+    # the buffer.  Cadence is f(buffer lap); N is f(n_mv, n_dv).
+    _n_mv_inj = int(len(getattr(env.sim, 'mv_indices', []) or []))
+    _n_dv_inj_ch = int(len(getattr(env.sim, 'dv_indices', []) or []))
+    _resolve_inject_cadence(
+        cfg, n_mv=_n_mv_inj, n_dv=_n_dv_inj_ch, log=True)
+    const_inject_every = int(getattr(cfg, 'const_action_inject_every', 20) or 0)
+    const_inject_n = int(getattr(cfg, 'const_action_inject_n', 5) or 0)
     # P49 RCA (2026-05-25): WM steady-state probe still shows 0%
     # convergence under zero/constant action even after P39's periodic
     # P1 injection — because the const-action episodes are evicted
@@ -7481,10 +12168,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # steady-state convergence (still 0% in P50).  Defaults reverted
     # to OFF (P1-only injection).  Opt-in for experimentation via
     # DREAMER_CONST_ACTION_INJECT_IN_{P2,P3}=1.  See P50 RCA.
-    const_inject_in_p2 = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P2', '0'))
-    const_inject_in_p3 = int(
-        os.environ.get('DREAMER_CONST_ACTION_INJECT_IN_P3', '0'))
+    const_inject_in_p2 = bool(getattr(cfg, 'const_action_inject_in_p2', False))
+    const_inject_in_p3 = bool(getattr(cfg, 'const_action_inject_in_p3', False))
     # ----- Periodic STEP-TEST (DV-exciting) re-injection (2026-06-13) -----
     # The const-inject above replenishes only the MV exciters (const +
     # step-settle); the DV-exciting STEP-TEST episodes are seed-only.  Once the
@@ -7495,14 +12180,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # step-test episodes on the same cadence so the DV gain stays supervised
     # right up to the WM freeze.  Default ON in P1 (matches const-inject), P2/P3
     # opt-in (P50 cascade caution), NO-OP when the sim has no DV channel.
-    step_test_inject_every = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_EVERY', '20'))
-    step_test_inject_n = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_N', '2'))
-    step_test_inject_in_p2 = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P2', '0'))
-    step_test_inject_in_p3 = int(
-        os.environ.get('DREAMER_STEP_TEST_INJECT_IN_P3', '0'))
+    step_test_inject_every = int(getattr(cfg, 'step_test_inject_every', 20) or 0)
+    step_test_inject_n = int(getattr(cfg, 'step_test_inject_n', 2) or 0)
+    step_test_inject_in_p2 = bool(getattr(cfg, 'step_test_inject_in_p2', False))
+    step_test_inject_in_p3 = bool(getattr(cfg, 'step_test_inject_in_p3', False))
     # DV-PRBS re-injection (2026-06-14): keep the full-range DV sweep fresh
     # in the ring buffer through Stage 1 so the DV→CV gain stays supervised
     # right up to the WM freeze (the seed-time dv-prbs episodes are FIFO-
@@ -7512,14 +12193,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # P1→P2 wm_best warm-restore keeps an early (~iter 30) checkpoint, so the
     # re-injects must land BEFORE it — every-10 fires at iter 10/20/30 (all
     # inside the kept window) instead of 20/40/60 (40/60 rolled back).
-    dv_prbs_inject_every = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_EVERY', '10'))
-    dv_prbs_inject_n = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_N', '2'))
-    dv_prbs_inject_in_p2 = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_IN_P2', '0'))
-    dv_prbs_inject_in_p3 = int(
-        os.environ.get('DREAMER_DV_PRBS_INJECT_IN_P3', '0'))
+    # Auto-scale still caps at warmup/4 so other plants keep that property.
+    dv_prbs_inject_every = int(getattr(cfg, 'dv_prbs_inject_every', 10) or 0)
+    dv_prbs_inject_n = int(getattr(cfg, 'dv_prbs_inject_n', 2) or 0)
+    dv_prbs_inject_in_p2 = bool(getattr(cfg, 'dv_prbs_inject_in_p2', False))
+    dv_prbs_inject_in_p3 = bool(getattr(cfg, 'dv_prbs_inject_in_p3', False))
     # ----- Periodic EXPERT re-injection (P81 RCA, 2026-06-03) -----
     # Same eviction failure mode as the const-action seeds above, but for
     # the objective-aligned expert demonstrations: the expert episodes are
@@ -7535,27 +12213,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # P2 injection does not threaten Var(r)/Var(target_v).  P83 keeps a
     # decaying masked-BC anchor alive THROUGH P3, so the expert episodes
     # must also survive in the buffer during P3 — hence injection in P3 is
-    # now ON by default.  Volume is kept low (3 eps every 20 iters) and the
+    # now ON by default.  Volume is kept low (3 eps every ~0.3 lap) and the
     # episodes ride the constraint edge with healthy reward variance, so the
     # P50 const-inject cascade risk (flat steady-state collapsing Var(r))
     # does not apply.  Disable via DREAMER_EXPERT_INJECT_IN_P3=0 for ablation.
-    expert_inject_every = int(
-        os.environ.get('DREAMER_EXPERT_INJECT_EVERY', '20'))
-    expert_inject_n = int(
-        os.environ.get('DREAMER_EXPERT_INJECT_N', '3'))
-    expert_inject_in_p3 = int(
-        os.environ.get('DREAMER_EXPERT_INJECT_IN_P3', '1'))
+    expert_inject_every = int(getattr(cfg, 'expert_inject_every', 20) or 0)
+    expert_inject_n = int(getattr(cfg, 'expert_inject_n', 3) or 0)
+    expert_inject_in_p3 = bool(getattr(cfg, 'expert_inject_in_p3', True))
     # ----- wm_best.pt warm-restore at P1→P2 (P39, 2026-05-22) -----
-    # When the WM's fidelity peak is reached well before P1 ends and the
-    # subsequent iters drift to a lower-quality basin (P38: peak iter 50,
-    # collapse by iter 70), starting critic training from the final P1
-    # weights hands P2 an already-degraded WM.  Restoring wm_best.pt at
-    # the P1→P2 boundary gives critic training the cleanest available
-    # latent dynamics.  Skipped when wm_best.pt is essentially the
-    # current state (gap < ``min_gap``) to avoid wasted I/O.  Disable
-    # with DREAMER_WM_BEST_RESTORE_AT_P2=0.
-    wm_best_restore_at_p2 = bool(int(
-        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P2', '1') or 0))
+    # P28 GPU RCA: default OFF (gain-blind fidelity peak).  Opt in with
+    # DREAMER_WM_BEST_RESTORE_AT_P2=1.  After skip-storm last-ok this
+    # reload is skipped even if opted in (see ``_should_warm_restore_wm_best``).
+    wm_best_restore_at_p2 = bool(getattr(cfg, 'wm_best_restore_at_p2', False))
+    print(f'[p1→p2] wm_best_restore_at_p2={wm_best_restore_at_p2} '
+          f'(OFF freezes end-of-P1 g; ON reloads fidelity-peak wm_best)',
+          flush=True)
     # ----- wm_best.pt warm-restore at P2→P3 (P90, 2026-06-06) -----
     # The WM keeps training through P2 (paper Algorithm 1 co-trains it during
     # critic warmup), but its held-action fixed point is UNSTABLE — the probe
@@ -7569,8 +12241,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # freezes only the WM CORE via requires_grad, preserving reward/policy
     # training).  Opt in with DREAMER_WM_BEST_RESTORE_AT_P3=1 only if not using
     # the freeze.
-    wm_best_restore_at_p3 = bool(int(
-        os.environ.get('DREAMER_WM_BEST_RESTORE_AT_P3', '0') or 0))
+    wm_best_restore_at_p3 = bool(getattr(cfg, 'wm_best_restore_at_p3', False))
     # P90: freeze the WM core after P1 (restore best at P1→P2, then no WM-core
     # training in P2/P3) for critic/WM coherence + drift immunity.  cfg flag,
     # env-overridable via DREAMER_WM_FREEZE_AFTER_P1.
@@ -7587,16 +12258,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # sits inside the inner train-steps loop, which would otherwise repeat it
     # once per step for the whole first warmup iter (~25x).
     _critic_warmup_logged = False
+    _return_scale_freeze_logged = False
     # One-shot guard so the log-row JSON-coercion warning logs EXACTLY once
     # (names the diagnostic key that slipped through as a torch/numpy value).
     _row_coerce_warned = False
     wm_trunk_stopgrad_in_p2 = bool(getattr(cfg, 'wm_trunk_stopgrad_in_p2', False))
     # neural-apc-mbrl JOINT training mode (DreamerV1/V2/V3 style).
     joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
-    joint_prior_refresh_iters = int(
-        getattr(cfg, 'joint_prior_refresh_iters', 0) or 0)
-    p3_prior_refresh_iters = int(
-        getattr(cfg, 'p3_prior_refresh_iters', 0) or 0)
     # ----- Staged clean->disturbance curriculum (2026-06-12) -----
     # Precondition: needs phased mode (it IS the phased curriculum) + the DOB.
     # If misconfigured, hard-disable with a loud warning rather than running a
@@ -7678,29 +12346,27 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f'reward={_fz["reward"]} tensors; disturbance prob=0; '
                   f'domain_randomization={"OFF in P1/P2 (clean WM/DOB id) -> ON in P3 (real-plant DR)" if (_dr_gated and _dr_found) else "on"}).',
                   flush=True)
-        # NOTE (2026-06-16, p124 RCA): the p123 experiment that DISABLED the
-        # P1->P2 wm_best warm-restore in curriculum mode was REVERTED — it
-        # regressed the MV gain (warm-restore OFF p124 MV 0.849 vs ON p121-123
-        # avg 0.926).  P1 recon is non-monotonic (p124: bottoms iter40 0.085,
-        # rises to iter70 0.108), so freezing the END-of-P1 WM froze a WORSE
-        # checkpoint than wm_best.  The warm-restore (P39 default) stays ON; the
-        # real gain fix is the CV-weighted overshoot loss (supervises the
-        # open-loop CV gain directly), not the checkpoint-selection policy.
+        # P28 GPU RCA (supersedes p124): curriculum P1→P2 wm_best restore
+        # is OFF by default.  p124's small ON vs OFF delta (MV 0.926 vs
+        # 0.849) does not hold when the fidelity peak is early and
+        # gain-blind (P28 restored iter 60, discarded 37 late-P1 iters,
+        # val MV ×0.52; P26 skipped restore via min_gap and froze MV
+        # ×0.97).  Opt in with DREAMER_WM_BEST_RESTORE_AT_P2=1.
     wm_best_restore_min_gap = int(
-        os.environ.get('DREAMER_WM_BEST_RESTORE_MIN_GAP', '10'))
-    # ----- Diagnostics for reward-MTP/WM coupling RCA (P39, 2026-05-22) -----
-    # All four are cheap and gated by env vars.  A + D are standing
-    # observability (default ON, run at probe cadence → <2% overhead).
-    # B + C are controlled-experiment switches (default OFF) used to
-    # causally isolate whether reward-MTP gradients distort the latent.
+        getattr(cfg, 'wm_best_restore_min_gap', 10) or 10)
+    # ----- Diagnostics for reward-MTP/WM coupling RCA (May-2026 P39) -----
+    # Extra autograd.grad(retain_graph=True) + tokenizer encode.  Default
+    # OFF (probes belong in gitignored scratch/; env-free must not pay
+    # a second backward every 10 iters).  Opt in via TrainConfig /
+    # ENV_OVERRIDES.  B + C stay default OFF.
     diag_perhead_grads_every = int(
-        os.environ.get('DREAMER_DIAG_PERHEAD_GRADS_EVERY', '10') or 0)
+        getattr(cfg, 'diag_perhead_grads_every', 0) or 0)
     diag_latent_stability_every = int(
-        os.environ.get('DREAMER_DIAG_LATENT_STABILITY_EVERY', '10') or 0)
-    diag_disable_reward_mtp_in_p1 = bool(int(
-        os.environ.get('DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1', '0') or 0))
-    diag_reward_mtp_stop_grad_in_p1 = bool(int(
-        os.environ.get('DREAMER_DIAG_REWARD_MTP_STOP_GRAD_IN_P1', '0') or 0))
+        getattr(cfg, 'diag_latent_stability_every', 0) or 0)
+    diag_disable_reward_mtp_in_p1 = bool(
+        getattr(cfg, 'diag_disable_reward_mtp_in_p1', False))
+    diag_reward_mtp_stop_grad_in_p1 = bool(
+        getattr(cfg, 'diag_reward_mtp_stop_grad_in_p1', False))
     diag_latent_ref: Optional[Dict[str, torch.Tensor]] = None
     diag_perhead_last: Dict[str, float] = {}
     if diag_disable_reward_mtp_in_p1 and diag_reward_mtp_stop_grad_in_p1:
@@ -7749,6 +12415,90 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             return 2
         return 3
 
+    def _apply_curriculum_stage(phase: int) -> None:
+        """Latch freeze/DOB to ``phase``.  Call at loop start AND after a
+        same-iter phase transition — otherwise the first P2 train step still
+        has g trainable (full-BPTT gain-match on skip-storm-restored weights).
+        """
+        nonlocal _cur_stage, _wm_frozen_now
+        if not curriculum:
+            return
+        phase = int(phase)
+        if _cont_curric:
+            env._disturbance_prob_override = (
+                float(getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
+                if phase < 3
+                else float(getattr(cfg, 'curriculum_stage3_disturbance_prob',
+                                   0.85)))
+            if _cur_stage != phase:
+                _cur_stage = phase
+                model.set_dob_active(False)
+                if _cur_stage < 3:
+                    _fz = model.set_world_model_trainable(
+                        g=True, dob=False, reward=True)
+                    _desc = (f'WM-id (cont gain+disturbance latent; g TRAINS, '
+                             f'disturbance {env._disturbance_prob_override:.2f}, '
+                             f'gain-match supervises the gain)')
+                else:
+                    _fz = model.set_world_model_trainable(
+                        g=False, dob=False, reward=True)
+                    _wm_frozen_now = True
+                    _desc = (f'actor/critic on FROZEN cont-WM (disturbance '
+                             f'{env._disturbance_prob_override:.2f}; real-plant '
+                             f'DR OFF; DOB-free disturbance via cont channel)')
+                print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
+                      f"steps{total_env_steps}: {_desc} "
+                      f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']}]",
+                      flush=True)
+                if not _dynamics_g_trainable(model):
+                    _release_rest_ic_after_g_freeze(
+                        getattr(model, 'dynamics', None))
+            return
+        if phase == 1:
+            env._disturbance_prob_override = 0.0
+        elif phase == 2:
+            env._disturbance_prob_override = float(
+                getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
+        else:
+            env._disturbance_prob_override = float(
+                getattr(cfg, 'curriculum_stage3_disturbance_prob', 0.85))
+        if _cur_stage == phase:
+            return
+        _cur_stage = phase
+        if _cur_stage == 1:
+            model.set_dob_active(False)
+            _fz = model.set_world_model_trainable(
+                g=True, dob=False, reward=True)
+            _desc = ('CLEAN-WM id (g trains, '
+                     + ('DOB suppressed, ' if bool(getattr(cfg, 'dob_enabled', False)) else '')
+                     + 'disturbance 0)')
+        elif _cur_stage == 2:
+            _dob_on = bool(getattr(cfg, 'dob_enabled', False))
+            model.set_dob_active(_dob_on)
+            _fz = model.set_world_model_trainable(
+                g=False, dob=_dob_on, reward=True)
+            _est = ('DOB id (observer A,K)' if _dob_on
+                    else 'disturbance-head id (frozen-g readout)')
+            _desc = (f'{_est} (g FROZEN + reward train via recon '
+                     f'innovation, disturbance '
+                     f'{env._disturbance_prob_override:.2f})')
+        else:
+            model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
+            _fz = model.set_world_model_trainable(
+                g=False, dob=False, reward=True)
+            _wm_frozen_now = True
+            _wmtag = 'WM+DOB' if bool(getattr(cfg, 'dob_enabled', False)) else 'WM'
+            _desc = (f'real-sim actor/critic on FROZEN {_wmtag} observer '
+                     f'(disturbance {env._disturbance_prob_override:.2f}; '
+                     f'real-plant DR ON for actor robustness)')
+        print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
+              f"steps{total_env_steps}: {_desc} "
+              f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
+              f"trainable-flags set]", flush=True)
+        if not _dynamics_g_trainable(model):
+            _release_rest_ic_after_g_freeze(
+                getattr(model, 'dynamics', None))
+
     # Seed buffer.  P0 (2026-05-05): instead of two uniform-random episodes
     # — which on cliff-shaped reward landscapes (this plant: raw_min=-250,
     # raw_max=+0.1) produce nothing but violation transitions and leave
@@ -7768,11 +12518,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # only mid-MV.  Audit (output/test_sim/_data_audit_v2_*) showed the
     # legacy zero-centred baseline_seed only excited 20 % of the MV
     # band; this stratification raises that to ~100 % with the same
-    # episode budget.  Op-band defaults to PRBS-1-sigma (0.6) and is
-    # overridable via ``DREAMER_BASELINE_SEED_OP_BAND``.
-    baseline_op_band = float(os.environ.get(
-        'DREAMER_BASELINE_SEED_OP_BAND',
-        str(min(0.6, float(prbs_op_band)))))
+    # episode budget.  Op-band is a TrainConfig field (unitless);
+    # ``DREAMER_BASELINE_SEED_OP_BAND`` is in ENV_OVERRIDES.
+    baseline_op_band = _resolve_baseline_seed_op_band(cfg, prbs_op_band)
     if n_baseline_seed > 0:
         # Stratified centres: split the operating band into
         # ``n_baseline_seed`` equal strata, draw one centre per stratum
@@ -7803,8 +12551,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     action_std=baseline_seed_std,
                                     op_band=prbs_op_band)
         buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-        if isolation_buf is not None:   # MV-isolated (MV swept, DV/others held)
-            isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
         total_env_steps += cfg.episode_length
 
     # Constant-action / step-and-settle seed (run_p31 RCA 2026-05-21
@@ -7851,9 +12597,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             do_step_mask[step_idx] = True
         n_step_emitted = 0
         n_const_emitted = 0
+        n_mv_hold = _env_n_mv(env)
+        hold_rows = _per_mv_hold_rows(
+            levels, n_mv_hold, int(env.action_dim), env.rng)
         for i, lvl in enumerate(levels):
+            level_i = (hold_rows[i] if hold_rows is not None
+                       else float(lvl))
             ep = _seed_one_const_or_step(env, cfg,
-                                          level=float(lvl),
+                                          level=level_i,
                                           do_step=bool(do_step_mask[i]))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
             total_env_steps += cfg.episode_length
@@ -7863,7 +12614,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 n_const_emitted += 1
         print(f"[seed] const-action={n_const_emitted} "
               f"step-settle={n_step_emitted} "
-              f"(step_fraction={step_frac:.2f}, op_band={const_op_band:.2f})",
+              f"(step_fraction={step_frac:.2f}, op_band={const_op_band:.2f}"
+              f"{'' if hold_rows is None else f', mimo_hold n_mv={n_mv_hold}'})",
               flush=True)
 
     # APC step-test seed episodes (P51 design, 2026-05-25).  Held-MV
@@ -7887,13 +12639,19 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         st_jit = env.rng.uniform(-0.05, 0.05,
                                    size=st_levels.shape).astype('float32')
         st_levels = np.clip(st_levels + st_jit * const_op_band, -1.0, 1.0)
+        st_hold_rows = _per_mv_hold_rows(
+            st_levels, n_mv, int(env.action_dim), env.rng)
         for ep_idx, lvl in enumerate(st_levels):
             # Round-robin primary DV so each DV channel gets balanced
             # coverage across the seed batch.  -1 disables when n_dv=0.
             primary = (ep_idx % n_dv) if n_dv > 0 else -1
-            ep = collect_step_test_episode(env, cfg,
-                                             initial_level=float(lvl),
-                                             primary_dv_pos=int(primary))
+            primary_mv = (ep_idx % n_mv) if n_mv > 1 else -1
+            level_i = (st_hold_rows[ep_idx] if st_hold_rows is not None
+                       else float(lvl))
+            ep = collect_step_test_episode(
+                env, cfg, initial_level=level_i,
+                primary_dv_pos=int(primary),
+                primary_mv_pos=int(primary_mv))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] step-test={n_step_test_seed} "
@@ -7901,7 +12659,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"floor={n_step_test_floor}, "
               f"dv_share={cfg.step_test_dv_share:.2f}, "
               f"overlap_frac={cfg.step_test_overlap_frac:.2f}, "
-              f"primary_dv_bias={cfg.step_test_primary_dv_bias:.2f})",
+              f"primary_dv_bias={cfg.step_test_primary_dv_bias:.2f}"
+              f"{'' if st_hold_rows is None else f', mimo_hold n_mv={n_mv}'})",
               flush=True)
 
     # ---------- DV-PRBS seed episodes (2026-06-14, p121 DV-gain RCA) ----------
@@ -7921,9 +12680,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         for lvl in dvp_levels:
             ep = collect_dv_prbs_episode(env, cfg, mv_level=float(lvl))
             buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-            if isolation_buf is not None:   # DV-isolated (DV swept, MV held)
-                isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
-                                          ep['cont'])
             total_env_steps += cfg.episode_length
         print(f"[seed] dv-prbs={n_dv_prbs_seed} "
               f"(n_dv={n_dv}, op_frac={cfg.dv_prbs_op_frac:.2f}, "
@@ -7932,15 +12688,29 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               flush=True)
 
     # ---------- Isolated STEADY-STATE (settle) seed episodes (p08 RCA) ----------
-    # Long-hold isolated excitation (one input held at a level for >=2*K steps so
-    # a full K-rollout window reaches steady state), all OTHER inputs held → feeds
-    # the self-supervised ``wm_ss_match`` DC-gain term.  The isolation loss's
-    # per-step MSE is transient-dominated; without settled content it under-shoots
-    # the DC gain (p08: WM gains ×0.86 / ×0.78).  MV-isolated (MV swept long, DV
-    # held) + DV-isolated (DV swept long, MV held) → unbiased gain, NO identified
-    # value (nonlinear / black-box safe, local per operating point).
+    # Whole-episode isolated hold at a stratified ``_st_levels`` operating
+    # point (P28 follow-up 9/10): ONE input at that level, all others at 0,
+    # action_std=0, noise-free.  DV step is MV-action-isomorphic
+    # (isolated_level × span/2, no extra dv_prbs_op_frac).  Sampled
+    # windows are max(seq_len, K+1) so ss-match can reach SS.  Follow-up
+    # 8 still PRBS-stepped inside the episode (T/4 cap) and dithered the
+    # isolated MV, and wired ``_st_levels`` to *other* MVs (no-op on
+    # test_sim).  These are the ONLY episodes written to ``isolation_buf``
+    # (follow-up 8): ordinary MIMO PRBS / all-DV PRBS stay in the main
+    # replay buffer.  ``wm_isolation_dcv_match`` then scales each
+    # input's ``isolated_level`` by ``1/|G_i|`` (clipped to ±1, scale
+    # floored at 1.0 so strong-|G| stays at op-band — P38 RCA) so abs
+    # isolation/ss-match sees a louder weak-input |ΔCV| (P33 drowning;
+    # not a loss reweight).
     n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
     if isolation_buf is not None and n_settle > 0:
+        # Pre-iso resolve is only for dcv scales. Actor A/B with
+        # ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` skips it so gain-match
+        # freezes exactly where P37 did (after isolation+expert).
+        if _cfg_on(cfg, 'wm_isolation_dcv_match', True):
+            _maybe_resolve_gain_match_targets(env, cfg)
+        _mv_sc, _dv_sc = _isolation_dcv_scales(cfg, n_mv, n_dv, const_op_band)
+        _stash_isolation_dcv_scales(cfg, _mv_sc, _dv_sc, const_op_band)
         _st_levels = np.linspace(-const_op_band, const_op_band, n_settle,
                                  dtype='float32')
         _st_jit = env.rng.uniform(-0.05, 0.05,
@@ -7948,22 +12718,52 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _st_levels = np.clip(_st_levels + _st_jit * const_op_band, -1.0, 1.0)
         _n_mv_settle = 0
         _n_dv_settle = 0
-        for _lvl in _st_levels:          # MV-isolated settle (MV swept long, DV held)
-            ep = collect_prbs_episode(env, cfg, action_std=baseline_seed_std,
-                                      op_band=prbs_op_band, long_hold=True)
-            isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'], ep['cont'])
-            total_env_steps += cfg.episode_length
-            _n_mv_settle += 1
-        if n_dv > 0:
-            for _lvl in _st_levels:      # DV-isolated settle (DV swept long, MV held)
-                ep = collect_dv_prbs_episode(env, cfg, mv_level=float(_lvl),
-                                             long_hold=True)
+        # Per isolated input (P28 follow-up 7): 24 levels × n_mv + 24 × n_dv.
+        # test_sim 1+1 stays 24+24.  Hold every other MV/DV so ss-match
+        # is not a MIMO-confounded mixture.
+        for _mv_i in range(max(0, n_mv)):
+            _sc = _mv_sc[_mv_i] if _mv_i < len(_mv_sc) else 1.0
+            for _lvl in _st_levels:
+                ep = collect_prbs_episode(
+                    env, cfg, action_std=0.0,
+                    op_band=prbs_op_band, long_hold=True,
+                    isolate_dim=int(_mv_i), hold_level=0.0,
+                    isolated_level=_scale_isolation_level(float(_lvl), _sc))
                 isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
                                           ep['cont'])
                 total_env_steps += cfg.episode_length
-                _n_dv_settle += 1
+                _n_mv_settle += 1
+        if n_dv > 0:
+            for _dv_j in range(n_dv):
+                _sc = _dv_sc[_dv_j] if _dv_j < len(_dv_sc) else 1.0
+                for _lvl in _st_levels:
+                    ep = collect_dv_prbs_episode(
+                        env, cfg, mv_level=0.0, long_hold=True,
+                        isolate_dv_idx=int(_dv_j),
+                        isolated_level=_scale_isolation_level(
+                            float(_lvl), _sc))
+                    isolation_buf.add_episode(ep['obs'], ep['act'], ep['rew'],
+                                              ep['cont'])
+                    total_env_steps += cfg.episode_length
+                    _n_dv_settle += 1
+        _sc_txt = (
+            f"dcv_match min_scale={float(getattr(cfg, 'wm_isolation_dcv_min_scale', 1.0)):g} "
+            f"MV={['%.3g' % s for s in _mv_sc]} "
+            f"DV={['%.3g' % s for s in _dv_sc]} "
+            f"edge_du MV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _mv_sc]} "
+            f"DV={['%.3g' % _isolation_edge_du(s, const_op_band) for s in _dv_sc]}"
+            if _cfg_on(cfg, 'wm_isolation_dcv_match', True) else 'dcv_match=off')
+        _gr = getattr(cfg, '_isolation_dcv_g_ratio', None)
+        _eq = getattr(cfg, '_isolation_dcv_equalize_possible', None)
+        _sx = getattr(cfg, '_isolation_dcv_smax', None)
+        if _gr is not None:
+            _sc_txt += (
+                f" g_ratio={float(_gr):.3g} smax={float(_sx or 0.0):.3g} "
+                f"equalize={_eq}")
         print(f"[seed] isolated-settle MV={_n_mv_settle} DV={_n_dv_settle} "
-              f"(long-hold ≥2·K → feeds wm_ss_match DC-gain term)", flush=True)
+              f"(per_input={n_settle}, n_mv={n_mv}, n_dv={n_dv}; "
+              f"whole-ep hold @ stratified level, action_std=0 → "
+              f"wm_ss_match; {_sc_txt})", flush=True)
 
     # ---------- APC expert seed episodes (P81 design, 2026-06-03) ----------
     # Build the steady-state expert (static gain-schedule or NN surrogate),
@@ -7996,6 +12796,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 mv_names=mv_names, cv_names=cv_names, dv_names=dv_names,
                 use_ss_samples=bool(getattr(cfg, 'expert_use_ss_samples', True)),
                 seed=int(getattr(cfg, 'seed', 0)),
+                cfg=cfg,
             )
         except Exception as _exc:
             expert, expert_info = None, {'expert_type': expert_type,
@@ -8038,15 +12839,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # Cached optimizer set per phase.
     # Initialize hidden-disturbance probability for the starting phase
     # (hidden CV disturbance is the default unmeasured-disturbance model).
-    env._disturbance_prob_override = get_phase_disturbance_prob(phase=1)
+    env._disturbance_prob_override = get_phase_disturbance_prob(phase=1, cfg=cfg)
     # neural-apc-mbrl JOINT mode: skip the P1/P2 curriculum entirely.  The
     # seed-buffer fill above is the random PREFILL (DreamerV3 prefill);
     # from here co-train WM + actor + critic every step via the P3 path.
-    # Run the P3-entry setup ONCE (snapshot the PMPO prior, anchor the BC
-    # decay + cascade canary) since we never hit the phase-transition block.
+    # Run the P3-entry setup ONCE (anchor the BC decay + cascade canary)
+    # since we never hit the phase-transition block.
     if joint_mode:
         current_phase = 3
-        model.snapshot_prior_policy()
+        if _cfg_on(cfg, 'p3_reset_log_std', False):
+            model.reset_policy_exploration(opt_actor)
+            print('[p3] reset policy log_std residual (joint)', flush=True)
+        print('[p3] on-policy collect streams measured DV + Kalman '
+              '(train/serve match with rollout_observed)',
+              flush=True)
+        _warmup_p3_collect_serve_graph(model, device, cfg)
         p3_start_steps = total_env_steps
         try:
             _rs0 = float(model.ret_scale.detach().item())
@@ -8055,25 +12862,53 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         except Exception:
             pass
         env._current_phase = 3
-        env._disturbance_prob_override = get_phase_disturbance_prob(phase=3)
+        env._disturbance_prob_override = get_phase_disturbance_prob(
+            phase=3, cfg=cfg)
         # mbrl2 real-sim: joint mode goes straight to P3 -> enable DR now.
         if env.set_domain_randomization(True):
             print('[realsim] domain randomization ENABLED (joint P3)', flush=True)
         print(f"[joint] DreamerV3-style joint training: WM+actor+critic "
               f"co-trained every step from prefill "
-              f"(critic_warmup={p3_critic_warmup_iters} iters, "
-              f"prior_refresh={joint_prior_refresh_iters})", flush=True)
+              f"(critic_warmup={p3_critic_warmup_iters} iters)", flush=True)
 
     # p08 RCA: resolve the gain-match targets from the identified gains now that
     # obs-norm is fitted (seed buffer collected above) → re-anchor the WM
-    # steady-state gains that isolation-only let shrink.  Graceful no-op if the
-    # identification data is missing (isolation loss still supervises the gain).
+    # steady-state gains that isolation-only let shrink.  ALWAYS re-resolve
+    # here even if dcv_match already resolved pre-iso: isolation-settle +
+    # expert still update Welford cv_std, and P37 froze |G| at this point.
+    # Skipping would confound the P38 excitation A/B with a different Huber
+    # target.  Graceful no-op if the identification data is missing
+    # (isolation loss still supervises the gain).
     try:
         _resolve_gain_match_targets(env, cfg)
     except Exception as _gm_exc:
-        cfg.gain_match_coef = 0.0
-        print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
-              f'falling back to isolation-only WM gain supervision.', flush=True)
+        if not _gain_match_targets_ready(cfg):
+            cfg.gain_match_coef = 0.0
+            print(f'[gain-match] DISABLED (target resolution failed: {_gm_exc!r}); '
+                  f'falling back to isolation-only WM gain supervision.',
+                  flush=True)
+        else:
+            print(f'[gain-match] post-seed re-resolve FAILED ({_gm_exc!r}); '
+                  f'keeping pre-iso targets', flush=True)
+    try:
+        _cache_gain_match_rest_ic(env, cfg)
+    except Exception as _rest_exc:
+        print(f'[gain-match] rest-ic cache FAILED ({_rest_exc!r})',
+              flush=True)
+        if _cfg_on(cfg, 'gain_match_rest_ic', False):
+            raise RuntimeError(
+                'gain_match_rest_ic=True but rest cache failed; '
+                'refusing PRBS-posterior fallback (would confound P45)'
+            ) from _rest_exc
+    if (_cfg_on(cfg, 'gain_match_rest_ic', False)
+            and getattr(cfg, '_gain_match_rest_obs', None) is None):
+        raise RuntimeError(
+            'gain_match_rest_ic=True but rest cache is empty; '
+            'refusing PRBS-posterior fallback (would confound P45)')
+    _warmup_rest_ic_cuda_graph(getattr(model, 'dynamics', None), cfg, device)
+    _resolve_aux_tbptt_steps(cfg)
+    _resolve_gain_match_step(cfg)
+    _write_resolved_run_plan(cfg)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value
@@ -8112,105 +12947,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 wm_best_score=(float(wm_best_score)
                                 if wm_best_score > -1e17 else None),
                 phase_progress=_phase_progress,
+                cfg=cfg,
             )
         except Exception:
             pass
 
         # ---------- Staged curriculum stage control (2026-06-12) ----------
-        # Stage == current_phase.  Override the disturbance prob per stage
-        # (cheap, every iter) and apply the freeze/dob_active partition ONCE
-        # per stage via the ``_cur_stage`` latch (idempotent; survives the
-        # quality-gate phase extensions since it keys off the actual phase).
-        if curriculum:
-            if _cont_curric:
-                # Continuous-latent curriculum: WM-id (g trains + disturbance
-                # present) for stages 1-2, then actor on the frozen WM (stage 3).
-                # Disturbance ON throughout; the cont gain channel + gain-match
-                # hold the gain unbiased (no clean-data / frozen-g protection).
-                env._disturbance_prob_override = (
-                    float(getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
-                    if int(current_phase) < 3
-                    else float(getattr(cfg, 'curriculum_stage3_disturbance_prob',
-                                       0.85)))
-                if _cur_stage != int(current_phase):
-                    _cur_stage = int(current_phase)
-                    model.set_dob_active(False)
-                    if _cur_stage < 3:
-                        _fz = model.set_world_model_trainable(
-                            g=True, dob=False, reward=True)
-                        _desc = (f'WM-id (cont gain+disturbance latent; g TRAINS, '
-                                 f'disturbance {env._disturbance_prob_override:.2f}, '
-                                 f'gain-match supervises the gain)')
-                    else:
-                        _fz = model.set_world_model_trainable(
-                            g=False, dob=False, reward=True)
-                        _wm_frozen_now = True
-                        _igf = float(getattr(cfg,
-                                'actor_imag_gain_random_frac', 0.0) or 0.0)
-                        _desc = (f'actor/critic on FROZEN cont-WM (disturbance '
-                                 f'{env._disturbance_prob_override:.2f}; real-plant '
-                                 f'DR OFF; imagination loop-gain rand '
-                                 f'±{_igf:.3f}; DOB-free disturbance via cont '
-                                 f'channel)')
-                    print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
-                          f"steps{total_env_steps}: {_desc} "
-                          f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']}]",
-                          flush=True)
-            elif int(current_phase) == 1:
-                env._disturbance_prob_override = 0.0
-            elif int(current_phase) == 2:
-                env._disturbance_prob_override = float(
-                    getattr(cfg, 'curriculum_stage2_disturbance_prob', 1.0))
-            else:
-                env._disturbance_prob_override = float(
-                    getattr(cfg, 'curriculum_stage3_disturbance_prob', 0.85))
-            if _cur_stage != int(current_phase):
-                _cur_stage = int(current_phase)
-                if _cur_stage == 1:
-                    model.set_dob_active(False)
-                    _fz = model.set_world_model_trainable(
-                        g=True, dob=False, reward=True)
-                    _desc = ('CLEAN-WM id (g trains, '
-                             + ('DOB suppressed, ' if bool(getattr(cfg, 'dob_enabled', False)) else '')
-                             + 'disturbance 0)')
-                elif _cur_stage == 2:
-                    # Freeze g (protect the clean Stage-1 gain), turn the
-                    # disturbance estimator ON, keep wm_total so its innovation
-                    # trains the estimator on the FROZEN g.  With the DOB on this
-                    # is the neural-Kalman A,K; with the DOB off (p136 default)
-                    # it is the always-trainable disturbance_head reading the
-                    # frozen GRU latent's disturbance tracking.
-                    _dob_on = bool(getattr(cfg, 'dob_enabled', False))
-                    model.set_dob_active(_dob_on)
-                    _fz = model.set_world_model_trainable(
-                        g=False, dob=_dob_on, reward=True)
-                    _est = ('DOB id (observer A,K)' if _dob_on
-                            else 'disturbance-head id (frozen-g readout)')
-                    _desc = (f'{_est} (g FROZEN + reward train via recon '
-                             f'innovation, disturbance '
-                             f'{env._disturbance_prob_override:.2f})')
-                else:
-                    # Freeze g AND the observer; the real-sim actor/critic train
-                    # on the FROZEN WM(+DOB) observer.  _wm_frozen_now drops
-                    # wm_total in the P3 path so only the actor/critic optimise.
-                    model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
-                    _fz = model.set_world_model_trainable(
-                        g=False, dob=False, reward=True)
-                    _wm_frozen_now = True
-                    # mbrl2 real-sim: the actor/critic train on REAL rollouts of
-                    # the true plant with domain randomisation ENABLED at this
-                    # transition (set_domain_randomization(True)); the observer
-                    # was identified CLEAN in P1/P2.  The unmeasured OU
-                    # disturbance rides the real P3 data (a feed-forward target
-                    # the actor rejects via the DOB estimate in feat).
-                    _wmtag = 'WM+DOB' if bool(getattr(cfg, 'dob_enabled', False)) else 'WM'
-                    _desc = (f'real-sim actor/critic on FROZEN {_wmtag} observer '
-                             f'(disturbance {env._disturbance_prob_override:.2f}; '
-                             f'real-plant DR ON for actor robustness)')
-                print(f"[curriculum] >>> STAGE {_cur_stage} @iter{total_iters} "
-                      f"steps{total_env_steps}: {_desc} "
-                      f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
-                      f"trainable-flags set]", flush=True)
+        # Stage == current_phase.  Disturbance-prob every iter; freeze/DOB
+        # once per stage.  Re-applied after a same-iter phase transition
+        # (see after ``current_phase = new_phase``) so P2 train does not
+        # run full-BPTT gain-match with g still trainable.
+        _apply_curriculum_stage(int(current_phase))
 
         # ---------- P52 RCA: phase-transition quality gates ----------
         # When the env-step budget says "leave the current phase", check
@@ -8221,32 +12968,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         _candidate_phase = _phase_for(total_env_steps)
         if (current_phase == 1 and _candidate_phase == 2
                 and p1_gate_wm_ema_min_v > 0.0):
-            # Healthy?  EMA above floor AND plateaued (≥ K probes
-            # within ±plateau_frac of EMA-best).
-            _ema_ok = (wm_score_ema_best > -1e17
-                       and wm_score_ema_best >= p1_gate_wm_ema_min_v)
-            _plateau_ok = False
-            if _ema_ok and len(p1_score_ema_history) >= p1_gate_plateau_probes_v:
-                # 2026-05-27 (P57 RCA): adaptive plateau band.  The
-                # static ``plateau_frac × ema_best`` band (default 5 %)
-                # is too tight for plants where the WM-fidelity probe
-                # has high per-probe variance (P57: σ(probe)≈0.4 →
-                # σ(EMA)≈0.3 → 5 % of ema_best=2.7 = 0.135 ≪ noise).
-                # The gate then never sees "plateaued" even after the
-                # EMA has flattened in the noisy sense.  Widen the
-                # band to ``max(plateau_frac × ema_best, k × σ(recent EMAs))``
-                # — sim-agnostic, derived from the actual EMA noise
-                # observed in the last ``2 × plateau_probes`` probes.
-                recent = p1_score_ema_history[-p1_gate_plateau_probes_v:]
-                _noise_window = p1_score_ema_history[
-                    -max(p1_gate_plateau_probes_v * 2, 4):]
-                _noise_std = (float(np.std([e for _, e in _noise_window]))
-                              if len(_noise_window) >= 2 else 0.0)
-                _band_static = p1_gate_plateau_frac_v * wm_score_ema_best
-                _band_noise = 2.0 * _noise_std
-                _band = max(1e-6, _band_static, _band_noise)
-                _plateau_ok = all(
-                    abs(e - wm_score_ema_best) <= _band for _, e in recent)
+            # Healthy?  Recent EMA above floor.  Do not require return
+            # to all-time ``wm_score_ema_best`` (P40 warmup spike →
+            # unbounded extra P1).  Local-flat is logged, not gated.
+            _recent_ok, _local_flat, _recent_max, _plat_band = (
+                _p1_fidelity_local_plateau(
+                    p1_score_ema_history,
+                    n_probes=p1_gate_plateau_probes_v,
+                    plateau_frac=p1_gate_plateau_frac_v,
+                    ema_min=p1_gate_wm_ema_min_v))
+            _ema_ok = bool(_recent_ok)
+            _plateau_ok = bool(_recent_ok)
             # p20 gain-readiness gate: don't freeze g until the observer's
             # controlled step-response GAIN matches the real plant across the
             # operating band (the correlation/EMA fidelity above is gain-blind —
@@ -8255,20 +12987,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _gain_ok = True
             _gain_probe = None
             if (_ema_ok and _plateau_ok
-                    and os.environ.get('DREAMER_P1_GAIN_GATE', '1').lower()
-                        not in ('0', 'off', 'false', 'no')):
-                _gain_probe = _probe_observer_gain_ready(model, env, device, cfg)
+                    and _cfg_on(cfg, 'p1_gain_gate', True)):
+                _gain_probe, _ = _probe_observer_gain_ready_maybe_last_ok(
+                    model, env, device, cfg,
+                    recon=_wm_recon_scalar(wm_losses),
+                    recon_best=p1_recon_best,
+                    last_ok_sd=p1_last_ok_sd,
+                    last_ok_iter=int(p1_last_ok_iter))
                 if _gain_probe is not None:
                     _gain_ok = bool(_gain_probe.get('gain_ready', True))
-                    print(f"[gate p1->p2] gain-probe ready={_gain_ok} "
-                          f"DCgain_ratio[{_gain_probe['r_min']:.2f},"
-                          f"{_gain_probe['r_max']:.2f}] "
-                          f"worst={_gain_probe['worst_ratio']:.2f}"
-                          f"@{_gain_probe['worst_input']} "
-                          f"band={_gain_probe['band']} | noise: "
-                          f"spread_x{_gain_probe['noise_worst']:.1f} "
-                          f"signflips={_gain_probe['sign_flips']} "
-                          f"({_gain_probe['n_checks']} inputs)", flush=True)
+                    print(f"[gate p1->p2] gain-probe "
+                          f"{_format_gain_probe_line(_gain_probe)}",
+                          flush=True)
             if _ema_ok and _plateau_ok and _gain_ok:
                 phase_gate_decisions.append({
                     'gate': 'p1->p2', 'iter': int(total_iters),
@@ -8276,14 +13006,21 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     'pass': True, 'ext_steps': int(p1_ext_steps),
                     'wm_ema_best': float(wm_score_ema_best),
                     'wm_ema_best_iter': int(wm_score_ema_best_iter),
+                    'wm_ema_recent_max': float(_recent_max)
+                        if math.isfinite(_recent_max) else None,
+                    'local_flat': bool(_local_flat),
                     'gain_worst_ratio': (float(_gain_probe['worst_ratio'])
                                           if _gain_probe else None),
+                    'gain_probed_last_ok': bool(
+                        (_gain_probe or {}).get('probed_last_ok')),
                 })
                 print(f'[gate p1->p2] PASS at iter {total_iters}: '
-                      f'wm_ema_best={wm_score_ema_best:.3f} '
-                      f'(iter {wm_score_ema_best_iter}, '
-                      f'min={p1_gate_wm_ema_min_v:.2f}), '
-                      f'plateaued over last {p1_gate_plateau_probes_v} probes; '
+                      f'recent_max={_recent_max:.3f} '
+                      f'(global_best={wm_score_ema_best:.3f}@iter'
+                      f'{wm_score_ema_best_iter}, '
+                      f'min={p1_gate_wm_ema_min_v:.2f}, '
+                      f'local_flat={int(_local_flat)}, '
+                      f'band={_plat_band:.3f}); '
                       f'p1_extension={p1_ext_steps}/{p1_gate_max_ext_steps} steps',
                       flush=True)
             elif p1_ext_steps + p1_gate_check_step <= p1_gate_max_ext_steps:
@@ -8300,25 +13037,79 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         if wm_score_ema > -1e17 else None,
                     'wm_ema_best': float(wm_score_ema_best)
                         if wm_score_ema_best > -1e17 else None,
+                    'wm_ema_recent_max': float(_recent_max)
+                        if math.isfinite(_recent_max) else None,
+                    'local_flat': bool(_local_flat),
+                    'gain_probed_last_ok': bool(
+                        (_gain_probe or {}).get('probed_last_ok')),
                 })
+                if reason == 'ema_below_floor':
+                    _why = (f'recent_max={_recent_max:.3f} < '
+                            f'{p1_gate_wm_ema_min_v:.2f} '
+                            f'(global_best={wm_score_ema_best:.3f}@iter'
+                            f'{wm_score_ema_best_iter})')
+                elif reason == 'not_plateaued':
+                    _why = (f'recent_max={_recent_max:.3f} '
+                            f'not plateaued')
+                elif _gain_probe is not None:
+                    _why = (f'gain_not_ready worst='
+                            f'{_gain_probe["worst_ratio"]:.2f}'
+                            f'@{_gain_probe["worst_input"]}')
+                else:
+                    _why = 'gain_not_ready'
                 print(f'[gate p1->p2] FAIL ({reason}) at iter {total_iters}: '
-                      f'wm_ema_best={wm_score_ema_best:.3f} < '
-                      f'{p1_gate_wm_ema_min_v:.2f} — extending P1 by '
+                      f'{_why} — extending P1 by '
                       f'{p1_gate_check_step} steps to '
                       f'{p1 + p1_ext_steps} (cap {p1 + p1_gate_max_ext_steps})',
                       flush=True)
             else:
+                # Cap: freeze is imminent.  Always run the gain probe here —
+                # the per-check probe is gated on ema∧plateau, so a later
+                # ``not_plateaued`` cap used to hide an earlier
+                # ``gain_not_ready`` (P29: iter 75 DC 3.05@MV, cap printed
+                # only not_plateaued, ``actor_experiment_valid`` stayed True).
+                if (_gain_probe is None
+                        and _cfg_on(cfg, 'p1_gain_gate', True)):
+                    _gain_probe, _ = _probe_observer_gain_ready_maybe_last_ok(
+                        model, env, device, cfg,
+                        recon=_wm_recon_scalar(wm_losses),
+                        recon_best=p1_recon_best,
+                        last_ok_sd=p1_last_ok_sd,
+                        last_ok_iter=int(p1_last_ok_iter))
+                    if _gain_probe is not None:
+                        _gain_ok = bool(_gain_probe.get('gain_ready', True))
+                        print(f"[gate p1->p2] cap-time gain-probe "
+                              f"{_format_gain_probe_line(_gain_probe)}",
+                              flush=True)
                 phase_gate_decisions.append({
                     'gate': 'p1->p2', 'iter': int(total_iters),
                     'env_steps': int(total_env_steps),
                     'pass': False, 'capped': True,
                     'wm_ema_best': float(wm_score_ema_best)
                         if wm_score_ema_best > -1e17 else None,
+                    'gain_worst_ratio': (float(_gain_probe['worst_ratio'])
+                                          if _gain_probe else None),
+                    'gain_ready': (bool(_gain_probe.get('gain_ready'))
+                                   if _gain_probe else None),
+                    'gain_probed_last_ok': bool(
+                        (_gain_probe or {}).get('probed_last_ok')),
                 })
+                _cap_why = []
+                if not _ema_ok:
+                    _cap_why.append(
+                        f'wm_ema_best={wm_score_ema_best:.3f} < '
+                        f'{p1_gate_wm_ema_min_v:.2f}')
+                if not _plateau_ok:
+                    _cap_why.append('not_plateaued')
+                if not _gain_ok:
+                    p1_gain_not_ready_capped = True
+                    _cap_why.append(
+                        f'GAIN_NOT_READY(worst='
+                        f'{(_gain_probe or {}).get("worst_ratio", float("nan")):.2f}'
+                        f'@{(_gain_probe or {}).get("worst_input", "?")})')
                 print(f'[gate p1->p2] CAPPED — proceeding to P2 despite '
-                      f'wm_ema_best={wm_score_ema_best:.3f} < '
-                      f'{p1_gate_wm_ema_min_v:.2f} (cap '
-                      f'{p1_gate_max_ext_steps} steps reached)',
+                      f'{"; ".join(_cap_why) or "gate unmet"} '
+                      f'(cap {p1_gate_max_ext_steps} steps reached)',
                       flush=True)
                 mid_check_flags.append(
                     f'p1_gate_capped: wm_ema_best={wm_score_ema_best:.3f}'
@@ -8381,6 +13172,31 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         if new_phase != current_phase:
             print(f'[phase] transition {current_phase} -> {new_phase} '
                   f'at env_steps={total_env_steps}', flush=True)
+            if new_phase == 3:
+                _aev = _actor_experiment_valid(
+                    skip_storm_source=skip_storm_restore_source,
+                    gain_not_ready_capped=bool(p1_gain_not_ready_capped))
+                if not _aev:
+                    _skip_p3 = _should_skip_invalid_p3(
+                        actor_valid=_aev,
+                        skip_enabled=bool(getattr(
+                            cfg, 'skip_invalid_p3', True)))
+                    print('[actor] P3 is NOT an actor experiment: observer '
+                          'freeze is GAIN_NOT_READY and/or skip-storm fell '
+                          'back to fidelity-peak wm_best. Judge observer '
+                          'only; do not attribute econ to actor knobs.',
+                          flush=True)
+                    if _skip_p3:
+                        early_stop_reason = 'p3_skipped_invalid_observer'
+                        mid_check_flags.append('p3_skipped_invalid_observer')
+                        print('[p3-skip] skipping actor training; P2-end '
+                              'observer freeze stands. Validation still '
+                              'runs on final.pt (expert-BC policy). '
+                              'DREAMER_SKIP_INVALID_P3=0 to train anyway.',
+                              flush=True)
+                        print(f'[early-stop] tripped: {early_stop_reason}',
+                              flush=True)
+                        break
             # mbrl2 real-sim: enable domain randomisation at P3 entry so the
             # actor trains on a RANDOMISED true plant (robustness), while the
             # observer was identified CLEAN in P1/P2 (DR off).  No-op if the
@@ -8399,19 +13215,101 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # P1-extension + horizon-clip mechanism was removed
                 # 2026-05-20; the 1M-step default budget gives P1
                 # enough time at the paper-default H=15.
+                if p1_initial_recon is not None:
+                    last_recon = _wm_recon_scalar(wm_losses)
+                    print(f"[p1→p2] recon {p1_initial_recon:.4f} → "
+                          f"{last_recon:.4f}", flush=True)
                 if p1_initial_sf is not None and 'sf_loss' in wm_losses:
                     _sf_val = wm_losses.get('sf_loss', p1_initial_sf)
                     last_sf = float(_sf_val.detach().item()
                                     if torch.is_tensor(_sf_val) else _sf_val)
                     print(f"[p1→p2] sf_loss {p1_initial_sf:.4f} → "
                           f"{last_sf:.4f}", flush=True)
+                # P31: quality-gate CAPPED (and any P1→P2) must not freeze
+                # detonated full-BPTT weights. Skip-storm needs >5 skips
+                # in 100 iters; a single huge-grad step still explodes
+                # recon. Restore last-ok, reset AdamW, re-probe gain so
+                # actor_experiment_valid reflects the frozen observer.
+                _fr_ratio = float(getattr(
+                    cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
+                _fr_rlv = _wm_recon_scalar(wm_losses)
+                if _should_restore_last_ok_at_p1_freeze(
+                        recon=_fr_rlv,
+                        recon_best=p1_recon_best,
+                        ratio=_fr_ratio,
+                        has_last_ok=p1_last_ok_sd is not None,
+                        last_ok_locked=bool(p1_last_ok_locked)):
+                    try:
+                        assert p1_last_ok_sd is not None
+                        model.load_state_dict({
+                            k: v.to(device)
+                            for k, v in p1_last_ok_sd.items()
+                        })
+                        opt_world = torch.optim.AdamW(
+                            model.parameters_world(),
+                            lr=eff_lr_world, eps=1e-8,
+                            weight_decay=0.0)
+                        p1_detonated_freeze_restored = True
+                        _persist_last_ok_ckpt(
+                            out_dir / 'wm_last_ok.pt', p1_last_ok_sd, cfg,
+                            env.get_obs_norm_stats(), int(p1_last_ok_iter))
+                        try:
+                            _gp = _probe_observer_gain_ready(
+                                model, env, device, cfg)
+                            if _gp is not None:
+                                print(f'[p1→p2] detonated-freeze gain-probe '
+                                      f'{_format_gain_probe_line(_gp)}',
+                                      flush=True)
+                                p1_gain_not_ready_capped = not bool(
+                                    _gp.get('gain_ready', True))
+                        except Exception as _e_gp:
+                            print('[p1→p2] detonated-freeze gain-probe '
+                                  f'failed: {_e_gp!r} — keeping cap-time '
+                                  'GAIN_NOT_READY flag', flush=True)
+                        _best_s = (f'{p1_recon_best:.4f}'
+                                   if p1_recon_best is not None else 'n/a')
+                        _lock_why = (
+                            'locked last-ok after silent recon spike '
+                            '(P40: recovered extra-P1 must not freeze)'
+                            if p1_last_ok_locked
+                            else (f'recon {_fr_rlv:.4f} > {_fr_ratio:g}× '
+                                  f'last-ok best {_best_s}'))
+                        mid_check_flags.append(
+                            f'p1_detonated_freeze_restored: wm_last_ok iter '
+                            f'{p1_last_ok_iter} ({_lock_why})')
+                        print(
+                            f'[p1→p2] detonated freeze restored wm_last_ok '
+                            f'(iter {p1_last_ok_iter}); reset opt_world; '
+                            f'{_lock_why}. Skip-storm needs >5 skips; a '
+                            f'single huge-grad step must not freeze exploded g.',
+                            flush=True)
+                    except Exception as _e_fr:
+                        print(f'[p1→p2] detonated-freeze last-ok restore '
+                              f'failed: {_e_fr!r} — freezing current weights',
+                              flush=True)
                 # P39: warm-restore WM to its fidelity peak before P2.
-                if (wm_best_restore_at_p2
-                        and wm_best_ckpt_path is not None
-                        and wm_best_iter > 0
-                        and (total_iters - wm_best_iter)
-                                >= wm_best_restore_min_gap
-                        and wm_best_ckpt_path.exists()):
+                # Skip after skip-storm last-ok: this transition is the
+                # very next iter, and wm_best is the gain-blind peak.
+                _wb_exists = bool(wm_best_ckpt_path is not None
+                                  and wm_best_ckpt_path.exists())
+                if p1_detonated_freeze_restored:
+                    print('[p1→p2] WM warm-restore SKIPPED: detonated freeze '
+                          f'already restored wm_last_ok (iter '
+                          f'{p1_last_ok_iter}); wm_best is gain-blind and '
+                          'must not overwrite last-ok', flush=True)
+                elif skip_storm_p1_recovered:
+                    print('[p1→p2] WM warm-restore SKIPPED: skip-storm already '
+                          f'restored {skip_storm_restore_source} (iter '
+                          f'{skip_storm_restore_iter}); wm_best is gain-blind '
+                          'and must not overwrite last-ok', flush=True)
+                elif _should_warm_restore_wm_best(
+                        restore_enabled=wm_best_restore_at_p2,
+                        skip_storm_recovered=bool(skip_storm_p1_recovered),
+                        wm_best_iter=int(wm_best_iter),
+                        total_iters=int(total_iters),
+                        min_gap=int(wm_best_restore_min_gap),
+                        wm_best_exists=_wb_exists,
+                        last_ok_on_model=bool(p1_detonated_freeze_restored)):
                     _wb_iter0 = int(wm_best_iter)
                     try:
                         # p21 RCA: the fidelity-score wm_best can freeze a
@@ -8422,9 +13320,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # the AUTHORITATIVE transfer-matrix gain: keep whichever
                         # of {wm_best, current} is more gain-ready.
                         # DREAMER_WM_BEST_GAIN_GATE=0 disables.
-                        _gain_gate = os.environ.get(
-                            'DREAMER_WM_BEST_GAIN_GATE', '1').lower() \
-                            not in ('0', 'off', 'false', 'no')
+                        _gain_gate = _cfg_on(cfg, 'wm_best_gain_gate', True)
 
                         def _gain_badness(_pr):
                             if not _pr:
@@ -8482,6 +13378,20 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         print(f"[p1→p2] WM warm-restore failed: {_e} "
                               f"— continuing with current weights",
                               flush=True)
+                else:
+                    if not wm_best_restore_at_p2:
+                        _skip_why = ('default-off — freeze end-of-P1 g '
+                                     '(P28 RCA: gain-blind wm_best)')
+                    elif not _wb_exists:
+                        _skip_why = 'wm_best.pt missing'
+                    elif int(wm_best_iter) <= 0:
+                        _skip_why = 'no wm_best.pt yet'
+                    else:
+                        _skip_why = (
+                            f'gap {total_iters - wm_best_iter} '
+                            f'< min_gap {wm_best_restore_min_gap}')
+                    print(f'[p1→p2] WM warm-restore SKIPPED ({_skip_why})',
+                          flush=True)
                 # P90: freeze the WM CORE for P2+P3 (after the restore) so the
                 # critic warms up on the exact WM P3 uses and the fixed point
                 # can't re-drift.  Freeze dynamics (+ tokenizer for SF); KEEP
@@ -8492,8 +13402,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     for _p in model.dynamics.parameters():
                         _p.requires_grad_(False)
                         _nfz += 1
-                    if (getattr(model, 'world_model_type', 'sf_transformer')
-                            != 'rssm'
+                    if (not _is_rssm_interface(model)
                             and getattr(model, 'tokenizer', None) is not None):
                         for _p in model.tokenizer.parameters():
                             _p.requires_grad_(False)
@@ -8515,12 +13424,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # P90: warm-restore WM to its conv-aware fidelity peak before
                 # the P2→P3 FREEZE so P3 + the post-training diagnostics use the
                 # best-converged WM, not the drifted end-of-P2 one.
-                if (wm_best_restore_at_p3
-                        and wm_best_ckpt_path is not None
-                        and wm_best_iter > 0
-                        and (total_iters - wm_best_iter)
-                                >= wm_best_restore_min_gap
-                        and wm_best_ckpt_path.exists()):
+                if _should_warm_restore_wm_best(
+                        restore_enabled=wm_best_restore_at_p3,
+                        skip_storm_recovered=bool(skip_storm_p1_recovered),
+                        wm_best_iter=int(wm_best_iter),
+                        total_iters=int(total_iters),
+                        min_gap=int(wm_best_restore_min_gap),
+                        wm_best_exists=bool(
+                            wm_best_ckpt_path is not None
+                            and wm_best_ckpt_path.exists()),
+                        last_ok_on_model=bool(p1_detonated_freeze_restored)):
                     try:
                         _blob = torch.load(wm_best_ckpt_path,
                                             map_location=device,
@@ -8543,9 +13456,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                               f"— continuing with current weights",
                               flush=True)
             current_phase = new_phase
+            # Same-iter freeze: the loop-start latch still saw the OLD phase.
+            # Without this, the first P2 train step runs full-BPTT gain-match
+            # with g trainable (skip-storm recovery re-explodes; every P1→P2
+            # also leaked one extra gain-match step onto the freeze).
+            _apply_curriculum_stage(int(current_phase))
             if current_phase == 3:
-                # Snapshot the prior policy (PMPO behavioural prior, eq. 11).
-                model.snapshot_prior_policy()
+                if _cfg_on(cfg, 'p3_reset_log_std', False):
+                    model.reset_policy_exploration(opt_actor)
+                    _init = float(getattr(cfg, 'policy_init_log_std', -1.5))
+                    print('[p3] reset policy log_std residual → '
+                          f'σ=init ({_init:.3f}); μ (BC) kept; '
+                          'Adam log_std-row moments zeroed '
+                          '(P45: P1/P2 BC pinned σ_min)',
+                          flush=True)
+                print('[p3] on-policy collect streams measured DV + Kalman '
+                      '(train/serve match with rollout_observed)',
+                      flush=True)
+                _warmup_p3_collect_serve_graph(model, device, cfg)
                 # 2026-05-23 (P41 RCA): snapshot return_scale at P3 start
                 # so the bootstrap-cascade canary can detect runaway growth.
                 # ``model.ret_scale`` is the EMA buffer used by the critic
@@ -8562,9 +13490,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # phase start (the schedule is phase-length adaptive).
                 p3_start_steps = total_env_steps
             # Refresh hidden-disturbance per-episode probability for the
-            # new phase (default: 0.3 in P1/P2, 0.5 in P3).
+            # new phase (P1/P2: disturbance_prob_wm/p2; P3: agent cap).
             env._disturbance_prob_override = get_phase_disturbance_prob(
-                phase=int(current_phase))
+                phase=int(current_phase), cfg=cfg)
 
         # ----- Periodic const/step injection (all phases) -----
         # Keep the steady-state + step-response regimes represented in
@@ -8606,9 +13534,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     0, const_inject_n - 1, _n_step, dtype=int)] = True
             _n_c = 0
             _n_s = 0
+            _n_mv_hold = _env_n_mv(env)
+            _hold_rows = _per_mv_hold_rows(
+                _levels, _n_mv_hold, int(env.action_dim), env.rng)
             for _i, _lvl in enumerate(_levels):
+                _level = (_hold_rows[_i] if _hold_rows is not None
+                          else float(_lvl))
                 _ep = _seed_one_const_or_step(
-                    env, cfg, level=float(_lvl),
+                    env, cfg, level=_level,
                     do_step=bool(_do_step_mask[_i]))
                 buf.add_episode(_ep['obs'], _ep['act'],
                                  _ep['rew'], _ep['cont'])
@@ -8647,11 +13580,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _st_jit = env.rng.uniform(-0.05, 0.05,
                                        size=_st_levels.shape).astype('float32')
             _st_levels = np.clip(_st_levels + _st_jit * _st_op, -1.0, 1.0)
+            _n_mv_inj = _env_n_mv(env)
+            _st_hold = _per_mv_hold_rows(
+                _st_levels, _n_mv_inj, int(env.action_dim), env.rng)
             for _si, _slvl in enumerate(_st_levels):
                 _primary = _si % _n_dv_inj
+                _primary_mv = (_si % _n_mv_inj) if _n_mv_inj > 1 else -1
+                _level = (_st_hold[_si] if _st_hold is not None
+                          else float(_slvl))
                 _stp = collect_step_test_episode(
-                    env, cfg, initial_level=float(_slvl),
-                    primary_dv_pos=int(_primary))
+                    env, cfg, initial_level=_level,
+                    primary_dv_pos=int(_primary),
+                    primary_mv_pos=int(_primary_mv))
                 buf.add_episode(_stp['obs'], _stp['act'], _stp['rew'],
                                  _stp['cont'])
                 total_env_steps += cfg.episode_length
@@ -8839,7 +13779,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             for _p in model.dynamics.parameters():
                 _p.requires_grad_(False)
                 _nfz += 1
-            if (getattr(model, 'world_model_type', 'sf_transformer') != 'rssm'
+            if (not _is_rssm_interface(model)
                     and getattr(model, 'tokenizer', None) is not None):
                 for _p in model.tokenizer.parameters():
                     _p.requires_grad_(False)
@@ -8849,6 +13789,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                   f"({_nfz} param tensors) after pretrain — reward/actor/"
                   f"critic keep training on the static WM "
                   f"(wm_freeze_after_iters={wm_freeze_after_iters})", flush=True)
+            _release_rest_ic_after_g_freeze(
+                getattr(model, 'dynamics', None))
 
         # ----- Train -----
         wm_grad_norm = torch.tensor(0.0)
@@ -8857,10 +13799,34 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         wm_losses: Dict[str, torch.Tensor] = {}
         ag_losses: Dict[str, torch.Tensor] = {}
         ac_losses: Dict[str, torch.Tensor] = {}
+        iter_wm_skips = 0
+        iter_wm_applied = 0
 
-        for _ in range(cfg.train_steps_per_iter
-                          if current_phase != 3
-                          else max(1, int(cfg.phase3_train_steps_per_iter))):
+        # P19 DOB-ground units: running CV obs-norm std.  Once per logged
+        # iter (Welford barely moves in 100 WM steps) and only while the
+        # Kalman observer is live.  Stage-1 ``d_t≡0`` skips ground/reg.
+        if (current_phase in (1, 2)
+                and float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) > 0.0
+                and bool(getattr(getattr(model, 'dynamics', None),
+                                 'dob_active', False))):
+            try:
+                _ovar = np.asarray(env.get_obs_norm_stats().get('var'),
+                                   dtype='float64')
+                cfg._cv_obs_std = [  # type: ignore[attr-defined]
+                    float(np.sqrt(max(_ovar[int(i)], 1e-8)))
+                    for i in env.cv_indices]
+            except Exception:
+                pass
+
+        n_inner = (int(cfg.train_steps_per_iter) if current_phase != 3
+                   else max(1, int(cfg.phase3_train_steps_per_iter)))
+        _log_every = max(1, int(getattr(cfg, 'log_every', 1) or 1))
+        _will_log = ((int(total_iters) + 1) % _log_every == 0)
+        p1_rmtp_weight = (0.0 if diag_disable_reward_mtp_in_p1
+                          else float(cfg.reward_scale_loss_p1))
+        _need_dist = _wm_need_dist_target(model, cfg)
+        _p1_need_dist = (current_phase == 1 and _need_dist)
+        for _i in range(n_inner):
             _t = time.time()
             # mbrl2 real-sim: P3 actor-critic REINFORCE is ON-POLICY — sample the
             # dedicated on-policy buffer (recent current-policy episodes only), NOT
@@ -8871,32 +13837,37 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         if (current_phase == 3 and onpol_buf is not None
                             and onpol_buf.filled > 0)
                         else buf)
-            batch_np = _src_buf.sample(cfg.batch_size, cfg.seq_len, rng)
-            batch: Dict[str, torch.Tensor] = {}
-            for k, v in batch_np.items():
-                t = torch.from_numpy(v)
-                if device.type == 'cuda':
-                    t = t.pin_memory().to(device, non_blocking=True)
-                else:
-                    t = t.to(device)
-                batch[k] = t
+            # P1/P2: window must fit overshoot/gain-match K (follow-up 13).
+            # P3 on-policy stays seq_len (actor λ-returns, not DC-gain).
+            _sample_T = (int(cfg.seq_len) if current_phase == 3
+                         else _wm_train_seq_len(cfg))
+            # jsonl / banner use the last inner of a logged iter.  Skip
+            # encoder-var / Huber MV-DV splits / unused replay sample+H2D
+            # on the other inner steps (objective unchanged).  Leftover
+            # ``cont`` is never indexed; P3 on-policy also skips
+            # ``dist`` / ``expert`` (BC reads the critic slot).
+            _need_aux = _wm_need_logged_aux(_will_log, _i, n_inner)
+            cfg._wm_need_logged_aux = _need_aux  # type: ignore[attr-defined]
+            cfg._wm_need_enc_diag = _need_aux  # type: ignore[attr-defined]
+            _p1_mtp = (current_phase == 1 and _p1_need_agent_finetune(
+                p1_rmtp_weight, _will_log, _i, n_inner))
+            if current_phase == 1 and not _p1_mtp:
+                _h2d_keys = _p1_wm_h2d_keys(_p1_need_dist)
+            elif current_phase == 3:
+                _h2d_keys = _replay_h2d_keys(False, True, False)
+            else:
+                # P1 last logged inner (MTP) and all P2 inners.
+                _h2d_keys = _replay_h2d_keys(
+                    _p1_need_dist if current_phase == 1 else _need_dist,
+                    True)
+            batch_np = _src_buf.sample(
+                cfg.batch_size, _sample_T, rng, keys=_h2d_keys)
+            batch = _batch_np_to_device(batch_np, device, keys=_h2d_keys)
             t_sample_acc += time.time() - _t
 
             if current_phase in (1, 2):
                 # World-model losses (always live in P1 + P2).
                 _t = time.time()
-                # P19: thread the running CV obs-norm std so the DOB grounding
-                # loss converts the engineering disturbance target into the
-                # normalized-CV units d_t lives in (no-op unless dob_ground_coef>0).
-                if float(getattr(cfg, 'dob_ground_coef', 0.0) or 0.0) > 0.0:
-                    try:
-                        _ovar = np.asarray(env.get_obs_norm_stats().get('var'),
-                                           dtype='float64')
-                        cfg._cv_obs_std = [  # type: ignore[attr-defined]
-                            float(np.sqrt(max(_ovar[int(i)], 1e-8)))
-                            for i in env.cv_indices]
-                    except Exception:
-                        pass
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
@@ -8910,22 +13881,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     if (wm_trunk_stopgrad_in_p2 and current_phase == 2
                             and isinstance(agent_hid, torch.Tensor)):
                         agent_hid = agent_hid.detach()
-                    # P1 + P2 both train the reward MTP head (paper
-                    # Algorithm 1: tokenizer + dynamics + reward + value
-                    # are co-trained throughout WM pretraining).
-                    # Previously P1 used only ``recon + sf``, leaving
-                    # the reward head untrained until P2 (~10 iters of
-                    # reward gradient at our default budget).
-                    # validate-iter80 RCA (2026-05-06): reward head
-                    # Pearson r = 0.16 with pred_std=2.8 vs real_std=80
-                    # — under-trained.  Adding reward MTP to P1 gives
-                    # ~3× more reward-head gradient updates over the
-                    # full schedule.  BC loss is *not* added in P1
-                    # because random-action episodes carry no expert
-                    # signal; cloning them collapses the actor prior
-                    # to uniform (preserves the existing P2-only BC
-                    # rationale documented at TrainConfig.bc_scale).
-                    if current_phase == 1:
+                    # P1 reward-MTP is opt-in (``reward_scale_loss_p1``,
+                    # paper default 0 — head trains in P2+).  BC is
+                    # never in the P1 loss (random-action clone would
+                    # collapse the prior).  Skip the unused MTP forward
+                    # except the last inner step of a logged iter.
+                    if (current_phase == 1
+                            and _p1_mtp):
                         # P39 diag C: optional stop-gradient on agent_hid
                         # before reward-MTP head, to isolate whether
                         # reward-MTP gradients distort the encoder/dynamics
@@ -8936,8 +13898,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 and not diag_disable_reward_mtp_in_p1
                                 and isinstance(agent_hid, torch.Tensor)):
                             _hid_for_agent = agent_hid.detach()
-                        ag_losses = agent_finetune_loss(model, batch,
-                                                          _hid_for_agent, cfg)
+                        if p1_rmtp_weight == 0.0:
+                            with torch.no_grad():
+                                ag_losses = agent_finetune_loss(
+                                    model, batch, _hid_for_agent, cfg)
+                        else:
+                            ag_losses = agent_finetune_loss(
+                                model, batch, _hid_for_agent, cfg)
                 # Phase 2: also update reward + policy via MTP (eq. 9).
                 if current_phase == 2:
                     with torch.amp.autocast(device_type=device.type,
@@ -8959,8 +13926,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     # honoured as a hard override to force-zero the P1
                     # weight regardless of cfg, for backward-compat with
                     # ad-hoc ablation runs.
-                    p1_rmtp_weight = (0.0 if diag_disable_reward_mtp_in_p1
-                                       else float(cfg.reward_scale_loss_p1))
                     if p1_rmtp_weight == 0.0:
                         total_loss = wm_losses['wm_total']
                     else:
@@ -8974,26 +13939,35 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 else:
                     total_loss = wm_losses['wm_total']
 
-                # MIMO self-supervised per-INPUT isolation (P1/P2 only): the
-                # general nonlinear/black-box DV+MV gain supervisor.  Sample the
-                # isolated-excitation buffer + roll the prior ``sample=False`` so
-                # the gradient lands in the cont-gain channel (bypassing the
-                # categorical bottleneck that attenuates subdominant inputs).
+                # MIMO self-supervised per-INPUT isolation (P1, and P2 only
+                # while g still trains): isolated-excitation buffer + prior
+                # roll ``sample=False`` so the gradient lands in the cont-gain
+                # channel.  Skip when g is frozen (DOB curriculum P2) — the
+                # extra unroll cannot update frozen params (dead hot-path
+                # forward).  Follow-up 11 skips the in-graph g-only aux
+                # (overshoot / held / gain-match) for the same reason.
+                # Window length is max(seq_len, K+1) so a slow plant's
+                # settle horizon still fits (test_sim unchanged).
                 if (isolation_buf is not None and isolation_buf.filled > 0
                         and current_phase in (1, 2)
+                        and _dynamics_g_trainable(model)
                         and float(getattr(cfg, 'wm_input_isolation_coef', 0.0)
                                   or 0.0) > 0.0):
-                    _iso_np = isolation_buf.sample(cfg.batch_size, cfg.seq_len,
-                                                   rng)
-                    _iso_obs = torch.from_numpy(_iso_np['obs']).to(device)
-                    _iso_act = torch.from_numpy(_iso_np['act']).to(device)
+                    _iso_np = isolation_buf.sample(
+                        cfg.batch_size, _isolation_sample_seq_len(cfg), rng,
+                        keys=('obs', 'act'))
+                    _iso = _batch_np_to_device(
+                        _iso_np, device, slot='iso')
+                    _iso_obs, _iso_act = _iso['obs'], _iso['act']
                     with torch.amp.autocast(device_type=device.type,
                                               dtype=torch.bfloat16,
                                               enabled=(device.type == 'cuda')):
-                        _iso_loss = _wm_input_isolation_loss(
+                        _iso_loss, _iso_extra = _wm_input_isolation_loss(
                             model, _iso_obs, _iso_act, cfg)
                     total_loss = total_loss + _iso_loss
                     wm_losses['wm_input_isolation_loss'] = _iso_loss.detach()
+                    for _ek, _ev in _iso_extra.items():
+                        wm_losses[_ek] = _ev
 
                 opt_world.zero_grad(set_to_none=True)
                 if current_phase == 2:
@@ -9117,29 +14091,24 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 if (not torch.isfinite(wm_grad_norm)) or (
                         _wm_skip_thr > 0.0 and float(wm_grad_norm) > _wm_skip_thr):
                     n_grad_skip += 1
+                    iter_wm_skips += 1
                     opt_world.zero_grad(set_to_none=True)
                     if current_phase == 2:
                         opt_actor.zero_grad(set_to_none=True)
                 else:
                     opt_world.step()
+                    iter_wm_applied += 1
                     if current_phase == 2 and torch.isfinite(actor_grad_norm):
                         opt_actor.step()
                 t_wm_acc += time.time() - _t
 
-            else:  # Phase 3 — imagination RL + continuous WM update
-                # Paper Algorithm 1: tokenizer + dynamics + reward head
-                # keep training in P3 alongside the actor / critic so the
-                # world model tracks the on-policy state-visit
-                # distribution.  We split the gradient steps: each P3
-                # iter does (a) one WM step on a fresh buffer batch
-                # (recon/sf + reward MTP), (b) one actor/critic step
-                # via imagination from a possibly different batch.
+            else:  # Phase 3 — real-sim actor-critic (frozen observer)
                 _t = time.time()
-                # mbrl2 real-sim controller: the WM(RSSM)+DOB is a FROZEN
-                # OBSERVER — there is NO P3 world-model update.  Train ONLY the
-                # actor + critic on λ-returns from the REAL simulator (the
-                # on-policy ``batch`` collected by ``collect_episode``, with
-                # domain randomisation), via ``_realsim_actor_critic_step``.
+                # mbrl2: the WM(RSSM)+DOB is a FROZEN OBSERVER — there is
+                # NO P3 world-model update.  Train ONLY the actor + critic
+                # on λ-returns from the REAL simulator (the on-policy
+                # ``batch`` collected by ``collect_episode``, with domain
+                # randomisation), via ``_realsim_actor_critic_step``.
                 # ``wm_losses``/``ag_losses`` stay empty so the log-row merge
                 # ``{**wm_losses, **ag_losses, **ac_losses}`` is a clean no-op.
                 wm_grad_norm = 0.0
@@ -9153,20 +14122,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 _critic_batch = None
                 if (onpol_buf is not None and onpol_buf.filled > 0
                         and buf.filled > 0):
-                    _cb_np = buf.sample(cfg.batch_size, cfg.seq_len, rng)
-                    _critic_batch = {}
-                    for _k, _v in _cb_np.items():
-                        # NB: do NOT reuse ``_t`` here — it is the AC-step
-                        # wall-clock timer (``_t = time.time()`` above), consumed
-                        # by ``t_ac_acc += time.time() - _t`` below.  Clobbering
-                        # it with a tensor made ``t_ac_s`` a Tensor -> the p04
-                        # json.dumps crash (2026-07-10).
-                        _ct = torch.from_numpy(_v)
-                        if device.type == 'cuda':
-                            _ct = _ct.pin_memory().to(device, non_blocking=True)
-                        else:
-                            _ct = _ct.to(device)
-                        _critic_batch[_k] = _ct
+                    _cb_keys = _replay_h2d_keys(False, True)
+                    _cb_np = buf.sample(
+                        cfg.batch_size, cfg.seq_len, rng, keys=_cb_keys)
+                    # NB: do NOT reuse ``_t`` here — it is the AC-step
+                    # wall-clock timer (``_t = time.time()`` above).
+                    _critic_batch = _batch_np_to_device(
+                        _cb_np, device, slot='critic', keys=_cb_keys)
                 # P83 FIX (p19 RCA): P3 expert-BC anchor weight — decay
                 # expert_bc_scale·(1→floor) across P3 so the actor starts pinned to
                 # the good BC-seeded policy and is progressively released to let
@@ -9179,12 +14141,23 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     _p3_prog = min(1.0, max(0.0,
                         (total_env_steps - p3_start_steps) / _p3_span))
                     _bc_w = _bc_scale * (1.0 - _p3_prog * (1.0 - _bc_floor))
+                _freeze_rs = (
+                    bool(getattr(cfg, 'return_scale_freeze_after_warmup', True))
+                    and p3_critic_warmup_iters > 0
+                    and p3_iters >= p3_critic_warmup_iters)
+                if _freeze_rs and not _return_scale_freeze_logged:
+                    print('[return-scale] FREEZE after critic warmup '
+                          f'(p3_iter={p3_iters}, scale='
+                          f'{float(model.ret_scale.reshape(-1)[0]):.3f})',
+                          flush=True)
+                    _return_scale_freeze_logged = True
                 with torch.amp.autocast(device_type=device.type,
                                           dtype=torch.bfloat16,
                                           enabled=(device.type == 'cuda')):
                     ac_losses = _realsim_actor_critic_step(
                         model, batch, cfg, critic_batch=_critic_batch,
-                        expert_bc_weight=_bc_w)
+                        expert_bc_weight=_bc_w,
+                        freeze_return_scale=_freeze_rs)
                 _actor_loss = ac_losses['actor_loss']
                 opt_actor.zero_grad(set_to_none=True)
                 opt_critic.zero_grad(set_to_none=True)
@@ -9219,20 +14192,82 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 model.update_target(cfg.target_critic_tau)
                 t_ac_acc += time.time() - _t
 
-        # Periodically refresh the KL trust-region prior so KL(π‖π_prior) tracks
-        # a slowly-moving target (a MOVING trust region, anti-hunting) instead of
-        # a static once-at-start snapshot.  JOINT: joint_prior_refresh_iters.
-        # PHASED P3 (p136): p3_prior_refresh_iters (the actor_kl_coef trust
-        # region needs a recent prior to BE a trust region, not an entropy pull).
-        _refresh_n = (joint_prior_refresh_iters if joint_mode
-                      else p3_prior_refresh_iters)
-        if (current_phase == 3 and p3_iters > 0 and _refresh_n > 0
-                and (p3_iters % _refresh_n) == 0):
-            model.snapshot_prior_policy()
-
         total_iters += 1
         if current_phase == 3:
             p3_iters += 1
+
+        # P1 last-healthy snapshot for skip-storm recovery.  Updated only
+        # on skip-free iters whose recon has not detonated vs the best
+        # seen — that is the late-P1 observer, not the fidelity-peak
+        # wm_best (which can be an early lucky spike).  A silent recon
+        # spike (P40 extra-P1 0.48; P41 original-P1 0.089) locks the
+        # snapshot so a later recovered recon cannot overwrite it.
+        # Lock is recon-only (not skip-free): P41 iter 58 skip 1 sat on
+        # the same spike.  Skip-storm restore unlocks unless the
+        # restored snapshot is GAIN-READY (P91 last_ok 31→44).
+        # Original-P1 wrap recovery also unlocks (P48 freeze restored
+        # 24 after a recovered 43× wrap) unless gain-ready-locked.
+        # Extra-P1 recovered basin stays locked (P40).
+        if (current_phase == 1
+                and bool(getattr(cfg, 'skip_storm_recover_p1', True))):
+            _rlv = _wm_recon_scalar(wm_losses)
+            _ok_ratio = float(getattr(
+                cfg, 'skip_storm_last_ok_recon_ratio', 5.0) or 5.0)
+            _lock_ratio = float(getattr(
+                cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0)
+            _was_locked = bool(p1_last_ok_locked)
+            p1_last_ok_locked = _should_lock_last_ok(
+                recon=_rlv,
+                recon_best=p1_recon_best,
+                lock_ratio=_lock_ratio,
+                has_last_ok=p1_last_ok_sd is not None,
+                skip_storm_restored=False,
+                already_locked=_was_locked,
+                extra_p1=int(p1_ext_steps) > 0,
+                gain_ready_locked=bool(p1_last_ok_gain_ready_locked))
+            if (not p1_last_ok_locked) and p1_last_ok_gain_ready_locked:
+                p1_last_ok_gain_ready_locked = False
+            if _was_locked and not p1_last_ok_locked:
+                _best_s = (f'{p1_recon_best:.4f}'
+                           if p1_recon_best is not None else 'n/a')
+                print(f'[wm-last-ok] unlocked after wrap recovery '
+                      f'(recon {_rlv:.4f} < {_lock_ratio:g}× best {_best_s}); '
+                      f'last-ok can advance',
+                      flush=True)
+            if p1_last_ok_locked and not _was_locked:
+                _best_s = (f'{p1_recon_best:.4f}'
+                           if p1_recon_best is not None else 'n/a')
+                print(f'[wm-last-ok] locked iter {p1_last_ok_iter} '
+                      f'(recon {_rlv:.4f} > {_lock_ratio:g}× best {_best_s}); '
+                      f'freeze restores this snapshot until wrap recovery '
+                      f'or skip-storm unlock (GAIN-READY skip-storm stay-locks)',
+                      flush=True)
+                if p1_last_ok_ckpt_path is None:
+                    p1_last_ok_ckpt_path = out_dir / 'wm_last_ok.pt'
+                if _persist_last_ok_ckpt(
+                        p1_last_ok_ckpt_path, p1_last_ok_sd, cfg,
+                        env.get_obs_norm_stats(), int(p1_last_ok_iter)):
+                    print(f'[wm-last-ok] wrote {p1_last_ok_ckpt_path.name} '
+                          f'(iter {p1_last_ok_iter})',
+                          flush=True)
+            if (not p1_last_ok_locked
+                    and iter_wm_applied > 0
+                    and iter_wm_skips == 0
+                    and _recon_still_healthy(_rlv, p1_recon_best, _ok_ratio)):
+                # In-process snapshot — skip-storm restore never needs
+                # disk on the happy path.  Reuses last-ok storage
+                # (``copy_``) after the first alloc; CPU if VRAM is
+                # tight.  Disk write on lock / storm / P1→P2 freeze.
+                try:
+                    p1_last_ok_sd = _refresh_module_state(
+                        p1_last_ok_sd, model, device)
+                    p1_last_ok_ckpt_path = out_dir / 'wm_last_ok.pt'
+                    p1_last_ok_iter = int(total_iters)
+                    if p1_recon_best is None or _rlv < p1_recon_best:
+                        p1_recon_best = float(_rlv)
+                except Exception as _e_ok:
+                    print(f'[wm-last-ok] snapshot failed: {_e_ok!r}',
+                          flush=True)
 
         if total_iters % cfg.log_every == 0:
             now = time.time()
@@ -9241,10 +14276,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             sps = (steps_dt / iter_dt) if iter_dt > 0 else 0.0
             gpu_mem_mb = None
             gpu_mem_peak_mb = None
+            gpu_mem_reserved_mb = None
             if device.type == 'cuda':
                 try:
                     gpu_mem_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                     gpu_mem_peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                    gpu_mem_reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
                     torch.cuda.reset_peak_memory_stats(device)
                 except Exception:
                     pass
@@ -9269,6 +14306,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                             else critic_grad_norm),
                 'gpu_mem_mb': gpu_mem_mb,
                 'gpu_mem_peak_mb': gpu_mem_peak_mb,
+                'gpu_mem_reserved_mb': gpu_mem_reserved_mb,
                 't_collect_s': t_collect_acc,
                 't_sample_s': t_sample_acc,
                 't_wm_s': t_wm_acc,
@@ -9286,14 +14324,70 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                             if iter_cv_violations else None),
                 'iter_mv_violation_mean': (float(np.mean(iter_mv_violations))
                                             if iter_mv_violations else None),
+                # Cumulative inner-step skips (P1 storm left 65 on P56
+                # P3 banners). Skip-storm already uses the per-log
+                # delta; emit it so P3 does not look like a live storm.
                 'n_grad_skip': int(n_grad_skip),
+                'n_grad_skip_iter': max(
+                    0, int(n_grad_skip) - int(grad_skip_prev_total)),
                 'buf_fill_pct': float(buf.filled) / max(1, buf.capacity_eps),
                 'wm_frozen': bool(_wm_frozen_now),
                 'expert_det_return': last_expert_det_return,
                 'agent_minus_expert_return': last_agent_minus_expert,
+                'p1_last_ok_iter': (int(p1_last_ok_iter)
+                                    if int(p1_last_ok_iter) >= 0 else None),
+                'p1_last_ok_locked': bool(p1_last_ok_locked),
+                'p1_last_ok_gain_ready_locked': bool(
+                    p1_last_ok_gain_ready_locked),
+                'p1_skip_storm_gain_ready': (
+                    bool(p1_skip_storm_gain_ready)
+                    if p1_skip_storm_gain_ready is not None else None),
+                'p1_skip_storm_gain_worst': (
+                    float(p1_skip_storm_gain_worst)
+                    if p1_skip_storm_gain_worst is not None else None),
+                'p1_recon_best': (float(p1_recon_best)
+                                  if p1_recon_best is not None else None),
+                'wm_score_ema': (float(wm_score_ema)
+                                  if wm_score_ema > -1e17 else None),
+                'wm_score_ema_best': (float(wm_score_ema_best)
+                                       if wm_score_ema_best > -1e17 else None),
+                'wm_score_ema_best_iter': (int(wm_score_ema_best_iter)
+                                           if int(wm_score_ema_best_iter) >= 0
+                                           else None),
             }
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
+            # Diagnosis scripts look for ``wm_gain_match_loss`` / isolation
+            # keys.  Isolation off (P40 env-free) used to omit the keys so
+            # parsers read None while the banner printed ``iso 0``.  Emit 0.
+            if 'joint_embed_loss' in row:
+                row.setdefault('jemb_loss', row['joint_embed_loss'])
+            if 'gain_match_loss' in row:
+                row.setdefault('wm_gain_match_loss', row['gain_match_loss'])
+            row.setdefault('wm_gain_match_mv_loss',
+                           float(row.get('gain_match_mv_loss') or 0.0))
+            row.setdefault('wm_gain_match_dv_loss',
+                           float(row.get('gain_match_dv_loss') or 0.0))
+            if 'gain_match_mv_ratio' in row:
+                row.setdefault('wm_gain_match_mv_ratio',
+                            row['gain_match_mv_ratio'])
+            if 'gain_match_dv_ratio' in row:
+                row.setdefault('wm_gain_match_dv_ratio',
+                            row['gain_match_dv_ratio'])
+            if 'gain_match_du_frac' in row:
+                row.setdefault('wm_gain_match_du_frac',
+                            row['gain_match_du_frac'])
+            if 'gain_match_clip_frac' in row:
+                row.setdefault('wm_gain_match_clip_frac',
+                            row['gain_match_clip_frac'])
+            if 'gain_match_ol_persist_rel' in row:
+                row.setdefault('wm_gain_match_ol_persist_rel',
+                            row['gain_match_ol_persist_rel'])
+            row.setdefault('wm_input_isolation_loss', 0.0)
+            row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
+            row.setdefault('wm_ss_match_loss', 0.0)
+            row.setdefault('dob_ground', 0.0)
+            row.setdefault('dob_ground_keep_frac', 0.0)
             # P39 diag A: emit last computed per-head grad norms (if any).
             # Values may be float (grad norms) or str (error messages); pass
             # strings through unchanged so jsonl serialisation works.
@@ -9369,20 +14463,62 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # JOINT mode has no phases -> tag rows 'joint' instead of 'P3';
             # phased mode keeps the informative P1/P2/P3 label.
             phase_tag = 'joint' if joint_mode else f'P{current_phase}'
+            # Observer discriminators on the live line (P29 leftover class:
+            # categorical KL vs deterministic joint-embed was only in jsonl
+            # while the banner printed RSSM ``sf≡0`` + deleted ``img_ret``).
+            _rssm = str(getattr(cfg, 'world_model_type', 'rssm')) in ('rssm', 'tssm')
+
+            def _lf(key, nd=4):
+                v = row.get(key, 0.0)
+                try:
+                    x = float(v)
+                    return (f'{x:.{nd}f}' if np.isfinite(x)
+                            else f'{0.0:.{nd}f}')
+                except (TypeError, ValueError):
+                    return f'{0.0:.{nd}f}'
+
+            _obs = (
+                f"recon {_lf('recon_loss')} "
+                + (f"precon {_lf('wm_prior_recon_loss')} "
+                   if _rssm else '')
+                + (f"kl {_lf('kl_loss', 3)} "
+                   f"jemb {_lf('joint_embed_loss')} "
+                   if _rssm else
+                   f"sf {_lf('sf_loss')} ")
+                + f"gmatch {_lf('gain_match_loss')} "
+                + (f"persist {_lf('gain_match_ol_persist_rel')} "
+                   if row.get('gain_match_ol_persist_rel') is not None else '')
+                + f"iso {_lf('wm_input_isolation_loss')} "
+                + f"ss {_lf('wm_ss_match_loss')} "
+                + (f"dobg {_lf('dob_ground')} "
+                   if current_phase >= 2 or joint_mode else '')
+            )
+            _enc = (
+                f"encvar {row.get('encoder_var_ratio', 0.0):.2f} "
+                f"zrank {row.get('z_eff_rank', 0.0):.1f}/{int(row.get('z_dim', 0))} "
+                f"alive {int(row.get('z_alive_dims', 0))} "
+                f"bc {row.get('bc_loss', 0.0):.3f} "
+            )
+            if current_phase >= 3 or joint_mode:
+                _logp = float(row.get('actor_logp_std') or 0.0)
+                _clip = float(row.get('actor_ratio_clip_frac') or 0.0)
+                _ac = (
+                    f"actor {row.get('actor_loss', 0.0):+.3f} "
+                    f"critic {row.get('critic_loss', 0.0):.3f} "
+                    f"ent {row.get('entropy_mean', 0.0):.3f} "
+                    f"logp {_logp:.2f} "
+                    f"clip {_clip:.2f} "
+                    f"rscale {row.get('return_scale', 0.0):.2f} "
+                    f"rtgt {row.get('critic_rew_to_tgt_var', 0.0):.4f} "
+                )
+            else:
+                _ac = ''
             print(f"[{row['timestamp']}] {phase_tag} iter {total_iters:4d} "
                   f"steps {total_env_steps:6d} sps {sps:5.1f} "
                   f"ret_ema {ema_str} ret_w {rwm_str} "
-                  f"recon {row.get('recon_loss', 0.0):.4f} "
-                  f"sf {row.get('sf_loss', 0.0):.4f} "
-                  f"encvar {row.get('encoder_var_ratio', 0.0):.2f} "
-                  f"zrank {row.get('z_eff_rank', 0.0):.1f}/{int(row.get('z_dim', 0))} "
-                  f"alive {int(row.get('z_alive_dims', 0))} "
-                  f"bc {row.get('bc_loss', 0.0):.3f} "
-                  f"actor {row.get('actor_loss', 0.0):+.3f} "
-                  f"critic {row.get('critic_loss', 0.0):.3f} "
-                  f"ent {row.get('entropy_mean', 0.0):.3f} "
-                  f"img_ret {row.get('imagined_return_mean', 0.0):+.3f} "
-                  f"skip {row.get('n_grad_skip', 0)}",
+                  f"{_obs}{_enc}{_ac}"
+                  f"skip {int(row.get('n_grad_skip_iter', 0) or 0)}/"
+                  f"{int(row.get('n_grad_skip', 0) or 0)}",
                   flush=True)
             last_log_time = now
             last_log_steps = total_env_steps
@@ -9400,9 +14536,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # than waiting for the phase transition.  Default every
             # 10 log-iters; disable via DREAMER_WM_PROBE_EVERY_ITERS=0.
             try:
-                _probe_every = int(os.environ.get(
-                    'DREAMER_WM_PROBE_EVERY_ITERS', '10') or 0)
-            except ValueError:
+                _probe_every = int(getattr(
+                    cfg, 'wm_probe_every_iters', 10) or 0)
+            except (TypeError, ValueError):
                 _probe_every = 0
             if (_probe_every > 0
                     and current_phase in (1, 2)
@@ -9447,8 +14583,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # degenerate flat-but-"converged" WM earns no credit.
                         # Weight via DREAMER_WM_FIDELITY_CONV_WEIGHT (0=off).
                         _conv_frac = _pbe.get('wm_converge_frac')
-                        _conv_w = float(os.environ.get(
-                            'DREAMER_WM_FIDELITY_CONV_WEIGHT', '1.0'))
+                        _conv_w = float(getattr(
+                            cfg, 'wm_fidelity_conv_weight', 1.0) or 0.0)
                         if (_conv_w > 0.0 and _conv_frac is not None
                                 and int(_pbe.get('best_h', 0)) > 0):
                             _score = _score + _conv_w * float(_conv_frac)
@@ -9464,8 +14600,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # recon ⇒ better gain, the control-relevant property).
                         # Weight via DREAMER_WM_FIDELITY_RECON_WEIGHT (0=off,
                         # legacy).  Uses the most recent training recon_loss.
-                        _recon_w = float(os.environ.get(
-                            'DREAMER_WM_FIDELITY_RECON_WEIGHT', '3.0'))
+                        _recon_w = float(getattr(
+                            cfg, 'wm_fidelity_recon_weight', 3.0) or 0.0)
                         if _recon_w > 0.0:
                             try:
                                 _rl = wm_losses.get('recon_loss')
@@ -9486,8 +14622,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # high-variance early checkpoint cannot win on spurious
                         # CV variance (mirrors the overshoot/held recon gates).
                         # Weight via DREAMER_WM_FIDELITY_GAIN_WEIGHT (0=off).
-                        _gain_w = float(os.environ.get(
-                            'DREAMER_WM_FIDELITY_GAIN_WEIGHT', '3.0'))
+                        _gain_w = float(getattr(
+                            cfg, 'wm_fidelity_gain_weight', 3.0) or 0.0)
                         _gain_fid = _pbe.get('wm_gain_fidelity')
                         if _gain_w > 0.0 and _gain_fid is not None:
                             try:
@@ -9495,8 +14631,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                 _rlv = float(_rl.detach().item()
                                               if torch.is_tensor(_rl)
                                               else _rl)
-                                _gate_thr = float(os.environ.get(
-                                    'DREAMER_WM_FIDELITY_GAIN_GATE_RECON', '0.15'))
+                                _gate_thr = float(getattr(
+                                    cfg, 'wm_fidelity_gain_gate_recon', 0.15)
+                                    or 0.15)
                                 _gate = (min(1.0, _gate_thr / max(_rlv, 1e-6))
                                           if np.isfinite(_rlv) else 0.0)
                                 _score = _score + _gain_w * float(_gain_fid) * _gate
@@ -9597,6 +14734,18 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                       f"{p1_gate_check_step}; deferring "
                                       f"to natural P2→P3 transition",
                                       flush=True)
+                            elif _wm_fidelity_es_suppressed_frozen_g(
+                                    _dynamics_g_trainable(model)):
+                                # Curriculum P2 freezes g.  A gain-blind
+                                # P2-open probe cannot improve, so patience
+                                # otherwise kills DOB after ~40 iters (P30).
+                                if not wm_fid_es_frozen_g_logged:
+                                    wm_fid_es_frozen_g_logged = True
+                                    print(
+                                        '[wm-fidelity-ES] suppressed: '
+                                        'dynamics g frozen (P2 cannot '
+                                        'improve a gain-blind P2-open probe)',
+                                        flush=True)
                             else:
                                 early_stop_reason = (
                                     f'wm_fidelity_degradation: EMA score '
@@ -9619,6 +14768,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 if (current_phase == 1 and p1_initial_sf is None
                         and 'sf_loss' in row and row['sf_loss'] > 1e-6):
                     p1_initial_sf = float(row['sf_loss'])
+                # RSSM/TSSM emit sf_loss≡0 (shortcut-forcing is N/A).
+                # Capture recon so P1→P2 still prints a WM-learning delta.
+                if (current_phase == 1 and p1_initial_recon is None
+                        and row.get('recon_loss') is not None
+                        and float(row['recon_loss']) > 1e-8):
+                    p1_initial_recon = float(row['recon_loss'])
 
                 # --- Hard fails ---
                 # Grad-skip storm.
@@ -9633,127 +14788,250 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 window_skips = sum(s for (it_, s) in grad_skip_history
                                     if it_ > total_iters - window_iters)
                 if window_skips > window_max:
-                    early_stop_reason = (
-                        f'grad_skip_storm: {window_skips} skips in last '
-                        f'{window_iters} iters (>{window_max})')
+                    if p1_last_ok_sd is not None:
+                        _ckpt, _src = p1_last_ok_ckpt_path, 'wm_last_ok'
+                    else:
+                        _ckpt, _src = _skip_storm_restore_ckpt(
+                            None, wm_best_ckpt_path)
+                    _recover_p1 = (
+                        current_phase == 1
+                        and bool(getattr(cfg, 'skip_storm_recover_p1', True))
+                        and (p1_last_ok_sd is not None or _ckpt is not None))
+                    if _recover_p1:
+                        # P27 RCA / P28 / P31: P1 skip-storm is a full-BPTT
+                        # blow-up of the gain-match roll, not an unrecoverable
+                        # NaN.  Restore the last skip-free observer
+                        # (wm_last_ok), not the fidelity-peak wm_best (lucky
+                        # early spike).  Drop AdamW moments (they hold the
+                        # 1e12 direction).  First storm keeps original P1
+                        # (P30 froze iter 18); Nth caps → Stage 2.
+                        try:
+                            if p1_last_ok_sd is not None:
+                                model.load_state_dict({
+                                    k: v.to(device)
+                                    for k, v in p1_last_ok_sd.items()
+                                })
+                                _persist_last_ok_ckpt(
+                                    out_dir / 'wm_last_ok.pt', p1_last_ok_sd,
+                                    cfg, env.get_obs_norm_stats(),
+                                    int(p1_last_ok_iter))
+                            else:
+                                _blob = torch.load(
+                                    _ckpt, map_location=device,
+                                    weights_only=False)
+                                model.load_state_dict(_blob['model'])
+                            opt_world = torch.optim.AdamW(
+                                model.parameters_world(),
+                                lr=eff_lr_world, eps=1e-8,
+                                weight_decay=0.0)
+                            skip_storm_p1_n += 1
+                            _cap_after = max(1, int(getattr(
+                                cfg, 'skip_storm_p1_cap_after', 2)))
+                            _continue_p1 = _skip_storm_should_continue_p1(
+                                skip_storm_p1_n, _cap_after)
+                            if _continue_p1:
+                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
+                                    _skip_storm_continue_p1(
+                                        p1, p1_ext_steps,
+                                        p1_gate_max_ext_steps))
+                            else:
+                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
+                                    _force_p1_cap_at(total_env_steps))
+                            grad_skip_history.clear()
+                            skip_storm_p1_recovered = True
+                            skip_storm_restore_source = _src
+                            skip_storm_restore_iter = (
+                                int(p1_last_ok_iter)
+                                if _src == 'wm_last_ok'
+                                else int(wm_best_iter))
+                            # Probe restored weights: cap-path sets
+                            # actor_experiment_valid; continue-path
+                            # stay-locks a GAIN-READY last_ok (P91).
+                            # Print the 5-level line (P92 LIVE storm-1
+                            # unlock had no probe dump — teacher jsonl
+                            # ≠ GAIN-READY).
+                            _storm_gain_ready = None
+                            _gp = None
+                            try:
+                                _gp = _probe_observer_gain_ready(
+                                    model, env, device, cfg)
+                                if _gp is not None and 'gain_ready' in _gp:
+                                    _storm_gain_ready = bool(_gp['gain_ready'])
+                                    p1_skip_storm_gain_ready = _storm_gain_ready
+                                    if _gp.get('worst_ratio') is not None:
+                                        p1_skip_storm_gain_worst = float(
+                                            _gp['worst_ratio'])
+                                    if (not _continue_p1
+                                            and not _storm_gain_ready):
+                                        p1_gain_not_ready_capped = True
+                            except Exception as _e_storm_gp:
+                                print(f'[skip-storm] gain-probe failed: '
+                                      f'{_e_storm_gp!r}', flush=True)
+                            if _gp is not None:
+                                try:
+                                    print(
+                                        f'[skip-storm] gain-probe '
+                                        f'{_format_gain_probe_line(_gp)}',
+                                        flush=True)
+                                except Exception as _e_storm_fmt:
+                                    print(f'[skip-storm] gain-probe '
+                                          f'ready={_storm_gain_ready} '
+                                          f'(format failed: {_e_storm_fmt!r})',
+                                          flush=True)
+                            else:
+                                print('[skip-storm] gain-probe None '
+                                      '(unlock)', flush=True)
+                            if _should_unlock_last_ok_after_skip_storm(
+                                    continue_p1=_continue_p1,
+                                    restored_gain_ready=_storm_gain_ready):
+                                if p1_last_ok_locked:
+                                    print('[wm-last-ok] unlocked after '
+                                          'skip-storm restore',
+                                          flush=True)
+                                p1_last_ok_locked = False
+                                p1_last_ok_gain_ready_locked = False
+                            else:
+                                p1_last_ok_locked = True
+                                p1_last_ok_gain_ready_locked = True
+                                print(
+                                    '[wm-last-ok] stay-locked after '
+                                    'skip-storm restore (GAIN-READY '
+                                    f'last_ok iter {int(p1_last_ok_iter)})',
+                                    flush=True)
+                                mid_check_flags.append(
+                                    'p1_skip_storm_gain_ready_locked: '
+                                    f'last_ok iter {int(p1_last_ok_iter)}')
+                            _restored = (Path(_ckpt).name
+                                         if _ckpt is not None else _src)
+                            if _continue_p1:
+                                mid_check_flags.append(
+                                    f'p1_skip_storm_recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); continuing '
+                                    f'P1 (storm {skip_storm_p1_n}/'
+                                    f'{_cap_after}, extension kept '
+                                    f'{p1_gate_max_ext_steps} steps)')
+                                print(
+                                    f'[skip-storm] P1 recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); reset '
+                                    f'opt_world; continuing P1 '
+                                    f'(storm {skip_storm_p1_n}/{_cap_after}, '
+                                    f'original P1 {p1} steps, extension '
+                                    f'kept {p1_gate_max_ext_steps} steps). '
+                                    f'({window_skips} skips in last '
+                                    f'{window_iters} iters)',
+                                    flush=True)
+                            else:
+                                mid_check_flags.append(
+                                    f'p1_skip_storm_recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); P1 capped at '
+                                    f'{p1} env_steps, extension closed '
+                                    f'(storm {skip_storm_p1_n}/{_cap_after})')
+                                print(
+                                    f'[skip-storm] P1 recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); reset '
+                                    f'opt_world; capping P1 at {p1} env_steps '
+                                    f'(storm {skip_storm_p1_n}/{_cap_after}, '
+                                    f'extension closed) → P2 '
+                                    f'(g freeze applies on the P1→P2 iter). '
+                                    f'({window_skips} skips in last '
+                                    f'{window_iters} iters)',
+                                    flush=True)
+                        except Exception as _e_rec:
+                            early_stop_reason = (
+                                f'grad_skip_storm: {window_skips} skips in '
+                                f'last {window_iters} iters (>{window_max}); '
+                                f'{_src} restore failed: {_e_rec}')
+                    else:
+                        early_stop_reason = (
+                            f'grad_skip_storm: {window_skips} skips in last '
+                            f'{window_iters} iters (>{window_max})')
 
                 # P3-only hard fails.
                 if early_stop_reason is None and current_phase == 3:
                     ent = row.get('entropy_mean')
                     if ent is not None:
-                        thr = (float(getattr(cfg,
-                                'early_stop_entropy_collapse_frac', 0.20))
-                               * n_action_bins_log)
-                        # Floor-relative collapse threshold
-                        # (2026-05-14, run_p22 RCA): the legacy
-                        # ceiling-relative formula
-                        #   thr = H_max(σ_max) − 0.10
-                        # tripped on every healthy run with a tight
-                        # σ_max because *any* shrink below the ceiling
-                        # (even down to σ_max/2) was flagged as
-                        # collapse.  σ legitimately moves below the
-                        # ceiling as the actor learns to commit;
-                        # collapse only matters when σ is approaching
-                        # σ_min (the floor) and exploration is dying.
-                        # Recompute thr from σ_min:
-                        #   H_floor(σ_min) = log_std_min + 0.5·log(2πe)
-                        #   thr = H_floor + margin
-                        # Trip only when entropy stays within ``margin``
-                        # nats of the floor (default 0.20 ≈ σ within
-                        # 22% of σ_min).  Keep the legacy ``thr`` as
-                        # the *upper* bound (still trip on truly
-                        # silent policies that fall below
-                        # 0.20·log(n_bins)), so the floor-relative
-                        # check only loosens the trip, never tightens
-                        # it past the legacy default.
-                        if str(getattr(cfg, 'policy_type', 'continuous')
-                                ).lower() == 'continuous':
-                            log_std_min = float(getattr(cfg,
-                                    'policy_log_std_min', -2.3))
-                            unit_g = 0.5 * math.log(2.0 * math.pi * math.e)
-                            h_floor = (
-                                float(cfg.action_dim)
-                                * (log_std_min + unit_g))
-                            margin = float(getattr(cfg,
-                                    'early_stop_entropy_collapse_floor_margin',
-                                    0.20))
-                            floor_aware_thr = h_floor + margin
-                            # Use the *lower* of the two: the heuristic
-                            # is "collapse when entropy is essentially
-                            # at the floor".  Floor-relative thr is
-                            # always ≤ legacy thr for any σ_min ≤ 1,
-                            # so this only loosens the trip on tight
-                            # σ_max regimes — never overrides a true
-                            # discrete-policy entropy crash.
-                            if floor_aware_thr < thr:
-                                thr = floor_aware_thr
-                        # Maintain sliding window of P3 entropy values.
-                        ent_window.append(float(ent))
-                        win_n = max(2, int(getattr(cfg,
-                                'early_stop_entropy_collapse_window_iters',
-                                30)))
-                        if len(ent_window) > win_n:
-                            ent_window.pop(0)
-                        # Sliding-window detector: trip when a sufficient
-                        # fraction of the last ``win_n`` entropies is
-                        # below ``thr``.
-                        # PERFORMANCE-AWARE GATE (Fix B, 2026-06-22): a low σ is
-                        # only a COLLAPSE if the policy is also DEGENERATE — a
-                        # healthy actor that has legitimately COMMITTED (low σ,
-                        # GOOD returns) reads the same entropy.  The p136
-                        # collapse had imag_adv_action_corr crash 0.77→0.014;
-                        # a committed-and-learning policy keeps it high.  So
-                        # only trip when the recent advantage-action correlation
-                        # is also low (genuine degeneracy), never on a
-                        # performing low-σ policy.  ``adv_corr`` None (pre-corr
-                        # logging) ⇒ fall back to the entropy-only trip.
-                        _ac = row.get('imag_adv_action_corr')
-                        if _ac is not None:
-                            adv_corr_window.append(abs(float(_ac)))
-                            if len(adv_corr_window) > win_n:
-                                adv_corr_window.pop(0)
-                        if len(ent_window) >= win_n:
-                            n_below = sum(1 for e in ent_window if e < thr)
-                            min_below = (float(getattr(cfg,
-                                    'early_stop_entropy_collapse_min_frac_below',
-                                    0.70))
-                                          * win_n)
-                            _corr_gate = float(getattr(cfg,
-                                    'early_stop_entropy_collapse_min_adv_corr',
-                                    0.05))
-                            _recent_corr = (float(np.median(adv_corr_window))
+                        # P53 RCA: 0.20-nat floor margin > log(σ_max/σ_min)
+                        # at ratio 1.2 → H(σ_init) already below thr.
+                        # Band-relative helper; None = skip (tiny σ-band).
+                        thr = _entropy_collapse_threshold(
+                            cfg,
+                            int(getattr(cfg, 'action_dim', 1) or 1),
+                            n_action_bins_log)
+                        if thr is not None:
+                            # Maintain sliding window of P3 entropy values.
+                            ent_window.append(float(ent))
+                            win_n = max(2, int(getattr(cfg,
+                                    'early_stop_entropy_collapse_window_iters',
+                                    30)))
+                            if len(ent_window) > win_n:
+                                ent_window.pop(0)
+                            # Sliding-window detector: trip when a sufficient
+                            # fraction of the last ``win_n`` entropies is
+                            # below ``thr``.
+                            # PERFORMANCE-AWARE GATE (Fix B, 2026-06-22): a low σ is
+                            # only a COLLAPSE if the policy is also DEGENERATE — a
+                            # healthy actor that has legitimately COMMITTED (low σ,
+                            # GOOD returns) reads the same entropy.  The p136
+                            # collapse had imag_adv_action_corr crash 0.77→0.014;
+                            # a committed-and-learning policy keeps it high.  So
+                            # only trip when the recent advantage-action correlation
+                            # is also low (genuine degeneracy), never on a
+                            # performing low-σ policy.  ``adv_corr`` None (pre-corr
+                            # logging) ⇒ fall back to the entropy-only trip.
+                            # Canonical jsonl key is ``adv_action_corr``.
+                            # ``_row_adv_action_corr`` still reads leftover
+                            # ``imag_adv_action_corr`` from old logs.
+                            _ac = _row_adv_action_corr(row)
+                            if _ac is not None:
+                                adv_corr_window.append(abs(float(_ac)))
+                                if len(adv_corr_window) > win_n:
+                                    adv_corr_window.pop(0)
+                            if len(ent_window) >= win_n:
+                                n_below = sum(1 for e in ent_window if e < thr)
+                                min_below = (float(getattr(cfg,
+                                        'early_stop_entropy_collapse_min_frac_below',
+                                        0.70))
+                                              * win_n)
+                                _corr_gate = float(getattr(cfg,
+                                        'early_stop_entropy_collapse_min_adv_corr',
+                                        0.05))
+                                _recent_corr = (float(np.median(adv_corr_window))
+                                                if adv_corr_window else 0.0)
+                                _degenerate = (_recent_corr < _corr_gate
+                                               or not adv_corr_window)
+                                if n_below >= min_below and _degenerate:
+                                    early_stop_reason = (
+                                        f'entropy_collapse_window: '
+                                        f'{n_below}/{win_n} iters below '
+                                        f'thr={thr:.3f} '
+                                        f'(latest={ent:.3f}, '
+                                        f'adv_corr={_recent_corr:.3f})')
+                            # Legacy consecutive-streak detector (kept as a
+                            # fallback for very long sustained collapse).  Same
+                            # performance gate: only a DEGENERATE low-σ streak trips.
+                            if ent < thr:
+                                ent_collapse_streak += 1
+                            else:
+                                ent_collapse_streak = 0
+                            _streak_corr = (float(np.median(adv_corr_window))
                                             if adv_corr_window else 0.0)
-                            _degenerate = (_recent_corr < _corr_gate
-                                           or not adv_corr_window)
-                            if n_below >= min_below and _degenerate:
+                            _streak_degen = (
+                                _streak_corr < float(getattr(cfg,
+                                    'early_stop_entropy_collapse_min_adv_corr', 0.05))
+                                or not adv_corr_window)
+                            if (early_stop_reason is None
+                                    and _streak_degen
+                                    and ent_collapse_streak >= int(getattr(cfg,
+                                    'early_stop_entropy_collapse_patience_iters',
+                                    30))):
                                 early_stop_reason = (
-                                    f'entropy_collapse_window: '
-                                    f'{n_below}/{win_n} iters below '
-                                    f'thr={thr:.3f} '
-                                    f'(latest={ent:.3f}, '
-                                    f'adv_corr={_recent_corr:.3f})')
-                        # Legacy consecutive-streak detector (kept as a
-                        # fallback for very long sustained collapse).  Same
-                        # performance gate: only a DEGENERATE low-σ streak trips.
-                        if ent < thr:
-                            ent_collapse_streak += 1
-                        else:
-                            ent_collapse_streak = 0
-                        _streak_corr = (float(np.median(adv_corr_window))
-                                        if adv_corr_window else 0.0)
-                        _streak_degen = (
-                            _streak_corr < float(getattr(cfg,
-                                'early_stop_entropy_collapse_min_adv_corr', 0.05))
-                            or not adv_corr_window)
-                        if (early_stop_reason is None
-                                and _streak_degen
-                                and ent_collapse_streak >= int(getattr(cfg,
-                                'early_stop_entropy_collapse_patience_iters',
-                                30))):
-                            early_stop_reason = (
-                                f'entropy_collapse: ent={ent:.3f} < '
-                                f'{thr:.3f} for {ent_collapse_streak} iters '
-                                f'(adv_corr={_streak_corr:.3f})')
+                                    f'entropy_collapse: ent={ent:.3f} < '
+                                    f'{thr:.3f} for {ent_collapse_streak} iters '
+                                    f'(adv_corr={_streak_corr:.3f})')
 
                     cl = row.get('critic_loss')
                     if cl is not None and cl > 0:
@@ -9949,9 +15227,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # steady-state (not just transients) the actor's imagined
     # rollouts depend on for terminal-value bootstrapping.  Cheap on
     # GPU (~10s); falls back to CPU if GPU is busy.  Disable with
-    # DREAMER_RUN_WM_DIAGNOSTIC=0.
+    # DREAMER_RUN_WM_DIAGNOSTIC=0 (ENV_OVERRIDES / TrainConfig).
     # ---------------------------------------------------------------
-    if int(os.environ.get('DREAMER_RUN_WM_DIAGNOSTIC', '1') or 0) == 1:
+    if bool(getattr(cfg, 'run_wm_diagnostic', True)):
         try:
             # Pre-free GPU before the diagnostic so its auto-device
             # picker doesn't fall back to CPU just because OUR training
@@ -9979,23 +15257,29 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                        flush=True)
             from tools.wm_steady_state_diagnostic import (
                 run_wm_steady_state_diagnostic)
-            n_starts = int(os.environ.get('DREAMER_WM_DIAG_N_STARTS', '8'))
+            n_starts = int(getattr(cfg, 'wm_diag_n_starts', 8) or 8)
             # (c) value-equivalence: probe horizon adaptive to the training
             # horizon H (default max(200, 8·H)) so large-H sims aren't under-
             # probed and small-H sims still get the long structural drift
             # signal; the diagnostic separately reports convergence AT H.
             _H_train = int(getattr(cfg, 'horizon', 15))
             _diag_h_default = max(200, 8 * _H_train)
-            horizon = int(os.environ.get('DREAMER_WM_DIAG_HORIZON',
-                                          str(_diag_h_default)))
-            # Force CUDA for inline diagnostics: the auto-picker reads
+            _h_cfg = int(getattr(cfg, 'wm_diag_horizon', 0) or 0)
+            horizon = _h_cfg if _h_cfg > 0 else _diag_h_default
+            # Inline diagnostic device.  Default ``wm_diag_device=cuda``
+            # matches the previous env injection: the auto-picker reads
             # nvidia-smi util, which sees *our own* training process as
-            # "GPU busy" and falls back to CPU — making the WM rollout
-            # very slow.  A manual override still wins (set
-            # DREAMER_WM_DIAG_DEVICE=cpu/cuda explicitly).
-            if (torch.cuda.is_available() and
-                    not os.environ.get('DREAMER_WM_DIAG_DEVICE')):
-                os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
+            # busy and would fall back to CPU.  Explicit env still wins.
+            # ``auto`` leaves the picker; ``cpu`` forces host.
+            if not os.environ.get('DREAMER_WM_DIAG_DEVICE'):
+                _diag_dev = str(
+                    getattr(cfg, 'wm_diag_device', 'cuda') or 'cuda'
+                    ).strip().lower()
+                if _diag_dev in ('cpu',):
+                    os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cpu'
+                elif (_diag_dev not in ('auto', 'off', '0', 'none')
+                      and torch.cuda.is_available()):
+                    os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
             run_wm_steady_state_diagnostic(
                 out_dir, ckpt_name='final.pt',
                 n_starts=n_starts, horizon=horizon,
@@ -10032,6 +15316,28 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'phase_gate_decisions': list(phase_gate_decisions),
         'p1_ext_steps': int(p1_ext_steps),
         'p2_ext_steps': int(p2_ext_steps),
+        'skip_storm_p1_recovered': bool(skip_storm_p1_recovered),
+        'skip_storm_p1_n': int(skip_storm_p1_n),
+        'skip_storm_p1_cap_after': int(getattr(
+            cfg, 'skip_storm_p1_cap_after', 2)),
+        'skip_storm_restore_source': skip_storm_restore_source,
+        'skip_storm_restore_iter': skip_storm_restore_iter,
+        'p1_last_ok_iter': (int(p1_last_ok_iter)
+                            if p1_last_ok_iter >= 0 else None),
+        'p1_last_ok_locked': bool(p1_last_ok_locked),
+        'p1_last_ok_gain_ready_locked': bool(p1_last_ok_gain_ready_locked),
+        'p1_skip_storm_gain_ready': (
+            bool(p1_skip_storm_gain_ready)
+            if p1_skip_storm_gain_ready is not None else None),
+        'p1_skip_storm_gain_worst': (
+            float(p1_skip_storm_gain_worst)
+            if p1_skip_storm_gain_worst is not None else None),
+        'p1_gain_not_ready_capped': bool(p1_gain_not_ready_capped),
+        'p1_detonated_freeze_restored': bool(p1_detonated_freeze_restored),
+        'actor_experiment_valid': _actor_experiment_valid(
+            skip_storm_source=skip_storm_restore_source,
+            gain_not_ready_capped=bool(p1_gain_not_ready_capped)),
+        'skip_invalid_p3': bool(getattr(cfg, 'skip_invalid_p3', True)),
     }
 
 
@@ -10039,116 +15345,41 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 # CLI
 # ---------------------------------------------------------------------------
 
+# Non-``DREAMER_*`` CLI leftovers.  P50 promoted architecture / policy /
+# seed-count / ``DREAMER_BATCH_SIZE`` into ``ENV_OVERRIDES``; applying
+# them here first then again in the whitelist was a double-setattr.
+# ``_cfg_from_env`` still calls ``apply_dreamer_env_overrides`` after
+# this loop.  Episode-length pin is ``DREAMER_EPISODE_LENGTH``
+# (whitelist).  Leftover ``SIM_EPISODE_LENGTH`` is ignored (P92-live).
+_CLI_ONLY_ENV = (
+    ('AGENT_TOTAL_STEPS', 'total_steps', int),
+    ('SIM_SAMPLE_RATE', 'sample_rate', int),
+    ('CONTROLLER_OUT_DIR', 'out_dir', str),
+)
+
+
 def _cfg_from_env() -> TrainConfig:
+    """CLI entry: non-``DREAMER_*`` leftovers + shared ``ENV_OVERRIDES``.
+
+    P28 follow-up 6: the duplicate loop here silently dropped 130+ knobs
+    that ``single_run`` already honors (aux TBPTT, skip-storm, n_critics,
+    grad-skip max, …).  Apply the shared whitelist so both entry points
+    share one contract.  Architecture / policy / seed-count ``DREAMER_*``
+    keys live only in the whitelist (P50 double-setattr).
+    """
     cfg = TrainConfig()
     explicit: set = set()
-    for name, attr, cast in [
-        ('DREAMER_D_MODEL', 'd_model', int),
-        ('DREAMER_N_LAYERS', 'n_layers', int),
-        ('DREAMER_N_HEADS', 'n_heads', int),
-        ('DREAMER_FF_MULT', 'ff_mult', int),
-        ('DREAMER_N_REGISTER', 'n_register', int),
-        ('DREAMER_Z_DIM', 'z_dim', int),
-        ('DREAMER_TOK_HIDDEN', 'tok_hidden', int),
-        ('DREAMER_HEAD_HIDDEN', 'head_hidden', int),
-        ('DREAMER_K_MAX', 'k_max', int),
-        ('DREAMER_LOOKBACK', 'lookback', int),
-        ('DREAMER_HORIZON', 'horizon', int),
-        ('DREAMER_SEQ_LEN', 'seq_len', int),
-        ('DREAMER_BATCH_SIZE', 'batch_size', int),
-        ('DREAMER_PHASE1_FRAC', 'phase1_frac', float),
-        ('DREAMER_PHASE2_FRAC', 'phase2_frac', float),
-        ('DREAMER_PHASE3_FRAC', 'phase3_frac', float),
-        ('DREAMER_PMPO_BETA', 'pmpo_beta', float),
-        ('DREAMER_PMPO_ALPHA', 'pmpo_alpha', float),
-        ('DREAMER_BC_SCALE', 'bc_scale', float),
-        ('DREAMER_MAE_PMAX', 'mae_p_max', float),
-        ('DREAMER_MTP_LENGTH', 'mtp_length', int),
-        ('DREAMER_POLICY_TYPE', 'policy_type', str),
-        ('DREAMER_POLICY_INIT_LOG_STD', 'policy_init_log_std', float),
-        ('DREAMER_POLICY_LOG_STD_MIN', 'policy_log_std_min', float),
-        ('DREAMER_POLICY_LOG_STD_MAX', 'policy_log_std_max', float),
-        ('DREAMER_PMPO_ENTROPY_COEF', 'pmpo_entropy_coef', float),
-        ('DREAMER_ACTOR_LOSS', 'actor_loss_type', str),
-        ('DREAMER_GRAD_CLIP', 'grad_clip', float),
-        ('DREAMER_LR_ACTOR', 'lr_actor', float),
-        ('DREAMER_LR_CRITIC', 'lr_critic', float),
-        ('DREAMER_LR_WORLD', 'lr_world', float),
-        ('DREAMER_GAE_LAMBDA', 'gae_lambda', float),
-        ('DREAMER_BASELINE_SEED_EPS', 'baseline_seed_episodes', int),
-        ('DREAMER_BASELINE_SEED_STD', 'baseline_seed_action_std', float),
-        ('DREAMER_RANDOM_SEED_EPS', 'random_seed_episodes', int),
-        ('DREAMER_P3_COLLECT_EVERY', 'phase3_collect_every_iters', int),
-        ('DREAMER_P3_ONPOLICY_BUFFER_EPS', 'phase3_onpolicy_buffer_eps', int),
-        ('DREAMER_P3_ONPOLICY_PREFILL_EPS', 'phase3_onpolicy_prefill_eps', int),
-        ('DREAMER_BUFFER_CAP_STEPS', 'buffer_capacity_steps', int),
-        ('DREAMER_ATTN_IMPL', 'attn_impl', str),
-        ('DREAMER_COMPILE_MODE', 'compile_mode', str),
-        ('AGENT_TOTAL_STEPS', 'total_steps', int),
-        ('SIM_EPISODE_LENGTH', 'episode_length', int),
-        ('SIM_SAMPLE_RATE', 'sample_rate', int),
-        ('CONTROLLER_OUT_DIR', 'out_dir', str),
-        # ----- Early-stop overrides -----
-        ('DREAMER_EARLY_STOP', 'early_stop_enable',
-            lambda v: bool(int(v))),
-        ('DREAMER_ES_P3_PATIENCE', 'early_stop_p3_patience_iters', int),
-        ('DREAMER_ES_P3_MIN_IMPROVEMENT',
-            'early_stop_p3_min_improvement', float),
-        ('DREAMER_ES_ENT_FRAC', 'early_stop_entropy_collapse_frac', float),
-        ('DREAMER_ES_ENT_PATIENCE',
-            'early_stop_entropy_collapse_patience_iters', int),
-        ('DREAMER_ES_ENT_WINDOW',
-            'early_stop_entropy_collapse_window_iters', int),
-        ('DREAMER_ES_ENT_MIN_BELOW',
-            'early_stop_entropy_collapse_min_frac_below', float),
-        ('DREAMER_ES_CRITIC_FACTOR',
-            'early_stop_critic_divergence_factor', float),
-        ('DREAMER_ES_CRITIC_PATIENCE',
-            'early_stop_critic_divergence_patience_iters', int),
-        # 2026-05-23 (P41 RCA): bootstrap-cascade canary thresholds.
-        ('DREAMER_ES_CASCADE_REWVAR',
-            'early_stop_cascade_min_rew_var_frac', float),
-        ('DREAMER_ES_CASCADE_GROWTH',
-            'early_stop_cascade_min_return_scale_growth', float),
-        ('DREAMER_ES_CASCADE_PATIENCE',
-            'early_stop_cascade_patience_iters', int),
-        ('DREAMER_ES_GRADSKIP_WINDOW',
-            'early_stop_grad_skip_window_iters', int),
-        ('DREAMER_ES_GRADSKIP_MAX', 'early_stop_grad_skip_max', int),
-        ('DREAMER_ES_P1_MIN_SF_DROP',
-            'early_stop_p1_min_sf_drop_frac', float),
-        ('DREAMER_ES_P2_MAX_RMTP',
-            'early_stop_p2_max_reward_mtp_loss', float),
-        # 2026-05-26 (P52 RCA): phase-transition quality gates.
-        ('DREAMER_P1_GATE_WM_EMA_MIN', 'p1_gate_wm_ema_min', float),
-        ('DREAMER_P1_GATE_PLATEAU_FRAC', 'p1_gate_plateau_frac', float),
-        ('DREAMER_P1_GATE_PLATEAU_PROBES', 'p1_gate_plateau_probes', int),
-        ('DREAMER_P1_GATE_MAX_EXTENSION', 'p1_gate_max_extension', float),
-        ('DREAMER_P2_GATE_REWARD_MTP_MAX', 'p2_gate_reward_mtp_max', float),
-        ('DREAMER_P2_GATE_RECENT_ITERS', 'p2_gate_recent_iters', int),
-        ('DREAMER_P2_GATE_MAX_EXTENSION', 'p2_gate_max_extension', float),
-        # 2026-05-30 (P70): RSSM imagination steady-state fix.
-        ('DREAMER_RSSM_IMAG_LATENT_MODE', 'rssm_imag_latent_mode',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        # 2026-05-31 (P73): bounded training reward (cascade root-cause fix).
-        ('DREAMER_BOUND_TRAINING_REWARD', 'bound_training_reward',
-            lambda v: str(v).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')),
-        ('DREAMER_BOUND_TRAINING_REWARD_MAX', 'bound_training_reward_max', float),
-        ('DREAMER_BOUND_TRAINING_REWARD_REF', 'bound_training_reward_ref', float),
-        # 2026-05-31 (P74): advantage clipping (Cursor stabilizer #3).
-        ('DREAMER_ADVANTAGE_CLIP', 'advantage_clip', float),
-    ]:
+    for name, attr, cast in _CLI_ONLY_ENV:
         v = os.environ.get(name)
         if v is not None and v != '':
             setattr(cfg, attr, cast(v))
             explicit.add(attr)
-    # Stash explicitly-set field names so the auto-tune apply loop can
-    # skip them even when the env-injected value equals the dataclass
-    # default (e.g. paper-faithful log_std_max=0.0).
     try:
         cfg._explicit_fields = explicit  # type: ignore[attr-defined]
     except Exception:
         pass
+    from workflow._plant_prepare import apply_dreamer_env_overrides
+    apply_dreamer_env_overrides(cfg)
     return cfg
 
 

@@ -25,11 +25,12 @@ model's free_bits floor — i.e. whether the prior is pinned at the floor.
 RSSM/TSSM only (needs obs_step/decode).  CPU-safe; does not touch a GPU run.
 
 Usage:
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  ./../neural-apc-mbrl-env/bin/python tools/wm_posterior_prior_probe.py \
-      --run-dir output/test_sim/run_20260608_p102_joint_distfix --ckpt best.pt
+  CUDA_VISIBLE_DEVICES="" DREAMER_WM_DIAG_DEVICE=cpu PYTHONPATH=$PWD \
+  ~/neural-APC-mbrl2-env/bin/python tools/wm_posterior_prior_probe.py \
+    --run-dir output/test_sim/run_p62_heldcv --ckpt ckpt_iter_00180.pt
 """
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -270,16 +271,53 @@ def compute_dv_posterior_prior_decomp(model, env, cfg, device, *,
     }
 
 
+def _wire_run_artifacts(rd: Path) -> None:
+    """Point the probe at THIS run's sim + SysID. Never invent test_sim 53 s / 8 s."""
+    plan_path = rd / 'run_plan.json'
+    sim_dir = tau = dead = None
+    if plan_path.is_file():
+        plan = json.loads(plan_path.read_text())
+        sim_dir = plan.get('simulation_dir')
+        tau = plan.get('tau')
+        dead = plan.get('dead_time')
+    if sim_dir:
+        sim = Path(str(sim_dir))
+        if not sim.is_absolute():
+            sim = REPO / sim
+        os.environ.setdefault('CONTROL_SETUP_JSON', str(sim / 'control_setup.json'))
+        os.environ.setdefault('CONTROL_OBJECTIVE_JSON',
+                              str(sim / 'control_objective.json'))
+        os.environ.setdefault('SIMULATION_DIR', str(sim))
+    if tau is None or dead is None:
+        pid = rd / 'plant_id.json'
+        if pid.is_file():
+            meta = json.loads(pid.read_text())
+            if tau is None:
+                tau = meta.get('tau') or meta.get('tau_dominant')
+            if dead is None:
+                dead = meta.get('dead_time')
+    if tau is not None and float(tau) > 0:
+        os.environ.setdefault('IDENTIFIED_TAU_DOMINANT', f'{float(tau):g}')
+    if dead is not None and float(dead) > 0:
+        os.environ.setdefault('IDENTIFIED_DEAD_TIME', f'{float(dead):g}')
+
+
 def probe(run_dir: Path, ckpt_name: str, levels=(0.0, 0.3, -0.3),
-          step_frac=0.4, horizon=220, settle=220):
-    device, _ = _pick_device()
+          step_frac=0.4, horizon=0, settle=0):
+    device, why = _pick_device()
+    print(f'[probe] device={device} ({why})', flush=True)
     ckpt = _find_ckpt(run_dir, ckpt_name)
     model, cfg, on = _load_model(ckpt, device)
     model.eval()
     if not _is_rssm_model(model):
         print('[probe] requires an RSSM/TSSM checkpoint (needs obs_step/decode).')
         return
+    from evaluation.wm_transfer_matrix import wm_tf_roll_len
     from training.train import APCEnv
+    h_roll = int(horizon) if int(horizon or 0) > 0 else wm_tf_roll_len(cfg)
+    s_roll = int(settle) if int(settle or 0) > 0 else h_roll
+    print(f'[probe] ckpt={ckpt} roll={h_roll} settle={s_roll} step_frac={step_frac}',
+          flush=True)
     env = APCEnv(cfg, np.random.default_rng(20260609))
     if on is not None and on.get('var') is not None:
         var = np.asarray(on.get('var'), 'float32')
@@ -287,7 +325,7 @@ def probe(run_dir: Path, ckpt_name: str, levels=(0.0, 0.3, -0.3),
                                count=float(on.get('count', 1.0)), learn=False)
     res = compute_posterior_prior_decomp(
         model, env, cfg, device, levels=levels, step_frac=step_frac,
-        horizon=horizon, settle=settle)
+        horizon=h_roll, settle=s_roll)
     if not res.get('enabled'):
         print(f'[probe] {res.get("reason")}')
         return
@@ -313,18 +351,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--run-dir', required=True)
     ap.add_argument('--ckpt', default='best.pt')
-    ap.add_argument('--horizon', type=int, default=220)
-    ap.add_argument('--settle', type=int, default=220)
+    ap.add_argument('--horizon', type=int, default=0,
+                    help='TM roll length; 0 = wm_tf_roll_len(cfg) = max(80, 4H)')
+    ap.add_argument('--settle', type=int, default=0,
+                    help='settle capture length; 0 = same as horizon')
     args = ap.parse_args()
     rd = Path(args.run_dir)
     if not rd.is_absolute():
         rd = REPO / rd
-    sim = REPO / 'simulation' / 'test_sim'
-    os.environ.setdefault('CONTROL_SETUP_JSON', str(sim / 'control_setup.json'))
-    os.environ.setdefault('CONTROL_OBJECTIVE_JSON', str(sim / 'control_objective.json'))
-    os.environ.setdefault('SIMULATION_DIR', str(sim))
-    os.environ.setdefault('IDENTIFIED_TAU_DOMINANT', '53')
-    os.environ.setdefault('IDENTIFIED_DEAD_TIME', '8')
+    _wire_run_artifacts(rd)
     probe(rd, args.ckpt, horizon=args.horizon, settle=args.settle)
     return 0
 

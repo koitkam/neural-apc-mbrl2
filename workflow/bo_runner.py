@@ -47,10 +47,17 @@ from typing import Dict, List, Tuple
 import numpy as np
 import optuna
 
-from training.train import TrainConfig, train as run_training
+from training.train import (TrainConfig, train as run_training,
+                            wm_train_seq_len_for_plant)
 from inference.export_onnx import export_dreamer_v4_onnx
-from models.dreamer_v4 import DreamerV4, DreamerV4Config
+from models.dreamer_v4 import DreamerV4, dreamer_v4_config_from_train
 import torch
+
+
+def _wm_probe_T(cfg: TrainConfig, horizon: int) -> int:
+    """GPU-probe unroll T = max(seq_len, H+1) (P1/P2 DC-gain window)."""
+    return wm_train_seq_len_for_plant(
+        int(cfg.seq_len), int(horizon), int(cfg.episode_length))
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +147,8 @@ from workflow._plant_prepare import (  # noqa: E402
     identify_lookback,
     build_noise_config as _build_noise_config,
     apply_dreamer_env_overrides,
+    explicit_batch_size,
+    pin_eval_modules_at_launch,
 )
 
 
@@ -170,9 +179,11 @@ def horizon_init(tau: float, dead_time: float, sample_rate: int) -> int:
     the identified 2%% settling time ``dead_time + 4*tau`` (converted to agent
     steps via ``sample_rate``) so the actor/critic credit the full settling
     response of the slowest loop.  Floored at the DreamerV3/V4 paper default
-    (15) and capped by ``DREAMER_HORIZON_MAX``; the settle multiple is tunable
-    via ``DREAMER_HORIZON_SETTLE_NTAU``.  An explicit ``DREAMER_HORIZON`` still
-    hard-overrides downstream via ``apply_dreamer_env_overrides``.
+    (15) and capped via ``horizon_formula_knobs()`` (TrainConfig
+    ``horizon_settle_n_tau`` / ``horizon_max``, leftover
+    ``DREAMER_HORIZON_SETTLE_NTAU`` / ``DREAMER_HORIZON_MAX``).  An explicit
+    ``DREAMER_HORIZON`` still hard-overrides downstream via
+    ``apply_dreamer_env_overrides``.
 
     Returns the paper floor (15) when no usable dynamics are available.
     Signature retained so BO trial code that multiplies the base by
@@ -352,21 +363,15 @@ def run_trial(trial: optuna.Trial, base: TrainConfig, plant: Dict,
 
     # Empirical per-trial batch sizing (cached on (model_size, seq, lb,
     # horizon) so repeated trials with same shape skip the ~10 s probe).
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
-    if bs_env:
-        try:
-            bs = max(1, int(bs_env))
-            bs_info = {'batch_size': bs, 'source': 'env_override'}
-        except Exception:
-            bs_info = pick_batch_size_for_plant(
-                model_size=model_size, seq_len=int(base.seq_len),
-                lookback=lookback, horizon=horizon, k_max=int(base.k_max),
-                sample_rate=int(base.sample_rate),
-                episode_length=int(base.episode_length))
-            bs = int(bs_info['batch_size'])
+    # Probe T is the P1/P2 DC-gain window (follow-up 13), not seq_len.
+    _probe_T = _wm_probe_T(base, horizon)
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        bs = bs_pin
+        bs_info = {'batch_size': bs, 'source': 'env_override'}
     else:
         bs_info = pick_batch_size_for_plant(
-            model_size=model_size, seq_len=int(base.seq_len),
+            model_size=model_size, seq_len=_probe_T,
             lookback=lookback, horizon=horizon, k_max=int(base.k_max),
             sample_rate=int(base.sample_rate),
             episode_length=int(base.episode_length))
@@ -489,19 +494,13 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
                            int(base.sample_rate))
     H_init = horizon
 
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
-    if bs_env:
-        try:
-            bs = max(1, int(bs_env))
-        except Exception:
-            bs = int(pick_batch_size_for_plant(
-                model_size=model_size, seq_len=int(base.seq_len),
-                lookback=lookback, horizon=horizon, k_max=int(base.k_max),
-                sample_rate=int(base.sample_rate),
-                episode_length=int(base.episode_length))['batch_size'])
+    _probe_T = _wm_probe_T(base, horizon)
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        bs = bs_pin
     else:
         bs = int(pick_batch_size_for_plant(
-            model_size=model_size, seq_len=int(base.seq_len),
+            model_size=model_size, seq_len=_probe_T,
             lookback=lookback, horizon=horizon, k_max=int(base.k_max),
             sample_rate=int(base.sample_rate),
             episode_length=int(base.episode_length))['batch_size'])
@@ -522,53 +521,8 @@ def train_final_and_export(base: TrainConfig, plant: Dict, best_params: Dict,
     ckpt = torch.load(final_dir / 'final.pt', map_location='cpu', weights_only=False)
     cfg_loaded = TrainConfig(**{k: v for k, v in ckpt['cfg'].items()
                                  if k in {f for f in TrainConfig.__dataclass_fields__}})
-    model_cfg = DreamerV4Config(
-        obs_dim=cfg_loaded.obs_dim, action_dim=cfg_loaded.action_dim,
-        lookback=cfg_loaded.lookback,
-        tok_hidden=cfg_loaded.tok_hidden, z_dim=cfg_loaded.z_dim,
-        mae_p_max=cfg_loaded.mae_p_max,
-        d_model=cfg_loaded.d_model, n_layers=cfg_loaded.n_layers,
-        n_heads=cfg_loaded.n_heads, ff_mult=cfg_loaded.ff_mult,
-        n_register=cfg_loaded.n_register,
-        k_max=cfg_loaded.k_max, tau_n_bins=cfg_loaded.tau_n_bins,
-        soft_cap=cfg_loaded.soft_cap,
-        n_action_bins=cfg_loaded.n_action_bins,
-        head_hidden=cfg_loaded.head_hidden,
-        head_n_layers=cfg_loaded.head_n_layers,
-        mtp_length=max(1, int(getattr(cfg_loaded, 'mtp_length', 1))),
-        policy_type=str(getattr(cfg_loaded, 'policy_type', 'continuous')),
-        policy_init_log_std=float(
-            getattr(cfg_loaded, 'policy_init_log_std', -0.5)),
-        policy_log_std_min=float(
-            getattr(cfg_loaded, 'policy_log_std_min', -2.3)),
-        policy_log_std_max=float(
-            getattr(cfg_loaded, 'policy_log_std_max', 0.0)),
-        world_model_type=str(
-            getattr(cfg_loaded, 'world_model_type', 'sf_transformer')),
-        rssm_deter_dim=int(getattr(cfg_loaded, 'rssm_deter_dim', 512)),
-        rssm_n_categoricals=int(
-            getattr(cfg_loaded, 'rssm_n_categoricals', 32)),
-        rssm_n_classes=int(getattr(cfg_loaded, 'rssm_n_classes', 32)),
-        rssm_embed_dim=int(getattr(cfg_loaded, 'rssm_embed_dim', 256)),
-        rssm_hidden_dim=int(getattr(cfg_loaded, 'rssm_hidden_dim', 256)),
-        rssm_unimix=float(getattr(cfg_loaded, 'rssm_unimix', 0.01)),
-        disturbance_head_dim=int(getattr(cfg_loaded, 'disturbance_head_dim', 0) or 0),
-        disturbance_head_hidden=int(getattr(cfg_loaded, 'disturbance_head_hidden', 0) or 0),
-        disturbance_head_layers=int(getattr(cfg_loaded, 'disturbance_head_layers', 2) or 2),
-        dv_dim=int(getattr(cfg_loaded, 'dv_dim', 0) or 0),
-        dv_indices=tuple(getattr(cfg_loaded, 'dv_indices', ()) or ()),
-        dv_feedforward=bool(getattr(cfg_loaded, 'dv_feedforward', True)),
-        dob_enabled=bool(getattr(cfg_loaded, 'dob_enabled', False)),
-        cv_obs_indices=tuple(getattr(cfg_loaded, 'cv_obs_indices', ()) or ()),
-        dob_decay_init=float(getattr(cfg_loaded, 'dob_decay_init', 3.0)),
-        dob_gain_init=float(getattr(cfg_loaded, 'dob_gain_init', -2.2)),
-        cont_gain_dim=int(getattr(cfg_loaded, 'cont_gain_dim', 0) or 0),
-        cont_dist_dim=int(getattr(cfg_loaded, 'cont_dist_dim', 0) or 0),
-        cont_min_std=float(getattr(cfg_loaded, 'cont_min_std', 0.1)),
-        cont_max_std=float(getattr(cfg_loaded, 'cont_max_std', 2.0)),
-        attn_impl='manual',  # ONNX export: manual path is safer than SDPA
-    )
-    model = DreamerV4(model_cfg)
+    model = DreamerV4(
+        dreamer_v4_config_from_train(cfg_loaded, attn_impl='manual'))
     sd = ckpt['model']
     if any('._orig_mod.' in k for k in sd):
         sd = {k.replace('._orig_mod.', '.'): v for k, v in sd.items()}
@@ -631,12 +585,16 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         print(f'[BO] init_from_ckpt={ckpt_path} '
               f'(applied to every trial + final retrain)', flush=True)
     # Sample-rate env override is supported here for sims that hard-code their
-    # scan rate.  Episode length is auto-derived from identification (or from
-    # SIM_EPISODE_LENGTH env via derive_episode_length).
+    # scan rate.  Episode length is auto-derived from identification (or
+    # from canonical ``DREAMER_EPISODE_LENGTH``).  Leftover
+    # ``SIM_EPISODE_LENGTH`` is ignored.
     sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
 
     print('[BO] Phase 1a: dynamics identification', flush=True)
     plant = identify_dynamics_from_plant(out_dir / 'plant_id')
+    base.identified_tau_dominant = float(plant['tau'])
+    base.identified_dead_time = float(plant['dead_time'])
+    pin_eval_modules_at_launch()
 
     # Plant-aware noise config — see ``workflow/_plant_prepare.build_noise_config``.
     # Builds dynamics-derived OU + measurement noise and exports
@@ -694,7 +652,11 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     print(f"[BO] lookback={plant['lookback']} (=seq_len; "
           f"identified={identified_lookback}, sr={sr})", flush=True)
 
-    # Episode length: env override > auto-derived from settling time > paper.
+    # Episode length: DREAMER_EPISODE_LENGTH > auto-derived k·(τ+θ) >
+    # paper fallback.  ``episode_formula_knobs()`` reads TrainConfig
+    # then canonical ``DREAMER_EPISODE_*`` (identity 20 / 500 / 4000).
+    # Leftover ``SIM_EPISODE_LENGTH`` ignored (P92-live).  Write it
+    # after derivation as IPC.
     from utils.auto_episode_length import derive_episode_length
     ep_len, ep_source = derive_episode_length()
     base.episode_length = int(ep_len)
@@ -715,23 +677,15 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     seed_horizon = horizon_init(float(plant.get('tau', 0.0)),
                                 float(plant.get('dead_time', 0.0)),
                                 int(base.sample_rate))
-    bs_env = os.environ.get('OBJ_BATCH_SIZE', '').strip()
-    if bs_env:
-        try:
-            base.batch_size = max(1, int(bs_env))
-            bs_info = {'batch_size': base.batch_size, 'source': 'env_override'}
-        except Exception:
-            bs_info = pick_batch_size_for_plant(
-                model_size=derived_model_size,
-                seq_len=int(base.seq_len), lookback=int(plant['lookback']),
-                horizon=int(seed_horizon), k_max=int(base.k_max),
-                sample_rate=int(base.sample_rate),
-                episode_length=int(base.episode_length))
-            base.batch_size = int(bs_info['batch_size'])
+    _probe_T = _wm_probe_T(base, seed_horizon)
+    bs_pin = explicit_batch_size()
+    if bs_pin is not None:
+        base.batch_size = bs_pin
+        bs_info = {'batch_size': base.batch_size, 'source': 'env_override'}
     else:
         bs_info = pick_batch_size_for_plant(
             model_size=derived_model_size,
-            seq_len=int(base.seq_len), lookback=int(plant['lookback']),
+            seq_len=_probe_T, lookback=int(plant['lookback']),
             horizon=int(seed_horizon), k_max=int(base.k_max),
             sample_rate=int(base.sample_rate),
             episode_length=int(base.episode_length))

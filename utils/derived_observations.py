@@ -25,53 +25,56 @@ All three are zero-mean / bounded by construction so the running obs
 normalizer in ``APCEnv._update_obs_norm`` does not have to compensate
 for arbitrary CV scaling.
 
-Toggle via ``DREAMER_DERIVED_OBSERVABLES=1`` (default OFF — preserves
-backward compat with existing checkpoints).  Window size is controlled
-by ``DREAMER_DERIVED_OBS_WINDOW`` (default 32 agent steps ≈ τ_dom for
-test_sim at sample_rate=4).
+Toggle via TrainConfig ``derived_observables`` (default ON since P37;
+``DREAMER_DERIVED_OBSERVABLES=0`` disables via ``_cfg_from_env``).
+Window size is ``derived_observables_window`` (0 = auto
+``round(2·τ/sample_rate)`` clamped to ``[8, 128]``).  Login leftover
+``DREAMER_DERIVED_*`` is ignored unless ``_cfg_from_env`` applied it.
 """
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from typing import Deque, Optional
 
 import numpy as np
 
 
-def derived_observables_enabled(*, default: bool = True) -> bool:
+def derived_observables_enabled(cfg=None, *, default: bool = True) -> bool:
     """Return True iff the derived-observables block is active.
 
-    Default ON (P37 onward).  Set ``DREAMER_DERIVED_OBSERVABLES=0`` to
-    disable for ablations or when loading a checkpoint trained with
-    the legacy obs layout (different ``obs_dim``).
+    Default ON (P37 onward).  TrainConfig only — ``DREAMER_DERIVED_OBSERVABLES``
+    is applied by ``_cfg_from_env`` / ``ENV_OVERRIDES``.  Set ``=0`` to
+    disable for ablations or a legacy-obs checkpoint (different ``obs_dim``).
     """
-    raw = os.environ.get('DREAMER_DERIVED_OBSERVABLES', '').strip()
-    if not raw:
-        return bool(default)
-    return raw not in ('0', 'false', 'False', 'off', 'OFF', 'no')
+    if cfg is not None:
+        return bool(getattr(cfg, 'derived_observables', default))
+    return bool(default)
 
 
 def derived_observables_window(default: int = 32,
                                *,
                                tau: Optional[float] = None,
-                               sample_rate: Optional[float] = None) -> int:
+                               sample_rate: Optional[float] = None,
+                               cfg=None) -> int:
     """Window length (in agent steps) for the rolling derived features.
 
     Resolution order:
-      1. ``DREAMER_DERIVED_OBS_WINDOW`` env var if set (operator override).
+      1. TrainConfig ``derived_observables_window`` if > 0 (``0`` is the
+         auto sentinel; ``_cfg_from_env`` already applied
+         ``DREAMER_DERIVED_OBS_WINDOW``).
       2. ``round(2 * tau / sample_rate)`` clamped to ``[8, 128]`` when
          both ``tau`` and ``sample_rate`` are provided (auto-tune per
          plant — covers ~2 dominant time-constants of context).
       3. Static ``default`` fallback.
     """
-    raw = os.environ.get('DREAMER_DERIVED_OBS_WINDOW', '').strip()
-    if raw:
+    if cfg is not None:
         try:
-            return max(2, int(raw))
+            w = int(getattr(cfg, 'derived_observables_window', 0) or 0)
         except Exception:
-            pass
+            w = 0
+        if w > 0:
+            return max(2, w)
     if tau is not None and sample_rate is not None:
         try:
             sr = max(1.0, float(sample_rate))

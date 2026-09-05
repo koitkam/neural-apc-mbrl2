@@ -17,7 +17,7 @@ Verifies, for BOTH backbones where applicable, WITHOUT a real env:
 
 Run (CPU, do not disturb a live GPU run):
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_wm_fixes.py
+    /home/koitkam/neural-APC-mbrl2-env/bin/python tools/_smoke_wm_fixes.py
 """
 import os
 import numpy as np
@@ -146,18 +146,28 @@ def _test_freeze_mechanism():
 def _test_defaults_and_env():
     print('\n=== defaults OFF + ENV_OVERRIDES wiring ===')
     cfg = TrainConfig()
-    assert cfg.wm_recon_cv_weight == 1.0, 'recon weight must default 1.0 (identity)'
     assert cfg.wm_freeze_after_iters == 0, 'freeze must default 0 (off)'
-    assert cfg.bc_track_expert_every == 0, 'bc track must default 0 (off)'
-    assert cfg.cv_obs_indices == (), 'cv_obs_indices must default empty'
-    print('[smoke] OK  all new knobs default to OFF / identity')
+    assert cfg.wm_best_restore_at_p2 is False
+    assert cfg.wm_best_restore_at_p3 is False
+    assert int(cfg.wm_best_restore_min_gap) == 10
+    print('[smoke] OK  wm_best_restore_at_p2 default OFF; freeze-after-iters OFF')
 
     from workflow._plant_prepare import apply_dreamer_env_overrides
     env_map = {
         'DREAMER_WM_FREEZE_AFTER_ITERS': ('40', 'wm_freeze_after_iters', 40),
-        'DREAMER_WM_RECON_CV_WEIGHT': ('6.0', 'wm_recon_cv_weight', 6.0),
+        'DREAMER_WM_RECON_CV_WEIGHT': ('8.0', 'wm_recon_cv_weight', 8.0),
         'DREAMER_BC_TRACK_EXPERT_EVERY': ('5', 'bc_track_expert_every', 5),
         'DREAMER_EXPERT_BC_P3_FLOOR': ('0.0', 'expert_bc_p3_floor', 0.0),
+        'DREAMER_WM_BEST_RESTORE_AT_P2': ('1', 'wm_best_restore_at_p2', True),
+        'DREAMER_WM_BEST_RESTORE_MIN_GAP': ('7', 'wm_best_restore_min_gap', 7),
+        'DREAMER_CONST_ACTION_INJECT_EVERY': ('7', 'const_action_inject_every', 7),
+        'DREAMER_DV_PRBS_INJECT_EVERY': ('5', 'dv_prbs_inject_every', 5),
+        'DREAMER_GAIN_READY_LO': ('0.75', 'gain_ready_lo', 0.75),
+        'DREAMER_P1_GAIN_GATE': ('0', 'p1_gain_gate', False),
+        'DREAMER_WM_PROBE_EVERY_ITERS': ('8', 'wm_probe_every_iters', 8),
+        'DREAMER_ES_GRADSKIP_MAX': ('11', 'early_stop_grad_skip_max', 11),
+        'DREAMER_STEP_TEST_INJECT_N': ('7', 'step_test_inject_n', 7),
+        'DREAMER_LR_WORLD': ('3e-4', 'lr_world', 3e-4),
     }
     for k, (val, _f, _e) in env_map.items():
         os.environ[k] = val
@@ -167,13 +177,70 @@ def _test_defaults_and_env():
         for k, (val, field, expected) in env_map.items():
             got = getattr(cfg2, field)
             assert got == expected, f'{k} -> {field}: expected {expected}, got {got}'
-        print('[smoke] OK  all five env overrides map to the right cfg fields')
+        print('[smoke] OK  env overrides map to the right cfg fields')
     finally:
         for k in env_map:
             os.environ.pop(k, None)
 
+    from dataclasses import fields
+    from workflow._plant_prepare import ENV_OVERRIDES
+    names = {f.name for f in fields(TrainConfig)}
+    missing = [k for k, (field, _) in ENV_OVERRIDES.items() if field not in names]
+    assert not missing, f'ENV_OVERRIDES fields missing on TrainConfig: {missing}'
+    print(f'[smoke] OK  all {len(ENV_OVERRIDES)} ENV_OVERRIDES map to TrainConfig')
+
+
+def _test_buffer_sample_identity():
+    print('\n=== TrajectoryBuffer.sample fancy-index identity ===')
+    T, D, A, N, n_dist = 32, 6, 2, 11, 1
+    buf = TrajectoryBuffer(N, T, D, A, n_dist=n_dist)
+    for i in range(N):
+        obs = np.full((T, D), float(i), dtype='float32')
+        obs[:, 0] = np.arange(T, dtype='float32')
+        act = np.full((T, A), float(i) + 0.5, dtype='float32')
+        rew = np.arange(T, dtype='float32') + i
+        cont = np.ones(T, dtype='float32')
+        expert = (np.arange(T) == i).astype('float32')
+        dist = np.full((T, n_dist), float(i) + 0.25, dtype='float32')
+        buf.add_episode(obs, act, rew, cont, expert=expert, dist=dist)
+    B, S = 8, 12
+    rng_a = np.random.default_rng(7)
+    rng_b = np.random.default_rng(7)
+    got = buf.sample(B, S, rng_a)
+    ep_idx = rng_b.integers(0, buf.filled, size=B)
+    max_start = buf.T - S
+    starts = (np.zeros(B, dtype=np.int64) if max_start <= 0
+              else rng_b.integers(0, max_start + 1, size=B))
+    want_obs = np.zeros((B, S, D), dtype='float32')
+    want_act = np.zeros((B, S, A), dtype='float32')
+    want_rew = np.zeros((B, S), dtype='float32')
+    want_cont = np.zeros((B, S), dtype='float32')
+    want_exp = np.zeros((B, S), dtype='float32')
+    want_dist = np.zeros((B, S, n_dist), dtype='float32')
+    for b in range(B):
+        s = starts[b]
+        want_obs[b] = buf.obs[ep_idx[b], s:s + S]
+        want_act[b] = buf.act[ep_idx[b], s:s + S]
+        want_rew[b] = buf.rew[ep_idx[b], s:s + S]
+        want_cont[b] = buf.cont[ep_idx[b], s:s + S]
+        want_exp[b] = buf.expert[ep_idx[b], s:s + S]
+        want_dist[b] = buf.dist[ep_idx[b], s:s + S]
+    assert np.array_equal(got['obs'], want_obs)
+    assert np.array_equal(got['act'], want_act)
+    assert np.array_equal(got['rew'], want_rew)
+    assert np.array_equal(got['cont'], want_cont)
+    assert np.array_equal(got['expert'], want_exp)
+    assert np.array_equal(got['dist'], want_dist)
+    slim = buf.sample(B, S, np.random.default_rng(7),
+                      keys=('obs', 'act', 'rew'))
+    assert set(slim) == {'obs', 'act', 'rew'}
+    assert np.array_equal(slim['obs'], got['obs'])
+    assert 'cont' not in slim
+    print('[smoke] OK  buffer sample matches per-row slice copy')
+
 
 if __name__ == '__main__':
+    _test_buffer_sample_identity()
     _test_weighted_recon()
     for wm in ('rssm', 'sf_transformer'):
         _test_recon_integration(wm)

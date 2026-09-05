@@ -25,22 +25,29 @@ plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
 
 ## Goals
 
-- Model-based control with a learned world model (RSSM default, transformer opt-in).
-- Stay close to the Dreamer papers. Add adaptive knobs only when they remain a strict
-  superset of the paper recipe (paper defaults as floors / minimums).
-- Simulator-agnostic via small, focused Bayesian Optimization on two axes
-  only: `model_size`, `horizon` (initialized from plant ID; lookback is
-  pinned to the identified value).
+- **Simulator-agnostic / sim-adaptive** neural APC: any chemical plant
+  (linear or nonlinear, any number of MVs / CVs / DVs). Knobs are unitless
+  or derived from dynamics-ID (τ, θ, authority, episode length) — never
+  hard-coded engineering units.
+- **Neural observer** (RSSM default, transformer-SSM opt-in) + **neural
+  Kalman DOB** for the unmeasured load. Bias-free DC gains on every
+  MV→CV and DV→CV pair; the DOB estimates only the hidden disturbance.
+- **Neural actor/critic** trained on real simulator rollouts (supervised
+  expert-BC is a launchpad, not a ceiling). The agent must **beat**
+  supervised / expert performance with RL.
+- Stay close to Dreamer paper defaults where they still apply. Add knobs
+  only when they remain a strict superset of the paper recipe.
 - One ONNX artifact per workflow: a single integrated graph
-  `(obs_window, prev_actions) → action`. No separate observer model — the
-  causal tokenizer + dynamics transformer *is* the observer.
+  `(obs_window, prev_actions) → action`. The RSSM/TSSM + DOB *is* the
+  observer the deployed policy reads.
 
 ## Training modes (`DREAMER_TRAIN_MODE`)
 
-- **`phased`** (default): the staged Dreamer-4 curriculum — P1 world-model
-  pretraining → P2 reward-head + policy-BC warmup → P3 actor+critic via
-  imagination, with phase boundaries. Best when the world model is expensive
-  to train (transformer backbone) and benefits from amortized pretraining.
+- **`phased`** (default): P1 world-model / observer pretraining → P2
+  reward-head + policy-BC warmup (and DOB A,K when the curriculum is on)
+  → P3 **real-sim** actor-critic (`_realsim_actor_critic_step`; imagination
+  for the actor is deleted). Best when the observer is expensive to train
+  (transformer backbone) and benefits from amortized pretraining.
 - **`joint`** (DreamerV1/V2/V3 style): after the seed-buffer **prefill**,
   co-train the world model, actor, and critic **every step from step 1** — no
   phase boundaries. This eliminates the phase-boundary failure modes (recon
@@ -48,8 +55,8 @@ plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
   checkpoint-discard) because all three components co-adapt. Recommended for
   the cheap RSSM backbone. The critic warmup (`DREAMER_P3_CRITIC_WARMUP_ITERS`)
   still runs at the very start so the value head calibrates before actor
-  coupling; `DREAMER_JOINT_PRIOR_REFRESH_ITERS` periodically refreshes the
-  PMPO prior.
+  coupling. PMPO prior-refresh is **REMOVED** (false A/B; real-sim P3 is
+  REINFORCE).
 
 ## Architecture (paper-faithful, adapted to vector APC observations)
 
@@ -163,9 +170,11 @@ Both share the same plant-derivation chain:
 ## Quick start — full workflow (recommended)
 
 ```bash
-source ../neural-apc-mbrl-env/bin/activate
-python -m workflow.bo_runner --simulation-dir simulation/test_sim
+source ../neural-APC-mbrl2-env/bin/activate
+python -m workflow.single_run --simulation-dir simulation/test_sim --out-dir output/test_sim/run_local
 ```
+
+BO (optional): `python -m workflow.bo_runner --simulation-dir simulation/test_sim`.
 
 That's the whole command.  Everything is auto-derived:
 
@@ -244,32 +253,46 @@ search *and* keep warm-starting model weights.
 
 | Var | Effect |
 |---|---|
-| `OBJ_REWARD_SCALE` | `auto` (default) / `off` / `<float>` — disable or force reward scale |
-| `OBJ_BATCH_SIZE` | force a batch size (else auto from GPU mem) |
-| `SIM_EPISODE_LENGTH` | force episode length (else auto from settling time) |
+| `DREAMER_OBJ_REWARD_SCALE` | `auto` (default) / `off` / `<float>` — disable or force reward scale. Leftover `OBJ_REWARD_SCALE` is ignored. |
+| `DREAMER_BATCH_SIZE` | pin `batch_size` (else empirical GPU-calib). Leftover `OBJ_BATCH_SIZE` is ignored. |
+| `DREAMER_TARGET_UTIL` | GPU-calib VRAM fraction (default 0.80). Read at `gpu_probe_knobs()`; explicit probe args win. |
+| `DREAMER_MAX_BS` | GPU-calib hard ceiling (default 512). Read at `gpu_probe_knobs()`; explicit probe args win. |
+| `DREAMER_EPISODE_LENGTH` | force episode length (else auto from settling time). Leftover `SIM_EPISODE_LENGTH` is ignored; `single_run` still writes `SIM_EPISODE_LENGTH` after derivation as IPC. |
 | `SIM_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10`) |
 | `SEED` | RNG seed (default 0) |
-| `DREAMER_FAST_ATTN` | `1`/`sdpa` force SDPA, `0`/`manual` force the paper soft-cap path. **Default: SDPA whenever a CUDA device is available** (~6–9× faster than manual; QKNorm provides numerical safety). ONNX export always uses `manual`. |
-| `SEED_TARGET_CV_FRAC` | seed-PRBS amplitude as a fraction of avg CV-bound width (default 0.20). Lower → narrower exploration; raise for plants where the actor needs to learn large MV moves. |
-| `SIGMA_MAX_CAP` | upper bound on the auto-derived policy `σ_max` (default 0.30). Raise to allow wider directional MV swings; lower to keep exploration tight. |
-| `SIGMA_MAX_FLOOR` | lower bound on the auto-derived `σ_max` (default 0.10). |
-| `SIGMA_MAX_OVER_SEED` | multiplier of `baseline_seed_action_std` used to set `σ_max` (default 1.0). |
-| `SIGMA_MIN_RATIO_OF_MAX` | `σ_min = σ_max / ratio` (default 2.5, min 2.0). |
+| `DREAMER_ATTN_IMPL` | `auto` (default: SDPA on CUDA) / `sdpa` / `manual`. Leftover `DREAMER_FAST_ATTN` (`1`/`sdpa`, `0`/`manual`) maps to the same field. |
+| `DREAMER_FAST_ATTN` | leftover alias of `DREAMER_ATTN_IMPL`. |
+| `DREAMER_WM_TF_LEVELS` / `_SPAN` / `_STEP_FRAC` / `_HORIZON` / `_SETTLE` | eval TM protocol (defaults 5 / 0.6 / 0.4 / 0=auto `max(80,4H)` / 0=auto). |
+| `DREAMER_VAL_WM_TRANSFER` / `_POSTPRIOR` / `_DISTPRED` | val-suite gates (default ON). |
+| `DREAMER_HORIZON_SETTLE_NTAU` / `DREAMER_HORIZON_MAX` | `H=(θ+n_τ·τ)/sr` formula (defaults 4.0 / 120). |
+| `DREAMER_INIT_RANDOMIZATION` / `_FRAC` | IC domain randomization (default ON / 0.6 of span). |
+| `DREAMER_WM_OVERHEAD` | GPU-calib WM-only probe headroom (default 1.30). |
+| `SEED_TARGET_CV_FRAC` | **ignored leftover** (P87-live); A/B `DREAMER_SEED_TARGET_CV_FRAC` (default 0.20). |
+| `SEED_SIGMA_CAP` | **ignored leftover** (P87-live); A/B `DREAMER_SEED_SIGMA_CAP` (default 0.30). |
+| `PRBS_SEG_MIN` / `PRBS_SEG_MIN_FLOOR` | **ignored leftover** (P87-live); A/B `DREAMER_PRBS_SEG_MIN` / `_FLOOR` (defaults 8 / 2). |
+| `PMPO_ENTROPY_COEF_BASELINE` / `PMPO_ENTROPY_SIGMA_REF` | **ignored leftover** (P87-live); A/B `DREAMER_PMPO_ENTROPY_ETA_V3` / `DREAMER_PMPO_ENTROPY_SIGMA_REF`. |
+| `SIGMA_MAX_CAP` | **ignored leftover** (P82-live); A/B `DREAMER_SIGMA_MAX_CAP` (default 0.30). |
+| `SIGMA_MAX_FLOOR` | **ignored leftover** (P82-live); A/B `DREAMER_SIGMA_MAX_FLOOR` (default 0.10). |
+| `SIGMA_MAX_OVER_SEED` | **ignored leftover** (P82-live); A/B `DREAMER_SIGMA_MAX_OVER_SEED` (default 1.0). |
+| `SIGMA_MIN_RATIO_OF_MAX` | **ignored leftover** (P82-live); A/B `DREAMER_SIGMA_MIN_RATIO` (`σ_min = σ_max / ratio`, default **1.2**). |
 | `OBJ_AUTO_ECON_OVER_MOVE_RATIO` | minimum ratio of `econ_budget` to per-step MV move penalty at typical actor jitter (default 2.0). Caps `move_base` so the user's economics term always strictly dominates the move term. Set to 1.0 to disable the cap; set higher (e.g. 5.0) for plants where you want the actor to ignore move pressure entirely while economics is small. |
 
 #### Hidden unmeasured-disturbance model + noise curriculum (P90)
 
-Unmeasured (truly hidden) CV upsets the controller must reject are modeled by a
-**realistic, simulator-adaptive event schedule** (`HiddenDisturbanceSchedule`)
-— not a constant wiggle. Each episode draws a sequence of discrete events with
-varied **shape** (`step` instant load change, `ramp` gradual drift, `pulse`
-temporary excursion, `ou_drift` noisy patch), **timing** (sometimes isolated
-with ≥ settling-time gaps so each upset reaches steady state, sometimes
-overlapping/serial), and **persistence** (some revert to baseline, some hold
-permanently). All timescales derive from the identified dead time + dominant
-time constant (`settle = (dead + N·τ)/sample_rate` agent steps); all magnitudes
-are capped by the agent's MV→CV authority. The schedule is never exposed to the
-agent or world model.
+Unmeasured (truly hidden) CV upsets the controller must reject are modeled by
+``HiddenDisturbance`` — a per-episode LOAD-event schedule filtered through a
+unit-DC FOPDT ``Gd`` (dead-time + lag). Not a constant wiggle and **not** a
+legacy OU added straight onto the CV (that path is deleted). Each episode draws
+discrete events with varied **shape** (`step` load change, `ramp` gradual drift,
+`pulse` temporary slug), **timing** (isolated with ≥ settling-time gaps, or
+overlapping), and **persistence** (some revert, some hold). All timescales
+derive from identified dead time + dominant τ
+(`settle = (dead + N·τ)/sample_rate`); magnitudes are capped by MV→CV authority.
+The schedule is never exposed to the agent or world model.
+
+These knobs are **TrainConfig + `ENV_OVERRIDES`** (identity defaults; leftover
+env still wins when the field is not explicit). Env-free `single_run` writes
+them into `run_plan.json`.
 
 **P89 noise RCA + fix:** the world model never learned a held-action steady
 state because *every* training trajectory — including the const-action
@@ -284,15 +307,26 @@ held-action seed episodes fully noise-free, and the **process-noise curriculum**
 | Var | Effect |
 |---|---|
 | `DREAMER_HIDDEN_DISTURBANCE` | `0` to disable the hidden disturbance entirely (default ON). |
-| `DREAMER_HIDDEN_DIST_MODE` | `schedule` (default, realistic event schedule) or `ou` (legacy single always-on OU drift). |
 | `DREAMER_HIDDEN_DIST_SETTLE_NTAU` | `N` in `settle = (dead + N·τ)/sr` (default 4 ≈ 98% settling). Controls event spacing + held-to-steady durations. |
 | `DREAMER_HIDDEN_DIST_MAX_EVENTS` | Cap on events per episode (default 6). |
 | `DREAMER_HIDDEN_DIST_P_ISOLATED` | P(gap ≥ settle, i.e. event fully settles before the next) vs overlap/serial (default 0.5). |
-| `DREAMER_HIDDEN_DIST_P_REVERT` | P(an event reverts to baseline) vs holds permanently (default 0.5; `pulse` always reverts). |
-| `DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS` | `"step,ramp,pulse,ou"` sampling weights (default `0.3,0.3,0.2,0.2`). |
-| `DREAMER_CLEAN_STEADY_SEEDS` | `0` to keep noise on the const-action / step-settle steady-state seeds (default ON = noise-free seeds). |
+| `DREAMER_HIDDEN_DIST_P_REVERT` | P(an event reverts to baseline) vs holds permanently (default **0.7**; `pulse` always reverts). |
+| `DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS` | `"step,ramp,pulse"` sampling weights (default **`0.5,0.3,0.2`**). |
+| `DREAMER_HIDDEN_DIST_SPREAD` | `0` to restore front-loaded sequential placement (default ON = spread across the episode). |
+| `DREAMER_HIDDEN_DIST_TAU_FRAC` | `"lo:hi"`: `tau_d = U(lo,hi)*tau_dom` (default `0.5:1.0`). |
+| `DREAMER_HIDDEN_DIST_DEADTIME_FRAC` | `"lo:hi"`: `theta_d = U(lo,hi)*dead_time` (default `0.5:1.5`). |
+| `DREAMER_CLEAN_STEADY_SEEDS` | `0` to keep noise on the const-action / step-settle / isolation-settle seeds (default ON = noise-free seeds). |
 | `DREAMER_PROCESS_NOISE_CURRICULUM` | `0` to disable the P1 process+measurement noise ramp (default ON). |
-| `DREAMER_PROCESS_NOISE_AMP_RAMP` | `"<start>:<reach>"` (default `0.0:0.4`): noise scale ramps from `start` at progress=0 to full by `progress=reach` in P1/P2; P3 always full. |
+| `DREAMER_PROCESS_NOISE_AMP_RAMP` | `"<start>:<reach>"` (default `0.0:0.4`): noise scale ramps from `start` at progress=0 to full by `progress=reach` in P1/P2; P3 always full. Empty leftover env = full noise. |
+| `DREAMER_SIM_NOISE_ADAPTIVE` | SNR-weighted OU gain + measurement-sigma cap (default ON). Leftover `SIM_NOISE_ADAPTIVE` ignored (P91-live). A/B `DREAMER_SIM_NOISE_ADAPTIVE`. |
+| `DREAMER_SIM_OU_SIGMA_FRAC` | OU σ as a fraction of channel span (default 0.008). Leftover `SIM_OU_SIGMA_FRAC` ignored. |
+| `DREAMER_SIM_OU_GAIN_CV` / `_DV` | OU gain multipliers (default 0.15 / 0.60). Leftover `SIM_OU_GAIN_*` ignored. |
+| `DREAMER_SIM_MEAS_NOISE_CV_FRAC` / `_DV_FRAC` | Measurement-noise σ as a fraction of span (default 0.005 / 0.010). Leftover `SIM_MEAS_NOISE_*` ignored. |
+| `DREAMER_SIM_NOISE_ENABLED` | Wrapper process+measurement noise (default ON). Leftover `SIM_NOISE_ENABLED` ignored. SysID `clean_mode` writes `DREAMER_SIM_NOISE_ENABLED=0`. |
+| `DREAMER_SIM_NOISE_SEED` | Wrapper RNG seed (default empty = unseeded). Leftover `SIM_NOISE_SEED` ignored. |
+| `DREAMER_SIM_NOISE_JITTER_PCT` | Per-episode OU/meas amplitude jitter ±fraction (default 0.20). Leftover `SIM_NOISE_JITTER_PCT` / `SIM_NOISE_AMPLITUDE_JITTER_PCT` ignored. SysID writes `DREAMER_SIM_NOISE_JITTER_PCT=0`. |
+| `DREAMER_SIM_DOMAIN_RANDOMIZATION` | Wrapper-level DR (default ON). Leftover `SIM_DOMAIN_RANDOMIZATION` / `DREAMER_DOMAIN_RANDOMIZATION` ignored. |
+| `DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED` | DR RNG seed (default empty = unseeded). Leftover `SIM_DOMAIN_RANDOMIZATION_SEED` ignored. |
 | `DREAMER_DISTURBANCE_PROB_WM` | Per-episode probability cap in P1/P2 (default 0.10). In P1 acts as the upper bound of the adaptive ramp; in P2 acts as the floor (P2 starts at this value). Observable schedule events (SP/DV) fire on 100% of episodes, so 0.10 gives the WM ~10× more clean episodes than disturbed ones during early learning. |
 | `DREAMER_DISTURBANCE_PROB_P2` | Per-episode probability cap in P2 (default 0.20). P2 linearly ramps from `DREAMER_DISTURBANCE_PROB_WM` (0.10) up to this cap as critic training progresses. Rationale: critic learns value of imagined rollouts starting from buffered real states; broadening buffer coverage with more disturbed episodes lets the critic estimate value across the disturbed manifold. |
 | `DREAMER_DISTURBANCE_PROB_AGENT` | Per-episode probability cap in P3 (**default 0.30**, P89: was 0.50 — a realistic plant sees occasional upsets ~20–30% of the time, and 50% corrupted too much of the actor's gradient + never let the CV settle). P3 linearly ramps from `DREAMER_DISTURBANCE_PROB_P2` (0.20) up to this cap. |
@@ -302,8 +336,8 @@ held-action seed episodes fully noise-free, and the **process-noise curriculum**
 | `DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH` | Fraction of P2 budget at which the P2 trigger probability reaches `DREAMER_DISTURBANCE_PROB_P2` (default 0.5 = midpoint of P2). |
 | `DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH` | Fraction of P3 budget at which the P3 trigger probability reaches `DREAMER_DISTURBANCE_PROB_AGENT` (default 0.5 = midpoint of P3). |
 | `DREAMER_HIDDEN_OU_AMP_RAMP` | `"<start>:<reach>"` (default `0.1:0.4`). Linear amplitude ramp from `start` at progress=0 to 1.0 at `progress=reach`, then capped by the phase-aware amplitude cap. |
-| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE` | Hard cap on `curriculum_amp_scale()` in **P1/P2** (default 0.2). With base `amp_frac=0.10`, peak disturbance ≈ 2% of MV authority during WM/critic learning. |
-| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3` | Hard cap on `curriculum_amp_scale()` in **P3** (default 1.0). The WM is frozen in P3 and the actor must learn realistic-magnitude rejection, so amplitude jumps to full nominal. |
+| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE` | Hard cap on `curriculum_amp_scale()` in **P1** (default 0.2). With base `amp_frac=0.10`, peak disturbance ≈ 2% of MV authority while `g` trains without DOB. |
+| `DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3` | Hard cap on `curriculum_amp_scale()` in **P2 and P3** (default 1.0). P64: P2 Kalman ID uses deployment amplitude (`g` frozen). P3 actor rejection stays full-scale. |
 | `DREAMER_HIDDEN_OU_AMP_JITTER` | `"<lo>:<hi>"` per-episode amplitude DR multiplier (default `0.6:1.6`). |
 | `DREAMER_HIDDEN_OU_DRIFT_FRAC` | Max constant per-episode mean offset as fraction of amp (default 0.4). |
 
@@ -314,14 +348,12 @@ least harm:
 | Phase | Trigger probability | Amplitude cap | Driving signal |
 |---|---|---|---|
 | P1 (WM) | 0.05 → 0.10 | 0.2 | `wm_best_score / TARGET_SCORE` |
-| P2 (critic) | 0.10 → 0.20 | 0.2 | `phase_progress / P2_RAMP_REACH` |
+| P2 (critic / DOB) | 0.10 → 0.20 | **1.0** (P64; was 0.2) | `phase_progress / P2_RAMP_REACH` |
 | P3 (actor) | 0.20 → 0.30 | 1.0 | `phase_progress / P3_RAMP_REACH` |
 
-This gives a continuous monotonic ramp across phases: trigger
-probability and amplitude both start small (clean signal for WM
-learning), broaden gradually as the critic needs broader state-space
-coverage, and reach full operational magnitude only in P3 when the
-actor is the one learning to reject.
+This keeps P1 amplitude small (clean signal for WM/`g` ID without DOB)
+and jumps to full operational magnitude in **P2** (Kalman ID; `g` frozen)
+and P3 (actor rejection). Trigger probability still ramps across phases.
 
 #### WM fidelity early-stop and `wm_best.pt`
 
@@ -349,34 +381,55 @@ steady-state behaviour. Mitigations:
 
 | Var | Effect |
 |---|---|
-| `DREAMER_CONST_ACTION_INJECT_EVERY` | Inject N fresh const-action episodes every K P1 iters (default K=20; set 0 to disable). |
-| `DREAMER_CONST_ACTION_INJECT_N` | Episodes per injection (default 5, stratified across `constant_action_seed_op_band`). |
-| `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (default 1; set 0 to disable). |
+| `DREAMER_CONST_ACTION_INJECT_EVERY` | Inject N fresh const-action episodes every K P1 iters. Dataclass default 20 is the **test_sim sentinel**; `_resolve_inject_cadence` sets `K = round(0.30 × buffer_lap)` unless explicit (`0` disables). test_sim stays 20. |
+| `DREAMER_CONST_ACTION_INJECT_N` | Episodes per injection. Dataclass default 5 is the **test_sim sentinel**; `_resolve_inject_cadence` sets `max(5, n_mv+n_dv)` unless explicit (`0` disables). test_sim stays 5. |
+| `DREAMER_STEP_TEST_INJECT_EVERY` | Same lap-fraction as const-inject (test_sim 20). `0` disables. |
+| `DREAMER_STEP_TEST_INJECT_N` | `max(2, n_mv+n_dv)` (test_sim 2; ≥1 episode per input channel per shot). |
+| `DREAMER_DV_PRBS_INJECT_EVERY` | DV-PRBS cadence: `min(round(0.15 × lap), warmup/4)` (test_sim 10; p122: land before typical `wm_best`). `0` disables. |
+| `DREAMER_DV_PRBS_INJECT_N` | `max(2, n_mv)` MV-hold levels while sweeping all DVs (test_sim 2). |
+| `DREAMER_EXPERT_INJECT_EVERY` | Expert-demo cadence (same 0.30×lap as const; test_sim 20). |
+| `DREAMER_EXPERT_INJECT_N` | `max(3, n_mv)` (test_sim 3). |
+| `DREAMER_WM_BEST_RESTORE_AT_P2` | Reload `wm_best.pt` at the P1→P2 boundary (**default OFF** after P28: freeze end-of-P1 `g`; set `1` to opt in). **Skipped after a P1 skip-storm last-ok restore** so the gain-blind fidelity peak cannot overwrite last-ok. |
+| `DREAMER_WM_BEST_RESTORE_AT_P3` | Reload `wm_best.pt` at P2→P3 (default 0; also skipped after skip-storm). |
 | `DREAMER_WM_BEST_RESTORE_MIN_GAP` | Skip restore when `total_iters - wm_best_iter` is below this (default 10). |
 
-Both knobs are sim-agnostic and adaptive: injection uses
-`cfg.episode_length` and the env's existing action range; warm-restore
-no-ops when `wm_best.pt` is essentially the current state.
+Both knobs are sim-agnostic and adaptive: injection cadence is a
+fraction of the replay-buffer FIFO lap (episode length already scales
+with τ+θ); inject **N** scales with `n_mv`/`n_dv`; isolation settle is
+**per isolated input** (`DREAMER_WM_ISOLATION_SETTLE_EPISODES`, auto 24:
+test_sim 24+24 / isolation-buf cap 48 settle-only; distillation 4 MV + 1 DV →
+96+24 / cap 120). Isolation_buf does **not** ingest ordinary MIMO PRBS;
+long-hold settle is noise-free when `clean_steady_seeds` (default ON).
+Isolation DV settle uses MV-action units (`isolated_level × span/2`);
+sample windows are `max(seq_len, K+1)` so ss-match can reach SS.
+Default `wm_isolation_dcv_match=True` then scales each input's
+`isolated_level` by `1/|G_i|` (WM-norm gain-match targets, clipped to
+±1, **scale floored at 1.0**) so abs isolation/ss-match can boost the
+weak-|G| input up to the cube without shrinking the strong-|G| teacher
+below op-band (P38 EXIT match-at-`g_min` starved MV: edge |Δu| 0.19 vs
+P37 0.60 → storm 2/2, val MV ×1.25 DV ×0.007). Not a loss reweight
+(`DREAMER_WM_ISOLATION_DCV_MATCH=0` to keep isomorphic |Δu|). Pre-iso
+resolve feeds those scales only; post-seed always re-resolves so Huber
+targets see isolation+expert obs-norm (P37 freeze point).
+Resolved Δu **multipliers**, `min_scale`, and applied **edge |Δu|**
+(`min(1, op_band·scale)`) are written to `run_plan.isolation_dcv_scales`
+(`[resolved-cfg] iso_dcv= min_scale= mv= dv= edge_du_mv= edge_du_dv=`).
+Warm-restore no-ops when `wm_best.pt` is essentially the current state.
 
-#### Reward-MTP / WM-coupling diagnostics (P39)
+#### Reward-MTP / WM-coupling diagnostics (opt-in)
 
-Four lightweight knobs to localise *why* the H=15 fidelity collapses
-even when supervised losses look healthy. A and D are standing
-observability (default ON, log-cadence-gated, <2% total overhead).
-B and C are controlled-experiment switches (default OFF) for one-off
-causal runs.
+Four lightweight knobs to localise *why* a fidelity cliff happens even
+when supervised losses look healthy. **Default OFF** (extra
+`autograd.grad(retain_graph=True)` every N iters is not env-free). Opt
+in via `DREAMER_DIAG_*` (`ENV_OVERRIDES` / TrainConfig). B and C stay
+controlled-experiment switches.
 
 | Var | Effect |
 |---|---|
-| `DREAMER_DIAG_PERHEAD_GRADS_EVERY` | (A) Log `diag_grad_{recon,sf,rmtp}` — per-loss gradient norms at the tokenizer's first parameter. Default 10 iters; 0 = off. |
-| `DREAMER_DIAG_LATENT_STABILITY_EVERY` | (D) Log `diag_latent_cos_{mean,min}` — cosine similarity of the encoder output on a fixed 64-transition reference set, vs. its values when first sampled. A sharp drop = the encoder is re-organising. Default 10 iters; 0 = off. |
+| `DREAMER_DIAG_PERHEAD_GRADS_EVERY` | (A) Log `diag_grad_{recon,sf,rmtp}` — extra per-loss gradient norms. Default **0** (off); `10` = every 10 iters. |
+| `DREAMER_DIAG_LATENT_STABILITY_EVERY` | (D) Log `diag_latent_cos_{mean,min}` — extra tokenizer encode on a fixed 64-transition set. Default **0** (off). |
 | `DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1` | (B) Ablate the reward MTP loss term from P1's `total_loss`. Reward head receives no gradient in P1 (will be untrained entering P2). If the fidelity cliff disappears, reward gradients are the cause. Default 0. |
 | `DREAMER_DIAG_REWARD_MTP_STOP_GRAD_IN_P1` | (C) Keep training the reward head but detach `agent_hid` before it. Head still learns; encoder/dynamics latent no longer receives reward-head gradient. Complements B: if C alone fixes the cliff, the problem is gradient distortion of shared params; if only B fixes it, it's something deeper. Default 0. Ignored when B is also set. |
-
-Recommended next experiment (P39-B): run with
-`DREAMER_DIAG_DISABLE_REWARD_MTP_IN_P1=1` and compare the
-`diag_latent_cos_mean` + fidelity-probe trajectory to the standing
-P39 baseline.
 
 #### WM gain fidelity, latent overshooting & critic grounding (P88, 2026-06-05)
 
@@ -403,7 +456,8 @@ default-OFF (paper-faithful) and apply to both entry points (single run + BO):
 | `DREAMER_WM_OVERSHOOT_LEN` | Open-loop horizon K to supervise (default 15; set to the imagination horizon for long-H runs). |
 | `DREAMER_WM_OVERSHOOT_MAX_STARTS` | Cap on strided start positions per batch (default 24) — bounds the added GRU cost. |
 | `DREAMER_WM_OVERSHOOT_GATE_RECON` | Soft recon-fidelity gate (default 0.1): scales the term by `min(1, gate/recon_loss)` so it ramps in only as 1-step reconstruction converges (no early-P1 destabilisation). |
-| `DREAMER_CRITIC_IMAG_LOSS_COEF` | **(#1) Critic real-grounding rebalance.** Weight on the *imagined* critic CE (default 1.0 = legacy). `<1.0` lets the real-return replay anchor (`critic_replay_anchor_coef`, `critic_anchor_lambda`) dominate the value target, breaking the bootstrap self-dominance (`critic_rew_to_tgt_var → ~0.001`) that freezes the actor. Both backbones. |
+
+mbrl2 real-sim: imagination critic CE / replay-anchor knobs are **removed** (`_realsim_actor_critic_step` never read them). Real-sim critic grounding is `DREAMER_CRITIC_MC_GROUNDING_COEF` (default 2.0, now in `ENV_OVERRIDES`).
 
 ## Single training run (no BO)
 
@@ -467,18 +521,18 @@ early via the `on_iter_end` callback in the trainer.
 
 | Knob | Floor (paper) | Auto rule | Override |
 |---|---|---|---|
-| `batch_size` | 16 | nearest power of two filling ~50 % of GPU memory; per-batch cost = `{S:220, M:330, L:640} MB × horizon/42` and is scaled by ~0.55 when SDPA is on; re-derived per BO trial | `OBJ_BATCH_SIZE` |
-| `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `OBJ_REWARD_SCALE` |
-| `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `SIM_EPISODE_LENGTH` |
+| `batch_size` | 16 | nearest power of two filling `gpu_target_util` of GPU memory (empirical probe); ceiling `gpu_max_bs` | `DREAMER_BATCH_SIZE` |
+| `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `DREAMER_OBJ_REWARD_SCALE` |
+| `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `DREAMER_EPISODE_LENGTH` (leftover `SIM_EPISODE_LENGTH` ignored) |
 | `sample_rate` | 5 | `min(τ_fast / 10, θ_fast / 2)` | `SIM_SAMPLE_RATE` |
 | `seq_len` | 64 | `max(64, ⌈(3τ + θ) / sr⌉)` | — |
 | `model_size` | M | `S/M/L` from complexity score | — |
 | `trial_steps` | 50 000 | `40 eps × max(1, complexity / 4) × ep_len`, clamped | `--trial_steps` |
 | `final_steps` | 200 000 | `10 × trial_steps`, clamped | `--final_steps` |
-| `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_FAST_ATTN` |
-| `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, SEED_SIGMA_CAP)` with `target_cv_frac=0.20` | `SEED_TARGET_CV_FRAC`, `SEED_SIGMA_CAP` |
-| `policy_log_std_max` | log(1.0) | `log(clip(SIGMA_MAX_OVER_SEED × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `SIGMA_MAX_CAP`, `SIGMA_MAX_FLOOR`, `SIGMA_MAX_OVER_SEED` |
-| `policy_log_std_min` | log(0.1) | `log(σ_max / SIGMA_MIN_RATIO_OF_MAX)` (default ratio 2.5) | `SIGMA_MIN_RATIO_OF_MAX` |
+| `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_ATTN_IMPL` / leftover `DREAMER_FAST_ATTN` |
+| `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, seed_sigma_cap)` with `target_cv_frac=0.20` | `DREAMER_SEED_TARGET_CV_FRAC` (leftover `SEED_*` ignored) |
+| `policy_log_std_max` | log(1.0) | `log(clip(σ_max_mult × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `DREAMER_SIGMA_MAX_*` (leftover `SIGMA_MAX_*` ignored) |
+| `policy_log_std_min` | log(0.1) | `log(σ_max / sigma_min_ratio)` (default ratio **1.2**) | `DREAMER_SIGMA_MIN_RATIO` (leftover `SIGMA_MIN_RATIO_OF_MAX` ignored) |
 
 ## Cascade stabilizers — fixed defaults
 
@@ -495,7 +549,7 @@ this table in sync whenever a default changes.
 | `bound_training_reward_ref` (`ref`) | `50.0` | econ-derived adaptive clip used to normalize raw reward before bounding | — | P77 |
 | `return_scale_abs_cap` | `500.0` | absolute hard cap on the percentile return_scale EMA (`0` disables); prevents the return-normalization runaway that froze the actor | `DREAMER_RETURN_SCALE_ABS_CAP` | Cursor stabilizer #2 (P79) |
 | `advantage_clip` | `8.0` | clamp normalized advantage to `±clip` before the actor loss | `DREAMER_ADVANTAGE_CLIP` | Cursor stabilizer #3 (P74) |
-| `critic_replay_anchor_coef` | `0.5` | anchors the critic on replayed real returns to resist the pessimistic self-consistent fixed point | — | anti-cascade |
+| `critic_mc_grounding_coef` | `2.0` | real-sim critic CE on a pure MC return-to-go (λ=1) in addition to the on-policy λ-return; pins V to realised economics | `DREAMER_CRITIC_MC_GROUNDING_COEF` | p04/p07 (imagination critic CE / replay-anchor knobs removed) |
 
 ## Disabled / dormant knobs (intentionally off)
 
@@ -531,8 +585,8 @@ rationale here.
 ## Setup
 
 ```bash
-python3 -m venv ../neural-apc-mbrl-env
-source ../neural-apc-mbrl-env/bin/activate
+python3 -m venv ../neural-APC-mbrl2-env
+source ../neural-APC-mbrl2-env/bin/activate
 pip install -r requirements.txt
 ```
 

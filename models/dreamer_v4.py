@@ -163,12 +163,15 @@ class CausalAttention(nn.Module):
     causal attention in a single 1-D sequence.
 
     ``attn_impl`` selects the backend:
-      * ``'manual'`` (default if ``soft_cap > 0``) — explicit matmul + softmax
-        with logit soft-cap. Paper-faithful but ~2× slower.
-      * ``'sdpa'``  — ``F.scaled_dot_product_attention`` (auto-dispatches to
-        FlashAttention-2 / cuDNN / mem-efficient). Drops soft-cap; QKNorm
-        provides the main numerical safety net. Set via env
-        ``DREAMER_FAST_ATTN=1`` or constructor arg.
+      * ``'manual'`` — explicit matmul + softmax with logit soft-cap.
+        Paper-faithful but ~2× slower. ONNX export always passes this.
+      * ``'sdpa'``  — ``F.scaled_dot_product_attention`` (FlashAttention-2 /
+        cuDNN). Drops soft-cap; QKNorm is the numerical safety net.
+      * ``'auto'`` (TrainConfig default) — SDPA on CUDA, manual on CPU.
+        Do **not** re-read leftover ``DREAMER_FAST_ATTN`` here:
+        ``ENV_OVERRIDES`` already maps FAST_ATTN then ATTN_IMPL onto
+        ``cfg.attn_impl`` (ATTN_IMPL wins). Re-reading env on ``auto``
+        would let leftover FAST_ATTN beat an explicit ``auto``.
     """
 
     def __init__(self, dim: int, n_heads: int, soft_cap: float = 50.0,
@@ -183,25 +186,12 @@ class CausalAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.soft_cap = soft_cap
-        # Resolve backend.
-        # Default policy (2026-05-12): SDPA whenever a CUDA device is
-        # available (FlashAttention-2 / cuDNN — ~3-9× faster than the
-        # manual soft-cap path with QKNorm providing the numerical
-        # safety net). CPU paths stay on 'manual' (SDPA gains are tiny
-        # without GPU kernels and ONNX export still passes
-        # attn_impl='manual' explicitly). Override via env
-        # DREAMER_FAST_ATTN: '0'/'manual' forces manual, '1'/'sdpa'
-        # forces sdpa.
+        # Resolve ``auto`` from the device only.  Override is
+        # ``cfg.attn_impl`` (``DREAMER_ATTN_IMPL`` / leftover
+        # ``DREAMER_FAST_ATTN`` via ``ENV_OVERRIDES``).  CPU stays
+        # manual (SDPA gains are tiny; ONNX passes ``manual``).
         if attn_impl == 'auto':
-            env_fast = os.environ.get('DREAMER_FAST_ATTN', '').strip().lower()
-            if env_fast in ('0', 'false', 'manual', 'off'):
-                attn_impl = 'manual'
-            elif env_fast in ('1', 'true', 'sdpa', 'on'):
-                attn_impl = 'sdpa'
-            elif torch.cuda.is_available():
-                attn_impl = 'sdpa'
-            else:
-                attn_impl = 'manual'
+            attn_impl = 'sdpa' if torch.cuda.is_available() else 'manual'
         assert attn_impl in ('manual', 'sdpa'), f'unknown attn_impl={attn_impl}'
         self.attn_impl = attn_impl
 
@@ -935,25 +925,21 @@ class PolicyHead(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         return log_probs.gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1)
 
-    # -- shared interface (used by pmpo_loss + early-stop entropy threshold) --
-
-    def kl_to(self, other: 'PolicyHead', latent: torch.Tensor) -> torch.Tensor:
-        """KL(self || other) at ``latent``.  Analytic for categoricals."""
-        cur_logp = F.log_softmax(self.logits(latent), dim=-1)     # (B,A,K)
-        with torch.no_grad():
-            prior_logp = F.log_softmax(other.logits(latent), dim=-1)
-        cur_p = cur_logp.exp()
-        return (cur_p * (cur_logp - prior_logp)).sum(-1).sum(-1)  # (B,)
+    # -- shared interface (entropy for real-sim P3 / early-stop) --
 
     def entropy(self, latent: torch.Tensor) -> torch.Tensor:
         """Per-state entropy H[π(·|latent)] summed over action dims.
 
-        Used by the PMPO entropy bonus (DreamerV3 §3, η = 3e-4).
+        Real-sim P3 entropy bonus + entropy-collapse early-stop.
         """
         logits = self.logits(latent)                              # (B,A,K)
         log_p = F.log_softmax(logits, dim=-1)
         p = log_p.exp()
         return -(p * log_p).sum(-1).sum(-1)                       # (B,)
+
+    def reset_log_std(self, optimizer=None) -> None:
+        """No-op: discrete policy has no Gaussian log_std residual."""
+        return
 
     @staticmethod
     def reference_entropy(action_dim: int, n_action_bins: int) -> float:
@@ -968,8 +954,8 @@ class ContinuousPolicyHead(nn.Module):
     ``a = tanh(mu + sigma * eps)`` with ``eps ~ N(0, I)``.  This is the
     standard continuous-control distribution (SAC, DreamerV3-continuous):
     bounded to ``[-1, 1]`` by construction with no boundary singularity, and
-    the underlying Gaussian gives well-behaved gradients & analytic KL for
-    PMPO.
+    the underlying Gaussian gives well-behaved entropy for the real-sim
+    P3 bonus / collapse trip.
 
     Replaces the discrete-bin ``PolicyHead`` for chemistry / process control
     where 6%-of-range bin steps (n_bins=21 over [-1,1] → 0.1) are too coarse
@@ -977,8 +963,8 @@ class ContinuousPolicyHead(nn.Module):
     test_sim diagnosed 2026-05-05.
 
     Interface mirrors ``PolicyHead`` (forward / log_prob_of /
-    log_prob_of_mtp / kl_to / reference_entropy) so the trainer + PMPO loss
-    code is policy-type agnostic.
+    log_prob_of_mtp / entropy / reference_entropy) so the trainer is
+    policy-type agnostic.  ``kl_to`` died with ``pmpo_loss``.
     """
 
     # Default log‐std bounds follow DreamerV3 §3 (σ ∈ [0.1, 1.0]).
@@ -1117,15 +1103,35 @@ class ContinuousPolicyHead(nn.Module):
         action = torch.tanh(raw)
         return self._tanh_log_prob(mu, log_std, raw, action).sum(-1)
 
-    def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor
+    def log_prob_of(self, latent: torch.Tensor, action: torch.Tensor,
+                     *, stop_grad_log_std: bool = False
                      ) -> torch.Tensor:
-        """Log-prob of a continuous action ``(B, action_dim)`` ∈ [-1, 1]."""
+        """Log-prob of a continuous action ``(B, action_dim)`` ∈ [-1, 1].
+
+        ``stop_grad_log_std`` detaches σ so REINFORCE trains μ only
+        (P51; P50 unfreeze yanked log_std).
+        """
+        logp, _ent = self.log_prob_and_entropy(
+            latent, action, stop_grad_log_std=stop_grad_log_std)
+        return logp
+
+    def log_prob_and_entropy(self, latent: torch.Tensor, action: torch.Tensor,
+                              *, stop_grad_log_std: bool = False
+                              ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One ``dist_params`` forward → ``(logp, entropy)``.
+
+        Identity vs ``log_prob_of`` + ``entropy`` (dropout-free MLP).
+        P3 REINFORCE used two MLP passes per inner step.
+        """
         mu, log_std = self.dist_params(latent)
-        # Invert tanh: u = atanh(action), clamped for numerical stability
-        # near ±1 (atanh(±1) is ±inf).
+        if stop_grad_log_std:
+            log_std = log_std.detach()
         a_clamped = action.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
         u = 0.5 * torch.log1p(2.0 * a_clamped / (1.0 - a_clamped))
-        return self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
+        logp = self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
+        entropy = (0.5 * (math.log(2.0 * math.pi * math.e)
+                           + 2.0 * log_std)).sum(-1)
+        return logp, entropy
 
     def log_prob_of_mtp(self, latent: torch.Tensor,
                          actions: torch.Tensor) -> torch.Tensor:
@@ -1136,26 +1142,23 @@ class ContinuousPolicyHead(nn.Module):
         u = 0.5 * torch.log1p(2.0 * a_clamped / (1.0 - a_clamped))
         return self._tanh_log_prob(mu, log_std, u, a_clamped).sum(-1)
 
+    def mean_of_mtp(self, latent: torch.Tensor,
+                    L: Optional[int] = None) -> torch.Tensor:
+        """Deterministic ``tanh(μ)`` for offsets ``[0, L)``. Shape ``(B, L, A)``.
+
+        P1/P2 MSE-on-μ BC (``bc_mean_only``) clones the mean without a
+        log_std gradient. Matches ``expert_bc_p3_loss`` at offset 0.
+        """
+        if L is None:
+            L = int(self.mtp_length)
+        L = max(1, min(int(L), int(self.mtp_length)))
+        mu, _log_std = self._params_offset(latent, L=L)
+        return torch.tanh(mu)
+
     # ---- shared interface (matches PolicyHead) ------------------------
 
-    def kl_to(self, other: 'ContinuousPolicyHead',
-               latent: torch.Tensor) -> torch.Tensor:
-        """Analytic KL(self || other) using the underlying Gaussians.
-
-        The tanh squash is identical for both, so the KL of the
-        squashed distributions equals the KL of the underlying Gaussians.
-        """
-        mu1, log_std1 = self.dist_params(latent)
-        with torch.no_grad():
-            mu2, log_std2 = other.dist_params(latent)
-        var1 = (2.0 * log_std1).exp()
-        var2 = (2.0 * log_std2).exp()
-        kl_per_dim = (log_std2 - log_std1
-                       + (var1 + (mu1 - mu2) ** 2) / (2.0 * var2)
-                       - 0.5)
-        return kl_per_dim.sum(-1)                                # (B,)
-
-    def entropy(self, latent: torch.Tensor) -> torch.Tensor:
+    def entropy(self, latent: torch.Tensor, *,
+                 stop_grad_log_std: bool = False) -> torch.Tensor:
         """Per-state Gaussian entropy summed over action dims.
 
         We report the entropy of the underlying Gaussian (pre-tanh)
@@ -1164,10 +1167,62 @@ class ContinuousPolicyHead(nn.Module):
         roughly state-independent, so it does not affect gradient
         directions for the entropy bonus / collapse trip.  Matches the
         SAC convention.
+
+        ``stop_grad_log_std`` makes η a constant w.r.t. σ (P51).
         """
-        _, log_std = self.dist_params(latent)
+        _mu, log_std = self.dist_params(latent)
+        if stop_grad_log_std:
+            log_std = log_std.detach()
         return (0.5 * (math.log(2.0 * math.pi * math.e)
                         + 2.0 * log_std)).sum(-1)
+
+    def reset_log_std(self, optimizer=None) -> None:
+        """Zero the log_std residual so σ = ``log_std_init``. Leave μ intact.
+
+        P45 RCA: P1/P2 expert-BC drives the last-layer log_std rows to
+        ``σ_min`` (entropy at the early-stop floor from the first P3
+        iter). Critic warmup then sees railed on-policy rollouts; actor
+        unfreeze explodes REINFORCE. Zeroing only the log_std half of
+        the ``(μ, log_std)`` last Linear restores exploration without
+        wiping the BC mean.
+
+        P46 GPU-occupied: P2 NLL also fills Adam ``exp_avg`` / ``exp_avg_sq``
+        on those rows. Weight-only reset then first ``opt_actor.step`` after
+        warmup re-collapses σ. When ``optimizer`` is the actor AdamW, zero
+        those moments on the log_std rows only (μ rows keep BC momentum).
+        """
+        last = self.head.net[-1]
+        if not isinstance(last, nn.Linear):
+            return
+        n = int(self.mtp_length) * int(self.action_dim)
+        idx = torch.arange(n, device=last.weight.device) * 2 + 1
+        with torch.no_grad():
+            last.weight.index_fill_(0, idx, 0.0)
+            if last.bias is not None:
+                last.bias.index_fill_(0, idx, 0.0)
+            if optimizer is not None:
+                self._zero_log_std_adam(optimizer, last, idx)
+
+    @staticmethod
+    def _zero_log_std_adam(optimizer, last: nn.Linear,
+                           idx: torch.Tensor) -> None:
+        """Zero Adam/AdamW row moments for log_std outputs of ``last``."""
+        params = {id(last.weight), id(last.bias)} if last.bias is not None \
+            else {id(last.weight)}
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if id(p) not in params:
+                    continue
+                st = optimizer.state.get(p)
+                if not st:
+                    continue
+                for key in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq'):
+                    buf = st.get(key)
+                    if buf is None or buf.ndim < 1:
+                        continue
+                    if buf.shape[0] != p.shape[0]:
+                        continue
+                    buf.index_fill_(0, idx.to(device=buf.device), 0.0)
 
     @staticmethod
     def reference_entropy(action_dim: int, n_action_bins: int = 0) -> float:
@@ -1191,6 +1246,7 @@ class DreamerV4Config:
     obs_dim: int
     action_dim: int
     lookback: int                          # transformer context length T_ctx
+    horizon: int = 0                       # control H (P76/P88 keep-h REVERT)
     # Tokenizer
     tok_hidden: int = 256
     z_dim: int = 24
@@ -1221,13 +1277,11 @@ class DreamerV4Config:
     # exploration; defaults are chosen for stable adaptive operation.
     policy_log_std_min: float = -2.3
     policy_log_std_max: float = 0.0
+    # P26 RCA / P27: TD3-style min-of-N twohot critics.  1 = paper single head.
+    n_critics: int = 2
     # ===== World-model backbone selection =====
-    # ``'rssm'`` (new default 2026-05-30) uses the DreamerV3 recurrent
-    # state-space model (GRU + categorical latent) whose deterministic
-    # core can learn a held-action fixed point — the property the
-    # SF-transformer lacked (0% steady-state convergence drove the
-    # bootstrap-cascade across P64/P66/P67).  ``'sf_transformer'`` keeps
-    # the original V4 shortcut-forcing transformer dynamics.
+    # ``'rssm'`` is the missing-ckpt fallback (P66 / P77: never default a
+    # loaded graph to TSSM or SF).  TrainConfig env-free default is ``'rssm'``.
     world_model_type: str = 'rssm'
     rssm_deter_dim: int = 512
     rssm_n_categoricals: int = 32
@@ -1235,7 +1289,7 @@ class DreamerV4Config:
     rssm_embed_dim: int = 256
     rssm_hidden_dim: int = 256
     rssm_unimix: float = 0.01
-    rssm_latent_type: str = 'categorical'   # or 'deterministic' (continuous, no-KL)
+    rssm_latent_type: str = 'deterministic'  # continuous tanh, no-KL (V3 categorical is opt-in)
     rssm_latent_noise: float = 0.0          # reparam noise on deterministic latent
     # ===== TSSM (transformer-SSM) backbone (neural-apc-mbrl) =====
     # ``'tssm'`` swaps the GRU recurrent core for a causal transformer that does
@@ -1287,12 +1341,86 @@ class DreamerV4Config:
     cont_gain_deterministic_roll: bool = True
 
 
+def dreamer_v4_config_from_train(cfg, *, attn_impl: Optional[str] = None
+                                 ) -> 'DreamerV4Config':
+    """Architecture-shaping ``DreamerV4Config`` from a TrainConfig / ckpt cfg.
+
+    One constructor for train + val / TM / ONNX reload.  Missing fields
+    used to default ``world_model_type`` to ``sf_transformer`` (pre-P68)
+    while ``TrainConfig`` / this dataclass default ``rssm`` — a silent
+    rebuild of the wrong backbone (same leftover class as P29 latent).
+    ``attn_impl`` override: diagnostic CPU ``sdpa``, ONNX ``manual``.
+    """
+    if attn_impl is None:
+        attn_impl = getattr(cfg, 'attn_impl', 'auto')
+    return DreamerV4Config(
+        obs_dim=int(getattr(cfg, 'obs_dim')),
+        action_dim=int(getattr(cfg, 'action_dim')),
+        lookback=int(getattr(cfg, 'lookback')),
+        horizon=int(getattr(cfg, 'horizon', 0) or 0),
+        tok_hidden=int(getattr(cfg, 'tok_hidden')),
+        z_dim=int(getattr(cfg, 'z_dim')),
+        mae_p_max=float(getattr(cfg, 'mae_p_max')),
+        d_model=int(getattr(cfg, 'd_model')),
+        n_layers=int(getattr(cfg, 'n_layers')),
+        n_heads=int(getattr(cfg, 'n_heads')),
+        ff_mult=int(getattr(cfg, 'ff_mult')),
+        n_register=int(getattr(cfg, 'n_register')),
+        k_max=int(getattr(cfg, 'k_max')),
+        tau_n_bins=int(getattr(cfg, 'tau_n_bins')),
+        soft_cap=float(getattr(cfg, 'soft_cap')),
+        attn_impl=attn_impl,
+        n_action_bins=int(getattr(cfg, 'n_action_bins')),
+        head_hidden=int(getattr(cfg, 'head_hidden')),
+        head_n_layers=int(getattr(cfg, 'head_n_layers')),
+        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 8) or 8)),
+        n_critics=max(1, int(getattr(cfg, 'n_critics', 2) or 2)),
+        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
+        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -2.0)),
+        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
+        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
+        world_model_type=str(getattr(cfg, 'world_model_type', 'rssm')),
+        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
+        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
+        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
+        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
+        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
+        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
+        rssm_latent_type=str(getattr(cfg, 'rssm_latent_type', 'deterministic')),
+        rssm_latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
+        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
+        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
+        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
+        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
+        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
+        disturbance_head_hidden=int(
+            getattr(cfg, 'disturbance_head_hidden', 0) or 0),
+        disturbance_head_layers=int(
+            getattr(cfg, 'disturbance_head_layers', 2) or 2),
+        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
+        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
+        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
+        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
+        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
+        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
+        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
+        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
+        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
+        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
+        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
+        cont_dist_deterministic_roll=bool(getattr(
+            cfg, 'cont_dist_deterministic_roll', True)),
+        cont_gain_deterministic_roll=bool(getattr(
+            cfg, 'cont_gain_deterministic_roll', True)),
+    )
+
+
 class DreamerV4(nn.Module):
     def __init__(self, cfg: DreamerV4Config):
         super().__init__()
         self.cfg = cfg
         self.world_model_type = str(
-            getattr(cfg, 'world_model_type', 'sf_transformer')).lower()
+            getattr(cfg, 'world_model_type', 'rssm')).lower()
         if self.world_model_type == 'rssm':
             # DreamerV3 RSSM backbone.  No tokenizer (the RSSM has an
             # integrated MLP encoder/decoder); heads read from the
@@ -1307,7 +1435,7 @@ class DreamerV4(nn.Module):
                 embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
                 hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-                latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
+                latent_type=str(getattr(cfg, 'rssm_latent_type', 'deterministic')),
                 latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
                 dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
                 dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
@@ -1325,6 +1453,7 @@ class DreamerV4(nn.Module):
                 cont_gain_deterministic_roll=bool(getattr(
                     cfg, 'cont_gain_deterministic_roll', True)),
                 dv_decoder_feedforward=bool(getattr(cfg, 'dv_decoder_feedforward', False)),
+                horizon=int(getattr(cfg, 'horizon', 0) or 0),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
             D = self.dynamics.feat_dim
@@ -1345,7 +1474,7 @@ class DreamerV4(nn.Module):
                 n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
                 n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
                 unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-                latent_type=str(getattr(cfg, 'rssm_latent_type', 'categorical')),
+                latent_type=str(getattr(cfg, 'rssm_latent_type', 'deterministic')),
                 latent_noise=float(getattr(cfg, 'rssm_latent_noise', 0.0) or 0.0),
                 max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
                 dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
@@ -1397,14 +1526,21 @@ class DreamerV4(nn.Module):
         self.reward = TwohotHead(D, cfg.head_hidden,
                                   n_layers=cfg.head_n_layers,
                                   mtp_length=cfg.mtp_length)
-        self.value = TwohotHead(D, cfg.head_hidden,
-                                 n_layers=cfg.head_n_layers)
-        # EMA target for value (TD-λ stability, paper §3.3).
-        self.target_value = TwohotHead(D, cfg.head_hidden,
-                                         n_layers=cfg.head_n_layers)
-        self.target_value.load_state_dict(self.value.state_dict())
-        for p in self.target_value.parameters():
-            p.requires_grad_(False)
+        # P26 RCA / P27: ensemble of twohot critics; bootstrap + advantage use
+        # min-of-N (TD3).  ``self.value`` aliases head 0 so smoke/validate
+        # call sites stay valid.  n_critics=1 is the paper single-head path.
+        n_c = max(1, int(getattr(cfg, 'n_critics', 1) or 1))
+        self.n_critics = n_c
+        self.values = nn.ModuleList([
+            TwohotHead(D, cfg.head_hidden, n_layers=cfg.head_n_layers)
+            for _ in range(n_c)])
+        self.target_values = nn.ModuleList([
+            TwohotHead(D, cfg.head_hidden, n_layers=cfg.head_n_layers)
+            for _ in range(n_c)])
+        for i in range(n_c):
+            self.target_values[i].load_state_dict(self.values[i].state_dict())
+            for p in self.target_values[i].parameters():
+                p.requires_grad_(False)
         # Frozen prior policy snapshot (PMPO behavioural prior, paper eq. 11).
         if self.policy_type == 'continuous':
             self.prior_policy = ContinuousPolicyHead(
@@ -1456,6 +1592,25 @@ class DreamerV4(nn.Module):
         if getattr(self, '_compiled', False):
             return
         try:
+            # Don't let inductor fork ncpu workers — that starves the
+            # plant sim (P29: 20 compile workers on 20 cores).  Leave
+            # cores for training + the CPU simulator.  User override
+            # via TORCHINDUCTOR_COMPILE_THREADS still wins.
+            try:
+                try:
+                    _ncpu = len(os.sched_getaffinity(0)) or (os.cpu_count() or 4)
+                except Exception:
+                    _ncpu = os.cpu_count() or 4
+                _nth = max(1, min(4, int(_ncpu) // 4 or 1))
+                os.environ.setdefault('TORCHINDUCTOR_COMPILE_THREADS', str(_nth))
+                try:
+                    import torch._inductor.config as _ind_cfg
+                    if getattr(_ind_cfg, 'compile_threads', None) is not None:
+                        _ind_cfg.compile_threads = _nth
+                except Exception:
+                    pass
+            except Exception:
+                pass
             # P3 imagination calls dynamics with context lengths T=seq_len..
             # seq_len+H (≈43 distinct shapes). The default recompile_limit=8
             # would bail to eager after 8 shapes despite dynamic=True. Bump
@@ -1562,19 +1717,80 @@ class DreamerV4(nn.Module):
     # ---------------------------------------------------------- target / prior
     def update_target(self, tau: float = 0.02) -> None:
         with torch.no_grad():
-            for p, t in zip(self.value.parameters(),
-                            self.target_value.parameters()):
-                t.data.mul_(1.0 - tau).add_(tau * p.data)
+            for h, th in zip(self.values, self.target_values):
+                for p, t in zip(h.parameters(), th.parameters()):
+                    t.data.mul_(1.0 - tau).add_(tau * p.data)
+
+    @property
+    def value(self):
+        """Head 0 alias so smoke/validate `model.value(...)` stays valid."""
+        return self.values[0]
+
+    @property
+    def target_value(self):
+        return self.target_values[0]
+
+    def critic_min_v(self, feat: torch.Tensor, *, target: bool = False
+                     ) -> torch.Tensor:
+        """Min-of-N twohot expectation (TD3).  n_critics=1 ⇒ the single head."""
+        heads = self.target_values if target else self.values
+        vs = torch.stack([h.expectation(h(feat)) for h in heads], dim=0)
+        return vs.min(dim=0).values
+
+    def critic_ensemble_ce(self, feat: torch.Tensor,
+                           target_returns: torch.Tensor) -> torch.Tensor:
+        """Mean twohot-CE across ensemble heads vs the same target."""
+        t = target_returns.reshape(-1)
+        return torch.stack([h.loss(h(feat), t) for h in self.values]).mean()
+
+    def critic_online_ce_and_min_v(
+            self, feat: torch.Tensor, target_returns: torch.Tensor,
+            mc_returns: Optional[torch.Tensor] = None
+            ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """One online-ensemble MLP pass → λ CE, min-of-N V, optional MC CE.
+
+        Identity vs ``critic_ensemble_ce`` + ``critic_min_v(target=False)``
+        (+ a second CE for MC) on the dropout-free twohot MLP.  P3 used
+        three online forwards per on-policy inner step.
+        """
+        logits = [h(feat) for h in self.values]
+        t = target_returns.reshape(-1)
+        ce = torch.stack(
+            [h.loss(lg, t) for h, lg in zip(self.values, logits)]).mean()
+        v = torch.stack(
+            [h.expectation(lg) for h, lg in zip(self.values, logits)],
+            dim=0).min(dim=0).values
+        mc: Optional[torch.Tensor] = None
+        if mc_returns is not None:
+            tm = mc_returns.reshape(-1)
+            mc = torch.stack(
+                [h.loss(lg, tm) for h, lg in zip(self.values, logits)]
+            ).mean()
+        return ce, v, mc
 
     def snapshot_prior_policy(self) -> None:
-        """Capture the current policy as the frozen PMPO prior (start of Phase 3)."""
-        self.prior_policy.load_state_dict(self.policy.state_dict())
-        for p in self.prior_policy.parameters():
-            p.requires_grad_(False)
+        """No-op leftover: PMPO π_prior is unused (real-sim REINFORCE).
+
+        ``prior_policy`` stays in the module for checkpoint load / frozen
+        param partition.  Prior-refresh knobs were a false A/B and are
+        **REMOVED**.  Do not copy weights — nothing reads π_prior.
+        """
+        return
+
+    def reset_policy_exploration(self, optimizer=None) -> None:
+        """Restore Gaussian σ to ``log_std_init``; no-op for discrete π.
+
+        Pass the actor AdamW so log_std-row moments are cleared with the
+        weights (P2 NLL otherwise re-collapses σ at the first unfreeze).
+        """
+        fn = getattr(self.policy, 'reset_log_std', None)
+        if callable(fn):
+            fn(optimizer)
 
     def update_return_scale(self, returns: torch.Tensor,
                              ema: float = 0.99,
                              abs_cap: float = 500.0,
+                             freeze: bool = False,
                              ) -> torch.Tensor:
         """EMA of the (p95-p05) return spread, with an absolute upper cap.
 
@@ -1588,7 +1804,15 @@ class DreamerV4(nn.Module):
         (``abs_cap``, default 500): normal growth is untouched and only
         the implausible runaway is arrested.  ``abs_cap=0`` recovers the
         original DreamerV3-faithful uncapped behaviour.
+
+        P26 RCA / P27: ``freeze=True`` after critic warmup stops the EMA
+        from tracking a growing bootstrap spread (P26: 1.19→49.5 cap,
+        rew_to_tgt_var 0.041→0.00015, entropy collapse).  Warmup still
+        updates the scale so the first actor step sees a calibrated
+        normaliser.
         """
+        if freeze:
+            return self.ret_scale.clamp_min(1.0)
         with torch.no_grad():
             r = returns.detach().reshape(-1).float()
             if r.numel() < 2:
@@ -1617,16 +1841,11 @@ class DreamerV4(nn.Module):
         2026-06-09).  Included for both backbones; omitted when the head is
         disabled (``disturbance_head_dim == 0`` ⇒ ``self.disturbance is None``).
         """
-        if getattr(self, 'world_model_type', 'sf_transformer') == 'rssm':
-            params = (list(self.dynamics.parameters())
-                      + list(self.reward.parameters()))
-        else:
-            # SF-transformer has a tokenizer; RSSM/TSSM integrate the encoder/
-            # decoder into ``dynamics`` (tokenizer is None) — guard it so both
-            # the 'rssm' and 'tssm' backbones work.
-            params = list(self.dynamics.parameters()) + list(self.reward.parameters())
-            if getattr(self, 'tokenizer', None) is not None:
-                params = list(self.tokenizer.parameters()) + params
+        # RSSM/TSSM fold encoder/decoder into ``dynamics`` (tokenizer is None).
+        # SF-transformer has a separate tokenizer — include it when present.
+        params = list(self.dynamics.parameters()) + list(self.reward.parameters())
+        if getattr(self, 'tokenizer', None) is not None:
+            params = list(self.tokenizer.parameters()) + params
         if getattr(self, 'disturbance', None) is not None:
             params = params + list(self.disturbance.parameters())
         return params
@@ -1636,8 +1855,11 @@ class DreamerV4(nn.Module):
         return list(self.policy.parameters())
 
     def parameters_critic(self):
-        """Value head — trained in Phase 3 only."""
-        return list(self.value.parameters())
+        """Value head(s) — trained in Phase 3 only."""
+        params: list = []
+        for h in self.values:
+            params.extend(h.parameters())
+        return params
 
     # ----------------------------------------- staged curriculum freeze control
     def set_world_model_trainable(self, *, g: bool, dob: bool,
@@ -1700,12 +1922,9 @@ class DreamerV4(nn.Module):
         ``z_history``     : ``(B, T_ctx, z_dim)``  — clean past latents.
         ``action``        : ``(B, action_dim)``    — action taken at the next step.
         ``action_history``: ``(B, T_ctx, action_dim)`` — REAL past actions
-            that produced ``z_history``.  REQUIRED for correctness: during
-            WM training the dynamics always sees real actions at every
-            position; passing zeros for the past creates a train/inference
-            distribution mismatch and the dynamics produces garbage.
-            (Defaults to zeros for back-compat with old callers; warn-loud
-            via ``DREAMER_ACT_HIST_REQUIRED=1`` to catch missing hookups.)
+            that produced ``z_history``.  Required.  Omitting it used to
+            zero-fill the past (train/inference mismatch); that fallback
+            is gone.
         ``tau_ctx``       : context noise level.  ``None`` (default) → auto
             ``1.0 / k_max`` so the past τ lands at ``(k_max-1)/k_max`` which
             is the MAX value in the training τ-grid (sample_tau_d only ever
@@ -1730,19 +1949,14 @@ class DreamerV4(nn.Module):
         z_seq = torch.cat([z_past_corr, z0], dim=1)                       # (B, T_ctx+1, z)
         # Action: real past actions + supplied current action.
         if action_history is None:
-            import os as _os
-            if _os.environ.get('DREAMER_ACT_HIST_REQUIRED', '').strip() in ('1','true','True'):
-                raise ValueError(
-                    'imagine_next_z called without action_history; this is '
-                    'a train/inference distribution bug.  Pass the real '
-                    'past actions that produced z_history.')
-            act_past = torch.zeros(B, T_ctx, cfg.action_dim, device=device,
-                                    dtype=action.dtype)
-        else:
-            assert action_history.shape == (B, T_ctx, cfg.action_dim), (
-                f'action_history shape {tuple(action_history.shape)} != '
-                f'expected ({B}, {T_ctx}, {cfg.action_dim})')
-            act_past = action_history.to(device=device, dtype=action.dtype)
+            raise ValueError(
+                'imagine_next_z called without action_history; this is '
+                'a train/inference distribution bug.  Pass the real '
+                'past actions that produced z_history.')
+        assert action_history.shape == (B, T_ctx, cfg.action_dim), (
+            f'action_history shape {tuple(action_history.shape)} != '
+            f'expected ({B}, {T_ctx}, {cfg.action_dim})')
+        act_past = action_history.to(device=device, dtype=action.dtype)
         act_seq = torch.cat([act_past, action.unsqueeze(1)], dim=1)       # (B, T_ctx+1, A)
         # τ / d sequences: past = (1 - tau_ctx, d_min), current = (0 → 1, d_min).
         d_min = 1.0 / cfg.k_max
@@ -1780,123 +1994,6 @@ class DreamerV4(nn.Module):
         """Sample an action from ``policy`` given an agent-register hidden state."""
         action, _, _ = self.policy(agent_hid, deterministic=deterministic)
         return action
-
-
-# ---------------------------------------------------------------------------
-# PMPO loss (paper eq. 11)
-# ---------------------------------------------------------------------------
-
-def pmpo_loss(policy, prior_policy,
-              latent: torch.Tensor, raw_action: torch.Tensor,
-              advantage: torch.Tensor,
-              alpha: float = 0.5, beta: float = 0.1,
-              entropy_coef: float = 0.0
-              ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Policy Maximum Likelihood Optimization loss (Dreamer 4 eq. 11).
-
-    Splits states by sign of advantage:
-      - D⁺ = {s | A ≥ 0} → upweight chosen action
-      - D⁻ = {s | A < 0} → downweight chosen action
-    Plus a KL term to a frozen prior policy and (optionally) an entropy
-    bonus following DreamerV3 §3 (``η = 3e-4`` by default in V3).  The
-    entropy bonus acts as a soft σ-floor for the continuous TanhNormal
-    head and a uniform-prior pull for the discrete categorical head;
-    both are essential for stability when the advantage signal is
-    heavy-tailed (e.g. process-control violation penalties).
-
-    All tensors are flat ``(N, …)``.  ``raw_action`` is the canonical
-    sample representation produced by ``policy.sample_with_raw`` (bin
-    index for discrete, pre-tanh ``u`` for continuous) — see those
-    methods for why this is required for numerical correctness in
-    bfloat16 training.  Polymorphic in policy class — both
-    ``PolicyHead`` and ``ContinuousPolicyHead`` expose
-    ``log_prob_of_raw`` / ``kl_to`` / ``entropy``.
-    """
-    log_prob = policy.log_prob_of_raw(latent, raw_action)        # (N,)
-    kl = policy.kl_to(prior_policy, latent)                      # (N,)
-
-    pos_mask = (advantage >= 0).float()
-    neg_mask = 1.0 - pos_mask
-    n_pos = pos_mask.sum().clamp_min(1.0)
-    n_neg = neg_mask.sum().clamp_min(1.0)
-    loss_pos = -(alpha * (log_prob * pos_mask).sum() / n_pos)
-    loss_neg = -((1.0 - alpha) * (-(log_prob) * neg_mask).sum() / n_neg)
-    loss_kl = beta * kl.mean()
-    if entropy_coef and entropy_coef > 0.0:
-        ent = policy.entropy(latent)                            # (N,)
-        loss_ent = -float(entropy_coef) * ent.mean()
-        ent_mean_diag = ent.mean().detach()
-    else:
-        loss_ent = torch.zeros((), device=log_prob.device,
-                                dtype=log_prob.dtype)
-        ent_mean_diag = torch.zeros((), device=log_prob.device,
-                                     dtype=log_prob.dtype)
-    total = loss_pos + loss_neg + loss_kl + loss_ent
-    diag = {
-        'pmpo_loss': total.detach(),
-        'pmpo_pos_frac': (n_pos / (n_pos + n_neg)).detach(),
-        'pmpo_kl': kl.mean().detach(),
-        'pmpo_logp_mean': log_prob.mean().detach(),
-        'pmpo_entropy_bonus': ent_mean_diag,
-    }
-    return total, diag
-
-
-# ---------------------------------------------------------------------------
-# DreamerV3 REINFORCE actor loss (V3 §3, eq. 3) — robust alternative
-# ---------------------------------------------------------------------------
-
-def reinforce_actor_loss(policy, prior_policy,
-                          latent: torch.Tensor, raw_action: torch.Tensor,
-                          advantage: torch.Tensor,
-                          entropy_coef: float = 3e-4,
-                          kl_coef: float = 0.0,
-                          ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """DreamerV3-style REINFORCE actor loss.
-
-    Replaces V4's PMPO advantage-sign-split (eq. 11) with the V3 surrogate:
-
-        L = -E[A · log π(a|s)] - η · H[π] + β · KL(π || π_prior)
-
-    ``raw_action`` is the canonical sample produced by
-    ``policy.sample_with_raw`` (pre-tanh ``u`` for continuous, bin
-    index for discrete).  Using ``raw_action`` instead of the
-    post-squash action is **required** for numerically-correct log_prob
-    recomputation under bfloat16 autocast — at moderate ``|u|``,
-    ``tanh(u)`` rounds to ±1 in bfloat16 and ``atanh`` returns the wrong
-    pre-image (manifests as ``log_prob`` ~ -1500 with std ~ 2750).
-    """
-    log_prob = policy.log_prob_of_raw(latent, raw_action)       # (N,)
-    entropy = policy.entropy(latent)                            # (N,)
-
-    # Reinforce surrogate. ``advantage`` is detached so the actor only
-    # backprops through the policy, not the critic baseline.
-    pg_loss = -(advantage.detach() * log_prob).mean()
-    ent_loss = -float(entropy_coef) * entropy.mean()
-    if kl_coef and kl_coef > 0.0:
-        kl = policy.kl_to(prior_policy, latent)                 # (N,)
-        kl_loss = float(kl_coef) * kl.mean()
-        kl_diag = kl.mean().detach()
-    else:
-        kl_loss = torch.zeros((), device=log_prob.device,
-                                dtype=log_prob.dtype)
-        kl_diag = torch.zeros((), device=log_prob.device,
-                                dtype=log_prob.dtype)
-    total = pg_loss + ent_loss + kl_loss
-    diag = {
-        'actor_pg_loss': pg_loss.detach(),
-        'actor_entropy_bonus': entropy.mean().detach(),
-        'actor_kl_pen': kl_diag,
-        'actor_logp_mean': log_prob.mean().detach(),
-        'actor_logp_std': log_prob.std().detach(),
-        # Mirror PMPO diag keys so existing logging / plotting works.
-        'pmpo_loss': total.detach(),
-        'pmpo_pos_frac': (advantage >= 0).float().mean().detach(),
-        'pmpo_kl': kl_diag,
-        'pmpo_logp_mean': log_prob.mean().detach(),
-        'pmpo_entropy_bonus': entropy.mean().detach(),
-    }
-    return total, diag
 
 
 # ---------------------------------------------------------------------------
@@ -2005,7 +2102,7 @@ __all__ = [
     'MLP', 'RMSNorm', 'SwiGLU', 'CausalAttention', 'TransformerBlock',
     'Tokenizer', 'DynamicsConfig', 'DynamicsTransformer',
     'TwohotHead', 'PolicyHead', 'ContinuousPolicyHead',
-    'DreamerV4Config', 'DreamerV4',
+    'DreamerV4Config', 'dreamer_v4_config_from_train', 'DreamerV4',
     'sample_tau_d', 'shortcut_corrupt', 'ramp_weight',
-    'shortcut_forcing_loss', 'pmpo_loss', 'reinforce_actor_loss',
+    'shortcut_forcing_loss',
 ]

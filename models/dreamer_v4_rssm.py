@@ -1,8 +1,7 @@
 """Recurrent State-Space Model (RSSM) world-model for DreamerV4.
 
-Drop-in alternative to the SF-transformer dynamics, selected via
-``TrainConfig.world_model_type == 'rssm'`` (the new default as of
-2026-05-30).  Motivation: across P64/P66/P67 the SF-transformer's
+Drop-in GRU observer, selected via ``TrainConfig.world_model_type == 'rssm'``
+(P79 env-free default after P77+P78 TSSM FALSIFIED; missing-ckpt fallback stays ``rssm``).  Motivation: across P64/P66/P67 the SF-transformer's
 ``wm_pred_converges_under_constant_action`` was pinned at **0.0** — it
 has no recurrent state able to hold an equilibrium (sliding-window
 attention + a freshly resampled ``z0 ~ N(0, I)`` each call → a
@@ -67,6 +66,236 @@ import torch.nn.functional as F
 from torch.distributions import OneHotCategorical
 
 
+_DOB_SCAN_MIX_BUDGET_BYTES: Optional[int] = None
+
+
+def _dob_scan_mix_budget_bytes() -> int:
+    """Cap the T×T Kalman mix by device RAM (identity on a 24 GB A10).
+
+    Closed-form mix is ``T×T×C``; ~16 MiB on this A10 (24 GiB / 1500).
+    Smaller GPUs drop the cap so a huge ``seq_len`` cannot OOM; larger
+    hosts may mix a longer window before falling back to the sequential
+    recurrence.  Floor 4 MiB / ceiling 64 MiB.  CPU smokes keep 16 MiB.
+    Cached after the first call (one device per process).
+    """
+    global _DOB_SCAN_MIX_BUDGET_BYTES
+    if _DOB_SCAN_MIX_BUDGET_BYTES is not None:
+        return _DOB_SCAN_MIX_BUDGET_BYTES
+    try:
+        if torch.cuda.is_available():
+            idx = torch.cuda.current_device()
+            total = int(torch.cuda.get_device_properties(idx).total_memory)
+            _DOB_SCAN_MIX_BUDGET_BYTES = int(
+                min(64 * 1024 * 1024,
+                    max(4 * 1024 * 1024, total // 1500)))
+            return _DOB_SCAN_MIX_BUDGET_BYTES
+    except Exception:
+        pass
+    _DOB_SCAN_MIX_BUDGET_BYTES = 16 * 1024 * 1024
+    return _DOB_SCAN_MIX_BUDGET_BYTES
+
+
+def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
+    """Vectorized ``d_t = coef * d_{t-1} + u_t`` with ``d_{-1}=0``.
+
+    ``u`` is ``(B, T, n_cv)``, ``coef`` is ``(n_cv,)``.  Same recurrence as
+    the old Python T-loop; that loop was T sequential GPU launches per WM
+    step in P2 (``dob_active``).  Closed form
+    ``d_t = sum_{s<=t} coef^{t-s} u_s`` via a lower-triangular mix.
+    Host-adaptive: if the T×T mix would exceed the device budget (≈16 MiB
+    on a 24 GB A10), fall back to the sequential recurrence (huge
+    ``seq_len`` / many CVs).  Differentiable in ``u`` and ``coef`` (P2
+    trains Kalman A,K through this).
+    """
+    B, T, C = u.shape
+    if T == 0:
+        return u
+    nbytes = T * T * C * int(u.element_size())
+    coef_f = coef.to(dtype=u.dtype)
+    if T == 1 or nbytes > _dob_scan_mix_budget_bytes():
+        d_prev = torch.zeros(B, C, device=u.device, dtype=u.dtype)
+        out = u.new_empty(B, T, C)
+        for t in range(T):
+            d_prev = coef_f * d_prev + u[:, t]
+            out[:, t] = d_prev
+        return out
+    t_idx = torch.arange(T, device=u.device)
+    lags = t_idx.view(T, 1) - t_idx.view(1, T)
+    mask = lags >= 0
+    lags_f = lags.clamp_min(0).to(dtype=u.dtype)
+    pows = coef_f.view(1, 1, C).pow(lags_f.unsqueeze(-1))
+    pows = pows.masked_fill(~mask.unsqueeze(-1), 0)
+    return torch.einsum('tsc,bsc->btc', pows, u)
+
+
+def _time_unbind(x: Optional[torch.Tensor]):
+    """Unbind time dim=1 once. ``None`` stays ``None``.
+
+    Identity vs ``x[:, t]`` inside a Python T/K loop (one tuple of views
+    instead of T advanced-index views per WM step).  Host-adaptive.
+    """
+    if x is None:
+        return None
+    return x.unbind(1)
+
+
+def _append_decode_core(h_l, z_l, c_l, dv_l, st) -> None:
+    """Collect ``[h, z, (c), (dv)]`` views for ``_stack_decode_core``.
+
+    Same parts as ``state.feat[..., :dec_in]`` (d-tail is sliced off
+    ``feat`` / appended later as ``ds``).  Identity vs per-step ``cat``.
+    ``z`` stays ``(B, K, C)`` — flatten after the T-stack (one
+    ``flatten`` vs T ``stoch_flat`` views on the WM hot path).
+    """
+    h_l.append(st.h)
+    z_l.append(st.z)
+    if st.c is not None:
+        c_l.append(st.c)
+    if st.dv is not None:
+        dv_l.append(st.dv)
+
+
+def _stack_decode_core(h_l, z_l, c_l, dv_l) -> torch.Tensor:
+    """``(B, T, dec_in)`` ≡ ``stack(state.feat[..., :dec_in], dim=1)``.
+
+    Main WM encode used to ``cat`` 2–4 views every t then stack T
+    cores (100 inner × T=128 on test_sim).  One cat after T stacks.
+    ``z`` is stacked ``(B, T, K, C)`` then flattened to ``K*C``
+    (identity vs stacking ``stoch_flat``).  Host-adaptive.
+    """
+    z_flat = torch.stack(z_l, 1).flatten(start_dim=-2)
+    parts = [torch.stack(h_l, 1), z_flat]
+    if c_l:
+        parts.append(torch.stack(c_l, 1))
+    if dv_l:
+        parts.append(torch.stack(dv_l, 1))
+    return torch.cat(parts, dim=-1)
+
+
+def cached_zeros_btd(mod, B: int, T: int, D: int, dtype, device,
+                     attr: str = '_zeros_btd_cache') -> torch.Tensor:
+    """Reuse a ``(B,T,D)`` zero buffer. Identity vs ``torch.zeros`` each call
+    as long as callers do not write the buffer in-place (``cat`` / ``detach``
+    do not).  Stage-1 DOB ``d_t≡0`` tail is this class.
+
+    Store is a **shape dict** (not a single slot): overshoot / held /
+    gain-match ``img_rollout`` IC ``z_logits`` reuse distinct ``Bm`` in
+    one WM step.  A one-key cache would reallocate every call.
+    """
+    key = (int(B), int(T), int(D), str(dtype), str(device))
+    store = getattr(mod, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(mod, attr, store)
+    z = store.get(key)
+    if z is None:
+        z = torch.zeros(B, T, D, device=device, dtype=dtype)
+        store[key] = z
+    return z
+
+
+def cached_zeros_bd(mod, B: int, D: int, dtype, device,
+                    attr: str = '_zeros_bd_cache') -> torch.Tensor:
+    """Reuse a ``(B, D)`` zero row. Identity vs ``torch.zeros``; do not write.
+
+    GRU / token ``c is None`` / ``dv is None`` fills on the T/K loop.
+    Own shape dict (not a ``[:,0]`` view of the 3-D cache — that view
+    is a new object every call).
+    """
+    key = (int(B), int(D), str(dtype), str(device))
+    store = getattr(mod, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(mod, attr, store)
+    z = store.get(key)
+    if z is None:
+        z = torch.zeros(int(B), int(D), device=device, dtype=dtype)
+        store[key] = z
+    return z
+
+
+def cached_onehot_z(mod, B: int, n_cat: int, n_classes: int, dtype, device,
+                    attr: str = '_onehot_z_cache') -> torch.Tensor:
+    """Reuse a valid one-hot ``z`` IC. Identity vs ``zeros`` + ``z[...,0]=1``.
+
+    ``initial_state`` used to allocate this every ``rollout_observed``
+    (P1/P2: 100 inner × main B=128 plus rest-IC N=6).  Callers must
+    not write it: GRU / ``img_step`` / ``obs_step`` return new ``z``;
+    collect CUDA-graph ``copy_`` targets a clone.  Own shape dict.
+    """
+    key = (int(B), int(n_cat), int(n_classes), str(dtype), str(device))
+    store = getattr(mod, attr, None)
+    if not isinstance(store, dict):
+        store = {} if store is None else {store[0]: store[1]}
+        setattr(mod, attr, store)
+    z = store.get(key)
+    if z is None:
+        z = torch.zeros(int(B), int(n_cat), int(n_classes),
+                        device=device, dtype=dtype)
+        z[..., 0] = 1.0
+        store[key] = z
+    return z
+
+
+def _prior_c_from_net(mod, h: torch.Tensor, sample: bool):
+    """Prior continuous latent for ``img_step``.
+
+    Deterministic-roll flags replace the sampled ``c`` with the prior
+    MEAN.  Skip ``randn`` + the splice ``cat`` when the whole ``c`` is
+    that mean (env-free: gain-only + ``cont_gain_deterministic_roll``).
+    Identity vs sample-then-overwrite.  Overshoot/held call this once
+    per K per WM inner.
+    """
+    if int(getattr(mod, 'cont_dim', 0) or 0) <= 0:
+        return None, None, None
+    gain_m = bool(getattr(mod, 'cont_gain_deterministic_roll', False))
+    dist_m = bool(getattr(mod, 'cont_dist_deterministic_roll', False))
+    gdim = int(getattr(mod, 'cont_gain_dim', 0) or 0)
+    cdim = int(mod.cont_dim)
+    whole_mean = (
+        (gain_m and dist_m)
+        or (gain_m and gdim >= cdim)
+        or (dist_m and gdim <= 0)
+    )
+    take_mean = (not sample) or whole_mean
+    c_new, c_mean, c_std = mod.cont_prior_net(h, sample=not take_mean)
+    if take_mean:
+        return c_mean, c_mean, c_std
+    if gain_m or dist_m:
+        gain_part = (
+            c_mean[..., :gdim] if gain_m else c_new[..., :gdim])
+        dist_part = (
+            c_mean[..., gdim:] if dist_m else c_new[..., gdim:])
+        c_new = torch.cat([gain_part, dist_part], dim=-1)
+    return c_new, c_mean, c_std
+
+
+def _recurrence_c(mod, c, batch, dtype, device):
+    """Continuous latent that enters the GRU / TSSM token.
+
+    Default is the full ``c`` (gain + dist). P71 set
+    ``recurrence_c_dim=cont_dist_dim`` so G was decoder/feat only; freeze
+    0.76@DV and the DV 1-step prior died (P64 post→1step ×0.987). Do not
+    restore that without a new mechanism. Env-free gain-only ⇒ GRU sees
+    ``[z, c_gain, a, dv]`` (P68 / P64 identity).
+    """
+    rdim = int(getattr(mod, 'recurrence_c_dim', 0) or 0)
+    if rdim <= 0:
+        return None
+    if c is None:
+        return cached_zeros_bd(
+            mod, int(batch), rdim, dtype, device,
+            attr='_recurrence_c_zeros')
+    cdim = int(c.shape[-1])
+    if cdim == rdim:
+        return c
+    if cdim > rdim:
+        return c[..., :rdim]
+    return cached_zeros_bd(
+        mod, int(batch), rdim, dtype, device,
+        attr='_recurrence_c_zeros')
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -81,13 +310,13 @@ class RSSMConfig:
     embed_dim: int = 256
     hidden_dim: int = 256
     unimix: float = 0.01            # paper 1% uniform mixture
-    # Latent type (2026-08-12).  ``'categorical'`` = paper DreamerV3 (default).
-    # ``'deterministic'`` = a continuous tanh latent with NO variational KL
-    # (prior/posterior consistency via joint-embedding) — no quantization, so
-    # the continuous CV/DV gain is not attenuated (bias-free observer).
-    # ``latent_noise`` > 0 adds reparameterization noise to the deterministic
-    # sample (information-bottleneck regularizer; anti-overfit, no quantization).
-    latent_type: str = 'categorical'
+    # Latent type (2026-08-12).  ``'deterministic'`` (default, P26/P29 RCA) = a
+    # continuous tanh latent with NO variational KL (prior/posterior consistency
+    # via joint-embedding) — no quantization, so the continuous CV/DV gain is
+    # not attenuated (bias-free observer).  ``'categorical'`` = paper DreamerV3
+    # (opt-in).  ``latent_noise`` > 0 adds reparameterization noise to the
+    # deterministic sample (information-bottleneck regularizer; no quantization).
+    latent_type: str = 'deterministic'
     latent_noise: float = 0.0
     # DV-as-input (Option B, 2026-06-07).  When ``dv_dim > 0`` the measured
     # disturbance-variable channels (at ``dv_indices`` within the obs vector)
@@ -146,10 +375,12 @@ class RSSMConfig:
     # categorical-attenuation bias AND carries the per-episode gain in-context
     # so the WM ADAPTS to DR) and a DISTURBANCE block (= n_cv, an amortized
     # Kalman state inferred from the innovation + rolled forward by the prior —
-    # the "inherent" replacement for the bolt-on DOB).  Both feed the GRU (so
-    # ``h`` carries them forward) and the decoder (so the recon forces them to
-    # mean what we want).  ``cont_gain_dim == cont_dist_dim == 0`` ⇒
-    # byte-identical to the pre-continuous-latent model.
+    # the "inherent" replacement for the bolt-on DOB).  The decoder still
+    # reads both.  **P71 REVERT:** the full ``c`` (gain + dist) enters the
+    # GRU / TSSM token. G-out-of-recurrence (P69–P71) freeze-failed 0.76@DV
+    # and killed the DV 1-step prior.  ``cont_gain_dim ==
+    # cont_dist_dim == 0`` ⇒ byte-identical to the pre-continuous-latent
+    # model.
     cont_gain_dim: int = 0
     cont_dist_dim: int = 0
     cont_min_std: float = 0.1       # σ floor (numerical + KL well-posedness)
@@ -176,6 +407,25 @@ class RSSMConfig:
     # sampling variance → a stable, unbiased observer gain.  No-op when
     # sample=False or no gain block.
     cont_gain_deterministic_roll: bool = True
+    # Control horizon (TrainConfig.horizon).  P76 GRU update-gate bias
+    # **REVERT** and P88 residual mix **REVERT** (keep-h family closed:
+    # P88 EXIT last_ok 59 GAIN_NOT_READY 0.40@MV).  Field kept so old
+    # RSSMConfig still constructs; ``gru_update_gate_bias`` is
+    # identically 0 (PyTorch init).
+    horizon: int = 0
+
+
+def gru_update_gate_bias(horizon: int) -> float:
+    """P76 REVERT: always 0 (PyTorch ``GRUCell`` init).
+
+    ``log(H/16)`` on both update-gate slices (idle logit ``2b`` →
+    sigmoid ~0.92) kept ``||h||`` and **prevented settling** (conv=0
+    through P1; freeze last_ok 84 5-level 0.80@MV GAIN_NOT_READY;
+    val 1step→OL ×0.770 vs P64 ×0.85).  Opposite of a DC fixed point.
+    ``horizon`` is unused; kept so call sites / resolved-cfg stay.
+    """
+    del horizon
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -218,15 +468,23 @@ class RSSMState:
     def stoch_flat(self) -> torch.Tensor:
         return self.z.flatten(start_dim=-2)
 
-    def detach(self) -> 'RSSMState':
-        """Detach every state tensor — truncated-BPTT cut that bounds the
-        gradient path through the recurrence without altering the forward roll."""
+    def detach(self, keep_c: bool = False) -> 'RSSMState':
+        """Truncated-BPTT cut that bounds the recurrent gradient path.
+
+        P25 RCA: detaching the CONTINUOUS gain channel ``c`` on a K-step
+        gain-match / isolation roll severs the DC-gain supervisor (forward
+        loss still looks healthy; transfer-matrix gain does not).  ``keep_c``
+        leaves ``c`` / ``c_mean`` / ``c_std`` attached so the un-quantized
+        gain path survives a GRU ``h`` cut.  Forward values are unchanged.
+        """
         def _d(t):
             return t.detach() if t is not None else None
         return RSSMState(
             h=_d(self.h), z_logits=_d(self.z_logits), z=_d(self.z),
-            d=_d(self.d), dv=_d(self.dv), c=_d(self.c),
-            c_mean=_d(self.c_mean), c_std=_d(self.c_std))
+            d=_d(self.d), dv=_d(self.dv),
+            c=(self.c if keep_c else _d(self.c)),
+            c_mean=(self.c_mean if keep_c else _d(self.c_mean)),
+            c_std=(self.c_std if keep_c else _d(self.c_std)))
 
     @property
     def feat(self) -> torch.Tensor:
@@ -369,12 +627,13 @@ class RSSMDynamics(nn.Module):
         self.stoch_flat_dim = self.n_categoricals * self.n_classes
         # Continuous gain+disturbance latent (2026-06-22).  cont_dim splits into
         # a supervised GAIN block (first ``cont_gain_dim`` dims) and a
-        # DISTURBANCE block (last ``cont_dist_dim`` dims).  Both feed the GRU
-        # (so ``h`` carries them forward → the prior can roll them) AND the
-        # decoder (so the recon forces them to mean what we want).
+        # DISTURBANCE block (last ``cont_dist_dim`` dims).  Decoder + feat
+        # still read both.  **P71 REVERT:** full ``c`` enters the GRU
+        # (G-out-of-recurrence freeze-failed 0.76@DV).
         self.cont_gain_dim = int(getattr(cfg, 'cont_gain_dim', 0) or 0)
         self.cont_dist_dim = int(getattr(cfg, 'cont_dist_dim', 0) or 0)
         self.cont_dim = self.cont_gain_dim + self.cont_dist_dim
+        self.recurrence_c_dim = int(self.cont_dim)
         self.cont_min_std = float(getattr(cfg, 'cont_min_std', 0.1))
         self.cont_max_std = float(getattr(cfg, 'cont_max_std', 2.0))
         # Deterministic cont-disturbance roll in imagination (p140 RCA).
@@ -405,20 +664,20 @@ class RSSMDynamics(nn.Module):
             bool(getattr(cfg, 'dv_decoder_feedforward', False))
             and self.dv_feedforward)
         self._dv_decode_dim = self.dv_dim if self.dv_decoder_feedforward else 0
-        # Transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
-        # latent feeds the GRU so ``h`` carries the gain/disturbance forward.
-        trans_in = (self.stoch_flat_dim + self.cont_dim
+        # Transition input = [z_flat ; c ; action ; (dv)].  c is gain
+        # (+ dist when a dist head is on). P71 G-out-of-GRU REVERT.
+        trans_in = (self.stoch_flat_dim + self.recurrence_c_dim
                     + self.action_dim + self.dv_dim)
 
         # Encoder: obs → per-frame embedding.
         self.encoder = _MLP(self.obs_dim, self.embed_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
-        # Decoder: [h, z, (dv)] → reconstructed (normalized) obs.  Reads the
-        # latent core (deter + stoch) PLUS the exogenous DV when DV-feedforward
-        # is on, so the CV reconstruction ``g(h, z, dv)`` has a DIRECT ∂CV/∂dv
-        # path that skips the categorical bottleneck (p129 RCA).  The DOB d-tail
-        # (Scope 2) is sliced off in ``decode`` and re-added via ``apply_dob``
-        # (the g + d factorisation).
+        # Decoder: [h, z, c, (dv)] → reconstructed (normalized) obs.  Reads the
+        # latent core (deter + stoch + cont) PLUS the exogenous DV when
+        # DV-decoder-feedforward is on.  The DOB d-tail (Scope 2) is sliced
+        # off in ``decode`` and re-added via ``apply_dob`` (g + d).  P74
+        # ``gain_cv_skip`` REVERT: teacher Huber sat by iter 5 so skip W
+        # stalled at ~0.004; val det_r collapsed 0.63→0.07.
         self.decoder = _MLP(self.deter_dim + self.stoch_flat_dim + self.cont_dim
                             + self._dv_decode_dim, self.obs_dim,
                             hidden_dim=self.hidden_dim, num_layers=3)
@@ -426,8 +685,12 @@ class RSSMDynamics(nn.Module):
         self.pre_gru = _MLP(trans_in, trans_in,
                             hidden_dim=self.hidden_dim, num_layers=1)
         self.gru = nn.GRUCell(trans_in, self.deter_dim)
+        # P76 REVERT: do not fill the update-gate bias. Keep-h FALSIFIED.
+        # P88 EXIT REVERT: no residual mix after GRUCell (vanilla ``h``).
+        _H = int(getattr(cfg, 'horizon', 0) or 0)
+        self._gru_update_gate_bias = float(gru_update_gate_bias(_H))
         # Prior p(z'|h') and posterior q(z'|h', embed).
-        _lt = str(getattr(cfg, 'latent_type', 'categorical'))
+        _lt = str(getattr(cfg, 'latent_type', 'deterministic'))
         _ln = float(getattr(cfg, 'latent_noise', 0.0) or 0.0)
         self.prior_net = _CategoricalLatent(
             self.deter_dim, self.n_categoricals, self.n_classes,
@@ -488,13 +751,12 @@ class RSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
-
     @property
     def feat_dim(self) -> int:
         # Scope 2: the head-facing feature includes the DV feedforward (dv_dim
         # when on) so the heads condition on the measured DV, plus the DOB
         # disturbance estimate ``d`` (one scalar per CV).  The decoder reads
-        # ``[h, z, (dv)]`` (see ``_decode_in_dim`` / ``decode``).
+        # ``[h, z, c, (dv)]`` (see ``_decode_in_dim`` / ``decode``).
         core = self.deter_dim + self.stoch_flat_dim + self.cont_dim
         return (core + self._dv_feed_dim
                 + (self.n_cv if getattr(self, 'dob_enabled', False) else 0))
@@ -513,18 +775,38 @@ class RSSMDynamics(nn.Module):
 
     def initial_state(self, batch_size: int,
                       device: torch.device) -> RSSMState:
-        h = torch.zeros(batch_size, self.deter_dim, device=device)
-        z_logits = torch.zeros(batch_size, self.n_categoricals,
-                               self.n_classes, device=device)
-        z = torch.zeros_like(z_logits)
-        z[..., 0] = 1.0  # arbitrary valid one-hot
-        d = (torch.zeros(batch_size, self.n_cv, device=device)
+        B = int(batch_size)
+        dtype = torch.get_default_dtype()
+        # Dedicated attrs: do not alias ``img_rollout`` / token zero fills
+        # (same ``(B, D)`` could otherwise share a live graph input).
+        h = cached_zeros_bd(
+            self, B, self.deter_dim, dtype, device, attr='_init_h_zeros')
+        z_logits = cached_zeros_btd(
+            self, B, self.n_categoricals, self.n_classes, dtype, device,
+            attr='_init_zlogits_zeros')
+        z = cached_onehot_z(
+            self, B, self.n_categoricals, self.n_classes, dtype, device)
+        d = (cached_zeros_bd(
+                self, B, self.n_cv, dtype, device, attr='_init_d_zeros')
              if self.dob_enabled else None)
-        dv = (torch.zeros(batch_size, self.dv_dim, device=device)
+        dv = (cached_zeros_bd(
+                self, B, self.dv_dim, dtype, device, attr='_init_dv_zeros')
               if self.dv_feedforward else None)
-        c = (torch.zeros(batch_size, self.cont_dim, device=device)
-             if self.cont_dim > 0 else None)
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c)
+        # ``c_mean`` / ``c_std`` must match serve/obs_step layout so a
+        # CUDA-graph ``copy_`` of the recurrent state is well-typed
+        # (collect capture used to raise ``c_mean None mismatch``).
+        c = c_mean = c_std = None
+        if self.cont_dim > 0:
+            c = cached_zeros_bd(
+                self, B, self.cont_dim, dtype, device, attr='_init_c_zeros')
+            c_mean = cached_zeros_bd(
+                self, B, self.cont_dim, dtype, device,
+                attr='_init_cmean_zeros')
+            c_std = cached_zeros_bd(
+                self, B, self.cont_dim, dtype, device,
+                attr='_init_cstd_zeros')
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c,
+                         c_mean=c_mean, c_std=c_std)
 
     # ----- DOB helpers --------------------------------------------------
     def dob_decay(self) -> torch.Tensor:
@@ -536,14 +818,56 @@ class RSSMDynamics(nn.Module):
     def apply_dob(self, decoded: torch.Tensor,
                   d: Optional[torch.Tensor]) -> torch.Tensor:
         """Add the DOB disturbance state ``d`` (..., n_cv) into the CV channels
-        of a decoded obs tensor (..., obs_dim).  Identity when DOB is off."""
-        if not self.dob_enabled or d is None:
+        of a decoded obs tensor (..., obs_dim).  Identity when DOB is off
+        or Stage-1-suppressed (``dob_active=False`` → ``d_t≡0``, skip the
+        clone+index_add)."""
+        if (not self.dob_enabled or d is None
+                or not bool(getattr(self, 'dob_active', True))):
             return decoded
         out = decoded.clone()
         out.index_add_(-1, self.cv_index_t, d.to(out.dtype))
         return out
 
     # ----- transitions --------------------------------------------------
+    def _gru_transition(self, prev: RSSMState, prev_action: torch.Tensor,
+                        dv: Optional[torch.Tensor] = None
+                        ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+                                   Optional[torch.Tensor]]:
+        """pre_gru + vanilla GRUCell + DOB predict + DV carry.
+
+        Shared by ``img_step`` (prior heads on ``h``) and rest-IC
+        ``_posterior_step`` (posterior heads on ``h``; prior_net unused).
+        ``img_rollout`` uses the same ``img_step``. Returns
+        ``(h, d_new, dv_new)``.
+        P88 EXIT REVERT: no residual mix (keep-h family closed with P76).
+        P76 z-bias stays 0.
+        """
+        # GRU input = [z_flat ; c ; action ; (dv)].  Full c (P71 REVERT).
+        parts = [prev.stoch_flat]
+        rc = _recurrence_c(
+            self, prev.c, int(prev_action.shape[0]),
+            prev_action.dtype, prev_action.device)
+        if rc is not None:
+            parts.append(rc)
+        parts.append(prev_action)
+        if self.dv_dim > 0:
+            if dv is None:
+                dv = cached_zeros_bd(
+                    self, int(prev_action.shape[0]), self.dv_dim,
+                    prev_action.dtype, prev_action.device)
+            parts.append(dv)
+        h = self.gru(self.pre_gru(torch.cat(parts, dim=-1)), prev.h)
+        # Stage-1 (``dob_active=False``) forces ``d_t≡0`` after the loop
+        # and ``d`` is not a GRU input — skip the unused sigmoid·d
+        # (P1 rest-IC + main WM T-loop, 100 inner steps).  P2 Kalman
+        # still needs the prior predict ``A·d``.
+        d_new = prev.d
+        if (self.dob_enabled and prev.d is not None
+                and bool(getattr(self, 'dob_active', True))):
+            d_new = self.dob_decay() * prev.d
+        dv_new = dv if self.dv_feedforward else None
+        return h, d_new, dv_new
+
     def img_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  dv: Optional[torch.Tensor] = None,
                  sample: bool = True) -> RSSMState:
@@ -551,64 +875,38 @@ class RSSMDynamics(nn.Module):
 
         ``dv`` (B, dv_dim) is the exogenous measured-DV input when DV-as-input
         is enabled (``dv_dim > 0``); ``None`` is filled with zeros.  Ignored
-        entirely when ``dv_dim == 0`` (paper behaviour)."""
-        # GRU transition input = [z_flat ; (c) ; action ; (dv)].  The continuous
-        # latent feeds the recurrence so ``h`` carries the gain/disturbance
-        # forward and the prior ``cont_prior_net(h')`` can roll them.
-        parts = [prev.stoch_flat]
-        if self.cont_dim > 0:
-            c_prev = prev.c
-            if c_prev is None:
-                c_prev = torch.zeros(prev_action.shape[0], self.cont_dim,
-                                     device=prev_action.device,
-                                     dtype=prev_action.dtype)
-            parts.append(c_prev)
-        parts.append(prev_action)
-        if self.dv_dim > 0:
-            if dv is None:
-                dv = torch.zeros(prev_action.shape[0], self.dv_dim,
-                                 device=prev_action.device,
-                                 dtype=prev_action.dtype)
-            parts.append(dv)
-        x = torch.cat(parts, dim=-1)
-        x = self.pre_gru(x)
-        h = self.gru(x, prev.h)
+        entirely when ``dv_dim == 0`` (paper behaviour).
+        """
+        h, d_new, dv_new = self._gru_transition(prev, prev_action, dv)
         z_logits, z = self.prior_net(h, sample=sample)
-        # Continuous-latent prior p(c'|h'): gain persists (carried via h) and
-        # the disturbance OU-rolls; both inferred from the recurrent state.
-        c_new = c_mean = c_std = None
-        if self.cont_dim > 0:
-            c_new, c_mean, c_std = self.cont_prior_net(h, sample=sample)
-            # Roll selected blocks DETERMINISTICALLY (prior MEAN) in imagination.
-            # DISTURBANCE block (p140 RCA): the actor needs the PREDICTED load as
-            # a clean feedforward, not a per-rollout sample that buries the action
-            # signal in the imagined reward.  GAIN block (p20 observer-bias RCA):
-            # the open-loop gain enters nonlinearly through the multi-step
-            # rollout, so E[f(c_sampled)] (what the sample=True supervisor trains)
-            # ≠ f(mean) (what the sample=False actor/transfer-matrix use) — roll
-            # the gain at its mean so the strong supervisor trains the actor's
-            # belief and the gain stops varying run-to-run.  No-op when
-            # sample=False (c_new == c_mean already) or the block is absent.
-            if sample and self.cont_dim > 0 and (
-                    self.cont_gain_deterministic_roll
-                    or self.cont_dist_deterministic_roll):
-                gain_part = (
-                    c_mean[..., :self.cont_gain_dim]
-                    if self.cont_gain_deterministic_roll
-                    else c_new[..., :self.cont_gain_dim])
-                dist_part = (
-                    c_mean[..., self.cont_gain_dim:]
-                    if self.cont_dist_deterministic_roll
-                    else c_new[..., self.cont_gain_dim:])
-                c_new = torch.cat([gain_part, dist_part], dim=-1)
-        # DOB predict step: decay the disturbance estimate (no obs to correct).
-        d_new = (self.dob_decay() * prev.d
-                 if (self.dob_enabled and prev.d is not None) else prev.d)
-        # DV feedforward: carry the (real / held / zero-filled) DV into the
-        # state so ``feat`` + ``decode`` expose it to the decoder and heads.
-        dv_new = dv if self.dv_feedforward else None
+        # Continuous-latent prior p(c'|h'). P70 hold REVERT (no copy of
+        # step-1 G). P71 REVERT: G is a GRU input again so h can carry DC
+        # gain. Deterministic-roll uses the prior MEAN.
+        c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
         return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
+
+    def _posterior_step(self, prev: RSSMState, prev_action: torch.Tensor,
+                        embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
+                        sample: bool = True) -> RSSMState:
+        """Teacher-forced posterior step without unused prior heads.
+
+        Rest-IC ``last_only`` encode: the next GRU input is this posterior
+        ``(z, c)``, never the prior.  ``prior_net`` / ``cont_prior_net`` do
+        not feed ``h/z/c_mean``.  Same GRU + posterior nets as
+        ``obs_step(..., obs=None)[0]`` when Kalman / two-pass are off
+        (Stage-1 P1 rest-IC: ``dob_active=False``, ``cont_dist_dim=0``).
+        """
+        h, d_new, dv_new = self._gru_transition(prev, prev_action, dv)
+        post_in = torch.cat([h, embed], dim=-1)
+        post_logits, post_z = self.post_net(post_in, sample=sample)
+        c_post = c_post_mean = c_post_std = None
+        if self.cont_dim > 0:
+            c_post, c_post_mean, c_post_std = self.cont_post_net(
+                post_in, sample=sample)
+        return RSSMState(h=h, z_logits=post_logits, z=post_z, d=d_new,
+                         dv=dv_new, c=c_post, c_mean=c_post_mean,
+                         c_std=c_post_std)
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -669,7 +967,9 @@ class RSSMDynamics(nn.Module):
 
     # ----- sequence rollout ---------------------------------------------
     def rollout_observed(self, obs: torch.Tensor, act: torch.Tensor,
-                         sample: bool = True
+                         sample: bool = True, store_aux: bool = True,
+                         last_only: bool = False,
+                         return_feats: bool = True
                          ) -> Tuple[torch.Tensor, torch.Tensor,
                                     torch.Tensor, RSSMState]:
         """Teacher-forced posterior rollout over a (B, T, *) batch.
@@ -683,6 +983,25 @@ class RSSMDynamics(nn.Module):
         shapes ``(B, T, F)``, ``(B, T, K, C)``, ``(B, T, K, C)``, the final
         ``RSSMState`` (for imagination warm-start), and ``ds`` ``(B, T, n_cv)``
         = the per-step DOB disturbance estimate (``None`` when DOB is off).
+
+        ``store_aux=False`` skips stacking logits / cont-KL stats (same
+        ``feats``).  Isolation's no-grad encode discards those tensors;
+        keeping them alive for T steps was a dead alloc on the P1 hot path
+        (100 WM steps/iter).  Default ``True`` is the training path.
+
+        ``last_only=True`` returns feats/ds with T=1 (the last step) and
+        skips the unused T-stack.  GRU recurrence is identical; last
+        ``RSSMState`` ≡ full-roll last state (P45 rest-IC encode only
+        needs that IC).  Aux logit/cont stacks stay ``None`` (T-stacks
+        would not match).  Isolation / main WM still need the full T.
+        ``return_feats=False`` (with ``last_only``) skips even the last
+        feat / Stage-1 zero-``d`` tail — rest-IC only reads ``h/z/c_mean``.
+        Ignored when ``last_only`` is False.
+
+        When ``last_only`` and Kalman / two-pass are off, the loop uses
+        ``_posterior_step`` (skip unused ``prior_net`` / ``cont_prior_net``;
+        next GRU input is the posterior).  Identity vs ``obs_step`` last
+        ``h/z/c_mean``.  P2 ``dob_active`` still needs the prior core.
         """
         B, T = obs.shape[:2]
         device = obs.device
@@ -710,76 +1029,115 @@ class RSSMDynamics(nn.Module):
         # imagination).  pass-1 ν ≈ the full load (its c_dist is ~uninformative),
         # exactly the signal the posterior should map.  Single pass when off.
         two_pass = bool(getattr(self, '_cont_post_uses_innov', False))
-        _need_prior_core = self.dob_enabled or two_pass
-        feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+        # Prior-core is only consumed by the batched DOB decode (P2
+        # ``dob_active``) or the cont-dist two-pass.  Stage-1 P1 forces
+        # ``d_t≡0`` and discarded the T-list — skip the append.
+        # P84: restore this P79 surface. P83 REVERT left P81's
+        # empty-list prior_core stack in the compiled graph; P1
+        # ph_l is empty and that branch is not P79.
+        _need_prior_core = two_pass or (self.dob_enabled and self.dob_active)
+        post_l, prior_l = [], []
+        h_l, z_l, c_l, dv_l = [], [], [], []
+        ph_l, pz_l, pc_l, pdv_l = [], [], [], []
         c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
-        for t in range(T):
-            dv_t = dvs[:, t] if dvs is not None else None
-            # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z) recurrence
-            # with ``obs=None`` so neither the DOB d-update NOR the per-step prior
-            # decode (used for both the DOB and the cont innovation) enters the
-            # compiled loop — the EXPENSIVE decode is hoisted OUT and done ONCE,
-            # batched, below (the T× decoder-MLP copies otherwise made the
-            # rollout ~15 min to compile / run launch-bound).  ``d`` does NOT
-            # affect h/z, and the cont innovation is fed in pass 2.
-            post, prior = self.obs_step(state, act[:, t], embeds[:, t],
-                                        dv=dv_t, sample=sample, obs=None)
-            state = post
-            feats_l.append(post.feat[..., :dec_in])    # decoder feat [h,z,(c),(dv)]
-            post_l.append(post.z_logits)
-            prior_l.append(prior.z_logits)
-            if self.cont_dim > 0:
-                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-            if _need_prior_core:
-                prior_core_l.append(prior.feat[..., :dec_in])
+        keep_aux = bool(store_aux) and not last_only
+        # last_only rest-IC only needs the last RSSMState.  Building
+        # post.feat every t was T concatenations of [h,z,c,dv,d] then
+        # discarding all but the last.  Kalman / two-pass still need
+        # per-step prior core.  Materialize the last post.feat once.
+        # Full-T encode stacks h/z/(c)/(dv) then one cat (not T cats).
+        _stack_post = not last_only
+        # Stage-1 rest-IC: posterior-only (prior heads unused).  P2 DOB /
+        # cont-dist two-pass still need obs_step + prior core.
+        use_post_only = bool(last_only) and not two_pass and not _need_prior_core
+        act_t = _time_unbind(act)
+        emb_t = _time_unbind(embeds)
+        dv_seq = _time_unbind(dvs)
+        if use_post_only:
+            pstep = self._posterior_step
+            for t in range(T):
+                state = pstep(
+                    state, act_t[t], emb_t[t],
+                    dv=None if dv_seq is None else dv_seq[t],
+                    sample=sample)
+        else:
+            for t in range(T):
+                dv_t = None if dv_seq is None else dv_seq[t]
+                # COMPILE-EFFICIENT recurrence (2026-06-12): run the (h, z)
+                # recurrence with ``obs=None`` so neither the DOB d-update
+                # NOR the per-step prior decode enters the compiled loop —
+                # the EXPENSIVE decode is hoisted OUT and done ONCE, batched,
+                # below.  ``d`` does NOT affect h/z; cont innovation is
+                # fed in pass 2.
+                post, prior = self.obs_step(state, act_t[t], emb_t[t],
+                                            dv=dv_t, sample=sample, obs=None)
+                state = post
+                if _stack_post:
+                    _append_decode_core(h_l, z_l, c_l, dv_l, post)
+                if keep_aux:
+                    post_l.append(post.z_logits)
+                    prior_l.append(prior.z_logits)
+                    if self.cont_dim > 0:
+                        c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                        c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if _need_prior_core:
+                    _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
         if two_pass:
             # ONE batched prior decode → CV forecast → innovation ν, then
             # re-roll with the innovation-driven cont posterior.
-            prior_core1 = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+            prior_core1 = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
             base = self.decode(prior_core1).index_select(-1, self.cv_index_t)
             nu_seq = obs.index_select(-1, self.cv_index_t) - base  # (B, T, n_cv)
+            nu_t = _time_unbind(nu_seq)
             state = self.initial_state(B, device)
-            feats_l, post_l, prior_l, prior_core_l = [], [], [], []
+            post_l, prior_l = [], []
+            h_l, z_l, c_l, dv_l = [], [], [], []
+            ph_l, pz_l, pc_l, pdv_l = [], [], [], []
             c_qm_l, c_qs_l, c_pm_l, c_ps_l = [], [], [], []
             for t in range(T):
-                dv_t = dvs[:, t] if dvs is not None else None
-                post, prior = self.obs_step(state, act[:, t], embeds[:, t],
+                dv_t = None if dv_seq is None else dv_seq[t]
+                post, prior = self.obs_step(state, act_t[t], emb_t[t],
                                             dv=dv_t, sample=sample, obs=None,
-                                            cont_innov=nu_seq[:, t])
+                                            cont_innov=nu_t[t])
                 state = post
-                feats_l.append(post.feat[..., :dec_in])
-                post_l.append(post.z_logits)
-                prior_l.append(prior.z_logits)
-                c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
-                c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
-                if self.dob_enabled:
-                    prior_core_l.append(prior.feat[..., :dec_in])
-        post_core = torch.stack(feats_l, dim=1)        # (B, T, dec_in)=[h,z,(c),(dv)]
-        post_logits = torch.stack(post_l, dim=1)
-        prior_logits = torch.stack(prior_l, dim=1)
+                if _stack_post:
+                    _append_decode_core(h_l, z_l, c_l, dv_l, post)
+                if keep_aux:
+                    post_l.append(post.z_logits)
+                    prior_l.append(prior.z_logits)
+                    c_qm_l.append(post.c_mean); c_qs_l.append(post.c_std)
+                    c_pm_l.append(prior.c_mean); c_ps_l.append(prior.c_std)
+                if self.dob_enabled and self.dob_active:
+                    _append_decode_core(ph_l, pz_l, pc_l, pdv_l, prior)
+        if last_only and not return_feats:
+            return None, None, None, state, None, None
+        if last_only:
+            post_core = state.feat[..., :dec_in].unsqueeze(1)  # (B, 1, dec_in)
+        else:
+            post_core = _stack_decode_core(h_l, z_l, c_l, dv_l)
+        post_logits = (torch.stack(post_l, dim=1) if keep_aux else None)
+        prior_logits = (torch.stack(prior_l, dim=1) if keep_aux else None)
         ds = None
         if self.dob_enabled:
             if self.dob_active:
                 # ONE batched prior decode → CV forecast base (d-free), then the
                 # scalar per-CV Kalman filter.  d_t = A·d_{t-1} + K·ν with
                 # ν = CV_obs − (base + A·d_{t-1}) ⇒ d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
-                prior_core = torch.stack(prior_core_l, dim=1)         # (B, T, dec_in)
+                prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
                 coef = (1.0 - K) * A                                  # (n_cv,)
-                d_prev = torch.zeros(B, self.n_cv, device=device, dtype=post_core.dtype)
-                ds_l = []
-                for t in range(T):
-                    d_prev = coef * d_prev + u[:, t]
-                    ds_l.append(d_prev)
-                ds = torch.stack(ds_l, dim=1)                         # (B, T, n_cv)
+                ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
+                if last_only:
+                    ds = ds[:, -1:]
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
-                ds = torch.zeros(B, T, self.n_cv, device=device,
-                                 dtype=post_core.dtype)
+                # Reuse a zeros buffer (identity; ``cat`` does not write it).
+                ds = cached_zeros_btd(
+                    self, B, int(post_core.shape[1]), self.n_cv,
+                    post_core.dtype, device)
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               d=ds[:, -1], dv=state.dv, c=state.c,
@@ -788,8 +1146,9 @@ class RSSMDynamics(nn.Module):
             feats = post_core
         # Continuous-latent KL stats + posterior sample (for the cont KL +
         # gain-matching aux loss + disturbance readout).  ``None`` when off.
+        # P83/P84: do not pack ``prior_core`` into ``cont`` (family REVERT).
         cont = None
-        if self.cont_dim > 0:
+        if self.cont_dim > 0 and keep_aux:
             cont = {
                 'post_mean': torch.stack(c_qm_l, dim=1),   # (B,T,cont_dim)
                 'post_std': torch.stack(c_qs_l, dim=1),
@@ -802,44 +1161,327 @@ class RSSMDynamics(nn.Module):
     def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,
                     actions: torch.Tensor,
                     dvs: Optional[torch.Tensor] = None,
-                    sample: bool = True) -> torch.Tensor:
-        """Prior-only (imagined) rollout of K steps from ``(h0, z0)`` under a
-        per-step action (and optional per-step DV) sequence.
+                    sample: bool = True,
+                    c0: Optional[torch.Tensor] = None,
+                    last_only: bool = False,
+                    out: str = 'feat',
+                    prev_state: Optional[RSSMState] = None,
+                    return_state: bool = False):
+        """Prior-only (imagined) rollout of K steps from ``(h0, z0[, c0])``.
 
         ``h0`` (Bm, deter_dim), ``z0`` (Bm, n_categoricals, n_classes),
-        ``actions`` (Bm, K, A), ``dvs`` (Bm, K, dv_dim) | None.  Returns the
-        stacked per-step feature ``(Bm, K, F)`` (``feat`` = [h, z_flat, (dv)]).
+        ``actions`` (Bm, K, A), ``dvs`` (Bm, K, dv_dim) | None,
+        ``c0`` (Bm, cont_dim) | None = posterior continuous latent MEAN at
+        the start (gain + optional cont-dist).  Prefer ``cont['post_mean']``
+        (P28 follow-up 14 / p20: isolation, actor, transfer-matrix are
+        ``sample=False`` = f(mean); slicing the sample from feat trains
+        ``E[f(c_sampled)]`` on the first GRU step).  ``c0=None`` with
+        ``cont_dim>0`` zero-fills — same as ``img_step`` when ``prev.c is None``.
+        Returns stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
+        ``last_only=True`` returns only the K-step value ``(Bm, *)`` — same
+        recurrence / last-step as ``stack[:, -1]``, without keeping the
+        unused K-stack (overshoot / held / gain-match last-step DC Huber;
+        P75 FOPDT K-stack **REVERT**).
+        ``out`` selects what is stacked (GRU recurrence is identical):
+          * ``'feat'`` (default) — full ``state.feat`` (isolation TBPTT
+            chunks slice ``h`` for ``keep_c``; loss still needs decode)
+          * ``'obs'`` — ``decode(feat)`` per step.  Pointwise MLP ⇒
+            ``stack(decode(feat_k))`` ≡ ``decode(stack(core))`` (overshoot
+            / P62 held decode-CV; one decode after K, no unused F-stack).
+        ``last_only`` materializes ``out`` once after the K-loop (no
+        intermediate decode / feat copies).  ``out='h'`` was P61 held
+        and is **removed** (no training call site).
+        ``prev_state`` continues an existing prior (KV / GRU state; smoke
+        continue + detach).  ``return_state`` also returns the last
+        ``RSSMState``.  P70 gain-c hold REVERT; P71 G-out-of-GRU
+        REVERT (full ``c`` is a GRU input again).
+
+        P28 follow-up 12: overshoot / held-rollout used to omit ``c0``, so
+        the open-loop gain supervisor trained a ``c=0`` GRU path while
+        isolation / gain-match / the actor / transfer-matrix start from
+        posterior ``c`` (p20 family: supervisor ≠ metric path).
+        Follow-up 14: pass the posterior MEAN, not the reparameterized sample.
 
         Compiled the SAME way as ``rollout_observed`` (see ``maybe_compile``):
         capturing the whole K-step ``img_step`` loop as ONE graph removes the
         per-step Python / kernel-launch overhead that otherwise makes the
-        multi-step WM aux losses (latent-overshoot + held-rollout) launch-bound
-        (~73% of the WM step).  Batched, single-graph analogue of the Python
-        loops those losses used to run inline.
+        multi-step WM aux losses (latent-overshoot + held-rollout +
+        gain-match FD + isolation TBPTT chunks) launch-bound.  Eager default
+        still wins by stacking independent rolls on the batch dim
+        (gain-match: baseline + one step per MV/DV).  Isolation TBPTT is
+        applied *between* ``img_rollout`` chunks in train.py (``h``-only
+        ``keep_c``) so compile-on always sees a TBPTT-free graph.
         """
-        Bm = h0.shape[0]
+        if out not in ('feat', 'obs'):
+            raise ValueError(f'img_rollout out={out!r}')
         K = actions.shape[1]
-        state = RSSMState(
-            h=h0,
-            z_logits=torch.zeros(Bm, self.n_categoricals, self.n_classes,
-                                 device=h0.device, dtype=h0.dtype),
-            z=z0)
-        feats = []
+        if prev_state is not None:
+            state = prev_state
+            Bm = int(state.h.shape[0])
+        else:
+            Bm = h0.shape[0]
+            c = None
+            if self.cont_dim > 0:
+                c = (c0 if c0 is not None else cached_zeros_bd(
+                    self, int(Bm), self.cont_dim, h0.dtype, h0.device))
+            # Layout-only IC: ``img_step`` replaces ``z_logits`` (no in-place
+            # write).  Deterministic latent never reads this softmax slot.
+            z_logits = cached_zeros_btd(
+                self, Bm, self.n_categoricals, self.n_classes,
+                h0.dtype, h0.device, attr='_img_zlogits_zeros')
+            state = RSSMState(
+                h=h0, z_logits=z_logits, z=z0, c=c)
+        h_l = z_l = c_l = dv_l = None
+        if not last_only:
+            h_l, z_l, c_l, dv_l = [], [], [], []
+        img_step = self.img_step
+        out_obs = out == 'obs'
+        act_k = _time_unbind(actions)
+        dv_seq = _time_unbind(dvs)
         for k in range(K):
-            dv_k = dvs[:, k] if dvs is not None else None
-            state = self.img_step(state, actions[:, k], dv=dv_k, sample=sample)
-            feats.append(state.feat)
-        return torch.stack(feats, dim=1)                          # (Bm, K, F)
+            dv_k = None if dv_seq is None else dv_seq[k]
+            state = img_step(
+                state, act_k[k], dv=dv_k, sample=sample)
+            if last_only:
+                continue
+            _append_decode_core(h_l, z_l, c_l, dv_l, state)
+        if last_only:
+            out_t = self.decode(state.feat) if out_obs else state.feat
+        else:
+            core = _stack_decode_core(h_l, z_l, c_l, dv_l)
+            out_t = self.decode(core) if out_obs else core
+        if return_state:
+            return out_t, state
+        return out_t
 
     def decode(self, feat: torch.Tensor) -> torch.Tensor:
-        # Scope 2 + DV feedforward: the decoder learns ``g([h, z, (dv)])``; the
-        # DV (when fed forward) sits right after the latent core so it is part
-        # of the contiguous front slice, while any DOB d-tail beyond it is
-        # sliced OFF (re-added by ``apply_dob``).  When DV-feedforward and DOB
-        # are both off, ``feat`` is already core-width so this is a no-op slice.
+        # Scope 2 + DV feedforward: the decoder learns ``g([h, z, c, (dv)])``;
+        # the DV (when decoder-ff is on) sits after the latent core so it is
+        # part of the contiguous front slice, while any DOB d-tail beyond it
+        # is sliced OFF (re-added by ``apply_dob``).  P74 skip REVERT.
         x = feat[..., :self._decode_in_dim]
-        out = self.decoder(x)
-        return out
+        return self.decoder(x)
+
+
+def stream_serve_step(dyn, state, prev_action: torch.Tensor,
+                      obs_t: torch.Tensor, sample: bool = False):
+    """One on-policy / val posterior step matching ``rollout_observed``.
+
+    Training ``_realsim_actor_critic_step`` re-encodes with measured DV
+    sliced from obs and batched Kalman when ``dob_active``. Collect/val
+    used to call ``_posterior_step`` / ``obs_step`` with ``dv=None`` and
+    ``obs=None`` (GRU zero-fills DV; ``d_t`` decays from 0). The actor
+    then trained on a different ``feat=[h,z,(c),(dv),d_t]`` than it
+    acted on — the P3 train/serve hole (P45–P47 bang-bang / limit-ride).
+
+    ``obs_t`` is ``(B, obs_dim)`` or ``(obs_dim,)``. Duck-typed for
+    RSSM and TSSM. ``d`` is not a GRU input, so Kalman here matches
+    the batched ``dob_kalman_scan`` on feats; Stage-1
+    (``dob_active=False``) still skips Kalman like the teacher.
+    """
+    if obs_t.dim() == 1:
+        obs_t = obs_t.unsqueeze(0)
+    emb = dyn.embed(obs_t)
+    dv = None
+    if int(getattr(dyn, 'dv_dim', 0) or 0) > 0:
+        dv = obs_t.index_select(-1, dyn.dv_index_t)
+    dob_live = (bool(getattr(dyn, 'dob_enabled', False))
+                and bool(getattr(dyn, 'dob_active', True)))
+    if dob_live:
+        post, _ = dyn.obs_step(
+            state, prev_action, emb, dv=dv, sample=sample, obs=obs_t)
+        return post
+    pstep = getattr(dyn, '_posterior_step', None)
+    if callable(pstep):
+        return pstep(state, prev_action, emb, dv=dv, sample=sample)
+    post, _ = dyn.obs_step(
+        state, prev_action, emb, dv=dv, sample=sample, obs=None)
+    return post
+
+
+def alloc_pinned_obs_host(device, obs_dim: int):
+    """Pinned 1-D host row for H2D obs copies.  ``None`` off CUDA."""
+    if getattr(device, 'type', '') != 'cuda':
+        return None
+    try:
+        return torch.empty(int(obs_dim), dtype=torch.float32, pin_memory=True)
+    except Exception:
+        return None
+
+
+def copy_obs_row(dst: torch.Tensor, row, host: Optional[torch.Tensor] = None
+                 ) -> None:
+    """Copy a 1-D obs vector into ``dst[0]``.
+
+    Collect/val used to ``from_numpy`` a new CPU tensor every step.
+    Optional pinned ``host`` (from ``alloc_pinned_obs_host``) stages the
+    row so the H2D can be non-blocking.  Identity values.
+    """
+    src = row if isinstance(row, torch.Tensor) else torch.as_tensor(
+        row, dtype=torch.float32)
+    src = src.detach().to(dtype=torch.float32).reshape(-1)
+    if host is not None:
+        host.copy_(src)
+        dst[0].copy_(host, non_blocking=True)
+    else:
+        dst[0].copy_(src)
+
+
+# ---------------------------------------------------------------------------
+# P3 collect: CUDA-graph one frozen-RSSM stream_serve_step (B=1)
+# ---------------------------------------------------------------------------
+
+_RSSM_STATE_TENSORS = (
+    'h', 'z_logits', 'z', 'd', 'dv', 'c', 'c_mean', 'c_std')
+
+
+def _rssm_dob_live(dyn) -> bool:
+    return (bool(getattr(dyn, 'dob_enabled', False))
+            and bool(getattr(dyn, 'dob_active', True)))
+
+
+def _clone_rssm_state(state) -> RSSMState:
+    kw = {}
+    for name in _RSSM_STATE_TENSORS:
+        t = getattr(state, name, None)
+        kw[name] = None if t is None else t.detach().clone()
+    return RSSMState(**kw)
+
+
+def _copy_rssm_state(dst: RSSMState, src: RSSMState) -> None:
+    for name in _RSSM_STATE_TENSORS:
+        a = getattr(dst, name)
+        b = getattr(src, name)
+        if a is None and b is None:
+            continue
+        if a is None or b is None:
+            raise RuntimeError(
+                f'collect-serve CUDA graph state {name!r} None mismatch')
+        if a.dtype != b.dtype or a.device != b.device:
+            a.copy_(b.to(device=a.device, dtype=a.dtype))
+        else:
+            a.copy_(b)
+
+
+class CollectServeCudaGraph:
+    """Replay one frozen-RSSM ``stream_serve_step`` (B=1 collect/val).
+
+    Policy stays eager (σ sampling + in-place Adam writes). Observer
+    weights are frozen in P3; replay reads those parameter addresses.
+    Host-adaptive: CPU / TSSM / capture-fail stay on eager
+    ``stream_serve_step``. Transient VRAM skip does not pin fail.
+    """
+
+    __slots__ = (
+        'graph', 'in_state', 'out_state', 'feat', 'obs', 'prev_a',
+        'dob_live')
+
+    def __init__(self, graph, in_state, out_state, feat, obs, prev_a,
+                 dob_live: bool):
+        self.graph = graph
+        self.in_state = in_state
+        self.out_state = out_state
+        self.feat = feat
+        self.obs = obs
+        self.prev_a = prev_a
+        self.dob_live = bool(dob_live)
+
+    def reset(self, state) -> None:
+        _copy_rssm_state(self.in_state, state)
+        self.prev_a.zero_()
+
+    def replay(self) -> torch.Tensor:
+        self.graph.replay()
+        _copy_rssm_state(self.in_state, self.out_state)
+        return self.feat
+
+
+def _capture_collect_serve_cuda_graph(
+        dyn, example_state, device, obs_dim: int, act_dim: int,
+        dob_live: bool):
+    """Capture or ``(None, pin_fail)``. VRAM skip is ``(None, False)``."""
+    if not hasattr(torch.cuda, 'CUDAGraph'):
+        return None, True
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+        if int(free) < 128 * 1024 * 1024:
+            print('[collect] serve CUDA graph skipped '
+                  f'(free VRAM {free / 1024 ** 2:.0f} MiB < 128); eager',
+                  flush=True)
+            return None, False
+    except Exception:
+        pass
+    try:
+        static_obs = torch.empty(
+            1, int(obs_dim), device=device, dtype=torch.float32)
+        static_prev_a = torch.zeros(
+            1, int(act_dim), device=device, dtype=torch.float32)
+        in_state = _clone_rssm_state(example_state)
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                tmp = stream_serve_step(
+                    dyn, in_state, static_prev_a, static_obs, sample=False)
+                _copy_rssm_state(in_state, tmp)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out_state = stream_serve_step(
+                dyn, in_state, static_prev_a, static_obs, sample=False)
+            feat = out_state.feat
+        print('[collect] serve CUDA graph captured '
+              '(B=1 stream_serve_step)', flush=True)
+        return CollectServeCudaGraph(
+            g, in_state, out_state, feat, static_obs, static_prev_a,
+            dob_live), False
+    except Exception as exc:
+        print(f'[collect] serve CUDA graph skipped ({exc!r}); eager '
+              'stream_serve_step', flush=True)
+        return None, True
+
+
+def get_collect_serve_cuda_graph(dyn, example_state, device, obs_dim: int,
+                                  act_dim: int):
+    """Lazy B=1 collect graph. ``None`` → eager ``stream_serve_step``."""
+    if getattr(device, 'type', '') != 'cuda':
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if type(example_state).__name__ != 'RSSMState':
+        return None
+    if getattr(dyn, '_collect_serve_cg_fail', False):
+        return None
+    dob_live = _rssm_dob_live(dyn)
+    existing = getattr(dyn, '_collect_serve_cg', None)
+    if existing is not None and existing.dob_live == dob_live:
+        return existing
+    captured, pin_fail = _capture_collect_serve_cuda_graph(
+        dyn, example_state, device, obs_dim, act_dim, dob_live)
+    if pin_fail:
+        dyn._collect_serve_cg_fail = True  # type: ignore[attr-defined]
+    if captured is None:
+        return None
+    dyn._collect_serve_cg = captured  # type: ignore[attr-defined]
+    return captured
+
+
+def warmup_collect_serve_cuda_graph(dyn, device, obs_dim: int, act_dim: int):
+    """Capture under the same bf16 autocast + inference_mode as collect/val.
+
+    Replay of a CUDA graph ignores the surrounding autocast, so capture
+    dtype must match ``collect_episode`` / ``_run_episode_with_window``
+    (bf16 on CUDA). CPU / TSSM / fail stay ``None``.
+    """
+    if getattr(device, 'type', '') != 'cuda':
+        return None
+    if not torch.cuda.is_available():
+        return None
+    with torch.inference_mode(), torch.amp.autocast(
+            device_type='cuda', dtype=torch.bfloat16, enabled=True):
+        st = dyn.initial_state(1, device)
+        return get_collect_serve_cuda_graph(
+            dyn, st, device, int(obs_dim), int(act_dim))
 
 
 # ---------------------------------------------------------------------------
@@ -869,10 +1511,9 @@ def rssm_kl_loss(post_logits: torch.Tensor, prior_logits: torch.Tensor,
 
     kl_dyn_raw = _kl_cat_summed(post_logits.detach(), prior_logits)
     kl_repr_raw = _kl_cat_summed(post_logits, prior_logits.detach())
-    fb = torch.tensor(float(free_bits), device=post_logits.device,
-                      dtype=kl_dyn_raw.dtype)
-    kl_dyn = torch.maximum(kl_dyn_raw.mean(), fb)
-    kl_repr = torch.maximum(kl_repr_raw.mean(), fb)
+    fb = float(free_bits)
+    kl_dyn = kl_dyn_raw.mean().clamp_min(fb)
+    kl_repr = kl_repr_raw.mean().clamp_min(fb)
     kl_loss = dyn_w * kl_dyn + repr_w * kl_repr
     diag = {
         'kl_dyn': kl_dyn.detach(),
@@ -907,10 +1548,9 @@ def rssm_cont_kl_loss(post_mean: torch.Tensor, post_std: torch.Tensor,
                            prior_mean, prior_std)
     kl_repr_raw = _kl_gauss(post_mean, post_std,
                             prior_mean.detach(), prior_std.detach())
-    fb = torch.tensor(float(free_bits), device=post_mean.device,
-                      dtype=kl_dyn_raw.dtype)
-    kl_dyn = torch.maximum(kl_dyn_raw.mean(), fb)
-    kl_repr = torch.maximum(kl_repr_raw.mean(), fb)
+    fb = float(free_bits)
+    kl_dyn = kl_dyn_raw.mean().clamp_min(fb)
+    kl_repr = kl_repr_raw.mean().clamp_min(fb)
     kl_loss = dyn_w * kl_dyn + repr_w * kl_repr
     diag = {
         'cont_kl_dyn': kl_dyn.detach(),

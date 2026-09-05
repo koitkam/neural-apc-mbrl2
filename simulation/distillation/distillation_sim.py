@@ -14,9 +14,10 @@ Functionality:
 Inputs:
 - Constructor parameters: ``episode_length``, ``sample_rate``.
 - Optional env controls:
-    - ``DISTILLATION_DOMAIN_RANDOMIZATION`` (default enabled)
-    - ``DISTILLATION_PARAM_RANDOMIZATION_PCT`` (default ``0.10``)
-    - ``DISTILLATION_DOMAIN_RANDOMIZATION_SEED`` (for reproducibility)
+    - ``DREAMER_SIM_DOMAIN_RANDOMIZATION`` (default enabled)
+    - ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` (default ``0.10``)
+    - ``DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED`` (for reproducibility)
+    Leftover ``DISTILLATION_*`` / ``SIM_*`` names are ignored.
 
 Outputs:
 - ``reset() -> (state, done)`` and ``step(action) -> (state, done)``.

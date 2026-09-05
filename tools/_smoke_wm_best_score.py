@@ -13,13 +13,12 @@ Verifies, WITHOUT a real env/sim (a minimal fake env + the real RSSM model):
 
 Run (CPU; does not disturb a live GPU run):
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  DREAMER_COMPILE=0 \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_wm_best_score.py
+  ~/neural-APC-mbrl2-env/bin/python tools/_smoke_wm_best_score.py
 """
 import numpy as np
 import torch
 
-from tools._smoke_overshoot_critic import _mk
+from tools._smoke_wm_fixes import _mk
 from training.train import _probe_wm_held_convergence, world_model_loss
 
 

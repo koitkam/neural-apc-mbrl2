@@ -35,15 +35,225 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 
-# ── Defaults (overridable via env) ────────────────────────────────────────
+# ── Defaults (overridable via TrainConfig / env) ─────────────────────────
+# Canonical DREAMER_SIM_* land in run_plan via ENV_OVERRIDES.  Leftover
+# SIM_* knob names are ignored (P91-live; login leftover was a silent
+# A/B outside run_plan).  ``SIM_NOISE_CONFIG_JSON`` stays env-only (path).
 
 _DEFAULT_OU_SIGMA_FRAC = 0.008       # OU sigma = fraction of channel span
 _DEFAULT_OU_GAIN_CV = 0.15           # OU gain multiplier for CV channels
 _DEFAULT_OU_GAIN_DV = 0.60           # OU gain multiplier for DV channels
 _DEFAULT_MEAS_NOISE_CV_FRAC = 0.005  # measurement noise sigma = frac of CV span
 _DEFAULT_MEAS_NOISE_DV_FRAC = 0.010  # measurement noise sigma = frac of DV span
+_DEFAULT_NOISE_ADAPTIVE = True       # SNR-weighted OU gain + meas-sigma cap
 _DEFAULT_DR_PCT = 0.10               # domain-randomization ±%
 _DEFAULT_DR_MAX = 0.30               # upper cap for DR %
+
+_BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f', '')
+
+
+def _snr_explicit(cfg, field: str) -> bool:
+    if cfg is None:
+        return False
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _snr_float(cfg, field: str, dreamer_key: str, leftover_key: str,
+               default: float) -> float:
+    """Explicit TrainConfig, else DREAMER_*, else cfg, else default.
+
+    Leftover ``SIM_*`` knob names are ignored (P91-live).  ``leftover_key``
+    stays on the signature so call sites do not churn.  Identity env-free.
+    """
+    _ = leftover_key
+    if _snr_explicit(cfg, field):
+        try:
+            return float(getattr(cfg, field))
+        except Exception:
+            return float(default)
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        try:
+            return float(d_raw)
+        except Exception:
+            pass
+    if cfg is not None:
+        try:
+            return float(getattr(cfg, field, default))
+        except Exception:
+            pass
+    return float(default)
+
+
+def _snr_bool(cfg, field: str, dreamer_key: str, leftover_key: str,
+              default: bool) -> bool:
+    """Same precedence as ``_snr_float``.  Leftover ``SIM_*`` ignored."""
+    _ = leftover_key
+    if _snr_explicit(cfg, field):
+        return bool(getattr(cfg, field))
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        return str(d_raw).strip().lower() not in _BOOL_OFF
+    if cfg is not None:
+        return bool(getattr(cfg, field, default))
+    return bool(default)
+
+
+def resolve_sim_snr_knobs(cfg=None) -> Dict[str, Any]:
+    """Unitless plant-SNR knobs used by ``build_noise_config``.
+
+    Identity defaults match the historical ``os.environ.get`` fallbacks.
+    ``SIM_NOISE_CONFIG_JSON`` stays env-only (baked path, not a knob).
+    """
+    return {
+        'adaptive': _snr_bool(
+            cfg, 'sim_noise_adaptive',
+            'DREAMER_SIM_NOISE_ADAPTIVE', 'SIM_NOISE_ADAPTIVE',
+            _DEFAULT_NOISE_ADAPTIVE),
+        'ou_sigma_frac': _snr_float(
+            cfg, 'sim_ou_sigma_frac',
+            'DREAMER_SIM_OU_SIGMA_FRAC', 'SIM_OU_SIGMA_FRAC',
+            _DEFAULT_OU_SIGMA_FRAC),
+        'ou_gain_cv': _snr_float(
+            cfg, 'sim_ou_gain_cv',
+            'DREAMER_SIM_OU_GAIN_CV', 'SIM_OU_GAIN_CV',
+            _DEFAULT_OU_GAIN_CV),
+        'ou_gain_dv': _snr_float(
+            cfg, 'sim_ou_gain_dv',
+            'DREAMER_SIM_OU_GAIN_DV', 'SIM_OU_GAIN_DV',
+            _DEFAULT_OU_GAIN_DV),
+        'meas_cv_frac': _snr_float(
+            cfg, 'sim_meas_noise_cv_frac',
+            'DREAMER_SIM_MEAS_NOISE_CV_FRAC', 'SIM_MEAS_NOISE_CV_FRAC',
+            _DEFAULT_MEAS_NOISE_CV_FRAC),
+        'meas_dv_frac': _snr_float(
+            cfg, 'sim_meas_noise_dv_frac',
+            'DREAMER_SIM_MEAS_NOISE_DV_FRAC', 'SIM_MEAS_NOISE_DV_FRAC',
+            _DEFAULT_MEAS_NOISE_DV_FRAC),
+    }
+
+
+_RUNTIME_BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f')
+_DEFAULT_NOISE_JITTER_PCT = 0.20
+_DEFAULT_NOISE_ENABLED = True
+_DEFAULT_DOMAIN_RANDOMIZATION = True
+
+
+def _snr_str(cfg, field: str, dreamer_key: str, leftover_key: str,
+             default: str = '') -> str:
+    """Explicit TrainConfig, else DREAMER_*, else cfg, else default.
+
+    Empty string = unset (unseeded RNG).  Explicit empty still wins.
+    Leftover ``SIM_*`` ignored (P91-live).
+    """
+    _ = leftover_key
+    if _snr_explicit(cfg, field):
+        return str(getattr(cfg, field, default) or '')
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        return str(d_raw).strip()
+    if cfg is not None:
+        return str(getattr(cfg, field, default) or '')
+    return str(default or '')
+
+
+def _snr_flag_empty_on(cfg, field: str, dreamer_key: str, leftover_keys,
+                       default: bool) -> bool:
+    """Bool with DomainRandomizer / ``DREAMER_SIM_NOISE_ENABLED`` identity.
+
+    Unset → default.  Leftover ``SIM_*`` / ``DREAMER_DOMAIN_RANDOMIZATION``
+    ignored (P91-live).  ``leftover_keys`` stays on the signature.
+    """
+    _ = leftover_keys
+    if _snr_explicit(cfg, field):
+        return bool(getattr(cfg, field))
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        return str(d_raw).strip().lower() not in _RUNTIME_BOOL_OFF
+    if cfg is not None:
+        return bool(getattr(cfg, field, default))
+    return bool(default)
+
+
+def _snr_float_multi(cfg, field: str, dreamer_key: str, leftover_keys,
+                     default: float) -> float:
+    """Like ``_snr_float``.  Leftover names ignored (P91-live)."""
+    _ = leftover_keys
+    if _snr_explicit(cfg, field):
+        try:
+            return float(getattr(cfg, field))
+        except Exception:
+            return float(default)
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        try:
+            return float(d_raw)
+        except Exception:
+            pass
+    if cfg is not None:
+        try:
+            return float(getattr(cfg, field, default))
+        except Exception:
+            pass
+    return float(default)
+
+
+def resolve_sim_runtime_knobs(cfg=None) -> Dict[str, Any]:
+    """Runtime wrapper knobs (seed / jitter / enable / DR).
+
+    Identity defaults match ``SimNoiseWrapper`` / ``DomainRandomizer``.
+    Leftover ``SIM_*`` / ``DREAMER_DOMAIN_RANDOMIZATION`` ignored (P91-live).
+    SysID ``clean_mode`` writes ``DREAMER_SIM_*`` (not leftover ``SIM_*``).
+    """
+    jitter = _snr_float_multi(
+        cfg, 'sim_noise_jitter_pct',
+        'DREAMER_SIM_NOISE_JITTER_PCT',
+        ('SIM_NOISE_JITTER_PCT', 'SIM_NOISE_AMPLITUDE_JITTER_PCT'),
+        _DEFAULT_NOISE_JITTER_PCT)
+    return {
+        'noise_enabled': _snr_flag_empty_on(
+            cfg, 'sim_noise_enabled',
+            'DREAMER_SIM_NOISE_ENABLED', 'SIM_NOISE_ENABLED',
+            _DEFAULT_NOISE_ENABLED),
+        'noise_seed': _snr_str(
+            cfg, 'sim_noise_seed',
+            'DREAMER_SIM_NOISE_SEED', 'SIM_NOISE_SEED', ''),
+        'jitter_pct': float(np.clip(float(jitter), 0.0, 0.5)),
+        'domain_randomization': _snr_flag_empty_on(
+            cfg, 'sim_domain_randomization',
+            'DREAMER_SIM_DOMAIN_RANDOMIZATION',
+            ('DREAMER_DOMAIN_RANDOMIZATION', 'SIM_DOMAIN_RANDOMIZATION'),
+            _DEFAULT_DOMAIN_RANDOMIZATION),
+        'domain_randomization_seed': _snr_str(
+            cfg, 'sim_domain_randomization_seed',
+            'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
+            'SIM_DOMAIN_RANDOMIZATION_SEED', ''),
+        'param_randomization_pct': resolve_sim_param_randomization_pct(cfg),
+    }
+
+
+def resolve_sim_param_randomization_pct(cfg=None) -> Optional[float]:
+    """Override for baked DR ±%.  ``None`` = identifier-derived auto.
+
+    Env-free identity: bake stays ``_domain_randomization_pct`` (test_sim
+    ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT`` ignored (P91-live).
+    Explicit cfg / ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` win at bake.
+    Sentinel ``<0`` is auto.
+    """
+    if _snr_explicit(cfg, 'sim_param_randomization_pct'):
+        try:
+            v = float(getattr(cfg, 'sim_param_randomization_pct'))
+        except Exception:
+            return None
+        return None if v < 0.0 else float(v)
+    d_raw = os.environ.get('DREAMER_SIM_PARAM_RANDOMIZATION_PCT')
+    if d_raw not in (None, ''):
+        try:
+            v = float(d_raw)
+            return None if v < 0.0 else float(v)
+        except Exception:
+            pass
+    return None
 
 
 def _span(bounds):
@@ -52,7 +262,8 @@ def _span(bounds):
 
 
 def noise_curriculum_scale(progress: float,
-                            phase: Optional[int] = None) -> float:
+                            phase: Optional[int] = None,
+                            cfg=None) -> float:
     """P1 process+measurement noise amplitude curriculum (P89, 2026-06-06).
 
     Returns a multiplier in ``[0, 1]`` applied to BOTH the OU process noise
@@ -66,22 +277,29 @@ def noise_curriculum_scale(progress: float,
     100 % of episodes, so the plant never sits still.  Ramping noise from ~0
     lets P1 establish the attractor before noise is added.
 
-    Schedule: ``DREAMER_PROCESS_NOISE_AMP_RAMP="<start>:<reach>"`` (default
-    ``"0.0:0.4"`` \u2014 start fully clean, reach full noise by 40 % progress).
-    ``start``: scale at ``progress=0``.  ``reach``: progress fraction at which
-    the scale reaches 1.0.  Phase-aware: **P3 always returns 1.0** (the WM is
-    frozen and the actor must learn to reject realistic-magnitude noise);
-    P1/P2 follow the ramp.  Disable the curriculum entirely (full noise from
-    step 0, legacy behaviour) with ``DREAMER_PROCESS_NOISE_AMP_RAMP=1.0:1e-6``
-    or by setting ``process_noise_curriculum=False`` on the cfg.
+    Schedule: TrainConfig ``process_noise_amp_ramp``
+    (``"<start>:<reach>"``; A/B ``DREAMER_PROCESS_NOISE_AMP_RAMP`` via
+    ``ENV_OVERRIDES``). Default ``"0.0:0.4"`` — start fully clean, reach
+    full noise by 40 % progress. ``start``: scale at ``progress=0``.
+    ``reach``: progress fraction at which the scale reaches 1.0.
+    Phase-aware: **P3 always returns 1.0** (the WM is frozen and the actor
+    must learn to reject realistic-magnitude noise); P1/P2 follow the ramp.
+    Disable the curriculum entirely (full noise from step 0, legacy
+    behaviour) with ramp ``"1.0:1e-6"`` or by setting
+    ``process_noise_curriculum=False`` on the cfg.
+
+    TrainConfig field only (P92-live leftover helper dual-read REMOVED).
+    Unset cfg → ``0.0:0.4``. Empty field → 1.0 (full noise sentinel).
     """
     if phase is not None and int(phase) >= 3:
         return 1.0
-    raw = os.environ.get('DREAMER_PROCESS_NOISE_AMP_RAMP', '0.0:0.4').strip()
-    if not raw:
+    from utils.hidden_disturbance import _knob_raw
+    raw, _leftover = _knob_raw(cfg, 'process_noise_amp_ramp')
+    text = '0.0:0.4' if raw is None else str(raw).strip()
+    if not text:
         return 1.0
     try:
-        start_str, reach_str = raw.split(':')
+        start_str, reach_str = text.split(':')
         start = float(start_str)
         reach = float(reach_str)
     except Exception:
@@ -110,7 +328,11 @@ def _theta_from_tau(tau_dominant: float, sample_rate: int = 1) -> float:
     returns.  Only a small positive floor is kept for numerical safety
     (``theta = 0`` would turn the OU into a random walk).
     """
-    tau = max(1.0, float(tau_dominant))
+    tau = float(tau_dominant or 0.0)
+    if tau <= 0.0:
+        # No identified τ: numerical OU floor only. Do not invent 50 s.
+        return 0.02
+    tau = max(1.0, tau)
     characteristic = 0.10 * tau
     dt = max(1e-3, float(sample_rate))
     ratio = dt / characteristic
@@ -173,6 +395,7 @@ def build_noise_config(
     dv_normalization_ranges: Optional[List[List[float]]] = None,
     sample_rate: int = 1,
     noise_stdv: float = 0.03,
+    cfg=None,
 ) -> Dict[str, Any]:
     """Build a complete noise + domain-randomization config from dynamics.
 
@@ -194,6 +417,10 @@ def build_noise_config(
         Simulator sample rate (seconds).
     noise_stdv : float
         Baseline noise level requested by the caller.
+    cfg : TrainConfig, optional
+        When present, explicit SNR fields win over env.  Phase 1a bake
+        passes ``None`` and dual-reads ``DREAMER_SIM_*`` / leftover
+        ``SIM_*``.
 
     Returns
     -------
@@ -211,16 +438,16 @@ def build_noise_config(
     cv_ranges = list(cv_normalization_ranges or [])
     dv_ranges = list(dv_normalization_ranges or [])
 
-    tau_dom = float(dyn.get('tau_dominant_identified', 50.0) or 50.0)
-    dead_time = float(dyn.get('dead_time_identified', 5.0) or 5.0)
+    tau_dom = float(dyn.get('tau_dominant_identified', 0.0) or 0.0)
+    dead_time = float(dyn.get('dead_time_identified', 0.0) or 0.0)
     per_mv = dyn.get('per_mv_dynamics', {}) or {}
     per_cv = dyn.get('per_cv_dynamics', {}) or {}
     per_pair = dyn.get('per_pair_estimates', []) or []
 
     theta = _theta_from_tau(tau_dom, sample_rate=sample_rate)
-    base_sigma_frac = float(os.environ.get(
-        'SIM_OU_SIGMA_FRAC', str(_DEFAULT_OU_SIGMA_FRAC),
-    ))
+    snr = resolve_sim_snr_knobs(cfg)
+    runtime = resolve_sim_runtime_knobs(cfg)
+    base_sigma_frac = float(snr['ou_sigma_frac'])
 
     # ── Build per-CV response amplitude map ──────────────────────────────
     cv_amp: Dict[int, float] = {}
@@ -251,13 +478,12 @@ def build_noise_config(
                 dv_amp[di] = max(dv_amp.get(di, 0.0), amp)
 
     # ── OU noise entries ─────────────────────────────────────────────────
-    # ``SIM_NOISE_ADAPTIVE=1`` opts in to per-channel SNR-weighted OU gain
-    # and measurement-sigma capping.  Default OFF preserves backward
-    # compatibility so an in-flight observer pretraining (which bakes the
-    # current noise config into cached rollouts) remains valid.
-    adaptive = str(os.environ.get('SIM_NOISE_ADAPTIVE', '1')).strip().lower() not in {'0', 'false', 'no', 'off', ''}
-    base_gain_cv = float(os.environ.get('SIM_OU_GAIN_CV', str(_DEFAULT_OU_GAIN_CV)))
-    base_gain_dv = float(os.environ.get('SIM_OU_GAIN_DV', str(_DEFAULT_OU_GAIN_DV)))
+    # Adaptive SNR weighting is env-free ON (TrainConfig
+    # ``sim_noise_adaptive``).  Leftover ``SIM_NOISE_ADAPTIVE`` ignored
+    # (P91-live; A/B ``DREAMER_SIM_NOISE_ADAPTIVE``).
+    adaptive = bool(snr['adaptive'])
+    base_gain_cv = float(snr['ou_gain_cv'])
+    base_gain_dv = float(snr['ou_gain_dv'])
 
     def _snr_gain(base_gain: float, amp: float, meas_sigma: float) -> float:
         if not adaptive:
@@ -283,7 +509,7 @@ def build_noise_config(
         sigma = _ou_sigma_for_channel(span, amp, base_sigma_frac)
         sigma = float(max(sigma, noise_stdv * 0.3))
         # Rough measurement-sigma estimate used only for SNR scaling below
-        cv_meas_frac_tmp = float(os.environ.get('SIM_MEAS_NOISE_CV_FRAC', str(_DEFAULT_MEAS_NOISE_CV_FRAC)))
+        cv_meas_frac_tmp = float(snr['meas_cv_frac'])
         meas_sigma_est = max(cv_meas_frac_tmp * span, noise_stdv * 0.6)
         gain = _snr_gain(base_gain_cv, amp, meas_sigma_est)
         ou_noise.append({
@@ -306,7 +532,7 @@ def build_noise_config(
         amp = dv_amp.get(idx, 0.10 * span)
         sigma = _ou_sigma_for_channel(span, amp, base_sigma_frac * 1.2)
         sigma = float(max(sigma, noise_stdv * 0.5))
-        dv_meas_frac_tmp = float(os.environ.get('SIM_MEAS_NOISE_DV_FRAC', str(_DEFAULT_MEAS_NOISE_DV_FRAC)))
+        dv_meas_frac_tmp = float(snr['meas_dv_frac'])
         meas_sigma_est = max(dv_meas_frac_tmp * span, noise_stdv * 1.0)
         gain = _snr_gain(base_gain_dv, amp, meas_sigma_est)
         ou_noise.append({
@@ -323,12 +549,8 @@ def build_noise_config(
     # ── Measurement noise entries ────────────────────────────────────────
     meas_noise: List[Dict] = []
 
-    cv_meas_frac = float(os.environ.get(
-        'SIM_MEAS_NOISE_CV_FRAC', str(_DEFAULT_MEAS_NOISE_CV_FRAC),
-    ))
-    dv_meas_frac = float(os.environ.get(
-        'SIM_MEAS_NOISE_DV_FRAC', str(_DEFAULT_MEAS_NOISE_DV_FRAC),
-    ))
+    cv_meas_frac = float(snr['meas_cv_frac'])
+    dv_meas_frac = float(snr['meas_dv_frac'])
 
     for i, idx in enumerate(cv_idx):
         bounds = cv_ranges[i] if i < len(cv_ranges) else (
@@ -368,12 +590,18 @@ def build_noise_config(
 
     # ── Domain randomization ─────────────────────────────────────────────
     dr_pct = _domain_randomization_pct(per_mv, per_cv)
+    dr_ov = runtime.get('param_randomization_pct')
+    if dr_ov is None:
+        dr_ov = resolve_sim_param_randomization_pct(cfg)
+    if dr_ov is not None:
+        dr_pct = float(np.clip(float(dr_ov), 0.0, 0.5))
+    dr_on = bool(runtime['domain_randomization'])
 
     config = {
         'ou_noise': ou_noise,
         'measurement_noise': meas_noise,
         'domain_randomization': {
-            'enabled': True,
+            'enabled': dr_on,
             'param_randomization_pct': round(dr_pct, 4),
         },
         'metadata': {
@@ -381,6 +609,14 @@ def build_noise_config(
             'dead_time': round(dead_time, 3),
             'theta_derived': round(theta, 4),
             'base_sigma_frac': round(base_sigma_frac, 6),
+            'sim_noise_adaptive': bool(adaptive),
+            'sim_ou_gain_cv': round(base_gain_cv, 6),
+            'sim_ou_gain_dv': round(base_gain_dv, 6),
+            'sim_meas_noise_cv_frac': round(cv_meas_frac, 6),
+            'sim_meas_noise_dv_frac': round(dv_meas_frac, 6),
+            'sim_noise_enabled': bool(runtime['noise_enabled']),
+            'sim_noise_jitter_pct': round(float(runtime['jitter_pct']), 6),
+            'sim_domain_randomization': dr_on,
             'noise_stdv_input': round(noise_stdv, 6),
             'sample_rate': int(sample_rate),
             'cv_channels': len(cv_idx),
@@ -417,7 +653,8 @@ def load_noise_config(path: Optional[str] = None) -> Optional[Dict]:
 
 
 def build_noise_config_from_sim(sim, dynamics_json=None, lookback_json=None,
-                                noise_stdv: float = 0.03) -> Dict[str, Any]:
+                                noise_stdv: float = 0.03, cfg=None,
+                                ) -> Dict[str, Any]:
     """Convenience: build noise config using metadata already on a sim.
 
     This is the bridge for callers that have a simulator instance with
@@ -436,4 +673,5 @@ def build_noise_config_from_sim(sim, dynamics_json=None, lookback_json=None,
         dv_normalization_ranges=list(getattr(sim, 'dv_normalization_ranges', [])),
         sample_rate=int(getattr(sim, 'sample_rate', 1)),
         noise_stdv=noise_stdv,
+        cfg=cfg,
     )

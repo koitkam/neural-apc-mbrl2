@@ -29,12 +29,11 @@ not the action vector).  Sim-agnostic: any MV/CV count.
 
 Standalone use:
   PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python -m evaluation.wm_transfer_matrix \
+  $PWD/../neural-APC-mbrl2-env/bin/python -m evaluation.wm_transfer_matrix \
       --run-dir output/test_sim/run_XXXX
 """
 from __future__ import annotations
 
-import os
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -46,6 +45,64 @@ import numpy as np
 from tools.wm_steady_state_diagnostic import (
     _imagine_open_loop, _imagine_open_loop_rssm, _is_rssm_model, _quiet_env,
 )
+
+
+def wm_tf_horizon(control_horizon: int) -> int:
+    """Default TM / gain-ready open-loop window: ``max(80, 4·H)``.
+
+    Slow WM prior τ~2× plant; 1.5H under-settled and under-read DC-gain.
+    Floor 80 covers fast plants (H=15 → 80, not 60).  Callers pass
+    ``horizon>0`` (TrainConfig ``wm_tf_horizon`` / leftover env) to override.
+    P44 gain-match *settle* is control H, not this window.  P67 teacher
+    FD K auto=4H CAPPED GAIN_NOT_READY 0.80@DV → **REVERT** to control H.
+    Do not retarget settle to 4H (not a retry of S=H).
+    """
+    h = max(1, int(control_horizon or 1))
+    return max(80, int(4 * h))
+
+
+def wm_tf_roll_len(cfg, horizon: int = 0) -> int:
+    """Resolved TM roll length: explicit ``horizon`` or ``wm_tf_horizon``."""
+    if int(horizon or 0) > 0:
+        return int(horizon)
+    return wm_tf_horizon(int(getattr(cfg, 'horizon', 30) or 30))
+
+
+def resolve_wm_tf_knobs(cfg=None) -> Dict:
+    """TM protocol from TrainConfig, else leftover ``DREAMER_WM_TF_*``.
+
+    Identity defaults match the historical env fallbacks (levels=5,
+    span=0.6, step_frac=0.4, horizon/settle 0 = auto).  Explicit
+    ``_explicit_fields`` wins over leftover env.
+    """
+    from training.train import _cfg_or_env
+    n_levels, _ = _cfg_or_env(cfg, 'wm_tf_levels', 'DREAMER_WM_TF_LEVELS', 5, int)
+    span, _ = _cfg_or_env(cfg, 'wm_tf_span', 'DREAMER_WM_TF_SPAN', 0.6, float)
+    step_frac, _ = _cfg_or_env(
+        cfg, 'wm_tf_step_frac', 'DREAMER_WM_TF_STEP_FRAC', 0.4, float)
+    horizon, _ = _cfg_or_env(
+        cfg, 'wm_tf_horizon', 'DREAMER_WM_TF_HORIZON', 0, int)
+    settle, _ = _cfg_or_env(
+        cfg, 'wm_tf_settle', 'DREAMER_WM_TF_SETTLE', 0, int)
+    return {
+        'n_levels': int(n_levels),
+        'span': float(span),
+        'step_frac': float(step_frac),
+        'horizon': int(horizon),
+        'settle': int(settle),
+    }
+
+
+def val_diag_enabled(cfg, field: str, env_key: str, default: bool = True
+                     ) -> bool:
+    """Val-suite gate from TrainConfig, else leftover ``DREAMER_VAL_WM_*``."""
+    from training.train import _cfg_or_env
+
+    def _as_b(s) -> bool:
+        return str(s).strip().lower() in ('1', 'true', 'yes', 'on', 't', 'y')
+
+    v, _ = _cfg_or_env(cfg, field, env_key, default, _as_b)
+    return bool(v)
 
 
 def _settle_capture(env, base_action: np.ndarray, settle_steps: int,
@@ -224,13 +281,9 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
     cv_idx = list(env.cv_indices)
     n_mv = int(env.action_dim)
     obs_dim = int(env.obs_dim)
-    # 4x the control horizon (was 1.5x).  The WM open-loop PRIOR settles ~2x
-    # slower than the real plant (effective tau ~2x), so 1.5x*H under-settled
-    # the WM step response and UNDER-READ its steady-state gain (the WM curve
-    # was still rising at the old cutoff).  4x*H lets the slow prior asymptote
-    # so the reported gain reflects the true steady state.  Override:
-    # DREAMER_WM_TF_HORIZON / _SETTLE.
-    H = int(horizon) if horizon > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+    # ``wm_tf_horizon``: 4×H so the slow WM prior reaches SS (was 1.5×).
+    # Callers pass ``horizon=`` from TrainConfig ``wm_tf_horizon``.
+    H = wm_tf_roll_len(cfg, horizon)
     S = int(settle_steps) if settle_steps > 0 else H
     L = min(int(getattr(cfg, 'lookback', 64)), S)
     if obs_std is None:
@@ -333,11 +386,9 @@ def compute_transfer_matrix(model, env, cfg, device, *,
     cv_idx = list(env.cv_indices)
     n_mv = int(env.action_dim)
     obs_dim = int(env.obs_dim)
-    # 4x the control horizon (was 1.5x) so the slow WM open-loop prior reaches
-    # steady state before the gain is read (WM effective tau ~2x the real
-    # plant; 1.5x*H under-settled -> under-read gain).  Override:
-    # DREAMER_WM_TF_HORIZON / _SETTLE.
-    H = int(horizon) if horizon > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+    # ``wm_tf_horizon``: 4×H so the slow WM prior reaches SS (was 1.5×).
+    # Callers pass ``horizon=`` from TrainConfig ``wm_tf_horizon``.
+    H = wm_tf_roll_len(cfg, horizon)
     S = int(settle_steps) if settle_steps > 0 else H
     L = min(int(getattr(cfg, 'lookback', 64)), S)
     k_max = int(getattr(cfg, 'k_max', 4))
@@ -718,15 +769,16 @@ def compute_and_plot(model, env, cfg, device, out_dir: Path, *,
     """Convenience wrapper for validation: compute, plot, and dump JSON.
 
     Fully guarded — returns ``None`` (and prints) on any failure so it can
-    never break a validation run.  Knobs via env:
-      DREAMER_WM_TF_LEVELS, _SPAN, _STEP_FRAC, _HORIZON, _SETTLE.
+    never break a validation run.  Knobs via TrainConfig (``wm_tf_*``)
+    with leftover ``DREAMER_WM_TF_*`` env fallback (identity defaults).
     """
     try:
-        n_levels = int(os.environ.get('DREAMER_WM_TF_LEVELS', '5'))
-        span = float(os.environ.get('DREAMER_WM_TF_SPAN', '0.6'))
-        step_frac = float(os.environ.get('DREAMER_WM_TF_STEP_FRAC', '0.4'))
-        horizon = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0'))
-        settle = int(os.environ.get('DREAMER_WM_TF_SETTLE', '0'))
+        knobs = resolve_wm_tf_knobs(cfg)
+        n_levels = knobs['n_levels']
+        span = knobs['span']
+        step_frac = knobs['step_frac']
+        horizon = knobs['horizon']
+        settle = knobs['settle']
         result = compute_transfer_matrix(
             model, env, cfg, device, obs_std=obs_std, n_levels=n_levels,
             level_span=span, step_frac=step_frac, horizon=horizon,

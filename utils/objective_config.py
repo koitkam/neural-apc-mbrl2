@@ -250,9 +250,11 @@ def load_objective_spec() -> Dict[str, Any]:
         _warn_legacy_weights(file_cfg)
         spec = _merge(spec, file_cfg)
 
+    d_raw = os.environ.get('DREAMER_OBJ_USE_NORMALIZED')
+    raw = d_raw if d_raw not in (None, '') else spec.get(
+        'objective_use_normalized', 1)
     spec['objective_use_normalized'] = 1 if int(_safe_float(
-        os.environ.get('OBJ_USE_NORMALIZED', spec.get('objective_use_normalized', 1)),
-        spec.get('objective_use_normalized', 1),
+        raw, spec.get('objective_use_normalized', 1),
     )) != 0 else 0
 
     return _coerce_spec(spec)

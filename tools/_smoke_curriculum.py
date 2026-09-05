@@ -12,15 +12,15 @@ the properties that make the staged Kalman/DOB identification correct:
     (frozen) -> the observer is identified on the fixed plant (identifiable).
   Stage 3 (actor):    g + DOB both FROZEN, reward trainable ->
     recon backward gives NO gradient to g or DOB (the WM is static); the
-    actor/critic train via imagination (covered by the existing rssm smoke).
+    actor/critic train on real-sim rollouts (covered by the rssm smoke).
 
 Also checks: set_world_model_trainable partitions requires_grad exactly;
 set_dob_active toggles d_t between zero (suppressed) and non-zero (active);
 feat width stays core+n_cv across stages (no head-dim hiccup).
 
 Run (CPU):
-  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD DREAMER_COMPILE=0 \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_curriculum.py
+  CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
+  ~/neural-APC-mbrl2-env/bin/python tools/_smoke_curriculum.py
 """
 import sys
 from pathlib import Path
@@ -164,6 +164,11 @@ def _check(wm_type):
     assert g_grad == 0.0, 'Stage2: g is FROZEN -> must get NO gradient'
     assert dob_grad > 0.0, 'Stage2: the DOB observer must get recon gradient'
     assert float(losses['dob_reg']) > 0.0, 'Stage2: dob_reg must be active'
+    # P28 follow-up 11: overshoot/held/gain-match train g; skip when frozen.
+    assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0, \
+        'Stage2: overshoot is a g-only aux and must skip'
+    assert float(losses.get('gain_match_loss', 0.0)) == 0.0, \
+        'Stage2: gain-match is a g-only aux and must skip'
     print(f'[smoke] OK  Stage2: recon trains the DOB (|dob_grad|={dob_grad:.4f}) '
           f'and NOT g (|g_grad|={g_grad:.1f}) — observer identifiable on the '
           f'fixed plant [{wm_type}]')

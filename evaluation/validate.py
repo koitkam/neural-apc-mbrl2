@@ -88,6 +88,83 @@ def _resolve_sim_dir(arg: str | None, controller_dir: Path,
         f'pass --simulation-dir explicitly.')
 
 
+def _ss_gain_rel_errs(pairs: Dict) -> List[float]:
+    """``|wm-real|/|real|`` per pair with a non-tiny real SS gain."""
+    rel_errs: List[float] = []
+    for v in (pairs or {}).values():
+        rg = abs(float(v.get('real_ss_gain', 0.0)))
+        if rg > 1e-6:
+            rel_errs.append(abs(float(v.get('ss_gain_abs_err', 0.0))) / rg)
+    return rel_errs
+
+
+def _merge_observer_gain_gate(gate: Dict, dv_gate: Optional[Dict]) -> Dict:
+    """Keep MV-only ``wm_gain_*`` for lineage; AND DV into observer-wide keys.
+
+    P29 printed ``wm_gain_healthy=True`` at MV rel_err=0.10 while DV ss
+    was ×0.56. ``wm_gain_pass`` stays MV-only. ``wm_observer_gain_*`` is
+    the control-relevant observer verdict (MV and DV both in band).
+    No-DV plants copy the MV flags.
+    """
+    mv_pass = bool(gate.get('wm_gain_pass'))
+    mv_healthy = bool(gate.get('wm_gain_healthy'))
+    if dv_gate:
+        gate['wm_observer_gain_pass'] = (
+            mv_pass and bool(dv_gate.get('wm_dv_gain_pass')))
+        gate['wm_observer_gain_healthy'] = (
+            mv_healthy and bool(dv_gate.get('wm_dv_gain_healthy')))
+    else:
+        gate['wm_observer_gain_pass'] = mv_pass
+        gate['wm_observer_gain_healthy'] = mv_healthy
+    return gate
+
+
+def _gain_status(healthy: bool, passed: bool) -> str:
+    if healthy:
+        return 'HEALTHY'
+    if passed:
+        return 'PASS'
+    return 'FAIL'
+
+
+def _dv_gain_gate_from_json(path: Path) -> Optional[Dict]:
+    """MV-only ``wm_gain_*`` hid P29 DV ss ×0.56 behind HEALTHY MV rel_err.
+
+    Same thresholds as the MV gate (pass <1.0, healthy <0.35). Does **not**
+    change ``wm_gain_pass`` so lineage comparisons stay MV-only.
+    """
+    if not path.exists():
+        return None
+    try:
+        dv = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    pairs = dv.get('pairs') or {}
+    rel_errs = _ss_gain_rel_errs(pairs)
+    if not rel_errs:
+        return None
+    ratios = []
+    for v in pairs.values():
+        r = v.get('ss_gain_ratio_wm_over_real')
+        if r is None:
+            continue
+        rf = float(r)
+        if np.isfinite(rf):
+            ratios.append(rf)
+    mean_err = float(np.mean(rel_errs))
+    gate = {
+        'wm_dv_gain_rel_err': mean_err,
+        'wm_dv_gain_rel_err_max': float(np.max(rel_errs)),
+        'wm_dv_gain_pass': bool(mean_err < 1.0),
+        'wm_dv_gain_healthy': bool(mean_err < 0.35),
+        'n_dv_pairs': len(rel_errs),
+    }
+    if ratios:
+        gate['wm_dv_ss_ratio_worst'] = float(
+            max(ratios, key=lambda r: abs(r - 1.0)))
+    return gate
+
+
 def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
                                   ) -> List[Dict]:
     """Flatten schedule events into ``(start_step, label)`` markers."""
@@ -99,6 +176,61 @@ def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
             out.append({'start': start, 'label': str(name)})
         except Exception:
             continue
+    return out
+
+
+def control_quality_gates(
+    disturbance_records: Optional[List[Dict]] = None,
+    seed_metrics: Optional[List[Dict]] = None,
+) -> Dict:
+    """Paired scripted-disturbance agent vs open-loop baseline.
+
+    Empty records must **not** pass (P49: leftover ``cfg=`` TypeError
+    skipped every scripted episode → 0.0 vs 0.0 falsely PASSED
+    ``beats_baseline``).  Seed-episode KPIs have no paired baseline, so
+    they can fill reversal / agent econ for the log but cannot pass
+    ``beats_baseline``.
+    """
+    _dr = list(disturbance_records or [])
+    out: Dict = {
+        'mv_reversal_rate_max': 0.5,
+        'n_scripted_pairs': len(_dr),
+    }
+    if not _dr:
+        revs: List[float] = []
+        econs: List[float] = []
+        if seed_metrics:
+            revs = [float(r.get('kpi_mv_reversal_rate', 0.0))
+                    for r in seed_metrics]
+            econs = [float(r.get('kpi_economic_score', 0.0))
+                     for r in seed_metrics]
+        rev_mean = float(np.mean(revs)) if revs else float('nan')
+        agent_econ = float(np.mean(econs)) if econs else float('nan')
+        out.update({
+            'mv_reversal_rate_observed': rev_mean,
+            'agent_economic_score': agent_econ,
+            'baseline_economic_score': float('nan'),
+            'smooth_pass': bool(revs) and bool(rev_mean <= 0.5),
+            'beats_baseline_pass': False,
+            'control_gate_skipped': 'no_scripted_disturbance_pairs',
+        })
+        return out
+    _rev = [float((r.get('episode_metrics_agent') or {}).get(
+        'mv_reversal_rate', 0.0)) for r in _dr]
+    _ae = [float((r.get('episode_metrics_agent') or {}).get(
+        'economic_score', 0.0)) for r in _dr]
+    _be = [float((r.get('episode_metrics_baseline') or {}).get(
+        'economic_score', 0.0)) for r in _dr]
+    rev_mean = float(np.mean(_rev)) if _rev else 0.0
+    agent_econ = float(np.mean(_ae)) if _ae else 0.0
+    base_econ = float(np.mean(_be)) if _be else 0.0
+    out.update({
+        'mv_reversal_rate_observed': rev_mean,
+        'agent_economic_score': agent_econ,
+        'baseline_economic_score': base_econ,
+        'smooth_pass': bool(rev_mean <= 0.5),
+        'beats_baseline_pass': bool(agent_econ >= base_econ),
+    })
     return out
 
 
@@ -189,7 +321,15 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
                     if cv_widths else 10.0)
 
     mv_authority_cv = compute_mv_authority_to_cv(env.sim, id_ctx)
-    authority_frac = get_authority_target_frac()
+    # P49 leftover race: HEAD validate.py passed cfg= while the live pid
+    # still had launch-time get_authority_target_frac(default=) only.
+    # TypeError skipped every scripted-disturbance episode → empty
+    # paired records → 0.0 vs 0.0 falsely PASSED beats_baseline.
+    try:
+        authority_frac = get_authority_target_frac(
+            cfg=getattr(env, 'cfg', None))
+    except TypeError:
+        authority_frac = get_authority_target_frac()
     cumulative_offset: Dict[str, float] = {}
     cumulative_cv_impact = 0.0
 
@@ -240,6 +380,7 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
                 cumulative_cv_impact=float(cumulative_cv_impact),
                 mv_authority_cv=float(mv_authority_cv),
                 target_frac=float(authority_frac),
+                cfg=getattr(env, 'cfg', None),
             )
             mag = float(new_delta)
             cumulative_cv_impact += float(achieved)
@@ -351,75 +492,100 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                    if _is_rssm else None)
     _rssm_prev_a = (torch.zeros(1, action_dim, device=device)
                     if _is_rssm else None)
+    _serve_step = None
+    _o = None
+    _o_host = None
+    _get_serve_cg = None
+    if _is_rssm:
+        from models.dreamer_v4_rssm import (
+            alloc_pinned_obs_host, copy_obs_row,
+            stream_serve_step as _serve_step,
+            get_collect_serve_cuda_graph as _get_serve_cg)
+        _o = torch.empty(1, int(obs_window.shape[-1]), device=device,
+                         dtype=torch.float32)
+        _o_host = alloc_pinned_obs_host(device, int(obs_window.shape[-1]))
 
-    for t in range(T):
-        ow = torch.from_numpy(obs_window).to(device)
-        a_ctx = torch.from_numpy(a_history).to(device)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=device.type,
-                                     dtype=torch.bfloat16,
-                                     enabled=(device.type == 'cuda')):
-                if _is_rssm:
-                    _o = torch.from_numpy(
-                        obs_window[-1]).to(device).unsqueeze(0)
-                    _emb = model.dynamics.embed(_o)
-                    # mbrl2 real-sim: certainty-equivalent (posterior MODE) belief
-                    # for control — matches training (``_realsim_actor_critic_step``
-                    # re-encodes sample=False) and ``collect_episode``.  A SAMPLED
-                    # belief here would inject latent-sampling noise into the
-                    # deterministic-eval MV (part of the p01 chatter the user saw
-                    # in the disturbance-rejection plots).
-                    _post, _ = model.dynamics.obs_step(
-                        _rssm_state, _rssm_prev_a, _emb, sample=False)
-                    agent_hid = _post.feat
-                    _rssm_state = _post
+    _use_cuda_amp = (device.type == 'cuda')
+    with torch.inference_mode(), torch.amp.autocast(
+            device_type=device.type, dtype=torch.bfloat16,
+            enabled=_use_cuda_amp):
+        # Reuse the P3 collect graph when present (same bf16 autocast).
+        # CPU / TSSM / capture-fail stay eager. ``copy_`` into static
+        # prev_a (no per-step rebind).
+        _serve_cg = None
+        if _is_rssm and _rssm_state is not None and _get_serve_cg is not None:
+            _serve_cg = _get_serve_cg(
+                model.dynamics, _rssm_state, device,
+                int(obs_window.shape[-1]), int(action_dim))
+            if _serve_cg is not None:
+                _serve_cg.reset(_rssm_state)
+        for t in range(T):
+            if _is_rssm:
+                # Certainty-equivalent belief + the same DV/Kalman feat
+                # ``collect_episode`` / ``_realsim_actor_critic_step`` use.
+                if _serve_cg is not None:
+                    copy_obs_row(_serve_cg.obs, obs_window[-1], _o_host)
+                    agent_hid = _serve_cg.replay()
                 else:
-                    z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
-                    tau = torch.full((1, L), tau_ctx_val, device=device,
-                                      dtype=z_ctx.dtype)
-                    d = torch.full((1, L), d_min, device=device,
-                                    dtype=z_ctx.dtype)
-                    out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
-                    agent_hid = out['agent_hid'][:, -1]
-                action_t, _, _ = model.policy(agent_hid,
-                                                deterministic=deterministic)
-        a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-        if _is_rssm:
-            _rssm_prev_a = torch.from_numpy(a_np).to(device).unsqueeze(0)
-        next_window, scaled_r, done, info = env.step(a_np)
-        comps = info.get('reward_components', {}) or {}
-        # Record the *raw* (physical-units) state so plots/npz read true
-        # plant values, not the post-standardizer z-scores that the
-        # tokenizer sees.  Falls back to the normalized obs slice if the
-        # env did not expose ``raw_state`` for back-compat.
-        raw_st = info.get('raw_state')
-        if raw_st is None:
-            states[t] = next_window[-1, :state_dim]
-        else:
-            arr = np.asarray(raw_st, dtype='float32').reshape(-1)
-            states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
-        actions_norm[t] = a_np
-        controls[t] = np.asarray(env._prev_control, dtype='float32')
-        raw_rewards[t] = float(info.get('raw_reward', 0.0))
-        scaled_rewards[t] = float(scaled_r)
-        cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
-        mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
-        hd = info.get('hidden_disturbance')
-        if hd is not None:
-            hd = np.asarray(hd, dtype='float32').reshape(-1)
-            hidden_dist_t[t, :min(n_cv_h, hd.shape[0])] = hd[:n_cv_h]
-        if n_mv_aux > 0:
-            current_mv_bounds_t[t] = np.asarray(
-                env.setpoint_mgr.current_mv_bounds, dtype='float32')
-        if n_cv_aux > 0:
-            current_cv_bounds_t[t] = np.asarray(
-                env.setpoint_mgr.current_cv_bounds, dtype='float32')
-            current_cv_targets_t[t] = np.asarray(
-                env.setpoint_mgr.current_cv_targets, dtype='float32')
-        a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
-        obs_window = next_window
-        if done:
-            break
+                    copy_obs_row(_o, obs_window[-1], _o_host)
+                    _rssm_state = _serve_step(
+                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                        sample=False)
+                    agent_hid = _rssm_state.feat
+            else:
+                ow = torch.from_numpy(obs_window).to(device)
+                a_ctx = torch.from_numpy(a_history).to(device)
+                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]
+            action_t, _, _ = model.policy(agent_hid,
+                                            deterministic=deterministic)
+            a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
+            if _is_rssm:
+                _prev = (_serve_cg.prev_a if _serve_cg is not None
+                         else _rssm_prev_a)
+                _prev.copy_(
+                    action_t.detach().to(dtype=_prev.dtype).reshape(1, -1))
+            next_window, scaled_r, done, info = env.step(a_np)
+            comps = info.get('reward_components', {}) or {}
+            # Record the *raw* (physical-units) state so plots/npz read true
+            # plant values, not the post-standardizer z-scores that the
+            # tokenizer sees.  Falls back to the normalized obs slice if the
+            # env did not expose ``raw_state`` for back-compat.
+            raw_st = info.get('raw_state')
+            if raw_st is None:
+                states[t] = next_window[-1, :state_dim]
+            else:
+                arr = np.asarray(raw_st, dtype='float32').reshape(-1)
+                states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
+            actions_norm[t] = a_np
+            controls[t] = np.asarray(env._prev_control, dtype='float32')
+            raw_rewards[t] = float(info.get('raw_reward', 0.0))
+            scaled_rewards[t] = float(scaled_r)
+            cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
+            mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
+            hd = info.get('hidden_disturbance')
+            if hd is not None:
+                hd = np.asarray(hd, dtype='float32').reshape(-1)
+                hidden_dist_t[t, :min(n_cv_h, hd.shape[0])] = hd[:n_cv_h]
+            if n_mv_aux > 0:
+                current_mv_bounds_t[t] = np.asarray(
+                    env.setpoint_mgr.current_mv_bounds, dtype='float32')
+            if n_cv_aux > 0:
+                current_cv_bounds_t[t] = np.asarray(
+                    env.setpoint_mgr.current_cv_bounds, dtype='float32')
+                current_cv_targets_t[t] = np.asarray(
+                    env.setpoint_mgr.current_cv_targets, dtype='float32')
+            if not _is_rssm:
+                a_history = np.concatenate(
+                    [a_history[1:], a_np[None, :]], axis=0)
+            obs_window = next_window
+            if done:
+                break
 
     return {
         'states': states[:t + 1],
@@ -1609,7 +1775,7 @@ def run_validation(*,
         os.environ['IDENTIFIED_DEAD_TIME'] = f"{run_plan['dead_time']:g}"
 
     from training.train import TrainConfig, APCEnv
-    from models.dreamer_v4 import DreamerV4, DreamerV4Config
+    from models.dreamer_v4 import DreamerV4, dreamer_v4_config_from_train
 
     print(f'[val] controller: {controller_dir}', flush=True)
     print(f'[val] simulation: {sim_dir}', flush=True)
@@ -1620,56 +1786,8 @@ def run_validation(*,
     valid_keys = set(TrainConfig.__dataclass_fields__.keys())
     cfg = TrainConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 
-    model_cfg = DreamerV4Config(
-        obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
-        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
-        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
-        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
-        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
-        n_action_bins=cfg.n_action_bins,
-        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
-        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
-        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
-        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
-        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
-        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
-        world_model_type=str(getattr(cfg, 'world_model_type', 'sf_transformer')),
-        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
-        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
-        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
-        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
-        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
-        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
-        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
-        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
-        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
-        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
-        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
-        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
-        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
-        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
-        # dv_feedforward changes feat_dim (DV in the head feat); thread it so a
-        # non-default reload matches the checkpoint structure.
-        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        # Neural Kalman filter / DOB (2026-06-11): MUST thread these so the
-        # rebuilt model has the d_t observer params (dynamics.dob_log_decay/
-        # gain) — else load_state_dict fails on the DOB checkpoint keys.
-        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
-        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
-        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
-        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
-        # Continuous gain+disturbance latent (2026-06-22): MUST thread these too
-        # so the rebuilt model has the cont prior/post nets + gain/disturbance
-        # latent params — else the strict load_state_dict fails on the cont keys.
-        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
-        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
-        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
-        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
-        attn_impl=getattr(cfg, 'attn_impl', 'auto'),
-    )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = DreamerV4(model_cfg).to(device)
+    model = DreamerV4(dreamer_v4_config_from_train(cfg)).to(device)
     # Checkpoints saved while ``torch.compile`` was active have keys
     # prefixed with ``_orig_mod.`` (e.g. ``tokenizer._orig_mod.encoder...``)
     # because ``torch.compile`` wraps the module in ``OptimizedModule``.
@@ -1695,21 +1813,20 @@ def run_validation(*,
     # ``int(seeds)+1`` total = 4 by default), each with the FULL feature set:
     #   * the measured-DV scripted schedule (events spread across the episode), and
     #   * the unmeasured/hidden disturbance at FULL phase-3 amplitude, ALSO spread
-    #     across the whole episode (``DREAMER_HIDDEN_DIST_SPREAD``) so it reads as a
-    #     realistic load active start->end instead of a few front-loaded events
-    #     holding a DC offset.
+    #     across the whole episode (TrainConfig ``hidden_dist_spread``, default
+    #     ON in training too) so it reads as a realistic load active start->end
+    #     instead of a few front-loaded events holding a DC offset.
     # The seeds differ only by RNG draw, so the four plots show the same realistic
     # operating regime under different disturbance realisations.  The PASS/FAIL
     # fidelity gates run on a separate CLEAN env (``_disturbance_prob_override=0``)
     # and are unaffected by this.
     n_plots = int(seeds) + 1
     seed_plan: List[Tuple[int, bool]] = [(10_000 + s, True) for s in range(n_plots)]
-    # Spread the hidden disturbance across the whole episode for validation only
-    # (training keeps the front-loaded sequential placement).  Saved/restored
-    # around the seed loop so we never leak the override.
-    _hd_spread_prev = os.environ.get('DREAMER_HIDDEN_DIST_SPREAD')
-    os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '1'
-    for seed, unmeasured_full in seed_plan:
+    # Pin spread ON for val plots even if an A/B set training spread=0.
+    # Explicit cfg — do not poke leftover ``DREAMER_HIDDEN_DIST_SPREAD``.
+    from utils.hidden_disturbance import force_val_hidden_dist_spread
+    with force_val_hidden_dist_spread(cfg):
+      for seed, unmeasured_full in seed_plan:
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
         # Force the hidden disturbance on every validation episode (always test
@@ -1939,12 +2056,6 @@ def run_validation(*,
         seed_results.append(eps)
         print(f'[val] seed {seed}: {len(eps)} episodes done', flush=True)
 
-    # Restore the hidden-disturbance spread override (validation-scoped).
-    if _hd_spread_prev is None:
-        os.environ.pop('DREAMER_HIDDEN_DIST_SPREAD', None)
-    else:
-        os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = _hd_spread_prev
-
     plot_summary(seed_results, out_dir / 'summary.png',
                   title=f'{controller_dir.name}  validation summary  '
                         f'({len(seed_results)} seeds × {episodes} eps)')
@@ -2019,25 +2130,14 @@ def run_validation(*,
             # validation.  smooth_pass flags the oscillation directly;
             # beats_baseline_pass flags any policy no better than doing nothing.
             try:
-                _dr = locals().get('disturbance_records') or []
-                _rev = [float((r.get('episode_metrics_agent') or {}).get(
-                    'mv_reversal_rate', 0.0)) for r in _dr]
-                _ae = [float((r.get('episode_metrics_agent') or {}).get(
-                    'economic_score', 0.0)) for r in _dr]
-                _be = [float((r.get('episode_metrics_baseline') or {}).get(
-                    'economic_score', 0.0)) for r in _dr]
-                rev_mean = float(np.mean(_rev)) if _rev else 0.0
-                agent_econ = float(np.mean(_ae)) if _ae else 0.0
-                base_econ = float(np.mean(_be)) if _be else 0.0
-                fidelity_gates['mv_reversal_rate_max'] = 0.5
-                fidelity_gates['mv_reversal_rate_observed'] = rev_mean
-                fidelity_gates['agent_economic_score'] = agent_econ
-                fidelity_gates['baseline_economic_score'] = base_econ
-                fidelity_gates['smooth_pass'] = bool(rev_mean <= 0.5)
-                fidelity_gates['beats_baseline_pass'] = bool(agent_econ >= base_econ)
+                _cq = control_quality_gates(
+                    locals().get('disturbance_records') or [],
+                    seed_metrics=locals().get('metrics_records') or [],
+                )
+                fidelity_gates.update(_cq)
             except Exception as _cge:
-                fidelity_gates['smooth_pass'] = True
-                fidelity_gates['beats_baseline_pass'] = True
+                fidelity_gates['smooth_pass'] = False
+                fidelity_gates['beats_baseline_pass'] = False
                 fidelity_gates['control_gate_error'] = repr(_cge)
             fidelity_gates['all_pass'] = bool(
                 fidelity_gates['wm_pass']
@@ -2064,10 +2164,16 @@ def run_validation(*,
                           ' > 0.5 (BANG-BANG: MV reverses direction most steps)',
                           flush=True)
                 if not fidelity_gates.get('beats_baseline_pass', True):
-                    print(f'        - agent economic_score='
-                          f'{fidelity_gates.get("agent_economic_score", 0.0):+.4f}'
-                          f' < baseline={fidelity_gates.get("baseline_economic_score", 0.0):+.4f}'
-                          ' (policy WORSE than open-loop baseline)', flush=True)
+                    if fidelity_gates.get('control_gate_skipped'):
+                        print('        - no scripted agent/baseline pairs '
+                              f'({fidelity_gates.get("control_gate_skipped")}); '
+                              'cannot claim beats-baseline (P49 0-vs-0 false pass)',
+                              flush=True)
+                    else:
+                        print(f'        - agent economic_score='
+                              f'{fidelity_gates.get("agent_economic_score", 0.0):+.4f}'
+                              f' < baseline={fidelity_gates.get("baseline_economic_score", 0.0):+.4f}'
+                              ' (policy WORSE than open-loop baseline)', flush=True)
             else:
                 print(f'[val] internal-fidelity gates PASSED '
                       f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '
@@ -2086,10 +2192,11 @@ def run_validation(*,
     # the operating region with a min/max variation band.  Directly measures
     # whether the world model captured the true GAINS + DYNAMICS (the
     # correlation-based fidelity probe does NOT).  Gated ON by default; skip
-    # with DREAMER_VAL_WM_TRANSFER=0.
-    if os.environ.get('DREAMER_VAL_WM_TRANSFER', '1').strip() not in ('0', 'false', 'False'):
+    # with DREAMER_VAL_WM_TRANSFER=0 (TrainConfig ``val_wm_transfer``).
+    from evaluation.wm_transfer_matrix import (
+        compute_and_plot, resolve_wm_tf_knobs, val_diag_enabled, wm_tf_roll_len)
+    if val_diag_enabled(cfg, 'val_wm_transfer', 'DREAMER_VAL_WM_TRANSFER'):
         try:
-            from evaluation.wm_transfer_matrix import compute_and_plot
             tf_env = APCEnv(cfg, np.random.default_rng(77_777))
             tf_env._disturbance_prob_override = 0.0
             tf_obs_std = None
@@ -2112,11 +2219,7 @@ def run_validation(*,
             # within ~2× of the real plant (rel_err < 1.0; healthy < 0.35).
             try:
                 pairs = (tf_result or {}).get('pairs', {}) if tf_result else {}
-                rel_errs = []
-                for v in pairs.values():
-                    rg = abs(float(v.get('real_ss_gain', 0.0)))
-                    if rg > 1e-6:
-                        rel_errs.append(abs(float(v.get('ss_gain_abs_err', 0.0))) / rg)
+                rel_errs = _ss_gain_rel_errs(pairs)
                 if rel_errs:
                     gain_rel_err = float(np.mean(rel_errs))
                     gate = {
@@ -2126,14 +2229,38 @@ def run_validation(*,
                         'wm_gain_healthy': bool(gain_rel_err < 0.35),
                         'n_pairs': len(rel_errs),
                     }
+                    # DV is a separate JSON (not in MV wm_gain_rel_err). P29
+                    # printed wm_gain_healthy=True at MV rel_err=0.10 while
+                    # DV ss was ×0.56 — the MV-only aggregate hid it.
+                    dv_gate = _dv_gain_gate_from_json(
+                        out_dir / 'wm_dv_transfer_matrix.json')
+                    if dv_gate:
+                        gate.update(dv_gate)
+                    _merge_observer_gain_gate(gate, dv_gate)
                     if isinstance(locals().get('fidelity_gates'), dict):
                         fidelity_gates.update(gate)
                     else:
                         fidelity_gates = gate
-                    status = ('HEALTHY' if gate['wm_gain_healthy']
-                              else ('PASS' if gate['wm_gain_pass'] else 'FAIL'))
-                    print(f'[val] WM gain fidelity: rel_err={gain_rel_err:.2f} '
-                          f'({status}; correlation gates can pass while this '
+                    mv_status = _gain_status(
+                        gate['wm_gain_healthy'], gate['wm_gain_pass'])
+                    print(f'[val] WM MV gain fidelity: rel_err={gain_rel_err:.2f} '
+                          f'({mv_status}; lineage wm_gain_pass is MV-only)',
+                          flush=True)
+                    if dv_gate:
+                        dv_status = _gain_status(
+                            dv_gate['wm_dv_gain_healthy'],
+                            dv_gate['wm_dv_gain_pass'])
+                        print(f'[val] WM DV gain fidelity: rel_err='
+                              f'{dv_gate["wm_dv_gain_rel_err"]:.2f} '
+                              f'ss_ratio_worst='
+                              f'{dv_gate.get("wm_dv_ss_ratio_worst", float("nan")):.2f} '
+                              f'({dv_status})',
+                              flush=True)
+                    obs_status = _gain_status(
+                        gate['wm_observer_gain_healthy'],
+                        gate['wm_observer_gain_pass'])
+                    print(f'[val] WM observer gain: {obs_status} '
+                          f'(MV+DV; correlation gates can pass while this '
                           f'fails — gain is the control-relevant metric)',
                           flush=True)
             except Exception as _ge:
@@ -2145,9 +2272,10 @@ def run_validation(*,
     # Localises WHERE the WM loses the steady-state gain (autoencoder vs the
     # prior<->posterior gap vs open-loop compounding) so the right lever is
     # obvious from the saved artefact alone — no manual probe re-run.  Gated
-    # ON by default (RSSM/TSSM only); skip with DREAMER_VAL_WM_POSTPRIOR=0.
+    # ON by default (RSSM/TSSM only); skip with DREAMER_VAL_WM_POSTPRIOR=0
+    # (TrainConfig ``val_wm_postprior``).
     # Reuses a fresh disturbance-free env; guarded so it never breaks a run.
-    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+    if val_diag_enabled(cfg, 'val_wm_postprior', 'DREAMER_VAL_WM_POSTPRIOR'):
         try:
             from tools.wm_posterior_prior_probe import compute_posterior_prior_decomp
             pp_env = APCEnv(cfg, np.random.default_rng(43_210))
@@ -2161,8 +2289,8 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
-            _tf_h = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
-            _pp_h = _tf_h if _tf_h > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            _tf_h = resolve_wm_tf_knobs(cfg)['horizon']
+            _pp_h = wm_tf_roll_len(cfg, _tf_h)
             pp_res = compute_posterior_prior_decomp(
                 model, pp_env, cfg, device, horizon=_pp_h, settle=_pp_h)
             with open(out_dir / 'wm_posterior_prior_decomp.json', 'w') as f:
@@ -2189,7 +2317,7 @@ def run_validation(*,
     # explaining why every excitation/data fix failed.  Saved as
     # wm_dv_posterior_prior_decomp.json.  ON by default (RSSM/TSSM + DV-as-input
     # + sim.set_disturbance_offset); shares the DREAMER_VAL_WM_POSTPRIOR gate.
-    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+    if val_diag_enabled(cfg, 'val_wm_postprior', 'DREAMER_VAL_WM_POSTPRIOR'):
         try:
             from tools.wm_posterior_prior_probe import compute_dv_posterior_prior_decomp
             dpp_env = APCEnv(cfg, np.random.default_rng(43_211))
@@ -2203,8 +2331,8 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
-            _tf_h2 = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
-            _dpp_h = _tf_h2 if _tf_h2 > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            _tf_h2 = resolve_wm_tf_knobs(cfg)['horizon']
+            _dpp_h = wm_tf_roll_len(cfg, _tf_h2)
             dvpp_res = compute_dv_posterior_prior_decomp(
                 model, dpp_env, cfg, device, horizon=_dpp_h, settle=_dpp_h)
             with open(out_dir / 'wm_dv_posterior_prior_decomp.json', 'w') as f:
@@ -2227,8 +2355,8 @@ def run_validation(*,
     # forced-disturbance episode, runs the head over the streamed WM posterior,
     # and scores pred-vs-true per CV channel (NRMSE / r / R² / lead-lag).  Saves
     # wm_disturbance_prediction.{json,png}.  ON by default (RSSM/TSSM + head);
-    # skip with DREAMER_VAL_WM_DISTPRED=0.
-    if os.environ.get('DREAMER_VAL_WM_DISTPRED', '1').strip() not in ('0', 'false', 'False'):
+    # skip with DREAMER_VAL_WM_DISTPRED=0 (TrainConfig ``val_wm_distpred``).
+    if val_diag_enabled(cfg, 'val_wm_distpred', 'DREAMER_VAL_WM_DISTPRED'):
         try:
             from evaluation.wm_disturbance_prediction import (
                 compute_disturbance_prediction, plot_disturbance_prediction)
