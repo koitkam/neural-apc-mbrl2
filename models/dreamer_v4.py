@@ -1327,10 +1327,6 @@ class DreamerV4Config:
     cv_obs_indices: Tuple[int, ...] = ()
     dob_decay_init: float = 3.0
     dob_gain_init: float = -2.2
-    # P90: serve-window for actor/critic DOB feat HP (same formula as val
-    # detrend).  Threaded so val/ONNX rebuild matches train.  No extra
-    # TrainConfig field — reuses ``disturbance_detrend_settle_mult``.
-    disturbance_detrend_settle_mult: float = 4.0
     # Continuous gain+disturbance latent (2026-06-22).  A Gaussian latent
     # alongside the categorical that holds the precision-critical CONTINUOUS
     # gain (supervised) + unmeasured disturbance (amortized Kalman) the
@@ -1408,8 +1404,6 @@ def dreamer_v4_config_from_train(cfg, *, attn_impl: Optional[str] = None
         cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
         dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
         dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
-        disturbance_detrend_settle_mult=float(getattr(
-            cfg, 'disturbance_detrend_settle_mult', 4.0) or 0.0),
         cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
         cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
         cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
@@ -1460,8 +1454,6 @@ class DreamerV4(nn.Module):
                     cfg, 'cont_gain_deterministic_roll', True)),
                 dv_decoder_feedforward=bool(getattr(cfg, 'dv_decoder_feedforward', False)),
                 horizon=int(getattr(cfg, 'horizon', 0) or 0),
-                disturbance_detrend_settle_mult=float(getattr(
-                    cfg, 'disturbance_detrend_settle_mult', 4.0) or 0.0),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
             D = self.dynamics.feat_dim
@@ -1500,9 +1492,6 @@ class DreamerV4(nn.Module):
                     cfg, 'cont_dist_deterministic_roll', True)),
                 cont_gain_deterministic_roll=bool(getattr(
                     cfg, 'cont_gain_deterministic_roll', True)),
-                horizon=int(getattr(cfg, 'horizon', 0) or 0),
-                disturbance_detrend_settle_mult=float(getattr(
-                    cfg, 'disturbance_detrend_settle_mult', 4.0) or 0.0),
             )
             self.dynamics = TransformerSSMDynamics(tssm_cfg)
             D = self.dynamics.feat_dim

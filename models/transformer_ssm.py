@@ -94,7 +94,6 @@ from models.dreamer_v4_rssm import (
     _CategoricalLatent, _ContinuousLatent, _prior_c_from_net,
     _recurrence_c, _time_unbind,
     cached_zeros_bd, cached_zeros_btd, cached_onehot_z, dob_kalman_scan,
-    apply_dob_feat_hp, configure_dob_feat_hp, dob_feat_d_tail, next_d_ma,
     _append_decode_core, _stack_decode_core)
 
 
@@ -151,8 +150,6 @@ class TransformerSSMConfig:
     # RSSMConfig; roll the gain block at its prior mean in imagination so the
     # strong sample=True gain supervisor trains the actor's sample=False belief.
     cont_gain_deterministic_roll: bool = True
-    horizon: int = 0
-    disturbance_detrend_settle_mult: float = 4.0
 
 
 @dataclass
@@ -171,7 +168,6 @@ class TSSMState:
     kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
     pos: int = 0                # number of tokens already in the cache
     d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
-    d_ma: Optional[torch.Tensor] = None  # (..., n_cv) causal EMA of d (P90 feat HP)
     dv: Optional[torch.Tensor] = None  # (..., dv_dim) exogenous DV feedforward (None=off)
     c: Optional[torch.Tensor] = None       # (..., cont_dim) continuous latent sample
     c_mean: Optional[torch.Tensor] = None  # post/prior mean (for KL)
@@ -196,7 +192,7 @@ class TSSMState:
         return TSSMState(
             h=_d(self.h), z_logits=_d(self.z_logits), z=_d(self.z),
             kv_cache=kv, pos=self.pos,
-            d=_d(self.d), d_ma=_d(self.d_ma), dv=_d(self.dv),
+            d=_d(self.d), dv=_d(self.dv),
             c=(self.c if keep_c else _d(self.c)),
             c_mean=(self.c_mean if keep_c else _d(self.c_mean)),
             c_std=(self.c_std if keep_c else _d(self.c_std)))
@@ -214,9 +210,8 @@ class TSSMState:
             parts.append(self.c)
         if self.dv is not None:
             parts.append(self.dv)
-        tail = dob_feat_d_tail(self.d, self.d_ma)
-        if tail is not None:
-            parts.append(tail)
+        if self.d is not None:
+            parts.append(self.d.detach())
         return torch.cat(parts, dim=-1)
 
 
@@ -438,7 +433,6 @@ class TransformerSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
-        configure_dob_feat_hp(self, cfg)
 
     @property
     def feat_dim(self) -> int:
@@ -496,9 +490,6 @@ class TransformerSSMDynamics(nn.Module):
         d = (cached_zeros_bd(
                 self, B, self.n_cv, dtype, device, attr='_init_d_zeros')
              if self.dob_enabled else None)
-        d_ma = (cached_zeros_bd(
-                self, B, self.n_cv, dtype, device, attr='_init_dma_zeros')
-                if self.dob_enabled else None)
         dv = (cached_zeros_bd(
                 self, B, self.dv_dim, dtype, device, attr='_init_dv_zeros')
               if self.dv_feedforward else None)
@@ -506,7 +497,7 @@ class TransformerSSMDynamics(nn.Module):
                 self, B, self.cont_dim, dtype, device, attr='_init_c_zeros')
              if self.cont_dim > 0 else None)
         return TSSMState(h=h, z_logits=z_logits, z=z, kv_cache=None, pos=0, d=d,
-                         d_ma=d_ma, dv=dv, c=c)
+                         dv=dv, c=c)
 
     # ----- internal: token build + causal encode -----
     def _build_token(self, z: torch.Tensor,
@@ -601,8 +592,7 @@ class TransformerSSMDynamics(nn.Module):
         # replaces the whole sample with the prior MEAN.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
         return TSSMState(h=h, z_logits=z_logits, z=z,
-                         kv_cache=new_cache, pos=new_pos, d=d_new,
-                         d_ma=next_d_ma(self, prev, d_new), dv=dv_new,
+                         kv_cache=new_cache, pos=new_pos, d=d_new, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
 
     def _posterior_step(self, prev: TSSMState, prev_action: torch.Tensor,
@@ -623,8 +613,7 @@ class TransformerSSMDynamics(nn.Module):
             c_post, c_post_mean, c_post_std = self.cont_post_net(
                 post_in, sample=sample)
         return TSSMState(h=h, z_logits=post_logits, z=post_z,
-                         kv_cache=new_cache, pos=new_pos, d=d_new,
-                         d_ma=next_d_ma(self, prev, d_new), dv=dv_new,
+                         kv_cache=new_cache, pos=new_pos, d=d_new, dv=dv_new,
                          c=c_post, c_mean=c_post_mean, c_std=c_post_std)
 
     def img_rollout(self, h0: torch.Tensor, z0: torch.Tensor,
@@ -739,7 +728,6 @@ class TransformerSSMDynamics(nn.Module):
         # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
         post = TSSMState(h=prior.h, z_logits=post_logits, z=post_z,
                          kv_cache=prior.kv_cache, pos=prior.pos, d=d_post,
-                         d_ma=next_d_ma(self, prev, d_post),
                          dv=prior.dv, c=c_post, c_mean=c_post_mean,
                          c_std=c_post_std)
         return post, prior
@@ -864,20 +852,18 @@ class TransformerSSMDynamics(nn.Module):
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
                 coef = (1.0 - K) * A                                  # (n_cv,)
                 ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
-                ds, ds_hp, d_ma_last = apply_dob_feat_hp(
-                    self, ds, last_only)
+                if last_only:
+                    ds = ds[:, -1:]
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
                 # Reuse a zeros buffer (identity; ``cat`` does not write it).
                 ds = cached_zeros_btd(
                     self, B, int(post_core.shape[1]), self.n_cv,
                     post_core.dtype, device)
-                ds, ds_hp, d_ma_last = apply_dob_feat_hp(
-                    self, ds, last_only=False)
-            feats = torch.cat([post_core, ds_hp.detach()], dim=-1)
+            feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = TSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               kv_cache=state.kv_cache, pos=state.pos,
-                              d=ds[:, -1], d_ma=d_ma_last, dv=state.dv, c=state.c,
+                              d=ds[:, -1], dv=state.dv, c=state.c,
                               c_mean=state.c_mean, c_std=state.c_std)
         else:
             feats = post_core

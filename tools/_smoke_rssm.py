@@ -1871,41 +1871,6 @@ def _test_dob_ground_highpass() -> None:
     print('[smoke] OK  dob_ground high-pass (min(4H,T); val MA identity)')
 
 
-def _test_dob_feat_hp() -> None:
-    """P90: actor/critic DOB tail is causal EMA HP; Kalman ``d`` stays raw."""
-    from models.dreamer_v4_rssm import (
-        dob_causal_hp_scan, dob_feat_d_tail, dob_feat_hp_width, dob_update_d_ma)
-    cfg = TrainConfig()
-    cfg.horizon = 55
-    cfg.disturbance_detrend_settle_mult = 4.0
-    assert dob_feat_hp_width(cfg) == 220  # unclipped; P89 ground is min(4H,T)=128
-    cfg0 = TrainConfig()
-    cfg0.horizon = 55
-    cfg0.disturbance_detrend_settle_mult = 0.0
-    assert dob_feat_hp_width(cfg0) == 0
-    cfg_h = TrainConfig()
-    cfg_h.horizon = 0
-    assert dob_feat_hp_width(cfg_h) == 0
-    torch.manual_seed(0)
-    ds = torch.full((2, 40, 1), 3.0)
-    hp, m_last = dob_causal_hp_scan(ds, 0.5)
-    assert hp.shape == ds.shape
-    assert float(hp[:, -1].abs().max()) < 1e-8
-    assert torch.allclose(m_last, ds[:, -1], atol=1e-6)
-    hp0, m0 = dob_causal_hp_scan(ds, 0.0)
-    assert torch.equal(hp0, ds)
-    assert float(m0.abs().max()) == 0.0
-    d = torch.tensor([[1.5, -0.5]])
-    ma = torch.tensor([[0.5, 0.25]])
-    assert torch.allclose(dob_feat_d_tail(d, ma), (d - ma).detach())
-    assert torch.equal(dob_feat_d_tail(d, None), d.detach())
-    ma1 = dob_update_d_ma(None, d, 0.5)
-    assert torch.allclose(ma1, 0.5 * d)
-    ma_id = dob_update_d_ma(None, d, 0.0)
-    assert torch.equal(ma_id, torch.zeros_like(d))
-    print('[smoke] OK  dob_feat HP (W=4H unclipped; constant → 0; α=0 identity)')
-
-
 def _test_img_step_det_roll_skips_sample() -> None:
     """Gain det-roll: sample=True prior c is the mean; skip discarded randn."""
     from models.dreamer_v4_rssm import (
@@ -1961,7 +1926,6 @@ def _test_initial_state_zeros_cache() -> None:
     assert s1.z is s2.z
     assert s1.z_logits is s2.z_logits
     assert s1.d is s2.d
-    assert s1.d_ma is s2.d_ma
     assert s1.c is s2.c
     assert s1.c_mean is s2.c_mean and s1.c_mean is not s1.c
     assert s1.c_std is not s1.c
@@ -2254,7 +2218,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gru_hres=' not in _src
     assert 'gru_hres_mix' not in _src
     assert 'dob_hp=' in _src
-    assert 'dob_feathp=' in _src
+    assert 'dob_feathp=' not in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
     assert "world_model_type: str = 'rssm'" in _src
     assert 'gain_cv_skip_rms' not in _src
@@ -5387,20 +5351,6 @@ def _test_stream_serve_matches_rollout() -> None:
         rssm.obs_step = _orig
     print('[smoke] OK  stream_serve_step ≡ rollout_observed (DV+Kalman); '
           'P3 collect uses obs_step')
-    rssm.dob_feat_hp_alpha = 0.5
-    feats_hp, *_ = rssm.rollout_observed(obs, act, sample=False, store_aux=False)
-    state_hp = rssm.initial_state(B, obs.device)
-    streamed_hp = []
-    for t in range(T):
-        state_hp = stream_serve_step(
-            rssm, state_hp, act[:, t], obs[:, t], sample=False)
-        streamed_hp.append(state_hp.feat)
-    streamed_hp = torch.stack(streamed_hp, dim=1)
-    if not torch.allclose(streamed_hp, feats_hp, atol=1e-5, rtol=1e-4):
-        err = (streamed_hp - feats_hp).abs().max().item()
-        raise AssertionError(
-            f'serve vs rollout_observed (α=0.5) max|Δ|={err:.4e}')
-    print('[smoke] OK  stream_serve_step ≡ rollout_observed with feat HP α=0.5')
 
 
 def _test_collect_serve_cuda_graph_cpu() -> None:
@@ -5479,11 +5429,10 @@ def _test_dreamer_v4_config_from_train() -> None:
     assert mc.cont_dist_deterministic_roll is True
     assert mc.cont_gain_deterministic_roll is True
     assert int(mc.horizon) == 0
-    assert abs(float(mc.disturbance_detrend_settle_mult) - 4.0) < 1e-12
     cfg.horizon = 55
     mc55 = dreamer_v4_config_from_train(cfg)
     assert int(mc55.horizon) == 55
-    assert abs(float(mc55.disturbance_detrend_settle_mult) - 4.0) < 1e-12
+    assert not hasattr(mc, 'disturbance_detrend_settle_mult')
     assert dreamer_v4_config_from_train(cfg, attn_impl='sdpa').attn_impl == 'sdpa'
     assert dreamer_v4_config_from_train(cfg, attn_impl='manual').attn_impl == 'manual'
 
@@ -5535,7 +5484,6 @@ if __name__ == '__main__':
     _test_gru_update_gate_bias()
     _test_gru_vanilla_no_residual_mix()
     _test_dob_ground_highpass()
-    _test_dob_feat_hp()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()
