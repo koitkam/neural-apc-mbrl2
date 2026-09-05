@@ -1805,6 +1805,52 @@ def _test_gru_update_gate_bias() -> None:
     print('[smoke] OK  GRU update-gate bias REVERT (PyTorch init); skip REVERT')
 
 
+def _test_gru_residual_mix() -> None:
+    """P88: ``h = prev.h + g*(h_gru-prev.h)``; ``g=1/H``; mix 0/1 identities."""
+    from dataclasses import replace
+    from models.dreamer_v4_rssm import (
+        RSSMConfig, RSSMDynamics, gru_hres_init_mix, gru_hres_logit)
+    assert abs(gru_hres_init_mix(0) - 1.0) < 1e-12
+    assert abs(gru_hres_init_mix(1) - 1.0) < 1e-12
+    assert abs(gru_hres_init_mix(55) - 1.0 / 55.0) < 1e-12
+    torch.manual_seed(0)
+    cfg0 = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                      n_categoricals=4, n_classes=4, embed_dim=16,
+                      hidden_dim=16, latent_type='deterministic',
+                      cont_gain_dim=2, horizon=0)
+    m0 = RSSMDynamics(cfg0)
+    assert abs(float(m0._gru_hres_init) - 1.0) < 1e-12
+    assert abs(float(torch.sigmoid(m0.gru_hres_logit).detach()) - 1.0) < 1e-5
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     cont_gain_dim=2, horizon=55)
+    m = RSSMDynamics(cfg)
+    assert abs(float(m._gru_hres_init) - 1.0 / 55.0) < 1e-12
+    assert abs(float(torch.sigmoid(m.gru_hres_logit).detach())
+               - 1.0 / 55.0) < 1e-5
+    B = 4
+    prev = replace(m.initial_state(B, torch.device('cpu')),
+                   h=torch.randn(B, m.deter_dim))
+    a = torch.randn(B, cfg.action_dim)
+    m.gru_hres_logit.data.fill_(20.0)
+    h_gru, _, _ = m._gru_transition(prev, a)
+    m.gru_hres_logit.data.fill_(-20.0)
+    h_id, _, _ = m._gru_transition(prev, a)
+    assert torch.allclose(h_id, prev.h, atol=1e-5, rtol=1e-5)
+    m.gru_hres_logit.data.fill_(
+        float(gru_hres_logit(55)))
+    h, _, _ = m._gru_transition(prev, a)
+    g = 1.0 / 55.0
+    expect = prev.h + g * (h_gru - prev.h)
+    assert torch.allclose(h, expect, atol=1e-5, rtol=1e-5)
+    # mix=1 ≡ vanilla GRUCell (sigmoid(20) ≈ 1)
+    m.gru_hres_logit.data.fill_(20.0)
+    h1, _, _ = m._gru_transition(prev, a)
+    assert torch.allclose(h1, h_gru, atol=1e-5, rtol=1e-5)
+    print('[smoke] OK  residual GRU mix (g=1/H; mix 0 identity; mix 1 vanilla)')
+
+
 def _test_img_step_det_roll_skips_sample() -> None:
     """Gain det-roll: sample=True prior c is the mean; skip discarded randn."""
     from models.dreamer_v4_rssm import (
@@ -2080,6 +2126,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _prior_c_from_net' in _cz
     assert 'def _recurrence_c' in _cz
     assert 'def gru_update_gate_bias' in _rssm_src
+    assert 'def gru_hres_init_mix' in _rssm_src
+    assert 'gru_hres_logit' in _rssm_src
+    assert 'g * (h_gru - prev.h)' in _rssm_src
     assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
     assert 'fill_(_zbias)' not in _rssm_src
     assert 'def init_gain_cv_skip' not in _rssm_src
@@ -2143,6 +2192,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "last_only=True, out='obs', return_state=True" in _src
     assert 'gmatch_fo=True' not in _src
     assert 'gru_zbias=' in _src
+    assert 'gru_hres=' in _src
+    assert 'gru_hres_mix' in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
     assert "world_model_type: str = 'rssm'" in _src
     assert 'gain_cv_skip_rms' not in _src
@@ -5387,6 +5438,7 @@ if __name__ == '__main__':
     _test_prior_cv_recon_reverted()
     _test_img_rollout_last_only()
     _test_gru_update_gate_bias()
+    _test_gru_residual_mix()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()

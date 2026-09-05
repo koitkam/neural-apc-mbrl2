@@ -4253,8 +4253,11 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         # Env-free P40: dcv_match default True is inert while isolation is off.
         _iso_txt = 'iso_dcv=off '
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
-    from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
+    from models.dreamer_v4_rssm import (
+        gru_update_gate_bias as _gru_zbias_fn,
+        gru_hres_init_mix as _gru_hres_fn)
     _gru_zb = float(_gru_zbias_fn(_h_zb))
+    _gru_hres = float(_gru_hres_fn(_h_zb))
     print(
         '[resolved-cfg] '
         f"wm={getattr(cfg, 'world_model_type', 'rssm')} "
@@ -4289,6 +4292,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"held_cv=True "
         f"ov_sgstart=True "
         f"gru_zbias={_gru_zb:.3g} "
+        f"gru_hres={_gru_hres:.3g} "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -6622,21 +6626,18 @@ def _wm_latent_overshoot_loss(model: DreamerV4, feats: torch.Tensor,
                                recon_loss: Optional[torch.Tensor] = None,
                                c_mean: Optional[torch.Tensor] = None,
                                ) -> Tuple[torch.Tensor, float]:
-    """Option #2 (P88): multi-step LATENT OVERSHOOTING — open-loop prior
-    rollout accuracy.
+    """Latent overshooting — open-loop prior rollout accuracy (PlaNet).
 
     Dreamer-v3 trains the prior only ONE step ahead (the KL term), so the
-    open-loop imagination rollout the actor depends on accumulates error every
-    step and per-offset WM fidelity decays fast (r 0.74@H13 -> 0.52@H55).  This
-    is the PlaNet/Dreamer-v1 "latent overshooting" objective (v2/v3 dropped it
-    because 1-step sufficed for Atari): from a strided set of start positions
-    ``t`` we reconstruct the posterior state, roll the PRIOR forward ``K`` steps
-    under the REAL actions ``a_{t+1..t+K}`` WITH NO OBSERVATIONS, decode, and
-    penalise all-obs ``MSE(decode, obs_{t+1..t+K})`` with
-    ``_recon_channel_weights`` (P86 CV-only **REVERT**).  Tail ``(k/K)^p``
-    KEEP.  P87: **stop-grad the start** ``(h, z, c0)`` so the K-step
-    prior/decoder must carry DC; a live encoder start absorbed the
-    residual (P85 1-step faithful / OL short).
+    open-loop imagination rollout accumulates error every step.  From a
+    strided set of start positions ``t`` we reconstruct the posterior
+    state, roll the PRIOR forward ``K`` steps under the REAL actions
+    ``a_{t+1..t+K}`` WITH NO OBSERVATIONS, decode, and penalise all-obs
+    ``MSE(decode, obs_{t+1..t+K})`` with ``_recon_channel_weights``
+    (P86 CV-only **REVERT**).  Tail ``(k/K)^p`` KEEP.  P87 KEEP:
+    **stop-grad the start** ``(h, z, c0)`` so the K-step prior/decoder
+    must carry DC (freeze vs P86 CAPPED; **FALSIFIED as compounding** —
+    val 1step→OL ×0.733 vs P79 ×0.840).
 
     RSSM-interface (rssm + tssm); returns ``(0, 0.0)`` for the SF-transformer
     backbone (its shortcut-forcing loss is the native multi-step-prediction
@@ -14274,6 +14275,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_ol_persist_rel' in row:
                 row.setdefault('wm_gain_match_ol_persist_rel',
                             row['gain_match_ol_persist_rel'])
+            _hres_logit = getattr(getattr(model, 'dynamics', None),
+                                  'gru_hres_logit', None)
+            if isinstance(_hres_logit, torch.nn.Parameter):
+                row['gru_hres_mix'] = float(
+                    torch.sigmoid(_hres_logit.detach()))
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
