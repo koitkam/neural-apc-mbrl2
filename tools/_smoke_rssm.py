@@ -4282,6 +4282,7 @@ def _test_entropy_collapse_threshold() -> None:
 
 def _test_id_tau_no_plant_sentinel() -> None:
     """Missing SysID keys must not invent τ=50 s / θ=5 s."""
+    import os
     from pathlib import Path
     from utils.noise_config import _theta_from_tau, build_noise_config
     root = Path(__file__).resolve().parents[1]
@@ -4335,11 +4336,43 @@ def _test_id_tau_no_plant_sentinel() -> None:
         from audit_data_generation_v2 import _resolve_audit_plant_knobs
     empty = SimpleNamespace(tau=None, dead=None, sample_rate=None,
                             episode_len=None, lookback=None)
+    _prev_sim = {k: os.environ.get(k) for k in (
+        'SIM_SAMPLE_RATE', 'SIM_EPISODE_LENGTH',
+        'DREAMER_SAMPLE_RATE', 'DREAMER_EPISODE_LENGTH',
+        'IDENTIFIED_TAU_DOMINANT', 'IDENTIFIED_DEAD_TIME')}
     try:
-        _resolve_audit_plant_knobs(empty, None)
-        raise AssertionError('expected SystemExit refusing test_sim knobs')
-    except SystemExit as e:
-        assert 'refuse to invent' in str(e)
+        os.environ['SIM_SAMPLE_RATE'] = '9'
+        os.environ['SIM_EPISODE_LENGTH'] = '900'
+        os.environ.pop('DREAMER_SAMPLE_RATE', None)
+        os.environ.pop('DREAMER_EPISODE_LENGTH', None)
+        os.environ.pop('IDENTIFIED_TAU_DOMINANT', None)
+        os.environ.pop('IDENTIFIED_DEAD_TIME', None)
+        try:
+            _resolve_audit_plant_knobs(empty, None)
+            raise AssertionError('expected SystemExit refusing test_sim knobs')
+        except SystemExit as e:
+            msg = str(e)
+            assert 'refuse to invent' in msg
+            miss = msg.split('missing ', 1)[-1].split(').', 1)[0]
+            assert 'sample_rate' in miss and 'episode_len' in miss
+        os.environ['DREAMER_SAMPLE_RATE'] = '8'
+        os.environ['DREAMER_EPISODE_LENGTH'] = '1100'
+        os.environ['IDENTIFIED_TAU_DOMINANT'] = '53'
+        os.environ['IDENTIFIED_DEAD_TIME'] = '8'
+        try:
+            _resolve_audit_plant_knobs(empty, None)
+            raise AssertionError('expected SystemExit missing lookback')
+        except SystemExit as e:
+            msg = str(e)
+            assert 'refuse to invent' in msg
+            miss = msg.split('missing ', 1)[-1].split(').', 1)[0]
+            assert miss.strip() == 'lookback', miss
+    finally:
+        for k, old in _prev_sim.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
     cli = SimpleNamespace(tau=53.0, dead=8.0, sample_rate=4,
                           episode_len=1220, lookback=128)
     tau_c, dead_c, sr_c, ep_c, lb_c, src_c = _resolve_audit_plant_knobs(
@@ -4700,6 +4733,11 @@ def _test_sample_rate_pin_ignores_leftover() -> None:
         assert "os.environ.get('SIM_SAMPLE_RATE'" not in pi_src
         tr_src = open('training/train.py').read()
         assert "('SIM_SAMPLE_RATE', 'sample_rate'" not in tr_src
+        audit_src = open('tools/audit_data_generation_v2.py').read()
+        assert "os.environ.get('SIM_SAMPLE_RATE')" not in audit_src
+        assert "os.environ.get('SIM_EPISODE_LENGTH')" not in audit_src
+        assert "os.environ.get('DREAMER_SAMPLE_RATE')" in audit_src
+        assert "os.environ.get('DREAMER_EPISODE_LENGTH')" in audit_src
     finally:
         for k, old in prev.items():
             if old is None:

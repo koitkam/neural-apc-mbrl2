@@ -59,7 +59,10 @@ def _resolve_audit_plant_knobs(args, source_run: Optional[Path]):
     Same leftover class as ``_wire_run_artifacts`` in
     ``tools/wm_posterior_prior_probe.py`` (sentinel 0, resolve, refuse).
     Explicit CLI / ``AUDIT_*`` env wins, then ``run_plan.json`` /
-    ``plant_id.json``, then already-exported ``IDENTIFIED_*``.
+    ``plant_id.json``, then already-exported ``IDENTIFIED_*`` (IPC)
+    and ``DREAMER_SAMPLE_RATE`` / ``DREAMER_EPISODE_LENGTH`` pins.
+    Leftover ``SIM_SAMPLE_RATE`` / ``SIM_EPISODE_LENGTH`` ignored
+    (same class as derive; P94-live / P92-live).
     """
     plan: Dict[str, Any] = {}
     cfg: Dict[str, Any] = {}
@@ -97,7 +100,7 @@ def _resolve_audit_plant_knobs(args, source_run: Optional[Path]):
     if sr is None:
         sr = _pos(cfg.get('sample_rate'), int)
     if sr is None:
-        sr = _pos(os.environ.get('SIM_SAMPLE_RATE'), int)
+        sr = _pos(os.environ.get('DREAMER_SAMPLE_RATE'), int)
 
     ep = _pos(getattr(args, 'episode_len', None), int)
     if ep is None:
@@ -105,7 +108,7 @@ def _resolve_audit_plant_knobs(args, source_run: Optional[Path]):
     if ep is None:
         ep = _pos(cfg.get('episode_length'), int)
     if ep is None:
-        ep = _pos(os.environ.get('SIM_EPISODE_LENGTH'), int)
+        ep = _pos(os.environ.get('DREAMER_EPISODE_LENGTH'), int)
 
     lb = _pos(getattr(args, 'lookback', None), int)
     if lb is None:
