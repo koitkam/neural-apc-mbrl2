@@ -4108,6 +4108,29 @@ def _refresh_module_state(
         return {k: v.detach().cpu().clone() for k, v in sd.items()}
 
 
+def _atomic_torch_save(obj, path) -> None:
+    """Write ``path`` via a same-dir ``.tmp`` then ``os.replace``.
+
+    A direct ``torch.save`` to the destination truncates it first.  Disk-full
+    (P94 EXIT) then left a shorter unreadable zip and aborted the trainer.
+    Replace is atomic on this filesystem so a failed write keeps the previous
+    good file.  Callers that must not kill training still wrap this in
+    try/except.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _persist_last_ok_ckpt(
         path: Path,
         last_ok_sd: Optional[Dict[str, torch.Tensor]],
@@ -4126,7 +4149,7 @@ def _persist_last_ok_ckpt(
     if last_ok_sd is None or path is None:
         return False
     try:
-        torch.save({
+        _atomic_torch_save({
             'model': last_ok_sd,
             'cfg': asdict(cfg),
             'obs_norm': obs_norm,
@@ -13459,7 +13482,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             model.load_state_dict(_cur_sd)
                             wm_best_iter = int(total_iters)
                             try:
-                                torch.save({
+                                _atomic_torch_save({
                                     'model': model.state_dict(),
                                     'cfg': asdict(cfg),
                                     'obs_norm': env.get_obs_norm_stats(),
@@ -14770,33 +14793,38 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             wm_best_score = float(wm_score_ema)
                             wm_best_iter = int(total_iters)
                             wm_best_ckpt_path = out_dir / 'wm_best.pt'
-                            torch.save({
-                                'model': model.state_dict(),
-                                'cfg': asdict(cfg),
-                                'obs_norm': env.get_obs_norm_stats(),
-                                'wm_fidelity_score': float(wm_score_ema),
-                                'wm_fidelity_score_raw': float(_score),
-                                'wm_fidelity_probe': {
-                                    'iter': int(total_iters),
-                                    'env_steps': int(total_env_steps),
-                                    'per_offset': [(int(o), float(r))
-                                                    for (o, r) in _per],
-                                    'best_h': int(_pbe.get('best_h', 0)),
-                                    'H': int(_pbe.get('H', 0)),
-                                    'wm_converge_frac': (
-                                        float(_pbe['wm_converge_frac'])
-                                        if _pbe.get('wm_converge_frac')
-                                        is not None else None),
-                                    'tail_drift_mean': (
-                                        float(_pbe['tail_drift_mean'])
-                                        if _pbe.get('tail_drift_mean')
-                                        is not None else None),
-                                },
-                            }, wm_best_ckpt_path)
-                            print(f"[wm-best] new best fidelity score (EMA) "
-                                  f"{wm_score_ema:.3f} (raw {_score:.3f}) at iter "
-                                  f"{total_iters} -> saved {wm_best_ckpt_path.name}",
-                                  flush=True)
+                            try:
+                                _atomic_torch_save({
+                                    'model': model.state_dict(),
+                                    'cfg': asdict(cfg),
+                                    'obs_norm': env.get_obs_norm_stats(),
+                                    'wm_fidelity_score': float(wm_score_ema),
+                                    'wm_fidelity_score_raw': float(_score),
+                                    'wm_fidelity_probe': {
+                                        'iter': int(total_iters),
+                                        'env_steps': int(total_env_steps),
+                                        'per_offset': [(int(o), float(r))
+                                                        for (o, r) in _per],
+                                        'best_h': int(_pbe.get('best_h', 0)),
+                                        'H': int(_pbe.get('H', 0)),
+                                        'wm_converge_frac': (
+                                            float(_pbe['wm_converge_frac'])
+                                            if _pbe.get('wm_converge_frac')
+                                            is not None else None),
+                                        'tail_drift_mean': (
+                                            float(_pbe['tail_drift_mean'])
+                                            if _pbe.get('tail_drift_mean')
+                                            is not None else None),
+                                    },
+                                }, wm_best_ckpt_path)
+                            except Exception as _e:
+                                print(f'[wm-best] save failed: {_e!r}',
+                                      flush=True)
+                            else:
+                                print(f"[wm-best] new best fidelity score (EMA) "
+                                      f"{wm_score_ema:.3f} (raw {_score:.3f}) at iter "
+                                      f"{total_iters} -> saved {wm_best_ckpt_path.name}",
+                                      flush=True)
                         # EMA-best tracking for the phase gates.
                         # 2026-05-26 (P53 RCA): previously scoped to
                         # P2 only, which left ``wm_score_ema_best`` at
@@ -15221,7 +15249,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # to promote even if no further improvement.
                         try:
                             best_ckpt_path = out_dir / 'best.pt'
-                            torch.save({'model': model.state_dict(),
+                            _atomic_torch_save({'model': model.state_dict(),
                                         'cfg': asdict(cfg),
                                         'obs_norm': env.get_obs_norm_stats(),
                                         'best_det_return': best_p3_ema,
@@ -15243,7 +15271,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             # Persist best ckpt for plateau-stop recovery.
                             try:
                                 best_ckpt_path = out_dir / 'best.pt'
-                                torch.save({'model': model.state_dict(),
+                                _atomic_torch_save({'model': model.state_dict(),
                                             'cfg': asdict(cfg),
                                             'obs_norm': env.get_obs_norm_stats(),
                                             'best_det_return': best_p3_ema,
@@ -15295,14 +15323,22 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                           flush=True)
                     break
         if total_iters % cfg.save_every_iters == 0:
-            torch.save({'model': model.state_dict(), 'cfg': asdict(cfg),
-                        'obs_norm': env.get_obs_norm_stats()},
-                       out_dir / f'ckpt_iter_{total_iters:05d}.pt')
+            try:
+                _atomic_torch_save(
+                    {'model': model.state_dict(), 'cfg': asdict(cfg),
+                     'obs_norm': env.get_obs_norm_stats()},
+                    out_dir / f'ckpt_iter_{total_iters:05d}.pt')
+            except Exception as _e:
+                # P94: disk-full iostream during this save aborted P3.
+                print(f'[ckpt] periodic save failed: {_e!r}', flush=True)
 
     log_f.close()
     final_path = out_dir / 'final.pt'
-    torch.save({'model': model.state_dict(), 'cfg': asdict(cfg),
-                'obs_norm': env.get_obs_norm_stats()}, final_path)
+    try:
+        _atomic_torch_save({'model': model.state_dict(), 'cfg': asdict(cfg),
+                            'obs_norm': env.get_obs_norm_stats()}, final_path)
+    except Exception as _e:
+        print(f'[ckpt] final.pt save failed: {_e!r}', flush=True)
 
     # Best-checkpoint promotion: regardless of early-stop status, the
     # snapshot at ``best_p3_iter`` is a more trustworthy controller than

@@ -1950,6 +1950,27 @@ def _test_dob_ground_shape_amp() -> None:
     print('[smoke] OK  dob_ground shape+amp (z-score; unitless std-ratio)')
 
 
+def _test_atomic_torch_save() -> None:
+    """P94 crash: ckpt write must replace atomically and not truncate dest."""
+    import tempfile
+    from pathlib import Path
+    from training.train import _atomic_torch_save
+    src = open('training/train.py').read()
+    assert 'def _atomic_torch_save' in src
+    assert 'ckpt_iter_{total_iters:05d}.pt' in src
+    assert '[ckpt] periodic save failed' in src
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / 'ckpt.pt'
+        _atomic_torch_save({'v': 1}, p)
+        blob = torch.load(p, map_location='cpu', weights_only=False)
+        assert blob['v'] == 1
+        _atomic_torch_save({'v': 2}, p)
+        blob = torch.load(p, map_location='cpu', weights_only=False)
+        assert blob['v'] == 2
+        assert not (p.with_name(p.name + '.tmp')).exists()
+    print('[smoke] OK  atomic torch.save (tmp+replace; no leftover .tmp)')
+
+
 def _test_img_step_det_roll_skips_sample() -> None:
     """Gain det-roll: sample=True prior c is the mean; skip discarded randn."""
     from models.dreamer_v4_rssm import (
@@ -4322,6 +4343,26 @@ def _test_id_tau_no_plant_sentinel() -> None:
     assert "IDENTIFIED_DEAD_TIME', '8'" not in probe_src
     assert "REPO / 'simulation' / 'test_sim'" not in probe_src
     assert 'def _wire_run_artifacts' in probe_src
+    id_src = (root / 'utils' / 'dynamics_identifier.py').read_text()
+    assert "os.environ.get('SIM_ACTION_DIM'" not in id_src
+    assert "SIM_ACTION_DIM', '3'" not in id_src
+    from utils.dynamics_identifier import _resolve_mv_count
+    _prev_adim = os.environ.get('SIM_ACTION_DIM')
+    try:
+        os.environ['SIM_ACTION_DIM'] = '9'
+        assert _resolve_mv_count({'mv_indices': [0]}) == 1
+        assert _resolve_mv_count({'mv_indices': [0, 2, 4]}) == 3
+        try:
+            _resolve_mv_count({'mv_indices': []})
+            raise AssertionError('expected refuse invented SIM_ACTION_DIM')
+        except ValueError as e:
+            msg = str(e)
+            assert 'mv_indices' in msg and 'SIM_ACTION_DIM' in msg, msg
+    finally:
+        if _prev_adim is None:
+            os.environ.pop('SIM_ACTION_DIM', None)
+        else:
+            os.environ['SIM_ACTION_DIM'] = _prev_adim
     audit_src = (root / 'tools' / 'audit_data_generation_v2.py').read_text()
     assert "AUDIT_TAU', '55'" not in audit_src
     assert "AUDIT_DEAD', '8'" not in audit_src
@@ -5766,6 +5807,7 @@ if __name__ == '__main__':
     _test_gru_vanilla_no_residual_mix()
     _test_dob_ground_highpass()
     _test_dob_ground_shape_amp()
+    _test_atomic_torch_save()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()

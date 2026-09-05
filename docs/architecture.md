@@ -257,7 +257,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
 > longer silently uses WM-only 1.0; explicit probe args beat leftover env). Missing SysID keys do **not**
-> invent τ=50 s / θ=5 s. APCEnv operator-limit schedule
+> invent τ=50 s / θ=5 s. Identifier leftover `SIM_ACTION_DIM` default **3**
+> **REMOVED** (refuse empty `mv_indices`). APCEnv operator-limit schedule
 > (change counts 1–2, ramp/warmup 0.10, strata 3, inside-margin 0.05)
 > is TrainConfig + `ENV_OVERRIDES`; `auto_derive` jitter is **0.15 / 0.20**.
 > Step-settle `|Δu|` 0.20/0.60 + prefix 0.05/0.20, `shaping_safe_margin_frac=0.25`,
@@ -1237,7 +1238,7 @@ batched-decodes prior for the Kalman.
   Mean MSE over all sequences. Do not `/dvar`. **P89 EXIT:** grounding is
   high-pass (`x−MA(x,w)`, `w=min(4H,T)`) so DC drift that val `det_r`
   already ignores does not dominate P2 (KEEP as protocol; PARTIAL amp;
-  FALSIFIED champ). **P94 LIVE P3:** freeze GAIN-READY **0.84@DV** 1step→OL **0.85** skip **0** last_ok **82**; P2 HP `std_ratio` **0.64→0.33** (falling; dabs **0.105**); P2→P3 PASS @136 MTP **0.948**; unfreeze **147** rscale **1.55 KEEP**. HP Wiener MSE → z-score shape + unitless
+  FALSIFIED champ). **P94 CRASH** freeze GAIN-READY **0.84@DV** 1step→OL **0.85** skip **0** last_ok **82**; P2 HP `std_ratio` **0.64→0.33**; P2→P3 PASS @136; unfreeze **147** rscale **1.55 KEEP**; aborted @340 disk-full periodic save (not a val). HP Wiener MSE → z-score shape + unitless
   std-ratio amp (same coef; jsonl `dob_ground_std_ratio`). **P90 EXIT REVERT:** served feat tail was causal EMA HP
   (`d−EMA(d,4H)`); storm 2/2 last_ok **7** GAIN_NOT_READY — cannot attribute.
   **P91 EXIT:** feat tail is raw `d.detach()` (P89 identity; FALSIFIED as P89 freeze — last_ok **44** **0.76@DV**; serve-HP family closed). Kalman state

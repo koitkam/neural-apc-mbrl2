@@ -138,6 +138,21 @@ def _get_cv_indices(meta: Dict[str, Any]) -> List[int]:
     return cv_idxs
 
 
+def _resolve_mv_count(meta: Dict[str, Any]) -> int:
+    """MV channel count from simulator metadata.
+
+    Empty ``mv_indices`` used to invent leftover ``SIM_ACTION_DIM`` default **3**
+    (a distillation MIMO magic number). Refuse rather than invent; plants must
+    expose ``mv_indices`` the same way they expose CVs.
+    """
+    mv_idxs = [int(x) for x in meta.get('mv_indices', []) if x is not None]
+    if not mv_idxs:
+        raise ValueError(
+            'No MV indices available. Simulator metadata must expose '
+            'mv_indices (do not invent leftover SIM_ACTION_DIM).')
+    return len(mv_idxs)
+
+
 def _resolve_mv_bounds(action_dim: int) -> List[List[float]]:
     try:
         spec = load_objective_spec()
@@ -564,9 +579,7 @@ def _identify_dynamics_inner(
     probe_meta = resolve_sim_metadata(probe)
     mv_idxs = [int(x) for x in probe_meta.get('mv_indices', []) if x is not None]
     dv_idxs = [int(x) for x in probe_meta.get('dv_indices', []) if x is not None]
-    mv_count = len(mv_idxs)
-    if mv_count == 0:
-        mv_count = int(os.environ.get('SIM_ACTION_DIM', '3'))
+    mv_count = _resolve_mv_count(probe_meta)
 
     mv_bounds = _resolve_mv_bounds(mv_count)
     dv_bounds = _resolve_dv_bounds(probe_meta, len(dv_idxs))
