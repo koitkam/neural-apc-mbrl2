@@ -4131,6 +4131,35 @@ def _atomic_torch_save(obj, path) -> None:
         raise
 
 
+def _prune_periodic_ckpts(out_dir, keep: int = 2) -> None:
+    """Keep the newest ``keep`` ``ckpt_iter_*.pt`` files in ``out_dir``.
+
+    P94: 875 finished-run periodics (40.7 GB) filled ``/home`` and aborted
+    a VALID P3.  Atomic replace stops a truncated dest from killing the
+    trainer; this stops the pile-up.  Does not touch ``wm_last_ok.pt`` /
+    ``wm_best.pt`` / ``best.pt`` / ``final.pt``.  No new TrainConfig field
+    (``save_every_iters`` already owns cadence).
+    """
+    out = Path(out_dir)
+    paths = sorted(
+        out.glob('ckpt_iter_*.pt'),
+        key=lambda p: p.name,
+    )
+    extra = paths[:-max(0, int(keep))]
+    if not extra:
+        return
+    n_ok = 0
+    for p in extra:
+        try:
+            p.unlink()
+            n_ok += 1
+        except OSError as e:
+            print(f'[ckpt] prune {p.name} failed: {e!r}', flush=True)
+    if n_ok:
+        print(f'[ckpt] pruned {n_ok} older ckpt_iter_*.pt (keep {int(keep)})',
+              flush=True)
+
+
 def _persist_last_ok_ckpt(
         path: Path,
         last_ok_sd: Optional[Dict[str, torch.Tensor]],
@@ -15328,6 +15357,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     {'model': model.state_dict(), 'cfg': asdict(cfg),
                      'obs_norm': env.get_obs_norm_stats()},
                     out_dir / f'ckpt_iter_{total_iters:05d}.pt')
+                _prune_periodic_ckpts(out_dir, keep=2)
             except Exception as _e:
                 # P94: disk-full iostream during this save aborted P3.
                 print(f'[ckpt] periodic save failed: {_e!r}', flush=True)

@@ -1238,7 +1238,7 @@ batched-decodes prior for the Kalman.
   Mean MSE over all sequences. Do not `/dvar`. **P89 EXIT:** grounding is
   high-pass (`x−MA(x,w)`, `w=min(4H,T)`) so DC drift that val `det_r`
   already ignores does not dominate P2 (KEEP as protocol; PARTIAL amp;
-  FALSIFIED champ). **P94 CRASH** freeze GAIN-READY **0.84@DV** 1step→OL **0.85** skip **0** last_ok **82**; P2 HP `std_ratio` **0.64→0.33**; P2→P3 PASS @136; unfreeze **147** rscale **1.55 KEEP**; aborted @340 disk-full periodic save (not a val). HP Wiener MSE → z-score shape + unitless
+  FALSIFIED champ). **P94 CRASH** freeze GAIN-READY **0.84@DV** 1step→OL **0.85** skip **0** last_ok **82**; P2 HP `std_ratio` **0.64→0.33**; P2→P3 PASS @136; unfreeze **147** rscale **1.55 KEEP**; aborted @340 disk-full periodic save (not a val). HEAD: atomic tmp+replace + try/except + prune keep-2 periodics. **P95 LIVE** identity relaunch (`run_p95_dobamp`). HP Wiener MSE → z-score shape + unitless
   std-ratio amp (same coef; jsonl `dob_ground_std_ratio`). **P90 EXIT REVERT:** served feat tail was causal EMA HP
   (`d−EMA(d,4H)`); storm 2/2 last_ok **7** GAIN_NOT_READY — cannot attribute.
   **P91 EXIT:** feat tail is raw `d.detach()` (P89 identity; FALSIFIED as P89 freeze — last_ok **44** **0.76@DV**; serve-HP family closed). Kalman state

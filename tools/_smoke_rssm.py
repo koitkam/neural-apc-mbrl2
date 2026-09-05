@@ -1954,11 +1954,13 @@ def _test_atomic_torch_save() -> None:
     """P94 crash: ckpt write must replace atomically and not truncate dest."""
     import tempfile
     from pathlib import Path
-    from training.train import _atomic_torch_save
+    from training.train import _atomic_torch_save, _prune_periodic_ckpts
     src = open('training/train.py').read()
     assert 'def _atomic_torch_save' in src
+    assert 'def _prune_periodic_ckpts' in src
     assert 'ckpt_iter_{total_iters:05d}.pt' in src
     assert '[ckpt] periodic save failed' in src
+    assert '_prune_periodic_ckpts(out_dir, keep=2)' in src
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / 'ckpt.pt'
         _atomic_torch_save({'v': 1}, p)
@@ -1968,7 +1970,19 @@ def _test_atomic_torch_save() -> None:
         blob = torch.load(p, map_location='cpu', weights_only=False)
         assert blob['v'] == 2
         assert not (p.with_name(p.name + '.tmp')).exists()
-    print('[smoke] OK  atomic torch.save (tmp+replace; no leftover .tmp)')
+        d = Path(td)
+        (d / 'wm_last_ok.pt').write_bytes(b'keep-last-ok')
+        (d / 'best.pt').write_bytes(b'keep-best')
+        for i in (20, 40, 60, 80):
+            (d / f'ckpt_iter_{i:05d}.pt').write_bytes(b'x' * 8)
+        _prune_periodic_ckpts(d, keep=2)
+        left = sorted(p.name for p in d.glob('ckpt_iter_*.pt'))
+        assert left == ['ckpt_iter_00060.pt', 'ckpt_iter_00080.pt'], left
+        assert (d / 'wm_last_ok.pt').exists() and (d / 'best.pt').exists()
+        _prune_periodic_ckpts(d, keep=2)
+        left = sorted(p.name for p in d.glob('ckpt_iter_*.pt'))
+        assert left == ['ckpt_iter_00060.pt', 'ckpt_iter_00080.pt'], left
+    print('[smoke] OK  atomic torch.save (tmp+replace; prune keep-2 periodics)')
 
 
 def _test_img_step_det_roll_skips_sample() -> None:
