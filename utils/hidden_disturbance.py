@@ -49,41 +49,28 @@ identified through ``sim.cv_indices`` and respects
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 import numpy as np
 
 
-_BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f')
+def _knob_raw(cfg, field: str, env_key: str = ''):
+    """TrainConfig field only. ``env_key`` unused (leftover dual-read REMOVED).
 
-
-def _explicit(cfg, field: str) -> bool:
-    if cfg is None:
-        return False
-    return field in (getattr(cfg, '_explicit_fields', set()) or set())
-
-
-def _knob_raw(cfg, field: str, env_key: str):
-    """Explicit TrainConfig, else leftover env, else cfg default.
-
-    Second return is True when the leftover env key is present (even
-    empty).  Empty leftover is distinct from unset.
+    Login leftover ``DREAMER_*`` without ``_cfg_from_env`` is ignored.
+    A/B via ``ENV_OVERRIDES``. Second return is always False (was
+    leftover-env present). Empty cfg field is still a sentinel at
+    the caller.
     """
-    if _explicit(cfg, field):
-        return getattr(cfg, field), False
-    if env_key in os.environ:
-        return os.environ.get(env_key), True
+    del env_key
     if cfg is not None:
         return getattr(cfg, field, None), False
     return None, False
 
 
 def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
-    raw, leftover = _knob_raw(cfg, field, env_key)
-    if leftover and (raw is None or str(raw).strip() == ''):
-        return float(default)
+    raw, _leftover = _knob_raw(cfg, field, env_key)
     if raw is None or str(raw).strip() == '':
         return float(default)
     try:
@@ -93,11 +80,7 @@ def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
 
 
 def _knob_bool(cfg, field: str, env_key: str, default: bool) -> bool:
-    if _explicit(cfg, field):
-        return bool(getattr(cfg, field))
-    raw = os.environ.get(env_key)
-    if raw is not None:
-        return str(raw).strip().lower() not in _BOOL_OFF
+    del env_key
     if cfg is not None:
         return bool(getattr(cfg, field, default))
     return bool(default)
@@ -107,10 +90,9 @@ def _knob_bool(cfg, field: str, env_key: str, default: bool) -> bool:
 def force_val_hidden_dist_spread(cfg):
     """Pin ``hidden_dist_spread=True`` on ``cfg`` for val/diag (no os.environ).
 
-    Training already defaults spread ON.  Val used to poke
-    ``DREAMER_HIDDEN_DIST_SPREAD=1`` (leftover dual path; a stale comment
-    claimed training was still front-loaded).  Explicit cfg beats leftover
-    env=0 so plots still spread when an A/B disables training spread.
+    Training already defaults spread ON. Val used to poke
+    ``DREAMER_HIDDEN_DIST_SPREAD=1``. Mutating the field is enough
+    (leftover helper dual-read REMOVED).
     """
     if cfg is None:
         yield
@@ -165,7 +147,8 @@ def hidden_disturbance_enabled(default: bool = True, cfg=None) -> bool:
     Default: ON.  The legacy step-shaped unmeasured-CV events are gone
     (run p33 showed they capped ``sf_loss`` at ~1.15 by being Dirac
     spikes the WM has no observation to predict).  Off-switch only:
-    set ``DREAMER_HIDDEN_DISTURBANCE=0`` to disable for ablations.
+    ``TrainConfig.hidden_disturbance=False`` / ``DREAMER_HIDDEN_DISTURBANCE=0``
+    via ``ENV_OVERRIDES`` (login leftover ignored).
     """
     return _knob_bool(cfg, 'hidden_disturbance',
                       'DREAMER_HIDDEN_DISTURBANCE', default)
@@ -194,11 +177,11 @@ def curriculum_amp_scale(progress: float, phase: Optional[int] = None,
                          cfg=None) -> float:
     """Amplitude curriculum scale (≤cap) as a function of training progress.
 
-    Reads TrainConfig ``hidden_ou_amp_ramp`` /
-    leftover ``DREAMER_HIDDEN_OU_AMP_RAMP="<start_frac>:<reach_full_at>"``.
-    Phase-aware cap: P1 ``hidden_ou_amp_max_scale`` (0.2); P2/P3
-    ``hidden_ou_amp_max_scale_p3`` (1.0; P64 P2 Kalman at deployment
-    amp).  Malformed/empty leftover → cap.
+    Reads TrainConfig ``hidden_ou_amp_ramp``
+    (``"<start_frac>:<reach_full_at>"``; A/B ``DREAMER_HIDDEN_OU_AMP_RAMP``
+    via ``ENV_OVERRIDES``). Phase-aware cap: P1 ``hidden_ou_amp_max_scale``
+    (0.2); P2/P3 ``hidden_ou_amp_max_scale_p3`` (1.0; P64 P2 Kalman at
+    deployment amp). Malformed/empty field → cap.
     """
     cap = _phase_amp_cap(phase, cfg)
     raw, leftover = _knob_raw(cfg, 'hidden_ou_amp_ramp',
@@ -280,9 +263,9 @@ def get_phase_disturbance_prob(
 ) -> float:
     """Return the per-episode probability that hidden disturbance fires.
 
-    TrainConfig / leftover env (identity defaults).  Omitting
-    ``phase_progress`` returns the phase-end cap (P1 still uses
-    ``wm_best_score`` when supplied).
+    TrainConfig / ``ENV_OVERRIDES`` (identity defaults; login leftover
+    ignored).  Omitting ``phase_progress`` returns the phase-end cap
+    (P1 still uses ``wm_best_score`` when supplied).
     """
     # ---- P3 ----
     if int(phase) >= 3:

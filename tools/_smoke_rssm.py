@@ -4588,12 +4588,15 @@ def _test_derived_observables_cfg() -> None:
 
 
 def _test_noise_hidden_cfg() -> None:
-    """Process-noise ramp + hidden-load: TrainConfig default, leftover, explicit."""
+    """Process-noise ramp + hidden-load: TrainConfig; leftover DREAMER_* ignored."""
     import os
     from utils.hidden_disturbance import (
         get_phase_disturbance_prob, hidden_disturbance_enabled,
         curriculum_amp_scale)
     from utils.noise_config import noise_curriculum_scale
+    src = open('utils/hidden_disturbance.py').read()
+    assert 'os.environ.get(env_key)' not in src
+    assert 'if env_key in os.environ' not in src
     keys = (
         'DREAMER_PROCESS_NOISE_AMP_RAMP',
         'DREAMER_DISTURBANCE_PROB_WM',
@@ -4625,9 +4628,13 @@ def _test_noise_hidden_cfg() -> None:
             phase=1, cfg=c)
         assert hidden_disturbance_enabled(cfg=c) is True
         os.environ['DREAMER_PROCESS_NOISE_AMP_RAMP'] = '0.5:0.4'
-        assert abs(noise_curriculum_scale(0.0, phase=1, cfg=c) - 0.5) < 1e-12
+        assert noise_curriculum_scale(0.0, phase=1, cfg=c) == 0.0  # leftover ignored
         os.environ['DREAMER_PROCESS_NOISE_AMP_RAMP'] = ''
-        assert noise_curriculum_scale(0.0, phase=1, cfg=c) == 1.0
+        assert noise_curriculum_scale(0.0, phase=1, cfg=c) == 0.0  # empty leftover ignored
+        from training.train import _cfg_from_env
+        os.environ['DREAMER_PROCESS_NOISE_AMP_RAMP'] = '0.5:0.4'
+        c_env = _cfg_from_env()
+        assert abs(noise_curriculum_scale(0.0, phase=1, cfg=c_env) - 0.5) < 1e-12
         os.environ.pop('DREAMER_PROCESS_NOISE_AMP_RAMP', None)
         c_ex = TrainConfig()
         c_ex.process_noise_amp_ramp = '0.2:0.4'
@@ -4636,18 +4643,20 @@ def _test_noise_hidden_cfg() -> None:
         assert abs(noise_curriculum_scale(0.0, phase=1, cfg=c_ex) - 0.2) < 1e-12
         os.environ.pop('DREAMER_PROCESS_NOISE_AMP_RAMP', None)
         os.environ['DREAMER_DISTURBANCE_PROB_WM'] = '0.25'
-        assert abs(get_phase_disturbance_prob(phase=1, cfg=c) - 0.25) < 1e-12
+        assert abs(get_phase_disturbance_prob(phase=1, cfg=c) - 0.10) < 1e-12  # leftover ignored
         os.environ.pop('DREAMER_DISTURBANCE_PROB_WM', None)
         os.environ['DREAMER_HIDDEN_DISTURBANCE'] = '0'
-        assert hidden_disturbance_enabled(cfg=c) is False
-        c_on = TrainConfig()
-        c_on.hidden_disturbance = True
-        c_on._explicit_fields = {'hidden_disturbance'}  # type: ignore
-        assert hidden_disturbance_enabled(cfg=c_on) is True  # explicit beats leftover
+        assert hidden_disturbance_enabled(cfg=c) is True  # leftover ignored
+        c_off = TrainConfig()
+        c_off.hidden_disturbance = False
+        assert hidden_disturbance_enabled(cfg=c_off) is False
         from utils.hidden_disturbance import (
             _knob_bool, force_val_hidden_dist_spread)
         os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '0'
         c_spread = TrainConfig()
+        assert _knob_bool(c_spread, 'hidden_dist_spread',
+                          'DREAMER_HIDDEN_DIST_SPREAD', True) is True  # leftover ignored
+        c_spread.hidden_dist_spread = False
         assert _knob_bool(c_spread, 'hidden_dist_spread',
                           'DREAMER_HIDDEN_DIST_SPREAD', True) is False
         with force_val_hidden_dist_spread(c_spread):
@@ -4670,7 +4679,7 @@ def _test_noise_hidden_cfg() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
-    print('[smoke] OK  process-noise / hidden-load TrainConfig + leftover env identity')
+    print('[smoke] OK  process-noise / hidden-load TrainConfig; leftover DREAMER_* ignored')
 
 
 def _test_gpu_calib_cfg() -> None:

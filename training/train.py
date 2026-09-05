@@ -1597,11 +1597,11 @@ class TrainConfig:
     # trains ``wm_ss_match``).
     clean_steady_seeds: bool = True
     process_noise_curriculum: bool = True
-    # Noise / hidden-load schedule (were leftover ``os.environ.get`` in
-    # ``utils/noise_config.py`` / ``utils/hidden_disturbance.py`` —
-    # worked, missing from ``run_plan``).  Identity defaults.  Strings
-    # are unitless ``start:reach`` / ``lo:hi`` / CSV weights.
+    # Noise / hidden-load schedule. Identity defaults. Strings are
+    # unitless ``start:reach`` / ``lo:hi`` / CSV weights.
     # ``hidden_ou_prob_max < 0`` = follow ``disturbance_prob_wm``.
+    # A/B via ``ENV_OVERRIDES`` / ``_cfg_from_env`` only (P92-live
+    # leftover helper dual-read REMOVED).
     process_noise_amp_ramp: str = '0.0:0.4'
     hidden_disturbance: bool = True
     hidden_ou_amp_ramp: str = '0.1:0.4'

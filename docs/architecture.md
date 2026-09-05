@@ -276,7 +276,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > `AGENT_DISTURBANCE_*` is not read)
 > plus expert move-law (`expert_move_frac` / `backoff_frac` / …;
 > leftover helper `DREAMER_EXPERT_*` **REMOVED** P92-live; `_cfg_from_env`
-> only)
+> only) and noise/hidden-load helper dual-read **REMOVED** P92-live
+> (`process_noise_amp_ramp` / `hidden_dist_*` / `hidden_ou_*` /
+> `disturbance_prob_*`; `_cfg_from_env` only)
 > and CLI extras (`POLICY_*` /
 > `GRAD_CLIP` / seed counts / plant-derived arch) that `single_run`
 > used to drop are TrainConfig + `ENV_OVERRIDES`. Val/diag pin

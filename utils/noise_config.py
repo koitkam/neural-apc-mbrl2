@@ -277,27 +277,24 @@ def noise_curriculum_scale(progress: float,
     100 % of episodes, so the plant never sits still.  Ramping noise from ~0
     lets P1 establish the attractor before noise is added.
 
-    Schedule: TrainConfig ``process_noise_amp_ramp`` / leftover
-    ``DREAMER_PROCESS_NOISE_AMP_RAMP="<start>:<reach>"`` (default
-    ``"0.0:0.4"`` \u2014 start fully clean, reach full noise by 40 % progress).
-    ``start``: scale at ``progress=0``.  ``reach``: progress fraction at which
-    the scale reaches 1.0.  Phase-aware: **P3 always returns 1.0** (the WM is
-    frozen and the actor must learn to reject realistic-magnitude noise);
-    P1/P2 follow the ramp.  Disable the curriculum entirely (full noise from
-    step 0, legacy behaviour) with ramp ``"1.0:1e-6"`` or by setting
+    Schedule: TrainConfig ``process_noise_amp_ramp``
+    (``"<start>:<reach>"``; A/B ``DREAMER_PROCESS_NOISE_AMP_RAMP`` via
+    ``ENV_OVERRIDES``). Default ``"0.0:0.4"`` — start fully clean, reach
+    full noise by 40 % progress. ``start``: scale at ``progress=0``.
+    ``reach``: progress fraction at which the scale reaches 1.0.
+    Phase-aware: **P3 always returns 1.0** (the WM is frozen and the actor
+    must learn to reject realistic-magnitude noise); P1/P2 follow the ramp.
+    Disable the curriculum entirely (full noise from step 0, legacy
+    behaviour) with ramp ``"1.0:1e-6"`` or by setting
     ``process_noise_curriculum=False`` on the cfg.
 
-    Dual-read: explicit TrainConfig wins; leftover env wins if not explicit;
-    else cfg default.  Unset → ``0.0:0.4``.  Empty leftover env → 1.0
-    (full noise, same as the historical ``os.environ.get`` empty-string path).
+    TrainConfig field only (P92-live leftover helper dual-read REMOVED).
+    Unset cfg → ``0.0:0.4``. Empty field → 1.0 (full noise sentinel).
     """
     if phase is not None and int(phase) >= 3:
         return 1.0
     from utils.hidden_disturbance import _knob_raw
-    raw, leftover = _knob_raw(cfg, 'process_noise_amp_ramp',
-                              'DREAMER_PROCESS_NOISE_AMP_RAMP')
-    if leftover and (raw is None or str(raw).strip() == ''):
-        return 1.0
+    raw, _leftover = _knob_raw(cfg, 'process_noise_amp_ramp')
     text = '0.0:0.4' if raw is None else str(raw).strip()
     if not text:
         return 1.0
