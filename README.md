@@ -257,7 +257,7 @@ search *and* keep warm-starting model weights.
 | `DREAMER_BATCH_SIZE` | pin `batch_size` (else empirical GPU-calib). Leftover `OBJ_BATCH_SIZE` is ignored. |
 | `DREAMER_TARGET_UTIL` | GPU-calib VRAM fraction (default 0.80). Dual-read at probe. |
 | `DREAMER_MAX_BS` | GPU-calib hard ceiling (default 512). Dual-read at probe. |
-| `SIM_EPISODE_LENGTH` | force episode length (else auto from settling time) |
+| `DREAMER_EPISODE_LENGTH` | force episode length (else auto from settling time). Leftover `SIM_EPISODE_LENGTH` is ignored; `single_run` still writes `SIM_EPISODE_LENGTH` after derivation as IPC. |
 | `SIM_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10`) |
 | `SEED` | RNG seed (default 0) |
 | `DREAMER_ATTN_IMPL` | `auto` (default: SDPA on CUDA) / `sdpa` / `manual`. Leftover `DREAMER_FAST_ATTN` (`1`/`sdpa`, `0`/`manual`) maps to the same field. |
@@ -523,7 +523,7 @@ early via the `on_iter_end` callback in the trainer.
 |---|---|---|---|
 | `batch_size` | 16 | nearest power of two filling `gpu_target_util` of GPU memory (empirical probe); ceiling `gpu_max_bs` | `DREAMER_BATCH_SIZE` |
 | `reward_scale` | 1.0 | `target_std=1.0 / measured_raw_std`, clamped ≥ 1.0 | `DREAMER_OBJ_REWARD_SCALE` |
-| `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `SIM_EPISODE_LENGTH` |
+| `episode_length` | 600 | `20 × (τ + θ)` clamped to `[500, 4000]` | `DREAMER_EPISODE_LENGTH` (leftover `SIM_EPISODE_LENGTH` ignored) |
 | `sample_rate` | 5 | `min(τ_fast / 10, θ_fast / 2)` | `SIM_SAMPLE_RATE` |
 | `seq_len` | 64 | `max(64, ⌈(3τ + θ) / sr⌉)` | — |
 | `model_size` | M | `S/M/L` from complexity score | — |

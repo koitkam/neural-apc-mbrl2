@@ -182,8 +182,8 @@ class TrainConfig:
     # reads these then leftover ``DREAMER_EPISODE_SETTLE_MULTIPLE`` /
     # ``DREAMER_EPISODE_MIN_LENGTH`` / ``DREAMER_EPISODE_MAX_LENGTH``.
     # Identity: 20 / 500 / 4000 (test_sim τ=53 θ=8 → 1220).  Changing
-    # the dataclass sizes L.  Explicit ``SIM_EPISODE_LENGTH`` still
-    # hard-overrides the derived length.
+    # the dataclass sizes L.  Explicit pin is ``DREAMER_EPISODE_LENGTH``.
+    # Leftover ``SIM_EPISODE_LENGTH`` is ignored at derive (P92-live).
     episode_settle_multiple: float = 20.0
     episode_min_length: int = 500
     episode_max_length: int = 4000
@@ -12049,6 +12049,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     p1_last_ok_iter: int = -1
     p1_last_ok_locked: bool = False
     p1_last_ok_gain_ready_locked: bool = False
+    p1_skip_storm_gain_ready: Optional[bool] = None
+    p1_skip_storm_gain_worst: Optional[float] = None
     p1_recon_best: Optional[float] = None
     p1_gain_not_ready_capped: bool = False
     p1_detonated_freeze_restored: bool = False
@@ -14335,6 +14337,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 'p1_last_ok_locked': bool(p1_last_ok_locked),
                 'p1_last_ok_gain_ready_locked': bool(
                     p1_last_ok_gain_ready_locked),
+                'p1_skip_storm_gain_ready': (
+                    bool(p1_skip_storm_gain_ready)
+                    if p1_skip_storm_gain_ready is not None else None),
+                'p1_skip_storm_gain_worst': (
+                    float(p1_skip_storm_gain_worst)
+                    if p1_skip_storm_gain_worst is not None else None),
                 'p1_recon_best': (float(p1_recon_best)
                                   if p1_recon_best is not None else None),
                 'wm_score_ema': (float(wm_score_ema)
@@ -14837,17 +14845,40 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             # Probe restored weights: cap-path sets
                             # actor_experiment_valid; continue-path
                             # stay-locks a GAIN-READY last_ok (P91).
+                            # Print the 5-level line (P92 LIVE storm-1
+                            # unlock had no probe dump — teacher jsonl
+                            # ≠ GAIN-READY).
                             _storm_gain_ready = None
+                            _gp = None
                             try:
                                 _gp = _probe_observer_gain_ready(
                                     model, env, device, cfg)
                                 if _gp is not None and 'gain_ready' in _gp:
                                     _storm_gain_ready = bool(_gp['gain_ready'])
+                                    p1_skip_storm_gain_ready = _storm_gain_ready
+                                    if _gp.get('worst_ratio') is not None:
+                                        p1_skip_storm_gain_worst = float(
+                                            _gp['worst_ratio'])
                                     if (not _continue_p1
                                             and not _storm_gain_ready):
                                         p1_gain_not_ready_capped = True
-                            except Exception:
-                                pass
+                            except Exception as _e_storm_gp:
+                                print(f'[skip-storm] gain-probe failed: '
+                                      f'{_e_storm_gp!r}', flush=True)
+                            if _gp is not None:
+                                try:
+                                    print(
+                                        f'[skip-storm] gain-probe '
+                                        f'{_format_gain_probe_line(_gp)}',
+                                        flush=True)
+                                except Exception as _e_storm_fmt:
+                                    print(f'[skip-storm] gain-probe '
+                                          f'ready={_storm_gain_ready} '
+                                          f'(format failed: {_e_storm_fmt!r})',
+                                          flush=True)
+                            else:
+                                print('[skip-storm] gain-probe None '
+                                      '(unlock)', flush=True)
                             if _should_unlock_last_ok_after_skip_storm(
                                     continue_p1=_continue_p1,
                                     restored_gain_ready=_storm_gain_ready):
@@ -15293,6 +15324,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             if p1_last_ok_iter >= 0 else None),
         'p1_last_ok_locked': bool(p1_last_ok_locked),
         'p1_last_ok_gain_ready_locked': bool(p1_last_ok_gain_ready_locked),
+        'p1_skip_storm_gain_ready': (
+            bool(p1_skip_storm_gain_ready)
+            if p1_skip_storm_gain_ready is not None else None),
+        'p1_skip_storm_gain_worst': (
+            float(p1_skip_storm_gain_worst)
+            if p1_skip_storm_gain_worst is not None else None),
         'p1_gain_not_ready_capped': bool(p1_gain_not_ready_capped),
         'p1_detonated_freeze_restored': bool(p1_detonated_freeze_restored),
         'actor_experiment_valid': _actor_experiment_valid(
@@ -15310,11 +15347,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 # seed-count / ``DREAMER_BATCH_SIZE`` into ``ENV_OVERRIDES``; applying
 # them here first then again in the whitelist was a double-setattr.
 # ``_cfg_from_env`` still calls ``apply_dreamer_env_overrides`` after
-# this loop.  ``SIM_EPISODE_LENGTH`` is also read at
-# ``derive_episode_length`` (explicit leftover still wins).
+# this loop.  Episode-length pin is ``DREAMER_EPISODE_LENGTH``
+# (whitelist).  Leftover ``SIM_EPISODE_LENGTH`` is ignored (P92-live).
 _CLI_ONLY_ENV = (
     ('AGENT_TOTAL_STEPS', 'total_steps', int),
-    ('SIM_EPISODE_LENGTH', 'episode_length', int),
     ('SIM_SAMPLE_RATE', 'sample_rate', int),
     ('CONTROLLER_OUT_DIR', 'out_dir', str),
 )

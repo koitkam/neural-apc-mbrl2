@@ -4,9 +4,14 @@ The goal is to give slow plants (large tau + dead_time) enough samples per
 episode to see the step response settle, while keeping fast plants from
 wasting training time on padded tails.  Resolution order:
 
-1. Explicit env ``SIM_EPISODE_LENGTH`` (user / BO override) — always wins.
+1. Canonical ``DREAMER_EPISODE_LENGTH`` (explicit pin).
 2. Identified dynamics: ``k * (tau + dead_time)`` steps, floored + ceilinged.
 3. Fallback: ``default_fallback`` (1000).
+
+Leftover ``SIM_EPISODE_LENGTH`` is ignored at derive time (P92-live;
+login leftover was a silent A/B).  ``single_run`` / BO still WRITE
+``SIM_EPISODE_LENGTH`` after derivation as IPC for env / validate
+(same class as ``SIM_NOISE_CONFIG_JSON``).
 
 All numbers come from :mod:`utils.dynamics_identifier` via the
 ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME`` environment variables
@@ -37,11 +42,12 @@ def episode_formula_knobs() -> Tuple[float, int, int]:
     ``single_run`` / BO call ``derive_episode_length`` before a plant-filled
     ``TrainConfig`` exists, so the formula used to hard-code ``20 / 500 /
     4000``.  Identity for env-free: those numbers **are** the TrainConfig
-    defaults.  Changing the dataclass now actually sizes L.  Leftover
+    defaults.  Changing the dataclass now actually sizes L.  Canonical
     ``DREAMER_EPISODE_SETTLE_MULTIPLE`` / ``DREAMER_EPISODE_MIN_LENGTH`` /
-    ``DREAMER_EPISODE_MAX_LENGTH`` still win when set (same keys as
-    ``ENV_OVERRIDES``).  Does **not** call ``apply_dreamer_env_overrides``.
-    Explicit ``SIM_EPISODE_LENGTH`` still hard-overrides the derived length.
+    ``DREAMER_EPISODE_MAX_LENGTH`` still apply when set (same keys as
+    ``ENV_OVERRIDES``; probe-before-cfg A/B).  Does **not** call
+    ``apply_dreamer_env_overrides`` (would reprint ``[env-override]``).
+    Leftover ``SIM_EPISODE_LENGTH`` is ignored.
     """
     k = 20.0
     min_len = 500
@@ -85,21 +91,20 @@ def derive_episode_length(
 ) -> Tuple[int, str]:
     """Return ``(episode_length, source)``.
 
-    - ``source='env'``: user-set SIM_EPISODE_LENGTH.
+    - ``source='env:DREAMER_EPISODE_LENGTH'``: canonical explicit pin.
     - ``source='auto:{k}x_tau_plus_dt'``: derived from identified dynamics.
     - ``source='default'``: fallback (no identification available).
 
     Formula inputs come from ``episode_formula_knobs()`` (TrainConfig
-    then leftover ``DREAMER_EPISODE_*``).  Explicit args override the
-    dataclass; leftover env still wins over an explicit arg (same
-    historical A/B as ``derive_horizon``).
+    then canonical ``DREAMER_EPISODE_*``).  Explicit args override the
+    dataclass.  Leftover ``SIM_EPISODE_LENGTH`` is ignored (P92-live).
     """
-    env_raw = os.environ.get('SIM_EPISODE_LENGTH', '').strip()
-    if env_raw:
+    pin = os.environ.get('DREAMER_EPISODE_LENGTH', '').strip()
+    if pin:
         try:
-            v = int(float(env_raw))
+            v = int(float(pin))
             if v > 0:
-                return v, 'env'
+                return v, 'env:DREAMER_EPISODE_LENGTH'
         except Exception:
             pass
 
@@ -107,25 +112,6 @@ def derive_episode_length(
     k = kn_k if settle_multiple is None else float(settle_multiple)
     min_len = kn_min if min_length is None else int(min_length)
     max_len = kn_max if max_length is None else int(max_length)
-    # Leftover env still wins over an explicit arg (historical A/B).
-    raw = os.environ.get('DREAMER_EPISODE_SETTLE_MULTIPLE', '').strip()
-    if raw:
-        try:
-            k = float(raw)
-        except ValueError:
-            pass
-    raw = os.environ.get('DREAMER_EPISODE_MIN_LENGTH', '').strip()
-    if raw:
-        try:
-            min_len = int(float(raw))
-        except ValueError:
-            pass
-    raw = os.environ.get('DREAMER_EPISODE_MAX_LENGTH', '').strip()
-    if raw:
-        try:
-            max_len = int(float(raw))
-        except ValueError:
-            pass
     min_len = max(2, int(min_len))
     max_len = max(min_len, int(max_len))
 

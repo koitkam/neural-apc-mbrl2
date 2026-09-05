@@ -885,6 +885,7 @@ def _test_cfg_from_env_whitelist() -> None:
         'DREAMER_EPISODE_SETTLE_MULTIPLE': '10',
         'DREAMER_EPISODE_MIN_LENGTH': '700',
         'DREAMER_EPISODE_MAX_LENGTH': '2000',
+        'DREAMER_EPISODE_LENGTH': '900',
         'DREAMER_INIT_RANDOMIZATION': '0',
         'DREAMER_INIT_RANDOMIZATION_FRAC': '0.4',
         'DREAMER_WM_OVERHEAD': '1.5',
@@ -985,6 +986,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert abs(float(cfg.episode_settle_multiple) - 10.0) < 1e-12
         assert int(cfg.episode_min_length) == 700
         assert int(cfg.episode_max_length) == 2000
+        assert int(cfg.episode_length) == 900
         assert cfg.init_randomization is False
         assert abs(float(cfg.init_randomization_frac) - 0.4) < 1e-12
         assert abs(float(cfg.wm_overhead) - 1.5) < 1e-12
@@ -1062,6 +1064,7 @@ def _test_cfg_from_env_whitelist() -> None:
         assert 'episode_settle_multiple' in explicit
         assert 'episode_min_length' in explicit
         assert 'episode_max_length' in explicit
+        assert 'episode_length' in explicit
         assert 'init_randomization' in explicit
         assert 'init_randomization_frac' in explicit
         assert 'wm_overhead' in explicit
@@ -1207,7 +1210,7 @@ def _test_cli_only_env_disjoint() -> None:
     assert not overlap, overlap
     kept = {k for k, _, _ in _CLI_ONLY_ENV}
     assert kept == {
-        'AGENT_TOTAL_STEPS', 'SIM_EPISODE_LENGTH', 'SIM_SAMPLE_RATE',
+        'AGENT_TOTAL_STEPS', 'SIM_SAMPLE_RATE',
         'CONTROLLER_OUT_DIR',
     }
     print('[smoke] OK  _CLI_ONLY_ENV disjoint from ENV_OVERRIDES')
@@ -2034,6 +2037,9 @@ def _test_isolation_dcv_scales() -> None:
     assert "'p1_last_ok_iter'" in _src
     assert "'p1_last_ok_locked'" in _src
     assert "'p1_last_ok_gain_ready_locked'" in _src
+    assert "'p1_skip_storm_gain_ready'" in _src
+    assert "'p1_skip_storm_gain_worst'" in _src
+    assert '[skip-storm] gain-probe' in _src
     assert '_should_unlock_last_ok_after_skip_storm' in _src
     assert 'stay-locked after ' in _src
     assert 'p1_skip_storm_gain_ready_locked' in _src
@@ -2555,6 +2561,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_EPISODE_SETTLE_MULTIPLE' in ENV_OVERRIDES
     assert 'DREAMER_EPISODE_MIN_LENGTH' in ENV_OVERRIDES
     assert 'DREAMER_EPISODE_MAX_LENGTH' in ENV_OVERRIDES
+    assert 'DREAMER_EPISODE_LENGTH' in ENV_OVERRIDES
     assert 'DREAMER_INIT_RANDOMIZATION' in ENV_OVERRIDES
     assert 'DREAMER_INIT_RANDOMIZATION_FRAC' in ENV_OVERRIDES
     assert 'DREAMER_WM_OVERHEAD' in ENV_OVERRIDES
@@ -4464,7 +4471,8 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
     keys = (
         'DREAMER_HORIZON_MAX', 'DREAMER_HORIZON_SETTLE_NTAU',
         'DREAMER_EPISODE_SETTLE_MULTIPLE', 'DREAMER_EPISODE_MIN_LENGTH',
-        'DREAMER_EPISODE_MAX_LENGTH', 'SIM_EPISODE_LENGTH',
+        'DREAMER_EPISODE_MAX_LENGTH', 'DREAMER_EPISODE_LENGTH',
+        'SIM_EPISODE_LENGTH',
         'IDENTIFIED_TAU_DOMINANT', 'IDENTIFIED_DEAD_TIME',
         'DREAMER_INIT_RANDOMIZATION', 'DREAMER_INIT_RANDOMIZATION_FRAC',
     )
@@ -4532,7 +4540,10 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
         os.environ.pop('DREAMER_EPISODE_MAX_LENGTH', None)
         os.environ['SIM_EPISODE_LENGTH'] = '900'
         L4, lsrc4 = derive_episode_length()
-        assert L4 == 900 and lsrc4 == 'env', (L4, lsrc4)
+        assert L4 == 1220 and '20x_tau_plus_dt' in lsrc4, (L4, lsrc4)
+        os.environ['DREAMER_EPISODE_LENGTH'] = '900'
+        L5, lsrc5 = derive_episode_length()
+        assert L5 == 900 and lsrc5 == 'env:DREAMER_EPISODE_LENGTH', (L5, lsrc5)
     finally:
         for k, old in prev.items():
             if old is None:

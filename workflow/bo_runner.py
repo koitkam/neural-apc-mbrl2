@@ -585,8 +585,9 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
         print(f'[BO] init_from_ckpt={ckpt_path} '
               f'(applied to every trial + final retrain)', flush=True)
     # Sample-rate env override is supported here for sims that hard-code their
-    # scan rate.  Episode length is auto-derived from identification (or from
-    # SIM_EPISODE_LENGTH env via derive_episode_length).
+    # scan rate.  Episode length is auto-derived from identification (or
+    # from canonical ``DREAMER_EPISODE_LENGTH``).  Leftover
+    # ``SIM_EPISODE_LENGTH`` is ignored.
     sr_env = os.environ.get('SIM_SAMPLE_RATE', '').strip()
 
     print('[BO] Phase 1a: dynamics identification', flush=True)
@@ -651,9 +652,11 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
     print(f"[BO] lookback={plant['lookback']} (=seq_len; "
           f"identified={identified_lookback}, sr={sr})", flush=True)
 
-    # Episode length: SIM_EPISODE_LENGTH > auto-derived k·(τ+θ) >
+    # Episode length: DREAMER_EPISODE_LENGTH > auto-derived k·(τ+θ) >
     # paper fallback.  ``episode_formula_knobs()`` reads TrainConfig
-    # then leftover ``DREAMER_EPISODE_*`` (identity 20 / 500 / 4000).
+    # then canonical ``DREAMER_EPISODE_*`` (identity 20 / 500 / 4000).
+    # Leftover ``SIM_EPISODE_LENGTH`` ignored (P92-live).  Write it
+    # after derivation as IPC.
     from utils.auto_episode_length import derive_episode_length
     ep_len, ep_source = derive_episode_length()
     base.episode_length = int(ep_len)

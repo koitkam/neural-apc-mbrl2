@@ -249,7 +249,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > `derive_horizon` / sim `reset()` now
 > `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
 > 4.0/120 / ON/0.6). `derive_episode_length` now
-> `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; smoke green).
+> `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; leftover
+> `SIM_EPISODE_LENGTH` **ignored** P92-live; pin `DREAMER_EPISODE_LENGTH`;
+> `single_run` still writes `SIM_EPISODE_LENGTH` as IPC).
 > GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
 > longer silently uses WM-only 1.0). Missing SysID keys do **not**

@@ -323,12 +323,16 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_HORIZON_SETTLE_NTAU': ('horizon_settle_n_tau',       float),
     'DREAMER_HORIZON_MAX':         ('horizon_max',                int),
     # Formula inputs for ``derive_episode_length``.  Identity 20 / 500 / 4000.
-    # ``episode_formula_knobs()`` reads TrainConfig then leftover env
-    # (called before a plant-filled cfg exists).  Explicit
-    # ``SIM_EPISODE_LENGTH`` still hard-overrides the derived length.
+    # ``episode_formula_knobs()`` reads TrainConfig then canonical
+    # ``DREAMER_EPISODE_*`` (called before a plant-filled cfg exists).
+    # Leftover ``SIM_EPISODE_LENGTH`` ignored (P92-live).  Explicit pin
+    # is ``DREAMER_EPISODE_LENGTH`` (also applied here so run_plan
+    # records it).  ``single_run`` / BO still WRITE ``SIM_EPISODE_LENGTH``
+    # after derivation as IPC.
     'DREAMER_EPISODE_SETTLE_MULTIPLE': ('episode_settle_multiple', float),
     'DREAMER_EPISODE_MIN_LENGTH':       ('episode_min_length',     int),
     'DREAMER_EPISODE_MAX_LENGTH':      ('episode_max_length',      int),
+    'DREAMER_EPISODE_LENGTH':          ('episode_length',          int),
     # IC domain-randomization + GPU-calib overhead.  ``ic_randomization_knobs()``
     # / ``gpu_probe_knobs()`` read TrainConfig then leftover env (no plant-filled
     # cfg at those call sites).
