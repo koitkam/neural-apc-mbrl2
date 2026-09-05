@@ -188,10 +188,10 @@ class TrainConfig:
     episode_min_length: int = 500
     episode_max_length: int = 4000
     # Identified plant timing (seconds).  Sentinel 0 = fall back to
-    # leftover ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME``
-    # env (CLI / old paths).  ``single_run`` / ``bo_runner`` write the
-    # identifier values so APCEnv / PRBS / SNR do not depend on env
-    # (P49 GPU-occupied leftover; identity).
+    # IPC ``IDENTIFIED_TAU_DOMINANT`` / ``IDENTIFIED_DEAD_TIME``
+    # (CLI / old paths).  ``single_run`` / ``bo_runner`` write the
+    # identifier values so APCEnv / PRBS / SNR do not depend on env.
+    # Leftover ``SIM_IDENTIFIED_*`` ignored (P93-live).
     identified_tau_dominant: float = 0.0
     identified_dead_time: float = 0.0
 
@@ -2874,9 +2874,10 @@ class APCEnv:
 
         Prefer ``TrainConfig.identified_tau_dominant`` /
         ``identified_dead_time`` (set by ``single_run`` / ``bo_runner``).
-        Fall back to leftover ``IDENTIFIED_TAU_DOMINANT`` /
-        ``IDENTIFIED_DEAD_TIME`` env (CLI / old paths), then the sim's
-        own attributes.  Cached per env (timing is static for a
+        Fall back to IPC ``IDENTIFIED_TAU_DOMINANT`` /
+        ``IDENTIFIED_DEAD_TIME`` (CLI / old paths), then the sim's
+        own attributes.  Leftover ``SIM_IDENTIFIED_*`` ignored
+        (P93-live).  Cached per env (timing is static for a
         ``single_run``).
         """
         cached = getattr(self, '_plant_timing', None)
@@ -2912,13 +2913,13 @@ class APCEnv:
         sim = getattr(self, 'sim', None)
         tau = _cfgf('identified_tau_dominant', 'tau')
         if tau <= 0:
-            tau = _envf('IDENTIFIED_TAU_DOMINANT', 'SIM_IDENTIFIED_TAU_DOMINANT')
+            tau = _envf('IDENTIFIED_TAU_DOMINANT')
         if tau <= 0 and sim is not None:
             tau = float(getattr(sim, 'tau_dominant', 0.0)
                         or getattr(sim, 'tau', 0.0) or 0.0)
         dead = _cfgf('identified_dead_time', 'dead_time')
         if dead <= 0:
-            dead = _envf('IDENTIFIED_DEAD_TIME', 'SIM_IDENTIFIED_DEAD_TIME')
+            dead = _envf('IDENTIFIED_DEAD_TIME')
         if dead <= 0 and sim is not None:
             dead = float(getattr(sim, 'dead_time', 0.0) or 0.0)
         self._plant_timing = (float(tau), float(dead))
@@ -5536,9 +5537,9 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
     cont_buf = np.ones(T, dtype='float32')
     # Segment length: prefer cfg-supplied (auto-derived from plant
     # timing in auto_tune_seed_buffer ⇒ (θ + 4τ)/sr ≈ 98% settling
-    # time).  Fall back to ``cfg.identified_tau_dominant`` then leftover
-    # ``IDENTIFIED_TAU_DOMINANT`` / ``SIM_IDENTIFIED_TAU_DOMINANT`` and
-    # finally to a generous T/12 default.
+    # time).  Fall back to ``cfg.identified_tau_dominant`` then IPC
+    # ``IDENTIFIED_TAU_DOMINANT`` and finally to a generous T/12
+    # default.  Leftover ``SIM_IDENTIFIED_*`` ignored (P93-live).
     seg_cfg = int(getattr(cfg, 'prbs_seed_segment_steps', 0) or 0)
     if seg_cfg > 0:
         seg_max = max(8, min(seg_cfg, T // 4))
@@ -5549,9 +5550,6 @@ def collect_prbs_episode(env: APCEnv, cfg: TrainConfig, *,
             tau_dom = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
         except Exception:
             tau_dom = 0.0
-        if tau_dom <= 0:
-            tau_dom = float(os.environ.get(
-                'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
         if tau_dom <= 0:
             tau_dom = float(os.environ.get(
                 'IDENTIFIED_TAU_DOMINANT', '0') or 0)
@@ -11862,9 +11860,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         cfg, 'identified_tau_dominant', 0.0) or 0.0)
                 except Exception:
                     tau_dom = 0.0
-            if tau_dom <= 0:
-                tau_dom = float(os.environ.get(
-                    'SIM_IDENTIFIED_TAU_DOMINANT', '0') or 0)
             if tau_dom <= 0:
                 tau_dom = float(os.environ.get(
                     'IDENTIFIED_TAU_DOMINANT', '0') or 0)

@@ -244,22 +244,24 @@ class DomainRandomizer:
             except (TypeError, ValueError):
                 return float(default)
 
-        # Identified plant-dynamics fallbacks (env vars exported by the
-        # workflow after dynamics ID); only consulted when control_setup
-        # leaves the knob unset. This keeps per-plant defaults adaptive
-        # — a fast plant gets small actuator tau, a slow plant gets more.
-        env_tau = os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT', '').strip()
-        env_dead = os.environ.get('SIM_IDENTIFIED_DEAD_TIME', '').strip()
-        if identified_tau is None and env_tau:
-            try:
-                identified_tau = float(env_tau)
-            except Exception:
-                identified_tau = None
-        if identified_dead_time is None and env_dead:
-            try:
-                identified_dead_time = float(env_dead)
-            except Exception:
-                identified_dead_time = None
+        # Identified plant-dynamics fallbacks: caller args, then IPC
+        # ``IDENTIFIED_*`` that ``single_run`` writes after SysID.
+        # Leftover ``SIM_IDENTIFIED_*`` ignored (P93-live; login leftover
+        # was a silent A/B, and ``single_run`` never writes that name).
+        if identified_tau is None:
+            env_tau = os.environ.get('IDENTIFIED_TAU_DOMINANT', '').strip()
+            if env_tau:
+                try:
+                    identified_tau = float(env_tau)
+                except Exception:
+                    identified_tau = None
+        if identified_dead_time is None:
+            env_dead = os.environ.get('IDENTIFIED_DEAD_TIME', '').strip()
+            if env_dead:
+                try:
+                    identified_dead_time = float(env_dead)
+                except Exception:
+                    identified_dead_time = None
 
         # Output gain ±output_gain_pct (defaults to self.frac so it tracks
         # the top-level DR magnitude).

@@ -2135,6 +2135,15 @@ def _test_isolation_dcv_scales() -> None:
     assert "slot='iso'" in _src
     assert "slot='critic'" in _src
     assert "SIM_IDENTIFIED_TAU_DOMINANT', '50'" not in _src
+    assert 'SIM_IDENTIFIED_TAU_DOMINANT' not in _src
+    assert 'SIM_IDENTIFIED_DEAD_TIME' not in _src
+    _sn = _P(__file__).resolve().parents[1].joinpath('utils', 'sim_noise.py').read_text()
+    _or = _P(__file__).resolve().parents[1].joinpath(
+        'utils', 'objective_runtime.py').read_text()
+    assert "os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT'" not in _sn
+    assert "os.environ.get('SIM_IDENTIFIED_DEAD_TIME'" not in _sn
+    assert "os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT'" not in _or
+    assert "os.environ.get('SIM_IDENTIFIED_DEAD_TIME'" not in _or
     assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
@@ -2686,19 +2695,26 @@ def _test_envfree_observer_recipe() -> None:
 
 
 def _test_identified_tau_cfg() -> None:
-    """Plant τ/θ on TrainConfig; APCEnv cache; leftover env only when unset."""
+    """Plant τ/θ on TrainConfig; APCEnv cache; leftover SIM_IDENTIFIED_* ignored."""
     import os
+    from utils.objective_runtime import _plant_timing_for_integral
+    from utils.sim_noise import DomainRandomizer
     c = TrainConfig()
     c.identified_tau_dominant = 53.0
     c.identified_dead_time = 8.0
     env = APCEnv.__new__(APCEnv)
     env.cfg = c
     env.sim = None
-    prev_tau = os.environ.get('IDENTIFIED_TAU_DOMINANT')
-    prev_dead = os.environ.get('IDENTIFIED_DEAD_TIME')
+    keys = (
+        'IDENTIFIED_TAU_DOMINANT', 'IDENTIFIED_DEAD_TIME',
+        'SIM_IDENTIFIED_TAU_DOMINANT', 'SIM_IDENTIFIED_DEAD_TIME',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
     try:
         os.environ['IDENTIFIED_TAU_DOMINANT'] = '99'
         os.environ['IDENTIFIED_DEAD_TIME'] = '1'
+        os.environ['SIM_IDENTIFIED_TAU_DOMINANT'] = '50'
+        os.environ['SIM_IDENTIFIED_DEAD_TIME'] = '9'
         tau, dead = env._resolve_plant_timing()
         assert abs(tau - 53.0) < 1e-12, tau
         assert abs(dead - 8.0) < 1e-12, dead
@@ -2711,16 +2727,42 @@ def _test_identified_tau_cfg() -> None:
         tau0, dead0 = env0._resolve_plant_timing()
         assert abs(tau0 - 99.0) < 1e-12, tau0
         assert abs(dead0 - 1.0) < 1e-12, dead0
+        os.environ.pop('IDENTIFIED_TAU_DOMINANT', None)
+        os.environ.pop('IDENTIFIED_DEAD_TIME', None)
+        env_sim = APCEnv.__new__(APCEnv)
+        env_sim.cfg = TrainConfig()
+        env_sim.sim = None
+        tau_s, dead_s = env_sim._resolve_plant_timing()
+        assert abs(tau_s - 0.0) < 1e-12, tau_s  # leftover SIM_* ignored
+        assert abs(dead_s - 0.0) < 1e-12, dead_s
+        tau_p, dead_p = _plant_timing_for_integral(TrainConfig())
+        assert abs(tau_p - 0.0) < 1e-12, tau_p
+        assert abs(dead_p - 0.0) < 1e-12, dead_p
+        os.environ['IDENTIFIED_TAU_DOMINANT'] = '53'
+        os.environ['IDENTIFIED_DEAD_TIME'] = '8'
+        tau_i, dead_i = _plant_timing_for_integral(TrainConfig())
+        assert abs(tau_i - 53.0) < 1e-12, tau_i
+        assert abs(dead_i - 8.0) < 1e-12, dead_i
+        os.environ.pop('IDENTIFIED_TAU_DOMINANT', None)
+        os.environ.pop('IDENTIFIED_DEAD_TIME', None)
+        rd = DomainRandomizer(
+            domain_randomization=True, param_randomization_pct=0.10,
+            randomization_seed=0)
+        rd.sample_episode(n_dvs=0)
+        assert abs(rd.actuator_tau_steps - 0.0) < 1e-12, rd.actuator_tau_steps
+        os.environ['IDENTIFIED_TAU_DOMINANT'] = '50'
+        rd2 = DomainRandomizer(
+            domain_randomization=True, param_randomization_pct=0.10,
+            randomization_seed=0)
+        rd2.sample_episode(n_dvs=0)
+        assert rd2.actuator_tau_steps > 0.0, rd2.actuator_tau_steps
     finally:
-        if prev_tau is None:
-            os.environ.pop('IDENTIFIED_TAU_DOMINANT', None)
-        else:
-            os.environ['IDENTIFIED_TAU_DOMINANT'] = prev_tau
-        if prev_dead is None:
-            os.environ.pop('IDENTIFIED_DEAD_TIME', None)
-        else:
-            os.environ['IDENTIFIED_DEAD_TIME'] = prev_dead
-    print('[smoke] OK  identified tau/dead_time TrainConfig beats leftover env')
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  identified tau/dead_time TrainConfig; leftover SIM_IDENTIFIED_* ignored')
 
 
 def _test_objective_runtime_cfg() -> None:

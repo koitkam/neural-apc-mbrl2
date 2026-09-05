@@ -317,7 +317,8 @@ def _plant_timing_for_integral(cfg) -> Tuple[float, float]:
     """``(tau, dead)`` for integral dead-time damping.
 
     Prefer TrainConfig identified timing (``single_run`` writes it);
-    leftover ``IDENTIFIED_*`` / ``SIM_IDENTIFIED_*`` when the field is 0.
+    IPC ``IDENTIFIED_*`` when the field is 0.  Leftover
+    ``SIM_IDENTIFIED_*`` ignored (P93-live).
     """
     tau = 0.0
     dead = 0.0
@@ -331,13 +332,9 @@ def _plant_timing_for_integral(cfg) -> Tuple[float, float]:
         except Exception:
             dead = 0.0
     if tau <= 0.0:
-        tau = _safe_float(
-            os.environ.get('IDENTIFIED_TAU_DOMINANT')
-            or os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT'), 0.0)
+        tau = _safe_float(os.environ.get('IDENTIFIED_TAU_DOMINANT'), 0.0)
     if dead <= 0.0:
-        dead = _safe_float(
-            os.environ.get('IDENTIFIED_DEAD_TIME')
-            or os.environ.get('SIM_IDENTIFIED_DEAD_TIME'), 0.0)
+        dead = _safe_float(os.environ.get('IDENTIFIED_DEAD_TIME'), 0.0)
     return float(tau), float(dead)
 
 
