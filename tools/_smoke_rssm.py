@@ -95,6 +95,7 @@ from training.train import (
                             _gaussian_entropy_nats, _entropy_collapse_threshold,
                             _p3_mu_ratio_surrogate, _p3_frozen_unfreeze_policy,
                             _format_gain_probe_line,
+                            _gain_ready_combine,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
@@ -350,6 +351,23 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _should_skip_invalid_p3(actor_valid=True, skip_enabled=True)
     assert not _should_skip_invalid_p3(actor_valid=False, skip_enabled=False)
     print('[smoke] OK  skip_invalid_p3 default-on (GAIN_NOT_READY skips P3)')
+    r, cok = _gain_ready_combine(
+        unbiased=True, not_noisy=True, compound_ratio=0.638,
+        band_lo=0.80, band_hi=1.30)
+    assert r is False and cok is False
+    r, cok = _gain_ready_combine(
+        unbiased=True, not_noisy=True, compound_ratio=0.935,
+        band_lo=0.80, band_hi=1.30)
+    assert r is True and cok is True
+    r, cok = _gain_ready_combine(
+        unbiased=True, not_noisy=True, compound_ratio=None,
+        band_lo=0.80, band_hi=1.30)
+    assert r is True and cok is None
+    r, cok = _gain_ready_combine(
+        unbiased=False, not_noisy=True, compound_ratio=0.935,
+        band_lo=0.80, band_hi=1.30)
+    assert r is False and cok is True
+    print('[smoke] OK  GAIN-READY compounding 1step→OL in existing band (P93)')
     assert float(TrainConfig().skip_storm_last_ok_recon_ratio) == 5.0
     assert bool(TrainConfig().wm_best_restore_at_p2) is False
     assert bool(TrainConfig().wm_best_restore_at_p3) is False
@@ -5137,11 +5155,14 @@ def _test_format_gain_probe_line() -> None:
         'atH_min': 0.78, 'atH_max': 1.01,
         'ss_pairs': [('MV CV0<-MV0', 1.04), ('DV CV0<-DV0', 0.75)],
         'ath_pairs': [('MV CV0<-MV0', 1.01), ('DV CV0<-DV0', 0.78)],
+        'compound_ok': False, 'compound_1step_ol': 0.638,
     })
     assert 'DCgain_ratio[0.75,1.04]' in line
     assert '@H[0.78,1.01]' in line
     assert 'MV CV0<-MV0=1.04/@H=1.01' in line
     assert 'DV CV0<-DV0=0.75/@H=0.78' in line
+    assert '1step→OL=0.64' in line
+    assert 'compound_ok=False' in line
     line_lo = _format_gain_probe_line({
         'gain_ready': True,
         'r_min': 0.91, 'r_max': 1.02,

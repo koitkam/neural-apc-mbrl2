@@ -2152,6 +2152,10 @@ class TrainConfig:
     # When live recon is > ``skip_storm_last_ok_recon_ratio`` × best, the
     # probe runs on last-ok (P50 wrap-adjacent MV ×1.37 EXTEND), then
     # restores live weights. Healthy-recon gates are unchanged.
+    # P93: READY also requires 1step→OL compounding in the SAME band
+    # (P92 freeze 0.84@DV 5-level READY, val 1step→OL ×0.638 — 5-level
+    # ss/@H is compounding-blind, same class as recon-health is gain-blind).
+    # No new field; missing/failed decomp is identity (do not fail closed).
     p1_gain_gate: bool = True
     gain_ready_lo: float = 0.80
     gain_ready_hi: float = 1.30
@@ -10039,8 +10043,34 @@ def _probe_wm_fidelity(model, env, device, cfg: 'TrainConfig'):
     return result
 
 
+def _gain_ready_combine(
+        *,
+        unbiased: bool,
+        not_noisy: bool,
+        compound_ratio: Optional[float],
+        band_lo: float,
+        band_hi: float,
+) -> Tuple[bool, Optional[bool]]:
+    """READY = unbiased AND not-noisy AND compounding in band if measured.
+
+    ``compound_ratio`` is 1step→OL (unitless).  Missing/NaN is identity
+    (P93: do not fail closed if the decomp import/roll fails).  Same
+    ``[gain_ready_lo, gain_ready_hi]`` as DC-gain — no new field.
+    """
+    compound_ok: Optional[bool] = None
+    if compound_ratio is not None:
+        try:
+            r = float(compound_ratio)
+        except (TypeError, ValueError):
+            r = float('nan')
+        if math.isfinite(r):
+            compound_ok = bool(band_lo <= r <= band_hi)
+    ready = bool(unbiased and not_noisy and (compound_ok is not False))
+    return ready, compound_ok
+
+
 def _format_gain_probe_line(probe: dict) -> str:
-    """Compact P1-gate line: ss + @H per input + unbiased/noise."""
+    """Compact P1-gate line: ss + @H per input + unbiased/noise + 1step→OL."""
     pairs = probe.get('ss_pairs') or []
     ath_map = {n: r for n, r in (probe.get('ath_pairs') or [])}
     bits = []
@@ -10052,6 +10082,14 @@ def _format_gain_probe_line(probe: dict) -> str:
     pair_s = ' '.join(bits)
     extra = (f" unbiased={bool(probe.get('unbiased'))}"
              f" not_noisy={bool(probe.get('not_noisy'))}")
+    if probe.get('compound_ok') is not None:
+        extra += f" compound_ok={bool(probe.get('compound_ok'))}"
+    cr = probe.get('compound_1step_ol')
+    if cr is not None:
+        try:
+            extra += f" 1step→OL={float(cr):.2f}"
+        except (TypeError, ValueError):
+            pass
     if probe.get('probed_last_ok'):
         extra += f" last_ok_iter={probe.get('last_ok_iter')}"
     if pair_s:
@@ -10079,17 +10117,19 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     gain_fid / per-batch-iso proxies are too noisy (p19 froze a x0.43 g on a
     lucky batch).  For every MV and DV input, at ``n_levels`` operating points
     spanning the band, it settles the env, steps the input, rolls the WM
-    open-loop AND the REAL sim, and compares dCV/dinput.  Certifies THREE
-    control-relevant properties the user requires:
+    open-loop AND the REAL sim, and compares dCV/dinput.  Certifies:
 
-      * UNBIASED   — the aggregate DC-gain AND at-horizon gain match the real
-        plant (ratio in [lo, hi]);
+      * UNBIASED   — aggregate DC-gain matches the real plant (ratio in [lo, hi]);
+        at-horizon gain is reported (diagnostic, not a hard gate);
       * NOT NOISY  — the WM's open-loop gain is CONSISTENT across operating points
         (its per-level gain band is not much wider than the REAL plant's own, and
         never flips sign vs the real gain).  p19's bad g had a gain band
         [-1.65, +1.30] (sign flips) — exactly the "noisy observer" symptom;
       * STABLE     — measured on the SETTLED open-loop rollout (a diverging WM
-        fails the ratio/at-horizon check).
+        fails the ratio check);
+      * NOT COMPOUNDING (P93) — 1step→OL in the same [lo, hi] band.  P92 freeze
+        5-level ss/@H READY 0.84@DV but val 1step→OL ×0.638: ss/@H is
+        compounding-blind.  Missing decomp is identity (do not fail closed).
 
     simulator-AGNOSTIC (the REAL plant is the reference; operating band from the
     env) and NONLINEAR-ROBUST (the noise check compares the WM's gain spread to
@@ -10170,18 +10210,54 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
     noise_max = float(getattr(cfg, 'gain_ready_noise_max', 3.0))
     flip_max = int(getattr(cfg, 'gain_ready_flip_max', 1) or 1)
     worst_noise = float(max(noises)) if noises else 0.0
-    # READY = UNBIASED (every MV+DV DC-gain ratio in band) AND NOT-NOISY (the
-    # deterministic open-loop gain is consistent across operating points: its
-    # spread is not >>the real plant's own, and it never flips sign vs the real
-    # gain).  Both are STABLE under sample=False (p20: P18 gain 1.1 / noise 1.5x
-    # / 0 flips = ready; P19 gain 0.67 / noise 6.3x / 4 flips = not ready).
+    # READY = UNBIASED (every MV+DV DC-gain ratio in band) AND NOT-NOISY
+    # AND compounding (1step→OL in the same band when measured; P93).
+    # atH stays diagnostic (P92 freeze @H was already in band).
     unbiased = all(band_lo <= r <= band_hi for r in srs)
     not_noisy = (worst_noise <= noise_max) and (flips <= flip_max)
     worst_name, worst_ratio = min(
         ss_ratios, key=lambda x: min(x[1] - band_lo, band_hi - x[1]))
+    compound_ratio = None
+    if unbiased and not_noisy:
+        try:
+            from evaluation.wm_transfer_matrix import (
+                resolve_wm_tf_knobs, wm_tf_roll_len)
+            from tools.wm_posterior_prior_probe import (
+                compute_posterior_prior_decomp)
+            env._disturbance_prob_override = 0.0
+            _tf_h = resolve_wm_tf_knobs(cfg)['horizon']
+            _pp_h = wm_tf_roll_len(cfg, _tf_h)
+            with torch.no_grad():
+                pp = compute_posterior_prior_decomp(
+                    model, env, cfg, device, obs_std=obs_std,
+                    horizon=_pp_h, settle=_pp_h)
+            if isinstance(pp, dict) and pp.get('enabled'):
+                compound_ratio = pp.get('decomp_1step_to_openloop')
+        except Exception as e:
+            print(f'[gain-ready-probe] compounding decomp skipped: {e!r}',
+                  flush=True)
+            compound_ratio = None
+        finally:
+            try:
+                env._disturbance_prob_override = _dprob
+            except Exception:
+                pass
+    ready, compound_ok = _gain_ready_combine(
+        unbiased=unbiased, not_noisy=not_noisy,
+        compound_ratio=compound_ratio, band_lo=band_lo, band_hi=band_hi)
+    cr_out = None
+    if compound_ratio is not None:
+        try:
+            _cr = float(compound_ratio)
+            if math.isfinite(_cr):
+                cr_out = _cr
+        except (TypeError, ValueError):
+            cr_out = None
     return {
-        'gain_ready': bool(unbiased and not_noisy),
+        'gain_ready': bool(ready),
         'unbiased': bool(unbiased), 'not_noisy': bool(not_noisy),
+        'compound_ok': compound_ok,
+        'compound_1step_ol': cr_out,
         'r_min': float(min(srs)), 'r_max': float(max(srs)),
         'worst_ratio': float(worst_ratio), 'worst_input': worst_name,
         'atH_min': float(min(r for _, r in ath_pairs)) if ath_pairs else None,
