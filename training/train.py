@@ -4232,17 +4232,42 @@ def _dob_ground_hp_window(cfg: 'TrainConfig', T: int) -> int:
 def _dob_ground_hp_mse(
         ds: torch.Tensor, dt: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Wiener MSE on the tensors passed in. Returns ``(mse, std_ratio.detach())``.
+    """Level Wiener MSE. Returns ``(mse, std_ratio.detach())``.
 
-    P101 callers pass **raw** ``d`` / load (HP crop-demean crushed
-    Luenberger K). P98 callers passed HP tensors. P94–P97 z-score +
-    log-std amp **REVERT**. P97 recon-sg already stop-grads Kalman from
-    recon so this term is the K trainer (A pinned). jsonl
-    ``dob_ground_std_ratio`` stays detached observability (not a loss).
+    Helper / smoke identity. **Not** the P2 training ground after P102
+    (increment MSE). P101 used this on raw ``d`` / load; P98 on HP
+    tensors. P94–P97 z-score + log-std amp **REVERT**. jsonl
+    ``dob_ground_std_ratio`` is detached observability (not a loss).
     """
     ds_f = ds.float()
     dt_f = dt.float()
     mse = (ds_f - dt_f).pow(2).mean()
+    d_std = ds_f.std().clamp_min(1e-6)
+    t_std = dt_f.std().clamp_min(1e-6)
+    return mse, (d_std / t_std).detach()
+
+
+def _dob_ground_inc_mse(
+        ds: torch.Tensor, dt: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+    """First-difference MSE. ``std_ratio`` is level-amp observability.
+
+    Luenberger ``d_t = A d_{t-1} + K ν_t`` settles at ``K/(1−A)·ν`` for a
+    persistent load. P101 level MSE fitted that DC into ``d`` (val det_r
+    **0.197**, drift_sd **1.33**). P100 crop-demean HP wanted ``E[d]=0``
+    and crushed K to Joseph ``1/A``. Increment MSE is DC-blind without
+    asking ``E[d]=0``: settled SS has ``Δd=0=Δload``, and K trains on
+    load *changes*. jsonl ``std_ratio`` stays ``std(d)/std(load)`` so amp
+    is comparable to P101. No new field. ``T<2`` falls back to level MSE.
+    """
+    ds_f = ds.float()
+    dt_f = dt.float()
+    if int(ds_f.shape[1]) < 2:
+        mse = (ds_f - dt_f).pow(2).mean()
+    else:
+        mse = (
+            (ds_f[:, 1:] - ds_f[:, :-1]) - (dt_f[:, 1:] - dt_f[:, :-1])
+        ).pow(2).mean()
     d_std = ds_f.std().clamp_min(1e-6)
     t_std = dt_f.std().clamp_min(1e-6)
     return mse, (d_std / t_std).detach()
@@ -4401,10 +4426,10 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
     from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
     _gru_zb = float(_gru_zbias_fn(_h_zb))
-    # P101: training ground is raw MSE (HP crop-demean crushed Luenberger K).
-    # ``_dob_ground_hp_window`` stays the val-protocol formula (smoke / A/B
-    # via ``disturbance_detrend_settle_mult<=0``); banner prints the
-    # *training* window (0).
+    # P102: training ground is increment MSE (P101 level MSE dumped DC
+    # into d; P100 HP crop-demean crushed K). Banner window stays 0
+    # (no crop-demean). ``_dob_ground_hp_window`` remains the val-protocol
+    # formula (smoke / A/B via ``disturbance_detrend_settle_mult<=0``).
     _hpw = 0
     print(
         '[resolved-cfg] '
@@ -4442,6 +4467,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gru_zbias={_gru_zb:.3g} "
         f"dob_hp={_hpw} "
         f"dob_hpamp=mse "
+        f"dob_inc=True "
         f"dob_reconsg=True "
         f"dob_afreeze=True "
         f"dob_luen=True "
@@ -8988,21 +9014,20 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 # |d| did not grow; val pred_std 0.252 vs P64 0.608).
                 # Mean MSE over all sequences (P64 identity).  Mixed
                 # ring KEEP (P65 flush REVERT).  Do not /dvar.
-                # P101: raw ``‖d−load‖²``. P89 HP ``min(4H,T)`` is
-                # crop-demean on test_sim (T=128=seq_len) — DC-blind —
-                # and crushed P100 Luenberger K 0.119→0.049 (end-P2 SS
-                # ≈1.04, Joseph's 1/A cap). Pin-A KEEP so DC cannot
-                # walk A (P89/P98 RCA). Val detrend (4H on episode
-                # T=1220) is unchanged. jsonl ``std_ratio`` is now the
-                # raw-crop amp (observability). Helper
-                # ``_dob_ground_hp_window`` stays for smoke / A/B.
+                # P102: increment ``‖Δd−Δload‖²``. P101 level MSE held K
+                # (SS≈2.04) but dumped DC into d (val det_r 0.197). P100
+                # HP crop-demean crushed K to Joseph 1/A. Pin-A KEEP so
+                # DC cannot walk A. Val detrend (4H on episode T=1220)
+                # unchanged. jsonl ``std_ratio`` is still level amp
+                # (observability vs P101). Helper window stays for smoke.
                 if not getattr(cfg, '_dob_ground_hp_logged', False):
                     print(
-                        '[dob-ground] raw MSE (P101; Luenberger+pin-A; '
-                        'HP crop-demean crushed K; val detrend unchanged)',
+                        '[dob-ground] increment MSE (P102; Δd vs Δload; '
+                        'P101 level MSE dumped DC into d; val detrend '
+                        'unchanged)',
                         flush=True)
                     cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
-                dob_ground, dob_ground_std_ratio = _dob_ground_hp_mse(
+                dob_ground, dob_ground_std_ratio = _dob_ground_inc_mse(
                     ds, dtgt)
                 dob_ground_keep_frac = torch.ones((), device=ds.device)
                 wm_total = wm_total + dgc * dob_ground
