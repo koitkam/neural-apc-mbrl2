@@ -1875,11 +1875,13 @@ class DreamerV4(nn.Module):
             This is the input→CV plant model whose gain we identify in Stage 1.
           * ``dob``    — the neural-Kalman observer params ``dob_log_decay`` /
             ``dob_log_gain`` (A, K).  Identified in Stage 2 on the FROZEN ``g``.
-            **P99:** when ``dob=True``, pin ``dob_log_decay`` (A stays at
+            **P99 KEEP:** when ``dob=True``, pin ``dob_log_decay`` (A stays at
             ``dob_decay_init``); only ``dob_log_gain`` (K) trains. P98 Wiener
             HP MSE jointly IDs A,K and loud first-P2 ``d`` pulls A down →
-            Kalman SS gain ``K/(1-(1-K)A)`` dies on val episodes (pred_std
-            **0.215 vs 1.93**).
+            Joseph SS gain ``K/(1-(1-K)A)`` dies on val episodes (pred_std
+            **0.215 vs 1.93**). P99 held A but crushed K (pred_std **0.628**).
+            **P100:** Luenberger plant-residual recurrence ``d_t = A d + K ν``
+            (SS ``K/(1-A)``); pin-A still on.
           * ``reward`` — the reward (-MTP) head.
 
         Frozen params (``requires_grad=False``) get no gradient, so ``opt_world``

@@ -4441,6 +4441,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_hpamp=mse "
         f"dob_reconsg=True "
         f"dob_afreeze=True "
+        f"dob_luen=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "

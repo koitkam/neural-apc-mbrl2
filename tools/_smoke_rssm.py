@@ -2294,7 +2294,14 @@ def _test_isolation_dcv_scales() -> None:
     assert 'dob_hpamp=zstd' not in _src
     assert 'dob_reconsg=True' in _src
     assert 'dob_afreeze=True' in _src
+    assert 'dob_luen=True' in _src
     assert 'P2 pin A (decay stays at init)' in _v4_src
+    assert 'coef = (1.0 - K) * A' not in _rssm_src
+    _tssm_src = _P(_tr.__file__).resolve().parents[1].joinpath(
+        'models/transformer_ssm.py').read_text()
+    assert 'coef = (1.0 - K) * A' not in _tssm_src
+    assert 'coef = A' in _rssm_src[_rssm_src.index('ONE batched prior decode'):]
+    assert 'P100 Luenberger' in _rssm_src
     assert '_decay.requires_grad_(False)' in _v4_src
     assert 'rssm.apply_dob(recon, ds.detach())' in _src
     assert '[dob-ground] recon stop-grad d' in _src
@@ -5841,6 +5848,69 @@ def _test_p2_recon_stopgrad_d() -> None:
     print('[smoke] OK  P2 recon stop-grad d (K grads from grounding only; A pinned)')
 
 
+def _test_p100_luenberger_kalman() -> None:
+    """P100: plant-residual scan d_t = A d + K ν; SS = K/(1-A), not Joseph 1/A cap.
+
+    Batched ``dob_kalman_scan(coef=A)`` must match ``obs_step`` (serve path).
+    """
+    from models.dreamer_v4_rssm import dob_kalman_scan, stream_serve_step
+    A = torch.tensor([0.95257])
+    K = torch.tensor([0.11920])
+    T = 128
+    nu = torch.ones(1, T, 1)
+    d_luen = dob_kalman_scan(K * nu, A)
+    d_joseph = dob_kalman_scan(K * nu, (1.0 - K) * A)
+    ss_luen = float(d_luen[0, -1, 0])
+    ss_joseph = float(d_joseph[0, -1, 0])
+    expect_luen = float((K / (1.0 - A)).item())
+    expect_joseph = float((K / (1.0 - (1.0 - K) * A)).item())
+    assert abs(ss_luen - expect_luen) / expect_luen < 0.02, (ss_luen, expect_luen)
+    assert abs(ss_joseph - expect_joseph) / expect_joseph < 0.02, (
+        ss_joseph, expect_joseph)
+    assert expect_luen > 2.0 * expect_joseph, (expect_luen, expect_joseph)
+    assert expect_luen > 2.0  # Joseph cap is 1/A ≈ 1.05; Luenberger init ≈ 2.5
+
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
+    cfg.mtp_length = 4
+    cfg.world_model_type = 'rssm'
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.head_hidden = 16
+    cfg.dob_enabled = True
+    cfg.cv_obs_indices = (0,)
+    cfg.compile_mode = 'off'
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    cfg.gain_match_coef = 0.0
+    cfg.wm_input_isolation_coef = 0.0
+    cfg.rssm_joint_embed_coef = 0.0
+    model = build_model(cfg)
+    model.set_dob_active(True)
+    rssm = model.dynamics
+    B, Tseq = 2, cfg.seq_len
+    obs = torch.randn(B, Tseq, cfg.obs_dim)
+    act = torch.rand(B, Tseq, cfg.action_dim) * 2 - 1
+    feats, *_ = rssm.rollout_observed(obs, act, sample=False, store_aux=False)
+    state = rssm.initial_state(B, obs.device)
+    streamed = []
+    for t in range(Tseq):
+        state = stream_serve_step(
+            rssm, state, act[:, t], obs[:, t], sample=False)
+        streamed.append(state.feat)
+    streamed = torch.stack(streamed, dim=1)
+    if not torch.allclose(streamed, feats, atol=1e-5, rtol=1e-4):
+        err = (streamed - feats).abs().max().item()
+        raise AssertionError(
+            f'P100 Luenberger serve vs batched max|Δ|={err:.4e}')
+    print('[smoke] OK  P100 Luenberger SS K/(1-A); obs_step ≡ batched scan')
+
+
 def _test_stream_serve_matches_rollout() -> None:
     """P3 serve feat matches training re-encode (measured DV + Kalman d_t)."""
     from models.dreamer_v4_rssm import stream_serve_step
@@ -6060,6 +6130,7 @@ if __name__ == '__main__':
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()
     _test_p2_recon_stopgrad_d()
+    _test_p100_luenberger_kalman()
     _test_stream_serve_matches_rollout()
     _test_collect_serve_cuda_graph_cpu()
     _test_dreamer_v4_config_from_train()

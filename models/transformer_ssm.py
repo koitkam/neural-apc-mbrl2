@@ -689,10 +689,11 @@ class TransformerSSMDynamics(nn.Module):
         share ``h``; the posterior conditions on the obs embedding and is the z
         carried forward (with the prior's KV-cache + position).  DOB: when
         ``obs`` is supplied the posterior carries the corrected disturbance
-        state ``d_t = A*d_{t-1} + K*nu`` (innovation on the prior forecast),
-        identical to RSSMDynamics.  ``cont_innov`` (B, cont_dist_dim) is the same
-        CV innovation, fed to the innovation-driven cont disturbance posterior
-        (Option B); precomputed batched by ``rollout_observed`` or inline."""
+        state ``d_t = A*d_{t-1} + K*nu`` (P100 Luenberger plant residual
+        ``nu = CV_obs − decode(prior)``; identical to RSSMDynamics).
+        ``cont_innov`` (B, cont_dist_dim) is the same CV innovation, fed to
+        the innovation-driven cont disturbance posterior (Option B);
+        precomputed batched by ``rollout_observed`` or inline."""
         prior = self.img_step(prev, prev_action, dv=dv, sample=sample)
         post_in = torch.cat([prior.h, embed], dim=-1)
         post_logits, post_z = self.post_net(post_in, sample=sample)
@@ -706,8 +707,6 @@ class TransformerSSMDynamics(nn.Module):
                     if obs is not None and self.n_cv > 0:
                         cv_fore = self.decode(prior.feat).index_select(
                             -1, self.cv_index_t)
-                        if prior.d is not None:
-                            cv_fore = cv_fore + prior.d
                         cont_innov = (obs.index_select(-1, self.cv_index_t)
                                       - cv_fore)
                     else:
@@ -719,8 +718,9 @@ class TransformerSSMDynamics(nn.Module):
                 cont_in, sample=sample)
         d_post = prior.d
         if self.dob_enabled and obs is not None and prior.d is not None:
-            cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
-                       + prior.d)
+            # P100 Luenberger: plant residual, d not in the forecast.
+            cv_pred = self.decode(prior.feat).index_select(
+                -1, self.cv_index_t)
             cv_obs = obs.index_select(-1, self.cv_index_t)
             nu = cv_obs - cv_pred
             d_post = prior.d + self.dob_gain() * nu
@@ -843,14 +843,14 @@ class TransformerSSMDynamics(nn.Module):
         ds = None
         if self.dob_enabled:
             if self.dob_active:
-                # ONE batched prior decode → CV forecast base, then the scalar per-CV
-                # Kalman filter: d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
+                # ONE batched prior decode → CV forecast base, then the scalar
+                # per-CV Kalman.  P100 Luenberger: d_t = A·d_{t-1} + K·(CV_obs − base).
                 prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
-                coef = (1.0 - K) * A                                  # (n_cv,)
+                coef = A                                              # (n_cv,)
                 ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
                 if last_only:
                     ds = ds[:, -1:]

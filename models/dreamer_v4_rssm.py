@@ -105,7 +105,9 @@ def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
     Host-adaptive: if the T×T mix would exceed the device budget (≈16 MiB
     on a 24 GB A10), fall back to the sequential recurrence (huge
     ``seq_len`` / many CVs).  Differentiable in ``u`` and ``coef`` (P2
-    trains Kalman A,K through this).
+    trains Kalman A,K through this).  Callers pass ``coef=A``,
+    ``u=K·(CV_obs−base)`` (P100 Luenberger).  Joseph used
+    ``coef=(1−K)·A`` (P99 and earlier).
     """
     B, T, C = u.shape
     if T == 0:
@@ -917,10 +919,13 @@ class RSSMDynamics(nn.Module):
 
         When the DOB is active and ``obs`` (the raw obs vector, for the CV
         channels) is supplied, the posterior carries the CORRECTED disturbance
-        state ``d_t = A·d_{t-1} + K·ν`` where ``ν`` is the one-step prediction
-        residual on the PRIOR forecast (a genuine innovation; the prior has not
-        seen the current obs).  ``obs=None`` (probes / diagnostics) ⇒ the
-        posterior just carries the decayed prior ``d`` (pure process model).
+        state ``d_t = A·d_{t-1} + K·ν`` where ``ν`` is the **plant** residual
+        ``CV_obs − decode(prior)`` (P100 Luenberger).  ``d`` is not residualized
+        out of the measurement: the Joseph complementary filter
+        ``ν = CV_obs − (g + A·d)`` capped SS gain at ``K/(1−(1−K)A) ≤ 1/A``
+        (P99 val pred_std **0.628 vs 1.93**).  The prior has not seen the
+        current obs.  ``obs=None`` (probes / diagnostics) ⇒ the posterior just
+        carries the decayed prior ``d`` (pure process model).
 
         ``cont_innov`` (B, cont_dist_dim) is the same CV innovation, precomputed
         BATCHED by ``rollout_observed`` and fed to the innovation-driven cont
@@ -940,8 +945,6 @@ class RSSMDynamics(nn.Module):
                     if obs is not None and self.n_cv > 0:
                         cv_fore = self.decode(prior.feat).index_select(
                             -1, self.cv_index_t)
-                        if prior.d is not None:
-                            cv_fore = cv_fore + prior.d
                         cont_innov = (obs.index_select(-1, self.cv_index_t)
                                       - cv_fore)
                     else:
@@ -953,10 +956,11 @@ class RSSMDynamics(nn.Module):
                 cont_in, sample=sample)
         d_post = prior.d
         if self.dob_enabled and obs is not None and prior.d is not None:
-            cv_pred = (self.decode(prior.feat).index_select(-1, self.cv_index_t)
-                       + prior.d)                       # one-step CV forecast
+            # P100 Luenberger: plant residual, d not in the forecast.
+            cv_pred = self.decode(prior.feat).index_select(
+                -1, self.cv_index_t)
             cv_obs = obs.index_select(-1, self.cv_index_t)
-            nu = cv_obs - cv_pred                        # innovation
+            nu = cv_obs - cv_pred                        # plant residual
             d_post = prior.d + self.dob_gain() * nu      # = A·d_{t-1} + K·ν
         # Posterior inherits the prior's exogenous DV feedforward (same measured
         # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
@@ -1121,14 +1125,17 @@ class RSSMDynamics(nn.Module):
         if self.dob_enabled:
             if self.dob_active:
                 # ONE batched prior decode → CV forecast base (d-free), then the
-                # scalar per-CV Kalman filter.  d_t = A·d_{t-1} + K·ν with
-                # ν = CV_obs − (base + A·d_{t-1}) ⇒ d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base).
+                # scalar per-CV Kalman.  P100 Luenberger / plant-residual:
+                # ν = CV_obs − base (d not residualized);
+                # d_t = A·d_{t-1} + K·ν.  Joseph complementary-filter
+                # d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base) capped SS gain
+                # at 1/A (P99 val pred_std 0.628 vs 1.93).
                 prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
                 u = K * (cv_obs - base)                               # drive (B,T,n_cv)
-                coef = (1.0 - K) * A                                  # (n_cv,)
+                coef = A                                              # (n_cv,)
                 ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
                 if last_only:
                     ds = ds[:, -1:]
