@@ -59,32 +59,38 @@ sys.path.insert(0, str(REPO))
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+try:
+    from tools.audit_data_generation_v2 import _resolve_audit_sim_name
+except ImportError:
+    from audit_data_generation_v2 import _resolve_audit_sim_name
+
 _p = argparse.ArgumentParser(allow_abbrev=False, description=__doc__)
-_p.add_argument('--sim', default=os.environ.get('AUDIT_SIM_NAME', 'test_sim'))
+_p.add_argument('--sim', default=None,
+                help='Simulation folder under simulation/. Unset = take from '
+                     '--source-run run_plan. Never leftover AUDIT_SIM_NAME / '
+                     'invented test_sim.')
 _p.add_argument('--source-run', default=os.environ.get('AUDIT_SOURCE_RUN', ''),
                 help='Run dir to harvest plant-id / noise-config / '
-                     'auto-tune from; auto-pick latest run_* if blank.')
+                     'auto-tune from (required; plant comes from run_plan).')
 _p.add_argument('--seed', type=int, default=int(os.environ.get('SEED', '0')))
 _p.add_argument('--use-saved-autotune', action='store_true', default=True,
                 help='Apply the run-saved auto_tune_seed_buffer.json values '
                      '(guarantees buffer matches the live run).')
 _args = _p.parse_args()
 
-SIM_NAME = _args.sim
+source_cli = (_args.source_run or '').strip()
+if not source_cli:
+    raise SystemExit('[audit] need a --source-run with run_plan.json')
+SOURCE_RUN = Path(source_cli)
+if not SOURCE_RUN.is_absolute():
+    SOURCE_RUN = REPO / SOURCE_RUN
+if SOURCE_RUN is None or not SOURCE_RUN.exists():
+    raise SystemExit('[audit] need a --source-run with run_plan.json')
+
+SIM_NAME = _resolve_audit_sim_name(_args.sim, SOURCE_RUN)
 SIM_DIR = REPO / 'simulation' / SIM_NAME
 if not (SIM_DIR / 'control_setup.json').exists():
     raise SystemExit(f'[audit] no control_setup.json under {SIM_DIR}')
-
-if _args.source_run.strip():
-    SOURCE_RUN = Path(_args.source_run)
-    if not SOURCE_RUN.is_absolute():
-        SOURCE_RUN = REPO / SOURCE_RUN
-else:
-    _runs = sorted((REPO / 'output' / SIM_NAME).glob('run_*'),
-                   key=lambda p: p.stat().st_mtime if p.exists() else 0)
-    SOURCE_RUN = _runs[-1] if _runs else None
-if SOURCE_RUN is None or not SOURCE_RUN.exists():
-    raise SystemExit('[audit] need a --source-run with run_plan.json')
 
 # --------------------------------------------------------------------------
 # Environment wiring — point every loader at the run's own artifacts so the

@@ -4457,11 +4457,14 @@ def _test_id_tau_no_plant_sentinel() -> None:
     assert "AUDIT_EPISODE_LEN', '1220'" not in audit_src
     assert "AUDIT_LOOKBACK', '120'" not in audit_src
     assert 'def _resolve_audit_plant_knobs' in audit_src
+    assert 'def _resolve_audit_sim_name' in audit_src
     from types import SimpleNamespace
     try:
-        from tools.audit_data_generation_v2 import _resolve_audit_plant_knobs
+        from tools.audit_data_generation_v2 import (
+            _p as _audit_p, _resolve_audit_plant_knobs, _resolve_audit_sim_name)
     except ImportError:
-        from audit_data_generation_v2 import _resolve_audit_plant_knobs
+        from audit_data_generation_v2 import (
+            _p as _audit_p, _resolve_audit_plant_knobs, _resolve_audit_sim_name)
     empty = SimpleNamespace(tau=None, dead=None, sample_rate=None,
                             episode_len=None, lookback=None)
     _prev_sim = {k: os.environ.get(k) for k in (
@@ -4526,6 +4529,40 @@ def _test_id_tau_no_plant_sentinel() -> None:
         assert abs(tau_r - 53.0) < 1e-12 and abs(dead_r - 8.0) < 1e-12
         assert (sr_r, ep_r, lb_r) == (4, 1220, 128)
         assert src_r.startswith('source_run=')
+    assert "os.environ.get('AUDIT_SIM_NAME'" not in audit_src
+    ns_sim = _audit_p.parse_args([])
+    assert ns_sim.sim is None
+    _prev_an = os.environ.get('AUDIT_SIM_NAME')
+    try:
+        os.environ['AUDIT_SIM_NAME'] = 'test_sim'
+        ns_left = _audit_p.parse_args([])
+        assert ns_left.sim is None
+        try:
+            _resolve_audit_sim_name(None, None)
+            raise AssertionError('expected SystemExit refusing test_sim plant')
+        except SystemExit as e:
+            assert 'refuse to invent' in str(e)
+        with tempfile.TemporaryDirectory() as td:
+            rd = Path(td)
+            (rd / 'run_plan.json').write_text(json.dumps({
+                'simulation_name': 'distillation',
+                'simulation_dir': '/x/simulation/distillation'}))
+            assert _resolve_audit_sim_name(None, rd) == 'distillation'
+            assert _resolve_audit_sim_name('distillation', rd) == 'distillation'
+            try:
+                _resolve_audit_sim_name('test_sim', rd)
+                raise AssertionError('expected --sim mismatch SystemExit')
+            except SystemExit as e:
+                assert 'mismatches' in str(e)
+            (rd / 'run_plan.json').write_text(json.dumps({
+                'simulation_dir': '/home/x/simulation/other_plant'}))
+            assert _resolve_audit_sim_name(None, rd) == 'other_plant'
+        assert _resolve_audit_sim_name('distillation', None) == 'distillation'
+    finally:
+        if _prev_an is None:
+            os.environ.pop('AUDIT_SIM_NAME', None)
+        else:
+            os.environ['AUDIT_SIM_NAME'] = _prev_an
     print('[smoke] OK  missing SysID τ does not invent 50 s; leftover IDENTIFIED_* / SIM_DV_PERTURB_ATTR_MAP_JSON ignored')
 
 
@@ -4882,9 +4919,12 @@ def _test_sample_rate_pin_ignores_leftover() -> None:
         assert "os.environ.get('DREAMER_EPISODE_LENGTH')" in audit_src
         assert "os.environ.get('IDENTIFIED_TAU_DOMINANT')" not in audit_src
         assert "os.environ.get('IDENTIFIED_DEAD_TIME')" not in audit_src
+        assert "os.environ.get('AUDIT_SIM_NAME'" not in audit_src
         rssm_audit = open('tools/audit_rssm_training_data.py').read()
         assert "os.environ.setdefault('SIM_SAMPLE_RATE'" not in rssm_audit
         assert "os.environ.setdefault('IDENTIFIED_TAU_DOMINANT'" not in rssm_audit
+        assert "os.environ.get('AUDIT_SIM_NAME'" not in rssm_audit
+        assert "(REPO / 'output' / SIM_NAME).glob('run_*')" not in rssm_audit
         assert "os.environ['DREAMER_SAMPLE_RATE']" in rssm_audit
         assert "os.environ['DREAMER_EPISODE_LENGTH']" in rssm_audit
     finally:

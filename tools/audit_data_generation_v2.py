@@ -135,14 +135,60 @@ def _resolve_audit_plant_knobs(args, source_run: Optional[Path]):
     return float(tau), float(dead), int(sr), int(ep), int(lb), src
 
 
+def _sim_name_from_plan(plan: Dict[str, Any]) -> Optional[str]:
+    name = plan.get('simulation_name')
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    sim_dir = plan.get('simulation_dir')
+    if isinstance(sim_dir, str) and sim_dir.strip():
+        return Path(sim_dir).name
+    return None
+
+
+def _resolve_audit_sim_name(sim_cli, source_run) -> str:
+    """Plant folder from the run. Never leftover AUDIT_SIM_NAME / test_sim.
+
+    1. ``--source-run`` with ``run_plan.json`` → ``simulation_name`` or
+       ``Path(simulation_dir).name``.
+    2. Explicit ``--sim`` must match that name when the plan has one.
+    3. Explicit ``--sim`` only if the plan has no name.
+    4. Else refuse (do not invent ``test_sim``).
+    """
+    cli = ''
+    if sim_cli is not None:
+        cli = str(sim_cli).strip()
+    plan_name = None
+    if source_run is not None:
+        plan_path = Path(source_run) / 'run_plan.json'
+        if plan_path.is_file():
+            try:
+                plan = json.loads(plan_path.read_text())
+            except (OSError, json.JSONDecodeError, TypeError):
+                plan = {}
+            if isinstance(plan, dict):
+                plan_name = _sim_name_from_plan(plan)
+    if plan_name:
+        if cli and cli != plan_name:
+            raise SystemExit(
+                f'[v2] --sim {cli} mismatches source-run plant {plan_name}')
+        return plan_name
+    if cli:
+        return cli
+    raise SystemExit(
+        '[v2] refuse to invent test_sim plant. Pass --source-run '
+        '(simulation_name / simulation_dir in run_plan.json) or explicit --sim.')
+
+
 # ---------- CLI / sim-agnostic config -------------------------------------
 _p = argparse.ArgumentParser(allow_abbrev=False, add_help=True,
                               description='Sim-agnostic data-buffer audit.')
-_p.add_argument('--sim', default=os.environ.get('AUDIT_SIM_NAME', 'test_sim'),
-                help='Simulation folder name under simulation/ (default test_sim).')
+_p.add_argument('--sim', default=None,
+                help='Simulation folder name under simulation/. Unset = take '
+                     'from --source-run run_plan. Never leftover AUDIT_SIM_NAME '
+                     '/ invented test_sim.')
 _p.add_argument('--source-run', default=os.environ.get('AUDIT_SOURCE_RUN', ''),
                 help='Prior run dir to harvest tau/dead/ep_len/noise_config; '
-                     'auto-pick latest run_* if blank.')
+                     'if omitted, latest run_* under output/<resolved-sim>/.')
 _p.add_argument('--tau', type=float, default=_opt_env_num('AUDIT_TAU', float),
                 help='Identified dominant time constant (sample steps). '
                      'Unset = take from --source-run / plant_id.json.')
@@ -165,13 +211,18 @@ _p.add_argument('--n-eps', type=int, default=8,
 def main(argv=None):
     _args = _p.parse_args(argv)
 
-    SIM_NAME = _args.sim
+    source_cli = (_args.source_run or '').strip()
+    source_run_explicit = Path(source_cli) if source_cli else None
+    if source_run_explicit is not None and not source_run_explicit.is_absolute():
+        source_run_explicit = REPO / source_run_explicit
+
+    SIM_NAME = _resolve_audit_sim_name(_args.sim, source_run_explicit)
     SIM_DIR  = REPO / 'simulation' / SIM_NAME
     if not (SIM_DIR / 'control_setup.json').exists():
         raise SystemExit(f'[v2] sim folder {SIM_DIR} has no control_setup.json')
 
-    if _args.source_run.strip():
-        SOURCE_RUN = Path(_args.source_run)
+    if source_run_explicit is not None:
+        SOURCE_RUN = source_run_explicit
     else:
         _runs = sorted((REPO / 'output' / SIM_NAME).glob('run_*'),
                        key=lambda p: p.stat().st_mtime if p.exists() else 0)
