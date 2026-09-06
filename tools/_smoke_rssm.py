@@ -4382,7 +4382,11 @@ def _test_id_tau_no_plant_sentinel() -> None:
     assert "os.environ.get('SIM_ACTION_DIM'" not in id_src
     assert "SIM_ACTION_DIM', '3'" not in id_src
     assert "os.environ.get('SIM_CV_INDICES_JSON'" not in id_src
-    from utils.dynamics_identifier import _get_cv_indices, _resolve_mv_count
+    assert "os.environ.get('SIM_DV_PERTURB_ATTR_MAP_JSON'" not in id_src
+    assert 'json.loads(raw_map)' not in id_src
+    from utils.dynamics_identifier import (
+        _get_cv_indices, _resolve_mv_count, _apply_dv_perturbation,
+    )
     _prev_adim = os.environ.get('SIM_ACTION_DIM')
     _prev_cv = os.environ.get('SIM_CV_INDICES_JSON')
     try:
@@ -4404,6 +4408,25 @@ def _test_id_tau_no_plant_sentinel() -> None:
         except ValueError as e:
             msg = str(e)
             assert 'cv_indices' in msg and 'SIM_CV_INDICES_JSON' in msg, msg
+        # Leftover attr-map must not steal SysID DV steps (native-less
+        # dummy falls through to episode_array).
+        _prev_map = os.environ.get('SIM_DV_PERTURB_ATTR_MAP_JSON')
+        try:
+            os.environ['SIM_DV_PERTURB_ATTR_MAP_JSON'] = '{"FEED":"poison"}'
+            dummy = type('Dummy', (), {})()
+            dummy.poison = 0.0
+            dummy.episode_array = __import__('numpy').zeros((3, 5))
+            dummy.episode_counter = 1
+            ok = _apply_dv_perturbation(
+                dummy, 2, 42.0, 'FEED', dv_pos=-1)
+            assert ok is True
+            assert float(dummy.poison) == 0.0
+            assert abs(float(dummy.episode_array[1, 2]) - 42.0) < 1e-12
+        finally:
+            if _prev_map is None:
+                os.environ.pop('SIM_DV_PERTURB_ATTR_MAP_JSON', None)
+            else:
+                os.environ['SIM_DV_PERTURB_ATTR_MAP_JSON'] = _prev_map
     finally:
         if _prev_adim is None:
             os.environ.pop('SIM_ACTION_DIM', None)
@@ -4484,7 +4507,7 @@ def _test_id_tau_no_plant_sentinel() -> None:
         assert abs(tau_r - 53.0) < 1e-12 and abs(dead_r - 8.0) < 1e-12
         assert (sr_r, ep_r, lb_r) == (4, 1220, 128)
         assert src_r.startswith('source_run=')
-    print('[smoke] OK  missing SysID τ does not invent 50 s; identified τ identity')
+    print('[smoke] OK  missing SysID τ does not invent 50 s; leftover SIM_DV_PERTURB_ATTR_MAP_JSON ignored')
 
 
 def _test_resolve_baseline_seed_op_band() -> None:

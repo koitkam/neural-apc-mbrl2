@@ -315,7 +315,12 @@ def _apply_dv_perturbation(sim, state_index: int, value: float, state_name: str,
             except Exception:
                 pass
 
-    # Generic interface priority: explicit simulator hook, env attr map, then common in-memory state containers.
+    # Generic interface: explicit simulator hook, then in-memory state.
+    # Leftover login ``SIM_DV_PERTURB_ATTR_MAP_JSON`` ignored (P98-live;
+    # silent A/B of SysID DV steps outside ``run_plan``). Plants must
+    # expose ``set_disturbance_offset`` / ``set_state_by_index`` or a
+    # state container — do not invent a per-plant attr map from env.
+    _ = state_name
     for method_name in ('set_disturbance_by_state_index', 'set_state_by_index'):
         fn = getattr(sim, method_name, None)
         if callable(fn):
@@ -324,18 +329,6 @@ def _apply_dv_perturbation(sim, state_index: int, value: float, state_name: str,
                 return True
             except Exception:
                 pass
-
-    raw_map = os.environ.get('SIM_DV_PERTURB_ATTR_MAP_JSON', '').strip()
-    if raw_map:
-        try:
-            attr_map = json.loads(raw_map)
-            if isinstance(attr_map, dict):
-                attr_name = attr_map.get(state_name, '')
-                if attr_name and hasattr(sim, str(attr_name)):
-                    setattr(sim, str(attr_name), float(value))
-                    return True
-        except Exception:
-            pass
 
     if hasattr(sim, 'episode_array') and hasattr(sim, 'episode_counter'):
         try:
