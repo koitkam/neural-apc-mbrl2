@@ -4886,10 +4886,15 @@ def _test_sim_factory_ignores_leftover_model_env() -> None:
     assert "_env_json('SIM_DV_INDICES_JSON', io_cfg.get" not in src
     assert "_env_json('SIM_STATE_VARIABLES_JSON', io_cfg.get" not in src
     assert 'def _setup_str' in src and 'def _setup_list' in src
+    assert 'def _env_json' not in src
+    assert 'are ignored (P99-live)' in src
 
     assert _setup_str('simulation.test_sim.test_sim', 'SIM_MODEL_MODULE') == (
         'simulation.test_sim.test_sim')
     assert _setup_list([0, 2], 'SIM_MV_INDICES_JSON') == [0, 2]
+    leftover = 'SIM_MODEL_KWARGS_JSON'
+    assert _setup_list([], leftover) == []
+    assert _setup_str('', leftover) == ''
 
     keys = (
         'CONTROL_SETUP_JSON', 'SIM_MODEL_MODULE', 'SIM_MODEL_CLASS',
@@ -4940,6 +4945,23 @@ def _test_sim_factory_ignores_leftover_model_env() -> None:
         assert _setup_list(io.get('state_variables', []),
                            'SIM_STATE_VARIABLES_JSON') == ['a', 'b']
         os.unlink(tmp)
+
+        with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.json', delete=False) as fh:
+            json.dump({
+                'simulator': {
+                    'module': 'simulation.test_sim.test_sim',
+                    'class': 'TestSimTower',
+                },
+            }, fh)
+            tmp_omit = fh.name
+        os.environ['CONTROL_SETUP_JSON'] = tmp_omit
+        os.environ['SIM_MODEL_KWARGS_JSON'] = json.dumps(
+            {'bogus': 1, 'episode_length': 9})
+        kw_omit = _constructor_kwargs(1220, 4, 0.03)
+        assert 'bogus' not in kw_omit, kw_omit
+        assert int(kw_omit['episode_length']) == 1220, kw_omit
+        os.unlink(tmp_omit)
     finally:
         for k, old in prev.items():
             if old is None:

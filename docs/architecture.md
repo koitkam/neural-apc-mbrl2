@@ -254,9 +254,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > `single_run` still writes `SIM_EPISODE_LENGTH` as IPC;
 > leftover `SIM_SAMPLE_RATE` **ignored** P94-live; pin `DREAMER_SAMPLE_RATE`;
 > `single_run` still writes `SIM_SAMPLE_RATE` as IPC;
-> leftover `SIM_MODEL_MODULE` / `CLASS` / `KWARGS_JSON` / `SIM_*_INDICES_JSON`
-> **ignored** when `control_setup.json` already names the plant (P95-live;
-> gap-fill only if the file omits the field)).
+>           leftover `SIM_MODEL_MODULE` / `CLASS` / `KWARGS_JSON` / `SIM_*_INDICES_JSON`
+> **ignored even when `control_setup.json` omits the field** (P99-live; P95
+> plant-file-wins still gap-filled from login env)).
 > GPU-calib probe reads
 > TrainConfig via `gpu_probe_knobs()` (identity 1.30/0.80/512; BO no
 > longer silently uses WM-only 1.0; explicit probe args beat leftover env). Missing SysID keys do **not**
@@ -452,8 +452,8 @@ env-gated off · **[planned]** = designed, not yet built.
 > caches them. Leftover `SIM_IDENTIFIED_*` is ignored (P93-live);
 > leftover login `IDENTIFIED_*` is ignored when the field is 0 (P95-live;
 > derive-time IPC stays in `auto_episode_length` / `identify_dynamics`).
-> leftover `SIM_MODEL_*` / `SIM_*_INDICES_JSON` is ignored when the plant
-> file already names module/class/kwargs/io (P95-live; gap-fill only).
+> leftover `SIM_MODEL_*` / `SIM_*_INDICES_JSON` is ignored even when the plant
+> file omits module/class/kwargs/io (P99-live; P95 gap-fill REMOVED).
 > P29's on-disk plan is the
 > *pre-rewrite* dump (`rssm_latent_type=categorical`).
 > **Compile leftover (same class):** `TrainConfig.compile_mode=''` was
@@ -1229,7 +1229,7 @@ batched-decodes prior for the Kalman.
 
 | | **Stage 1 = P1** (plant id) | **Stage 2 = P2** (observer id) | **Stage 3 = P3** (controller) |
 |---|---|---|---|
-| **trainable** | `g` (enc/dec/GRU/prior/post) + reward | DOB `(A,K)` + reward | actor + critic + reward |
+| **trainable** | `g` (enc/dec/GRU/prior/post) + reward | DOB `K` (A pinned at init; **P99** live A/B) + reward | actor + critic + reward |
 | **frozen** | DOB `(A,K)` | **`g`** | **`g` AND DOB** |
 | **DOB `d_t`** | suppressed (`≡0`) | active | active (feeds actor via `feat`) |
 | **unmeasured disturbance** | **OFF** (prob 0) | **ON** (prob 1.0) | ON (prob 0.85) |

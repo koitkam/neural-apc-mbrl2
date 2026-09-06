@@ -1,18 +1,16 @@
 """Create simulator instances and normalize metadata for workflow scripts.
 
 Functionality:
-- Loads simulator module/class from `CONTROL_SETUP_JSON` (leftover
-  `SIM_MODEL_*` only if the setup file omits them).
+- Loads simulator module/class from `CONTROL_SETUP_JSON` (auto-discover
+  when the file omits them). Login leftover `SIM_MODEL_*` /
+  `SIM_*_INDICES_JSON` is ignored (P99-live; P95 plant-file-wins still
+  left a gap-fill A/B when the setup omitted the field).
 - Instantiates simulator with tolerant constructor filtering.
 - Resolves and attaches standardized metadata/aliases expected by training and
     validation scripts.
 
 Inputs:
-- Setup file: `CONTROL_SETUP_JSON` (plant file wins).
-- Leftover `SIM_MODEL_MODULE` / `SIM_MODEL_CLASS` / `SIM_MODEL_KWARGS_JSON`
-  / `SIM_*_INDICES_JSON` / `SIM_STATE_VARIABLES_JSON` fill gaps only when
-  the setup file does not already provide the field (P95-live; login
-  leftover was a silent A/B of which plant `single_run` constructed).
+- Setup file: `CONTROL_SETUP_JSON` (plant file / sim attrs / auto-discover).
 - Runtime constructor args: `episode_length`, `sample_rate`, `noise_stdv`.
 
 Outputs:
@@ -50,30 +48,18 @@ def _load_setup_file() -> Dict[str, Any]:
         return {}
 
 
-def _env_json(name: str, default):
-    raw = os.environ.get(name, '')
-    if not raw:
-        return default
-    try:
-        return json.loads(raw)
-    except Exception:
-        return default
+def _setup_str(setup_val, leftover_key: str = '') -> str:
+    """Plant ``control_setup.json`` string. Leftover env is ignored."""
+    _ = leftover_key
+    return str(setup_val or '').strip()
 
 
-def _setup_str(setup_val, leftover_key: str) -> str:
-    """Plant ``control_setup.json`` string, else leftover env (gap-fill)."""
-    s = str(setup_val or '').strip()
-    if s:
-        return s
-    return str(os.environ.get(leftover_key, '') or '').strip()
-
-
-def _setup_list(setup_val, leftover_key: str) -> list:
-    """Plant ``io`` list, else leftover JSON env (gap-fill)."""
+def _setup_list(setup_val, leftover_key: str = '') -> list:
+    """Plant ``io`` list. Leftover JSON env is ignored."""
+    _ = leftover_key
     if isinstance(setup_val, list) and setup_val:
         return list(setup_val)
-    env_val = _env_json(leftover_key, [])
-    return list(env_val) if isinstance(env_val, list) else []
+    return []
 
 
 def _load_sim_class():
@@ -121,7 +107,7 @@ def _load_sim_class():
         'Unable to resolve simulator class from CONTROL_SETUP_JSON '
         'or discovered simulation setup files. Provide simulator.module/class '
         'in control_setup.json. Leftover SIM_MODEL_MODULE / SIM_MODEL_CLASS '
-        'are last-resort gap-fill only when the setup file omits them.'
+        'are ignored (P99-live).'
     ) from last_exc
 
 
@@ -176,8 +162,7 @@ def _constructor_kwargs(episode_length: int, sample_rate: int, noise_stdv: float
     if 'kwargs' in sim_cfg and isinstance(sim_cfg.get('kwargs'), dict):
         kwargs = dict(sim_cfg['kwargs'])
     else:
-        leftover = _env_json('SIM_MODEL_KWARGS_JSON', {})
-        kwargs = dict(leftover) if isinstance(leftover, dict) else {}
+        kwargs = {}
     kwargs.setdefault('episode_length', episode_length)
     kwargs.setdefault('sample_rate', sample_rate)
     kwargs.setdefault('noise_stdv', noise_stdv)
@@ -375,7 +360,7 @@ def require_sim_metadata(sim, required_fields: List[str]):
             + ', '.join(missing)
             + '. Provide attributes on the simulator class or io in '
             + 'control_setup.json. Leftover SIM_*_INDICES_JSON / '
-            + 'SIM_STATE_VARIABLES_JSON are last-resort gap-fill only.'
+            + 'SIM_STATE_VARIABLES_JSON are ignored (P99-live).'
         )
 
 
