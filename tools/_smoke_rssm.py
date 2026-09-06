@@ -1920,7 +1920,8 @@ def _test_dob_ground_highpass() -> None:
 
 
 def _test_dob_ground_shape_amp() -> None:
-    """P94: z-score shape + std-ratio amp; stop-grad pred std in shape."""
+    """P94 z-score shape KEEP; P96 amp is log(std_ratio)^2 not (r-1)^2."""
+    import math
     from training.train import _dob_ground_shape_amp
     torch.manual_seed(0)
     dt = torch.randn(4, 32, 1)
@@ -1930,7 +1931,8 @@ def _test_dob_ground_shape_amp() -> None:
     ds = 0.5 * dt
     loss, ratio = _dob_ground_shape_amp(ds, dt)
     assert abs(float(ratio) - 0.5) < 1e-4
-    assert abs(float(loss) - 0.25) < 1e-4  # shape ~0, amp (0.5-1)^2
+    # shape ~0 (z-score); amp log(0.5)^2 ≈ 0.480
+    assert abs(float(loss) - math.log(0.5) ** 2) < 1e-4
     # stop-grad: shape term does not flow through pred std
     ds_g = (0.4 * dt).detach().requires_grad_(True)
     d_std = ds_g.std().clamp_min(1e-3)
@@ -1947,7 +1949,13 @@ def _test_dob_ground_shape_amp() -> None:
     g_a, = torch.autograd.grad(loss_a, ds_a)
     align = float((g_a * ds_a.detach()).sum())
     assert align < 0.0  # negative: reducing |d| raises loss → grow |d|
-    print('[smoke] OK  dob_ground shape+amp (z-score; unitless std-ratio)')
+    # P95 RCA: linear (ratio-1)^2 at 107× is ~11236; log^2 is ~21.7
+    ds_loud = (100.0 * dt).detach().requires_grad_(True)
+    loss_loud, ratio_loud = _dob_ground_shape_amp(ds_loud, dt)
+    assert abs(float(ratio_loud) - 100.0) < 1e-2
+    assert float(loss_loud) < 30.0  # not thousands
+    assert abs(float(loss_loud) - math.log(100.0) ** 2) < 1e-3
+    print('[smoke] OK  dob_ground shape+amp (z-score; log-std amp)')
 
 
 def _test_atomic_torch_save() -> None:
@@ -2293,10 +2301,12 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _dob_ground_shape_amp' in _src
     assert 'def _highpass_bt' in _src
     assert '[dob-ground] high-pass MA w=' in _src
-    assert 'shape+amp z-score' in _src
-    assert 'dob_hpamp=zstd' in _src
+    assert 'shape z-score + log-std amp' in _src
+    assert 'dob_hpamp=zlog' in _src
+    assert 'dob_hpamp=zstd' not in _src
     assert "row.setdefault('dob_ground_std_ratio'" in _src
     assert '(ds_hp - dt_hp).pow(2).mean()' not in _src
+    assert '(ratio - 1.0).pow(2)' not in _src
     assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
     assert 'fill_(_zbias)' not in _rssm_src
     assert 'def init_gain_cv_skip' not in _rssm_src
@@ -2363,7 +2373,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gru_hres=' not in _src
     assert 'gru_hres_mix' not in _src
     assert 'dob_hp=' in _src
-    assert 'dob_hpamp=zstd' in _src
+    assert 'dob_hpamp=zlog' in _src
     assert 'dob_feathp=' not in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
     assert "world_model_type: str = 'rssm'" in _src
