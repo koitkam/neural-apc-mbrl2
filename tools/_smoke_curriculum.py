@@ -106,11 +106,11 @@ def _check(wm_type):
 
     fz2 = model.set_world_model_trainable(g=False, dob=True, reward=True)
     model.set_dob_active(True)
-    assert (not g_ref.requires_grad) and dob_decay.requires_grad \
+    assert (not g_ref.requires_grad) and (not dob_decay.requires_grad) \
         and dob_gain.requires_grad and rew_ref.requires_grad, \
-        'Stage2 partition wrong'
+        'Stage2 partition wrong (P99: A pinned, K trains)'
     assert rssm.dob_active, 'Stage2 dob_active must be True'
-    print(f'[smoke] OK  Stage2 partition g=FROZEN dob=train reward=train, '
+    print(f'[smoke] OK  Stage2 partition g=FROZEN dob=K-only (A pinned) reward=train, '
           f'dob_active=True {fz2} [{wm_type}]')
 
     fz3 = model.set_world_model_trainable(g=False, dob=False, reward=True)
@@ -160,16 +160,19 @@ def _check(wm_type):
     losses, _, _ = world_model_loss(model, batch, cfg)
     losses['wm_total'].backward()
     g_grad = _grad_sum(g_ref)
-    dob_grad = _grad_sum(rssm.dob_log_decay) + _grad_sum(rssm.dob_log_gain)
+    k_grad = _grad_sum(rssm.dob_log_gain)
+    a_grad = _grad_sum(rssm.dob_log_decay)
     assert g_grad == 0.0, 'Stage2: g is FROZEN -> must get NO gradient'
-    assert dob_grad > 0.0, 'Stage2: the DOB observer must get recon gradient'
+    assert k_grad > 0.0, 'Stage2: K must get Kalman-ID gradient'
+    assert a_grad == 0.0, 'Stage2 P99: A is pinned -> must get NO gradient'
     assert float(losses['dob_reg']) > 0.0, 'Stage2: dob_reg must be active'
     # P28 follow-up 11: overshoot/held/gain-match train g; skip when frozen.
     assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0, \
         'Stage2: overshoot is a g-only aux and must skip'
     assert float(losses.get('gain_match_loss', 0.0)) == 0.0, \
         'Stage2: gain-match is a g-only aux and must skip'
-    print(f'[smoke] OK  Stage2: recon trains the DOB (|dob_grad|={dob_grad:.4f}) '
+    print(f'[smoke] OK  Stage2: recon trains K (|k_grad|={k_grad:.4f}, '
+          f'A pinned |a_grad|={a_grad:.1f}) '
           f'and NOT g (|g_grad|={g_grad:.1f}) — observer identifiable on the '
           f'fixed plant [{wm_type}]')
 

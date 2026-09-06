@@ -800,8 +800,9 @@ class TrainConfig:
     # innovation (gain↔disturbance identifiability) and never recovered (p137–
     # p141 held-out r ≤ 0), so it was reverted at p142.  The neural-Kalman DOB
     # ``d_t`` is now the DEFAULT disturbance estimator of the OBSERVER (RSSM+DOB):
-    # clean gain ID in Stage-1, DOB A,K identified (now GROUNDED, below) in
-    # Stage-2, frozen observer in Stage-3 while the agent trains on real rollouts.
+    # clean gain ID in Stage-1, DOB K identified with A pinned (now GROUNDED,
+    # below) in Stage-2, frozen observer in Stage-3 while the agent trains on
+    # real rollouts.
     # ``DREAMER_DOB_ENABLED=0`` restores the pre-DOB model.
     dob_enabled: bool = True
     dob_reg_coef: float = 0.01      # L2 "process-noise-is-small" prior on d_t
@@ -823,7 +824,8 @@ class TrainConfig:
     # under-reaches (p18: pred vs true load r=0.42, amplitude ~0.3x) and BOTH
     # imagination AND the critic input stay disturbance-blind (→ critic can't fit
     # the disturbance-driven returns → actor collapses).  A direct target on d_t
-    # tunes A,K to track (the structural fix for the manual ``dob_gain_init``
+    # tunes K to track with A pinned at init (P99; the structural fix for the
+    # manual ``dob_gain_init``
     # amplitude tuning above).  Target ``batch['dist']`` is ENGINEERING CV units,
     # d_t is NORMALIZED obs space → the loss divides the target by the running CV
     # obs-norm std (threaded as ``cfg._cv_obs_std``).  0.0 = off (byte-identical).
@@ -4438,6 +4440,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_hp={_hpw} "
         f"dob_hpamp=mse "
         f"dob_reconsg=True "
+        f"dob_afreeze=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -8940,11 +8943,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # innovation alone under-drives d_t (the slow load is a small share of the
     # recon MSE and dob_reg opposes it) so d_t under-tracks (r~0.42) and
     # imagination + the critic stay disturbance-blind.  A direct target tunes the
-    # Kalman gain/decay (A,K — the only unfrozen DOB params in Stage-2) so the
+    # Kalman gain K (P99: A pinned at ``dob_decay_init``; K is the only unfrozen
+    # DOB param in Stage-2) so the
     # estimate TRACKS the load.  P96 RCA: live recon through d does NOT agree
     # with grounding once g is frozen — residual ``y−g`` soaks DC into |d|
     # while HP amp is crushed. P97 stop-grads d in recon; this term is the
-    # A,K trainer.  The target batch['dist'] is in ENGINEERING CV units and
+    # K trainer.  The target batch['dist'] is in ENGINEERING CV units and
     # d_t is NORMALIZED, so divide by the running CV obs-norm std (threaded
     # on cfg as _cv_obs_std).
     dob_ground = torch.zeros((), device=feats.device)
@@ -9130,6 +9134,11 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dob_ground_std_ratio': dob_ground_std_ratio.detach(),
         'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
+        # P99 observability: sigmoid(A), sigmoid(K). No extra WM forward.
+        'dob_A': (rssm.dob_decay().mean().detach()
+                  if dob_on else torch.zeros((), device=feats.device)),
+        'dob_K': (rssm.dob_gain().mean().detach()
+                  if dob_on else torch.zeros((), device=feats.device)),
     }
     losses.update(kl_diag)
     losses.update(gain_match_diag)
@@ -11571,7 +11580,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             # style) so the observer TRACKS the disturbance instead of under-
             # reaching it (p18: d_t vs load r=0.42, ~0.3x amplitude → imagination
             # + the critic go disturbance-blind → actor collapses worse-than-
-            # baseline).  Direct A,K supervision is the STRUCTURAL fix for the
+            # baseline).  Direct K supervision (A pinned P99) is the STRUCTURAL
+            # fix for the
             # manual dob_gain_init amplitude tuning.  Drop dob_reg (the "d small"
             # prior fights the grounding; the grounded target IS the prior now).
             # Honour explicit ``DREAMER_DOB_GROUND_COEF=0`` (A/B off).
@@ -12624,7 +12634,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             model.set_dob_active(_dob_on)
             _fz = model.set_world_model_trainable(
                 g=False, dob=_dob_on, reward=True)
-            _est = ('DOB id (observer A,K)' if _dob_on
+            _est = ('DOB id (observer K; A pinned)' if _dob_on
                     else 'disturbance-head id (frozen-g readout)')
             _desc = (f'{_est} (g FROZEN + reward train via recon '
                      f'innovation, disturbance '
@@ -14536,6 +14546,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             row.setdefault('dob_ground', 0.0)
             row.setdefault('dob_ground_keep_frac', 0.0)
             row.setdefault('dob_ground_std_ratio', 0.0)
+            row.setdefault('dob_A', 0.0)
+            row.setdefault('dob_K', 0.0)
             # P39 diag A: emit last computed per-head grad norms (if any).
             # Values may be float (grad norms) or str (error messages); pass
             # strings through unchanged so jsonl serialisation works.

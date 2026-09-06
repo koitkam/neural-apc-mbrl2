@@ -1875,6 +1875,11 @@ class DreamerV4(nn.Module):
             This is the input→CV plant model whose gain we identify in Stage 1.
           * ``dob``    — the neural-Kalman observer params ``dob_log_decay`` /
             ``dob_log_gain`` (A, K).  Identified in Stage 2 on the FROZEN ``g``.
+            **P99:** when ``dob=True``, pin ``dob_log_decay`` (A stays at
+            ``dob_decay_init``); only ``dob_log_gain`` (K) trains. P98 Wiener
+            HP MSE jointly IDs A,K and loud first-P2 ``d`` pulls A down →
+            Kalman SS gain ``K/(1-(1-K)A)`` dies on val episodes (pred_std
+            **0.215 vs 1.93**).
           * ``reward`` — the reward (-MTP) head.
 
         Frozen params (``requires_grad=False``) get no gradient, so ``opt_world``
@@ -1895,6 +1900,15 @@ class DreamerV4(nn.Module):
                 p.requires_grad_(bool(dob)); n_dob += 1
             else:
                 p.requires_grad_(bool(g)); n_g += 1
+        # P99: pin A at init during Kalman ID. HP ``dob_ground`` on loud
+        # first-P2 ``d`` otherwise shrinks decay and val-episode amp dies.
+        _decay = getattr(dyn, 'dob_log_decay', None)
+        if bool(dob) and _decay is not None:
+            _decay.requires_grad_(False)
+            if not getattr(self, '_dob_a_pinned_logged', False):
+                print('[dob] P2 pin A (decay stays at init); train K only '
+                      '(P99)', flush=True)
+                self._dob_a_pinned_logged = True
         if getattr(self, 'tokenizer', None) is not None:
             for p in self.tokenizer.parameters():
                 p.requires_grad_(bool(g)); n_g += 1

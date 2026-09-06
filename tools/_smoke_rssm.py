@@ -2262,6 +2262,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_arm_rest_ic_stream_mismatch_warn(False)' in _rel
     _rssm_src = _P(_tr.__file__).resolve().parents[1].joinpath(
         'models/dreamer_v4_rssm.py').read_text()
+    _v4_src = _P(_tr.__file__).resolve().parents[1].joinpath(
+        'models/dreamer_v4.py').read_text()
     _app = _rssm_src[_rssm_src.index('def _append_decode_core'):
                      _rssm_src.index('def _stack_decode_core')]
     assert 'z_l.append(st.z)' in _app
@@ -2291,9 +2293,14 @@ def _test_isolation_dcv_scales() -> None:
     assert 'dob_hpamp=zlog' not in _src
     assert 'dob_hpamp=zstd' not in _src
     assert 'dob_reconsg=True' in _src
+    assert 'dob_afreeze=True' in _src
+    assert 'P2 pin A (decay stays at init)' in _v4_src
+    assert '_decay.requires_grad_(False)' in _v4_src
     assert 'rssm.apply_dob(recon, ds.detach())' in _src
     assert '[dob-ground] recon stop-grad d' in _src
     assert "row.setdefault('dob_ground_std_ratio'" in _src
+    assert "row.setdefault('dob_A'" in _src
+    assert "row.setdefault('dob_K'" in _src
     assert '(ds_f - dt_f).pow(2).mean()' in _src
     assert '(ratio - 1.0).pow(2)' not in _src
     assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
@@ -5748,7 +5755,8 @@ def _test_stage1_dob_ground_skip() -> None:
 
 
 def _test_p2_recon_stopgrad_d() -> None:
-    """P97: recon add(d.detach()) must not train A,K when dob_ground_coef=0."""
+    """P97: recon add(d.detach()) must not train K when dob_ground_coef=0.
+    P99: A is pinned even when grounding is on."""
     torch.manual_seed(0)
     cfg = TrainConfig()
     cfg.obs_dim, cfg.action_dim = 6, 1
@@ -5773,7 +5781,7 @@ def _test_p2_recon_stopgrad_d() -> None:
     dyn = model.dynamics
     A = dyn.dob_log_decay
     K = dyn.dob_log_gain
-    assert A.requires_grad and K.requires_grad
+    assert (not A.requires_grad) and K.requires_grad, 'P99: pin A, train K'
     B, T = 2, cfg.seq_len
     batch = {
         'obs': torch.randn(B, T, cfg.obs_dim),
@@ -5806,7 +5814,9 @@ def _test_p2_recon_stopgrad_d() -> None:
     with_ground = _dob_grad_norm()
     assert float(losses_g['dob_ground']) > 0.0, float(losses_g['dob_ground'])
     assert with_ground > 1e-5, with_ground
-    print('[smoke] OK  P2 recon stop-grad d (A,K grads from grounding only)')
+    assert (K.grad is not None) and float(K.grad.abs().sum()) > 1e-5
+    assert A.grad is None or float(A.grad.abs().sum()) < 1e-8
+    print('[smoke] OK  P2 recon stop-grad d (K grads from grounding only; A pinned)')
 
 
 def _test_stream_serve_matches_rollout() -> None:
