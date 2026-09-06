@@ -54,15 +54,17 @@ def _pos(v, typ):
 
 
 def _resolve_audit_plant_knobs(args, source_run: Optional[Path]):
-    """SysID from the run / CLI / IDENTIFIED_*. Never invent test_sim 55/8/4/1220/120.
+    """SysID from the run / CLI. Never invent test_sim 55/8/4/1220/120.
 
     Same leftover class as ``_wire_run_artifacts`` in
     ``tools/wm_posterior_prior_probe.py`` (sentinel 0, resolve, refuse).
     Explicit CLI / ``AUDIT_*`` env wins, then ``run_plan.json`` /
-    ``plant_id.json``, then already-exported ``IDENTIFIED_*`` (IPC)
-    and ``DREAMER_SAMPLE_RATE`` / ``DREAMER_EPISODE_LENGTH`` pins.
-    Leftover ``SIM_SAMPLE_RATE`` / ``SIM_EPISODE_LENGTH`` ignored
-    (same class as derive; P94-live / P92-live).
+    ``plant_id.json``, then ``DREAMER_SAMPLE_RATE`` /
+    ``DREAMER_EPISODE_LENGTH`` pins. Leftover login ``IDENTIFIED_*``
+    ignored (P100-live; ``single_run`` still WRITES those names as
+    derive-time IPC). Leftover ``SIM_SAMPLE_RATE`` /
+    ``SIM_EPISODE_LENGTH`` ignored (same class as derive; P94-live /
+    P92-live).
     """
     plan: Dict[str, Any] = {}
     cfg: Dict[str, Any] = {}
@@ -83,16 +85,12 @@ def _resolve_audit_plant_knobs(args, source_run: Optional[Path]):
         tau = _pos(plan.get('tau'), float)
     if tau is None:
         tau = _pos(plant.get('tau') or plant.get('tau_dominant'), float)
-    if tau is None:
-        tau = _pos(os.environ.get('IDENTIFIED_TAU_DOMINANT'), float)
 
     dead = _pos(getattr(args, 'dead', None), float)
     if dead is None:
         dead = _pos(plan.get('dead_time'), float)
     if dead is None:
         dead = _pos(plant.get('dead_time'), float)
-    if dead is None:
-        dead = _pos(os.environ.get('IDENTIFIED_DEAD_TIME'), float)
 
     sr = _pos(getattr(args, 'sample_rate', None), int)
     if sr is None:
@@ -128,12 +126,12 @@ def _resolve_audit_plant_knobs(args, source_run: Optional[Path]):
             f'(missing {", ".join(missing)}). Pass --source-run with '
             'run_plan.json / plant_id.json, or explicit --tau --dead '
             '--sample-rate --episode-len --lookback from SysID.')
-    if getattr(args, 'tau', None) is not None or getattr(args, 'dead', None) is not None:
-        src = 'cli/env explicit'
-    elif source_run is not None and (plan or plant):
+    if (getattr(args, 'tau', None) is None
+            and getattr(args, 'dead', None) is None
+            and source_run is not None and (plan or plant)):
         src = f'source_run={Path(source_run).name}'
     else:
-        src = 'identified env'
+        src = 'cli/env explicit'
     return float(tau), float(dead), int(sr), int(ep), int(lb), src
 
 

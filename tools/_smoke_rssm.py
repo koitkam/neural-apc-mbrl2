@@ -4489,18 +4489,23 @@ def _test_id_tau_no_plant_sentinel() -> None:
         os.environ['IDENTIFIED_DEAD_TIME'] = '8'
         try:
             _resolve_audit_plant_knobs(empty, None)
-            raise AssertionError('expected SystemExit missing lookback')
+            raise AssertionError('expected SystemExit leftover IDENTIFIED ignored')
         except SystemExit as e:
             msg = str(e)
             assert 'refuse to invent' in msg
             miss = msg.split('missing ', 1)[-1].split(').', 1)[0]
-            assert miss.strip() == 'lookback', miss
+            for name in ('tau', 'dead', 'lookback'):
+                assert name in miss, miss
+            assert 'sample_rate' not in miss and 'episode_len' not in miss, miss
     finally:
         for k, old in _prev_sim.items():
             if old is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = old
+    audit_src = (root / 'tools' / 'audit_data_generation_v2.py').read_text()
+    assert "os.environ.get('IDENTIFIED_TAU_DOMINANT')" not in audit_src
+    assert "os.environ.get('IDENTIFIED_DEAD_TIME')" not in audit_src
     cli = SimpleNamespace(tau=53.0, dead=8.0, sample_rate=4,
                           episode_len=1220, lookback=128)
     tau_c, dead_c, sr_c, ep_c, lb_c, src_c = _resolve_audit_plant_knobs(
@@ -4521,7 +4526,7 @@ def _test_id_tau_no_plant_sentinel() -> None:
         assert abs(tau_r - 53.0) < 1e-12 and abs(dead_r - 8.0) < 1e-12
         assert (sr_r, ep_r, lb_r) == (4, 1220, 128)
         assert src_r.startswith('source_run=')
-    print('[smoke] OK  missing SysID τ does not invent 50 s; leftover SIM_DV_PERTURB_ATTR_MAP_JSON ignored')
+    print('[smoke] OK  missing SysID τ does not invent 50 s; leftover IDENTIFIED_* / SIM_DV_PERTURB_ATTR_MAP_JSON ignored')
 
 
 def _test_resolve_baseline_seed_op_band() -> None:
@@ -4875,6 +4880,8 @@ def _test_sample_rate_pin_ignores_leftover() -> None:
         assert "os.environ.get('SIM_EPISODE_LENGTH')" not in audit_src
         assert "os.environ.get('DREAMER_SAMPLE_RATE')" in audit_src
         assert "os.environ.get('DREAMER_EPISODE_LENGTH')" in audit_src
+        assert "os.environ.get('IDENTIFIED_TAU_DOMINANT')" not in audit_src
+        assert "os.environ.get('IDENTIFIED_DEAD_TIME')" not in audit_src
         rssm_audit = open('tools/audit_rssm_training_data.py').read()
         assert "os.environ.setdefault('SIM_SAMPLE_RATE'" not in rssm_audit
         assert "os.environ.setdefault('IDENTIFIED_TAU_DOMINANT'" not in rssm_audit
