@@ -113,6 +113,12 @@ def _estimate_fopdt(y: np.ndarray, step_index: int, deadband_frac: float = 0.05)
 
 
 def _get_cv_indices(meta: Dict[str, Any]) -> List[int]:
+    """CV channel indices from simulator metadata.
+
+    Empty ``cv_indices`` used to invent leftover ``SIM_CV_INDICES_JSON``.
+    Refuse rather than invent; plants must expose ``cv_indices`` (or named
+    PV indices) the same way they expose MVs.
+    """
     cv_idxs = [int(x) for x in meta.get('cv_indices', []) if x is not None]
 
     # Backward-compatible fallback for simulators exposing named PV indices only.
@@ -126,15 +132,9 @@ def _get_cv_indices(meta: Dict[str, Any]) -> List[int]:
             cv_idxs.append(int(v))
 
     if not cv_idxs:
-        env_cv = os.environ.get('SIM_CV_INDICES_JSON', '')
-        if env_cv:
-            try:
-                cv_idxs = [int(x) for x in json.loads(env_cv)]
-            except Exception:
-                cv_idxs = []
-
-    if not cv_idxs:
-        raise ValueError('No CV indices available. Set SIM_CV_INDICES_JSON or provide simulator CV index attributes.')
+        raise ValueError(
+            'No CV indices available. Simulator metadata must expose '
+            'cv_indices (do not invent leftover SIM_CV_INDICES_JSON).')
     return cv_idxs
 
 

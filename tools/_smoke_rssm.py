@@ -4395,8 +4395,10 @@ def _test_id_tau_no_plant_sentinel() -> None:
     id_src = (root / 'utils' / 'dynamics_identifier.py').read_text()
     assert "os.environ.get('SIM_ACTION_DIM'" not in id_src
     assert "SIM_ACTION_DIM', '3'" not in id_src
-    from utils.dynamics_identifier import _resolve_mv_count
+    assert "os.environ.get('SIM_CV_INDICES_JSON'" not in id_src
+    from utils.dynamics_identifier import _get_cv_indices, _resolve_mv_count
     _prev_adim = os.environ.get('SIM_ACTION_DIM')
+    _prev_cv = os.environ.get('SIM_CV_INDICES_JSON')
     try:
         os.environ['SIM_ACTION_DIM'] = '9'
         assert _resolve_mv_count({'mv_indices': [0]}) == 1
@@ -4407,11 +4409,24 @@ def _test_id_tau_no_plant_sentinel() -> None:
         except ValueError as e:
             msg = str(e)
             assert 'mv_indices' in msg and 'SIM_ACTION_DIM' in msg, msg
+        os.environ['SIM_CV_INDICES_JSON'] = '[9]'
+        assert _get_cv_indices({'cv_indices': [0]}) == [0]
+        assert _get_cv_indices({'top_pv_index': 2, 'cv_indices': []}) == [2]
+        try:
+            _get_cv_indices({'cv_indices': []})
+            raise AssertionError('expected refuse leftover SIM_CV_INDICES_JSON')
+        except ValueError as e:
+            msg = str(e)
+            assert 'cv_indices' in msg and 'SIM_CV_INDICES_JSON' in msg, msg
     finally:
         if _prev_adim is None:
             os.environ.pop('SIM_ACTION_DIM', None)
         else:
             os.environ['SIM_ACTION_DIM'] = _prev_adim
+        if _prev_cv is None:
+            os.environ.pop('SIM_CV_INDICES_JSON', None)
+        else:
+            os.environ['SIM_CV_INDICES_JSON'] = _prev_cv
     audit_src = (root / 'tools' / 'audit_data_generation_v2.py').read_text()
     assert "AUDIT_TAU', '55'" not in audit_src
     assert "AUDIT_DEAD', '8'" not in audit_src
