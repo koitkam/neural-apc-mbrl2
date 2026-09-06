@@ -360,8 +360,9 @@ class RSSMConfig:
     # forced to soak it up — de-confounding the omitted-variable gain attenuation
     # (p112: gain 0.36 with the disturbance ON vs 0.18 with it OFF, Exp A p113).
     # Predict (img_step, no obs): d_t = A·d_{t-1}.  Correct (obs_step, real obs):
-    # d_t = A·d_{t-1} + K·(CV_obs − [g(prior.feat)+A·d_{t-1}]).  A,K are learned
-    # per-CV scalars in (0,1) (sigmoid) — a first-order learned Kalman gain.
+    # d_t = A·d_{t-1} + K·(CV_obs − g(prior.feat))  (P100 Luenberger plant
+    # residual; Joseph residualized A·d out of ν and capped SS at 1/A).
+    # A,K are learned per-CV scalars in (0,1) (sigmoid).
     # ``cv_indices`` = the CV obs-vector positions (== env.cv_indices); 0 CVs or
     # ``dob_enabled=False`` ⇒ byte-identical to the pre-DOB model.
     dob_enabled: bool = False

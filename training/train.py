@@ -2226,11 +2226,10 @@ class TrainConfig:
     # warmup, etc.) without throwing away weights.  Empty = cold start.
     init_from_ckpt: str = ''
 
-    # ----- Speedups (DREAMER_FAST_ATTN=1, DREAMER_COMPILE=1 opt-in) -----
+    # ----- Speedups (DREAMER_COMPILE=1 opt-in) -----
     # ``auto`` = SDPA on CUDA / manual on CPU (CausalAttention).  Canonical
-    # override is ``DREAMER_ATTN_IMPL``; leftover ``DREAMER_FAST_ATTN``
-    # maps to the same field (was CLI-only / constructor-env, so
-    # ``single_run`` silently dropped ATTN_IMPL).
+    # override is ``DREAMER_ATTN_IMPL``.  Leftover ``DREAMER_FAST_ATTN``
+    # is **not** read (P100-live; login leftover was a silent A/B).
     attn_impl: str = 'auto'          # 'auto'|'manual'|'sdpa'
     # '' = eager (P26/P28 observer). Opt in: DREAMER_COMPILE=1 /
     # DREAMER_COMPILE_MODE=default|reduce-overhead|max-autotune.

@@ -260,8 +260,8 @@ search *and* keep warm-starting model weights.
 | `DREAMER_EPISODE_LENGTH` | force episode length (else auto from settling time). Leftover `SIM_EPISODE_LENGTH` is ignored; `single_run` still writes `SIM_EPISODE_LENGTH` after derivation as IPC. |
 | `DREAMER_SAMPLE_RATE` | force sample rate (else auto from `τ_fast / 10` / `θ_fast / 2`). Leftover `SIM_SAMPLE_RATE` is ignored at derive; `single_run` still writes `SIM_SAMPLE_RATE` after derivation as IPC. |
 | `SEED` | RNG seed (default 0) |
-| `DREAMER_ATTN_IMPL` | `auto` (default: SDPA on CUDA) / `sdpa` / `manual`. Leftover `DREAMER_FAST_ATTN` (`1`/`sdpa`, `0`/`manual`) maps to the same field. |
-| `DREAMER_FAST_ATTN` | leftover alias of `DREAMER_ATTN_IMPL`. |
+| `DREAMER_ATTN_IMPL` | `auto` (default: SDPA on CUDA) / `sdpa` / `manual`. Leftover `DREAMER_FAST_ATTN` is ignored. |
+| `DREAMER_FAST_ATTN` | **ignored leftover** (P100-live); A/B `DREAMER_ATTN_IMPL`. |
 | `DREAMER_WM_TF_LEVELS` / `_SPAN` / `_STEP_FRAC` / `_HORIZON` / `_SETTLE` | eval TM protocol (defaults 5 / 0.6 / 0.4 / 0=auto `max(80,4H)` / 0=auto). |
 | `DREAMER_VAL_WM_TRANSFER` / `_POSTPRIOR` / `_DISTPRED` | val-suite gates (default ON). |
 | `DREAMER_HORIZON_SETTLE_NTAU` / `DREAMER_HORIZON_MAX` | `H=(θ+n_τ·τ)/sr` formula (defaults 4.0 / 120). |
@@ -529,7 +529,7 @@ early via the `on_iter_end` callback in the trainer.
 | `model_size` | M | `S/M/L` from complexity score | — |
 | `trial_steps` | 50 000 | `40 eps × max(1, complexity / 4) × ep_len`, clamped | `--trial_steps` |
 | `final_steps` | 200 000 | `10 × trial_steps`, clamped | `--final_steps` |
-| `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_ATTN_IMPL` / leftover `DREAMER_FAST_ATTN` |
+| `attn_impl` | manual (paper soft-cap) | `sdpa` whenever CUDA is available | `DREAMER_ATTN_IMPL` (leftover `DREAMER_FAST_ATTN` ignored) |
 | `baseline_seed_action_std` | n/a | `clip(target_cv_frac × cv_w / mv_auth, 0.01, seed_sigma_cap)` with `target_cv_frac=0.20` | `DREAMER_SEED_TARGET_CV_FRAC` (leftover `SEED_*` ignored) |
 | `policy_log_std_max` | log(1.0) | `log(clip(σ_max_mult × σ_seed, FLOOR=0.10, CAP=0.30))` — plant-adaptive | `DREAMER_SIGMA_MAX_*` (leftover `SIGMA_MAX_*` ignored) |
 | `policy_log_std_min` | log(0.1) | `log(σ_max / sigma_min_ratio)` (default ratio **1.2**) | `DREAMER_SIGMA_MIN_RATIO` (leftover `SIGMA_MIN_RATIO_OF_MAX` ignored) |

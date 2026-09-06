@@ -2651,7 +2651,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_P3_TRAIN_STEPS_PER_ITER' in ENV_OVERRIDES
     assert 'DREAMER_OBJ_REWARD_SCALE' in ENV_OVERRIDES
     assert 'DREAMER_ATTN_IMPL' in ENV_OVERRIDES
-    assert 'DREAMER_FAST_ATTN' in ENV_OVERRIDES
+    assert 'DREAMER_FAST_ATTN' not in ENV_OVERRIDES
     assert 'DREAMER_SIGMA_MIN_RATIO' in ENV_OVERRIDES
     assert 'DREAMER_WM_TF_LEVELS' in ENV_OVERRIDES
     assert 'DREAMER_WM_TF_SPAN' in ENV_OVERRIDES
@@ -4660,24 +4660,33 @@ def _test_policy_sigma_bounds_honours_cfg() -> None:
 def _test_attention_auto_ignores_leftover_fast_attn() -> None:
     """``attn_impl='auto'`` must not re-read leftover ``DREAMER_FAST_ATTN``.
 
-    Whitelist maps FAST_ATTN then ATTN_IMPL onto ``cfg.attn_impl``.
+    P100-live: leftover FAST_ATTN is **not** in ``ENV_OVERRIDES``.
     Constructor ``auto`` is device-only (SDPA on CUDA, manual on CPU).
     Smoke uses ``CUDA_VISIBLE_DEVICES=""`` so leftover FAST_ATTN=1
-    used to force SDPA on CPU.
+    used to force SDPA on CPU (constructor) and map ``cfg.attn_impl``
+    via the whitelist.
     """
     import os
     from models.dreamer_v4 import CausalAttention
     prev = os.environ.get('DREAMER_FAST_ATTN')
+    prev_impl = os.environ.get('DREAMER_ATTN_IMPL')
     try:
+        os.environ.pop('DREAMER_ATTN_IMPL', None)
         os.environ['DREAMER_FAST_ATTN'] = '1'
         blk = CausalAttention(8, 2, attn_impl='auto')
         expected = 'sdpa' if torch.cuda.is_available() else 'manual'
         assert blk.attn_impl == expected, (blk.attn_impl, expected)
+        cfg = _cfg_from_env()
+        assert cfg.attn_impl == 'auto', cfg.attn_impl  # leftover ignored
     finally:
         if prev is None:
             os.environ.pop('DREAMER_FAST_ATTN', None)
         else:
             os.environ['DREAMER_FAST_ATTN'] = prev
+        if prev_impl is None:
+            os.environ.pop('DREAMER_ATTN_IMPL', None)
+        else:
+            os.environ['DREAMER_ATTN_IMPL'] = prev_impl
     print('[smoke] OK  CausalAttention auto ignores leftover FAST_ATTN')
 
 
@@ -4866,6 +4875,11 @@ def _test_sample_rate_pin_ignores_leftover() -> None:
         assert "os.environ.get('SIM_EPISODE_LENGTH')" not in audit_src
         assert "os.environ.get('DREAMER_SAMPLE_RATE')" in audit_src
         assert "os.environ.get('DREAMER_EPISODE_LENGTH')" in audit_src
+        rssm_audit = open('tools/audit_rssm_training_data.py').read()
+        assert "os.environ.setdefault('SIM_SAMPLE_RATE'" not in rssm_audit
+        assert "os.environ.setdefault('IDENTIFIED_TAU_DOMINANT'" not in rssm_audit
+        assert "os.environ['DREAMER_SAMPLE_RATE']" in rssm_audit
+        assert "os.environ['DREAMER_EPISODE_LENGTH']" in rssm_audit
     finally:
         for k, old in prev.items():
             if old is None:

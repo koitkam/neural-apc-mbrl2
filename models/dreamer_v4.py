@@ -169,9 +169,9 @@ class CausalAttention(nn.Module):
         cuDNN). Drops soft-cap; QKNorm is the numerical safety net.
       * ``'auto'`` (TrainConfig default) — SDPA on CUDA, manual on CPU.
         Do **not** re-read leftover ``DREAMER_FAST_ATTN`` here:
-        ``ENV_OVERRIDES`` already maps FAST_ATTN then ATTN_IMPL onto
-        ``cfg.attn_impl`` (ATTN_IMPL wins). Re-reading env on ``auto``
-        would let leftover FAST_ATTN beat an explicit ``auto``.
+        whitelist A/B is ``DREAMER_ATTN_IMPL`` only (P100-live leftover
+        FAST_ATTN ignored). Re-reading env on ``auto`` would let login
+        leftover beat an explicit ``auto``.
     """
 
     def __init__(self, dim: int, n_heads: int, soft_cap: float = 50.0,
@@ -187,9 +187,9 @@ class CausalAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         self.soft_cap = soft_cap
         # Resolve ``auto`` from the device only.  Override is
-        # ``cfg.attn_impl`` (``DREAMER_ATTN_IMPL`` / leftover
-        # ``DREAMER_FAST_ATTN`` via ``ENV_OVERRIDES``).  CPU stays
-        # manual (SDPA gains are tiny; ONNX passes ``manual``).
+        # ``cfg.attn_impl`` (``DREAMER_ATTN_IMPL``).  Leftover
+        # ``DREAMER_FAST_ATTN`` is ignored.  CPU stays manual
+        # (SDPA gains are tiny; ONNX passes ``manual``).
         if attn_impl == 'auto':
             attn_impl = 'sdpa' if torch.cuda.is_available() else 'manual'
         assert attn_impl in ('manual', 'sdpa'), f'unknown attn_impl={attn_impl}'
@@ -1260,7 +1260,7 @@ class DreamerV4Config:
     k_max: int = 4
     tau_n_bins: int = 32
     soft_cap: float = 50.0
-    attn_impl: str = 'auto'                # 'auto'|'manual'|'sdpa' (DREAMER_FAST_ATTN=1)
+    attn_impl: str = 'auto'                # 'auto'|'manual'|'sdpa' (DREAMER_ATTN_IMPL)
     # Heads
     n_action_bins: int = 21
     head_hidden: int = 256

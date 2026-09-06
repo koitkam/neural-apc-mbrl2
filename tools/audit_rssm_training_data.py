@@ -110,9 +110,16 @@ TAU_FAST = float(plan.get('tau_fast') or TAU)
 SAMPLE_RATE = int(plan.get('sample_rate') or 1)
 EPISODE_LEN = int(plan['config'].get('episode_length'))
 LOOKBACK = int(plan['config'].get('lookback'))
-os.environ.setdefault('SIM_SAMPLE_RATE', str(SAMPLE_RATE))
-os.environ.setdefault('IDENTIFIED_TAU_DOMINANT', f'{TAU:g}')
-os.environ.setdefault('IDENTIFIED_DEAD_TIME', f'{DEAD:g}')
+# Pin canonical DREAMER_* from the source run (overwrite login leftover).
+# SIM_* writes are IPC for wrappers that still read the derived names
+# (same class as ``single_run``). Leftover ``SIM_SAMPLE_RATE`` setdefault
+# used to let login leftover beat the source-run timestep (P100-live).
+os.environ['DREAMER_SAMPLE_RATE'] = str(SAMPLE_RATE)
+os.environ['DREAMER_EPISODE_LENGTH'] = str(EPISODE_LEN)
+os.environ['SIM_SAMPLE_RATE'] = str(SAMPLE_RATE)
+os.environ['SIM_EPISODE_LENGTH'] = str(EPISODE_LEN)
+os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{TAU:g}'
+os.environ['IDENTIFIED_DEAD_TIME'] = f'{DEAD:g}'
 
 TS = time.strftime('%Y%m%d_%H%M%S')
 OUT = REPO / f'output/{SIM_NAME}/_rssm_data_audit_{TS}'

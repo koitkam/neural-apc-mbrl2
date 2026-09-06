@@ -197,8 +197,12 @@ def _as_compile_mode(s: str) -> str:
 
 
 def _as_attn_impl(s: str) -> str:
-    """Map ``DREAMER_ATTN_IMPL`` / leftover ``DREAMER_FAST_ATTN`` onto
-    TrainConfig ``attn_impl``.  ``auto`` = SDPA on CUDA."""
+    """Map ``DREAMER_ATTN_IMPL`` onto TrainConfig ``attn_impl``.
+
+    Leftover ``DREAMER_FAST_ATTN`` is ignored (P100-live; login leftover
+    was a silent A/B of SDPA vs manual outside ``DREAMER_ATTN_IMPL`` /
+    ``run_plan``).  ``auto`` = SDPA on CUDA.
+    """
     v = str(s).strip().lower()
     if v in ('0', 'false', 'off', 'manual'):
         return 'manual'
@@ -713,10 +717,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # skip ``apply_dreamer_env_overrides`` still work.
     'DREAMER_COMPILE':                    ('compile_mode',                   _as_compile_mode),
     'DREAMER_COMPILE_MODE':               ('compile_mode',                   _as_compile_mode),
-    # Attention backend.  Env-free ``auto`` = SDPA on CUDA.  FAST_ATTN
-    # first so ATTN_IMPL wins if both are set.  Was CLI-only
+    # Attention backend.  Env-free ``auto`` = SDPA on CUDA.  Was CLI-only
     # (``single_run`` silently dropped ATTN_IMPL) + constructor env.
-    'DREAMER_FAST_ATTN':                  ('attn_impl',                      _as_attn_impl),
+    # Leftover ``DREAMER_FAST_ATTN`` ignored (P100-live).
     'DREAMER_ATTN_IMPL':                  ('attn_impl',                      _as_attn_impl),
     # TSSM (transformer-SSM) backbone dims (world_model_type='tssm').
     'DREAMER_TSSM_D_MODEL':               ('tssm_d_model',                   int),
