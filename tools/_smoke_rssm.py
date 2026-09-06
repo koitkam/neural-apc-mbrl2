@@ -2304,6 +2304,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'shape z-score + log-std amp' in _src
     assert 'dob_hpamp=zlog' in _src
     assert 'dob_hpamp=zstd' not in _src
+    assert 'dob_reconsg=True' in _src
+    assert 'rssm.apply_dob(recon, ds.detach())' in _src
+    assert '[dob-ground] recon stop-grad d' in _src
     assert "row.setdefault('dob_ground_std_ratio'" in _src
     assert '(ds_hp - dt_hp).pow(2).mean()' not in _src
     assert '(ratio - 1.0).pow(2)' not in _src
@@ -2374,6 +2377,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gru_hres_mix' not in _src
     assert 'dob_hp=' in _src
     assert 'dob_hpamp=zlog' in _src
+    assert 'dob_reconsg=True' in _src
     assert 'dob_feathp=' not in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
     assert "world_model_type: str = 'rssm'" in _src
@@ -5719,6 +5723,68 @@ def _test_stage1_dob_ground_skip() -> None:
     print('[smoke] OK  Stage-1 dob_ground skipped; apply_dob identity')
 
 
+def _test_p2_recon_stopgrad_d() -> None:
+    """P97: recon add(d.detach()) must not train A,K when dob_ground_coef=0."""
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
+    cfg.mtp_length = 4
+    cfg.world_model_type = 'rssm'
+    cfg.dob_enabled = True
+    cfg.dob_ground_coef = 0.0
+    cfg.dob_reg_coef = 0.0
+    cfg.cv_obs_indices = (0,)
+    cfg.compile_mode = 'off'
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    cfg.gain_match_coef = 0.0
+    cfg.wm_input_isolation_coef = 0.0
+    cfg.rssm_joint_embed_coef = 0.0
+    cfg.cont_gain_persist_coef = 0.0
+    cfg.recon_scale = 0.1
+    model = build_model(cfg)
+    model.set_dob_active(True)
+    model.set_world_model_trainable(g=False, dob=True, reward=False)
+    dyn = model.dynamics
+    A = dyn.dob_log_decay
+    K = dyn.dob_log_gain
+    assert A.requires_grad and K.requires_grad
+    B, T = 2, cfg.seq_len
+    batch = {
+        'obs': torch.randn(B, T, cfg.obs_dim),
+        'act': torch.rand(B, T, cfg.action_dim) * 2 - 1,
+        'rew': torch.randn(B, T),
+        'cont': torch.ones(B, T),
+        'expert': torch.zeros(B, T),
+        'dist': torch.randn(B, T, 1) * 2,
+    }
+
+    def _dob_grad_norm() -> float:
+        ga = 0.0 if A.grad is None else float(A.grad.abs().sum())
+        gk = 0.0 if K.grad is None else float(K.grad.abs().sum())
+        return ga + gk
+
+    model.zero_grad(set_to_none=True)
+    losses, _, _ = world_model_loss(model, batch, cfg)
+    if losses['wm_total'].requires_grad:
+        losses['wm_total'].backward()
+        recon_only = _dob_grad_norm()
+    else:
+        recon_only = 0.0
+    assert recon_only < 1e-7, recon_only
+    assert float(losses['dob_ground']) == 0.0
+
+    cfg.dob_ground_coef = 2.0
+    model.zero_grad(set_to_none=True)
+    losses_g, _, _ = world_model_loss(model, batch, cfg)
+    losses_g['wm_total'].backward()
+    with_ground = _dob_grad_norm()
+    assert float(losses_g['dob_ground']) > 0.0, float(losses_g['dob_ground'])
+    assert with_ground > 1e-5, with_ground
+    print('[smoke] OK  P2 recon stop-grad d (A,K grads from grounding only)')
+
+
 def _test_stream_serve_matches_rollout() -> None:
     """P3 serve feat matches training re-encode (measured DV + Kalman d_t)."""
     from models.dreamer_v4_rssm import stream_serve_step
@@ -5937,6 +6003,7 @@ if __name__ == '__main__':
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()
     _test_stage1_dob_ground_skip()
+    _test_p2_recon_stopgrad_d()
     _test_stream_serve_matches_rollout()
     _test_collect_serve_cuda_graph_cpu()
     _test_dreamer_v4_config_from_train()

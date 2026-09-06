@@ -4446,6 +4446,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gru_zbias={_gru_zb:.3g} "
         f"dob_hp={_hpw} "
         f"dob_hpamp=zlog "
+        f"dob_reconsg=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -8829,10 +8830,21 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # the unmeasured load (de-confounds the omitted-variable gain attenuation).
     # Stage-1 (``dob_active=False``) forces ``d_t≡0`` — skip the clone+add and
     # the ground/reg terms (constant MSE of zeros vs load; no gradient).
+    # P97: add ``d.detach()``. P2 freezes g and trains only A,K. Live recon
+    # through d pulls the Kalman toward the residual ``y−g`` (DC soak:
+    # ``|d|~0.07`` while HP ``std_ratio`` walks 1.08→0.39 — P94/P96 crush).
+    # Grounding still uses live ``ds``. KalmanNet split: recon trains g on
+    # ``obs−sg(d)``; A,K trained only by ``dob_ground``. P1 is ``dob_live``
+    # false so this is a P2 (and any dob-live) change only.
     dob_on = bool(getattr(rssm, 'dob_enabled', False)) and ds is not None
     dob_live = dob_on and bool(getattr(rssm, 'dob_active', True))
     if dob_live:
-        recon = rssm.apply_dob(recon, ds)
+        if not getattr(cfg, '_dob_recon_sg_logged', False):
+            print('[dob-ground] recon stop-grad d (P97; Kalman trained by '
+                  'grounding only)',
+                  flush=True)
+            cfg._dob_recon_sg_logged = True  # type: ignore[attr-defined]
+        recon = rssm.apply_dob(recon, ds.detach())
     recon_loss = _weighted_recon_mse(recon, obs_cur, cfg)
     # P81/P82 prior-recon family REVERT (P82 EXIT): obs-space
     # ``decode(prior)`` (live or stop-grad decoder) FALSIFIED as TM
@@ -8938,10 +8950,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # recon MSE and dob_reg opposes it) so d_t under-tracks (r~0.42) and
     # imagination + the critic stay disturbance-blind.  A direct target tunes the
     # Kalman gain/decay (A,K — the only unfrozen DOB params in Stage-2) so the
-    # estimate TRACKS the load.  recon and this term AGREE (decode(post) is
-    # frozen-clean → both want d_t = disturbance), so there is no conflict.  The
-    # target batch['dist'] is in ENGINEERING CV units and d_t is NORMALIZED, so
-    # divide by the running CV obs-norm std (threaded on cfg as _cv_obs_std).
+    # estimate TRACKS the load.  P96 RCA: live recon through d does NOT agree
+    # with grounding once g is frozen — residual ``y−g`` soaks DC into |d|
+    # while HP amp is crushed. P97 stop-grads d in recon; this term is the
+    # A,K trainer.  The target batch['dist'] is in ENGINEERING CV units and
+    # d_t is NORMALIZED, so divide by the running CV obs-norm std (threaded
+    # on cfg as _cv_obs_std).
     dob_ground = torch.zeros((), device=feats.device)
     dob_ground_keep_frac = torch.zeros((), device=feats.device)
     dob_ground_std_ratio = torch.zeros((), device=feats.device)
