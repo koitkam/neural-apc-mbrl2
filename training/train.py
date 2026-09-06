@@ -4232,12 +4232,12 @@ def _dob_ground_hp_window(cfg: 'TrainConfig', T: int) -> int:
 def _dob_ground_hp_mse(
         ds: torch.Tensor, dt: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-    """P89/P93/P98 Wiener HP MSE. Returns ``(mse, std_ratio.detach())``.
+    """Wiener MSE on the tensors passed in. Returns ``(mse, std_ratio.detach())``.
 
-    P94–P97 z-score + log-std amp **REVERT**. P97 recon-sg already
-    stop-grads Kalman from recon so this term is the A,K trainer; first
-    P2 ``log(185)^2≈28`` while Wiener at the same ``|d|~0.34`` is
-    O(0.2), then ``std_ratio`` walked **1.00@76–77 → 0.55@96**. jsonl
+    P101 callers pass **raw** ``d`` / load (HP crop-demean crushed
+    Luenberger K). P98 callers passed HP tensors. P94–P97 z-score +
+    log-std amp **REVERT**. P97 recon-sg already stop-grads Kalman from
+    recon so this term is the K trainer (A pinned). jsonl
     ``dob_ground_std_ratio`` stays detached observability (not a loss).
     """
     ds_f = ds.float()
@@ -4401,7 +4401,11 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
     from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
     _gru_zb = float(_gru_zbias_fn(_h_zb))
-    _hpw = _dob_ground_hp_window(cfg, int(getattr(cfg, 'seq_len', 0) or 0))
+    # P101: training ground is raw MSE (HP crop-demean crushed Luenberger K).
+    # ``_dob_ground_hp_window`` stays the val-protocol formula (smoke / A/B
+    # via ``disturbance_detrend_settle_mult<=0``); banner prints the
+    # *training* window (0).
+    _hpw = 0
     print(
         '[resolved-cfg] '
         f"wm={getattr(cfg, 'world_model_type', 'rssm')} "
@@ -8984,28 +8988,22 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 # |d| did not grow; val pred_std 0.252 vs P64 0.608).
                 # Mean MSE over all sequences (P64 identity).  Mixed
                 # ring KEEP (P65 flush REVERT).  Do not /dvar.
-                # P89: high-pass both sides with the val detrend window
-                # ``min(4H, T)`` so slow drift (feedback-rejectable) does
-                # not dominate the term that should train det_r / AC amp.
-                # P98: Wiener ``‖HP(d)−HP(load)‖²`` restored (P94–P97
-                # zlog REVERT). jsonl ``dob_ground_keep_frac`` is 1.0
-                # when this term fires (observability; no skip).
-                _hpw = _dob_ground_hp_window(cfg, int(ds.shape[1]))
-                if _hpw > 1:
-                    if not getattr(cfg, '_dob_ground_hp_logged', False):
-                        print(
-                            f'[dob-ground] high-pass MA w={_hpw} '
-                            f'(min(4H,T); val detrend; P89) '
-                            f'Wiener HP MSE (P98; P94–P97 zlog REVERT)',
-                            flush=True)
-                        cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
-                    ds_g = _highpass_bt(ds, _hpw)
-                    dt_g = _highpass_bt(dtgt, _hpw)
-                else:
-                    ds_g = ds
-                    dt_g = dtgt
+                # P101: raw ``‖d−load‖²``. P89 HP ``min(4H,T)`` is
+                # crop-demean on test_sim (T=128=seq_len) — DC-blind —
+                # and crushed P100 Luenberger K 0.119→0.049 (end-P2 SS
+                # ≈1.04, Joseph's 1/A cap). Pin-A KEEP so DC cannot
+                # walk A (P89/P98 RCA). Val detrend (4H on episode
+                # T=1220) is unchanged. jsonl ``std_ratio`` is now the
+                # raw-crop amp (observability). Helper
+                # ``_dob_ground_hp_window`` stays for smoke / A/B.
+                if not getattr(cfg, '_dob_ground_hp_logged', False):
+                    print(
+                        '[dob-ground] raw MSE (P101; Luenberger+pin-A; '
+                        'HP crop-demean crushed K; val detrend unchanged)',
+                        flush=True)
+                    cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
                 dob_ground, dob_ground_std_ratio = _dob_ground_hp_mse(
-                    ds_g, dt_g)
+                    ds, dtgt)
                 dob_ground_keep_frac = torch.ones((), device=ds.device)
                 wm_total = wm_total + dgc * dob_ground
             elif not getattr(cfg, '_dob_ground_shape_warned', False):

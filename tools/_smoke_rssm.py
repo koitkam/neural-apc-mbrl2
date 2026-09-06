@@ -1920,7 +1920,7 @@ def _test_dob_ground_highpass() -> None:
 
 
 def _test_dob_ground_hp_mse() -> None:
-    """P98 REVERT: Wiener HP MSE (P89/P93). std_ratio is detached observability."""
+    """P101: MSE on tensors passed in (raw). std_ratio is detached observability."""
     from training.train import _dob_ground_hp_mse
     torch.manual_seed(0)
     dt = torch.randn(4, 32, 1)
@@ -1938,7 +1938,7 @@ def _test_dob_ground_hp_mse() -> None:
     loss_loud, ratio_loud = _dob_ground_hp_mse(ds_loud, dt)
     assert abs(float(ratio_loud) - 100.0) < 1e-2
     assert float(loss_loud) > 100.0  # not the log-amp bowl (~21)
-    print('[smoke] OK  dob_ground Wiener HP MSE (P98)')
+    print('[smoke] OK  dob_ground raw MSE (P101; helper identity)')
 
 
 def _test_atomic_torch_save() -> None:
@@ -2286,8 +2286,11 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def _dob_ground_hp_mse' in _src
     assert 'def _dob_ground_shape_amp' not in _src
     assert 'def _highpass_bt' in _src
-    assert '[dob-ground] high-pass MA w=' in _src
-    assert 'Wiener HP MSE (P98; P94–P97 zlog REVERT)' in _src
+    assert '[dob-ground] high-pass MA w=' not in _src
+    assert '[dob-ground] raw MSE (P101' in _src
+    assert 'HP crop-demean crushed K' in _src
+    assert '_hpw = 0' in _src
+    assert '_highpass_bt(ds,' not in _src
     assert 'shape z-score + log-std amp' not in _src
     assert 'dob_hpamp=mse' in _src
     assert 'dob_hpamp=zlog' not in _src
