@@ -4823,6 +4823,87 @@ def _test_sample_rate_pin_ignores_leftover() -> None:
     print('[smoke] OK  sample-rate pin DREAMER_SAMPLE_RATE; leftover SIM_SAMPLE_RATE ignored')
 
 
+def _test_sim_factory_ignores_leftover_model_env() -> None:
+    """Plant control_setup.json wins; leftover SIM_MODEL_* / SIM_*_JSON ignored."""
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+    from utils.sim_factory import (
+        _constructor_kwargs, _load_sim_class, _setup_list, _setup_str)
+
+    src = open('utils/sim_factory.py').read()
+    assert "os.environ.get('SIM_MODEL_MODULE', sim_cfg.get" not in src
+    assert "os.environ.get('SIM_MODEL_CLASS', sim_cfg.get" not in src
+    assert "_env_json('SIM_MODEL_KWARGS_JSON', file_kwargs)" not in src
+    assert "_env_json('SIM_MV_INDICES_JSON', io_cfg.get" not in src
+    assert "_env_json('SIM_CV_INDICES_JSON', io_cfg.get" not in src
+    assert "_env_json('SIM_DV_INDICES_JSON', io_cfg.get" not in src
+    assert "_env_json('SIM_STATE_VARIABLES_JSON', io_cfg.get" not in src
+    assert 'def _setup_str' in src and 'def _setup_list' in src
+
+    assert _setup_str('simulation.test_sim.test_sim', 'SIM_MODEL_MODULE') == (
+        'simulation.test_sim.test_sim')
+    assert _setup_list([0, 2], 'SIM_MV_INDICES_JSON') == [0, 2]
+
+    keys = (
+        'CONTROL_SETUP_JSON', 'SIM_MODEL_MODULE', 'SIM_MODEL_CLASS',
+        'SIM_MODEL_KWARGS_JSON', 'SIM_MV_INDICES_JSON', 'SIM_CV_INDICES_JSON',
+        'SIM_DV_INDICES_JSON', 'SIM_STATE_VARIABLES_JSON',
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    setup_path = Path('simulation/test_sim/control_setup.json').resolve()
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ['CONTROL_SETUP_JSON'] = str(setup_path)
+        os.environ['SIM_MODEL_MODULE'] = 'does.not.exist.module'
+        os.environ['SIM_MODEL_CLASS'] = 'NotAClass'
+        cls = _load_sim_class()
+        assert cls.__name__ == 'TestSimTower', cls
+        os.environ['SIM_MODEL_KWARGS_JSON'] = json.dumps(
+            {'episode_length': 9, 'noise_stdv': 0.99, 'bogus': 1})
+        kw = _constructor_kwargs(1220, 4, 0.03)
+        assert int(kw['episode_length']) == 1220, kw
+        assert abs(float(kw['noise_stdv']) - 0.03) < 1e-12, kw
+        assert 'bogus' not in kw, kw
+
+        with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.json', delete=False) as fh:
+            json.dump({
+                'simulator': {
+                    'module': 'simulation.test_sim.test_sim',
+                    'class': 'TestSimTower',
+                    'kwargs': {'episode_length': 50},
+                },
+                'io': {'mv_indices': [0], 'cv_indices': [1], 'dv_indices': [2],
+                       'state_variables': ['a', 'b']},
+            }, fh)
+            tmp = fh.name
+        os.environ['CONTROL_SETUP_JSON'] = tmp
+        os.environ['SIM_MV_INDICES_JSON'] = '[9, 9]'
+        os.environ['SIM_CV_INDICES_JSON'] = '[8]'
+        os.environ['SIM_DV_INDICES_JSON'] = '[7]'
+        os.environ['SIM_STATE_VARIABLES_JSON'] = json.dumps(['x'])
+        assert _setup_list([0], 'SIM_MV_INDICES_JSON') == [0]
+        from utils.sim_factory import _load_setup_file
+        io = _load_setup_file().get('io', {})
+        assert _setup_list(io.get('mv_indices', []),
+                           'SIM_MV_INDICES_JSON') == [0]
+        assert _setup_list(io.get('cv_indices', []),
+                           'SIM_CV_INDICES_JSON') == [1]
+        assert _setup_list(io.get('state_variables', []),
+                           'SIM_STATE_VARIABLES_JSON') == ['a', 'b']
+        os.unlink(tmp)
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  sim_factory plant setup wins; leftover SIM_MODEL_* ignored')
+
+
 def _test_derived_observables_cfg() -> None:
     """Derived-obs: TrainConfig default ON; leftover DREAMER_DERIVED_* ignored."""
     import os
@@ -5890,6 +5971,7 @@ if __name__ == '__main__':
     _test_wm_tf_knobs_cfg_or_env()
     _test_horizon_ic_overhead_cfg_or_env()
     _test_sample_rate_pin_ignores_leftover()
+    _test_sim_factory_ignores_leftover_model_env()
     _test_derived_observables_cfg()
     _test_noise_hidden_cfg()
     _test_gpu_calib_cfg()
