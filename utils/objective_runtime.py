@@ -316,9 +316,10 @@ def _obj_str(cfg, field: str, dreamer_key: str, leftover_key: str,
 def _plant_timing_for_integral(cfg) -> Tuple[float, float]:
     """``(tau, dead)`` for integral dead-time damping.
 
-    Prefer TrainConfig identified timing (``single_run`` writes it);
-    IPC ``IDENTIFIED_*`` when the field is 0.  Leftover
-    ``SIM_IDENTIFIED_*`` ignored (P93-live).
+    Prefer TrainConfig identified timing (``single_run`` writes it).
+    Login leftover ``IDENTIFIED_*`` ignored when the field is 0
+    (P95-live; derive-time IPC stays in ``auto_episode_length``).
+    Leftover ``SIM_IDENTIFIED_*`` ignored (P93-live).
     """
     tau = 0.0
     dead = 0.0
@@ -331,10 +332,6 @@ def _plant_timing_for_integral(cfg) -> Tuple[float, float]:
             dead = float(getattr(cfg, 'identified_dead_time', 0.0) or 0.0)
         except Exception:
             dead = 0.0
-    if tau <= 0.0:
-        tau = _safe_float(os.environ.get('IDENTIFIED_TAU_DOMINANT'), 0.0)
-    if dead <= 0.0:
-        dead = _safe_float(os.environ.get('IDENTIFIED_DEAD_TIME'), 0.0)
     return float(tau), float(dead)
 
 
@@ -395,8 +392,8 @@ def resolve_integral_config(objective_spec=None, cfg=None) -> Tuple[bool, float,
                 _boost = float(min(max(1.0, _margin / _cv_ratio),
                                    max(1.0, _boost_max)))
                 # Dead-time-aware LIMIT-CYCLE damping (2026-06-09, p107 RCA).
-                # Prefer TrainConfig identified τ/θ; leftover IDENTIFIED_*
-                # when the field is 0.
+                # Prefer TrainConfig identified τ/θ (P95-live: leftover
+                # IDENTIFIED_* ignored when the field is 0).
                 try:
                     _k = _obj_float(
                         cfg, 'obj_auto_integral_deadtime_k',

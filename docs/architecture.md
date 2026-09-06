@@ -442,7 +442,9 @@ env-gated off · **[planned]** = designed, not yet built.
 > Identified plant `τ`/`θ` live on TrainConfig
 > (`identified_tau_dominant` / `identified_dead_time`); APCEnv
 > caches them. Leftover `SIM_IDENTIFIED_*` is ignored (P93-live);
-> IPC `IDENTIFIED_*` still wins when the field is 0. P29's on-disk plan is the
+> leftover login `IDENTIFIED_*` is ignored when the field is 0 (P95-live;
+> derive-time IPC stays in `auto_episode_length` / `identify_dynamics`).
+> P29's on-disk plan is the
 > *pre-rewrite* dump (`rssm_latent_type=categorical`).
 > **Compile leftover (same class):** `TrainConfig.compile_mode=''` was
 > documented off, but `build_model` treated empty as default-on unless

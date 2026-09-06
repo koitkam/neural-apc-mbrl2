@@ -208,10 +208,10 @@ class DomainRandomizer:
 
         Sims should call this once in ``reset()``. All values are neutral
         (gain=1, bias=0, tau=0, delay=0) when domain randomisation is
-        disabled. ``identified_tau`` / ``identified_dead_time`` (in sample
-        steps) let the randomiser derive sensible defaults for actuator
-        lag and MV dead-time when the user did not specify them in the
-        control_setup.json block.
+        disabled. ``identified_tau`` / ``identified_dead_time`` (caller
+        plant units) let the randomiser derive actuator lag and MV
+        dead-time when the control_setup.json block omits them.  Login
+        leftover ``IDENTIFIED_*`` is ignored (P95-live).
 
         The sampled fields are plant-agnostic and intended for ONNX-backed
         simulators where the model weights cannot themselves be perturbed:
@@ -244,24 +244,10 @@ class DomainRandomizer:
             except (TypeError, ValueError):
                 return float(default)
 
-        # Identified plant-dynamics fallbacks: caller args, then IPC
-        # ``IDENTIFIED_*`` that ``single_run`` writes after SysID.
-        # Leftover ``SIM_IDENTIFIED_*`` ignored (P93-live; login leftover
-        # was a silent A/B, and ``single_run`` never writes that name).
-        if identified_tau is None:
-            env_tau = os.environ.get('IDENTIFIED_TAU_DOMINANT', '').strip()
-            if env_tau:
-                try:
-                    identified_tau = float(env_tau)
-                except Exception:
-                    identified_tau = None
-        if identified_dead_time is None:
-            env_dead = os.environ.get('IDENTIFIED_DEAD_TIME', '').strip()
-            if env_dead:
-                try:
-                    identified_dead_time = float(env_dead)
-                except Exception:
-                    identified_dead_time = None
+        # Identified plant-dynamics from caller args (plant τ/θ).
+        # Login leftover ``IDENTIFIED_*`` ignored (P95-live; derive-time
+        # IPC stays in ``auto_episode_length`` / ``identify_dynamics``).
+        # Leftover ``SIM_IDENTIFIED_*`` ignored (P93-live).
 
         # Output gain ±output_gain_pct (defaults to self.frac so it tracks
         # the top-level DR magnitude).

@@ -355,7 +355,14 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
         # (output gain/bias, input jitter std, actuator lag, MV dead-time,
         # DV mean-shift). All become neutral when domain randomisation is
         # disabled via control_setup or DREAMER_SIM_DOMAIN_RANDOMIZATION=0.
-        self._randomizer.sample_episode(n_dvs=len(_DV_TAGS))
+        # Pass plant DV-OU τ like the other sims (test_sim / distillation
+        # / nonlinear).  Do not fall back to login leftover IDENTIFIED_*
+        # (seconds-as-steps silent A/B; P95-live).
+        self._randomizer.sample_episode(
+            n_dvs=len(_DV_TAGS),
+            identified_tau=float(self.dv_tau),
+            identified_dead_time=0.0,
+        )
 
         rng = self._randomizer.rng
 
