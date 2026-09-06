@@ -349,12 +349,13 @@ env-gated off · **[planned]** = designed, not yet built.
 > under-drives `d_t` (the slow load is a small share of the recon MSE) and
 > `dob_reg` opposes it, so imagination + the critic stayed disturbance-blind and
 > the actor collapsed below the open-loop baseline. Grounding adds a direct
-> `dob_ground_coef · (shape + amp)` on HP tensors (P89 EXIT KEEP: high-pass MA
+> `dob_ground_coef · ‖HP(d)−HP(load)‖²` on HP tensors (P89 EXIT KEEP: high-pass MA
 > `min(4H,T)` matching val detrend; **P94/P95:** Wiener HP MSE → z-score shape
 > with stop-grad pred std + unitless `(std_d/std_tgt−1)²` amp **FALSIFIED as
 > P2-entry**; **P96 EXIT:** amp `log(std_ratio)²` KEEP as P2-entry / FALSIFIED
-> as recovery; **P97:** recon adds `d.detach()` so A,K are trained by this
-> term only — unit-matched via the running CV obs-norm std; P90 serve-HP feat tail
+> as recovery; **P97 EXIT:** recon adds `d.detach()` KEEP as P2-entry /
+> FALSIFIED as amp recovery; **P98:** Wiener HP MSE **REVERT** of P94–P97 zlog
+> (recon-sg KEEP) — unit-matched via the running CV obs-norm std; P90 serve-HP feat tail
 > **REVERT** — actor/critic feat uses raw `d.detach()`; this term is the P2
 > ground only) that tunes the Kalman `A,K` to TRACK the load — the structural fix
 > for the manual `dob_gain_init` amplitude tuning. `dob_reg_coef → 0` when
@@ -975,13 +976,15 @@ flowchart LR
   in Stage-2 (the slow load is a small share of the recon MSE and `dob_reg`
   opposes it, so the load amplitude is under-estimated — p18: `d_t` vs true load
   r=0.42, ~0.3× amplitude). When `dob_ground_coef > 0` a direct target
-  `shape + amp` on HP tensors (**P89:** high-pass MA `min(round(4H),T)` with
+  `‖HP(d)−HP(load)‖²` on HP tensors (**P89:** high-pass MA `min(round(4H),T)` with
   existing `disturbance_detrend_settle_mult`; test_sim crop = per-window DC;
   `mult<=0` keeps raw; **P94/P95:** Wiener `‖HP(d)−HP(load)‖²` → z-score shape
   MSE with stop-grad pred std + `(std_d/std_tgt−1)²` amp **FALSIFIED as P2-entry**;
   **P96 EXIT:** `log(std_ratio)²` KEEP as P2-entry / FALSIFIED as recovery;
-  **P97:** recon `apply_dob(recon, ds.detach())` so this term is the A,K trainer
-  of the sim's known hidden load, unit-matched to `d_t`'s
+  **P97 EXIT:** recon `apply_dob(recon, ds.detach())` KEEP as P2-entry /
+  FALSIFIED as amp recovery (first P2 `dobg≈28`=`log(185)²`; crush **1.00→0.55**);
+  **P98:** Wiener HP MSE **REVERT** of P94–P97 zlog (recon-sg KEEP) so this
+  term is the A,K trainer of the sim's known hidden load, unit-matched to `d_t`'s
   normalized space via the running CV obs-norm std, threaded as `cfg._cv_obs_std`)
   tunes the Kalman `A,K` to TRACK the load — the structural replacement for the
   manual `dob_gain_init` amplitude tuning and the `dob_reg` prior

@@ -1919,43 +1919,26 @@ def _test_dob_ground_highpass() -> None:
     print('[smoke] OK  dob_ground high-pass (min(4H,T); val MA identity)')
 
 
-def _test_dob_ground_shape_amp() -> None:
-    """P94 z-score shape KEEP; P96 amp is log(std_ratio)^2 not (r-1)^2."""
-    import math
-    from training.train import _dob_ground_shape_amp
+def _test_dob_ground_hp_mse() -> None:
+    """P98 REVERT: Wiener HP MSE (P89/P93). std_ratio is detached observability."""
+    from training.train import _dob_ground_hp_mse
     torch.manual_seed(0)
     dt = torch.randn(4, 32, 1)
-    loss, ratio = _dob_ground_shape_amp(dt, dt)
+    loss, ratio = _dob_ground_hp_mse(dt, dt)
     assert abs(float(ratio) - 1.0) < 1e-5
     assert float(loss) < 1e-6
     ds = 0.5 * dt
-    loss, ratio = _dob_ground_shape_amp(ds, dt)
+    loss, ratio = _dob_ground_hp_mse(ds, dt)
     assert abs(float(ratio) - 0.5) < 1e-4
-    # shape ~0 (z-score); amp log(0.5)^2 ≈ 0.480
-    assert abs(float(loss) - math.log(0.5) ** 2) < 1e-4
-    # stop-grad: shape term does not flow through pred std
-    ds_g = (0.4 * dt).detach().requires_grad_(True)
-    d_std = ds_g.std().clamp_min(1e-3)
-    t_std = dt.std().clamp_min(1e-3)
-    shape = (ds_g / d_std.detach() - dt / t_std).pow(2).mean()
-    # A uniform scale of ds_g changes std but not z-score → shape unchanged
-    ds2 = (ds_g.detach() * 1.7).requires_grad_(True)
-    d_std2 = ds2.std().clamp_min(1e-3)
-    shape2 = (ds2 / d_std2.detach() - dt / t_std).pow(2).mean()
-    assert abs(float(shape.detach()) - float(shape2.detach())) < 1e-5
-    # amp alone pushes |d| up when under-gained
-    ds_a = (0.3 * dt).detach().requires_grad_(True)
-    loss_a, _ = _dob_ground_shape_amp(ds_a, dt)
-    g_a, = torch.autograd.grad(loss_a, ds_a)
-    align = float((g_a * ds_a.detach()).sum())
-    assert align < 0.0  # negative: reducing |d| raises loss → grow |d|
-    # P95 RCA: linear (ratio-1)^2 at 107× is ~11236; log^2 is ~21.7
-    ds_loud = (100.0 * dt).detach().requires_grad_(True)
-    loss_loud, ratio_loud = _dob_ground_shape_amp(ds_loud, dt)
+    expected = (ds.float() - dt.float()).pow(2).mean()
+    assert abs(float(loss) - float(expected)) < 1e-5
+    assert abs(float(loss) - 0.25 * float(dt.float().pow(2).mean())) < 1e-4
+    # P97 RCA: log(185)^2≈28 at first P2; Wiener at that |d| is O(0.2)
+    ds_loud = 100.0 * dt
+    loss_loud, ratio_loud = _dob_ground_hp_mse(ds_loud, dt)
     assert abs(float(ratio_loud) - 100.0) < 1e-2
-    assert float(loss_loud) < 30.0  # not thousands
-    assert abs(float(loss_loud) - math.log(100.0) ** 2) < 1e-3
-    print('[smoke] OK  dob_ground shape+amp (z-score; log-std amp)')
+    assert float(loss_loud) > 100.0  # not the log-amp bowl (~21)
+    print('[smoke] OK  dob_ground Wiener HP MSE (P98)')
 
 
 def _test_atomic_torch_save() -> None:
@@ -2298,17 +2281,20 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gru_hres_logit' not in _rssm_src
     assert 'g * (h_gru - prev.h)' not in _rssm_src
     assert 'def _dob_ground_hp_window' in _src
-    assert 'def _dob_ground_shape_amp' in _src
+    assert 'def _dob_ground_hp_mse' in _src
+    assert 'def _dob_ground_shape_amp' not in _src
     assert 'def _highpass_bt' in _src
     assert '[dob-ground] high-pass MA w=' in _src
-    assert 'shape z-score + log-std amp' in _src
-    assert 'dob_hpamp=zlog' in _src
+    assert 'Wiener HP MSE (P98; P94–P97 zlog REVERT)' in _src
+    assert 'shape z-score + log-std amp' not in _src
+    assert 'dob_hpamp=mse' in _src
+    assert 'dob_hpamp=zlog' not in _src
     assert 'dob_hpamp=zstd' not in _src
     assert 'dob_reconsg=True' in _src
     assert 'rssm.apply_dob(recon, ds.detach())' in _src
     assert '[dob-ground] recon stop-grad d' in _src
     assert "row.setdefault('dob_ground_std_ratio'" in _src
-    assert '(ds_hp - dt_hp).pow(2).mean()' not in _src
+    assert '(ds_f - dt_f).pow(2).mean()' in _src
     assert '(ratio - 1.0).pow(2)' not in _src
     assert 'keeps the K-stack of decoded obs for the FOPDT' not in _rssm_src
     assert 'fill_(_zbias)' not in _rssm_src
@@ -2376,7 +2362,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gru_hres=' not in _src
     assert 'gru_hres_mix' not in _src
     assert 'dob_hp=' in _src
-    assert 'dob_hpamp=zlog' in _src
+    assert 'dob_hpamp=mse' in _src
     assert 'dob_reconsg=True' in _src
     assert 'dob_feathp=' not in _src
     assert "wm={getattr(cfg, 'world_model_type', 'rssm')}" in _src
@@ -6013,7 +5999,7 @@ if __name__ == '__main__':
     _test_gru_update_gate_bias()
     _test_gru_vanilla_no_residual_mix()
     _test_dob_ground_highpass()
-    _test_dob_ground_shape_amp()
+    _test_dob_ground_hp_mse()
     _test_atomic_torch_save()
     _test_img_step_det_roll_skips_sample()
     _test_initial_state_zeros_cache()

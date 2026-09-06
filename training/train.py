@@ -4228,32 +4228,23 @@ def _dob_ground_hp_window(cfg: 'TrainConfig', T: int) -> int:
     return int(min(T, w))
 
 
-def _dob_ground_shape_amp(
+def _dob_ground_hp_mse(
         ds: torch.Tensor, dt: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scale-free shape MSE + unitless log-std amplitude.
+    """P89/P93/P98 Wiener HP MSE. Returns ``(mse, std_ratio.detach())``.
 
-    P89 HP MSE is Wiener: the MMSE fit shrinks ``pred_std`` (P89/P93
-    ``~0.5`` vs true ``1.93``). Shape z-scores the pred with **stop-grad
-    std** so phase grads cannot fight amplitude. P94 amp
-    ``(pred_std / teacher_std - 1)^2`` detonated at P2 entry: first
-    Kalman ``d`` is OOD-loud (P94 ``std_ratio`` 60.6 / P95 **107** →
-    amp **3556 / 11236**, P95 gnorm **21463** skip **46** ES). Linear
-    ratio then crushed P94 to **0.33** (shallow bowl once under). Amp
-    is ``log(pred_std / teacher_std)^2``: first-P2 107× → **~21.7**
-    not 11236; under-gain 0.33 keeps a steeper pull than ``(r-1)^2``.
-    Same ``dob_ground_coef``. ``clamp_min(1e-3)`` is numerical, **not**
-    the P66 skip gate. Returns ``(loss, std_ratio)`` with
-    ``std_ratio`` detached.
+    P94–P97 z-score + log-std amp **REVERT**. P97 recon-sg already
+    stop-grads Kalman from recon so this term is the A,K trainer; first
+    P2 ``log(185)^2≈28`` while Wiener at the same ``|d|~0.34`` is
+    O(0.2), then ``std_ratio`` walked **1.00@76–77 → 0.55@96**. jsonl
+    ``dob_ground_std_ratio`` stays detached observability (not a loss).
     """
     ds_f = ds.float()
     dt_f = dt.float()
-    d_std = ds_f.std().clamp_min(1e-3)
-    t_std = dt_f.std().clamp_min(1e-3)
-    shape = (ds_f / d_std.detach() - dt_f / t_std).pow(2).mean()
-    ratio = d_std / t_std
-    amp = ratio.log().pow(2)
-    return shape + amp, ratio.detach()
+    mse = (ds_f - dt_f).pow(2).mean()
+    d_std = ds_f.std().clamp_min(1e-6)
+    t_std = dt_f.std().clamp_min(1e-6)
+    return mse, (d_std / t_std).detach()
 
 
 def _highpass_bt(x: torch.Tensor, w: int) -> torch.Tensor:
@@ -4445,7 +4436,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"ov_sgstart=True "
         f"gru_zbias={_gru_zb:.3g} "
         f"dob_hp={_hpw} "
-        f"dob_hpamp=zlog "
+        f"dob_hpamp=mse "
         f"dob_reconsg=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
@@ -8992,11 +8983,8 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 # P89: high-pass both sides with the val detrend window
                 # ``min(4H, T)`` so slow drift (feedback-rejectable) does
                 # not dominate the term that should train det_r / AC amp.
-                # P94: replace Wiener HP MSE with z-score shape +
-                # unitless amp (same coef; no new knob). P96: amp is
-                # ``log(std_ratio)^2`` — P94 ``(ratio-1)^2`` detonated
-                # P2 entry (P95 ratio 107 skip 46 ES) then crushed
-                # P94 to 0.33. jsonl ``dob_ground_keep_frac`` is 1.0
+                # P98: Wiener ``‖HP(d)−HP(load)‖²`` restored (P94–P97
+                # zlog REVERT). jsonl ``dob_ground_keep_frac`` is 1.0
                 # when this term fires (observability; no skip).
                 _hpw = _dob_ground_hp_window(cfg, int(ds.shape[1]))
                 if _hpw > 1:
@@ -9004,8 +8992,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                         print(
                             f'[dob-ground] high-pass MA w={_hpw} '
                             f'(min(4H,T); val detrend; P89) '
-                            f'shape z-score + log-std amp '
-                            f'(P96; not (ratio-1)^2)',
+                            f'Wiener HP MSE (P98; P94–P97 zlog REVERT)',
                             flush=True)
                         cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
                     ds_g = _highpass_bt(ds, _hpw)
@@ -9013,7 +9000,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 else:
                     ds_g = ds
                     dt_g = dtgt
-                dob_ground, dob_ground_std_ratio = _dob_ground_shape_amp(
+                dob_ground, dob_ground_std_ratio = _dob_ground_hp_mse(
                     ds_g, dt_g)
                 dob_ground_keep_frac = torch.ones((), device=ds.device)
                 wm_total = wm_total + dgc * dob_ground
