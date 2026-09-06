@@ -4234,10 +4234,11 @@ def _dob_ground_hp_mse(
         ) -> tuple[torch.Tensor, torch.Tensor]:
     """Level Wiener MSE. Returns ``(mse, std_ratio.detach())``.
 
-    Helper / smoke identity. **Not** the P2 training ground after P102
-    (increment MSE). P101 used this on raw ``d`` / load; P98 on HP
-    tensors. P94–P97 z-score + log-std amp **REVERT**. jsonl
-    ``dob_ground_std_ratio`` is detached observability (not a loss).
+    P103 training ground on **served** ``d = d_slow + d_fast``. P102
+    increment MSE crushed K (``|Δd|∝K``); P101 used this on a single
+    ``d`` (held K, dumped DC). P98 used this on HP tensors. P94–P97
+    z-score + log-std amp **REVERT**. jsonl ``dob_ground_std_ratio`` is
+    detached observability (not a loss).
     """
     ds_f = ds.float()
     dt_f = dt.float()
@@ -4250,15 +4251,12 @@ def _dob_ground_hp_mse(
 def _dob_ground_inc_mse(
         ds: torch.Tensor, dt: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-    """First-difference MSE. ``std_ratio`` is level-amp observability.
+    """P102 helper / smoke. First-difference MSE; not the P103 train path.
 
-    Luenberger ``d_t = A d_{t-1} + K ν_t`` settles at ``K/(1−A)·ν`` for a
-    persistent load. P101 level MSE fitted that DC into ``d`` (val det_r
-    **0.197**, drift_sd **1.33**). P100 crop-demean HP wanted ``E[d]=0``
-    and crushed K to Joseph ``1/A``. Increment MSE is DC-blind without
-    asking ``E[d]=0``: settled SS has ``Δd=0=Δload``, and K trains on
-    load *changes*. jsonl ``std_ratio`` stays ``std(d)/std(load)`` so amp
-    is comparable to P101. No new field. ``T<2`` falls back to level MSE.
+    ``std_ratio`` is level-amp observability. P102 EXIT FALSIFIED this as
+    K-hold: Luenberger ``|Δd|∝K``, so ``‖Δd−Δload‖²`` shrinks K
+    (end-P2 **0.042** SS **≈0.89** vs P101 **0.097** SS **≈2.04**).
+    ``T<2`` falls back to level MSE.
     """
     ds_f = ds.float()
     dt_f = dt.float()
@@ -4426,10 +4424,11 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
     from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
     _gru_zb = float(_gru_zbias_fn(_h_zb))
-    # P102: training ground is increment MSE (P101 level MSE dumped DC
-    # into d; P100 HP crop-demean crushed K). Banner window stays 0
-    # (no crop-demean). ``_dob_ground_hp_window`` remains the val-protocol
-    # formula (smoke / A/B via ``disturbance_detrend_settle_mult<=0``).
+    # P103: two-timescale DOB; training ground is P101 level MSE on
+    # served d. P102 increment MSE crushed K; P100 HP crop-demean crushed K.
+    # Banner window stays 0 (no crop-demean).
+    # ``_dob_ground_hp_window`` remains the val-protocol formula (smoke /
+    # A/B via ``disturbance_detrend_settle_mult<=0``).
     _hpw = 0
     print(
         '[resolved-cfg] '
@@ -4467,7 +4466,8 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gru_zbias={_gru_zb:.3g} "
         f"dob_hp={_hpw} "
         f"dob_hpamp=mse "
-        f"dob_inc=True "
+        f"dob_inc=False "
+        f"dob_2ts=True "
         f"dob_reconsg=True "
         f"dob_afreeze=True "
         f"dob_luen=True "
@@ -9014,20 +9014,17 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                 # |d| did not grow; val pred_std 0.252 vs P64 0.608).
                 # Mean MSE over all sequences (P64 identity).  Mixed
                 # ring KEEP (P65 flush REVERT).  Do not /dvar.
-                # P102: increment ``‖Δd−Δload‖²``. P101 level MSE held K
-                # (SS≈2.04) but dumped DC into d (val det_r 0.197). P100
-                # HP crop-demean crushed K to Joseph 1/A. Pin-A KEEP so
-                # DC cannot walk A. Val detrend (4H on episode T=1220)
-                # unchanged. jsonl ``std_ratio`` is still level amp
-                # (observability vs P101). Helper window stays for smoke.
+                # P103: level MSE on served ``d_slow+d_fast``. Increment
+                # family closed (P102 ``|Δd|∝K`` crushed K). P101 dumped
+                # DC into a single Luenberger state; 2TS puts DC in
+                # ``d_slow``. Pin-A KEEP. Val detrend unchanged.
                 if not getattr(cfg, '_dob_ground_hp_logged', False):
                     print(
-                        '[dob-ground] increment MSE (P102; Δd vs Δload; '
-                        'P101 level MSE dumped DC into d; val detrend '
-                        'unchanged)',
+                        '[dob-ground] raw MSE (P103 2TS served d; '
+                        'P102 increment-MSE closed; val detrend unchanged)',
                         flush=True)
                     cfg._dob_ground_hp_logged = True  # type: ignore[attr-defined]
-                dob_ground, dob_ground_std_ratio = _dob_ground_inc_mse(
+                dob_ground, dob_ground_std_ratio = _dob_ground_hp_mse(
                     ds, dtgt)
                 dob_ground_keep_frac = torch.ones((), device=ds.device)
                 wm_total = wm_total + dgc * dob_ground
@@ -9157,6 +9154,10 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dob_ground_std_ratio': dob_ground_std_ratio.detach(),
         'dob_d_absmean': (ds.abs().mean().detach() if dob_live
                           else torch.zeros((), device=feats.device)),
+        'dob_d_slow_absmean': (
+            _last.d_slow.abs().mean().detach()
+            if dob_live and getattr(_last, 'd_slow', None) is not None
+            else torch.zeros((), device=feats.device)),
         # P99 observability: sigmoid(A), sigmoid(K). No extra WM forward.
         'dob_A': (rssm.dob_decay().mean().detach()
                   if dob_on else torch.zeros((), device=feats.device)),
@@ -14571,6 +14572,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             row.setdefault('dob_ground_std_ratio', 0.0)
             row.setdefault('dob_A', 0.0)
             row.setdefault('dob_K', 0.0)
+            row.setdefault('dob_d_slow_absmean', 0.0)
             # P39 diag A: emit last computed per-head grad norms (if any).
             # Values may be float (grad norms) or str (error messages); pass
             # strings through unchanged so jsonl serialisation works.

@@ -461,7 +461,8 @@ class RSSMState:
     h: torch.Tensor             # (..., deter_dim) deterministic recurrent state
     z_logits: torch.Tensor      # (..., n_categoricals, n_classes)
     z: torch.Tensor             # (..., n_categoricals, n_classes) one-hot (ST grad)
-    d: Optional[torch.Tensor] = None  # (..., n_cv) DOB disturbance state (None=off)
+    d: Optional[torch.Tensor] = None  # (..., n_cv) served DOB d = d_fast+d_slow (None=off)
+    d_slow: Optional[torch.Tensor] = None  # (..., n_cv) P103 DC EMA; None = single-timescale
     dv: Optional[torch.Tensor] = None  # (..., dv_dim) exogenous DV feedforward (None=off)
     c: Optional[torch.Tensor] = None       # (..., cont_dim) continuous latent sample (None=off)
     c_mean: Optional[torch.Tensor] = None  # (..., cont_dim) post/prior mean (for KL)
@@ -484,7 +485,7 @@ class RSSMState:
             return t.detach() if t is not None else None
         return RSSMState(
             h=_d(self.h), z_logits=_d(self.z_logits), z=_d(self.z),
-            d=_d(self.d), dv=_d(self.dv),
+            d=_d(self.d), d_slow=_d(self.d_slow), dv=_d(self.dv),
             c=(self.c if keep_c else _d(self.c)),
             c_mean=(self.c_mean if keep_c else _d(self.c_mean)),
             c_std=(self.c_std if keep_c else _d(self.c_std)))
@@ -792,6 +793,9 @@ class RSSMDynamics(nn.Module):
         d = (cached_zeros_bd(
                 self, B, self.n_cv, dtype, device, attr='_init_d_zeros')
              if self.dob_enabled else None)
+        d_slow = (cached_zeros_bd(
+                self, B, self.n_cv, dtype, device, attr='_init_dslow_zeros')
+                  if self.dob_enabled else None)
         dv = (cached_zeros_bd(
                 self, B, self.dv_dim, dtype, device, attr='_init_dv_zeros')
               if self.dv_feedforward else None)
@@ -808,8 +812,8 @@ class RSSMDynamics(nn.Module):
             c_std = cached_zeros_bd(
                 self, B, self.cont_dim, dtype, device,
                 attr='_init_cstd_zeros')
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, dv=dv, c=c,
-                         c_mean=c_mean, c_std=c_std)
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d, d_slow=d_slow,
+                         dv=dv, c=c, c_mean=c_mean, c_std=c_std)
 
     # ----- DOB helpers --------------------------------------------------
     def dob_decay(self) -> torch.Tensor:
@@ -817,6 +821,11 @@ class RSSMDynamics(nn.Module):
 
     def dob_gain(self) -> torch.Tensor:
         return torch.sigmoid(self.dob_log_gain)
+
+    def dob_slow(self) -> torch.Tensor:
+        """P103 two-timescale α. Detached ``(1−A)`` — DC EMA settles inside
+        a T=128 crop (same leak as pinned A). No new Parameter."""
+        return (1.0 - self.dob_decay()).detach()
 
     def apply_dob(self, decoded: torch.Tensor,
                   d: Optional[torch.Tensor]) -> torch.Tensor:
@@ -863,11 +872,17 @@ class RSSMDynamics(nn.Module):
         # Stage-1 (``dob_active=False``) forces ``d_t≡0`` after the loop
         # and ``d`` is not a GRU input — skip the unused sigmoid·d
         # (P1 rest-IC + main WM T-loop, 100 inner steps).  P2 Kalman
-        # still needs the prior predict ``A·d``.
+        # still needs the prior predict.  P103: decay only the fast
+        # residual; hold ``d_slow`` (DC persists in imagination).
         d_new = prev.d
         if (self.dob_enabled and prev.d is not None
                 and bool(getattr(self, 'dob_active', True))):
-            d_new = self.dob_decay() * prev.d
+            A = self.dob_decay()
+            if prev.d_slow is not None:
+                d_fast_new = A * (prev.d - prev.d_slow)
+                d_new = d_fast_new + prev.d_slow
+            else:
+                d_new = A * prev.d
         dv_new = dv if self.dv_feedforward else None
         return h, d_new, dv_new
 
@@ -886,7 +901,8 @@ class RSSMDynamics(nn.Module):
         # step-1 G). P71 REVERT: G is a GRU input again so h can carry DC
         # gain. Deterministic-roll uses the prior MEAN.
         c_new, c_mean, c_std = _prior_c_from_net(self, h, sample)
-        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new, dv=dv_new,
+        return RSSMState(h=h, z_logits=z_logits, z=z, d=d_new,
+                         d_slow=prev.d_slow, dv=dv_new,
                          c=c_new, c_mean=c_mean, c_std=c_std)
 
     def _posterior_step(self, prev: RSSMState, prev_action: torch.Tensor,
@@ -908,8 +924,8 @@ class RSSMDynamics(nn.Module):
             c_post, c_post_mean, c_post_std = self.cont_post_net(
                 post_in, sample=sample)
         return RSSMState(h=h, z_logits=post_logits, z=post_z, d=d_new,
-                         dv=dv_new, c=c_post, c_mean=c_post_mean,
-                         c_std=c_post_std)
+                         d_slow=prev.d_slow, dv=dv_new, c=c_post,
+                         c_mean=c_post_mean, c_std=c_post_std)
 
     def obs_step(self, prev: RSSMState, prev_action: torch.Tensor,
                  embed: torch.Tensor, dv: Optional[torch.Tensor] = None,
@@ -920,13 +936,11 @@ class RSSMDynamics(nn.Module):
 
         When the DOB is active and ``obs`` (the raw obs vector, for the CV
         channels) is supplied, the posterior carries the CORRECTED disturbance
-        state ``d_t = A·d_{t-1} + K·ν`` where ``ν`` is the **plant** residual
-        ``CV_obs − decode(prior)`` (P100 Luenberger).  ``d`` is not residualized
-        out of the measurement: the Joseph complementary filter
-        ``ν = CV_obs − (g + A·d)`` capped SS gain at ``K/(1−(1−K)A) ≤ 1/A``
-        (P99 val pred_std **0.628 vs 1.93**).  The prior has not seen the
-        current obs.  ``obs=None`` (probes / diagnostics) ⇒ the posterior just
-        carries the decayed prior ``d`` (pure process model).
+        state ``d_t`` (served = ``d_slow + d_fast``). P100 Luenberger plant
+        residual ``ν = CV_obs − decode(prior)`` (d not residualized). P103:
+        ``d_slow`` is an EMA of ν (DC); ``d_fast = A d_fast + K(ν − d_slow)``.
+        ``obs=None`` (probes / diagnostics) ⇒ posterior carries the prior
+        (fast decay + slow hold).
 
         ``cont_innov`` (B, cont_dist_dim) is the same CV innovation, precomputed
         BATCHED by ``rollout_observed`` and fed to the innovation-driven cont
@@ -956,18 +970,28 @@ class RSSMDynamics(nn.Module):
             c_post, c_post_mean, c_post_std = self.cont_post_net(
                 cont_in, sample=sample)
         d_post = prior.d
+        d_slow_post = prior.d_slow
         if self.dob_enabled and obs is not None and prior.d is not None:
             # P100 Luenberger: plant residual, d not in the forecast.
+            # P103: slow EMA of ν holds DC; K trains on (ν − d_slow).
             cv_pred = self.decode(prior.feat).index_select(
                 -1, self.cv_index_t)
             cv_obs = obs.index_select(-1, self.cv_index_t)
             nu = cv_obs - cv_pred                        # plant residual
-            d_post = prior.d + self.dob_gain() * nu      # = A·d_{t-1} + K·ν
+            if prior.d_slow is not None:
+                alpha = self.dob_slow()
+                d_slow_post = (1.0 - alpha) * prior.d_slow + alpha * nu
+                d_fast_prior = prior.d - prior.d_slow
+                d_fast_post = (
+                    d_fast_prior + self.dob_gain() * (nu - d_slow_post))
+                d_post = d_fast_post + d_slow_post
+            else:
+                d_post = prior.d + self.dob_gain() * nu  # = A·d_{t-1} + K·ν
         # Posterior inherits the prior's exogenous DV feedforward (same measured
         # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
         post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z, d=d_post,
-                         dv=prior.dv, c=c_post, c_mean=c_post_mean,
-                         c_std=c_post_std)
+                         d_slow=d_slow_post, dv=prior.dv, c=c_post,
+                         c_mean=c_post_mean, c_std=c_post_std)
         return post, prior
 
     # ----- sequence rollout ---------------------------------------------
@@ -1135,21 +1159,28 @@ class RSSMDynamics(nn.Module):
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
-                u = K * (cv_obs - base)                               # drive (B,T,n_cv)
+                nu = cv_obs - base                                    # plant residual
+                # P103 two-timescale: d_slow = EMA_α(ν), d_fast = Luenberger
+                # on (ν − d_slow). Served ds = sum (feat tail width unchanged).
+                alpha = self.dob_slow()
+                d_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)
                 coef = A                                              # (n_cv,)
-                ds = dob_kalman_scan(u, coef)                         # (B, T, n_cv)
+                ds_fast = dob_kalman_scan(K * (nu - d_slow), coef)
+                ds = d_slow + ds_fast
                 if last_only:
                     ds = ds[:, -1:]
+                    d_slow = d_slow[:, -1:]
             else:
                 # Stage-1 suppression: d_t ≡ 0 (force g to explain all CV motion).
                 # Reuse a zeros buffer (identity; ``cat`` does not write it).
                 ds = cached_zeros_btd(
                     self, B, int(post_core.shape[1]), self.n_cv,
                     post_core.dtype, device)
+                d_slow = ds
             feats = torch.cat([post_core, ds.detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
-                              d=ds[:, -1], dv=state.dv, c=state.c,
-                              c_mean=state.c_mean, c_std=state.c_std)
+                              d=ds[:, -1], d_slow=d_slow[:, -1], dv=state.dv,
+                              c=state.c, c_mean=state.c_mean, c_std=state.c_std)
         else:
             feats = post_core
         # Continuous-latent KL stats + posterior sample (for the cont KL +
@@ -1340,7 +1371,7 @@ def copy_obs_row(dst: torch.Tensor, row, host: Optional[torch.Tensor] = None
 # ---------------------------------------------------------------------------
 
 _RSSM_STATE_TENSORS = (
-    'h', 'z_logits', 'z', 'd', 'dv', 'c', 'c_mean', 'c_std')
+    'h', 'z_logits', 'z', 'd', 'd_slow', 'dv', 'c', 'c_mean', 'c_std')
 
 
 def _rssm_dob_live(dyn) -> bool:
