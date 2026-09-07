@@ -372,7 +372,7 @@ env-gated off · **[planned]** = designed, not yet built.
 > plant-residual `d_t = A d + K (CV−g)` KEEP as Kalman form (SS `K/(1−A)`; pred_std
 > **0.737 vs 1.93**; det_r **0.469**; paired **−8.72**; **FALSIFIED as champ / TM**;
 > HP crop-demean crushed K **0.119→0.049**). **P101 EXIT:** raw MSE KEEP as K-hold /
-> FALSIFIED as det_r. **P103 EXIT:** two-timescale DOB KEEP as filter / FALSIFIED as champ. **P107:** α=`1/H` (banner `dob_2tsa=H`) not P103 `(1−A)`. **P104 EXIT:** feat-fast **REVERT** (cannot attribute). **P102 EXIT:** increment MSE
+> FALSIFIED as det_r. **P103 EXIT:** two-timescale DOB KEEP as filter / FALSIFIED as champ. **P107 EXIT:** α=`1/H` **FALSIFIED as leftover/K**. **P108:** α=`1/T` (banner `dob_2tsa=T`). **P104 EXIT:** feat-fast **REVERT** (cannot attribute). **P102 EXIT:** increment MSE
 > FALSIFIED as K-hold. `dob_reg_coef → 0` when
 > grounding is on. First run: p19 (`run_p19_dobground`).
 

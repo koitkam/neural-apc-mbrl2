@@ -4448,7 +4448,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     # GAIN_NOT_READY; P1 d≡0 cannot attribute). P90 serve-HP closed.
     # P102 increment MSE crushed K; P100 HP crop-demean crushed K.
     # Banner window stays 0 (no crop-demean).
-    # P107: d_slow α = 1/H (banner dob_2tsa=H), not (1−A).
+    # P108: d_slow α = 1/T (banner dob_2tsa=T), not 1/H / (1−A).
     # ``_dob_ground_hp_window`` remains the val-protocol formula (smoke /
     # A/B via ``disturbance_detrend_settle_mult<=0``).
     _hpw = 0
@@ -4489,7 +4489,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_hp={_hpw} "
         f"dob_hpamp=mse "
         f"dob_2ts=True "
-        f"dob_2tsa={max(1, int(getattr(cfg, 'horizon', 0) or 0))} "
+        f"dob_2tsa={max(1, int(getattr(cfg, 'seq_len', 0) or getattr(cfg, 'horizon', 0) or 0))} "
         f"dob_reconsg=True "
         f"dob_afreeze=True "
         f"dob_luen=True "
@@ -9185,7 +9185,7 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                   if dob_on else torch.zeros((), device=feats.device)),
         'dob_K': (rssm.dob_gain().mean().detach()
                   if dob_on else torch.zeros((), device=feats.device)),
-        # P107: 1/H vs P103 (1−A). Watch vs 0.047 on test_sim (H=55 → 0.018).
+        # P108: 1/T vs P107 1/H. Watch vs 0.018 on test_sim (T=128 → 0.00781).
         'dob_slow_alpha': (rssm.dob_slow().mean().detach()
                            if dob_on else torch.zeros((), device=feats.device)),
     }

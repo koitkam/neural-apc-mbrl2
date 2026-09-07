@@ -1247,6 +1247,7 @@ class DreamerV4Config:
     action_dim: int
     lookback: int                          # transformer context length T_ctx
     horizon: int = 0                       # control H (P76/P88 keep-h REVERT)
+    seq_len: int = 0                       # WM crop T (P108 2TS α=1/T)
     # Tokenizer
     tok_hidden: int = 256
     z_dim: int = 24
@@ -1358,6 +1359,7 @@ def dreamer_v4_config_from_train(cfg, *, attn_impl: Optional[str] = None
         action_dim=int(getattr(cfg, 'action_dim')),
         lookback=int(getattr(cfg, 'lookback')),
         horizon=int(getattr(cfg, 'horizon', 0) or 0),
+        seq_len=int(getattr(cfg, 'seq_len', 0) or 0),
         tok_hidden=int(getattr(cfg, 'tok_hidden')),
         z_dim=int(getattr(cfg, 'z_dim')),
         mae_p_max=float(getattr(cfg, 'mae_p_max')),
@@ -1454,6 +1456,7 @@ class DreamerV4(nn.Module):
                     cfg, 'cont_gain_deterministic_roll', True)),
                 dv_decoder_feedforward=bool(getattr(cfg, 'dv_decoder_feedforward', False)),
                 horizon=int(getattr(cfg, 'horizon', 0) or 0),
+                seq_len=int(getattr(cfg, 'seq_len', 0) or 0),
             )
             self.dynamics = RSSMDynamics(rssm_cfg)
             D = self.dynamics.feat_dim
