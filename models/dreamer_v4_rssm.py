@@ -825,9 +825,22 @@ class RSSMDynamics(nn.Module):
         return torch.sigmoid(self.dob_log_gain)
 
     def dob_slow(self) -> torch.Tensor:
-        """P103 two-timescale α. Detached ``(1−A)`` — DC EMA settles inside
-        a T=128 crop (same leak as pinned A). No new Parameter."""
-        return (1.0 - self.dob_decay()).detach()
+        """P107 two-timescale α = 1/H, not detached ``(1−A)``.
+
+        P103 tied α to pinned A so the EMA settled inside a T=128 crop
+        (same leak as A). ``1/α ≈ 21`` steps ``< H=55``, so ``d_slow``
+        tracked in-band plant dynamics: P106 ``|d_slow|/|d|`` 0.65→0.93
+        and K crushed to Joseph ``1/A`` (0.045 / 0.95) vs P103 0.085 /
+        1.79. Horizon is already sim-adaptive (4τ settling). ``α=1/H``
+        → ``1/α=H``; a constant ν still reaches ~0.90 on T=128. ``H<=0``
+        falls back to ``(1−A)`` so unit tests without a plant horizon
+        stay defined. No new Parameter / TrainConfig field.
+        """
+        A = self.dob_decay()
+        h = int(getattr(self.cfg, 'horizon', 0) or 0)
+        if h <= 0:
+            return (1.0 - A).detach()
+        return torch.full_like(A, 1.0 / float(h))
 
     def apply_dob(self, decoded: torch.Tensor,
                   d: Optional[torch.Tensor]) -> torch.Tensor:
@@ -976,6 +989,7 @@ class RSSMDynamics(nn.Module):
         if self.dob_enabled and obs is not None and prior.d is not None:
             # P100 Luenberger: plant residual, d not in the forecast.
             # P103: slow EMA of ν holds DC; K trains on (ν − d_slow).
+            # P107: α = 1/H (not 1−A) so d_slow is slower than settling.
             cv_pred = self.decode(prior.feat).index_select(
                 -1, self.cv_index_t)
             cv_obs = obs.index_select(-1, self.cv_index_t)
@@ -1164,7 +1178,7 @@ class RSSMDynamics(nn.Module):
                 nu = cv_obs - base                                    # plant residual
                 # P103 two-timescale: d_slow = EMA_α(ν), d_fast = Luenberger
                 # on (ν − d_slow). Served ds = sum (recon / apply_dob / feat).
-                # P104 d_fast feat REVERT (cannot attribute).
+                # P107: α = 1/H (not 1−A). P104 d_fast feat REVERT.
                 alpha = self.dob_slow()
                 d_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)
                 coef = A                                              # (n_cv,)

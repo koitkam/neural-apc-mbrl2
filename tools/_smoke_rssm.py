@@ -1957,21 +1957,46 @@ def _test_dob_ground_hp_mse() -> None:
 
 
 def _test_dob_two_timescale_scan() -> None:
-    """P103: constant ν → DC in d_slow; d_fast → 0. P104 REVERT: feat=served d."""
-    from models.dreamer_v4_rssm import RSSMState, dob_kalman_scan
+    """P107: α=1/H not (1−A). Constant ν → most DC in d_slow; leftover to d_fast."""
+    from models.dreamer_v4_rssm import (
+        RSSMConfig, RSSMDynamics, RSSMState, dob_kalman_scan)
     nu = torch.ones(2, 128, 1)
     A = torch.tensor([0.95257])
     K = torch.tensor([0.11920])
-    alpha = 1.0 - A
+    H = 55
+    alpha = torch.tensor([1.0 / H])
     d_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)
     d_fast = dob_kalman_scan(K * (nu - d_slow), A)
     served = d_slow + d_fast
-    assert abs(float(d_slow[0, -1, 0]) - 1.0) < 0.05, d_slow[0, -1, 0]
-    assert abs(float(d_fast[0, -1, 0])) < 0.05, d_fast[0, -1, 0]
-    assert abs(float(served[0, -1, 0]) - 1.0) < 0.05
+    # 1-(1-1/H)^128 ≈ 0.903. Leftover DC is Luenberger-amplified
+    # (P103 A-tied α zeroed d_fast by eating the residual).
+    assert 0.85 < float(d_slow[0, -1, 0]) < 0.96, d_slow[0, -1, 0]
+    assert float(d_fast[0, -1, 0]) > 0.05, d_fast[0, -1, 0]
+    served_last = float(served[0, -1, 0])
+    assert 0.9 < served_last < 1.6, served_last
+    alpha_a = 1.0 - A
+    assert float(alpha) < float(alpha_a) * 0.5
+    d_slow_a = dob_kalman_scan(alpha_a * nu, 1.0 - alpha_a)
+    d_fast_a = dob_kalman_scan(K * (nu - d_slow_a), A)
+    assert abs(float(d_slow_a[0, -1, 0]) - 1.0) < 0.05, d_slow_a[0, -1, 0]
+    assert abs(float(d_fast_a[0, -1, 0])) < 0.08, d_fast_a[0, -1, 0]
     # Single-timescale Luenberger SS is K/(1-A)≈2.5, not 1.
     d_luen = dob_kalman_scan(K * nu, A)
     assert float(d_luen[0, -1, 0]) > 2.0
+    cfg = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                     n_categoricals=4, n_classes=4, embed_dim=16,
+                     hidden_dim=16, latent_type='deterministic',
+                     dob_enabled=True, cv_indices=(0,), horizon=H)
+    m = RSSMDynamics(cfg)
+    a = m.dob_slow()
+    assert abs(a.mean().detach().item() - 1.0 / H) < 1e-6, a
+    assert abs((1.0 - m.dob_decay()).mean().detach().item() - (1.0 / H)) > 0.02
+    cfg0 = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
+                      n_categoricals=4, n_classes=4, embed_dim=16,
+                      hidden_dim=16, latent_type='deterministic',
+                      dob_enabled=True, cv_indices=(0,), horizon=0)
+    m0 = RSSMDynamics(cfg0)
+    assert torch.allclose(m0.dob_slow(), (1.0 - m0.dob_decay()).detach())
     B = 2
     h = torch.zeros(B, 4)
     z = torch.zeros(B, 2, 2)
@@ -1979,7 +2004,7 @@ def _test_dob_two_timescale_scan() -> None:
                    d=served[:, -1], d_slow=d_slow[:, -1])
     assert torch.allclose(st.feat[..., -1:], served[:, -1], atol=1e-5)
     assert not torch.allclose(st.feat[..., -1:], d_fast[:, -1], atol=1e-2)
-    print('[smoke] OK  two-timescale scan (DC→d_slow; fast→0; feat=served d)')
+    print('[smoke] OK  two-timescale scan (DC→d_slow α=1/H; leftover→d_fast; feat=served d)')
 
 
 def _test_atomic_torch_save() -> None:
@@ -2342,6 +2367,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'HP crop-demean crushed K' in _src
     assert '_hpw = 0' in _src
     assert 'dob_2ts=True' in _src
+    assert 'dob_2tsa=' in _src
     assert 'dob_featfast=' not in _src
     assert 'dob_2tsg=' not in _src
     assert 'def dob_feat_tail' not in _rssm_src
@@ -2360,9 +2386,13 @@ def _test_isolation_dcv_scales() -> None:
     assert 'dob_ground, dob_ground_std_ratio = _dob_ground_hp_mse(' in _src
     assert 'dob_ground, dob_ground_std_ratio = _dob_ground_inc_mse(' not in _src
     assert 'def dob_slow' in _rssm_src
+    _slow = _rssm_src.split('def dob_slow')[1].split('def apply_dob')[0]
+    assert '1.0 / float(h)' in _slow
+    assert 'if h <= 0' in _slow
     assert 'd_slow: Optional' in _rssm_src
     assert 'd_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)' in _rssm_src
     assert "row.setdefault('dob_d_slow_absmean'" in _src
+    assert "row.setdefault('dob_slow_alpha'" in _src
     assert 'ds_f[:, 1:] - ds_f[:, :-1]' not in _src
     assert 'P2 pin A (decay stays at init)' in _v4_src
     assert 'coef = (1.0 - K) * A' not in _rssm_src
