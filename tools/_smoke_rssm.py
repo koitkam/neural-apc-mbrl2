@@ -1941,8 +1941,9 @@ def _test_dob_ground_hp_mse() -> None:
 
 
 def _test_dob_two_timescale_scan() -> None:
-    """P103: constant ν → DC in d_slow; d_fast → 0. Feat width unchanged."""
-    from models.dreamer_v4_rssm import dob_kalman_scan
+    """P103: constant ν → DC in d_slow; d_fast → 0. P104: feat tail → 0."""
+    from models.dreamer_v4_rssm import (
+        RSSMState, dob_feat_tail, dob_kalman_scan)
     nu = torch.ones(2, 128, 1)
     A = torch.tensor([0.95257])
     K = torch.tensor([0.11920])
@@ -1953,10 +1954,21 @@ def _test_dob_two_timescale_scan() -> None:
     assert abs(float(d_slow[0, -1, 0]) - 1.0) < 0.05, d_slow[0, -1, 0]
     assert abs(float(d_fast[0, -1, 0])) < 0.05, d_fast[0, -1, 0]
     assert abs(float(served[0, -1, 0]) - 1.0) < 0.05
+    tail = dob_feat_tail(served, d_slow)
+    assert torch.allclose(tail, d_fast, atol=1e-5)
+    assert abs(float(tail[0, -1, 0])) < 0.05, tail[0, -1, 0]
     # Single-timescale Luenberger SS is K/(1-A)≈2.5, not 1.
     d_luen = dob_kalman_scan(K * nu, A)
     assert float(d_luen[0, -1, 0]) > 2.0
-    print('[smoke] OK  two-timescale scan (DC→d_slow; fast→0; SS≠K/(1-A))')
+    B = 2
+    h = torch.zeros(B, 4)
+    z = torch.zeros(B, 2, 2)
+    st = RSSMState(h=h, z_logits=z, z=z,
+                   d=served[:, -1], d_slow=d_slow[:, -1])
+    assert torch.allclose(st.feat[..., -1:], d_fast[:, -1], atol=1e-5)
+    st1 = RSSMState(h=h, z_logits=z, z=z, d=served[:, -1], d_slow=None)
+    assert torch.allclose(st1.feat[..., -1:], served[:, -1], atol=1e-5)
+    print('[smoke] OK  two-timescale scan (DC→d_slow; feat tail→d_fast→0)')
 
 
 def _test_atomic_torch_save() -> None:
@@ -2314,6 +2326,13 @@ def _test_isolation_dcv_scales() -> None:
     assert 'HP crop-demean crushed K' in _src
     assert '_hpw = 0' in _src
     assert 'dob_2ts=True' in _src
+    assert 'dob_featfast=True' in _src
+    assert 'dob_2tsg=' not in _src
+    assert 'def dob_feat_tail' in _rssm_src
+    assert 'dob_feat_tail(self.d, self.d_slow)' in _rssm_src
+    assert 'dob_feat_tail(ds, d_slow)' in _rssm_src
+    assert '_dob_d_fast_bt' not in _rssm_src
+    assert 'ground_ds, dtgt)' not in _src
     assert 'dob_inc=' not in _src
     assert '_highpass_bt(ds,' not in _src
     assert 'shape z-score + log-std amp' not in _src
@@ -6053,6 +6072,11 @@ def _test_stream_serve_matches_rollout() -> None:
     if not torch.allclose(streamed, feats, atol=1e-5, rtol=1e-4):
         err = (streamed - feats).abs().max().item()
         raise AssertionError(f'serve vs rollout_observed max|Δ|={err:.4e}')
+    # P104: last n_cv of feat is d_fast, not served d.
+    n_cv = int(rssm.n_cv)
+    feat_tail = streamed[:, -1, -n_cv:]
+    d_fast = state.d - state.d_slow
+    assert torch.allclose(feat_tail, d_fast.detach(), atol=1e-5, rtol=1e-4)
     # Collect with DOB+DV must stream obs_step (Kalman needs the prior decode).
     class _Dummy:
         def __init__(self):

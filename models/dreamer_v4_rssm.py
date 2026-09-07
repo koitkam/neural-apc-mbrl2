@@ -130,6 +130,24 @@ def dob_kalman_scan(u: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
     return torch.einsum('tsc,bsc->btc', pows, u)
 
 
+def dob_feat_tail(
+        d: Optional[torch.Tensor],
+        d_slow: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """P104: actor/critic/reward feat tail is the fast residual.
+
+    Served Kalman state stays ``d = d_slow + d_fast`` (recon /
+    ``apply_dob``). When ``d_slow`` is missing (single-timescale), the
+    tail is served ``d``. Width is still ``n_cv``. Not P90: no extra
+    EMA in the serve loop — this is pointwise ``d − d_slow`` already
+    on the two-timescale state. P1 ``d≡d_slow≡0`` keeps a zero tail.
+    """
+    if d is None:
+        return None
+    if d_slow is None:
+        return d
+    return d - d_slow
+
+
 def _time_unbind(x: Optional[torch.Tensor]):
     """Unbind time dim=1 once. ``None`` stays ``None``.
 
@@ -494,14 +512,17 @@ class RSSMState:
     def feat(self) -> torch.Tensor:
         # Scope 2 (DOB feed-forward, 2026-06-11) + DV feed-forward (2026-06-19)
         # + continuous gain/disturbance latent (2026-06-22): the head-facing
-        # feature is ``[h, z_flat, (c), (dv), (d.detach())]``.
+        # feature is ``[h, z_flat, (c), (dv), (d_fast.detach())]``.
         #  * ``c`` (continuous gain+disturbance latent) is appended RIGHT AFTER
         #    the categorical core so the DECODER reads ``[h, z, c, (dv)]`` (a
         #    contiguous front slice) — the un-quantized path for the gain and
         #    the unmeasured disturbance.  NOT detached: the decoder learns to
         #    use the gain/disturbance through it.
         #  * ``dv`` (DV feedforward) follows ``c``.  Not detached.
-        #  * ``d`` (DOB) is appended LAST and DETACHED (sliced off by decode).
+        #  * DOB tail is LAST and DETACHED (sliced off by decode). P104: the
+        #    tail is ``d_fast = d − d_slow`` so the policy is not DC-dominated
+        #    (P103 ``|d_slow|/|d|~0.72``). Served ``d`` stays on the state
+        #    for recon / ``apply_dob``.
         # ``c is None`` AND ``dv is None`` AND ``d is None`` ⇒ feat = [h, z_flat]
         # (byte-identical to the paper RSSM).
         parts = [self.h, self.stoch_flat]
@@ -510,7 +531,8 @@ class RSSMState:
         if self.dv is not None:
             parts.append(self.dv)
         if self.d is not None:
-            parts.append(self.d.detach())
+            tail = dob_feat_tail(self.d, self.d_slow)
+            parts.append(tail.detach())
         return torch.cat(parts, dim=-1)
 
 
@@ -1161,7 +1183,8 @@ class RSSMDynamics(nn.Module):
                 A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
                 nu = cv_obs - base                                    # plant residual
                 # P103 two-timescale: d_slow = EMA_α(ν), d_fast = Luenberger
-                # on (ν − d_slow). Served ds = sum (feat tail width unchanged).
+                # on (ν − d_slow). Served ds = sum (recon / apply_dob).
+                # P104: feat tail is d_fast (width unchanged).
                 alpha = self.dob_slow()
                 d_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)
                 coef = A                                              # (n_cv,)
@@ -1177,7 +1200,8 @@ class RSSMDynamics(nn.Module):
                     self, B, int(post_core.shape[1]), self.n_cv,
                     post_core.dtype, device)
                 d_slow = ds
-            feats = torch.cat([post_core, ds.detach()], dim=-1)
+            feats = torch.cat(
+                [post_core, dob_feat_tail(ds, d_slow).detach()], dim=-1)
             state = RSSMState(h=state.h, z_logits=state.z_logits, z=state.z,
                               d=ds[:, -1], d_slow=d_slow[:, -1], dv=state.dv,
                               c=state.c, c_mean=state.c_mean, c_std=state.c_std)
@@ -1310,7 +1334,7 @@ def stream_serve_step(dyn, state, prev_action: torch.Tensor,
     sliced from obs and batched Kalman when ``dob_active``. Collect/val
     used to call ``_posterior_step`` / ``obs_step`` with ``dv=None`` and
     ``obs=None`` (GRU zero-fills DV; ``d_t`` decays from 0). The actor
-    then trained on a different ``feat=[h,z,(c),(dv),d_t]`` than it
+    then trained on a different ``feat=[h,z,(c),(dv),d_fast]`` than it
     acted on — the P3 train/serve hole (P45–P47 bang-bang / limit-ride).
 
     ``obs_t`` is ``(B, obs_dim)`` or ``(obs_dim,)``. Duck-typed for
