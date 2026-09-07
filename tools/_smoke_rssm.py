@@ -234,9 +234,9 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _skip_storm_continue_after_probe(
         restored_gain_ready=True, ready_storm_n=2, cap_after=2) is False
     assert _wm_fidelity_es_suppressed_frozen_g(False) is True
-    assert _wm_fidelity_es_suppressed_frozen_g(True) is False
+    assert _wm_fidelity_es_suppressed_frozen_g(True) is True
     print('[smoke] OK  P1 skip-storm continue first READY / cap second READY; '
-          'GAIN_NOT_READY cap-deferred; frozen-g ES')
+          'GAIN_NOT_READY cap-deferred; P2 gain-blind ES')
     assert _p1_need_agent_finetune(0.0, False, 0, 100) is False
     assert _p1_need_agent_finetune(0.0, True, 98, 100) is False
     assert _p1_need_agent_finetune(0.0, True, 99, 100) is True
@@ -717,10 +717,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
 
     # Frozen-g skip: isolation extra unroll (follow-up 10) AND the in-graph
     # g-only aux (overshoot / held-rollout / full-BPTT gain-match,
-    # follow-up 11) are dead when DOB curriculum freezes the plant model
-    # (P2).  Isolation is a separate extra unroll; the aux trio is ~73% of
-    # each WM step.  Restore g=True so later smokes stay live.
+    # follow-up 11) are dead when g is frozen.  P1-like (dob suppressed)
+    # still runs g-aux.  P109 curriculum P2 recon-finetunes g but still
+    # skips g-aux via dob_live.  Restore g=True so later smokes stay live.
     assert _dynamics_g_trainable(model)
+    model.set_dob_active(False)
     _gate_over = float(cfg.wm_overshoot_gate_recon)
     _gate_held = float(cfg.wm_held_rollout_gate_recon)
     cfg.wm_overshoot_gate_recon = 0.0
@@ -736,13 +737,25 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     if wm_type == 'rssm':
         assert float(losses_g['wm_overshoot_loss']) > 0.0, losses_g['wm_overshoot_loss']
     model.set_world_model_trainable(g=False, dob=True, reward=True)
+    model.set_dob_active(True)
     assert not _dynamics_g_trainable(model)
     losses_fz, _, _ = world_model_loss(model, batch, cfg)
     assert float(losses_fz['wm_overshoot_loss']) == 0.0, losses_fz['wm_overshoot_loss']
     assert float(losses_fz['wm_held_rollout_loss']) == 0.0, losses_fz['wm_held_rollout_loss']
     assert float(losses_fz['gain_match_loss']) == 0.0, losses_fz['gain_match_loss']
     assert 'gain_match_n' not in losses_fz
+    model.set_world_model_trainable(g=True, dob=True, reward=True)
+    model.set_dob_active(True)
+    assert _dynamics_g_trainable(model)
+    _ncv = int(getattr(model.dynamics, 'n_cv', 0) or 0)
+    if _ncv > 0:
+        losses_p2g, _, _ = world_model_loss(model, batch, cfg)
+        assert float(losses_p2g['wm_overshoot_loss']) > 0.0, losses_p2g['wm_overshoot_loss']
+        print('[smoke] OK  P110 curriculum P2 g-aux ON while g recon-finetunes')
+    else:
+        print('[smoke] OK  P110 curriculum P2 g-aux ON (n_cv=0; curriculum smoke covers DOB)')
     model.set_world_model_trainable(g=True, dob=False, reward=True)
+    model.set_dob_active(False)
     assert _dynamics_g_trainable(model)
     cfg.wm_overshoot_gate_recon = _gate_over
     cfg.wm_held_rollout_gate_recon = _gate_held
@@ -750,6 +763,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     cfg.gain_match_mv_target = ()
     print('[smoke] OK  isolation skip when g frozen (_dynamics_g_trainable)')
     print('[smoke] OK  g-only aux (overshoot/held/gain-match) skip when g frozen')
+    print('[smoke] OK  P110 curriculum P2 g-aux ON while g recon-finetunes')
 
     # P1/P2 random collect is numpy-only (no RSSM).  P3 on-policy streams
     # stream_serve_step (DV + Kalman when DOB is live).
@@ -1957,7 +1971,7 @@ def _test_dob_ground_hp_mse() -> None:
 
 
 def _test_dob_two_timescale_scan() -> None:
-    """P110: α=1/(2T) not 1/T. Constant ν → ~0.39 DC in d_slow; leftover to d_fast."""
+    """P108: α=1/T not 1/H. Constant ν → ~0.63 DC in d_slow; leftover to d_fast."""
     from models.dreamer_v4_rssm import (
         RSSMConfig, RSSMDynamics, RSSMState, dob_kalman_scan)
     nu = torch.ones(2, 128, 1)
@@ -1965,18 +1979,15 @@ def _test_dob_two_timescale_scan() -> None:
     K = torch.tensor([0.11920])
     H = 55
     T = 128
-    alpha = torch.tensor([1.0 / (2 * T)])
+    alpha = torch.tensor([1.0 / T])
     d_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)
     d_fast = dob_kalman_scan(K * (nu - d_slow), A)
     served = d_slow + d_fast
-    # 1-(1-1/(2T))^T ≈ 0.393. P108 1/T ≈ 0.632. P107 1/H ≈ 0.90.
-    assert 0.32 < float(d_slow[0, -1, 0]) < 0.48, d_slow[0, -1, 0]
-    assert float(d_fast[0, -1, 0]) > 0.30, d_fast[0, -1, 0]
+    # 1-(1-1/T)^T → 1-1/e ≈ 0.632. P107 1/H reached ~0.90 inside T.
+    assert 0.55 < float(d_slow[0, -1, 0]) < 0.72, d_slow[0, -1, 0]
+    assert float(d_fast[0, -1, 0]) > 0.15, d_fast[0, -1, 0]
     served_last = float(served[0, -1, 0])
-    assert 0.9 < served_last < 2.6, served_last
-    alpha_t = torch.tensor([1.0 / T])
-    d_slow_t = dob_kalman_scan(alpha_t * nu, 1.0 - alpha_t)
-    assert float(d_slow[0, -1, 0]) < float(d_slow_t[0, -1, 0]) - 0.15
+    assert 0.9 < served_last < 1.8, served_last
     alpha_h = torch.tensor([1.0 / H])
     d_slow_h = dob_kalman_scan(alpha_h * nu, 1.0 - alpha_h)
     assert float(d_slow[0, -1, 0]) < float(d_slow_h[0, -1, 0]) - 0.15
@@ -1996,13 +2007,13 @@ def _test_dob_two_timescale_scan() -> None:
                      seq_len=T)
     m = RSSMDynamics(cfg)
     a = m.dob_slow()
-    assert abs(a.mean().detach().item() - 1.0 / (2 * T)) < 1e-6, a
+    assert abs(a.mean().detach().item() - 1.0 / T) < 1e-6, a
     cfg_h = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
                        n_categoricals=4, n_classes=4, embed_dim=16,
                        hidden_dim=16, latent_type='deterministic',
                        dob_enabled=True, cv_indices=(0,), horizon=H)
     mh = RSSMDynamics(cfg_h)
-    assert abs(mh.dob_slow().mean().detach().item() - 1.0 / (2 * H)) < 1e-6
+    assert abs(mh.dob_slow().mean().detach().item() - 1.0 / H) < 1e-6
     cfg0 = RSSMConfig(obs_dim=6, action_dim=2, deter_dim=16,
                      n_categoricals=4, n_classes=4, embed_dim=16,
                      hidden_dim=16, latent_type='deterministic',
@@ -2016,7 +2027,7 @@ def _test_dob_two_timescale_scan() -> None:
                    d=served[:, -1], d_slow=d_slow[:, -1])
     assert torch.allclose(st.feat[..., -1:], served[:, -1], atol=1e-5)
     assert not torch.allclose(st.feat[..., -1:], d_fast[:, -1], atol=1e-2)
-    print('[smoke] OK  two-timescale scan (DC→d_slow α=1/(2T); leftover→d_fast; feat=served d)')
+    print('[smoke] OK  two-timescale scan (DC→d_slow α=1/T; leftover→d_fast; feat=served d)')
 
 
 def _test_atomic_torch_save() -> None:
@@ -2395,14 +2406,17 @@ def _test_isolation_dcv_scales() -> None:
     assert 'dob_reconsg=True' in _src
     assert 'dob_afreeze=True' in _src
     assert 'dob_luen=True' in _src
-    assert 'p2g=True' not in _src
-    assert 'p2gaux=True' not in _src
-    assert 'g recon-finetune' not in _src
+    assert 'p2g=True' in _src
+    assert 'p2gaux=True' in _src
+    assert 'g recon-finetune' in _src
+    assert 'P1 gain-match ON' in _src
+    assert 'P1 gain-match OFF' not in _src
+    assert 'if _cur_stage >= 2:' not in _src
     assert 'dob_ground, dob_ground_std_ratio = _dob_ground_hp_mse(' in _src
     assert 'dob_ground, dob_ground_std_ratio = _dob_ground_inc_mse(' not in _src
     assert 'def dob_slow' in _rssm_src
     _slow = _rssm_src.split('def dob_slow')[1].split('def apply_dob')[0]
-    assert '1.0 / float(2 * t)' in _slow
+    assert '1.0 / float(t)' in _slow
     assert 'seq_len' in _slow
     assert 'if t <= 0' in _slow
     assert 'd_slow: Optional' in _rssm_src

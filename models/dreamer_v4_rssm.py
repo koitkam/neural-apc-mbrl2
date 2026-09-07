@@ -416,10 +416,10 @@ class RSSMConfig:
     # RSSMConfig still constructs; ``gru_update_gate_bias`` is
     # identically 0 (PyTorch init).
     horizon: int = 0
-    # WM crop length (TrainConfig.seq_len). P110 two-timescale α = 1/(2T)
-    # so leftover ≈0.39 stays in d_fast (P108 α=1/T leftover ≈0.63 KEEP
-    # vs crush; P109 leftover 0.367 was a g-finetune side-effect).
-    # 0 → fall back to 1/(2H), then to (1−A).
+    # WM crop length (TrainConfig.seq_len). P108 two-timescale α = 1/T
+    # so the slow EMA cannot finish settling inside the scan (P107 α=1/H
+    # still reached ~0.90 of a constant ν on T=128). 0 → fall back to
+    # horizon, then to (1−A).
     seq_len: int = 0
 
 
@@ -830,14 +830,16 @@ class RSSMDynamics(nn.Module):
         return torch.sigmoid(self.dob_log_gain)
 
     def dob_slow(self) -> torch.Tensor:
-        """P110 two-timescale α = 1/(2T) (seq_len), not 1/T / 1/H / (1−A).
+        """P108 two-timescale α = 1/T (seq_len), not 1/H or (1−A).
 
-        P108 KEEP leftover/K at α=1/T (end-P2 0.592 / K 0.057/1.20 vs
-        P107 1.03 crush). P109 leftover 0.367 recovered amp but killed
-        TM because P2 g finetuned; α stayed 1/T. Smoke
-        ``1-(1-1/(2T))^T ≈ 0.393`` on T=128 isolates more leftover /
-        more ``d_fast`` with frozen g. ``seq_len`` is already
-        sim-adaptive. ``T<=0`` falls back to 1/(2H), then to
+        P107 EXIT FALSIFIED α=1/H as leftover/K: end-P2 ``|d_slow|/|d|``
+        1.03 and K 0.039/0.83 vs P106 crush 0.93 / 0.045/0.95. Smoke
+        already predicted ``1-(1-1/H)^T ≈ 0.90`` on T=128 — the slow
+        EMA finished settling *inside the crop*, so in-band residual
+        still went to ``d_slow`` and starved K. ``α=1/T`` →
+        ``1-(1-1/T)^T → 1-1/e ≈ 0.63``, so ~37% of a constant ν stays
+        in ``d_fast`` at crop end. ``seq_len`` is already sim-adaptive
+        (settling coverage). ``T<=0`` falls back to 1/H, then to
         ``(1−A)``. No new Parameter / TrainConfig field.
         """
         A = self.dob_decay()
@@ -846,7 +848,7 @@ class RSSMDynamics(nn.Module):
             t = int(getattr(self.cfg, 'horizon', 0) or 0)
         if t <= 0:
             return (1.0 - A).detach()
-        return torch.full_like(A, 1.0 / float(2 * t))
+        return torch.full_like(A, 1.0 / float(t))
 
     def apply_dob(self, decoded: torch.Tensor,
                   d: Optional[torch.Tensor]) -> torch.Tensor:
@@ -995,7 +997,7 @@ class RSSMDynamics(nn.Module):
         if self.dob_enabled and obs is not None and prior.d is not None:
             # P100 Luenberger: plant residual, d not in the forecast.
             # P103: slow EMA of ν holds DC; K trains on (ν − d_slow).
-            # P110: α = 1/(2T) (not 1/T / 1/H / 1−A). P108 leftover KEEP.
+            # P108: α = 1/T (not 1/H / 1−A) so d_slow cannot finish in-crop.
             cv_pred = self.decode(prior.feat).index_select(
                 -1, self.cv_index_t)
             cv_obs = obs.index_select(-1, self.cv_index_t)
@@ -1184,7 +1186,7 @@ class RSSMDynamics(nn.Module):
                 nu = cv_obs - base                                    # plant residual
                 # P103 two-timescale: d_slow = EMA_α(ν), d_fast = Luenberger
                 # on (ν − d_slow). Served ds = sum (recon / apply_dob / feat).
-                # P110: α = 1/(2T) (not 1/T). P104 d_fast feat REVERT.
+                # P108: α = 1/T (not 1/H). P104 d_fast feat REVERT.
                 alpha = self.dob_slow()
                 d_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)
                 coef = A                                              # (n_cv,)
