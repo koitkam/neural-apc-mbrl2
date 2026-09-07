@@ -4248,29 +4248,6 @@ def _dob_ground_hp_mse(
     return mse, (d_std / t_std).detach()
 
 
-def _dob_ground_inc_mse(
-        ds: torch.Tensor, dt: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-    """P102 helper / smoke. First-difference MSE; not the P103 train path.
-
-    ``std_ratio`` is level-amp observability. P102 EXIT FALSIFIED this as
-    K-hold: Luenberger ``|Δd|∝K``, so ``‖Δd−Δload‖²`` shrinks K
-    (end-P2 **0.042** SS **≈0.89** vs P101 **0.097** SS **≈2.04**).
-    ``T<2`` falls back to level MSE.
-    """
-    ds_f = ds.float()
-    dt_f = dt.float()
-    if int(ds_f.shape[1]) < 2:
-        mse = (ds_f - dt_f).pow(2).mean()
-    else:
-        mse = (
-            (ds_f[:, 1:] - ds_f[:, :-1]) - (dt_f[:, 1:] - dt_f[:, :-1])
-        ).pow(2).mean()
-    d_std = ds_f.std().clamp_min(1e-6)
-    t_std = dt_f.std().clamp_min(1e-6)
-    return mse, (d_std / t_std).detach()
-
-
 def _highpass_bt(x: torch.Tensor, w: int) -> torch.Tensor:
     """``x - MA(x, w)`` matching ``evaluation.wm_disturbance_prediction``.
 
@@ -4466,7 +4443,6 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gru_zbias={_gru_zb:.3g} "
         f"dob_hp={_hpw} "
         f"dob_hpamp=mse "
-        f"dob_inc=False "
         f"dob_2ts=True "
         f"dob_reconsg=True "
         f"dob_afreeze=True "

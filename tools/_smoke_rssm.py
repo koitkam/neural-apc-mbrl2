@@ -1940,37 +1940,6 @@ def _test_dob_ground_hp_mse() -> None:
     print('[smoke] OK  dob_ground level MSE helper (not P102 train path)')
 
 
-def _test_dob_ground_inc_mse() -> None:
-    """P102: Δd vs Δload. DC offset is free; std_ratio stays level amp."""
-    from training.train import _dob_ground_inc_mse, _dob_ground_hp_mse
-    torch.manual_seed(0)
-    dt = torch.randn(4, 32, 1)
-    loss, ratio = _dob_ground_inc_mse(dt, dt)
-    assert abs(float(ratio) - 1.0) < 1e-5
-    assert float(loss) < 1e-6
-    # Persistent DC must not train K (P101 RCA). Increment loss ~0;
-    # level MSE is huge. std_ratio is level amp (offset does not change std).
-    ds_dc = dt + 5.0
-    loss_inc, ratio_dc = _dob_ground_inc_mse(ds_dc, dt)
-    loss_lvl, _ = _dob_ground_hp_mse(ds_dc, dt)
-    assert float(loss_inc) < 1e-6, loss_inc
-    assert float(loss_lvl) > 10.0, loss_lvl
-    assert abs(float(ratio_dc) - 1.0) < 0.05
-    # Matching increments of a scaled trajectory: loss is on diffs.
-    ds = 0.5 * dt
-    loss, ratio = _dob_ground_inc_mse(ds, dt)
-    assert abs(float(ratio) - 0.5) < 1e-4
-    dds = ds.float()[:, 1:] - ds.float()[:, :-1]
-    ddt = dt.float()[:, 1:] - dt.float()[:, :-1]
-    expected = (dds - ddt).pow(2).mean()
-    assert abs(float(loss) - float(expected)) < 1e-5
-    ds_loud = 100.0 * dt
-    loss_loud, ratio_loud = _dob_ground_inc_mse(ds_loud, dt)
-    assert abs(float(ratio_loud) - 100.0) < 1e-2
-    assert float(loss_loud) > 1.0
-    print('[smoke] OK  dob_ground increment MSE helper (P102; not P103 train path)')
-
-
 def _test_dob_two_timescale_scan() -> None:
     """P103: constant ν → DC in d_slow; d_fast → 0. Feat width unchanged."""
     from models.dreamer_v4_rssm import dob_kalman_scan
@@ -2334,7 +2303,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'g * (h_gru - prev.h)' not in _rssm_src
     assert 'def _dob_ground_hp_window' in _src
     assert 'def _dob_ground_hp_mse' in _src
-    assert 'def _dob_ground_inc_mse' in _src
+    assert 'def _dob_ground_inc_mse' not in _src
     assert 'def _dob_ground_inc_zscore' not in _src
     assert 'def _dob_ground_shape_amp' not in _src
     assert 'def _highpass_bt' in _src
@@ -2344,10 +2313,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '[dob-ground] raw MSE (P103 2TS' in _src
     assert 'HP crop-demean crushed K' in _src
     assert '_hpw = 0' in _src
-    assert 'dob_inc=False' in _src
     assert 'dob_2ts=True' in _src
-    assert 'dob_inc=True' not in _src
-    assert 'dob_inc=z' not in _src
+    assert 'dob_inc=' not in _src
     assert '_highpass_bt(ds,' not in _src
     assert 'shape z-score + log-std amp' not in _src
     assert 'dob_hpamp=mse' in _src
@@ -2362,7 +2329,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'd_slow: Optional' in _rssm_src
     assert 'd_slow = dob_kalman_scan(alpha * nu, 1.0 - alpha)' in _rssm_src
     assert "row.setdefault('dob_d_slow_absmean'" in _src
-    assert 'ds_f[:, 1:] - ds_f[:, :-1]' in _src
+    assert 'ds_f[:, 1:] - ds_f[:, :-1]' not in _src
     assert 'P2 pin A (decay stays at init)' in _v4_src
     assert 'coef = (1.0 - K) * A' not in _rssm_src
     _tssm_src = _P(_tr.__file__).resolve().parents[1].joinpath(
@@ -6254,7 +6221,6 @@ if __name__ == '__main__':
     _test_gru_vanilla_no_residual_mix()
     _test_dob_ground_highpass()
     _test_dob_ground_hp_mse()
-    _test_dob_ground_inc_mse()
     _test_dob_two_timescale_scan()
     _test_atomic_torch_save()
     _test_img_step_det_roll_skips_sample()
