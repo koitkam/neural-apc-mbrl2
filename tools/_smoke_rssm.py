@@ -234,9 +234,9 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _skip_storm_continue_after_probe(
         restored_gain_ready=True, ready_storm_n=2, cap_after=2) is False
     assert _wm_fidelity_es_suppressed_frozen_g(False) is True
-    assert _wm_fidelity_es_suppressed_frozen_g(True) is False
+    assert _wm_fidelity_es_suppressed_frozen_g(True) is True
     print('[smoke] OK  P1 skip-storm continue first READY / cap second READY; '
-          'GAIN_NOT_READY cap-deferred; frozen-g ES')
+          'GAIN_NOT_READY cap-deferred; P2 gain-blind ES')
     assert _p1_need_agent_finetune(0.0, False, 0, 100) is False
     assert _p1_need_agent_finetune(0.0, True, 98, 100) is False
     assert _p1_need_agent_finetune(0.0, True, 99, 100) is True
@@ -717,10 +717,11 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
 
     # Frozen-g skip: isolation extra unroll (follow-up 10) AND the in-graph
     # g-only aux (overshoot / held-rollout / full-BPTT gain-match,
-    # follow-up 11) are dead when DOB curriculum freezes the plant model
-    # (P2).  Isolation is a separate extra unroll; the aux trio is ~73% of
-    # each WM step.  Restore g=True so later smokes stay live.
+    # follow-up 11) are dead when g is frozen.  P1-like (dob suppressed)
+    # still runs g-aux.  P109 curriculum P2 recon-finetunes g but still
+    # skips g-aux via dob_live.  Restore g=True so later smokes stay live.
     assert _dynamics_g_trainable(model)
+    model.set_dob_active(False)
     _gate_over = float(cfg.wm_overshoot_gate_recon)
     _gate_held = float(cfg.wm_held_rollout_gate_recon)
     cfg.wm_overshoot_gate_recon = 0.0
@@ -736,13 +737,26 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     if wm_type == 'rssm':
         assert float(losses_g['wm_overshoot_loss']) > 0.0, losses_g['wm_overshoot_loss']
     model.set_world_model_trainable(g=False, dob=True, reward=True)
+    model.set_dob_active(True)
     assert not _dynamics_g_trainable(model)
     losses_fz, _, _ = world_model_loss(model, batch, cfg)
     assert float(losses_fz['wm_overshoot_loss']) == 0.0, losses_fz['wm_overshoot_loss']
     assert float(losses_fz['wm_held_rollout_loss']) == 0.0, losses_fz['wm_held_rollout_loss']
     assert float(losses_fz['gain_match_loss']) == 0.0, losses_fz['gain_match_loss']
     assert 'gain_match_n' not in losses_fz
+    model.set_world_model_trainable(g=True, dob=True, reward=True)
+    model.set_dob_active(True)
+    assert _dynamics_g_trainable(model)
+    _ncv = int(getattr(model.dynamics, 'n_cv', 0) or 0)
+    if _ncv > 0:
+        losses_p2g, _, _ = world_model_loss(model, batch, cfg)
+        assert float(losses_p2g['wm_overshoot_loss']) == 0.0, losses_p2g['wm_overshoot_loss']
+        assert float(losses_p2g['gain_match_loss']) == 0.0, losses_p2g['gain_match_loss']
+        print('[smoke] OK  P109 curriculum P2 g-aux skip while g recon-finetunes')
+    else:
+        print('[smoke] OK  P109 curriculum P2 g-aux skip (n_cv=0; curriculum smoke covers DOB)')
     model.set_world_model_trainable(g=True, dob=False, reward=True)
+    model.set_dob_active(False)
     assert _dynamics_g_trainable(model)
     cfg.wm_overshoot_gate_recon = _gate_over
     cfg.wm_held_rollout_gate_recon = _gate_held
@@ -750,6 +764,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     cfg.gain_match_mv_target = ()
     print('[smoke] OK  isolation skip when g frozen (_dynamics_g_trainable)')
     print('[smoke] OK  g-only aux (overshoot/held/gain-match) skip when g frozen')
+    print('[smoke] OK  P109 curriculum P2 g-aux skip while g recon-finetunes')
 
     # P1/P2 random collect is numpy-only (no RSSM).  P3 on-policy streams
     # stream_serve_step (DV + Kalman when DOB is live).
@@ -2392,6 +2407,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'dob_reconsg=True' in _src
     assert 'dob_afreeze=True' in _src
     assert 'dob_luen=True' in _src
+    assert 'p2g=True' in _src
+    assert 'g recon-finetune' in _src
+    assert 'if _cur_stage >= 2:' in _src
     assert 'dob_ground, dob_ground_std_ratio = _dob_ground_hp_mse(' in _src
     assert 'dob_ground, dob_ground_std_ratio = _dob_ground_inc_mse(' not in _src
     assert 'def dob_slow' in _rssm_src

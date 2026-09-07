@@ -328,6 +328,7 @@ def test_end_to_end_dreamer_tssm():
     cfg.wm_held_rollout_len = 8
     cfg.wm_held_rollout_win = 2
     model = build_model(cfg)
+    model.set_dob_active(False)
     assert model.world_model_type == 'tssm'
     assert type(model.dynamics).__name__ == 'TransformerSSMDynamics'
     assert model.disturbance is not None, "disturbance head NOT built for TSSM"
