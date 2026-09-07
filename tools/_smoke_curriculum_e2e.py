@@ -65,6 +65,7 @@ def _mk_cfg(out_dir):
     cfg.phase3_pruner_warmup_iters = 0
     cfg.p3_critic_warmup_iters = 1
     cfg.early_stop_enable = False
+    cfg.skip_invalid_p3 = False
     # Even-ish phase split so all three stages get iters in a tiny budget.
     cfg.phase1_frac = 0.4
     cfg.phase2_frac = 0.3
@@ -89,6 +90,7 @@ def _mk_cfg(out_dir):
         'exploration_seed_episodes', 'phase1_frac', 'phase2_frac',
         'phase3_frac', 'gamma', 'policy_init_log_std',
         'policy_log_std_max', 'policy_log_std_min', 'pmpo_entropy_coef',
+        'skip_invalid_p3',
     }
     # --- THE CURRICULUM (requires the DOB) ---
     cfg.dob_enabled = True
@@ -126,17 +128,19 @@ def main():
 
     # Stage descriptors carry the right semantics.
     assert 'DOB suppressed' in out, 'Stage 1 descriptor wrong'
-    assert 'g FROZEN' in out and 'observer' in out, 'Stage 2 descriptor wrong'
+    assert 'g recon-finetune' in out and 'observer' in out, 'Stage 2 descriptor wrong'
     assert 'FROZEN WM+DOB' in out, 'Stage 3 descriptor wrong'
-    print('[e2e] OK  stage descriptors correct (S1 suppress / S2 freeze-g+id '
+    print('[e2e] OK  stage descriptors correct (S1 suppress / S2 g recon-finetune+id '
           'observer / S3 frozen WM+DOB)')
 
     log_path = os.path.join(out_dir, 'train_log.jsonl')
     rows = [json.loads(l) for l in open(log_path) if l.strip()]
     assert rows, 'train_log.jsonl empty'
     phases = sorted({int(r.get('phase', 0)) for r in rows})
-    assert phases == [1, 2, 3], f'did not pass through all phases: {phases}'
-    print(f'[e2e] OK  reached all three phases {phases} ({len(rows)} rows)')
+    # Tiny budget may skip P1 jsonl rows (seed/prefill); STAGE 1/2/3 banners
+    # already asserted the latch. P109 needs P2+P3 rows for recon/wm_frozen.
+    assert 2 in phases and 3 in phases, f'jsonl missing P2/P3: {phases!r}'
+    print(f'[e2e] OK  jsonl phases={phases!r} ({len(rows)} rows)')
 
     recons = [r.get('recon_loss') for r in rows
               if r.get('recon_loss') is not None]
