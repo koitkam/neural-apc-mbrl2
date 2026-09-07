@@ -4401,12 +4401,10 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     _h_zb = int(getattr(cfg, 'horizon', 0) or 0)
     from models.dreamer_v4_rssm import gru_update_gate_bias as _gru_zbias_fn
     _gru_zb = float(_gru_zbias_fn(_h_zb))
-    # P104: two-timescale DOB; feat tail is d_fast. Training ground
-    # stays P101 level MSE on served d. P103 2TS split the filter but
-    # Scope-2 feat was still DC-dominated. P90 serve-HP was a causal
-    # EMA in the serve loop (P1 detonated); this is pointwise
-    # d−d_slow already on the 2TS state. P102 increment MSE crushed K;
-    # P100 HP crop-demean crushed K.
+    # P103: two-timescale DOB; feat tail is served d. Training ground
+    # is P101 level MSE on served d. P104 d_fast feat REVERT (CAPPED
+    # GAIN_NOT_READY; P1 d≡0 cannot attribute). P90 serve-HP closed.
+    # P102 increment MSE crushed K; P100 HP crop-demean crushed K.
     # Banner window stays 0 (no crop-demean).
     # ``_dob_ground_hp_window`` remains the val-protocol formula (smoke /
     # A/B via ``disturbance_detrend_settle_mult<=0``).
@@ -4448,7 +4446,6 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_hp={_hpw} "
         f"dob_hpamp=mse "
         f"dob_2ts=True "
-        f"dob_featfast=True "
         f"dob_reconsg=True "
         f"dob_afreeze=True "
         f"dob_luen=True "
@@ -7403,7 +7400,7 @@ def _gain_match_fd_action_seq(
 def _gain_match_state_from_feat(rssm, feat: torch.Tensor):
     """Unpack ``img_rollout`` last feat into ``(h, z, c)`` for a follow-on roll.
 
-    Layout is ``[h, z_flat, (c), (dv), (d_fast.detach())]``.  The follow-on
+    Layout is ``[h, z_flat, (c), (dv), (d.detach())]``.  The follow-on
     ``img_rollout`` takes DV via ``dvs`` and starts ``d=None`` (P1
     ``d_t≡0``; gain-match is skipped when g is frozen in P2).
     """
