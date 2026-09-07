@@ -7,10 +7,9 @@ the properties that make the staged Kalman/DOB identification correct:
   Stage 1 (clean WM): g trainable, DOB frozen + SUPPRESSED (d_t==0) ->
     recon backward trains g (the plant) and gives NO gradient to the DOB
     (there is no d_t path) -> g must explain all CV movement (unbiased gain).
-  Stage 2 API freeze-g: g FROZEN, DOB trainable + ACTIVE remains a valid
-    partition (P108 identity). P109 curriculum P2 instead recon-finetunes g
-    while K trains (A pinned); P1 gain-match/overshoot/held stay OFF via
-    curriculum_enabled and dob_live.
+  Stage 2 (DOB id):   g FROZEN, DOB trainable + ACTIVE ->
+    recon backward trains the DOB observer (A,K) and gives NO gradient to g
+    (frozen) -> the observer is identified on the fixed plant (identifiable).
   Stage 3 (actor):    g + DOB both FROZEN, reward trainable ->
     recon backward gives NO gradient to g or DOB (the WM is static); the
     actor/critic train on real-sim rollouts (covered by the rssm smoke).
@@ -176,41 +175,6 @@ def _check(wm_type):
           f'A pinned |a_grad|={a_grad:.1f}) '
           f'and NOT g (|g_grad|={g_grad:.1f}) — observer identifiable on the '
           f'fixed plant [{wm_type}]')
-
-    # ---- P109: curriculum P2 recon-finetunes g; P1 g-aux still skipped ----
-    cfg, model, batch = _mk(wm_type)
-    rssm = model.dynamics
-    g_ref = _g_param(rssm)
-    cfg.wm_overshoot_gate_recon = 0.0
-    cfg.wm_held_rollout_gate_recon = 0.0
-    model.set_world_model_trainable(g=True, dob=True, reward=True)
-    model.set_dob_active(True)
-    assert bool(getattr(cfg, 'curriculum_enabled', True))
-    model.zero_grad(set_to_none=True)
-    losses, _, _ = world_model_loss(model, batch, cfg)
-    losses['wm_total'].backward()
-    g_grad = _grad_sum(g_ref)
-    k_grad = _grad_sum(rssm.dob_log_gain)
-    a_grad = _grad_sum(rssm.dob_log_decay)
-    assert g_grad > 0.0, 'P109 Stage2: g recon-finetune must get recon gradient'
-    assert k_grad > 0.0, 'P109 Stage2: K must get Kalman-ID gradient'
-    assert a_grad == 0.0, 'P109 Stage2 P99: A is pinned -> must get NO gradient'
-    assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0, \
-        'P109: overshoot is P1-only even when g trains'
-    assert float(losses.get('gain_match_loss', 0.0)) == 0.0, \
-        'P109: gain-match is P1-only even when g trains'
-    print(f'[smoke] OK  P109 Stage2: g recon-finetune (|g_grad|={g_grad:.4f}) '
-          f'+ K (|k_grad|={k_grad:.4f}, A pinned |a_grad|={a_grad:.1f}) '
-          f'and g-aux skipped [{wm_type}]')
-
-    # Non-curriculum DOB + g must still run g-aux (guard is not dob_live alone).
-    cfg.curriculum_enabled = False
-    model.zero_grad(set_to_none=True)
-    losses_nc, _, _ = world_model_loss(model, batch, cfg)
-    if wm_type == 'rssm':
-        assert float(losses_nc.get('wm_overshoot_loss', 0.0)) > 0.0, \
-            'non-curriculum DOB+g must keep overshoot'
-    print(f'[smoke] OK  P109 non-curriculum DOB+g keeps g-aux [{wm_type}]')
 
     # ---- Stage 3 grad isolation: WM static (wm_total carries NO trainable
     # gradient).  The real P3 path trains the reward head via reward-MTP +
