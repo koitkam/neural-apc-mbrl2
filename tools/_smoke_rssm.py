@@ -23,6 +23,8 @@ from training.train import (
                             _steady_held_mask, _force_p1_cap_at,
                             _skip_storm_continue_p1,
                             _skip_storm_should_continue_p1,
+                            _skip_storm_consume_ready_cap,
+                            _skip_storm_continue_after_probe,
                             _wm_fidelity_es_suppressed_frozen_g,
                             _p1_fidelity_local_plateau,
                             _resolve_aux_tbptt_steps, _resolve_gain_match_step,
@@ -218,9 +220,23 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert _skip_storm_should_continue_p1(1, 2) is True
     assert _skip_storm_should_continue_p1(2, 2) is False
     assert _skip_storm_should_continue_p1(1, 1) is False
+    # P106: GAIN_NOT_READY last_ok does not consume storm-cap (P105
+    # CAPPED@5 last_ok 3 @0.02@DV). READY last_ok still caps at 2 (P61).
+    assert _skip_storm_consume_ready_cap(True) is True
+    assert _skip_storm_consume_ready_cap(False) is False
+    assert _skip_storm_consume_ready_cap(None) is False
+    assert _skip_storm_continue_after_probe(
+        restored_gain_ready=False, ready_storm_n=2, cap_after=2) is True
+    assert _skip_storm_continue_after_probe(
+        restored_gain_ready=None, ready_storm_n=2, cap_after=2) is True
+    assert _skip_storm_continue_after_probe(
+        restored_gain_ready=True, ready_storm_n=1, cap_after=2) is True
+    assert _skip_storm_continue_after_probe(
+        restored_gain_ready=True, ready_storm_n=2, cap_after=2) is False
     assert _wm_fidelity_es_suppressed_frozen_g(False) is True
     assert _wm_fidelity_es_suppressed_frozen_g(True) is False
-    print('[smoke] OK  P1 skip-storm continue first / cap second; frozen-g ES')
+    print('[smoke] OK  P1 skip-storm continue first READY / cap second READY; '
+          'GAIN_NOT_READY cap-deferred; frozen-g ES')
     assert _p1_need_agent_finetune(0.0, False, 0, 100) is False
     assert _p1_need_agent_finetune(0.0, True, 98, 100) is False
     assert _p1_need_agent_finetune(0.0, True, 99, 100) is True
@@ -2142,6 +2158,11 @@ def _test_isolation_dcv_scales() -> None:
     assert "'p1_last_ok_gain_ready_locked'" in _src
     assert "'p1_skip_storm_gain_ready'" in _src
     assert "'p1_skip_storm_gain_worst'" in _src
+    assert "'skip_storm_p1_ready_n'" in _src
+    assert "'p1_skip_storm_cap_deferred'" in _src
+    assert '_skip_storm_consume_ready_cap' in _src
+    assert '_skip_storm_continue_after_probe' in _src
+    assert 'cap-deferred: last_ok GAIN_NOT_READY' in _src
     assert '[skip-storm] gain-probe' in _src
     assert '_should_unlock_last_ok_after_skip_storm' in _src
     assert 'stay-locked after ' in _src

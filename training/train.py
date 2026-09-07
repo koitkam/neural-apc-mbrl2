@@ -2078,11 +2078,14 @@ class TrainConfig:
     # exists.  Then reset ``opt_world``.  P30 capped P1 on the *first*
     # storm and froze an under-trained observer (iter 18 of ~90).  Default
     # ``skip_storm_p1_cap_after=2`` continues original P1 **and** the
-    # quality-gate extension on the first recovery; storm 2 still
-    # ``_force_p1_cap_at`` (closes extension → P2).  P32 closed extension
-    # on storm 1 and CAPPED GAIN_NOT_READY(worst=0.71@DV) with healthy
-    # recon — P26/P31 needed that extension past ~iter 75.  P2/P3
-    # skip-storms still abort.  Set 0 to keep the P27 abort behaviour.
+    # quality-gate extension on the first **GAIN-READY** recovery;
+    # the second READY storm still ``_force_p1_cap_at`` (closes
+    # extension → P2).  P106: GAIN_NOT_READY last_ok does **not**
+    # consume that count (P105 CAPPED@5 last_ok **3** @0.02@DV).
+    # P32 closed extension on storm 1 and CAPPED GAIN_NOT_READY
+    # (worst=0.71@DV) with healthy recon — P26/P31 needed that
+    # extension past ~iter 75.  P2/P3 skip-storms still abort.
+    # Set 0 to keep the P27 abort behaviour.
     skip_storm_recover_p1: bool = True
     # Unitless recon-health band for ``wm_last_ok`` (sim-agnostic).  P27
     # exploded 0.004 → 0.50 (~125×); 5× still accepts mild recon jitter
@@ -2104,8 +2107,11 @@ class TrainConfig:
     # after a recovered 43× wrap and discarded live 0.89@DV). Extra-P1
     # recovered basin stays locked (P40). ``DREAMER_SKIP_STORM_LAST_OK_LOCK_RATIO``.
     skip_storm_last_ok_lock_ratio: float = 20.0
-    # 1-indexed: 1 = P30 (cap on first storm), 2 = continue first
-    # (keep extension) then cap.  ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
+    # 1-indexed READY storms: 1 = P30 (cap on first GAIN-READY storm),
+    # 2 = continue first READY then cap.  GAIN_NOT_READY last_ok does
+    # **not** consume this budget (P106 / P105 last_ok **3** @0.02@DV).
+    # Quality-gate CAPPED still ends P1 if never READY.
+    # ``DREAMER_SKIP_STORM_P1_CAP_AFTER``.
     skip_storm_p1_cap_after: int = 2
     # P28 GPU RCA: fidelity-peak ``wm_best`` is gain-blind.  Restoring it
     # at P1→P2 on a *healthy* P1 discarded 37 late-P1 iters (val MV ×0.52
@@ -3342,13 +3348,48 @@ def _force_p1_cap_at(total_env_steps: int) -> Tuple[int, int, int]:
 
 
 def _skip_storm_should_continue_p1(storm_n: int, cap_after: int) -> bool:
-    """True if this 1-indexed P1 skip-storm should keep the original P1 budget.
+    """True if this 1-indexed **GAIN-READY** P1 skip-storm keeps original P1.
 
-    ``cap_after=1`` is the P30 policy (cap on first storm). Default 2
-    continues the first recovery (P1 budget **and** extension) and
-    caps the second so a repeated explosion still exits to Stage 2.
+    ``cap_after=1`` is the P30 policy (cap on first READY storm). Default 2
+    continues the first READY recovery (P1 budget **and** extension) and
+    caps the second so a repeated explosion of a freeze-worthy snapshot
+    still exits to Stage 2.  GAIN_NOT_READY last_ok is gated by
+    ``_skip_storm_consume_ready_cap`` (P106) and never reaches this count.
     """
     return int(storm_n) < max(1, int(cap_after))
+
+
+def _skip_storm_consume_ready_cap(
+        restored_gain_ready: Optional[bool]) -> bool:
+    """P106: storm-cap counts only a GAIN-READY last_ok.
+
+    P105 CAPPED storm **2/2** at last_ok **3** GAIN_NOT_READY **0.02@DV**
+    (recon 0.10, teacher unpinned, gnorm 7e6). P103 storm **1/2 @5**
+    restored last_ok **2** (also not READY) then recovered to extra-P1
+    GAIN-READY **94**. Cap-on-2 of an untrained snapshot is the same
+    class as fidelity-peak ``wm_best`` freeze (P28). Probe fail
+    (``None``) does not consume cap (same fail-open as skip-storm
+    unlock). READY last_ok still caps at ``skip_storm_p1_cap_after``
+    (P61 2/2 @56 KEEP). Quality-gate CAPPED still ends P1 if never
+    READY. No new TrainConfig field.
+    """
+    return restored_gain_ready is True
+
+
+def _skip_storm_continue_after_probe(
+        *,
+        restored_gain_ready: Optional[bool],
+        ready_storm_n: int,
+        cap_after: int,
+) -> bool:
+    """True → keep original P1 after a skip-storm restore+probe.
+
+    ``ready_storm_n`` is the 1-indexed READY-storm count **including**
+    this storm when ``_skip_storm_consume_ready_cap`` is True.
+    """
+    if not _skip_storm_consume_ready_cap(restored_gain_ready):
+        return True
+    return _skip_storm_should_continue_p1(ready_storm_n, cap_after)
 
 
 def _skip_storm_continue_p1(
@@ -3361,9 +3402,10 @@ def _skip_storm_continue_p1(
     (P26 needed ~90).  P32 continued original P1 after storm 1 but
     closed extension (``p1_gate_max_ext_steps=0``), so the first
     P1→P2 gate CAPPED GAIN_NOT_READY(worst=0.71@DV) with healthy
-    recon — P26/P31 needed that extension past ~iter 75.  Storm 2
-    still ``_force_p1_cap_at`` (close extension so a cap-now cannot
-    re-open the next-iter gate — P28).
+    recon — P26/P31 needed that extension past ~iter 75. Storm 2 of a
+    **GAIN-READY** last_ok still ``_force_p1_cap_at`` (close extension so
+    a cap-now cannot re-open the next-iter gate — P28). GAIN_NOT_READY
+    last_ok does not consume that budget (P106).
     """
     return int(p1), int(p1_ext_steps), int(p1_gate_max_ext_steps)
 
@@ -12202,6 +12244,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     early_stop_reason: Optional[str] = None
     skip_storm_p1_recovered: bool = False
     skip_storm_p1_n: int = 0
+    skip_storm_p1_ready_n: int = 0
+    p1_skip_storm_cap_deferred: Optional[bool] = None
     skip_storm_restore_source: Optional[str] = None
     skip_storm_restore_iter: Optional[int] = None
     wm_fid_es_frozen_g_logged: bool = False
@@ -14504,6 +14548,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 'p1_skip_storm_gain_worst': (
                     float(p1_skip_storm_gain_worst)
                     if p1_skip_storm_gain_worst is not None else None),
+                'skip_storm_p1_n': int(skip_storm_p1_n),
+                'skip_storm_p1_ready_n': int(skip_storm_p1_ready_n),
+                'p1_skip_storm_cap_deferred': (
+                    bool(p1_skip_storm_cap_deferred)
+                    if p1_skip_storm_cap_deferred is not None else None),
                 'p1_recon_best': (float(p1_recon_best)
                                   if p1_recon_best is not None else None),
                 'wm_score_ema': (float(wm_score_ema)
@@ -14972,7 +15021,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                         # (wm_last_ok), not the fidelity-peak wm_best (lucky
                         # early spike).  Drop AdamW moments (they hold the
                         # 1e12 direction).  First storm keeps original P1
-                        # (P30 froze iter 18); Nth caps → Stage 2.
+                        # (P30 froze iter 18); Nth **GAIN-READY** storm
+                        # caps → Stage 2 (P106: GAIN_NOT_READY last_ok
+                        # does not consume that budget).
                         try:
                             if p1_last_ok_sd is not None:
                                 model.load_state_dict({
@@ -14995,29 +15046,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             skip_storm_p1_n += 1
                             _cap_after = max(1, int(getattr(
                                 cfg, 'skip_storm_p1_cap_after', 2)))
-                            _continue_p1 = _skip_storm_should_continue_p1(
-                                skip_storm_p1_n, _cap_after)
-                            if _continue_p1:
-                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
-                                    _skip_storm_continue_p1(
-                                        p1, p1_ext_steps,
-                                        p1_gate_max_ext_steps))
-                            else:
-                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
-                                    _force_p1_cap_at(total_env_steps))
-                            grad_skip_history.clear()
-                            skip_storm_p1_recovered = True
-                            skip_storm_restore_source = _src
-                            skip_storm_restore_iter = (
-                                int(p1_last_ok_iter)
-                                if _src == 'wm_last_ok'
-                                else int(wm_best_iter))
-                            # Probe restored weights: cap-path sets
-                            # actor_experiment_valid; continue-path
-                            # stay-locks a GAIN-READY last_ok (P91).
-                            # Print the 5-level line (P92 LIVE storm-1
-                            # unlock had no probe dump — teacher jsonl
-                            # ≠ GAIN-READY).
+                            # Probe restored weights BEFORE consuming
+                            # storm-cap (P106). Continue/cap used to run
+                            # on storm count alone and freeze last_ok=3
+                            # at 0.02@DV (P105).
                             _storm_gain_ready = None
                             _gp = None
                             try:
@@ -15029,9 +15061,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     if _gp.get('worst_ratio') is not None:
                                         p1_skip_storm_gain_worst = float(
                                             _gp['worst_ratio'])
-                                    if (not _continue_p1
-                                            and not _storm_gain_ready):
-                                        p1_gain_not_ready_capped = True
                             except Exception as _e_storm_gp:
                                 print(f'[skip-storm] gain-probe failed: '
                                       f'{_e_storm_gp!r}', flush=True)
@@ -15049,6 +15078,33 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             else:
                                 print('[skip-storm] gain-probe None '
                                       '(unlock)', flush=True)
+                            _consume_cap = _skip_storm_consume_ready_cap(
+                                _storm_gain_ready)
+                            p1_skip_storm_cap_deferred = not _consume_cap
+                            if _consume_cap:
+                                skip_storm_p1_ready_n += 1
+                            _continue_p1 = _skip_storm_continue_after_probe(
+                                restored_gain_ready=_storm_gain_ready,
+                                ready_storm_n=skip_storm_p1_ready_n,
+                                cap_after=_cap_after)
+                            if _continue_p1:
+                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
+                                    _skip_storm_continue_p1(
+                                        p1, p1_ext_steps,
+                                        p1_gate_max_ext_steps))
+                            else:
+                                p1, p1_ext_steps, p1_gate_max_ext_steps = (
+                                    _force_p1_cap_at(total_env_steps))
+                            if (not _continue_p1
+                                    and not bool(_storm_gain_ready)):
+                                p1_gain_not_ready_capped = True
+                            grad_skip_history.clear()
+                            skip_storm_p1_recovered = True
+                            skip_storm_restore_source = _src
+                            skip_storm_restore_iter = (
+                                int(p1_last_ok_iter)
+                                if _src == 'wm_last_ok'
+                                else int(wm_best_iter))
                             if _should_unlock_last_ok_after_skip_storm(
                                     continue_p1=_continue_p1,
                                     restored_gain_ready=_storm_gain_ready):
@@ -15071,12 +15127,37 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     f'last_ok iter {int(p1_last_ok_iter)}')
                             _restored = (Path(_ckpt).name
                                          if _ckpt is not None else _src)
-                            if _continue_p1:
+                            _storm_banner = (
+                                f'ready-storms {skip_storm_p1_ready_n}/'
+                                f'{_cap_after}')
+                            if _continue_p1 and not _consume_cap:
                                 mid_check_flags.append(
                                     f'p1_skip_storm_recovered: restored '
                                     f'{_restored} ({_src} iter '
                                     f'{skip_storm_restore_iter}); continuing '
-                                    f'P1 (storm {skip_storm_p1_n}/'
+                                    f'P1 (storm {skip_storm_p1_n} '
+                                    f'cap-deferred: last_ok GAIN_NOT_READY, '
+                                    f'{_storm_banner}, extension kept '
+                                    f'{p1_gate_max_ext_steps} steps)')
+                                print(
+                                    f'[skip-storm] P1 recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); reset '
+                                    f'opt_world; continuing P1 '
+                                    f'(storm {skip_storm_p1_n} cap-deferred: '
+                                    f'last_ok GAIN_NOT_READY, '
+                                    f'{_storm_banner}, original P1 {p1} '
+                                    f'steps, extension kept '
+                                    f'{p1_gate_max_ext_steps} steps). '
+                                    f'({window_skips} skips in last '
+                                    f'{window_iters} iters)',
+                                    flush=True)
+                            elif _continue_p1:
+                                mid_check_flags.append(
+                                    f'p1_skip_storm_recovered: restored '
+                                    f'{_restored} ({_src} iter '
+                                    f'{skip_storm_restore_iter}); continuing '
+                                    f'P1 (storm {skip_storm_p1_ready_n}/'
                                     f'{_cap_after}, extension kept '
                                     f'{p1_gate_max_ext_steps} steps)')
                                 print(
@@ -15084,9 +15165,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     f'{_restored} ({_src} iter '
                                     f'{skip_storm_restore_iter}); reset '
                                     f'opt_world; continuing P1 '
-                                    f'(storm {skip_storm_p1_n}/{_cap_after}, '
-                                    f'original P1 {p1} steps, extension '
-                                    f'kept {p1_gate_max_ext_steps} steps). '
+                                    f'(storm {skip_storm_p1_ready_n}/'
+                                    f'{_cap_after}, original P1 {p1} steps, '
+                                    f'extension kept '
+                                    f'{p1_gate_max_ext_steps} steps). '
                                     f'({window_skips} skips in last '
                                     f'{window_iters} iters)',
                                     flush=True)
@@ -15096,14 +15178,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                     f'{_restored} ({_src} iter '
                                     f'{skip_storm_restore_iter}); P1 capped at '
                                     f'{p1} env_steps, extension closed '
-                                    f'(storm {skip_storm_p1_n}/{_cap_after})')
+                                    f'(storm {skip_storm_p1_ready_n}/'
+                                    f'{_cap_after})')
                                 print(
                                     f'[skip-storm] P1 recovered: restored '
                                     f'{_restored} ({_src} iter '
                                     f'{skip_storm_restore_iter}); reset '
                                     f'opt_world; capping P1 at {p1} env_steps '
-                                    f'(storm {skip_storm_p1_n}/{_cap_after}, '
-                                    f'extension closed) → P2 '
+                                    f'(storm {skip_storm_p1_ready_n}/'
+                                    f'{_cap_after}, extension closed) → P2 '
                                     f'(g freeze applies on the P1→P2 iter). '
                                     f'({window_skips} skips in last '
                                     f'{window_iters} iters)',
@@ -15495,6 +15578,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         'p2_ext_steps': int(p2_ext_steps),
         'skip_storm_p1_recovered': bool(skip_storm_p1_recovered),
         'skip_storm_p1_n': int(skip_storm_p1_n),
+        'skip_storm_p1_ready_n': int(skip_storm_p1_ready_n),
+        'p1_skip_storm_cap_deferred': (
+            bool(p1_skip_storm_cap_deferred)
+            if p1_skip_storm_cap_deferred is not None else None),
         'skip_storm_p1_cap_after': int(getattr(
             cfg, 'skip_storm_p1_cap_after', 2)),
         'skip_storm_restore_source': skip_storm_restore_source,
