@@ -44,6 +44,7 @@ import numpy as np
 # uses so the WM/real comparison matches training exactly.
 from tools.wm_steady_state_diagnostic import (
     _imagine_open_loop, _imagine_open_loop_rssm, _is_rssm_model, _quiet_env,
+    scoped_quiet_env,
 )
 
 
@@ -260,6 +261,20 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
                                horizon: int = 0, settle_steps: int = 0,
                                sample: bool = False,
                                seed: int = 20260607) -> Dict:
+    """WM-vs-real DV→CV TM.  Quiets then restores the live env (P113)."""
+    with scoped_quiet_env(env):
+        return _compute_dv_transfer_matrix_impl(
+            model, env, cfg, device, obs_std=obs_std, n_levels=n_levels,
+            step_frac=step_frac, horizon=horizon, settle_steps=settle_steps,
+            sample=sample, seed=seed)
+
+
+def _compute_dv_transfer_matrix_impl(model, env, cfg, device, *,
+                               obs_std: Optional[np.ndarray] = None,
+                               n_levels: int = 3, step_frac: float = 0.4,
+                               horizon: int = 0, settle_steps: int = 0,
+                               sample: bool = False,
+                               seed: int = 20260607) -> Dict:
     """WM-vs-real **DV→CV** step-response matrix (Option B DV-as-input only).
 
     Mirrors ``compute_transfer_matrix`` but the exogenous input is a measured
@@ -373,6 +388,22 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
 
 
 def compute_transfer_matrix(model, env, cfg, device, *,
+                            obs_std: Optional[np.ndarray] = None,
+                            n_levels: int = 5, level_span: float = 0.6,
+                            step_frac: float = 0.4, horizon: int = 0,
+                            settle_steps: int = 0, max_starts_note: str = '',
+                            sample: bool = False,
+                            seed: int = 20260605) -> Dict:
+    """WM-vs-real MV→CV TM.  Quiets then restores the live env (P113)."""
+    with scoped_quiet_env(env):
+        return _compute_transfer_matrix_impl(
+            model, env, cfg, device, obs_std=obs_std, n_levels=n_levels,
+            level_span=level_span, step_frac=step_frac, horizon=horizon,
+            settle_steps=settle_steps, max_starts_note=max_starts_note,
+            sample=sample, seed=seed)
+
+
+def _compute_transfer_matrix_impl(model, env, cfg, device, *,
                             obs_std: Optional[np.ndarray] = None,
                             n_levels: int = 5, level_span: float = 0.6,
                             step_frac: float = 0.4, horizon: int = 0,

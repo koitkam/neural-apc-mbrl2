@@ -44,7 +44,7 @@ sys.path.insert(0, str(REPO))
 
 from tools.wm_steady_state_diagnostic import (  # noqa: E402
     _find_ckpt, _load_model, _pick_device, _imagine_open_loop_rssm,
-    _is_rssm_model,
+    _is_rssm_model, scoped_quiet_env,
 )
 from evaluation.wm_transfer_matrix import (  # noqa: E402
     _settle_capture, _real_step_rollout, _dv_settle_step_rollout,
@@ -111,7 +111,17 @@ def compute_posterior_prior_decomp(model, env, cfg, device, *,
 
     Used both by the CLI ``probe()`` and by ``evaluation.validate`` so every
     run saves the localisation (autoencoder vs free_bits vs compounding).
+    Quiets then restores the live env (P113).
     """
+    with scoped_quiet_env(env):
+        return _compute_posterior_prior_decomp_impl(
+            model, env, cfg, device, obs_std=obs_std, levels=levels,
+            step_frac=step_frac, horizon=horizon, settle=settle)
+
+
+def _compute_posterior_prior_decomp_impl(model, env, cfg, device, *,
+                                   obs_std=None, levels=(0.0, 0.3, -0.3),
+                                   step_frac=0.4, horizon=220, settle=220):
     if not _is_rssm_model(model):
         return {'enabled': False, 'reason': 'not an RSSM/TSSM model'}
     free_bits = float(getattr(cfg, 'rssm_free_bits', 1.0))
@@ -181,6 +191,17 @@ def compute_posterior_prior_decomp(model, env, cfg, device, *,
 
 @torch.no_grad()
 def compute_dv_posterior_prior_decomp(model, env, cfg, device, *,
+                                      levels=(0.0, 0.3, -0.3), step_frac=0.4,
+                                      horizon=220, settle=220, dv_pos=0):
+    """DV→CV analogue of ``compute_posterior_prior_decomp``.  P113 restores."""
+    with scoped_quiet_env(env):
+        return _compute_dv_posterior_prior_decomp_impl(
+            model, env, cfg, device, levels=levels, step_frac=step_frac,
+            horizon=horizon, settle=settle, dv_pos=dv_pos)
+
+
+@torch.no_grad()
+def _compute_dv_posterior_prior_decomp_impl(model, env, cfg, device, *,
                                       levels=(0.0, 0.3, -0.3), step_frac=0.4,
                                       horizon=220, settle=220, dv_pos=0):
     """DV→CV analogue of ``compute_posterior_prior_decomp``: localise WHERE the

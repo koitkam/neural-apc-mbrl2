@@ -53,9 +53,10 @@ import math
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -311,6 +312,75 @@ def _convergence_stats(traj: np.ndarray, tail_frac: float = 0.2,
     }
 
 
+def _env_randomizer(env):
+    """DomainRandomizer on the sim or the inner unwrapped sim."""
+    sim = getattr(env, 'sim', None)
+    rd = getattr(sim, '_randomizer', None) if sim is not None else None
+    if rd is None and sim is not None:
+        inner = getattr(sim, '_sim', None)
+        if inner is not None:
+            rd = getattr(inner, '_randomizer', None)
+    return rd
+
+
+def _snapshot_env_noise(env) -> dict:
+    """Capture live-env stochastic sources ``_quiet_env`` mutates."""
+    snap: dict = {}
+    sim = getattr(env, 'sim', None)
+    if sim is not None:
+        if hasattr(sim, '_ou_sources'):
+            snap['ou'] = list(sim._ou_sources)
+        if hasattr(sim, '_meas_noise'):
+            snap['meas'] = list(sim._meas_noise)
+        if hasattr(sim, '_has_noise'):
+            snap['has_noise'] = bool(sim._has_noise)
+        if hasattr(sim, '_noise_scale'):
+            snap['noise_scale'] = float(sim._noise_scale)
+    rd = _env_randomizer(env)
+    if rd is not None:
+        snap['rd'] = rd
+        if hasattr(rd, 'enabled'):
+            snap['rd_enabled'] = bool(rd.enabled)
+        if hasattr(rd, 'frac'):
+            snap['rd_frac'] = float(rd.frac)
+    for attr in ('_disturbance_prob_override', '_hidden_disturbance_force',
+                 '_hidden_disturbance'):
+        if hasattr(env, attr):
+            snap[attr] = getattr(env, attr)
+    return snap
+
+
+def _restore_env_noise(env, snap: dict) -> None:
+    """Undo ``_quiet_env`` on the live training env (P113)."""
+    if not snap:
+        return
+    sim = getattr(env, 'sim', None)
+    if sim is not None:
+        if 'ou' in snap and hasattr(sim, '_ou_sources'):
+            sim._ou_sources = list(snap['ou'])
+        if 'meas' in snap and hasattr(sim, '_meas_noise'):
+            sim._meas_noise = list(snap['meas'])
+        if 'has_noise' in snap and hasattr(sim, '_has_noise'):
+            sim._has_noise = bool(snap['has_noise'])
+        if 'noise_scale' in snap and hasattr(sim, 'set_noise_scale'):
+            try:
+                sim.set_noise_scale(float(snap['noise_scale']))
+            except Exception:
+                sim._noise_scale = float(snap['noise_scale'])
+        elif 'noise_scale' in snap and hasattr(sim, '_noise_scale'):
+            sim._noise_scale = float(snap['noise_scale'])
+    rd = snap.get('rd')
+    if rd is not None:
+        if 'rd_enabled' in snap:
+            rd.enabled = bool(snap['rd_enabled'])
+        if 'rd_frac' in snap:
+            rd.frac = float(snap['rd_frac'])
+    for attr in ('_disturbance_prob_override', '_hidden_disturbance_force',
+                 '_hidden_disturbance'):
+        if attr in snap:
+            setattr(env, attr, snap[attr])
+
+
 def _quiet_env(env) -> None:
     """Disable all stochastic sources on a constructed APCEnv in-place.
 
@@ -329,13 +399,13 @@ def _quiet_env(env) -> None:
     the schedule from the curriculum.
 
     Mutates ``env`` in place.  Also zeros ``rd.frac`` (not only
-    ``rd.enabled``).  Training ``collect_rest_lookback`` and the GAIN-READY
-    TM helpers call this on the live training env; wrapper ``reset`` /
-    ``apply_runtime_knobs`` / ``set_noise_scale`` do not rebuild emptied
-    ``_ou_sources`` / ``_meas_noise``, and P3 ``set_domain_randomization(True)``
-    preserves frac so a zeroed frac is a no-op.  Callers that share the
-    training env must save/restore or clone (P113 after P112 EXIT — do not
-    patch the live P112 pid).
+    ``rd.enabled``).  Wrapper ``reset`` / ``apply_runtime_knobs`` /
+    ``set_noise_scale`` do not rebuild emptied ``_ou_sources`` /
+    ``_meas_noise``, and P3 ``set_domain_randomization(True)`` preserves
+    frac so a zeroed frac is a no-op.  Training call sites that share
+    the live env must use ``scoped_quiet_env`` (P113): rest-IC collect,
+    GAIN-READY TM, and posterior-prior decomp.  Fresh diagnostic envs
+    (this file's CLI) may keep the one-way mutate.
     """
     sim = env.sim
     # Wipe OU + measurement noise channels on the SimNoiseWrapper.
@@ -345,15 +415,7 @@ def _quiet_env(env) -> None:
         sim._meas_noise = []
     if hasattr(sim, '_has_noise'):
         sim._has_noise = False
-    # Disable domain randomization so plant tau / gain stay at base.
-    rd = getattr(sim, '_randomizer', None)
-    if rd is None:
-        # SimNoiseWrapper proxies most attribute access to the inner sim;
-        # try the inner sim explicitly in case the wrapper does not
-        # surface ``_randomizer`` directly.
-        inner = getattr(sim, '_sim', None)
-        if inner is not None:
-            rd = getattr(inner, '_randomizer', None)
+    rd = _env_randomizer(env)
     if rd is not None and hasattr(rd, 'frac'):
         rd.enabled = False
         rd.frac = 0.0
@@ -365,6 +427,21 @@ def _quiet_env(env) -> None:
         env._hidden_disturbance_force = False
     if hasattr(env, '_hidden_disturbance'):
         env._hidden_disturbance = None
+
+
+@contextmanager
+def scoped_quiet_env(env) -> Iterator[None]:
+    """Quiet for a probe, then restore the live training env (P113).
+
+    Nested scopes each snapshot: an inner restore leaves the env quiet;
+    the outermost restore returns inject-noise sources + ``rd.frac``.
+    """
+    snap = _snapshot_env_noise(env)
+    _quiet_env(env)
+    try:
+        yield
+    finally:
+        _restore_env_noise(env, snap)
 
 
 def _run_protocol(env, model, cfg, device: torch.device,

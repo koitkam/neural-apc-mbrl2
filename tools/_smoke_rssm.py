@@ -2265,6 +2265,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
     assert "gmatch_traj={'FO' if" in _src
     assert 'gprobe_R=' in _src
+    assert 'scoped_quiet_env' in _src
+    assert 'P113' in _src or 'scoped_quiet_env restores' in _src
     assert 'f"gmatch_ol_tail=0 "' not in _src
     assert "persist {_lf('gain_match_ol_persist_rel')}" in _src
     assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
@@ -3873,6 +3875,85 @@ def _test_collect_rest_lookback_tm_pairing() -> None:
     assert _np.allclose(o[:, 0], [3.0, 4.0, 5.0]), o[:, 0]
     assert _np.allclose(a, 0.0)
     print('[smoke] OK  rest-ic collect is TM post-step pairing')
+
+
+def _test_scoped_quiet_env_restores() -> None:
+    """P113: rest-IC / TM quiet must restore OU sources + rd.frac."""
+    import numpy as _np
+    from tools.wm_steady_state_diagnostic import scoped_quiet_env, _quiet_env
+
+    class _RD:
+        enabled = True
+        frac = 0.15
+
+    class _Sim:
+        def __init__(self):
+            self._ou_sources = ['ou']
+            self._meas_noise = ['mn']
+            self._has_noise = True
+            self._noise_scale = 0.7
+            self._randomizer = _RD()
+
+        def set_noise_scale(self, s):
+            self._noise_scale = float(s)
+
+    class _Env:
+        action_dim = 1
+        t = 0
+        _schedule: list = []
+        _hidden_disturbance = object()
+        _hidden_disturbance_force = True
+        _disturbance_prob_override = 0.3
+        sim = None
+
+        def __init__(self):
+            self.sim = _Sim()
+
+        def reset(self, exploration=False):
+            self.t = 0
+            return _np.zeros((2, 3), dtype='float32')
+
+        def step(self, _a):
+            self.t += 1
+            o = _np.full((2, 3), float(self.t), dtype='float32')
+            return o, 0.0, False, {}
+
+        def set_sim_noise_scale(self, x):
+            self.sim.set_noise_scale(x)
+
+    env = _Env()
+    ou0, mn0, frac0, en0 = (list(env.sim._ou_sources), list(env.sim._meas_noise),
+                            env.sim._randomizer.frac, env.sim._randomizer.enabled)
+    hid0 = env._hidden_disturbance
+    scale0 = env.sim._noise_scale
+    with scoped_quiet_env(env):
+        assert env.sim._ou_sources == []
+        assert env.sim._meas_noise == []
+        assert env.sim._has_noise is False
+        assert env.sim._randomizer.frac == 0.0
+        assert env.sim._randomizer.enabled is False
+        assert env._disturbance_prob_override == 0.0
+        assert env._hidden_disturbance is None
+    assert env.sim._ou_sources == ou0
+    assert env.sim._meas_noise == mn0
+    assert env.sim._has_noise is True
+    assert env.sim._randomizer.frac == frac0
+    assert env.sim._randomizer.enabled is en0
+    assert env._disturbance_prob_override == 0.3
+    assert env._hidden_disturbance is hid0
+    assert env._hidden_disturbance_force is True
+    assert abs(env.sim._noise_scale - scale0) < 1e-12
+
+    cfg = TrainConfig()
+    env2 = _Env()
+    collect_rest_lookback(env2, cfg, 0.0, settle=5, lookback=3)
+    assert env2.sim._ou_sources == ['ou']
+    assert env2.sim._randomizer.frac == 0.15
+    assert env2.sim._has_noise is True
+    # One-way mutate still exists for dedicated diagnostic envs.
+    _quiet_env(env2)
+    assert env2.sim._ou_sources == []
+    print('[smoke] OK  scoped_quiet_env restores inject noise + rd.frac (P113)')
 
 
 def _test_gain_match_rest_ic() -> None:
@@ -6503,6 +6584,7 @@ if __name__ == '__main__':
     _test_held_rollout_cv_space()
     _test_overshoot_stopgrad_start()
     _test_collect_rest_lookback_tm_pairing()
+    _test_scoped_quiet_env_restores()
     _test_gain_match_rest_ic()
     _test_gain_match_traj_fo()
     _test_gain_match_traj_huber()

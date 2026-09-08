@@ -2948,7 +2948,9 @@ class APCEnv:
         across runs; the eval already disables DR via _quiet_env, so this is a
         TRAIN-time confound).  Identify the plant CLEAN (DR off in P1/P2), then
         randomise for the actor (DR on in P3).  ``frac`` is preserved so
-        re-enabling restores the configured magnitude.
+        re-enabling restores the configured magnitude.  P113
+        ``scoped_quiet_env`` restores ``rd.frac`` after rest-IC / TM
+        probes (P45–P112 ``_quiet_env`` zeroed frac permanently).
         """
         sim = getattr(self, 'sim', None)
         rd = getattr(sim, '_randomizer', None)
@@ -8154,31 +8156,32 @@ def collect_rest_lookback(
     tiled ``lookback_act``.  Training replay is obs-*before*-step;
     rest-IC follows the TM rest-then-step gate, not the replay pairing.
     Isolation loss is not used.  ``clean_steady_seeds`` still zeros
-    process/measurement noise (P89).
+    process/measurement noise (P89).  ``scoped_quiet_env`` restores
+    inject-noise sources + ``rd.frac`` after the collect (P113).
     """
-    from tools.wm_steady_state_diagnostic import _quiet_env
+    from tools.wm_steady_state_diagnostic import scoped_quiet_env
     S = max(2, int(settle))
     L = max(2, min(int(lookback), S))
-    _quiet_env(env)
-    env.reset(exploration=False)
-    env._schedule = []
-    env._hidden_disturbance = None
-    _maybe_clean_steady_seed(env, cfg)
-    a_const = _as_hold_action(action_level, env.action_dim)
-    obs_hist: List[np.ndarray] = []
-    for _ in range(S):
-        ow, _, done, _ = env.step(a_const)
-        obs_hist.append(np.asarray(ow[-1], dtype='float32').copy())
-        if done:
-            env.reset(exploration=False)
-            env._schedule = []
-            env._hidden_disturbance = None
-            _maybe_clean_steady_seed(env, cfg)
-    obs_arr = np.stack(obs_hist, axis=0)
-    lookback_obs = obs_arr[-L:]
-    lookback_act = np.tile(
-        np.asarray(a_const, dtype='float32').reshape(-1), (L, 1))
-    return lookback_obs, lookback_act
+    with scoped_quiet_env(env):
+        env.reset(exploration=False)
+        env._schedule = []
+        env._hidden_disturbance = None
+        _maybe_clean_steady_seed(env, cfg)
+        a_const = _as_hold_action(action_level, env.action_dim)
+        obs_hist: List[np.ndarray] = []
+        for _ in range(S):
+            ow, _, done, _ = env.step(a_const)
+            obs_hist.append(np.asarray(ow[-1], dtype='float32').copy())
+            if done:
+                env.reset(exploration=False)
+                env._schedule = []
+                env._hidden_disturbance = None
+                _maybe_clean_steady_seed(env, cfg)
+        obs_arr = np.stack(obs_hist, axis=0)
+        lookback_obs = obs_arr[-L:]
+        lookback_act = np.tile(
+            np.asarray(a_const, dtype='float32').reshape(-1), (L, 1))
+        return lookback_obs, lookback_act
 
 
 def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
