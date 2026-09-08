@@ -5240,6 +5240,42 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
     print('[smoke] OK  horizon/episode/IC/overhead cfg-or-env identity')
 
 
+def _test_compile_leftover_ignored() -> None:
+    """Leftover DREAMER_COMPILE* dual-read REMOVED; whitelist + apply only."""
+    import os
+    from workflow._plant_prepare import apply_dreamer_env_overrides
+    tr_src = open('training/train.py').read()
+    resolve = tr_src.split('def _resolve_compile_mode', 1)[1].split(
+        'def _host_cpu_count', 1)[0]
+    assert 'os.environ.get' not in resolve
+    keys = ('DREAMER_COMPILE', 'DREAMER_COMPILE_MODE')
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        assert _resolve_compile_mode(TrainConfig()) == ''
+        os.environ['DREAMER_COMPILE'] = '1'
+        assert _resolve_compile_mode(TrainConfig()) == '', (
+            'leftover DREAMER_COMPILE ignored until apply')
+        os.environ['DREAMER_COMPILE_MODE'] = 'reduce-overhead'
+        assert _resolve_compile_mode(TrainConfig()) == '', (
+            'leftover DREAMER_COMPILE_MODE ignored until apply')
+        cfg = TrainConfig()
+        apply_dreamer_env_overrides(cfg)
+        assert _resolve_compile_mode(cfg) == 'reduce-overhead'
+        os.environ.pop('DREAMER_COMPILE_MODE', None)
+        cfg2 = TrainConfig()
+        apply_dreamer_env_overrides(cfg2)
+        assert _resolve_compile_mode(cfg2) == 'default'
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  leftover DREAMER_COMPILE* ignored until apply (P113-live)')
+
+
 def _test_sample_rate_pin_ignores_leftover() -> None:
     """Sample-rate pin: leftover SIM_SAMPLE_RATE ignored; DREAMER_* pins."""
     import os
@@ -6628,6 +6664,7 @@ if __name__ == '__main__':
     _test_attention_auto_ignores_leftover_fast_attn()
     _test_wm_tf_knobs_cfg_or_env()
     _test_horizon_ic_overhead_cfg_or_env()
+    _test_compile_leftover_ignored()
     _test_sample_rate_pin_ignores_leftover()
     _test_sim_factory_ignores_leftover_model_env()
     _test_derived_observables_cfg()

@@ -714,8 +714,8 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_RSSM_JOINT_EMBED_COEF':      ('rssm_joint_embed_coef',          float),
     # torch.compile (P29 leftover): env-free is eager.  COMPILE before
     # COMPILE_MODE so an explicit mode wins if both are set.  ``1`` →
-    # ``default``.  Also read in ``_resolve_compile_mode`` so tests that
-    # skip ``apply_dreamer_env_overrides`` still work.
+    # ``default``.  Leftover ``_resolve_compile_mode`` env dual-read
+    # **REMOVED** (P113-live; whitelist + ``apply_dreamer_env_overrides`` only).
     'DREAMER_COMPILE':                    ('compile_mode',                   _as_compile_mode),
     'DREAMER_COMPILE_MODE':               ('compile_mode',                   _as_compile_mode),
     # Attention backend.  Env-free ``auto`` = SDPA on CUDA.  Was CLI-only

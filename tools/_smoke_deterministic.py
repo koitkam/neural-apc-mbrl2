@@ -120,6 +120,8 @@ def _check_backbone(wm_type):
 
 def _check_compile_default_eager():
     import os
+    from workflow._plant_prepare import (
+        apply_dreamer_env_overrides, _as_compile_mode)
     saved = os.environ.pop('DREAMER_COMPILE', None)
     saved_m = os.environ.pop('DREAMER_COMPILE_MODE', None)
     try:
@@ -128,34 +130,35 @@ def _check_compile_default_eager():
         assert _resolve_compile_mode(cfg) == '', (
             'env-free compile must be eager (P29 leftover default-on)'
         )
-        os.environ['DREAMER_COMPILE'] = '0'
-        assert _resolve_compile_mode(cfg) == ''
         os.environ['DREAMER_COMPILE'] = '1'
-        assert _resolve_compile_mode(cfg) == 'default'
-        os.environ['DREAMER_COMPILE'] = 'reduce-overhead'
-        assert _resolve_compile_mode(cfg) == 'reduce-overhead'
-        os.environ.pop('DREAMER_COMPILE', None)
+        assert _resolve_compile_mode(TrainConfig()) == '', (
+            'leftover DREAMER_COMPILE ignored until apply_dreamer_env_overrides'
+        )
         os.environ['DREAMER_COMPILE_MODE'] = 'reduce-overhead'
-        assert _resolve_compile_mode(TrainConfig()) == 'reduce-overhead'
+        assert _resolve_compile_mode(TrainConfig()) == '', (
+            'leftover DREAMER_COMPILE_MODE ignored until apply'
+        )
         os.environ.pop('DREAMER_COMPILE_MODE', None)
         off = TrainConfig()
         off.compile_mode = 'off'
         off._explicit_fields = {'compile_mode'}
-        os.environ['DREAMER_COMPILE'] = '1'
         assert _resolve_compile_mode(off) == '', (
-            'explicit compile_mode=off must beat DREAMER_COMPILE=1'
+            'explicit compile_mode=off stays eager'
         )
-        os.environ['DREAMER_COMPILE'] = '1'
-        from workflow._plant_prepare import (
-            apply_dreamer_env_overrides, _as_compile_mode)
         assert _as_compile_mode('1') == 'default'
         assert _as_compile_mode('0') == ''
         cfg2 = TrainConfig()
         apply_dreamer_env_overrides(cfg2)
         assert cfg2.compile_mode == 'default', cfg2.compile_mode
         assert 'compile_mode' in getattr(cfg2, '_explicit_fields', set())
-        print('[smoke] OK  compile default eager; DREAMER_COMPILE=1 opt-in '
-              '(whitelist + MODE)')
+        assert _resolve_compile_mode(cfg2) == 'default'
+        os.environ.pop('DREAMER_COMPILE', None)
+        os.environ['DREAMER_COMPILE_MODE'] = 'reduce-overhead'
+        cfg3 = TrainConfig()
+        apply_dreamer_env_overrides(cfg3)
+        assert _resolve_compile_mode(cfg3) == 'reduce-overhead'
+        print('[smoke] OK  compile default eager; leftover COMPILE ignored; '
+              'DREAMER_COMPILE=1 opt-in via whitelist')
     finally:
         if saved is None:
             os.environ.pop('DREAMER_COMPILE', None)

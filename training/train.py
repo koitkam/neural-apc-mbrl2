@@ -3848,31 +3848,18 @@ def _resolve_compile_mode(cfg: 'TrainConfig') -> str:
     empty as default-on unless ``DREAMER_COMPILE=0``.  Env-free P29 therefore
     compiled while P26/P28 (observer win) passed ``DREAMER_COMPILE=0`` and
     stayed eager — the same silent-drop class as ``rssm_latent_type``.
-    Opt in with ``DREAMER_COMPILE=1`` / ``DREAMER_COMPILE_MODE=default``.
-    Precedence: explicit ``compile_mode`` (incl. whitelist
-    ``DREAMER_COMPILE_MODE`` / ``DREAMER_COMPILE``) over a direct
-    ``DREAMER_COMPILE_MODE`` env read over ``DREAMER_COMPILE`` over eager.
+    Opt in with ``DREAMER_COMPILE=1`` / ``DREAMER_COMPILE_MODE=default``
+    via ``ENV_OVERRIDES`` (``_as_compile_mode``).  Leftover env dual-read
+    of those keys is **REMOVED** (P113-live; login leftover was a silent
+    A/B outside ``run_plan``).
+    CLI ``_cfg_from_env`` already calls ``apply_dreamer_env_overrides``.
     """
     off = {'', '0', 'off', 'false', 'none', 'no'}
     on = {'1', 'true', 'yes'}
     cm = str(getattr(cfg, 'compile_mode', None) or '').strip().lower()
-    if _field_is_explicit(cfg, 'compile_mode'):
-        if cm in off:
-            return ''
-        return 'default' if cm in on else cm
-    if cm not in off:
-        return 'default' if cm in on else cm
-    # Direct env read so tests / CLI that skip apply_dreamer_env_overrides
-    # still opt in.  MODE before COMPILE (explicit mode wins).
-    env_mode = os.environ.get('DREAMER_COMPILE_MODE', '').strip().lower()
-    if env_mode and env_mode not in off:
-        return 'default' if env_mode in on else env_mode
-    env_cm = os.environ.get('DREAMER_COMPILE', '').strip().lower()
-    if env_cm in off:
+    if cm in off:
         return ''
-    if env_cm in on:
-        return 'default'
-    return env_cm
+    return 'default' if cm in on else cm
 
 
 def _host_cpu_count() -> int:
@@ -10084,8 +10071,6 @@ def build_model(cfg: TrainConfig) -> DreamerV4:
     # ``DREAMER_COMPILE_MODE=default``.  ``maybe_compile`` still falls back
     # to eager on any failure.
     cm = _resolve_compile_mode(cfg)
-    if cm and not str(getattr(cfg, 'compile_mode', '') or '').strip():
-        cfg.compile_mode = cm
     if cm:
         model.maybe_compile(mode=cm)
     return model
