@@ -317,7 +317,7 @@ def main() -> int:
     # (``DREAMER_BATCH_SIZE`` only; leftover ``OBJ_BATCH_SIZE`` ignored).
     # Probe the P1/P2 WM unroll T (max(seq_len, H+1)), not lookback-seq_len,
     # so a slow plant's DC-gain window is in the memory budget (follow-up 13).
-    # test_sim seq_len=64, H≈55 → unchanged.
+    # test_sim seq_len=lookback=128, H≈55 → probe T = max(128, 56) = 128.
     _probe_T = wm_train_seq_len_for_plant(seq_len, horizon, int(episode_length))
     bs_pin = explicit_batch_size()
     if bs_pin is not None:

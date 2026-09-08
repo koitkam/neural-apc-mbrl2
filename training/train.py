@@ -1786,8 +1786,10 @@ class TrainConfig:
     # noise-free steady-state diagnostic on p31, where WM imagined
     # trajectories converge in 0% of cases at horizon=200 even though
     # the real plant converges in 75–88%.  L=32 spans roughly 4× the
-    # planning horizon (15) and matches the seq_len=64 segment so the
-    # WM is supervised over the full BPTT window.  Paper precedent:
+    # planning horizon (15) and matched the then-seq_len=64 segment so
+    # the WM was supervised over the full BPTT window (current env-free
+    # test_sim seq_len/lookback is 128; mtp_length is 8 after P41).
+    # Paper precedent:
     # DreamerV3 uses L≥8 only on Atari; control-task ablations in the
     # appendix favour larger L when episodes carry long settled
     # transients.
