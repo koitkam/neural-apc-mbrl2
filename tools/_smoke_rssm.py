@@ -75,7 +75,8 @@ from training.train import (
                             _gain_match_held_settle, _auto_gain_match_settle_len,
                             _auto_gain_match_len,
                             _gain_match_pred_over_tgt, _gain_match_tgt_tensor,
-                            _gain_match_rest_window, _gain_match_rest_ic_state,
+                            _gain_match_rest_window, _gain_match_traj_fo,
+                            _gain_match_rest_ic_state,
                             _expand_dyn_state, _rest_ic_last_state,
                             _held_rollout_win,
                             _wm_held_rollout_stationarity_loss,
@@ -2226,6 +2227,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
+    assert "gmatch_traj={'FO' if" in _src
     assert 'f"gmatch_ol_tail=0 "' not in _src
     assert "persist {_lf('gain_match_ol_persist_rel')}" in _src
     assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
@@ -2300,6 +2302,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
+    assert 'def _gain_match_traj_fo' in _src
     assert 'gain_match_rest_ic_len: int = 0' in _src
     assert '_gain_match_rest_ic_state' in _src
     assert 'def _expand_dyn_state' in _src
@@ -2485,8 +2488,13 @@ def _test_isolation_dcv_scales() -> None:
     assert '_auto_gain_match_len' in _src
     assert '_gain_match_ol_tail_len' not in _src
     assert 'gain_match_ol_persist_rel' in _src
-    assert "last_only=True, out='obs', return_state=True" in _src
+    # P111: last_only=not stack_k so rest-IC with identified τ stacks the
+    # FOPDT trajectory (last_only=False) while persist / τ=0 stay last-step.
+    assert 'last_only=not stack_k' in _src
+    assert "out='obs', return_state=True" in _src
     assert 'gmatch_fo=True' not in _src
+    assert 'gmatch_traj=' in _src
+    assert "traj {_lf('gain_match_traj_loss')}" in _src
     assert 'gru_zbias=' in _src
     assert 'gru_hres=' not in _src
     assert 'gru_hres_mix' not in _src
@@ -2713,6 +2721,8 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.wm_diag_horizon) == 0
     assert c.actor_train_source == 'realsim'
     assert not hasattr(c, 'gain_match_relative')
+    assert not hasattr(c, 'gain_match_rise_wfrac')
+    assert not hasattr(c, 'wm_gain_match_mv_ratio_mid')
     assert not hasattr(c, 'expert_bc_p3_adaptive_scale')
     assert not hasattr(c, 'early_stop_p1_min_sf_drop_frac')
     from workflow._plant_prepare import ENV_OVERRIDES
@@ -3875,6 +3885,7 @@ def _test_gain_match_rest_ic() -> None:
     model.zero_grad(set_to_none=True)
     gm1, diag1 = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert torch.isfinite(gm1).all() and float(gm1) > 0.0, float(gm1)
+    assert 'gain_match_traj_loss' not in diag1
     assert 'gain_match_ol_tail_len' not in diag1
     assert 'gain_match_ol_tail_loss' not in diag1
     assert 'gain_match_ol_persist_rel' in diag1
@@ -3924,6 +3935,7 @@ def _test_gain_match_rest_ic() -> None:
     assert "getattr(st0, 'kv_cache', None) is not None" in _gm_src
     assert 'gain_match_ol_persist_rel' in _gm_src
     assert 'return_state=True' in _gm_src
+    assert 'last_only=not stack_k' in _gm_src
     assert 'def _hold_continuous_gain_c' not in _gm_src
     cfg.wm_tf_horizon = 4
     gm_notail, d_notail = _wm_gain_match_loss(
@@ -4011,6 +4023,108 @@ def _test_gain_match_rest_ic() -> None:
     _arm_rest_ic_stream_mismatch_warn(False)
     _arm_rest_ic_stream_mismatch_warn(False)
     print('[smoke] OK  rest-ic AccumulateGrad warn arm/disarm is idempotent')
+
+
+def _test_gain_match_traj_fo() -> None:
+    """P111 FOPDT(t_k)/FOPDT(t_K): last=1, dead-time zeros, τ=0 → None."""
+    cfg = TrainConfig()
+    cpu, dt = torch.device('cpu'), torch.float32
+    assert _gain_match_traj_fo(cfg, 55, cpu, dt) is None
+    cfg.identified_tau_dominant = 53.0
+    cfg.identified_dead_time = 8.0
+    cfg.sample_rate = 4
+    fo = _gain_match_traj_fo(cfg, 55, cpu, dt)
+    assert fo is not None and tuple(fo.shape) == (55,)
+    assert abs(float(fo[-1]) - 1.0) < 1e-5
+    # k=1 t=4s ≤ θ=8 → 0; k=2 t=8s ≤ θ → 0; k=3 t=12s > θ → rise.
+    assert float(fo[0]) == 0.0
+    assert float(fo[1]) == 0.0
+    assert float(fo[2]) > 0.0
+    fo2 = _gain_match_traj_fo(cfg, 55, cpu, dt)
+    assert fo2 is fo
+    cfg.identified_tau_dominant = 0.0
+    assert _gain_match_traj_fo(cfg, 55, cpu, dt) is None
+    cfg.identified_tau_dominant = 53.0
+    assert _gain_match_traj_fo(cfg, 1, cpu, dt) is None
+    print('[smoke] OK  FOPDT traj FO last=1, dead-time zeros, τ=0 last-only')
+
+
+def _test_gain_match_traj_huber() -> None:
+    """Rest-IC + identified τ adds uniform traj Huber; last DC KEEP; not P75."""
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim = 6
+    cfg.action_dim = 1
+    cfg.lookback = 8
+    cfg.world_model_type = 'rssm'
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.d_model = 32
+    cfg.head_hidden = 32
+    cfg.head_n_layers = 1
+    cfg.mtp_length = 2
+    cfg.horizon = 4
+    cfg.seq_len = 16
+    cfg.dv_dim = 1
+    cfg.dv_indices = (3,)
+    cfg.cv_obs_indices = (0,)
+    cfg.dob_enabled = False
+    cfg.cont_latent_enabled = True
+    cfg.cont_gain_dim = 2
+    cfg.cont_dist_dim = 0
+    cfg.gain_match_coef = 1.0
+    cfg.gain_match_len = 4
+    cfg.wm_tf_horizon = 6
+    cfg.gain_match_settle_len = 8
+    cfg.gain_match_rest_ic = True
+    cfg.gain_match_mv_target = ((-1.0,),)
+    cfg.gain_match_dv_target = ((0.5,),)
+    cfg.gain_match_huber_per_input = True
+    cfg.cont_gain_persist_coef = 0.0
+    cfg.identified_tau_dominant = 0.0
+    cfg.identified_dead_time = 8.0
+    cfg.sample_rate = 4
+    model = build_model(cfg)
+    B, T, O, A = 2, 16, 6, 1
+    obs = torch.randn(B, T, O)
+    act = torch.rand(B, T, A) * 2 - 1
+    with torch.no_grad():
+        feats, *_ = model.dynamics.rollout_observed(obs, act, sample=False)
+    rest_o = torch.randn(3, 8, O)
+    rest_a = torch.rand(3, 8, A) * 2 - 1
+    cfg._gain_match_rest_obs = rest_o.numpy()
+    cfg._gain_match_rest_act = rest_a.numpy()
+    gm0, d0 = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm0.detach()).all() and float(gm0.detach()) > 0.0
+    assert 'gain_match_traj_loss' not in d0
+    assert 'gain_match_mv_ratio_mid' not in d0
+    assert 'gain_match_rise_wfrac' not in d0
+    cfg.identified_tau_dominant = 53.0
+    cfg._gmatch_traj_fo = None
+    gm1, d1 = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert torch.isfinite(gm1).all()
+    assert 'gain_match_traj_loss' in d1
+    traj = float(d1['gain_match_traj_loss'])
+    assert traj > 0.0 and traj == traj
+    assert abs(float(gm1) - float(gm0) - traj) < 1e-4, (
+        f'traj not additive (gm0={float(gm0):.6f} gm1={float(gm1):.6f} '
+        f'traj={traj:.6f})')
+    assert float(gm1) + 1e-8 >= float(gm0)
+    assert 'gain_match_mv_ratio' in d1
+    assert 'gain_match_mv_ratio_mid' not in d1
+    assert 'gain_match_mv_ratio_mid_fo' not in d1
+    assert 'gain_match_rise_wfrac' not in d1
+    assert 'gain_match_last_wfrac' not in d1
+    gm1.backward()
+    gru_g = sum(float(p.grad.abs().sum())
+                for n, p in model.dynamics.named_parameters()
+                if p.grad is not None and 'gru' in n)
+    assert gru_g > 0.0, 'traj Huber did not reach GRU'
+    print(f'[smoke] OK  rest-ic traj Huber additive '
+          f'(traj={traj:.4g} Δ={float(gm1) - float(gm0):.4g})')
 
 
 def _test_gain_match_tssm_kv_continue() -> None:
@@ -5852,6 +5966,8 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'huber_per_in=True' in banner, banner
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_len=55' in banner, banner
+    assert 'gmatch_traj=0' in banner, banner
+    assert 'gmatch_fo' not in banner, banner
     assert 'gmatch_ol_tail' not in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
     assert 'gmatch_clip=True' in banner, banner
@@ -6338,6 +6454,8 @@ if __name__ == '__main__':
     _test_overshoot_stopgrad_start()
     _test_collect_rest_lookback_tm_pairing()
     _test_gain_match_rest_ic()
+    _test_gain_match_traj_fo()
+    _test_gain_match_traj_huber()
     _test_gain_match_tssm_kv_continue()
     _test_p3_reset_log_std()
     _test_bc_mean_only()

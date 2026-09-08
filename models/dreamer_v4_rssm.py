@@ -1242,8 +1242,9 @@ class RSSMDynamics(nn.Module):
         Returns stacked ``feat`` ``(Bm, K, F)`` = ``[h, z_flat, (c), (dv), (d)]``.
         ``last_only=True`` returns only the K-step value ``(Bm, *)`` — same
         recurrence / last-step as ``stack[:, -1]``, without keeping the
-        unused K-stack (overshoot / held / gain-match last-step DC Huber;
-        P75 FOPDT K-stack **REVERT**).
+        unused K-stack (overshoot / held / gain-match last-step DC Huber
+        when P111 FOPDT traj is off).  P111 rest-IC traj uses
+        ``last_only=False`` so Huber can pin ``G(k)`` uniformly.
         ``out`` selects what is stacked (GRU recurrence is identical):
           * ``'feat'`` (default) — full ``state.feat`` (isolation TBPTT
             chunks slice ``h`` for ``keep_c``; loss still needs decode)

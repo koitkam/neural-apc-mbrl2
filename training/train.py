@@ -957,6 +957,10 @@ class TrainConfig:
     # 4H **REVERT** to control H (jsonl ×1 at 220 ≠ TM DC; P64 at K=H
     # PASS 0.91@DV).  Explicit ``DREAMER_GAIN_MATCH_LEN=220`` A/B.
     # Matching 4H *settle* (S=H_tf) is still not a retry of S=H.
+    # P111: rest-IC last-step DC Huber KEEP + uniform FOPDT trajectory
+    # Huber (identified τ, θ, sr — no new field).  P75 rise *mass*
+    # 1.4% was last-step identity; this is last + mean_k (≈50/50).
+    # τ<=0 or PRBS fallback stays last-only (P64/P110 identity).
     # P43 Huber ~1e-4 from PRBS
     # posteriors while the rest-then-step probe stays ~0.75@DV.  P43 DV
     # @H ×0.849 vs ss ×0.740 is a real 4H-asymptote gap (MV @H≈ss); do
@@ -4473,6 +4477,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_len={int(getattr(cfg, 'gain_match_len', 0) or 0)} "
+        f"gmatch_traj={'FO' if (float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0) > 0.0 and bool(getattr(cfg, 'gain_match_rest_ic', False))) else '0'} "
         f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
         f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
@@ -7521,6 +7526,41 @@ def _gain_match_rest_window(cfg: 'TrainConfig') -> Tuple[int, int]:
     return settle, L
 
 
+def _gain_match_traj_fo(
+        cfg: 'TrainConfig', K: int, device, dtype,
+        ) -> Optional[torch.Tensor]:
+    """``(K,)`` FOPDT(t_k)/FOPDT(t_K) for rest-IC traj Huber. Last = 1.
+
+    ``t_k = k·sr`` with ``k=1..K``.  ``t<=θ`` → 0.  ``τ<=0`` or
+    ``sr<=0`` or ``FO(K)~0`` → ``None`` (last-only DC identity).
+    Cached on cfg.  P111: uniform mean over this curve, not P75
+    last-step-dominated rise mass 1.4%.  ``sample_rate`` is seconds
+    per agent step (``H=(θ+nτ·τ)/sr``).
+    """
+    tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+    if tau <= 0.0 or int(K) < 2:
+        return None
+    theta = max(0.0, float(getattr(cfg, 'identified_dead_time', 0.0) or 0.0))
+    dt = float(getattr(cfg, 'sample_rate', 0.0) or 0.0)
+    if dt <= 0.0:
+        return None
+    K = int(K)
+    key = (K, float(tau), float(theta), float(dt), str(device), str(dtype))
+    cached = getattr(cfg, '_gmatch_traj_fo', None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    k = torch.arange(1, K + 1, device=device, dtype=dtype)
+    t = k * dt
+    fo = 1.0 - torch.exp(-(t - theta).clamp_min(0.0) / tau)
+    fo = torch.where(t <= theta, torch.zeros_like(fo), fo)
+    last = fo[-1]
+    if float(last.detach()) < 1e-6:
+        return None
+    fo = fo / last.clamp_min(1e-6)
+    cfg._gmatch_traj_fo = (key, fo)  # type: ignore[attr-defined]
+    return fo
+
+
 def _gain_match_rest_ic_tensors(
         cfg: 'TrainConfig', device, dtype
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -8211,10 +8251,15 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     hygiene** / **FALSIFIED as compounding** (persist_rel 0.037 @81;
     val 1step→OL ×0.761).  **P74 EXIT REVERT:** decoder
     ``gain_cv_skip`` was a teacher-pin no-op (rms stalled 0.00387;
-    det_r 0.074; paired −48 vs −105, mv_viol 20).  **P75 EXIT REVERT:**
+    det_r 0.074; paired −48 vs −105, mv_viol 20).      **P75 EXIT REVERT:**
     FOPDT rise teacher (rise Huber mass 1.4% at K=H; val 1step→OL
     ×0.803 vs P64 ×0.85).  Dummy
     ``gmatch_ol_tail=0`` banner **REMOVED** (P69 field was always 0).
+    **P111:** rest-IC last-step DC Huber KEEP + uniform-in-k FOPDT
+    *target* (``G_tgt·FO(k)/FO(K)``; last = DC).  P75 closed the
+    last-dominated *weight*; this is last + mean_k (≈50/50 mass)
+    on the TM rest-then-step path that measures compounding.
+    PRBS fallback / ``τ<=0`` stay last-only.
     **P76 EXIT REVERT:** RSSM GRU update-gate bias ``log(H/16)``
     (keep-h stalled conv; freeze GAIN_NOT_READY 0.80@MV).  Last-step
     DC Huber stays (P64/P73).  **P77 EXIT FALSIFIED** Markovian TSSM
@@ -8238,12 +8283,13 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     + one step per MV/DV into a single roll (batch
     ``Bm·(1+n_mv+n_dv)``; rest-pre skips the unused held row so
     ``Bm·(n_mv+n_dv)``) so the K-step prior loop runs once.  **P76:**
-    last-step DC Huber (P75 FOPDT rise **REVERT**);
-    ``last_only=True, out='obs', return_state=True``.  Decoded-obs
-    last step is ~100× smaller than a feat stack.  ``return_state``
-    is the P73 OL gain-c persist IC.  Sequential ``img_step``
-    fallback REMOVED (both RSSM-interface backbones expose
-    ``img_rollout``).
+    last-step DC Huber (P75 FOPDT *weight* **REVERT**).  **P111:**
+    ``last_only=not stack_k`` — K-stack only when rest-IC FOPDT traj
+    is on (uniform mean + last DC).  ``out='obs', return_state=True``.
+    Decoded-obs last step is ~100× smaller than a feat stack.
+    ``return_state`` is the P73 OL gain-c persist IC.  Sequential
+    ``img_step`` fallback REMOVED (both RSSM-interface backbones
+    expose ``img_rollout``).
     """
     zero = torch.zeros((), device=obs.device, dtype=obs.dtype)
     diag: Dict[str, torch.Tensor] = {}
@@ -8367,6 +8413,30 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         return _smooth_l1_gain_match(
             g_wm, tgt_b, beta=_hb, per_input=_per, mask=ok)
 
+    def _huber_from_cv_traj(cv_base, cv_traj, tgts, du_in, fo):
+        # Uniform-in-k Huber of ``G(k)=(CV_k−pre)/Δu`` vs ``G_tgt·fo[k]``.
+        # β from DC ``|G_tgt|`` (not ``|G_tgt·fo|`` — dead-time β→0 is
+        # P27/P63 relative-Huber class).  Last step of ``fo`` is 1.
+        if not tgts:
+            return zero
+        den = du_in.unsqueeze(-1).unsqueeze(-1)
+        ok = den.abs() >= 1e-6
+        g_wm = (cv_traj - cv_base.unsqueeze(0).unsqueeze(2)) / torch.where(
+            ok, den, torch.ones_like(den))
+        tgt = _gain_match_tgt_tensor(g_wm[:, :, -1], tgts, cfg)
+        tgt_k = tgt.view(tgt.shape[0], 1, 1, tgt.shape[-1]) * fo.view(1, 1, -1, 1)
+        if _per:
+            e = g_wm - tgt_k
+            b = tgt.abs().clamp_min(1e-6).view(
+                tgt.shape[0], 1, 1, tgt.shape[-1])
+            abs_e = e.abs()
+            el = torch.where(abs_e < b, 0.5 * e.square() / b,
+                             abs_e - 0.5 * b)
+            w = ok.to(dtype=el.dtype).expand_as(el)
+            return (el * w).sum() / w.sum().clamp_min(1.0)
+        return _smooth_l1_gain_match(
+            g_wm, tgt_k, beta=_hb, per_input=False, mask=ok)
+
     # P25 RCA: do NOT TBPTT this roll.  The loss is the K-step FD
     # ASYMPTOTE (DC gain); detaching h/c every 16 of K=55 severs the
     # gradient that pins transfer-matrix gain (forward loss still
@@ -8385,6 +8455,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         if o_rest is None or int(o_rest.shape[0]) != int(Bm):
             o_rest = None
     skip_held = o_rest is not None
+    fo = (_gain_match_traj_fo(cfg, K, obs.device, obs.dtype)
+          if skip_held else None)
+    stack_k = fo is not None
     n_rolls = int(n_mv_t) + int(n_dv_t) + (0 if skip_held else 1)
     cache_owner = None
     cache_key = None
@@ -8411,9 +8484,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     h_b = _repeat_starts(h0)
     z_b = _repeat_starts(z0)
     c_b = _repeat_starts(c0) if c0 is not None else None
-    # P76: last-step DC Huber (P75 FOPDT K-stack REVERT).  Persist
-    # still reads ``return_state``.  Last obs is ~100× smaller than
-    # a feat stack.
+    # P111: last-step DC Huber KEEP.  Rest-IC FOPDT traj stacks K
+    # (``last_only=not stack_k``).  P75 last-dominated *weight*
+    # REVERT.  Persist still reads ``return_state``.
     # P78: TSSM continues rest-IC KV (teacher = TM cached dynamics).
     # RSSM ``st0 is None`` → Markovian ``(h,z)`` identity (GRU ``h``
     # already is the history).  Not P69 (no extra DC window).
@@ -8438,10 +8511,16 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                 cfg._gain_match_kv_logged = True  # type: ignore[attr-defined]
     roll_obs, st_k = rssm.img_rollout(
         h_b, z_b, a_seq, dvs=dv_seq, sample=False, c0=c_b,
-        last_only=True, out='obs', return_state=True,
+        last_only=not stack_k, out='obs', return_state=True,
         prev_state=st_b)
-    cv_k = roll_obs.index_select(-1, cv_idx)
-    cv_k = cv_k.view(n_rolls, Bm, -1)
+    if stack_k:
+        cv_all = roll_obs.index_select(-1, cv_idx).view(
+            n_rolls, Bm, int(K), -1)
+        cv_k = cv_all[:, :, -1, :]
+        cv_traj = cv_all
+    else:
+        cv_k = roll_obs.index_select(-1, cv_idx).view(n_rolls, Bm, -1)
+        cv_traj = None
     # P68: TM ``g = (pred − pre) / Δu`` uses plant rest as ``pre``, not a
     # K-step held WM prediction.  Held-K compounding made P67 jsonl ×1
     # while val TM vs rest-pre missed DC.  Rest-IC last obs is that
@@ -8460,6 +8539,18 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     total = _huber_from_cv(
         cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
     loss = total
+    if stack_k and cv_traj is not None:
+        cv_traj_steps = cv_traj if skip_held else cv_traj[1:]
+        traj_term = _huber_from_cv_traj(
+            cv_base, cv_traj_steps, list(mv_tgts) + list(dv_tgts), du, fo)
+        loss = loss + traj_term
+        if bool(getattr(cfg, '_wm_need_logged_aux', True)):
+            diag['gain_match_traj_loss'] = traj_term.detach()
+        if not getattr(cfg, '_gain_match_traj_logged', False):
+            print('[gain-match] traj Huber = last DC + uniform FOPDT '
+                  '(P111; not P75 rise-mass)',
+                  flush=True)
+            cfg._gain_match_traj_logged = True  # type: ignore[attr-defined]
     # P69 REVERT: OL tail Huber deleted (TBPTT-on-asymptote). Dummy jsonl
     # keys REMOVED (P72-live; same class as ``wm_held_ol_ratio``).
     # P73: posterior 1-step persist does not constrain OL
@@ -14599,6 +14690,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             if 'gain_match_ol_persist_rel' in row:
                 row.setdefault('wm_gain_match_ol_persist_rel',
                             row['gain_match_ol_persist_rel'])
+            if 'gain_match_traj_loss' in row:
+                row.setdefault('wm_gain_match_traj_loss',
+                            row['gain_match_traj_loss'])
+            else:
+                row.setdefault('wm_gain_match_traj_loss', 0.0)
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
@@ -14709,6 +14805,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 + f"gmatch {_lf('gain_match_loss')} "
                 + (f"persist {_lf('gain_match_ol_persist_rel')} "
                    if row.get('gain_match_ol_persist_rel') is not None else '')
+                + (f"traj {_lf('gain_match_traj_loss')} "
+                   if row.get('gain_match_traj_loss') is not None else '')
                 + f"iso {_lf('wm_input_isolation_loss')} "
                 + f"ss {_lf('wm_ss_match_loss')} "
                 + (f"dobg {_lf('dob_ground')} "
