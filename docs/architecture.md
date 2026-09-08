@@ -1084,7 +1084,11 @@ fixes BOTH:
   **P74 EXIT REVERT:** decoder `gain_cv_skip` was a teacher-pin no-op
   (rms 0.00387; det_r 0.074; mv_viol 20).   **P75 EXIT REVERT:**
   FOPDT rise teacher (rise mass 1.4% at K=H; val 1step→OL ×0.803).
-  Last-step DC Huber restored. **P76 EXIT REVERT:** RSSM GRU
+  Last-step DC Huber restored. **P111 LIVE:** rest-IC last DC KEEP +
+  uniform-in-k FOPDT traj Huber (`G(k)=(CV_k−rest_pre)/Δu` vs
+  `G_tgt·FO(k)/FO(K)`; `img_rollout last_only=not stack_k`; banner
+  `gmatch_traj=FO`; jsonl `wm_gain_match_traj_loss`; `τ<=0` / PRBS
+  stays last-only). Not P75 rise-mass. **P76 EXIT REVERT:** RSSM GRU
   update-gate bias `log(H/16)` (keep-h stalled conv; freeze
   GAIN_NOT_READY 0.80@MV; val 1step→OL ×0.770). Do not GRU-bias N+1.
   **P77 EXIT FALSIFIED** Markovian rest-IC; **P78 EXIT FALSIFIED**

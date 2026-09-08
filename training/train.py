@@ -3739,9 +3739,10 @@ def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
 def _resolve_gain_match_step(cfg: 'TrainConfig') -> float:
     """P60: sentinel ``<=0`` → ``wm_tf_step_frac`` so teacher Δu matches val TM.
 
-    P59: rest-IC + last_only K already shared the TM IC/path, but the
+    P59: rest-IC already shared the TM IC/path, but the
     teacher still stepped Δu=1.0 while ``compute_transfer_matrix`` uses
-    ``wm_tf_step_frac=0.4``.  jsonl Huber ``*_ratio`` ~×1 at freeze was
+    ``wm_tf_step_frac=0.4``.  P111 K-stacks rest-IC obs for traj Huber;
+    jsonl Huber ``*_ratio`` is still last-step FD.  ~×1 at freeze was
     G(1.0); live gate 0.88@DV / val MV ×0.876 were G(0.4).  Writes the
     resolved value back onto ``cfg`` (idempotent).  Clamp ``(1e-3, 1.0)``.
     """
@@ -8286,7 +8287,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     last-step DC Huber (P75 FOPDT *weight* **REVERT**).  **P111:**
     ``last_only=not stack_k`` — K-stack only when rest-IC FOPDT traj
     is on (uniform mean + last DC).  ``out='obs', return_state=True``.
-    Decoded-obs last step is ~100× smaller than a feat stack.
+    Decoded-obs last step (or K-stack when traj Huber) is ~100×
+    smaller than a feat stack.
     ``return_state`` is the P73 OL gain-c persist IC.  Sequential
     ``img_step`` fallback REMOVED (both RSSM-interface backbones
     expose ``img_rollout``).
