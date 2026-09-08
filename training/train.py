@@ -217,8 +217,9 @@ class TrainConfig:
     horizon_settle_n_tau: float = 4.0
     horizon_max: int = 120
     # Wide uniform IC randomization (domain randomization).
-    # ``ic_randomization_knobs()`` at sim ``reset()`` reads these then
-    # leftover ``DREAMER_INIT_RANDOMIZATION`` / ``_FRAC``.  Identity ON / 0.6.
+    # ``bind_ic_randomization_from_cfg`` after ``ENV_OVERRIDES`` pins
+    # sim ``reset()``.  Leftover ``DREAMER_INIT_RANDOMIZATION*`` dual-read
+    # at every reset is REMOVED.  Identity ON / 0.6.
     init_randomization: bool = True
     init_randomization_frac: float = 0.6
 
@@ -11823,6 +11824,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     _require_realsim_actor(cfg)
     from workflow._plant_prepare import pin_eval_modules_at_launch
     pin_eval_modules_at_launch()
+    from utils.initial_conditions import bind_ic_randomization_from_cfg
+    bind_ic_randomization_from_cfg(cfg)
 
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim

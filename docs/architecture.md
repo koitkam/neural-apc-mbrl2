@@ -247,8 +247,11 @@ env-gated off · **[planned]** = designed, not yet built.
 > **FALSIFIED** (val MV ×−0.496 1step→OL ×0.379). **P78 EXIT FALSIFIED** KV-continue as GAIN-READY (last_ok **91** **4.08@MV / 0.72@DV**; val MV **×1.721 / ×1.710** DV **×0.729 / ×0.624**; 1step→OL **×0.857** OL **×0.567**; det_r **0.010**). TSSM family closed; env-free default **rssm**. **P79 EXIT** KEEP rssm / **FALSIFIED as P64-identity** (GAIN-READY **0.81@DV** last_ok **81**; val MV **×0.923 / ×0.953** DV **×0.781 / ×0.838**; 1step→OL **×0.840**; paired **−10.57 vs −82.79** VALID 9/9). **P80 EXIT** persist 0.1→0.0 **REVERT** (`run_p80_persist0`, pid **293761**, 515 iters budget): freeze GAIN-READY **0.86@MV / 0.87@DV** last_ok **82**; val MV **×0.723 / ×0.755** DV **×0.789 / ×0.857**; 1step→OL **×0.735** OL **×0.743**; paired **−35.33 vs −107.43** VALID 8/9 loses to P64 **−4.54** / P79 **−10.57**; persist **0.1 KEEP**.
 > Dummy ol-tail jsonl **REMOVED**.
 > `derive_horizon` / sim `reset()` now
-> `horizon_formula_knobs()` / `ic_randomization_knobs()` (TrainConfig
-> 4.0/120 / ON/0.6; explicit `derive_horizon` args beat leftover env). `derive_episode_length` now
+> `horizon_formula_knobs()` (TrainConfig 4.0/120; leftover env when args
+> None) / `ic_randomization_knobs()` (TrainConfig ON/0.6 via
+> `bind_ic_randomization_from_cfg` after `ENV_OVERRIDES`; leftover
+> `DREAMER_INIT_RANDOMIZATION*` dual-read at `reset()` **REMOVED**
+> P113-live). Explicit `derive_horizon` args beat leftover env. `derive_episode_length` now
 > `episode_formula_knobs()` (TrainConfig 20 / 500 / 4000; leftover
 > `SIM_EPISODE_LENGTH` **ignored** P92-live; pin `DREAMER_EPISODE_LENGTH`;
 > `single_run` still writes `SIM_EPISODE_LENGTH` as IPC;

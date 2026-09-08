@@ -5121,12 +5121,21 @@ def _test_wm_tf_knobs_cfg_or_env() -> None:
 
 
 def _test_horizon_ic_overhead_cfg_or_env() -> None:
-    """Horizon / episode formula + IC DR: TrainConfig default, leftover env."""
+    """Horizon / episode formula leftover env; IC DR via ENV_OVERRIDES bind."""
     import os
     from utils.auto_episode_length import (
         derive_episode_length, derive_horizon, episode_formula_knobs,
         horizon_formula_knobs)
-    from utils.initial_conditions import _enabled, _frac, ic_randomization_knobs
+    from utils.initial_conditions import (
+        _enabled, _frac, ic_randomization_knobs, reset_ic_randomization_bind)
+    from workflow._plant_prepare import apply_dreamer_env_overrides
+    ic_src = open('utils/initial_conditions.py').read()
+    assert "os.environ.get('DREAMER_INIT_RANDOMIZATION'" not in ic_src
+    assert 'bind_ic_randomization_from_cfg' in ic_src
+    pp_src = open('workflow/_plant_prepare.py').read()
+    assert 'bind_ic_randomization_from_cfg' in pp_src
+    tr_src = open('training/train.py').read()
+    assert 'bind_ic_randomization_from_cfg' in tr_src
     keys = (
         'DREAMER_HORIZON_MAX', 'DREAMER_HORIZON_SETTLE_NTAU',
         'DREAMER_EPISODE_SETTLE_MULTIPLE', 'DREAMER_EPISODE_MIN_LENGTH',
@@ -5139,6 +5148,7 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
     try:
         for k in keys:
             os.environ.pop(k, None)
+        reset_ic_randomization_bind()
         c = TrainConfig()
         assert abs(float(c.horizon_settle_n_tau) - 4.0) < 1e-12
         assert int(c.horizon_max) == 120
@@ -5180,10 +5190,20 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
         h_exp2, _ = derive_horizon(
             tau=55.0, dead_time=8.0, sample_rate=4, settle_n_tau=4.0)
         assert h_exp2 == 57, h_exp2
+        os.environ.pop('DREAMER_HORIZON_SETTLE_NTAU', None)
         os.environ['DREAMER_INIT_RANDOMIZATION'] = '0'
         os.environ['DREAMER_INIT_RANDOMIZATION_FRAC'] = '0.4'
+        assert _enabled() is True  # leftover ignored until bind
+        assert abs(_frac() - 0.6) < 1e-12
+        c_ic = TrainConfig()
+        apply_dreamer_env_overrides(c_ic)
+        assert c_ic.init_randomization is False
+        assert abs(float(c_ic.init_randomization_frac) - 0.4) < 1e-12
         assert _enabled() is False
         assert abs(_frac() - 0.4) < 1e-12
+        os.environ.pop('DREAMER_INIT_RANDOMIZATION', None)
+        os.environ.pop('DREAMER_INIT_RANDOMIZATION_FRAC', None)
+        reset_ic_randomization_bind()
         os.environ['IDENTIFIED_TAU_DOMINANT'] = '53'
         os.environ['IDENTIFIED_DEAD_TIME'] = '8'
         L, lsrc = derive_episode_length()
@@ -5211,6 +5231,7 @@ def _test_horizon_ic_overhead_cfg_or_env() -> None:
         L5, lsrc5 = derive_episode_length()
         assert L5 == 900 and lsrc5 == 'env:DREAMER_EPISODE_LENGTH', (L5, lsrc5)
     finally:
+        reset_ic_randomization_bind()
         for k, old in prev.items():
             if old is None:
                 os.environ.pop(k, None)

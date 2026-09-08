@@ -344,10 +344,10 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # Leftover ``SIM_SAMPLE_RATE`` ignored at derive (P94-live).
     # ``single_run`` / BO still WRITE ``SIM_SAMPLE_RATE`` as IPC.
     'DREAMER_SAMPLE_RATE':            ('sample_rate',              int),
-    # IC domain-randomization + GPU-calib overhead.  ``ic_randomization_knobs()``
-    # / ``gpu_probe_knobs()`` read TrainConfig then leftover env (no plant-filled
-    # cfg at those call sites).  Explicit probe / ``derive_horizon`` args
-    # beat leftover env (P92-live).
+    # IC domain-randomization + GPU-calib overhead.  ``apply_dreamer_env_overrides``
+    # then ``bind_ic_randomization_from_cfg`` pins sim ``reset()`` (no plant-filled
+    # cfg at plant ID).  Leftover dual-read at every reset REMOVED (P113-live).
+    # Explicit probe / ``derive_horizon`` args beat leftover env (P92-live).
     'DREAMER_INIT_RANDOMIZATION':      ('init_randomization',      _as_bool),
     'DREAMER_INIT_RANDOMIZATION_FRAC': ('init_randomization_frac', float),
     'DREAMER_WM_OVERHEAD':             ('wm_overhead',             float),
@@ -1043,6 +1043,8 @@ def apply_dreamer_env_overrides(cfg) -> Iterable[str]:
                   flush=True)
         except Exception as e:
             print(f"[env-override] {env_k}={val!r} ignored: {e}", flush=True)
+    from utils.initial_conditions import bind_ic_randomization_from_cfg
+    bind_ic_randomization_from_cfg(cfg)
     return overridden
 
 
