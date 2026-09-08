@@ -43,20 +43,15 @@ plus the DreamerV1–V3 lineage (joint WM+actor+critic training).
 
 ## Training modes (`DREAMER_TRAIN_MODE`)
 
-- **`phased`** (default): P1 world-model / observer pretraining → P2
-  reward-head + policy-BC warmup (and DOB A,K when the curriculum is on)
-  → P3 **real-sim** actor-critic (`_realsim_actor_critic_step`; imagination
-  for the actor is deleted). Best when the observer is expensive to train
-  (transformer backbone) and benefits from amortized pretraining.
-- **`joint`** (DreamerV1/V2/V3 style): after the seed-buffer **prefill**,
-  co-train the world model, actor, and critic **every step from step 1** — no
-  phase boundaries. This eliminates the phase-boundary failure modes (recon
-  destabilization at P1→P2 from gradient bleed, cold-critic cascade at P2→P3,
-  checkpoint-discard) because all three components co-adapt. Recommended for
-  the cheap RSSM backbone. The critic warmup (`DREAMER_P3_CRITIC_WARMUP_ITERS`)
-  still runs at the very start so the value head calibrates before actor
-  coupling. PMPO prior-refresh is **REMOVED** (false A/B; real-sim P3 is
-  REINFORCE).
+- **`phased`** (default, env-free product): P1 clean-g observer pretraining
+  → P2 g recon-finetune + neural-Kalman K (A pinned; P1 g-aux ON while
+  leftover mixes) + reward-head / policy-BC warmup → P3 **real-sim**
+  actor-critic on the frozen observer (`_realsim_actor_critic_step`).
+  Imagination for the actor is deleted.
+- **`joint`** (opt-in; curriculum refuses it): after the seed-buffer
+  **prefill**, co-train WM + actor + critic from step 1. Not the env-free
+  product — `workflow.single_run` uses **phased**. PMPO prior-refresh is
+  **REMOVED** (false A/B; real-sim P3 is REINFORCE).
 
 ## Architecture (paper-faithful, adapted to vector APC observations)
 
