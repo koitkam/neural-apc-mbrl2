@@ -4,8 +4,10 @@ Provides reusable building blocks for adding stochastic elements to any
 deterministic simulator used in the control workflow:
 
 - **OUActionNoise** — Ornstein-Uhlenbeck temporally-correlated noise process.
-- **DomainRandomizer** — Per-episode parameter perturbation with env-var
-  controls for enable/disable, range, and reproducibility seed.
+- **DomainRandomizer** — Per-episode parameter perturbation. Enable /
+  range / seed come from the bound TrainConfig (``ENV_OVERRIDES`` then
+  ``bind_domain_randomization_from_cfg``), not leftover env at every
+  constructor.
 - **DisturbanceOffsetMixin** — Mixin providing ``set_disturbance_offset`` /
   ``reset_disturbance_offsets`` interface consumed by the disturbance
   curriculum module.
@@ -89,21 +91,67 @@ class OUActionNoise:
 # Domain randomizer
 # ---------------------------------------------------------------------------
 
+# Pinned after ``ENV_OVERRIDES`` (same class as IC ``_TC_IC``).  Unbound
+# identity: ON / 0.10 / unseeded.  Wrap bake still overwrites ``frac`` from
+# identifier-derived ``noise_config``.
+_TC_DR: Optional[Tuple[bool, float, str]] = None
+
+
+def bind_domain_randomization_from_cfg(cfg) -> Tuple[bool, float, str]:
+    """Pin sim-constructor DR knobs from the live TrainConfig.
+
+    ``DomainRandomizer()`` has no cfg.  A/B is ``ENV_OVERRIDES`` then this
+    bind, not leftover ``DREAMER_SIM_DOMAIN_RANDOMIZATION*`` at every
+    constructor.  Sentinel ``sim_param_randomization_pct < 0`` keeps
+    identity frac 0.10 (wrap bake still sets identifier-derived %).
+    """
+    enabled = bool(getattr(cfg, 'sim_domain_randomization', True))
+    try:
+        pct = float(getattr(cfg, 'sim_param_randomization_pct', -1.0))
+    except Exception:
+        pct = -1.0
+    frac = 0.10 if pct < 0.0 else float(np.clip(pct, 0.0, 0.5))
+    seed = str(getattr(cfg, 'sim_domain_randomization_seed', '') or '').strip()
+    global _TC_DR
+    _TC_DR = (enabled, frac, seed)
+    return _TC_DR
+
+
+def reset_domain_randomization_bind() -> None:
+    """Drop the pinned triple (smokes).  Next constructor uses identity."""
+    global _TC_DR
+    _TC_DR = None
+
+
+def domain_randomization_knobs() -> Tuple[bool, float, str]:
+    """Enable / ±% / seed for ``DomainRandomizer()`` when ctor args are None.
+
+    After ``bind_domain_randomization_from_cfg`` the live cfg wins.
+    Before that, dataclass identity ON / 0.10 / unseeded.
+    """
+    if _TC_DR is not None:
+        return _TC_DR
+    return True, 0.10, ''
+
+
 class DomainRandomizer:
     """Per-episode parameter randomization utility.
 
-    Reads enable/disable, range, and seed from ``DREAMER_SIM_*`` (TrainConfig
-    / ``ENV_OVERRIDES``).  Leftover ``SIM_*`` / ``DISTILLATION_*`` /
-    ``DREAMER_DOMAIN_RANDOMIZATION`` names are ignored (P91-live).
+    Reads enable/disable, range, and seed from the bound TrainConfig
+    (``ENV_OVERRIDES`` then ``bind_domain_randomization_from_cfg``).
+    Leftover ``DREAMER_SIM_DOMAIN_RANDOMIZATION*`` / ``SIM_*`` /
+    ``DISTILLATION_*`` / ``DREAMER_DOMAIN_RANDOMIZATION`` at every
+    constructor are ignored (P114-live; P91 leftover names already
+    ignored).  Factory wrap still bakes identifier-derived ``frac``.
 
     Args:
         env_prefixes: Unused leftover (kept so sim constructors do not churn).
         domain_randomization: Explicit override for enable/disable (*None*
-            falls back to ``DREAMER_SIM_DOMAIN_RANDOMIZATION``, default enabled).
+            uses the bind, else identity ON).
         param_randomization_pct: Explicit override for the ±% range (*None*
-            falls back to ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``, default 0.10).
-        randomization_seed: Explicit seed (*None* falls back to
-            ``DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED``, default un-seeded).
+            uses the bind, else identity 0.10).
+        randomization_seed: Explicit seed (*None* uses the bind, else
+            unseeded).
     """
 
     def __init__(
@@ -116,37 +164,22 @@ class DomainRandomizer:
         prefixes = list(env_prefixes or ['SIM'])
         _ = prefixes  # leftover SIM_ / DISTILLATION_ prefixes ignored (P91-live)
 
-        # --- enabled ---
-        # TrainConfig / DREAMER_SIM_* only.  Leftover SIM_ /
-        # DISTILLATION_ / DREAMER_DOMAIN_RANDOMIZATION ignored (P91-live).
-        env_val = os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION')
+        en, fr, seed_bound = domain_randomization_knobs()
         if domain_randomization is not None:
             self.enabled = bool(domain_randomization)
-        elif env_val is not None:
-            self.enabled = str(env_val).strip().lower() not in {
-                '0', 'false', 'no', 'off',
-            }
         else:
-            self.enabled = True
+            self.enabled = bool(en)
 
-        # --- fraction ---
-        env_pct = os.environ.get('DREAMER_SIM_PARAM_RANDOMIZATION_PCT')
         if param_randomization_pct is not None:
             self.frac = float(param_randomization_pct)
-        elif env_pct is not None:
-            self.frac = float(env_pct)
         else:
-            self.frac = 0.10
+            self.frac = float(fr)
         self.frac = float(np.clip(self.frac, 0.0, 0.5))
 
-        # --- seed / rng ---
-        env_seed = str(
-            os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED') or ''
-        ).strip()
         seed_str = (
             str(randomization_seed).strip()
             if randomization_seed is not None
-            else env_seed
+            else seed_bound
         )
         self.rng = (
             np.random.default_rng(int(seed_str))
@@ -581,8 +614,12 @@ class SimNoiseWrapper:
         """Re-apply TrainConfig runtime knobs after wrap (factory has no cfg).
 
         Identity when ``cfg`` defaults match wrap-time env (jitter 0.20,
-        noise on).  Does not re-seed the RNG (would change episode noise
-        draws).  Domain randomization stays under APCEnv phase gating.
+        noise on, DR on).  Does not re-seed the RNG (would change episode
+        noise draws).  DR *magnitude* (``frac``) stays the identifier bake
+        unless ``sim_param_randomization_pct`` is explicit (≥0).  Enable
+        comes from cfg so leftover wrap-time ``DREAMER_SIM_*`` cannot
+        silently disable P1 DR.  Later APCEnv phase gating still mutates
+        ``rd.enabled``.
         """
         from utils.noise_config import resolve_sim_runtime_knobs
         runtime = resolve_sim_runtime_knobs(cfg)
@@ -592,6 +629,15 @@ class SimNoiseWrapper:
             self._has_noise = bool(self._ou_sources or self._meas_noise)
         else:
             self._has_noise = False
+        randomizer = getattr(self._sim, '_randomizer', None)
+        if randomizer is not None and hasattr(randomizer, 'enabled'):
+            randomizer.enabled = bool(runtime.get('domain_randomization', True))
+            pct = runtime.get('param_randomization_pct')
+            if pct is not None:
+                try:
+                    randomizer.frac = float(np.clip(float(pct), 0.0, 0.5))
+                except Exception:
+                    pass
 
     # -- Intercepted methods -----------------------------------------------
 

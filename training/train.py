@@ -1668,6 +1668,9 @@ class TrainConfig:
     # Runtime DR magnitude.  Sentinel <0 = identifier-derived bake
     # (test_sim ~0.115).  Leftover ``SIM_PARAM_RANDOMIZATION_PCT``
     # ignored (P91-live).  Explicit ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT``.
+    # ``bind_domain_randomization_from_cfg`` after ``ENV_OVERRIDES`` pins
+    # ``DomainRandomizer()`` (P114-live leftover constructor dual-read
+    # REMOVED).  Wrap bake still sets identifier-derived ``frac``.
     sim_param_randomization_pct: float = -1.0
     # Operator-event schedule (measured DV steps).  TrainConfig +
     # ``DREAMER_DISTURBANCE_*``.  Leftover ``AGENT_DISTURBANCE_*`` is
@@ -11815,7 +11818,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     from workflow._plant_prepare import pin_eval_modules_at_launch
     pin_eval_modules_at_launch()
     from utils.initial_conditions import bind_ic_randomization_from_cfg
+    from utils.sim_noise import bind_domain_randomization_from_cfg
     bind_ic_randomization_from_cfg(cfg)
+    bind_domain_randomization_from_cfg(cfg)
 
     env = APCEnv(cfg, rng)
     cfg.action_dim = env.action_dim

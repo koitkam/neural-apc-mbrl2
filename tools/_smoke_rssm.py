@@ -5825,7 +5825,20 @@ def _test_sim_runtime_cfg() -> None:
     """Wrapper seed/jitter/enable/DR: TrainConfig default; leftover SIM_* ignored; DREAMER wins."""
     import os
     from utils.noise_config import build_noise_config, resolve_sim_runtime_knobs
-    from utils.sim_noise import DomainRandomizer, SimNoiseWrapper
+    from utils.sim_noise import (
+        DomainRandomizer, SimNoiseWrapper, reset_domain_randomization_bind)
+    from workflow._plant_prepare import apply_dreamer_env_overrides
+    sn_src = open('utils/sim_noise.py').read()
+    ctor = sn_src.split('class DomainRandomizer', 1)[1].split(
+        'def _load_config_block', 1)[0]
+    assert "os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION')" not in ctor
+    assert "os.environ.get('DREAMER_SIM_PARAM_RANDOMIZATION_PCT')" not in ctor
+    assert "os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED')" not in ctor
+    assert 'bind_domain_randomization_from_cfg' in sn_src
+    pp_src = open('workflow/_plant_prepare.py').read()
+    tr_src = open('training/train.py').read()
+    assert 'bind_domain_randomization_from_cfg' in pp_src
+    assert 'bind_domain_randomization_from_cfg' in tr_src
 
     c = TrainConfig()
     assert c.sim_noise_enabled is True
@@ -5871,6 +5884,7 @@ def _test_sim_runtime_cfg() -> None:
     try:
         for k in keys:
             os.environ.pop(k, None)
+        reset_domain_randomization_bind()
         kn = resolve_sim_runtime_knobs()
         kn_cfg = resolve_sim_runtime_knobs(c)
         assert kn == kn_cfg
@@ -5915,7 +5929,13 @@ def _test_sim_runtime_cfg() -> None:
         assert dr_left.enabled is True
         os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '0'
         dr_off = DomainRandomizer()
-        assert dr_off.enabled is False
+        assert dr_off.enabled is True  # leftover ignored until apply
+        c_dr = TrainConfig()
+        apply_dreamer_env_overrides(c_dr)
+        assert c_dr.sim_domain_randomization is False
+        dr_bound = DomainRandomizer()
+        assert dr_bound.enabled is False
+        reset_domain_randomization_bind()
         os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '1'
         assert resolve_sim_runtime_knobs()['domain_randomization'] is True
         os.environ['SIM_PARAM_RANDOMIZATION_PCT'] = '0.25'
@@ -5945,7 +5965,23 @@ def _test_sim_runtime_cfg() -> None:
         assert wrap._has_noise is False
         wrap.apply_runtime_knobs(TrainConfig())
         assert wrap._has_noise is True
+        class _HasRd(_Bare):
+            def __init__(self):
+                self._randomizer = DomainRandomizer()
+        wrap_rd = SimNoiseWrapper(_HasRd())
+        assert wrap_rd._sim._randomizer.enabled is True
+        c_dr_off = TrainConfig()
+        c_dr_off.sim_domain_randomization = False
+        c_dr_off._explicit_fields = {'sim_domain_randomization'}  # type: ignore
+        wrap_rd.apply_runtime_knobs(c_dr_off)
+        assert wrap_rd._sim._randomizer.enabled is False
+        c_dr_on = TrainConfig()
+        c_dr_on.sim_domain_randomization = True
+        c_dr_on._explicit_fields = {'sim_domain_randomization'}  # type: ignore
+        wrap_rd.apply_runtime_knobs(c_dr_on)
+        assert wrap_rd._sim._randomizer.enabled is True
     finally:
+        reset_domain_randomization_bind()
         for k, old in prev.items():
             if old is None:
                 os.environ.pop(k, None)
