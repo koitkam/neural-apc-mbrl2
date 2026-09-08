@@ -5280,6 +5280,37 @@ def _test_compile_leftover_ignored() -> None:
     print('[smoke] OK  leftover DREAMER_COMPILE* ignored until apply (P113-live)')
 
 
+def _test_wm_diag_device_leftover_ignored() -> None:
+    """Leftover DREAMER_WM_DIAG_DEVICE dual-read REMOVED; cfg + apply only."""
+    import os
+    from tools.wm_steady_state_diagnostic import _pick_device
+    from workflow._plant_prepare import apply_dreamer_env_overrides
+    tr = open('training/train.py').read()
+    hook = tr.split('[wm-ss-diag] pre-free skipped', 1)[1].split(
+        '[train] wm_steady_state_diagnostic skipped', 1)[0]
+    assert "os.environ.get('DREAMER_WM_DIAG_DEVICE')" not in hook
+    assert "os.environ['DREAMER_WM_DIAG_DEVICE']" not in hook
+    assert 'device=_diag_dev' in hook
+    prev = os.environ.get('DREAMER_WM_DIAG_DEVICE')
+    try:
+        os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
+        dev, why = _pick_device(forced='cpu')
+        assert str(dev) == 'cpu' and why == 'forced_cpu', (dev, why)
+        os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cpu'
+        cfg = TrainConfig()
+        assert cfg.wm_diag_device == 'cuda'
+        apply_dreamer_env_overrides(cfg)
+        assert str(cfg.wm_diag_device).strip().lower() == 'cpu'
+        dev2, why2 = _pick_device(forced=cfg.wm_diag_device)
+        assert str(dev2) == 'cpu' and why2 == 'forced_cpu', (dev2, why2)
+    finally:
+        if prev is None:
+            os.environ.pop('DREAMER_WM_DIAG_DEVICE', None)
+        else:
+            os.environ['DREAMER_WM_DIAG_DEVICE'] = prev
+    print('[smoke] OK  leftover DREAMER_WM_DIAG_DEVICE ignored until apply (P114-live)')
+
+
 def _test_sample_rate_pin_ignores_leftover() -> None:
     """Sample-rate pin: leftover SIM_SAMPLE_RATE ignored; DREAMER_* pins."""
     import os
@@ -6760,6 +6791,7 @@ if __name__ == '__main__':
     _test_wm_tf_knobs_cfg_or_env()
     _test_horizon_ic_overhead_cfg_or_env()
     _test_compile_leftover_ignored()
+    _test_wm_diag_device_leftover_ignored()
     _test_sample_rate_pin_ignores_leftover()
     _test_sim_factory_ignores_leftover_model_env()
     _test_derived_observables_cfg()

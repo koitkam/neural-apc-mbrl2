@@ -28,8 +28,10 @@ final-step (steady-state) error vs. simulator ground truth, and a
 "converged" flag (true if obs std over the last 20 steps < ε).
 
 GPU/CPU selection: auto-detects GPU utilization via ``nvidia-smi`` and
-falls back to CPU if utilization >50% or memory_used/total >0.5. Can
-be forced with ``DREAMER_WM_DIAG_DEVICE={cpu,cuda}``.
+falls back to CPU if utilization >50% or memory_used/total >0.5. Train
+passes ``TrainConfig.wm_diag_device`` (default ``cuda``; A/B
+``DREAMER_WM_DIAG_DEVICE`` via ``ENV_OVERRIDES``). CLI still honours
+the env when ``--device`` / ``forced`` is omitted.
 
 CLI::
 
@@ -103,17 +105,20 @@ def _gpu_busy(util_threshold_pct: float = 50.0,
     return bool(busy), reason
 
 
-def _pick_device() -> Tuple[torch.device, str]:
-    """Honour ``DREAMER_WM_DIAG_DEVICE`` / TrainConfig ``wm_diag_device``.
+def _pick_device(forced: Optional[str] = None) -> Tuple[torch.device, str]:
+    """Pick cuda/cpu. Explicit ``forced`` (TrainConfig) beats leftover env.
 
-    ``train()`` writes the env from cfg (default ``cuda``) before calling
-    so nvidia-smi does not treat the training process as "GPU busy" and
-    fall back to CPU.  CLI without the env still auto-detects.
+    Train passes ``cfg.wm_diag_device`` so login leftover
+    ``DREAMER_WM_DIAG_DEVICE`` cannot beat the bound cfg (P114-live;
+    same class as P113 compile dual-read). CLI with ``forced=None``
+    still honours the env, then nvidia-smi auto.
     """
-    forced = os.environ.get('DREAMER_WM_DIAG_DEVICE', '').strip().lower()
-    if forced in ('cpu',):
+    raw = ('' if forced is None else str(forced)).strip().lower()
+    if not raw:
+        raw = os.environ.get('DREAMER_WM_DIAG_DEVICE', '').strip().lower()
+    if raw in ('cpu',):
         return torch.device('cpu'), 'forced_cpu'
-    if forced in ('cuda', 'gpu'):
+    if raw in ('cuda', 'gpu'):
         if not torch.cuda.is_available():
             return torch.device('cpu'), 'forced_cuda_unavailable_fallback_cpu'
         return torch.device('cuda'), 'forced_cuda'
@@ -610,6 +615,7 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
                                      protocols: Optional[Tuple[str, ...]] = None,
                                      noise_free: bool = True,
                                      output_dir: Optional[Path] = None,
+                                     device: Optional[str] = None,
                                      ) -> Dict:
     """Run the diagnostic; write JSON (+ plot if matplotlib available).
 
@@ -627,13 +633,15 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
             (legacy behaviour; results are then a mix of WM extrapolation
             error and stochastic plant variance and should not be read as
             a pure WM-quality metric).
+        device: TrainConfig ``wm_diag_device`` (``cuda`` / ``cpu`` /
+            ``auto``).  None = CLI leftover env then nvidia-smi.
 
     Returns the result dict.
     """
     run_dir = Path(run_dir)
     out_dir = Path(output_dir) if output_dir is not None else run_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    device, dev_reason = _pick_device()
+    device, dev_reason = _pick_device(forced=device)
     ckpt_path = _find_ckpt(run_dir, ckpt_name)
     print(f'[wm-ss-diag] ckpt={ckpt_path.name}  device={device}  ({dev_reason})',
           flush=True)

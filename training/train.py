@@ -486,10 +486,11 @@ class TrainConfig:
     diag_disable_reward_mtp_in_p1: bool = False
     diag_reward_mtp_stop_grad_in_p1: bool = False
     # End-of-training WM steady-state diagnostic (default ON).  Horizon
-    # 0 = auto ``max(200, 8·H)``.  Device: ``cuda`` (identity with the
-    # previous train()-injected env — nvidia-smi would see *this* process
-    # as busy and fall back to CPU).  ``auto`` restores the picker;
-    # ``cpu`` forces host.  ``DREAMER_WM_DIAG_DEVICE``.
+    # 0 = auto ``max(200, 8·H)``.  Device: ``cuda`` so nvidia-smi does
+    # not treat this process as busy and fall back to CPU.  ``auto``
+    # restores the picker; ``cpu`` forces host.  A/B
+    # ``DREAMER_WM_DIAG_DEVICE`` via ``ENV_OVERRIDES`` (leftover env
+    # dual-read REMOVED P114-live).
     run_wm_diagnostic: bool = True
     wm_diag_n_starts: int = 8
     wm_diag_horizon: int = 0
@@ -15800,24 +15801,17 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             _diag_h_default = max(200, 8 * _H_train)
             _h_cfg = int(getattr(cfg, 'wm_diag_horizon', 0) or 0)
             horizon = _h_cfg if _h_cfg > 0 else _diag_h_default
-            # Inline diagnostic device.  Default ``wm_diag_device=cuda``
-            # matches the previous env injection: the auto-picker reads
-            # nvidia-smi util, which sees *our own* training process as
-            # busy and would fall back to CPU.  Explicit env still wins.
-            # ``auto`` leaves the picker; ``cpu`` forces host.
-            if not os.environ.get('DREAMER_WM_DIAG_DEVICE'):
-                _diag_dev = str(
-                    getattr(cfg, 'wm_diag_device', 'cuda') or 'cuda'
-                    ).strip().lower()
-                if _diag_dev in ('cpu',):
-                    os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cpu'
-                elif (_diag_dev not in ('auto', 'off', '0', 'none')
-                      and torch.cuda.is_available()):
-                    os.environ['DREAMER_WM_DIAG_DEVICE'] = 'cuda'
+            # Bound cfg only (P114-live). Default cuda so nvidia-smi
+            # does not treat this process as busy. Leftover env cannot
+            # beat apply_dreamer_env_overrides.
+            _diag_dev = str(
+                getattr(cfg, 'wm_diag_device', 'cuda') or 'cuda'
+                ).strip().lower()
             run_wm_steady_state_diagnostic(
                 out_dir, ckpt_name='final.pt',
                 n_starts=n_starts, horizon=horizon,
-                output_dir=(out_dir / 'validation'))
+                output_dir=(out_dir / 'validation'),
+                device=_diag_dev)
         except Exception as e:
             print(f'[train] wm_steady_state_diagnostic skipped: {e!r}',
                    flush=True)
