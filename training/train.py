@@ -849,10 +849,10 @@ class TrainConfig:
     # (the 3 stages = phases P1/P2/P3, budgeted by phase{1,2,3}_frac):
     #   Stage 1 (P1): CLEAN (hidden disturbance OFF) + DOB d_t SUPPRESSED ->
     #     g learns the UNBIASED input->CV gain (no omitted-variable confound).
-    #   Stage 2 (P2): g recon-finetune + Kalman K (A pinned) + disturbance ON
-    #     + d_t ACTIVE (P108 froze g; P109 trains g; P110 also runs P1
-    #     gain-match/overshoot/held while leftover mixes in feat). Recon +
-    #     Kalman ID; leftover-in-feat. BC still warms the actor.
+    #   Stage 2 (P2): FREEZE g (NOT the DOB) + disturbance ON + d_t ACTIVE ->
+    #     the recon innovation trains the Kalman observer (A,K) on the fixed g
+    #     (all CV movement g can't explain is attributed to d_t = identifiable).
+    #     (reuses the P2 loss path; BC also warms the actor as a free bonus.)
     #   Stage 3 (P3): FREEZE g AND the DOB + disturbance + domain-randomization
     #     ON -> actor/critic train on the static unbiased WM + working observer
     #     and learn to REJECT disturbances (d_t feed-forward) for runtime
@@ -3411,9 +3411,8 @@ def _skip_storm_continue_p1(
 
 
 def _wm_fidelity_es_suppressed_frozen_g(g_trainable: bool) -> bool:
-    """P2 leftover mix is gain-blind (P109: g may recon-finetune)."""
-    del g_trainable
-    return True
+    """P2 curriculum freezes ``g``; a gain-blind probe cannot improve."""
+    return not bool(g_trainable)
 
 
 def _p1_fidelity_local_plateau(
@@ -3690,9 +3689,6 @@ def _actor_experiment_valid(*,
     ``wm_best`` is the lucky-spike path — also invalid.  Restoring
     ``wm_last_ok`` (late healthy P1) is valid unless the gain probe
     also capped GAIN_NOT_READY.
-    P2 g recon-finetune (P109/P110) is not re-probed here: this flag
-    keys off P1 ``gain_not_ready_capped`` / wm_best. Freeze TM of live
-    P2 g is val-only (P109 freeze 0.95@MV → val ×0.170 still VALID).
     """
     if gain_not_ready_capped:
         return False
@@ -4452,7 +4448,9 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
     # GAIN_NOT_READY; P1 d≡0 cannot attribute). P90 serve-HP closed.
     # P102 increment MSE crushed K; P100 HP crop-demean crushed K.
     # Banner window stays 0 (no crop-demean).
-    # P108: d_slow α = 1/T (banner dob_2tsa=T), not 1/H / (1−A).
+    # P110: d_slow α = 1/(2T) (banner dob_2tsa=2T), not 1/T / 1/H / (1−A).
+    # P108 KEEP leftover/K at 1/T. P109 leftover 0.367 was g-finetune
+    # side-effect (α stayed 1/T). P2 g stays FROZEN (P109 REVERT).
     # ``_dob_ground_hp_window`` remains the val-protocol formula (smoke /
     # A/B via ``disturbance_detrend_settle_mult<=0``).
     _hpw = 0
@@ -4493,12 +4491,10 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_hp={_hpw} "
         f"dob_hpamp=mse "
         f"dob_2ts=True "
-        f"dob_2tsa={max(1, int(getattr(cfg, 'seq_len', 0) or getattr(cfg, 'horizon', 0) or 0))} "
+        f"dob_2tsa={max(1, 2 * int(getattr(cfg, 'seq_len', 0) or getattr(cfg, 'horizon', 0) or 0))} "
         f"dob_reconsg=True "
         f"dob_afreeze=True "
         f"dob_luen=True "
-        f"p2g=True "
-        f"p2gaux=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -4789,9 +4785,9 @@ def _dynamics_g_trainable(model: 'DreamerV4') -> bool:
     """True iff the plant model ``g`` (not DOB A,K) still takes gradients.
 
     Gate for g-only aux (isolation extra unroll, overshoot, held-rollout,
-    full-BPTT gain-match).  Curriculum P2 trains g (P109 recon-finetune;
-    P110 also runs P1 g-aux while leftover mixes). Isolation extra
-    unroll follows this flag.
+    full-BPTT gain-match).  DOB-curriculum P2 freezes encoder/decoder/GRU/
+    cont-gain; those K-step prior rolls cannot update frozen params and
+    are ~73% of the WM step (P28 follow-up 11).
     """
     dyn = getattr(model, 'dynamics', None)
     if dyn is None:
@@ -8005,12 +8001,12 @@ def _warmup_rest_ic_cuda_graph(rssm, cfg: 'TrainConfig', device) -> None:
 def _release_rest_ic_cuda_graph(rssm) -> bool:
     """Drop the rest-IC CUDA graph after g freeze.
 
-    P110 keeps P1 gain-match live in P2 (g trains + leftover-in-feat),
-    so the ~14 GB lookback-T graph stays until STAGE 3 freezes g.
-    P3 needs the VRAM.  No-op when the pid never captured (P55
-    eager-fail pin).  Returns True iff a graph object was dropped
-    (caller may ``empty_cache``).  Restores the AccumulateGrad
-    stream-mismatch warn (P59).
+    P2/P3 skip gain-match (``_g_live``).  The captured graph holds a
+    static lookback-T replay for the whole run; releasing it is
+    identity for training and host-adaptive (P3 needs the VRAM).
+    No-op when the pid never captured (P55 eager-fail pin).  Returns
+    True iff a graph object was dropped (caller may ``empty_cache``).
+    Restores the AccumulateGrad stream-mismatch warn (P59).
     """
     _arm_rest_ic_stream_mismatch_warn(False)
     if rssm is None:
@@ -8882,13 +8878,12 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # the unmeasured load (de-confounds the omitted-variable gain attenuation).
     # Stage-1 (``dob_active=False``) forces ``d_t≡0`` — skip the clone+add and
     # the ground/reg terms (constant MSE of zeros vs load; no gradient).
-    # P97: add ``d.detach()``. P109 recon-finetunes g in P2 while K trains
-    # (A pinned). Live recon through d would pull Kalman toward ``y−g``
-    # (DC soak: ``|d|~0.07`` while HP ``std_ratio`` walks 1.08→0.39 —
-    # P94/P96 crush) if d were not stop-grad. Grounding still uses live
-    # ``ds``. KalmanNet split: recon trains g on ``obs−sg(d)``; A,K trained
-    # only by ``dob_ground``. P1 is ``dob_live`` false so this is a P2
-    # (and any dob-live) change only.
+    # P97: add ``d.detach()``. P2 freezes g and trains only A,K. Live recon
+    # through d pulls the Kalman toward the residual ``y−g`` (DC soak:
+    # ``|d|~0.07`` while HP ``std_ratio`` walks 1.08→0.39 — P94/P96 crush).
+    # Grounding still uses live ``ds``. KalmanNet split: recon trains g on
+    # ``obs−sg(d)``; A,K trained only by ``dob_ground``. P1 is ``dob_live``
+    # false so this is a P2 (and any dob-live) change only.
     dob_on = bool(getattr(rssm, 'dob_enabled', False)) and ds is not None
     dob_live = dob_on and bool(getattr(rssm, 'dob_active', True))
     if dob_live:
@@ -9107,12 +9102,13 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     # stays every-other.
     # Gain-match (full-BPTT FD) batches baseline+per-input into the same
     # ``img_rollout`` so MIMO width does not multiply sequential K-loops.
-    # P28 follow-up 11: skip when g is frozen.  P109 skipped P1 g-aux
-    # while leftover mixed (gain-blind; freeze 0.95@MV → val ×0.170).
-    # P110 keeps g-aux ON whenever g is trainable so gain-match /
-    # overshoot / held can re-ID DC during leftover-in-feat.  P1 is
-    # ``dob_live=False`` already.  Non-curriculum DOB+g still keeps
-    # g-aux via this flag alone.
+    # P28 follow-up 11: skip when g is frozen (DOB curriculum P2).  Same
+    # reason as isolation extra unroll (follow-up 10): these K-step prior
+    # rolls train encoder/decoder/GRU/cont-gain, which ``set_world_model_
+    # trainable(g=False)`` has frozen.  Full-BPTT gain-match is the same
+    # family (and more expensive: baseline + one roll per input).  P2
+    # still pays for recon + DOB ground/reg (A,K).  Cadence counter
+    # still ticks so a later unfreeze keeps every-other held.
     _g_live = _dynamics_g_trainable(model)
     _wm_aux_n = int(getattr(model, '_wm_aux_step', 0)) + 1
     model._wm_aux_step = _wm_aux_n
@@ -9191,12 +9187,10 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
                   if dob_on else torch.zeros((), device=feats.device)),
         'dob_K': (rssm.dob_gain().mean().detach()
                   if dob_on else torch.zeros((), device=feats.device)),
-        # P108: 1/T vs P107 1/H. Watch vs 0.018 on test_sim (T=128 → 0.00781).
-        # TSSM has no two-timescale scan; jsonl stays 0 (RSSM GPU path).
-        'dob_slow_alpha': (
-            rssm.dob_slow().mean().detach()
-            if dob_on and hasattr(rssm, 'dob_slow')
-            else torch.zeros((), device=feats.device)),
+        # P110: 1/(2T) vs P108 1/T. Watch vs 0.00781 on test_sim (T=128 → 0.00391).
+        'dob_slow_alpha': (rssm.dob_slow().mean().detach()
+                           if dob_on and hasattr(rssm, 'dob_slow')
+                           else torch.zeros((), device=feats.device)),
     }
     losses.update(kl_diag)
     losses.update(gain_match_diag)
@@ -12526,8 +12520,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # Stage-1 state applied BEFORE the seed fill so the seed buffer is
         # collected CLEAN (no hidden disturbance) and the DOB is suppressed
         # (d_t==0 -> g must explain all CV movement).  wm_freeze_after_p1 is
-        # forced off so the Stage-2 (P2) loss keeps wm_total (recon + Kalman
-        # K; P109/P110 also recon-finetune g — freeze is STAGE 3).
+        # forced off so the Stage-2 (P2) loss keeps wm_total (its recon
+        # innovation is what trains the observer on the frozen g).
         wm_freeze_after_p1 = False
         _fz = model.set_world_model_trainable(g=True, dob=False, reward=True)
         model.set_dob_active(False)
@@ -12634,9 +12628,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     def _apply_curriculum_stage(phase: int) -> None:
         """Latch freeze/DOB to ``phase``.  Call at loop start AND after a
-        same-iter phase transition.  P110 trains g in P2 *and* runs P1
-        gain-match/overshoot/held while leftover mixes (P109 skip was
-        gain-blind).
+        same-iter phase transition — otherwise the first P2 train step still
+        has g trainable (full-BPTT gain-match on skip-storm-restored weights).
         """
         nonlocal _cur_stage, _wm_frozen_now
         if not curriculum:
@@ -12693,14 +12686,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         elif _cur_stage == 2:
             _dob_on = bool(getattr(cfg, 'dob_enabled', False))
             model.set_dob_active(_dob_on)
-            # P110: recon-finetune g while Kalman K still trains (A pinned)
-            # AND run P1 gain-match/overshoot/held (leftover-in-feat).
             _fz = model.set_world_model_trainable(
-                g=True, dob=_dob_on, reward=True)
-            _est = ('DOB id + g recon-finetune (observer K; A pinned)' if _dob_on
-                    else 'recon + observer (g + K; A pinned)')
-            _desc = (f'{_est} (P1 gain-match ON; leftover-in-feat; '
-                     f'disturbance {env._disturbance_prob_override:.2f})')
+                g=False, dob=_dob_on, reward=True)
+            _est = ('DOB id (observer K; A pinned)' if _dob_on
+                    else 'disturbance-head id (frozen-g readout)')
+            _desc = (f'{_est} (g FROZEN + reward train via recon '
+                     f'innovation, disturbance '
+                     f'{env._disturbance_prob_override:.2f})')
         else:
             model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
             _fz = model.set_world_model_trainable(
@@ -12714,9 +12706,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f"steps{total_env_steps}: {_desc} "
               f"[g={_fz['g']} dob={_fz['dob']} reward={_fz['reward']} "
               f"trainable-flags set]", flush=True)
-        # P1 rest-IC CUDA graph is ~14 GB. P110 keeps g-aux ON in P2, so
-        # hold the graph until g is frozen (STAGE 3). A10 24 GB can hold
-        # P1 VRAM through P2. Cont-curric already gates on g frozen.
         if not _dynamics_g_trainable(model):
             _release_rest_ic_after_g_freeze(
                 getattr(model, 'dynamics', None))
@@ -14973,15 +14962,15 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                       flush=True)
                             elif _wm_fidelity_es_suppressed_frozen_g(
                                     _dynamics_g_trainable(model)):
-                                # P2 leftover mix + g-aux (P110). Patience
-                                # would still kill Kalman after ~40 iters
-                                # (P30). Keep suppressed while mix runs.
+                                # Curriculum P2 freezes g.  A gain-blind
+                                # P2-open probe cannot improve, so patience
+                                # otherwise kills DOB after ~40 iters (P30).
                                 if not wm_fid_es_frozen_g_logged:
                                     wm_fid_es_frozen_g_logged = True
                                     print(
                                         '[wm-fidelity-ES] suppressed: '
-                                        'P2 Kalman mix (gain-blind probe; '
-                                        'P109 g may recon-finetune)',
+                                        'dynamics g frozen (P2 cannot '
+                                        'improve a gain-blind P2-open probe)',
                                         flush=True)
                             else:
                                 early_stop_reason = (
