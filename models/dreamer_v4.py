@@ -1247,7 +1247,7 @@ class DreamerV4Config:
     action_dim: int
     lookback: int                          # transformer context length T_ctx
     horizon: int = 0                       # control H (P76/P88 keep-h REVERT)
-    seq_len: int = 0                       # WM crop T (P108 2TS α=1/T)
+    seq_len: int = 0                       # WM crop T (P110 2TS α=1/(2T); P108 was 1/T)
     # Tokenizer
     tok_hidden: int = 256
     z_dim: int = 24
