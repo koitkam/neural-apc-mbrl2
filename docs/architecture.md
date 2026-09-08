@@ -1091,7 +1091,8 @@ fixes BOTH:
   stays last-only). Not P75 rise-mass. Freeze last_ok 81 GAIN_NOT_READY
   1.35@MV vs val ×0.909; `[p3-skip]`; **FALSIFIED as freeze / GAIN-READY /
   actor**; do not promote / traj N+1. **P112:** GAIN-READY median of 3
-  TM draws (`gprobe_R=3`). **P76 EXIT REVERT:** RSSM GRU
+  TM draws (`gprobe_R=3`; DC/@H/noise median-merged; compounding
+  1step→OL still one decomp after merge). **P76 EXIT REVERT:** RSSM GRU
   update-gate bias `log(H/16)` (keep-h stalled conv; freeze
   GAIN_NOT_READY 0.80@MV; val 1step→OL ×0.770). Do not GRU-bias N+1.
   **P77 EXIT FALSIFIED** Markovian rest-IC; **P78 EXIT FALSIFIED**

@@ -10488,7 +10488,14 @@ def _finalize_gain_ready_probe(
         n_rep: int,
         draw_worsts: List[float],
 ) -> Optional[dict]:
-    """Apply UNBIASED / NOT-NOISY / compounding gates to merged TM stats."""
+    """Apply UNBIASED / NOT-NOISY / compounding gates to merged TM stats.
+
+    DC / @H / noise are median-merged across ``n_rep`` draws (P112).
+    Compounding 1step→OL is still **one** posterior-prior decomp after
+    that merge — P111's lottery was DC (0.77 vs 1.35 vs val 0.909), not
+    compounding.  Median-merge the decomp only if freeze 1step→OL vs val
+    is still a lottery.
+    """
     ss_ratios = list(tm.get('ss_pairs') or [])
     ath_pairs = list(tm.get('ath_pairs') or [])
     if not ss_ratios:
