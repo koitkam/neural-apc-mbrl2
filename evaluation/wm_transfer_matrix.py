@@ -292,7 +292,10 @@ def compute_dv_transfer_matrix(model, env, cfg, device, *,
     cv_names = list(env.meta.get('cv_names') or [f'CV{c}' for c in cv_idx])
     dv_names = list(env.meta.get('dv_names') or
                     [f'DV{p}' for p in range(len(dv_obs_idx))])
-    rng = np.random.default_rng(seed)
+    # ``seed=`` is unused: ICs come from ``env.sim.reset`` /
+    # ``sample_initial_value(_randomizer.rng)`` after discard-schedule.
+    # P112 median-merges that lottery. Wiring seed into reset would change TM.
+    _ = seed
     # Operating points: a few MV levels (region coverage), DV stepped +/-.
     levels = np.linspace(-0.4, 0.4, max(1, n_levels))
     cells: Dict[str, Dict] = {}
@@ -382,7 +385,10 @@ def compute_transfer_matrix(model, env, cfg, device, *,
     holds the time axis and the mean / min / max engineering-gain curves for
     both the world model and the real simulator, with steady-state gains.
     """
-    rng = np.random.default_rng(seed)
+    # ``seed=`` is unused: ICs come from ``env.sim.reset`` /
+    # ``sample_initial_value(_randomizer.rng)`` after discard-schedule.
+    # P112 median-merges that lottery. Wiring seed into reset would change TM.
+    _ = seed
     cv_idx = list(env.cv_indices)
     n_mv = int(env.action_dim)
     obs_dim = int(env.obs_dim)

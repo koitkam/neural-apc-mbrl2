@@ -1124,7 +1124,10 @@ fixes BOTH:
   `DREAMER_GAIN_MATCH_REST_IC=0` reverts to PRBS-posterior FD. Collect
   pairing = TM `_settle_capture` (obs after step). Encode `L` default
   is lookback (`gain_match_rest_ic_len=0`; P57 EXIT **REVERT**; `-1`
-  A/B last `max(K, 2τ/sr)`).   Encode is
+  A/B last `max(K, 2τ/sr)`). `_quiet_env` in `collect_rest_lookback`
+  mutates the **live training env** (`_ou_sources=[]`); wrapper reset
+  does not rebuild sources (P112 review; save/restore or clone — do not
+  patch mid-P112).   Encode is
   `rollout_observed(..., last_only=True, return_feats=False)` via
   Stage-1 `_posterior_step`. Full-T main WM encode stacks
   `h/z/(c)/(dv)` then one cat (`_stack_decode_core`; identity vs

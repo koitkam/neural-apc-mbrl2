@@ -327,6 +327,12 @@ def _quiet_env(env) -> None:
     must additionally clear ``env._schedule = []`` after every
     ``env.reset()`` (see ``_run_protocol``) because ``reset()`` rebuilds
     the schedule from the curriculum.
+
+    Mutates ``env`` in place.  Training ``collect_rest_lookback`` calls
+    this on the live training env at P1 rest-IC cache.
+    ``SimNoiseWrapper.reset`` / ``apply_runtime_knobs`` / ``set_noise_scale``
+    do not rebuild emptied ``_ou_sources`` / ``_meas_noise``.  Callers that
+    share the training env must save/restore or clone.
     """
     sim = env.sim
     # Wipe OU + measurement noise channels on the SimNoiseWrapper.
