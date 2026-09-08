@@ -5443,6 +5443,9 @@ def _test_noise_hidden_cfg() -> None:
     assert 'os.environ.get(env_key)' not in src
     assert 'if env_key in os.environ' not in src
     assert 'if leftover and' not in src
+    assert 'def _knob_raw(cfg, field: str):' in src
+    assert 'def _knob_float(cfg, field: str, default: float)' in src
+    assert 'def _knob_bool(cfg, field: str, default: bool)' in src
     keys = (
         'DREAMER_PROCESS_NOISE_AMP_RAMP',
         'DREAMER_DISTURBANCE_PROB_WM',
@@ -5500,17 +5503,13 @@ def _test_noise_hidden_cfg() -> None:
             _knob_bool, force_val_hidden_dist_spread)
         os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '0'
         c_spread = TrainConfig()
-        assert _knob_bool(c_spread, 'hidden_dist_spread',
-                          'DREAMER_HIDDEN_DIST_SPREAD', True) is True  # leftover ignored
+        assert _knob_bool(c_spread, 'hidden_dist_spread', True) is True  # leftover ignored
         c_spread.hidden_dist_spread = False
-        assert _knob_bool(c_spread, 'hidden_dist_spread',
-                          'DREAMER_HIDDEN_DIST_SPREAD', True) is False
+        assert _knob_bool(c_spread, 'hidden_dist_spread', True) is False
         with force_val_hidden_dist_spread(c_spread):
             assert c_spread.hidden_dist_spread is True
-            assert _knob_bool(c_spread, 'hidden_dist_spread',
-                              'DREAMER_HIDDEN_DIST_SPREAD', True) is True
-        assert _knob_bool(c_spread, 'hidden_dist_spread',
-                          'DREAMER_HIDDEN_DIST_SPREAD', True) is False
+            assert _knob_bool(c_spread, 'hidden_dist_spread', True) is True
+        assert _knob_bool(c_spread, 'hidden_dist_spread', True) is False
         from pathlib import Path
         _root = Path(__file__).resolve().parents[1]
         src_val = (_root / 'evaluation' / 'validate.py').read_text()
@@ -5941,6 +5940,9 @@ def _test_training_diagnostics_cascade_axes() -> None:
         assert abs(float(p3['realsim_return_mean']['first']) + 7.3) < 1e-9
         flags = ' '.join(summary['flags'])
         assert 'imagined returns' not in flags
+        tr = open('training/train.py').read()
+        assert 'bc_track_fresh' in tr
+        assert 'if bc_track_fresh else None' in tr
         # Pre-P65 jsonl still surfaces the imagination alias.
         oldp = os.path.join(td, 'old_train_log.jsonl')
         with open(oldp, 'w') as fh:

@@ -1536,11 +1536,12 @@ class TrainConfig:
     # ``> 0`` and an expert is active, every ``bc_track_expert_every`` det-eval
     # cadences roll ONE deterministic expert episode under the SAME eval
     # protocol and log ``expert_det_return`` + ``agent_minus_expert_return``
-    # to train_log.jsonl.  A persistently ~0 gap = crutch (actor cloning the
-    # expert); a positive, growing gap = the actor is genuinely surpassing the
-    # expert via the real-reward/MC-critic objective.  ``0`` = OFF (no extra
-    # eval cost = p106-baseline behaviour).  To remove the floor confound for a
-    # clean learning test, ALSO set DREAMER_EXPERT_BC_P3_FLOOR=0 (full release).
+    # on that jsonl row only (None between collects).  A persistently ~0 gap
+    # = crutch (actor cloning the expert); a positive, growing gap = the
+    # actor is genuinely surpassing the expert via the real-reward/MC-critic
+    # objective.  ``0`` = OFF (no extra eval cost = p106-baseline behaviour).
+    # To remove the floor confound for a clean learning test, ALSO set
+    # DREAMER_EXPERT_BC_P3_FLOOR=0 (full release).
     # Default 1 = p117 curriculum-recipe (promoted 2026-06-14; was 0).
     bc_track_expert_every: int = 1
 
@@ -12485,11 +12486,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     t_ac_acc = 0.0
     # BC learning-vs-crutch tracking (2026-06-09): rolled-expert det-return
     # baseline + agent-minus-expert gap, refreshed every bc_track_expert_every
-    # det-evals (0 = off).  Stashed here, logged into each train_log row.
+    # det-evals (0 = off).  Logged only on the collecting jsonl row.
     bc_track_expert_every = int(getattr(cfg, 'bc_track_expert_every', 0) or 0)
     _expert_eval_count = 0
     last_expert_det_return: Optional[float] = None
     last_agent_minus_expert: Optional[float] = None
+    bc_track_fresh = False
 
     # ----- Early-stop bookkeeping -----
     es_enable = bool(getattr(cfg, 'early_stop_enable', True))
@@ -14232,6 +14234,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             last_expert_det_return = float(_xep['rew'].sum())
                             last_agent_minus_expert = (
                                 ret_eval - last_expert_det_return)
+                            bc_track_fresh = True
                         except Exception as _bce:
                             print(f"[bc-track] expert eval skipped @iter"
                                   f"{total_iters}: {_bce!r}", flush=True)
@@ -14803,8 +14806,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     0, int(n_grad_skip) - int(grad_skip_prev_total)),
                 'buf_fill_pct': float(buf.filled) / max(1, buf.capacity_eps),
                 'wm_frozen': bool(_wm_frozen_now),
-                'expert_det_return': last_expert_det_return,
-                'agent_minus_expert_return': last_agent_minus_expert,
+                'expert_det_return': (
+                    last_expert_det_return if bc_track_fresh else None),
+                'agent_minus_expert_return': (
+                    last_agent_minus_expert if bc_track_fresh else None),
                 'p1_last_ok_iter': (int(p1_last_ok_iter)
                                     if int(p1_last_ok_iter) >= 0 else None),
                 'p1_last_ok_locked': bool(p1_last_ok_locked),
@@ -14831,6 +14836,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                                            if int(wm_score_ema_best_iter) >= 0
                                            else None),
             }
+            bc_track_fresh = False
             for k, v in {**wm_losses, **ag_losses, **ac_losses}.items():
                 row[k] = float(v.detach().item() if torch.is_tensor(v) else v)
             # Diagnosis scripts look for ``wm_gain_match_loss`` / isolation

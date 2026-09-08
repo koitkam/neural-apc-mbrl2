@@ -55,22 +55,19 @@ from typing import Dict, List, Optional
 import numpy as np
 
 
-def _knob_raw(cfg, field: str, env_key: str = ''):
-    """TrainConfig field only. ``env_key`` unused (leftover dual-read REMOVED).
+def _knob_raw(cfg, field: str):
+    """TrainConfig field only (login leftover dual-read REMOVED).
 
-    Login leftover ``DREAMER_*`` without ``_cfg_from_env`` is ignored.
-    A/B via ``ENV_OVERRIDES``. Leftover-flag return dropped (P93-live;
-    was always False after P92 dual-read REMOVED). Empty cfg field is
+    A/B via ``ENV_OVERRIDES`` / ``_cfg_from_env``. Empty cfg field is
     still a sentinel at the caller.
     """
-    del env_key
     if cfg is not None:
         return getattr(cfg, field, None)
     return None
 
 
-def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
-    raw = _knob_raw(cfg, field, env_key)
+def _knob_float(cfg, field: str, default: float) -> float:
+    raw = _knob_raw(cfg, field)
     if raw is None or str(raw).strip() == '':
         return float(default)
     try:
@@ -79,8 +76,7 @@ def _knob_float(cfg, field: str, env_key: str, default: float) -> float:
         return float(default)
 
 
-def _knob_bool(cfg, field: str, env_key: str, default: bool) -> bool:
-    del env_key
+def _knob_bool(cfg, field: str, default: bool) -> bool:
     if cfg is not None:
         return bool(getattr(cfg, field, default))
     return bool(default)
@@ -150,8 +146,7 @@ def hidden_disturbance_enabled(default: bool = True, cfg=None) -> bool:
     ``TrainConfig.hidden_disturbance=False`` / ``DREAMER_HIDDEN_DISTURBANCE=0``
     via ``ENV_OVERRIDES`` (login leftover ignored).
     """
-    return _knob_bool(cfg, 'hidden_disturbance',
-                      'DREAMER_HIDDEN_DISTURBANCE', default)
+    return _knob_bool(cfg, 'hidden_disturbance', default)
 
 
 def _phase_amp_cap(phase: Optional[int], cfg=None) -> float:
@@ -165,11 +160,9 @@ def _phase_amp_cap(phase: Optional[int], cfg=None) -> float:
     """
     p = None if phase is None else int(phase)
     if p is not None and p >= 2:
-        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale_p3',
-                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE_P3', 1.0)
+        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale_p3', 1.0)
     else:
-        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale',
-                          'DREAMER_HIDDEN_OU_AMP_MAX_SCALE', 0.2)
+        cap = _knob_float(cfg, 'hidden_ou_amp_max_scale', 0.2)
     return float(np.clip(cap, 0.0, 1.0))
 
 
@@ -184,8 +177,7 @@ def curriculum_amp_scale(progress: float, phase: Optional[int] = None,
     deployment amp). Malformed/empty field → cap.
     """
     cap = _phase_amp_cap(phase, cfg)
-    raw = _knob_raw(cfg, 'hidden_ou_amp_ramp',
-                    'DREAMER_HIDDEN_OU_AMP_RAMP')
+    raw = _knob_raw(cfg, 'hidden_ou_amp_ramp')
     text = '0.1:0.4' if raw is None else str(raw).strip()
     if not text:
         return cap
@@ -216,8 +208,7 @@ def _sample_amp_jitter(rng: np.random.Generator, cfg=None) -> float:
     """
     # Default ON (P37 onward): uniform ±60% around nominal amplitude.
     # Set ``DREAMER_HIDDEN_OU_AMP_JITTER=1.0:1.0`` to disable.
-    raw = _knob_raw(cfg, 'hidden_ou_amp_jitter',
-                    'DREAMER_HIDDEN_OU_AMP_JITTER')
+    raw = _knob_raw(cfg, 'hidden_ou_amp_jitter')
     text = '0.6:1.6' if raw is None else str(raw).strip()
     if not text:
         return 1.0
@@ -244,8 +235,7 @@ def _sample_drift_frac(rng: np.random.Generator, cfg=None) -> float:
     # Default ON (P37 onward): up to ±40% of nominal amplitude as a
     # constant per-episode mean offset.  Set ``DREAMER_HIDDEN_OU_DRIFT_FRAC=0``
     # to disable.
-    mx = _knob_float(cfg, 'hidden_ou_drift_frac',
-                     'DREAMER_HIDDEN_OU_DRIFT_FRAC', 0.4)
+    mx = _knob_float(cfg, 'hidden_ou_drift_frac', 0.4)
     if mx <= 0.0:
         return 0.0
     return float(rng.uniform(-mx, mx))
@@ -266,18 +256,15 @@ def get_phase_disturbance_prob(
     # ---- P3 ----
     if int(phase) >= 3:
         p3_cap = float(np.clip(
-            _knob_float(cfg, 'disturbance_prob_agent',
-                        'DREAMER_DISTURBANCE_PROB_AGENT', 0.3),
+            _knob_float(cfg, 'disturbance_prob_agent', 0.3),
             0.0, 1.0))
         p3_floor = float(np.clip(
-            _knob_float(cfg, 'disturbance_prob_p2',
-                        'DREAMER_DISTURBANCE_PROB_P2', 0.2),
+            _knob_float(cfg, 'disturbance_prob_p2', 0.2),
             0.0, 1.0))
         if phase_progress is None:
             return p3_cap
         reach = float(np.clip(
-            _knob_float(cfg, 'hidden_ou_prob_p3_ramp_reach',
-                        'DREAMER_HIDDEN_OU_PROB_P3_RAMP_REACH', 0.5),
+            _knob_float(cfg, 'hidden_ou_prob_p3_ramp_reach', 0.5),
             1e-6, 1.0))
         pp = float(np.clip(phase_progress, 0.0, 1.0))
         if pp >= reach:
@@ -285,23 +272,20 @@ def get_phase_disturbance_prob(
         return float(p3_floor + (p3_cap - p3_floor) * (pp / reach))
 
     wm_cap = float(np.clip(
-        _knob_float(cfg, 'disturbance_prob_wm',
-                    'DREAMER_DISTURBANCE_PROB_WM', 0.10),
+        _knob_float(cfg, 'disturbance_prob_wm', 0.10),
         0.0, 1.0))
 
     # ---- P2 ----
     if int(phase) == 2:
         p2_cap = float(np.clip(
-            _knob_float(cfg, 'disturbance_prob_p2',
-                        'DREAMER_DISTURBANCE_PROB_P2', 0.2),
+            _knob_float(cfg, 'disturbance_prob_p2', 0.2),
             0.0, 1.0))
         if p2_cap < wm_cap:
             p2_cap = wm_cap
         if phase_progress is None:
             return p2_cap
         reach = float(np.clip(
-            _knob_float(cfg, 'hidden_ou_prob_p2_ramp_reach',
-                        'DREAMER_HIDDEN_OU_PROB_P2_RAMP_REACH', 0.5),
+            _knob_float(cfg, 'hidden_ou_prob_p2_ramp_reach', 0.5),
             1e-6, 1.0))
         pp = float(np.clip(phase_progress, 0.0, 1.0))
         if pp >= reach:
@@ -312,18 +296,14 @@ def get_phase_disturbance_prob(
     if wm_best_score is None:
         return wm_cap
     p_min = float(np.clip(
-        _knob_float(cfg, 'hidden_ou_prob_min',
-                    'DREAMER_HIDDEN_OU_PROB_MIN', 0.05),
+        _knob_float(cfg, 'hidden_ou_prob_min', 0.05),
         0.0, 1.0))
-    p_max_raw = _knob_float(cfg, 'hidden_ou_prob_max',
-                            'DREAMER_HIDDEN_OU_PROB_MAX', -1.0)
+    p_max_raw = _knob_float(cfg, 'hidden_ou_prob_max', -1.0)
     p_max = wm_cap if p_max_raw < 0.0 else float(p_max_raw)
     p_max = float(np.clip(p_max, 0.0, 1.0))
     if p_max < p_min:
         p_max = p_min
-    target = float(max(_knob_float(
-        cfg, 'hidden_ou_prob_target_score',
-        'DREAMER_HIDDEN_OU_PROB_TARGET_SCORE', 2.0), 1e-6))
+    target = float(max(_knob_float(cfg, 'hidden_ou_prob_target_score', 2.0), 1e-6))
     score = float(max(0.0, wm_best_score))
     frac = float(np.clip(score / target, 0.0, 1.0))
     return float(p_min + (p_max - p_min) * frac)
@@ -464,20 +444,16 @@ class HiddenDisturbance:
         sr = max(1e-6, float(sample_rate))
         tau_steps = max(1.0, float(tau_dom) / sr)         # agent steps
         dead_steps = max(0.0, float(dead_time) / sr)
-        n_settle = _knob_float(cfg, 'hidden_dist_settle_n_tau',
-                               'DREAMER_HIDDEN_DIST_SETTLE_NTAU', 4.0)
+        n_settle = _knob_float(cfg, 'hidden_dist_settle_n_tau', 4.0)
         settle = max(2.0, dead_steps + n_settle * tau_steps)
         self._settle = float(settle)
         self._tau_steps = float(tau_steps)
         T = int(episode_length)
-        max_events = int(_knob_float(cfg, 'hidden_dist_max_events',
-                                     'DREAMER_HIDDEN_DIST_MAX_EVENTS', 6.0))
+        max_events = int(_knob_float(cfg, 'hidden_dist_max_events', 6.0))
         p_isolated = float(np.clip(
-            _knob_float(cfg, 'hidden_dist_p_isolated',
-                        'DREAMER_HIDDEN_DIST_P_ISOLATED', 0.5), 0.0, 1.0))
+            _knob_float(cfg, 'hidden_dist_p_isolated', 0.5), 0.0, 1.0))
         p_revert = float(np.clip(
-            _knob_float(cfg, 'hidden_dist_p_revert',
-                        'DREAMER_HIDDEN_DIST_P_REVERT', 0.7), 0.0, 1.0))
+            _knob_float(cfg, 'hidden_dist_p_revert', 0.7), 0.0, 1.0))
         shapes = ['step', 'ramp', 'pulse']
         weights = self._shape_weights()
 
@@ -488,10 +464,8 @@ class HiddenDisturbance:
         # sim-adaptive (from the identified plant) + env-overridable.  UNIT DC
         # gain (the lag has no extra gain) so the authority-based amp cap on
         # the load is preserved at the CV.
-        tau_raw = _knob_raw(cfg, 'hidden_dist_tau_frac',
-                            'DREAMER_HIDDEN_DIST_TAU_FRAC')
-        dt_raw = _knob_raw(cfg, 'hidden_dist_deadtime_frac',
-                           'DREAMER_HIDDEN_DIST_DEADTIME_FRAC')
+        tau_raw = _knob_raw(cfg, 'hidden_dist_tau_frac')
+        dt_raw = _knob_raw(cfg, 'hidden_dist_deadtime_frac')
         tau_lo, tau_hi = _parse_pair(tau_raw, 0.5, 1.0)
         dt_lo, dt_hi = _parse_pair(dt_raw, 0.5, 1.5)
         self.tau_d_steps = np.maximum(
@@ -516,8 +490,7 @@ class HiddenDisturbance:
         # the whole episode (a realistic sequence of distinct upsets) instead of
         # the legacy front-loaded sequential placement.  Set
         # ``DREAMER_HIDDEN_DIST_SPREAD=0`` to restore the legacy placement.
-        spread = _knob_bool(cfg, 'hidden_dist_spread',
-                            'DREAMER_HIDDEN_DIST_SPREAD', True)
+        spread = _knob_bool(cfg, 'hidden_dist_spread', True)
         events: List[Dict] = []
         if spread:
             earliest = float(rng.uniform(0.0, settle))
@@ -584,9 +557,7 @@ class HiddenDisturbance:
         # ``ou_drift`` shape — a per-step random walk that read as
         # high-frequency noise — is removed.)
         default = np.array([0.5, 0.3, 0.2], dtype='float64')
-        raw = _knob_raw(getattr(self, '_cfg', None),
-                        'hidden_dist_shape_weights',
-                        'DREAMER_HIDDEN_DIST_SHAPE_WEIGHTS')
+        raw = _knob_raw(getattr(self, '_cfg', None), 'hidden_dist_shape_weights')
         text = '' if raw is None else str(raw).strip()
         if text:
             try:
