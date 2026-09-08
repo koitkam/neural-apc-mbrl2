@@ -8318,8 +8318,9 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # never reached the identified settling length when H >= seq_len
     # (P25-family: forward Huber tiny, transfer-matrix DC dead).  The
     # roll holds a/dv from the start — no future obs needed.  When
-    # T > K keep the historical start restriction (test_sim T=64,
-    # K=55 → n_valid=9).  When T <= K roll the full K from every start.
+    # T > K keep the historical start restriction (env-free test_sim
+    # T=128, K=55 → n_valid=73; rest-IC skips this start grid).  When
+    # T <= K roll the full K from every start.
     # P60: do NOT ``or 1.0`` — dataclass sentinel 0.0 would silently
     # become the P59 teacher (Δu=1) that disagrees with val TM 0.4.
     step = _resolve_gain_match_step(cfg)
