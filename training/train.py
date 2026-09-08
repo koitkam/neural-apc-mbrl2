@@ -849,10 +849,10 @@ class TrainConfig:
     # (the 3 stages = phases P1/P2/P3, budgeted by phase{1,2,3}_frac):
     #   Stage 1 (P1): CLEAN (hidden disturbance OFF) + DOB d_t SUPPRESSED ->
     #     g learns the UNBIASED input->CV gain (no omitted-variable confound).
-    #   Stage 2 (P2): FREEZE g (NOT the DOB) + disturbance ON + d_t ACTIVE ->
-    #     the recon innovation trains the Kalman observer (A,K) on the fixed g
-    #     (all CV movement g can't explain is attributed to d_t = identifiable).
-    #     (reuses the P2 loss path; BC also warms the actor as a free bonus.)
+    #   Stage 2 (P2): g recon-finetune + Kalman K (A pinned) + disturbance ON
+    #     + d_t ACTIVE (P108 froze g; P109 trains g; P110 also runs P1
+    #     gain-match/overshoot/held while leftover mixes in feat). Recon +
+    #     Kalman ID; leftover-in-feat. BC still warms the actor.
     #   Stage 3 (P3): FREEZE g AND the DOB + disturbance + domain-randomization
     #     ON -> actor/critic train on the static unbiased WM + working observer
     #     and learn to REJECT disturbances (d_t feed-forward) for runtime
@@ -3690,6 +3690,9 @@ def _actor_experiment_valid(*,
     ``wm_best`` is the lucky-spike path — also invalid.  Restoring
     ``wm_last_ok`` (late healthy P1) is valid unless the gain probe
     also capped GAIN_NOT_READY.
+    P2 g recon-finetune (P109/P110) is not re-probed here: this flag
+    keys off P1 ``gain_not_ready_capped`` / wm_best. Freeze TM of live
+    P2 g is val-only (P109 freeze 0.95@MV → val ×0.170 still VALID).
     """
     if gain_not_ready_capped:
         return False
@@ -12523,8 +12526,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # Stage-1 state applied BEFORE the seed fill so the seed buffer is
         # collected CLEAN (no hidden disturbance) and the DOB is suppressed
         # (d_t==0 -> g must explain all CV movement).  wm_freeze_after_p1 is
-        # forced off so the Stage-2 (P2) loss keeps wm_total (its recon
-        # innovation is what trains the observer on the frozen g).
+        # forced off so the Stage-2 (P2) loss keeps wm_total (recon + Kalman
+        # K; P109/P110 also recon-finetune g — freeze is STAGE 3).
         wm_freeze_after_p1 = False
         _fz = model.set_world_model_trainable(g=True, dob=False, reward=True)
         model.set_dob_active(False)
