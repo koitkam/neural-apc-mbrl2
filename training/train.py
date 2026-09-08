@@ -2183,6 +2183,13 @@ class TrainConfig:
     gain_ready_levels: int = 5
     gain_ready_noise_max: float = 3.0
     gain_ready_flip_max: int = 1
+    # P112: GAIN-READY DC/noise = median of this many independent 5-level
+    # TM draws.  P111 last_ok 81: orig-P1 0.77@MV (clean), freeze 1.35@MV
+    # (noisy), val TM ×0.909 on the same frozen g.  ``compute_transfer_matrix``
+    # ``seed=`` is unused; ``sim.reset`` IC/DR advances — a single draw is
+    # lottery.  Band / noise / 1step→OL gates UNCHANGED.  1 restores P111
+    # identity (A/B ``DREAMER_GAIN_READY_PROBE_REPEATS``).  Clamp 1–9.
+    gain_ready_probe_repeats: int = 3
     wm_best_gain_gate: bool = True
     # WM-fidelity probe / wm_best score (unitless mix).  Cadence and
     # patience stay in *iters* (one WM update ≈ one iter); inject EVERY
@@ -4481,6 +4488,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_len={int(getattr(cfg, 'gain_match_len', 0) or 0)} "
         f"gmatch_traj={'FO' if (float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0) > 0.0 and bool(getattr(cfg, 'gain_match_rest_ic', False))) else '0'} "
+        f"gprobe_R={_gain_ready_probe_repeats(cfg)} "
         f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
         f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
         f"gmatch_rest={bool(getattr(cfg, 'gain_match_rest_ic', False))} "
@@ -10303,6 +10311,73 @@ def _gain_ready_combine(
     return ready, compound_ok
 
 
+def _gain_ready_probe_repeats(cfg: 'TrainConfig') -> int:
+    """Independent 5-level TM draws whose DC/noise are median-merged (P112)."""
+    raw = getattr(cfg, 'gain_ready_probe_repeats', 3)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 3
+    if n <= 0:
+        n = 1
+    return min(n, 9)
+
+
+def _finite_median(vals) -> Optional[float]:
+    xs: List[float] = []
+    for v in vals:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x):
+            xs.append(x)
+    if not xs:
+        return None
+    return float(np.median(np.asarray(xs, dtype=np.float64)))
+
+
+def _median_merge_gain_tm_draws(draws: List[dict]) -> dict:
+    """Median-merge independent 5-level TM draws (P112).
+
+    Per-input DC and @H are the median across draws.  Noise / sign-flips
+    use the median of each draw's aggregate so one noisy lottery cannot
+    veto a val-HEALTHY observer (P111 freeze 1.35@MV vs val ×0.909).
+    Band gates stay on the merged ratios — this is not a looser band.
+    """
+    if not draws:
+        raise ValueError('empty TM draws')
+    if len(draws) == 1:
+        return dict(draws[0])
+    names: List[str] = []
+    seen = set()
+    for d in draws:
+        for n, _ in (d.get('ss_pairs') or []):
+            ns = str(n)
+            if ns not in seen:
+                seen.add(ns)
+                names.append(ns)
+    ss_maps = [dict(d.get('ss_pairs') or []) for d in draws]
+    ath_maps = [dict(d.get('ath_pairs') or []) for d in draws]
+    ss_pairs: List[Tuple[str, float]] = []
+    ath_pairs: List[Tuple[str, float]] = []
+    for n in names:
+        med = _finite_median([m[n] for m in ss_maps if n in m])
+        if med is not None:
+            ss_pairs.append((n, med))
+        amed = _finite_median([m[n] for m in ath_maps if n in m])
+        if amed is not None:
+            ath_pairs.append((n, amed))
+    noise_med = _finite_median([d.get('noise_worst') for d in draws])
+    flip_med = _finite_median([d.get('sign_flips') for d in draws])
+    return {
+        'ss_pairs': ss_pairs,
+        'ath_pairs': ath_pairs,
+        'noise_worst': float(noise_med) if noise_med is not None else 0.0,
+        'sign_flips': int(round(flip_med)) if flip_med is not None else 0,
+    }
+
+
 def _format_gain_probe_line(probe: dict) -> str:
     """Compact P1-gate line: ss + @H per input + unbiased/noise + 1step→OL."""
     pairs = probe.get('ss_pairs') or []
@@ -10326,6 +10401,14 @@ def _format_gain_probe_line(probe: dict) -> str:
             pass
     if probe.get('probed_last_ok'):
         extra += f" last_ok_iter={probe.get('last_ok_iter')}"
+    n_rep = probe.get('probe_repeats')
+    if n_rep is not None and int(n_rep) > 1:
+        extra += f' R={int(n_rep)}'
+        draw_w = probe.get('probe_draw_worsts') or []
+        if draw_w:
+            extra += (' draws['
+                      + ','.join(f'{float(x):.2f}' for x in draw_w)
+                      + ']')
     if pair_s:
         extra += f' pairs[{pair_s}]'
     ath_lo, ath_hi = probe.get('atH_min'), probe.get('atH_max')
@@ -10344,76 +10427,12 @@ def _format_gain_probe_line(probe: dict) -> str:
     )
 
 
-def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
-    """Controlled multi-level step-response GAIN-readiness probe (p20, 2026-08-19).
-
-    Certifies the observer is READY before P1->P2 freezes it — the correlation /
-    gain_fid / per-batch-iso proxies are too noisy (p19 froze a x0.43 g on a
-    lucky batch).  For every MV and DV input, at ``n_levels`` operating points
-    spanning the band, it settles the env, steps the input, rolls the WM
-    open-loop AND the REAL sim, and compares dCV/dinput.  Certifies:
-
-      * UNBIASED   — aggregate DC-gain matches the real plant (ratio in [lo, hi]);
-        at-horizon gain is reported (diagnostic, not a hard gate);
-      * NOT NOISY  — the WM's open-loop gain is CONSISTENT across operating points
-        (its per-level gain band is not much wider than the REAL plant's own, and
-        never flips sign vs the real gain).  p19's bad g had a gain band
-        [-1.65, +1.30] (sign flips) — exactly the "noisy observer" symptom;
-      * STABLE     — measured on the SETTLED open-loop rollout (a diverging WM
-        fails the ratio check);
-      * NOT COMPOUNDING (P93) — 1step→OL in the same [lo, hi] band.  P92 freeze
-        5-level ss/@H READY 0.84@DV but val 1step→OL ×0.638: ss/@H is
-        compounding-blind.  Missing decomp is identity (do not fail closed).
-
-    simulator-AGNOSTIC (the REAL plant is the reference; operating band from the
-    env) and NONLINEAR-ROBUST (the noise check compares the WM's gain spread to
-    the REAL plant's OWN spread, so a genuinely curved plant is allowed while
-    excess WM variance is flagged).  Returns a diag dict or ``None`` (never fatal).
-    """
-    if not _is_rssm_interface(model):
-        return None
-    try:
-        from evaluation.wm_transfer_matrix import (
-            compute_transfer_matrix, compute_dv_transfer_matrix)
-    except Exception as e:
-        print(f'[gain-ready-probe] import failed: {e!r}', flush=True)
-        return None
-    band_lo = float(getattr(cfg, 'gain_ready_lo', 0.80))
-    band_hi = float(getattr(cfg, 'gain_ready_hi', 1.30))
-    n_levels = int(getattr(cfg, 'gain_ready_levels', 5) or 5)
-    _dprob = getattr(env, '_disturbance_prob_override', None)
-    obs_std = None
-    try:
-        _var = np.asarray(env.get_obs_norm_stats().get('var'), dtype='float32')
-        obs_std = np.clip(np.sqrt(np.maximum(_var, 1e-6)), 1e-3, None)
-    except Exception:
-        pass
-    try:
-        env._disturbance_prob_override = 0.0
-        # sample=False = the DETERMINISTIC belief the actor acts on
-        # (_realsim_actor_critic_step uses sample=False).  Verified STABLE +
-        # repeatable across env seeds (p20: P18 gain 1.09 +/-0.05, P19 0.76
-        # +/-0.00) whereas the SAMPLED rollout is noisy (P18 +/-0.90) -- so the
-        # deterministic gain is both the control-relevant AND the reliable
-        # readiness signal.  The per-level figures below are a reported
-        # noise/consistency diagnostic (now stable under sample=False).
-        mv = compute_transfer_matrix(model, env, cfg, device, obs_std=obs_std,
-                                     n_levels=n_levels, sample=False)
-        dv = compute_dv_transfer_matrix(model, env, cfg, device, obs_std=obs_std,
-                                        n_levels=n_levels, sample=False)
-    except Exception as e:
-        print(f'[gain-ready-probe] measure failed: {e!r}', flush=True)
-        return None
-    finally:
-        try:
-            env._disturbance_prob_override = _dprob
-        except Exception:
-            pass
-
-    ss_ratios: List[Tuple[str, float]] = []   # aggregate DC-gain ratio (HARD gate)
-    ath_pairs: List[Tuple[str, float]] = []   # at-horizon ratio (diagnostic)
-    noises: List[float] = []                  # per-pair WM/real gain-spread (diag)
-    flips = 0                                 # WM open-loop gain sign flips (diag)
+def _collect_gain_tm_pairs(mv, dv) -> Optional[dict]:
+    """Pack one MV+DV TM into ss/@H/noise stats (no READY gate)."""
+    ss_ratios: List[Tuple[str, float]] = []
+    ath_pairs: List[Tuple[str, float]] = []
+    noises: List[float] = []
+    flips = 0
 
     def _collect(res, tag):
         nonlocal flips
@@ -10440,13 +10459,47 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
         _collect(dv, 'DV')
     if not ss_ratios:
         return None
-    srs = [r for _, r in ss_ratios]
+    return {
+        'ss_pairs': [(str(n), float(r)) for n, r in ss_ratios],
+        'ath_pairs': [(str(n), float(r)) for n, r in ath_pairs],
+        'noise_worst': float(max(noises)) if noises else 0.0,
+        'sign_flips': int(flips),
+    }
+
+
+def _probe_observer_gain_tm_once(
+        model, env, device, cfg: 'TrainConfig', *,
+        obs_std, n_levels: int,
+) -> Optional[dict]:
+    """One 5-level MV+DV TM draw.  ``seed=`` on the TM helpers is unused."""
+    from evaluation.wm_transfer_matrix import (
+        compute_transfer_matrix, compute_dv_transfer_matrix)
+    mv = compute_transfer_matrix(model, env, cfg, device, obs_std=obs_std,
+                                 n_levels=n_levels, sample=False)
+    dv = compute_dv_transfer_matrix(model, env, cfg, device, obs_std=obs_std,
+                                    n_levels=n_levels, sample=False)
+    return _collect_gain_tm_pairs(mv, dv)
+
+
+def _finalize_gain_ready_probe(
+        tm: dict, *,
+        cfg: 'TrainConfig',
+        model, env, device, obs_std, dprob,
+        n_rep: int,
+        draw_worsts: List[float],
+) -> Optional[dict]:
+    """Apply UNBIASED / NOT-NOISY / compounding gates to merged TM stats."""
+    ss_ratios = list(tm.get('ss_pairs') or [])
+    ath_pairs = list(tm.get('ath_pairs') or [])
+    if not ss_ratios:
+        return None
+    band_lo = float(getattr(cfg, 'gain_ready_lo', 0.80))
+    band_hi = float(getattr(cfg, 'gain_ready_hi', 1.30))
     noise_max = float(getattr(cfg, 'gain_ready_noise_max', 3.0))
     flip_max = int(getattr(cfg, 'gain_ready_flip_max', 1) or 1)
-    worst_noise = float(max(noises)) if noises else 0.0
-    # READY = UNBIASED (every MV+DV DC-gain ratio in band) AND NOT-NOISY
-    # AND compounding (1step→OL in the same band when measured; P93).
-    # atH stays diagnostic (P92 freeze @H was already in band).
+    srs = [r for _, r in ss_ratios]
+    worst_noise = float(tm.get('noise_worst') or 0.0)
+    flips = int(tm.get('sign_flips') or 0)
     unbiased = all(band_lo <= r <= band_hi for r in srs)
     not_noisy = (worst_noise <= noise_max) and (flips <= flip_max)
     worst_name, worst_ratio = min(
@@ -10473,7 +10526,7 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
             compound_ratio = None
         finally:
             try:
-                env._disturbance_prob_override = _dprob
+                env._disturbance_prob_override = dprob
             except Exception:
                 pass
     ready, compound_ok = _gain_ready_combine(
@@ -10501,7 +10554,108 @@ def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
         'n_checks': int(len(srs)), 'band': [band_lo, band_hi],
         'noise_max': noise_max,
         'ss_pairs': [(str(n), float(r)) for n, r in ss_ratios],
+        'probe_repeats': int(n_rep),
+        'probe_draw_worsts': [float(x) for x in draw_worsts],
     }
+
+
+def _probe_observer_gain_ready(model, env, device, cfg: 'TrainConfig'):
+    """Controlled multi-level step-response GAIN-readiness probe (p20, 2026-08-19).
+
+    Certifies the observer is READY before P1->P2 freezes it — the correlation /
+    gain_fid / per-batch-iso proxies are too noisy (p19 froze a x0.43 g on a
+    lucky batch).  For every MV and DV input, at ``n_levels`` operating points
+    spanning the band, it settles the env, steps the input, rolls the WM
+    open-loop AND the REAL sim, and compares dCV/dinput.  Certifies:
+
+      * UNBIASED   — aggregate DC-gain matches the real plant (ratio in [lo, hi]);
+        at-horizon gain is reported (diagnostic, not a hard gate);
+      * NOT NOISY  — the WM's open-loop gain is CONSISTENT across operating points
+        (its per-level gain band is not much wider than the REAL plant's own, and
+        never flips sign vs the real gain).  p19's bad g had a gain band
+        [-1.65, +1.30] (sign flips) — exactly the "noisy observer" symptom;
+      * STABLE     — measured on the SETTLED open-loop rollout (a diverging WM
+        fails the ratio check);
+      * NOT COMPOUNDING (P93) — 1step→OL in the same [lo, hi] band.  P92 freeze
+        5-level ss/@H READY 0.84@DV but val 1step→OL ×0.638: ss/@H is
+        compounding-blind.  Missing decomp is identity (do not fail closed).
+      * MEDIAN OF R DRAWS (P112) — DC/noise are the median of
+        ``gain_ready_probe_repeats`` independent TM draws (default 3).  P111
+        last_ok 81 was val ×0.909 but orig-P1 0.77@MV / freeze 1.35@MV:
+        ``compute_transfer_matrix`` ``seed=`` is unused and ``sim.reset`` IC/DR
+        advances, so one draw is lottery.  Band unchanged.
+
+    simulator-AGNOSTIC (the REAL plant is the reference; operating band from the
+    env) and NONLINEAR-ROBUST (the noise check compares the WM's gain spread to
+    the REAL plant's OWN spread, so a genuinely curved plant is allowed while
+    excess WM variance is flagged).  Returns a diag dict or ``None`` (never fatal).
+    """
+    if not _is_rssm_interface(model):
+        return None
+    try:
+        from evaluation.wm_transfer_matrix import (  # noqa: F401
+            compute_transfer_matrix, compute_dv_transfer_matrix)
+    except Exception as e:
+        print(f'[gain-ready-probe] import failed: {e!r}', flush=True)
+        return None
+    n_levels = int(getattr(cfg, 'gain_ready_levels', 5) or 5)
+    n_rep = _gain_ready_probe_repeats(cfg)
+    band_lo = float(getattr(cfg, 'gain_ready_lo', 0.80))
+    band_hi = float(getattr(cfg, 'gain_ready_hi', 1.30))
+    _dprob = getattr(env, '_disturbance_prob_override', None)
+    obs_std = None
+    try:
+        _var = np.asarray(env.get_obs_norm_stats().get('var'), dtype='float32')
+        obs_std = np.clip(np.sqrt(np.maximum(_var, 1e-6)), 1e-3, None)
+    except Exception:
+        pass
+    draws: List[dict] = []
+    draw_worsts: List[float] = []
+    try:
+        env._disturbance_prob_override = 0.0
+        # sample=False = the DETERMINISTIC belief the actor acts on
+        # (_realsim_actor_critic_step uses sample=False).  Verified STABLE +
+        # repeatable across env seeds (p20: P18 gain 1.09 +/-0.05, P19 0.76
+        # +/-0.00) whereas the SAMPLED rollout is noisy (P18 +/-0.90) -- so the
+        # deterministic gain is both the control-relevant AND the reliable
+        # readiness signal.  The per-level figures below are a reported
+        # noise/consistency diagnostic (now stable under sample=False).
+        # P112: R independent draws; env/sim RNG advances between them.
+        for i in range(n_rep):
+            try:
+                one = _probe_observer_gain_tm_once(
+                    model, env, device, cfg,
+                    obs_std=obs_std, n_levels=n_levels)
+            except Exception as e:
+                print(f'[gain-ready-probe] measure failed draw {i + 1}/{n_rep}: '
+                      f'{e!r}', flush=True)
+                one = None
+            if one is None:
+                continue
+            draws.append(one)
+            srs = list(one.get('ss_pairs') or [])
+            if srs:
+                _wn, _wr = min(
+                    srs, key=lambda x: min(x[1] - band_lo, band_hi - x[1]))
+                draw_worsts.append(float(_wr))
+    finally:
+        try:
+            env._disturbance_prob_override = _dprob
+        except Exception:
+            pass
+    if not draws:
+        return None
+    if n_rep > 1:
+        print(
+            f'[gain-ready-probe] median of {len(draws)}/{n_rep} TM draws '
+            f'worsts=[{", ".join(f"{w:.2f}" for w in draw_worsts)}]',
+            flush=True)
+    merged = _median_merge_gain_tm_draws(draws)
+    return _finalize_gain_ready_probe(
+        merged, cfg=cfg, model=model, env=env, device=device,
+        obs_std=obs_std, dprob=_dprob, n_rep=n_rep,
+        draw_worsts=draw_worsts)
+
 
 
 def _load_module_state(

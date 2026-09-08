@@ -476,6 +476,7 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     'DREAMER_GAIN_READY_LEVELS':   ('gain_ready_levels',          int),
     'DREAMER_GAIN_READY_NOISE_MAX': ('gain_ready_noise_max',      float),
     'DREAMER_GAIN_READY_FLIP_MAX': ('gain_ready_flip_max',        int),
+    'DREAMER_GAIN_READY_PROBE_REPEATS': ('gain_ready_probe_repeats', int),
     'DREAMER_WM_BEST_GAIN_GATE':   ('wm_best_gain_gate',          _as_bool),
     'DREAMER_WM_FIDELITY_EMA_ALPHA': ('wm_fidelity_ema_alpha',    float),
     'DREAMER_WM_FIDELITY_WARMUP_ITERS': ('wm_fidelity_warmup_iters', int),

@@ -99,6 +99,8 @@ from training.train import (
                             _p3_mu_ratio_surrogate, _p3_frozen_unfreeze_policy,
                             _format_gain_probe_line,
                             _gain_ready_combine,
+                            _gain_ready_probe_repeats,
+                            _median_merge_gain_tm_draws,
                             _isolation_seq_is_mv, _snr_build_report,
                             _snr_moving_average,
                             _as_hold_action, _per_mv_hold_rows,
@@ -385,6 +387,38 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         band_lo=0.80, band_hi=1.30)
     assert r is False and cok is True
     print('[smoke] OK  GAIN-READY compounding 1step→OL in existing band (P93)')
+    assert int(TrainConfig().gain_ready_probe_repeats) == 3
+    assert _gain_ready_probe_repeats(TrainConfig()) == 3
+    _c_r1 = TrainConfig()
+    _c_r1.gain_ready_probe_repeats = 1
+    assert _gain_ready_probe_repeats(_c_r1) == 1
+    _c_r0 = TrainConfig()
+    _c_r0.gain_ready_probe_repeats = 0
+    assert _gain_ready_probe_repeats(_c_r0) == 1
+    d1 = {'ss_pairs': [('MV a', 0.77), ('DV b', 0.81)],
+          'ath_pairs': [('MV a', 0.55), ('DV b', 0.82)],
+          'noise_worst': 0.5, 'sign_flips': 1}
+    d2 = {'ss_pairs': [('MV a', 1.35), ('DV b', 0.81)],
+          'ath_pairs': [('MV a', 1.74), ('DV b', 0.81)],
+          'noise_worst': 4.0, 'sign_flips': 2}
+    d3 = {'ss_pairs': [('MV a', 0.91), ('DV b', 0.82)],
+          'ath_pairs': [('MV a', 0.78), ('DV b', 0.85)],
+          'noise_worst': 1.0, 'sign_flips': 0}
+    merged = _median_merge_gain_tm_draws([d1, d2, d3])
+    ss = dict(merged['ss_pairs'])
+    ath = dict(merged['ath_pairs'])
+    assert abs(ss['MV a'] - 0.91) < 1e-9
+    assert abs(ss['DV b'] - 0.81) < 1e-9
+    assert abs(ath['MV a'] - 0.78) < 1e-9
+    assert abs(merged['noise_worst'] - 1.0) < 1e-9
+    assert int(merged['sign_flips']) == 1
+    r, cok = _gain_ready_combine(
+        unbiased=all(0.80 <= v <= 1.30 for v in ss.values()),
+        not_noisy=(merged['noise_worst'] <= 3.0
+                   and int(merged['sign_flips']) <= 1),
+        compound_ratio=None, band_lo=0.80, band_hi=1.30)
+    assert r is True and cok is None
+    print('[smoke] OK  GAIN-READY median of 3 TM draws (P112; P111 0.77/1.35/0.91)')
     assert float(TrainConfig().skip_storm_last_ok_recon_ratio) == 5.0
     assert bool(TrainConfig().wm_best_restore_at_p2) is False
     assert bool(TrainConfig().wm_best_restore_at_p3) is False
@@ -1250,6 +1284,8 @@ def _test_cli_only_env_disjoint() -> None:
     }
     assert 'DREAMER_SAMPLE_RATE' in ENV_OVERRIDES
     assert ENV_OVERRIDES['DREAMER_SAMPLE_RATE'][0] == 'sample_rate'
+    assert ENV_OVERRIDES['DREAMER_GAIN_READY_PROBE_REPEATS'][0] == (
+        'gain_ready_probe_repeats')
     print('[smoke] OK  _CLI_ONLY_ENV disjoint from ENV_OVERRIDES')
 
 
@@ -2228,6 +2264,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
     assert "gmatch_traj={'FO' if" in _src
+    assert 'gprobe_R=' in _src
     assert 'f"gmatch_ol_tail=0 "' not in _src
     assert "persist {_lf('gain_match_ol_persist_rel')}" in _src
     assert "gmatch_step={float(getattr(cfg, 'gain_match_step'" in _src
@@ -2887,6 +2924,7 @@ def _test_envfree_observer_recipe() -> None:
     assert 'DREAMER_ACTOR_KL_COEF' not in ENV_OVERRIDES
     assert not hasattr(c, 'actor_kl_coef')
     assert 'DREAMER_GAIN_MATCH_HUBER_PER_INPUT' in ENV_OVERRIDES
+    assert 'DREAMER_GAIN_READY_PROBE_REPEATS' in ENV_OVERRIDES
     assert 'DREAMER_GAIN_MATCH_CLIP_REALIZED' in ENV_OVERRIDES
     assert 'DREAMER_WM_ISOLATION_VAR_NORM' not in ENV_OVERRIDES
     assert not hasattr(c, 'wm_isolation_var_norm')
@@ -5866,6 +5904,17 @@ def _test_format_gain_probe_line() -> None:
         'probed_last_ok': True, 'last_ok_iter': 81,
     })
     assert 'last_ok_iter=81' in line_lo
+    line_r = _format_gain_probe_line({
+        'gain_ready': True,
+        'r_min': 0.91, 'r_max': 0.91,
+        'worst_ratio': 0.91, 'worst_input': 'MV a',
+        'band': [0.8, 1.3], 'noise_worst': 1.0, 'sign_flips': 1,
+        'n_checks': 1, 'unbiased': True, 'not_noisy': True,
+        'ss_pairs': [('MV a', 0.91)],
+        'probe_repeats': 3, 'probe_draw_worsts': [0.77, 1.35, 0.91],
+    })
+    assert 'R=3' in line_r
+    assert 'draws[0.77,1.35,0.91]' in line_r
     print('[smoke] OK  gain-probe line prints ss and @H')
 
 
@@ -5967,6 +6016,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'gmatch_settle=-1' in banner, banner
     assert 'gmatch_len=55' in banner, banner
     assert 'gmatch_traj=0' in banner, banner
+    assert 'gprobe_R=3' in banner, banner
     assert 'gmatch_fo' not in banner, banner
     assert 'gmatch_ol_tail' not in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
