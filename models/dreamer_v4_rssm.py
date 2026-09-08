@@ -762,6 +762,17 @@ class RSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
+            # P114: K = σ(bias + MLP(stop-grad decode-core)). Zero-init last
+            # Linear so the first step matches P100–P113 scalar K. Core =
+            # feat[:decode_in] (h,z,c,dv) — not the d-tail, so K is not a
+            # function of the load it is integrating.
+            self.dob_k_net = _MLP(
+                self._decode_in_dim, self.n_cv,
+                hidden_dim=self.hidden_dim, num_layers=1)
+            _k_last = self.dob_k_net.net[-1]
+            if isinstance(_k_last, nn.Linear):
+                nn.init.zeros_(_k_last.weight)
+                nn.init.zeros_(_k_last.bias)
     @property
     def feat_dim(self) -> int:
         # Scope 2: the head-facing feature includes the DV feedforward (dv_dim
@@ -826,8 +837,22 @@ class RSSMDynamics(nn.Module):
     def dob_decay(self) -> torch.Tensor:
         return torch.sigmoid(self.dob_log_decay)
 
-    def dob_gain(self) -> torch.Tensor:
-        return torch.sigmoid(self.dob_log_gain)
+    def dob_gain(self, feat: torch.Tensor | None = None) -> torch.Tensor:
+        """Luenberger K ∈ (0, 1). P97 scalar bias; P114 adds MLP(stop-grad core).
+
+        ``feat`` is RSSM ``prior.feat`` or the decode-core slice. The d-tail is
+        dropped so K is not a function of the load it is integrating.
+        ``feat=None`` returns the bias-only K (jsonl / init). Applied K is
+        stashed on ``_dob_k_applied`` for metrics. TSSM keeps scalar K.
+        """
+        logit = self.dob_log_gain
+        k_net = getattr(self, 'dob_k_net', None)
+        if feat is not None and k_net is not None:
+            core = feat[..., : self._decode_in_dim]
+            logit = logit + k_net(core.detach())
+        k = torch.sigmoid(logit)
+        self._dob_k_applied = k
+        return k
 
     def dob_slow(self) -> torch.Tensor:
         """P110 two-timescale α = 1/(2T) (seq_len), not 1/T / 1/H / (1−A).
@@ -1005,10 +1030,10 @@ class RSSMDynamics(nn.Module):
                 d_slow_post = (1.0 - alpha) * prior.d_slow + alpha * nu
                 d_fast_prior = prior.d - prior.d_slow
                 d_fast_post = (
-                    d_fast_prior + self.dob_gain() * (nu - d_slow_post))
+                    d_fast_prior + self.dob_gain(prior.feat) * (nu - d_slow_post))
                 d_post = d_fast_post + d_slow_post
             else:
-                d_post = prior.d + self.dob_gain() * nu  # = A·d_{t-1} + K·ν
+                d_post = prior.d + self.dob_gain(prior.feat) * nu  # = A·d_{t-1} + K·ν
         # Posterior inherits the prior's exogenous DV feedforward (same measured
         # DV drove both) so ``post.feat`` / ``decode(post.feat)`` expose it.
         post = RSSMState(h=prior.h, z_logits=post_logits, z=post_z, d=d_post,
@@ -1172,15 +1197,18 @@ class RSSMDynamics(nn.Module):
         if self.dob_enabled:
             if self.dob_active:
                 # ONE batched prior decode → CV forecast base (d-free), then the
-                # scalar per-CV Kalman.  P100 Luenberger / plant-residual:
+                # per-CV Kalman.  P100 Luenberger / plant-residual:
                 # ν = CV_obs − base (d not residualized);
-                # d_t = A·d_{t-1} + K·ν.  Joseph complementary-filter
+                # d_t = A·d_{t-1} + K·ν.  P114: K may be (B,T,n_cv) from
+                # MLP(stop-grad prior core); scan ``u`` carries K_t·(ν−d_slow).
+                # Joseph complementary-filter
                 # d_t = (1−K)·A·d_{t-1} + K·(CV_obs − base) capped SS gain
                 # at 1/A (P99 val pred_std 0.628 vs 1.93).
                 prior_core = _stack_decode_core(ph_l, pz_l, pc_l, pdv_l)
                 base = self.decode(prior_core).index_select(-1, self.cv_index_t)
                 cv_obs = obs.index_select(-1, self.cv_index_t)        # (B, T, n_cv)
-                A = self.dob_decay(); K = self.dob_gain()             # (n_cv,)
+                A = self.dob_decay()
+                K = self.dob_gain(prior_core)                         # (B, T, n_cv) or (n_cv,)
                 nu = cv_obs - base                                    # plant residual
                 # P103 two-timescale: d_slow = EMA_α(ν), d_fast = Luenberger
                 # on (ν − d_slow). Served ds = sum (recon / apply_dob / feat).

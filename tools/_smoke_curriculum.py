@@ -100,6 +100,10 @@ def _check(wm_type):
     assert g_ref.requires_grad and not dob_decay.requires_grad \
         and not dob_gain.requires_grad and rew_ref.requires_grad, \
         'Stage1 partition wrong'
+    k_net1 = getattr(rssm, 'dob_k_net', None)
+    if k_net1 is not None:
+        assert not any(p.requires_grad for p in k_net1.parameters()), \
+            'P114: k_net frozen in Stage-1'
     assert not rssm.dob_active, 'Stage1 dob_active must be False'
     print(f'[smoke] OK  Stage1 partition g=train dob=frozen reward=train, '
           f'dob_active=False {fz1} [{wm_type}]')
@@ -109,6 +113,10 @@ def _check(wm_type):
     assert (not g_ref.requires_grad) and (not dob_decay.requires_grad) \
         and dob_gain.requires_grad and rew_ref.requires_grad, \
         'Stage2 partition wrong (P99: A pinned, K trains)'
+    k_net = getattr(rssm, 'dob_k_net', None)
+    if k_net is not None:
+        assert all(p.requires_grad for p in k_net.parameters()), \
+            'P114: k_net must train in Stage-2'
     assert rssm.dob_active, 'Stage2 dob_active must be True'
     print(f'[smoke] OK  Stage2 partition g=FROZEN dob=K-only (A pinned) reward=train, '
           f'dob_active=True {fz2} [{wm_type}]')
@@ -117,6 +125,9 @@ def _check(wm_type):
     assert (not g_ref.requires_grad) and (not dob_decay.requires_grad) \
         and (not dob_gain.requires_grad) and rew_ref.requires_grad, \
         'Stage3 partition wrong'
+    if k_net is not None:
+        assert not any(p.requires_grad for p in k_net.parameters()), \
+            'P114: k_net frozen in Stage-3'
     print(f'[smoke] OK  Stage3 partition g=FROZEN dob=FROZEN reward=train '
           f'{fz3} [{wm_type}]')
 
@@ -145,6 +156,9 @@ def _check(wm_type):
     losses['wm_total'].backward()
     g_grad = _grad_sum(g_ref)
     dob_grad = _grad_sum(dob_decay) + _grad_sum(dob_gain)
+    knet = getattr(rssm, 'dob_k_net', None)
+    if knet is not None:
+        dob_grad += sum(_grad_sum(p) for p in knet.parameters())
     assert g_grad > 0.0, 'Stage1: g must get recon gradient'
     assert dob_grad == 0.0, 'Stage1: DOB must get NO gradient (suppressed+frozen)'
     print(f'[smoke] OK  Stage1: recon trains g (|g_grad|={g_grad:.4f}) and NOT '
@@ -165,6 +179,10 @@ def _check(wm_type):
     assert g_grad == 0.0, 'Stage2: g is FROZEN -> must get NO gradient'
     assert k_grad > 0.0, 'Stage2: K must get Kalman-ID gradient'
     assert a_grad == 0.0, 'Stage2 P99: A is pinned -> must get NO gradient'
+    knet = getattr(rssm, 'dob_k_net', None)
+    if knet is not None:
+        kn_grad = sum(_grad_sum(p) for p in knet.parameters())
+        assert kn_grad > 0.0, 'Stage2: k_net must get Kalman-ID gradient'
     assert float(losses['dob_reg']) > 0.0, 'Stage2: dob_reg must be active'
     # P28 follow-up 11: overshoot/held/gain-match train g; skip when frozen.
     assert float(losses.get('wm_overshoot_loss', 0.0)) == 0.0, \

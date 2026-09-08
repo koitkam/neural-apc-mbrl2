@@ -4502,6 +4502,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_reconsg=True "
         f"dob_afreeze=True "
         f"dob_luen=True "
+        f"dob_kfeat=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -4801,7 +4802,7 @@ def _dynamics_g_trainable(model: 'DreamerV4') -> bool:
         return False
     dob_names = ('dob_log_decay', 'dob_log_gain')
     for n, p in dyn.named_parameters():
-        if n in dob_names:
+        if n in dob_names or n.startswith('dob_'):
             continue
         if p.requires_grad:
             return True
@@ -9281,8 +9282,11 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         # P99 observability: sigmoid(A), sigmoid(K). No extra WM forward.
         'dob_A': (rssm.dob_decay().mean().detach()
                   if dob_on else torch.zeros((), device=feats.device)),
-        'dob_K': (rssm.dob_gain().mean().detach()
-                  if dob_on else torch.zeros((), device=feats.device)),
+        'dob_K': (
+            (getattr(rssm, '_dob_k_applied', None).float().mean().detach()
+             if getattr(rssm, '_dob_k_applied', None) is not None
+             else rssm.dob_gain().mean().detach())
+            if dob_on else torch.zeros((), device=feats.device)),
         # P110: 1/(2T) vs P108 1/T. Watch vs 0.00781 on test_sim (T=128 → 0.00391).
         'dob_slow_alpha': (rssm.dob_slow().mean().detach()
                            if dob_on and hasattr(rssm, 'dob_slow')

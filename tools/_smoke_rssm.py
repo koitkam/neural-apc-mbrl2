@@ -2437,6 +2437,9 @@ def _test_isolation_dcv_scales() -> None:
     assert 'dob_reconsg=True' in _src
     assert 'dob_afreeze=True' in _src
     assert 'dob_luen=True' in _src
+    assert 'dob_kfeat=True' in _src
+    assert 'dob_k_net' in _rssm_src
+    assert 'def dob_gain' in _rssm_src
     assert 'p2g=True' not in _src
     assert 'p2gaux=True' not in _src
     assert 'g recon-finetune' not in _src
@@ -2453,6 +2456,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "row.setdefault('dob_slow_alpha'" in _src
     assert 'ds_f[:, 1:] - ds_f[:, :-1]' not in _src
     assert 'P2 pin A (decay stays at init)' in _v4_src
+    assert "_n.startswith('dob_')" in _v4_src
     assert 'coef = (1.0 - K) * A' not in _rssm_src
     _tssm_src = _P(_tr.__file__).resolve().parents[1].joinpath(
         'models/transformer_ssm.py').read_text()
@@ -6157,6 +6161,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'gmatch_len=55' in banner, banner
     assert 'gmatch_traj=0' in banner, banner
     assert 'gprobe_R=3' in banner, banner
+    assert 'dob_kfeat=True' in banner, banner
     assert 'gmatch_fo' not in banner, banner
     assert 'gmatch_ol_tail' not in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
@@ -6292,7 +6297,11 @@ def _test_p2_recon_stopgrad_d() -> None:
     dyn = model.dynamics
     A = dyn.dob_log_decay
     K = dyn.dob_log_gain
+    k_net = getattr(dyn, 'dob_k_net', None)
     assert (not A.requires_grad) and K.requires_grad, 'P99: pin A, train K'
+    if k_net is not None:
+        assert all(p.requires_grad for p in k_net.parameters()), \
+            'P114: k_net trains with K in P2'
     B, T = 2, cfg.seq_len
     batch = {
         'obs': torch.randn(B, T, cfg.obs_dim),
@@ -6303,10 +6312,19 @@ def _test_p2_recon_stopgrad_d() -> None:
         'dist': torch.randn(B, T, 1) * 2,
     }
 
+    def _knet_grad_norm() -> float:
+        if k_net is None:
+            return 0.0
+        s = 0.0
+        for p in k_net.parameters():
+            if p.grad is not None:
+                s += float(p.grad.abs().sum())
+        return s
+
     def _dob_grad_norm() -> float:
         ga = 0.0 if A.grad is None else float(A.grad.abs().sum())
         gk = 0.0 if K.grad is None else float(K.grad.abs().sum())
-        return ga + gk
+        return ga + gk + _knet_grad_norm()
 
     model.zero_grad(set_to_none=True)
     losses, _, _ = world_model_loss(model, batch, cfg)
@@ -6316,6 +6334,7 @@ def _test_p2_recon_stopgrad_d() -> None:
     else:
         recon_only = 0.0
     assert recon_only < 1e-7, recon_only
+    assert _knet_grad_norm() < 1e-7
     assert float(losses['dob_ground']) == 0.0
 
     cfg.dob_ground_coef = 2.0
@@ -6326,8 +6345,9 @@ def _test_p2_recon_stopgrad_d() -> None:
     assert float(losses_g['dob_ground']) > 0.0, float(losses_g['dob_ground'])
     assert with_ground > 1e-5, with_ground
     assert (K.grad is not None) and float(K.grad.abs().sum()) > 1e-5
+    assert _knet_grad_norm() > 1e-5, _knet_grad_norm()
     assert A.grad is None or float(A.grad.abs().sum()) < 1e-8
-    print('[smoke] OK  P2 recon stop-grad d (K grads from grounding only; A pinned)')
+    print('[smoke] OK  P2 recon stop-grad d (K+k_net grads from grounding only; A pinned)')
 
 
 def _test_p100_luenberger_kalman() -> None:
@@ -6479,6 +6499,80 @@ def _test_stream_serve_matches_rollout() -> None:
           'P3 collect uses obs_step')
 
 
+def _test_p114_kfeat() -> None:
+    """P114: K = σ(bias + MLP(stop-grad decode-core)); init ≡ scalar K.
+
+    Serve vs batched scan must still match when K varies with feat.
+    """
+    from models.dreamer_v4_rssm import stream_serve_step
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
+    cfg.mtp_length = 4
+    cfg.world_model_type = 'rssm'
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.head_hidden = 16
+    cfg.dob_enabled = True
+    cfg.cv_obs_indices = (0,)
+    cfg.compile_mode = 'off'
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    cfg.gain_match_coef = 0.0
+    cfg.wm_input_isolation_coef = 0.0
+    cfg.rssm_joint_embed_coef = 0.0
+    model = build_model(cfg)
+    model.set_dob_active(True)
+    rssm = model.dynamics
+    assert hasattr(rssm, 'dob_k_net')
+    last = rssm.dob_k_net.net[-1]
+    assert isinstance(last, torch.nn.Linear)
+    assert float(last.weight.detach().abs().sum()) == 0.0
+    assert float(last.bias.detach().abs().sum()) == 0.0
+    B, Tseq = 2, cfg.seq_len
+    obs = torch.randn(B, Tseq, cfg.obs_dim)
+    act = torch.rand(B, Tseq, cfg.action_dim) * 2 - 1
+    core = torch.randn(B, Tseq, rssm._decode_in_dim)
+    k_bias = rssm.dob_gain()
+    k_feat = rssm.dob_gain(core)
+    assert k_bias.shape[-1] == rssm.n_cv
+    assert torch.allclose(k_feat, k_bias.expand_as(k_feat), atol=1e-6, rtol=1e-5), \
+        (float((k_feat - k_bias).abs().max()),)
+    k_init = float(torch.sigmoid(rssm.dob_log_gain).mean())
+    assert abs(float(k_bias.mean()) - k_init) < 1e-6
+
+    model.set_world_model_trainable(g=False, dob=True, reward=False)
+    assert not rssm.dob_log_decay.requires_grad
+    assert rssm.dob_log_gain.requires_grad
+    assert all(p.requires_grad for p in rssm.dob_k_net.parameters())
+    model.set_world_model_trainable(g=True, dob=False, reward=False)
+    assert not any(p.requires_grad for p in rssm.dob_k_net.parameters())
+    model.set_world_model_trainable(g=False, dob=True, reward=False)
+
+    with torch.no_grad():
+        last.weight.normal_(0.0, 0.05)
+        last.bias.normal_(0.0, 0.05)
+    k_feat2 = rssm.dob_gain(core)
+    assert (k_feat2 - k_bias.expand_as(k_feat2)).abs().max() > 1e-4
+
+    feats, *_ = rssm.rollout_observed(obs, act, sample=False, store_aux=False)
+    state = rssm.initial_state(B, obs.device)
+    streamed = []
+    for t in range(Tseq):
+        state = stream_serve_step(
+            rssm, state, act[:, t], obs[:, t], sample=False)
+        streamed.append(state.feat)
+    streamed = torch.stack(streamed, dim=1)
+    if not torch.allclose(streamed, feats, atol=1e-5, rtol=1e-4):
+        err = (streamed - feats).abs().max().item()
+        raise AssertionError(f'P114 kfeat serve vs batched max|Δ|={err:.4e}')
+    print('[smoke] OK  P114 kfeat init≡bias; k_net in dob group; serve≡scan')
+
+
 def _test_collect_serve_cuda_graph_cpu() -> None:
     """GPU-occupied identity: collect graph is CUDA-only; CPU stays eager."""
     from models.dreamer_v4_rssm import get_collect_serve_cuda_graph
@@ -6619,6 +6713,7 @@ if __name__ == '__main__':
     _test_p2_recon_stopgrad_d()
     _test_p100_luenberger_kalman()
     _test_stream_serve_matches_rollout()
+    _test_p114_kfeat()
     _test_collect_serve_cuda_graph_cpu()
     _test_dreamer_v4_config_from_train()
     _test_envfree_observer_recipe()

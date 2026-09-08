@@ -1876,10 +1876,11 @@ class DreamerV4(nn.Module):
             transformer)/prior/posterior (+ tokenizer for the SF backbone),
             i.e. EVERYTHING in ``self.dynamics`` EXCEPT the DOB observer params.
             This is the input→CV plant model whose gain we identify in Stage 1.
-          * ``dob``    — the neural-Kalman observer params ``dob_log_decay`` /
-            ``dob_log_gain`` (A, K).  Identified in Stage 2 on the FROZEN ``g``.
+          * ``dob``    — the neural-Kalman observer params whose names start
+            with ``dob_`` (``dob_log_decay`` / ``dob_log_gain`` / P114
+            ``dob_k_net``). Identified in Stage 2 on the FROZEN ``g``.
             **P99 KEEP:** when ``dob=True``, pin ``dob_log_decay`` (A stays at
-            ``dob_decay_init``); only ``dob_log_gain`` (K) trains. P98 Wiener
+            ``dob_decay_init``); K trains (P114: bias + k_net). P98 Wiener
             HP MSE jointly IDs A,K and loud first-P2 ``d`` pulls A down →
             Joseph SS gain ``K/(1-(1-K)A)`` dies on val episodes (pred_std
             **0.215 vs 1.93**). P99 held A but crushed K (pred_std **0.628**).
@@ -1895,9 +1896,8 @@ class DreamerV4(nn.Module):
         """
         dyn = self.dynamics
         dob_ids = set()
-        for _n in ('dob_log_decay', 'dob_log_gain'):
-            _p = getattr(dyn, _n, None)
-            if _p is not None:
+        for _n, _p in dyn.named_parameters():
+            if _n.startswith('dob_'):
                 dob_ids.add(id(_p))
         n_g = n_dob = n_r = 0
         for p in dyn.parameters():
@@ -1911,8 +1911,8 @@ class DreamerV4(nn.Module):
         if bool(dob) and _decay is not None:
             _decay.requires_grad_(False)
             if not getattr(self, '_dob_a_pinned_logged', False):
-                print('[dob] P2 pin A (decay stays at init); train K only '
-                      '(P99)', flush=True)
+                print('[dob] P2 pin A (decay stays at init); train K '
+                      '(bias+k_net; P99/P114)', flush=True)
                 self._dob_a_pinned_logged = True
         if getattr(self, 'tokenizer', None) is not None:
             for p in self.tokenizer.parameters():

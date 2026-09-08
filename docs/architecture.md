@@ -977,7 +977,10 @@ flowchart LR
 
 - **Predict** (`img_step`, no obs): `d_t = A·d_{t-1}`; `CV_hat = g(feat) + d_t` (output equation).
 - **Correct** (`obs_step`, real obs): `ν_t = CV_obs − g` (**P100** Luenberger plant residual).
-  `d_t = A·d_{t-1} + K·ν_t` (`K` = **learned** Kalman gain). P99-and-earlier Joseph
+  `d_t = A·d_{t-1} + K·ν_t`. **P114:** `K = σ(bias + MLP(stop-grad decode-core))`
+  with zero-init last Linear (identity with P100–P113 scalar `K`); core is
+  `feat[:decode_in]` (`h,z,c,dv`), not the `d`-tail. TSSM stays scalar `K`.
+  P99-and-earlier Joseph
   residualized `ν = CV_obs − (g + A·d)` and capped SS gain at `K/(1−(1−K)A) ≤ 1/A`.
 - **Output**: decoder `CV = g(h,z) + d_t`. `g` now learns the *true* gain because
   `d_t` absorbs the unexplained movement (de-confounds the attenuation). The
@@ -1270,7 +1273,7 @@ batched-decodes prior for the Kalman.
 
 | | **Stage 1 = P1** (plant id) | **Stage 2 = P2** (observer id) | **Stage 3 = P3** (controller) |
 |---|---|---|---|
-| **trainable** | `g` (enc/dec/GRU/prior/post) + reward | DOB `K` (A pinned at init; **P99 KEEP** / **P100** Luenberger) + reward | actor + critic + reward |
+| **trainable** | `g` (enc/dec/GRU/prior/post) + reward | DOB `K` (A pinned; **P99 KEEP** / **P100** Luenberger / **P114** `k_net`) + reward | actor + critic + reward |
 | **frozen** | DOB `(A,K)` | **`g`** | **`g` AND DOB** |
 | **DOB `d_t`** | suppressed (`≡0`) | active | active (feeds actor via `feat`) |
 | **unmeasured disturbance** | **OFF** (prob 0) | **ON** (prob 1.0) | ON (prob 0.85) |
