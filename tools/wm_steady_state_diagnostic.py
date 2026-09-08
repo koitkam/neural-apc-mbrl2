@@ -328,11 +328,14 @@ def _quiet_env(env) -> None:
     ``env.reset()`` (see ``_run_protocol``) because ``reset()`` rebuilds
     the schedule from the curriculum.
 
-    Mutates ``env`` in place.  Training ``collect_rest_lookback`` calls
-    this on the live training env at P1 rest-IC cache.
-    ``SimNoiseWrapper.reset`` / ``apply_runtime_knobs`` / ``set_noise_scale``
-    do not rebuild emptied ``_ou_sources`` / ``_meas_noise``.  Callers that
-    share the training env must save/restore or clone.
+    Mutates ``env`` in place.  Also zeros ``rd.frac`` (not only
+    ``rd.enabled``).  Training ``collect_rest_lookback`` and the GAIN-READY
+    TM helpers call this on the live training env; wrapper ``reset`` /
+    ``apply_runtime_knobs`` / ``set_noise_scale`` do not rebuild emptied
+    ``_ou_sources`` / ``_meas_noise``, and P3 ``set_domain_randomization(True)``
+    preserves frac so a zeroed frac is a no-op.  Callers that share the
+    training env must save/restore or clone (P113 after P112 EXIT — do not
+    patch the live P112 pid).
     """
     sim = env.sim
     # Wipe OU + measurement noise channels on the SimNoiseWrapper.
