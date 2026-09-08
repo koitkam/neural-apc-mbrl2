@@ -28,7 +28,7 @@ import torch
 
 
 def _is_rssm(model) -> bool:
-    return getattr(model, 'world_model_type', 'rssm') in ('rssm', 'tssm')
+    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
 
 
 def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:

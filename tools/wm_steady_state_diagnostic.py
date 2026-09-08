@@ -212,7 +212,7 @@ def _is_rssm_model(model) -> bool:
     # 'tssm' (transformer-SSM, neural-apc-mbrl) implements the SAME interface as
     # the RSSM (initial_state/obs_step/img_step/decode/feat), so the RSSM
     # open-loop rollout protocol applies to it unchanged.
-    return getattr(model, 'world_model_type', 'rssm') in ('rssm', 'tssm')
+    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
 
 
 @torch.no_grad()
