@@ -6286,9 +6286,9 @@ def _test_dreamer_v4_config_from_train() -> None:
         assert 'dreamer_v4_config_from_train' in src, tag
         assert "getattr(cfg, 'world_model_type', 'sf_transformer')" not in src
         assert "getattr(cfg_loaded, 'world_model_type', 'sf_transformer')" not in src
-    # Model-object fallbacks still treat missing attr as old SF.
-    assert "getattr(model, 'world_model_type', 'sf_transformer')" in val
-    assert "getattr(model, 'world_model_type', 'sf_transformer')" in tr
+    # Model-object fallbacks follow TrainConfig default rssm (P66 leftover).
+    assert "getattr(model, 'world_model_type', 'rssm')" in val
+    assert "getattr(model, 'world_model_type', 'rssm')" in tr
     print('[smoke] OK  dreamer_v4_config_from_train rssm fallback; '
           'reload sites share helper; snapshot_prior_policy no-op')
 

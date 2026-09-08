@@ -73,12 +73,12 @@ policy heads and the same three-phase trainer:
 
 - **`models/dreamer_v4_rssm.py:RSSMDynamics`**: DreamerV3 recurrent
   state-space model — a deterministic GRU core
-  `h_t = f(h_{t-1}, z_{t-1}, a_{t-1})` plus a 32×32 categorical stochastic
-  latent `z` (straight-through one-hot, 1% uniform mixture). MLP
-  encoder/decoder (LayerNorm+SiLU) operate in **already-normalized** obs
-  space (no extra symlog). Trained with reconstruction (MSE) + KL-balanced
-  free-bits loss (dyn weight 0.5, repr weight 0.1, free-bits 1.0 nat).
-  The agent feature is `feat = [h, z_flat]`.
+  `h_t = f(h_{t-1}, z_{t-1}, a_{t-1})` plus a **deterministic continuous**
+  latent `z` (P26 default; paper 32×32 categorical is opt-in
+  `rssm_latent_type='categorical'`). MLP encoder/decoder (LayerNorm+SiLU)
+  operate in **already-normalized** obs space (no extra symlog). Trained
+  with reconstruction (MSE) + joint-embedding 1-step consistency (KL
+  free-bits only when categorical). The agent feature is `feat = [h, z_flat]`.
 - **Why it is the default**: the SF-transformer below has no recurrent
   fixed point (`wm_pred_converges_under_constant_action = 0.0` by
   construction), which drove a Phase-3 bootstrap cascade that no
@@ -102,9 +102,9 @@ policy heads and the same three-phase trainer:
 ### Shared trainer + heads
 
 - **Three explicit phases** (paper Algorithm 1, adapted to single-task online APC):
-  - Phase 1 — pretrain world model: RSSM recon + KL (or tokenizer recon + dynamics shortcut forcing for `sf_transformer`).
-  - Phase 2 — agent finetune: keep WM losses live; add policy + reward MTP heads (eq. 9).
-  - Phase 3 — imagination training: freeze WM, train policy via PMPO (eq. 11) and value via TD-λ (eq. 10) on imagined rollouts.
+  - Phase 1 — pretrain world model: RSSM recon + joint-embed (or tokenizer recon + dynamics shortcut forcing for `sf_transformer`).
+  - Phase 2 — observer / DOB: keep WM losses live; neural-Kalman disturbance estimator; optional g recon-finetune.
+  - Phase 3 — freeze the observer, train the **real-sim** actor-critic (`_realsim_actor_critic_step`) on λ-returns from the true plant. Imagination / PMPO for the actor is deleted.
 - **Heads** — carried over from Dreamer 3 (paper still uses these in V4),
   shared by both backbones (built on `feat`):
   - Policy: continuous Tanh-Normal (per-action-dim) — `ContinuousPolicyHead`.
@@ -114,8 +114,8 @@ policy heads and the same three-phase trainer:
 
 ```
 models/dreamer_v4.py        # Heads (reward/value/policy) + SF-transformer WM (tokenizer + dynamics) + world_model_type dispatch
-models/dreamer_v4_rssm.py   # DreamerV3 RSSM world model (GRU + 32×32 categorical latent) — DEFAULT backbone (P68)
-training/train.py           # Three-phase trainer (Phase 1 WM pretrain / Phase 2 agent finetune / Phase 3 imagination RL)
+models/dreamer_v4_rssm.py   # DreamerV3 RSSM world model (GRU + deterministic latent default) — DEFAULT backbone (P68)
+training/train.py           # Three-phase trainer (P1 WM / P2 observer+DOB / P3 real-sim actor-critic)
 utils/
   plant_init.py             # sample_rate / model_size / seq_len / batch_size / step-budget derivations
   runtime_setpoints.py      # packed per-CV (lo, hi, target, active) augmentation
@@ -134,8 +134,8 @@ utils/
 simulation/                 # plant simulators (one folder per simulator)
 inference/export_onnx.py    # single-graph deterministic ONNX export
 workflow/
-  runner.py                 # FULL PIPELINE: plant ID → BO → final retrain → ONNX
-  run.py                    # single training run (no BO; paper-faithful seed config)
+  single_run.py             # product: plant ID → one training run → ONNX (`python -m workflow.single_run`)
+  bo_runner.py              # full BO + final retrain + ONNX
 evaluation/validate.py      # held-out deterministic validation + timeseries plots
 output/<sim>/<run_id>/      # all artefacts for one workflow run (default location)
 ```

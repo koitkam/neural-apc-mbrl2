@@ -63,7 +63,7 @@ def _is_rssm_like(model) -> bool:
     neural-apc-mbrl) both implement it, so the RSSM rollout protocol in these
     probes applies to both; only the SF-transformer uses the tokenizer path.
     """
-    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+    return getattr(model, 'world_model_type', 'rssm') in ('rssm', 'tssm')
 
 
 # ---------------------------------------------------------------------------

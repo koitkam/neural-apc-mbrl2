@@ -4041,8 +4041,13 @@ def _batch_np_to_device(batch_np: Dict, device: torch.device,
 
 
 def _is_rssm_interface(model) -> bool:
-    """RSSM and TSSM share ``rollout_observed`` / ``img_rollout`` / ``decode``."""
-    return getattr(model, 'world_model_type', 'sf_transformer') in ('rssm', 'tssm')
+    """RSSM and TSSM share ``rollout_observed`` / ``img_rollout`` / ``decode``.
+
+    Missing ``world_model_type`` follows TrainConfig default ``rssm`` (P66+).
+    An ``sf_transformer`` fallback would skip RSSM gain-match on a default
+    constructor that omitted the attr.
+    """
+    return getattr(model, 'world_model_type', 'rssm') in ('rssm', 'tssm')
 
 
 def _warmup_p3_collect_serve_graph(model, device, cfg) -> None:
@@ -8907,8 +8912,9 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
     joint_embed_loss = torch.zeros((), device=feats.device)
     if latent_type == 'deterministic':
         # Deterministic continuous latent: NO variational KL — prior/posterior
-        # consistency (for imagination) is the joint-embedding predict-next-
-        # latent MSE.  post_logits/prior_logits are the continuous latents here.
+        # consistency (observer 1-step, not imagination) is the
+        # joint-embedding predict-next-latent MSE.  post_logits/prior_logits
+        # are the continuous latents here.
         from models.dreamer_v4_rssm import rssm_joint_embed_loss
         kl_loss = torch.zeros((), device=feats.device)
         kl_diag = {}
