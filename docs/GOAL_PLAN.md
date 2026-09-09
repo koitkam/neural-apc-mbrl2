@@ -32,7 +32,7 @@ extra-P1 as freeze (P41; **P117 on this plant**); compounding-teacher Huber (P11
 
 ## Live this visit — P118 `opscale` (do not kill / do not relaunch / do not second GPU)
 
-tmux `mbrl2_p118` pid **551549** sha **`ff5f84c`** `device=cuda` bs=128 compile=eager nvidia **~14751 MiB**. `[resolved-cfg] opscale=True` no ol1. STAGE 1 `g=84 dob=8`. Rest-IC graph captured N=6 T=128. sps **~52**. jsonl **~52** P1. Heartbeat ~2 min/iter. orig-P1 budget **796080** steps (~iter 82–87 class). Process 100% CPU, `wm_last_ok` walked, **not** locked.
+tmux `mbrl2_p118` pid **551549** sha **`ff5f84c`** `device=cuda` bs=128 compile=eager nvidia **~14751 MiB**. `[resolved-cfg] opscale=True` no ol1. STAGE 1 `g=84 dob=8`. Rest-IC graph captured N=6 T=128. sps **~52**. jsonl **55** P1. Heartbeat ~2 min/iter. orig-P1 budget **796080** steps (~iter 82–87 class). Process 100% CPU, `wm_last_ok` walked, **not** locked.
 
 **Teacher print (launch):** local G mean MV **0.0153** / DV **−0.345** vs identified **2.627 / −0.426**. jsonl MV ratio still wild early (**−74…+16**) then late **~0.25–0.58** (still vs G≈0.015). DV ratio **~0.7–1.1** (storm@13 DV **2.11**; spike@45 DV **0.27**). `wm_op_scale_dev` **0.52→0.99@18–22** then **~0.87**. recon recovered **0.050@50** (best **0.030@44**). skip **0** except storms. `wm_best` still **iter 10** (gain-blind). Probe@50 H=1 r=**+0.096** H=56 r=**+0.339** gain_fid=0.904 `best_h=0/56`.
 
