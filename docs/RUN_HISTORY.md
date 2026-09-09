@@ -50,7 +50,7 @@ Living record (automation-owned; **not** frozen in the prompt):
 |---|---|---|---|
 | **R1** | Observer TM | MV/DV `ss_ratio`, **`curve_iae_normed`**, compounding `1step→OL` | curve IAE → 0, ss → 1, compounding → 1 |
 | **R2** | CV quality / opt potential | worst-seed `cv_d2_rms_normed`, `cv_reversal_rate`, `cv_viol_frac`; residual `cv_opt_headroom`. MV reversal is diagnostic. | d2 ≤ 0.01, reversal ≤ 0.10, headroom ≤ 0.15, viol ~ 0 |
-| **R3** | Unmeasured DR | Kalman `det_r` + `pred_std` vs true; closed-loop `iae_agent/iae_baseline` | det_r → 1, amp ratio → 1, IAE ratio → 0 |
+| **R3** | Unmeasured DR | Kalman `det_r` + `pred_std` vs true; closed-loop `iae_agent/iae_baseline`; CV returns to the economic limit after the event | det_r → 1, amp ratio → 1, IAE ratio → 0, return-to-limit |
 
 Hygiene gates (`all_pass`): worst-seed `cv_d2_rms ≤ 0.05` **and**
 `cv_reversal ≤ 0.25`, plus existing WM/critic floors and `beats_baseline`.
