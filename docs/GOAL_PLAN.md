@@ -4,7 +4,7 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 EXIT INVALID CAPPED **0.68@MV**; **P119 locgfix LIVE P1 @15** — Inf@13 **ABSENT**; inject@10 no lock; then return-to-`test_sim`).
+Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 EXIT INVALID CAPPED **0.68@MV**; **P119 locgfix LIVE P1 @24** — probe@20 H=56 **+0.514** above floor / **not** GAIN-READY; then return-to-`test_sim`).
 
 ## Residual board vs champions (test_sim unless noted)
 
@@ -50,11 +50,11 @@ tmux `mbrl2_p119` pid **557257** sha **`ea7def9`** `device=cuda` bs=128 compile=
 
 **Teacher print (locgfix CONFIRMED):** local G `plant_fd=6/6` mean MV **2.890** / DV **−0.341** vs identified **2.709 / −0.435**. span MV **2.01** / DV **0.46**. `|du_mv|=0.4000` **=** step **0.4000**. **No** WARNING.
 
-**LIVE P1 @15 (2026-09-09 14:43:00):** skip **0** last_ok **15 unlocked**. recon **0.7686@1 → 0.0302@14** (best) **→ 0.0313@15** (held). jsonl MV/DV **×0.983 / ×1.079** (O(1) pin since @5 **×0.961 / ×1.033**; @1 was **0.574 / −2.37**). gnorm **2.38 finite** (peak **27.3@8**). persist_rel **1.02** (peak **4.43@9**, not 31). `wm_op_scale_dev` **0.80**. jsonl NaN/Inf **0**. **Inf@13 ABSENT** vs P118 @13 recon **0.676** skip **56/56** `wm_grad_norm=inf` MV **−23.5**. dv-prbs inject **@10** (buf 204/320) did **not** 20×-lock or recon-spike (0.064@10 → **0.030@14→0.031@15**) — P118 inject@60 locked last_ok **60** recon **0.935**.
+**LIVE P1 @24 (2026-09-09 15:01:33, ~51 min):** skip **0** last_ok **24 unlocked**. recon **0.0100** (best; **0.7686@1 → 0.030@14 → 0.016@19 → 0.010@24**). jsonl MV/DV **×1.014 / ×0.902** (O(1) pin since @5). gnorm **2.92 finite** (peak **27.3@8**). persist_rel **8.36@24** (peak **12.23@21** after inject@20, not 31). `wm_op_scale_dev` **0.78**. jsonl NaN/Inf **0**. **Inf@13 ABSENT**. P117 storm@23 **ABSENT** (skip 0 recon **0.011**). Inject@19 const/step/expert + @20 dv-prbs: recon **0.0163→0.0188→0.0242@21** then **0.010@24** — no 20×-lock.
 
-**Probe@10:** `H=1:r=+0.458 H=14:r=+0.219 H=28:r=+0.202 H=56:r=+0.184 conv=1.00 drift=0.026 floor=0.40 best_h=1/56 gain_fid=0.445`. H=1 above floor; H=56 below — 1-step only, **not** GAIN-READY. `wm_best` EMA **3.214@10** — gain-blind (same class as P118 `wm_best` @100 SKIPPED). Do not treat conv=1 / jsonl ×1 as freeze. Next probe @20.
+**Probe@20:** `H=1:r=+0.370 H=14:r=+0.456 H=28:r=+0.507 H=56:r=+0.514 conv=0.25 drift=0.169 floor=0.40 best_h=56/56 gain_fid=0.897`. vs probe@10 H=56 **+0.184** best_h=1 / P118@20 H=56 **+0.327** best_h=0. First H=56 **above floor** + best_h=56. H=1 slipped below floor. conv **1.00→0.25**. **Not** GAIN-READY (need 5-level TM in [0.8,1.3] + compound_ok). `wm_best` EMA **4.224@20** — still gain-blind. Do not treat H=56-above-floor / jsonl ×1 as freeze.
 
-Predicted remaining: 20× lock@60-class / orig-P1@~87 (~2.1 h); then GAIN-READY vs P118 CAPPED **0.68@MV** / P117 **0.71@DV**. Score actor only if freeze GAIN-READY **and** P3.
+Predicted remaining: probe@30 / 20× lock@60-class / orig-P1@~87 (~2.1 h); then GAIN-READY vs P118 CAPPED **0.68@MV** / P117 **0.71@DV**. Score actor only if freeze GAIN-READY **and** P3.
 
 Falsifier: still CAPPED ~0.68@MV **after** this WM-norm teacher (WARNING absent; `|du_mv|`~step; jsonl MV ratio O(1); Inf@13 absent). Do **not** use P118’s 0.68@MV as the falsifier.
 
@@ -77,9 +77,9 @@ After a fair P119 VALID or a fair GAIN_NOT_READY with a **correct** local teache
 ## RCA this visit
 
 - SysID: OP-varying DC is real (equal-% + 1/feed; MV amp **2.23×** / DV **2.34×**). Median G is still the wrong pin **once local G is in WM-norm**. P118 local MV 0.015 is units, not that 2.23× span.
-- Signal: P119 locgfix teacher CONFIRMED (MV G **2.89** vs ident **2.71**; `|du_mv|=0.4=step`; jsonl @15 MV **0.98** skip **0**). **Inf@13 ABSENT**. Inject@10 no lock (recon kept falling). Probe@10 H=56 **+0.184** below floor / best_h=1 — not freeze. GPU P119 P1 **~14.8 GB**. Disk `/home` 64% / 62G. Keep P119+P118+P117+P116+P64+P53.
+- Signal: P119 locgfix teacher CONFIRMED (MV G **2.89** vs ident **2.71**; `|du_mv|=0.4=step`; jsonl @24 MV **1.01** skip **0** recon **0.010**). **Inf@13 ABSENT**. P117 storm@23 **ABSENT**. Probe@20 H=56 **+0.514** above floor / best_h=56 / conv **0.25** — **not** GAIN-READY. GPU P119 P1 **~14.7 GB**. Disk `/home` 64% / 62G. Keep P119+P118+P117+P116+P64+P53.
 - Control: do not score P118 actor (`skip_invalid_p3`; freeze GAIN_NOT_READY). Score P119 only if freeze GAIN-READY **and** P3. Do not kill P119 / second GPU.
-- ML: LPV `wm_op_scale_dev` sat chasing a ~0 MV Huber target — not a test of gain-c G(op). P119 **Inf@13 ABSENT** (gnorm **1.39** skip **0**) confirms P118 Inf@13 / persist 31 / skip-storm 0.02@MV were teacher-unit. 20× lock@60-class still ahead. `wm_best` @10 EMA **3.214** is gain-blind (same class as P118 @100 SKIPPED). last_ok **108** recon-best with wrong G; freeze **0.68@MV / 0.85@DV** is not a P119 falsifier. extra-P1 live@98 **0.11@MV** was worse than orig-P1 last_ok **0.34@MV** — lottery closed. Val TM **×0.609** matches under-gain, not a plot/file fight.
+- ML: LPV `wm_op_scale_dev` **0.78** (not sat). P119 **Inf@13 ABSENT** + storm@23 **ABSENT** confirm P118 Inf@13 / persist 31 / skip-storm 0.02@MV were teacher-unit. Probe@20 H=56-above-floor is mid-P1 health, **not** freeze (conv **0.25**; no 5-level TM). persist **12@21** after inject recovered — not persist-31. 20× lock@60-class still ahead. `wm_best` @20 EMA **4.224** is gain-blind. last_ok **108** recon-best with wrong G; freeze **0.68@MV / 0.85@DV** is not a P119 falsifier. extra-P1 lottery closed. Val TM **×0.609** matches under-gain.
 - Plant: HeatExchangerTower `step` is engineering; APCEnv denorms. Teacher must use `_prev_cmd_norm`. Restore must not leave a post-FD leftover when the snapshot was `None`.
 - Metric: jsonl MV ratio vs 0.015 is not val TM. Cap 0.68@MV is last_ok TM vs identified, still GAIN_NOT_READY because the teacher never trained identified-scale MV G. Lineage gain PASS (rel_err 0.39) is looser than band [0.8, 1.3].
 
