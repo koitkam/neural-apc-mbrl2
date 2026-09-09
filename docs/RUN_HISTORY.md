@@ -72,7 +72,7 @@ that time to analyze history, literature, codebase, and workflow and update
 one return-to-test_sim on the worst residual) is cadence, not a ban on
 refactors.
 
-Paste-ready **full** GPU-host automation prompt: `docs/AUTOMATION_RUN_PROMPT.txt`.
+Paste-ready **full** automation prompt: `docs/AUTOMATION_RUN_PROMPT.txt`.
 
 ## BEST-RUN BASELINES (per subsystem) — UPDATE THIS EACH VERDICT
 
