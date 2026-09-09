@@ -5893,6 +5893,11 @@ def _test_sim_runtime_cfg() -> None:
         DomainRandomizer, SimNoiseWrapper, reset_domain_randomization_bind)
     from workflow._plant_prepare import apply_dreamer_env_overrides
     sn_src = open('utils/sim_noise.py').read()
+    wrap_ctor = sn_src.split('class SimNoiseWrapper', 1)[1].split(
+        'def apply_runtime_knobs', 1)[0]
+    assert 'if not noise_on:' not in wrap_ctor
+    assert 'cfg = {}' not in wrap_ctor
+    assert 'noise_on and (self._ou_sources' in wrap_ctor
     ctor = sn_src.split('class DomainRandomizer', 1)[1].split(
         'def _load_config_block', 1)[0]
     assert "os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION')" not in ctor
@@ -5984,6 +5989,12 @@ def _test_sim_runtime_cfg() -> None:
         assert resolve_sim_runtime_knobs()['noise_enabled'] is False
         wrap_off = SimNoiseWrapper(_Bare())
         assert wrap_off._has_noise is False
+        assert wrap_off._ou_sources  # tables kept; apply can restore
+        c_restore = TrainConfig()
+        c_restore.sim_noise_enabled = True
+        c_restore._explicit_fields = {'sim_noise_enabled'}  # type: ignore
+        wrap_off.apply_runtime_knobs(c_restore)
+        assert wrap_off._has_noise is True
         os.environ['DREAMER_SIM_NOISE_ENABLED'] = '1'
         assert resolve_sim_runtime_knobs()['noise_enabled'] is True
         os.environ['SIM_DOMAIN_RANDOMIZATION'] = '0'

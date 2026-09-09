@@ -546,11 +546,14 @@ class SimNoiseWrapper:
             cfg = getattr(sim, 'noise_config', None) or {}
 
         # --- Runtime knobs (TrainConfig / DREAMER_SIM_*; leftover SIM_* ignored) -
+        # Unbound wrap still honours ``DREAMER_SIM_NOISE_ENABLED`` (SysID
+        # ``clean_mode`` IPC).  Do **not** drop the OU/meas tables when
+        # noise is off — ``apply_runtime_knobs`` can only toggle
+        # ``_has_noise``; wiping ``cfg`` made leftover ``=0`` at ctor
+        # irreversible (P116-live).
         from utils.noise_config import resolve_sim_runtime_knobs
         runtime = resolve_sim_runtime_knobs()
         noise_on = bool(runtime['noise_enabled'])
-        if not noise_on:
-            cfg = {}
 
         # --- Local RNG for all noise operations ---------------------------
         seed_str = str(runtime.get('noise_seed') or '').strip()
@@ -585,7 +588,8 @@ class SimNoiseWrapper:
                 bounds=entry.get('bounds', (-1e9, 1e9)),
             ))
 
-        self._has_noise = bool(self._ou_sources or self._meas_noise)
+        # Gate the flag, not the tables — leftover env=0 must stay reversible.
+        self._has_noise = bool(noise_on and (self._ou_sources or self._meas_noise))
 
         # Global per-episode noise amplitude scale (P89, 2026-06-06).
         # Multiplies BOTH OU process noise and white measurement noise on
