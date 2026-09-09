@@ -1732,6 +1732,8 @@ def run_validation(*,
     controller_dir = Path(controller_dir).resolve()
     if not controller_dir.exists():
         raise FileNotFoundError(controller_dir)
+    from utils.training_disturbance import bind_identifier_out_dir
+    bind_identifier_out_dir(controller_dir)
     ckpt_path = controller_dir / ckpt
     if not ckpt_path.exists():
         raise FileNotFoundError(ckpt_path)

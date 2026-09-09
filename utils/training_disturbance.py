@@ -24,19 +24,60 @@ Design notes:
   trajectories seen by the agent.
 """
 
-import glob
 import json
 import math
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 
-# Identifier JSON is static for a single_run.  Glob every env.reset()
-# (P1 ~5 episodes/iter) was host-CPU waste; cache on cwd + path env.
+# Identifier JSON is static for a single_run.  Cache on bound out-dir +
+# explicit path env (not a repo-wide glob — V4 writes
+# ``plant_id/dynamics_identification.json`` with no extra suffix, which
+# the underscore-suffix glob missed; a newest-mtime glob also picks
+# another plant's run once ``nonlinear_sim`` exists).
 _ID_CTX_CACHE = None
 _ID_CTX_KEY = None
+_ID_OUT_DIR = ''
+
+
+def bind_identifier_out_dir(out_dir=None) -> None:
+    """Pin identifier JSON to this run's ``out_dir`` / ``plant_id/``.
+
+    ``AGENT_DYNAMICS_JSON`` / ``AGENT_LOOKBACK_JSON`` still win (audit IPC).
+    Call after ``auto_tune_seed_buffer`` so seed-σ keeps the V4 mean
+    fallback already in ``train.py`` (p70 here vs mean there).
+    """
+    global _ID_OUT_DIR, _ID_CTX_CACHE, _ID_CTX_KEY
+    _ID_OUT_DIR = str(out_dir or '').strip()
+    _ID_CTX_CACHE = None
+    _ID_CTX_KEY = None
+
+
+def _id_json_path(kind: str) -> str:
+    env_key = ('AGENT_DYNAMICS_JSON' if kind == 'dyn'
+               else 'AGENT_LOOKBACK_JSON')
+    explicit = str(os.environ.get(env_key, '')).strip()
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    names = (
+        ('dynamics_identification.json',)
+        if kind == 'dyn'
+        else ('lookback_identification.json',
+              'lookback_identification_practical.json')
+    )
+    # Bound run dir only — ancestor walk was glob-search leftover and
+    # would pick another plant once ``output/<sim>/`` exists.
+    if not _ID_OUT_DIR:
+        return ''
+    root = Path(_ID_OUT_DIR)
+    for name in names:
+        for cand in (root / 'plant_id' / name, root / name):
+            if cand.is_file():
+                return str(cand)
+    return ''
 
 
 def _explicit(cfg, field: str) -> bool:
@@ -140,6 +181,7 @@ def _state_group_value(state: np.ndarray, sim, group: str, pos: int, idx: int) -
 def _load_identifier_context() -> Dict:
     global _ID_CTX_CACHE, _ID_CTX_KEY
     key = (
+        _ID_OUT_DIR,
         os.getcwd(),
         str(os.environ.get("CONTROL_SETUP_JSON", "")).strip(),
         str(os.environ.get("AGENT_DYNAMICS_JSON", "")).strip(),
@@ -147,43 +189,8 @@ def _load_identifier_context() -> Dict:
     )
     if _ID_CTX_CACHE is not None and _ID_CTX_KEY == key:
         return _ID_CTX_CACHE
-    roots = []
-    setup_json = str(os.environ.get('CONTROL_SETUP_JSON', '')).strip()
-    if setup_json:
-        roots.append(os.path.dirname(os.path.abspath(setup_json)))
-
-    cur = os.getcwd()
-    for _ in range(6):
-        roots.append(cur)
-        nxt = os.path.dirname(cur)
-        if nxt == cur:
-            break
-        cur = nxt
-
-    explicit_dyn = str(os.environ.get('AGENT_DYNAMICS_JSON', '')).strip()
-    explicit_lb = str(os.environ.get('AGENT_LOOKBACK_JSON', '')).strip()
-
-    def _latest_match(patterns):
-        candidates = []
-        for r in roots:
-            for pat in patterns:
-                candidates.extend(glob.glob(os.path.join(r, pat)))
-        candidates = [p for p in candidates if os.path.isfile(p)]
-        if not candidates:
-            return ''
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return candidates[0]
-
-    dyn_path = explicit_dyn if (explicit_dyn and os.path.isfile(explicit_dyn)) else _latest_match([
-        'dynamics_identification_*.json',
-        '**/dynamics_identification_*.json',
-    ])
-    lb_path = explicit_lb if (explicit_lb and os.path.isfile(explicit_lb)) else _latest_match([
-        'lookback_identification_*.json',
-        'lookback_identification_practical.json',
-        '**/lookback_identification_*.json',
-        '**/lookback_identification_practical.json',
-    ])
+    dyn_path = _id_json_path('dyn')
+    lb_path = _id_json_path('lb')
 
     dyn = {}
     lb = {}

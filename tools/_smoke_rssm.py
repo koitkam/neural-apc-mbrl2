@@ -5870,6 +5870,7 @@ def _test_agent_disturbance_cfg() -> None:
         a = td._load_identifier_context()
         b = td._load_identifier_context()
         assert a is b, 'identifier JSON must be process-cached'
+        td.bind_identifier_out_dir('')
         assert not hasattr(td, 'MVSaturationMonitor')
         assert not hasattr(td, 'DisturbanceIntensityController')
         assert not hasattr(td, 'disturbance_curriculum_enabled')
@@ -5881,6 +5882,94 @@ def _test_agent_disturbance_cfg() -> None:
             else:
                 os.environ[k] = old
     print('[smoke] OK  operator-event TrainConfig + DREAMER_*; leftover AGENT_* ignored')
+
+
+def _test_identifier_v4_outdir() -> None:
+    """V4 ``plant_id/dynamics_identification.json`` via bound out-dir.
+
+    Repo-wide underscore-suffix glob missed the V4 name and could pick
+    another plant's run.
+    """
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+    import utils.training_disturbance as td
+    from training.train import train as _train_fn
+    import inspect
+    src = Path('utils/training_disturbance.py').read_text()
+    assert 'dynamics_identification_*.json' not in src
+    assert '**/dynamics_identification' not in src
+    assert 'bind_identifier_out_dir' in src
+    tr_src = inspect.getsource(_train_fn)
+    assert 'bind_identifier_out_dir' in tr_src
+    val_src = Path('evaluation/validate.py').read_text()
+    assert 'bind_identifier_out_dir' in val_src
+    prev_dyn = os.environ.get('AGENT_DYNAMICS_JSON')
+    prev_lb = os.environ.get('AGENT_LOOKBACK_JSON')
+    td.bind_identifier_out_dir('')
+    try:
+        os.environ.pop('AGENT_DYNAMICS_JSON', None)
+        os.environ.pop('AGENT_LOOKBACK_JSON', None)
+        empty = td._load_identifier_context()
+        assert float((empty.get('dynamics') or {}).get(
+            'tau_dominant_identified', 0.0) or 0.0) == 0.0
+        with tempfile.TemporaryDirectory() as td_dir:
+            plant = Path(td_dir) / 'plant_id'
+            plant.mkdir()
+            (plant / 'dynamics_identification.json').write_text(json.dumps({
+                'tau_dominant_identified': 54.0,
+                'dead_time_identified': 8.0,
+                'per_pair_estimates': [{
+                    'valid': True, 'input_type': 'mv',
+                    'input': 'STEAM_VALVE_MV_%', 'mv': 'STEAM_VALVE_MV_%',
+                    'input_index': 0, 'delta': -10.0, 'amplitude': -10.6,
+                }],
+            }))
+            (plant / 'lookback_identification.json').write_text(json.dumps({
+                'identified_lookback': 131,
+            }))
+            td.bind_identifier_out_dir(td_dir)
+            ctx = td._load_identifier_context()
+            assert abs(float(ctx['dynamics']['tau_dominant_identified'])
+                       - 54.0) < 1e-12
+            assert int(ctx['lookback']['identified_lookback']) == 131
+            assert 'STEAM_VALVE_MV_%' in ctx['mv_gain_to_cv']
+            # Sibling plant_id must not win (old newest-mtime glob).
+            sib = Path(td_dir).parent / 'other_plant' / 'plant_id'
+            sib.mkdir(parents=True)
+            (sib / 'dynamics_identification.json').write_text(json.dumps({
+                'tau_dominant_identified': 12.0,
+                'dead_time_identified': 1.0,
+                'per_pair_estimates': [],
+            }))
+            td.bind_identifier_out_dir(td_dir)
+            ctx_sib = td._load_identifier_context()
+            assert abs(float(ctx_sib['dynamics']['tau_dominant_identified'])
+                       - 54.0) < 1e-12
+            # Audit IPC still wins over the bound out-dir.
+            other = Path(td_dir) / 'other.json'
+            other.write_text(json.dumps({
+                'tau_dominant_identified': 99.0,
+                'dead_time_identified': 1.0,
+                'per_pair_estimates': [],
+            }))
+            os.environ['AGENT_DYNAMICS_JSON'] = str(other)
+            td.bind_identifier_out_dir(td_dir)
+            ctx2 = td._load_identifier_context()
+            assert abs(float(ctx2['dynamics']['tau_dominant_identified'])
+                       - 99.0) < 1e-12
+    finally:
+        td.bind_identifier_out_dir('')
+        if prev_dyn is None:
+            os.environ.pop('AGENT_DYNAMICS_JSON', None)
+        else:
+            os.environ['AGENT_DYNAMICS_JSON'] = prev_dyn
+        if prev_lb is None:
+            os.environ.pop('AGENT_LOOKBACK_JSON', None)
+        else:
+            os.environ['AGENT_LOOKBACK_JSON'] = prev_lb
+    print('[smoke] OK  identifier V4 plant_id via bound out-dir; glob leftover gone')
 
 
 def _test_sim_runtime_cfg() -> None:
@@ -6909,6 +6998,7 @@ if __name__ == '__main__':
     _test_gpu_calib_cfg()
     _test_sim_snr_cfg()
     _test_agent_disturbance_cfg()
+    _test_identifier_v4_outdir()
     _test_sim_runtime_cfg()
     _test_adv_action_corr_vectorized()
     _test_training_diagnostics_cascade_axes()

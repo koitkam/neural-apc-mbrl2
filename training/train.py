@@ -52,6 +52,7 @@ from utils.runtime_setpoints import RuntimeSetpointManager, RuntimeSetpointConfi
 from utils.training_disturbance import (
     build_training_disturbance_schedule,
     apply_disturbance_schedule,
+    bind_identifier_out_dir,
 )
 from utils.hidden_disturbance import (
     curriculum_amp_scale,
@@ -11959,6 +11960,11 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # works without operator intervention.  User / env-var overrides
     # take precedence (detected via dataclass-default sentinel).
     auto = auto_tune_seed_buffer(env, cfg)
+    # After auto-tune: V4 ``plant_id/dynamics_identification.json`` (no
+    # extra suffix).  Repo-wide underscore-suffix glob missed it and
+    # could pick another plant's newest run.  Bind after auto-tune so
+    # seed-σ keeps the mean fallback above (identifier p70 ≠ that mean).
+    bind_identifier_out_dir(getattr(cfg, 'out_dir', '') or '')
     auto_summary: Dict[str, Dict[str, object]] = {}
     # 2026-05-19 fix: prefer explicit-set tracking over value-equality.
     # The legacy sentinel ``cur == default`` cannot distinguish
