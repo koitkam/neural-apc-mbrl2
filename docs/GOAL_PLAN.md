@@ -4,7 +4,7 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 = job 2 of 2 **EXIT INVALID** after CAPPED GAIN_NOT_READY **0.68@MV**; P119 is the fair repeat of the same mechanism after the MV-Δu unit bug; then return-to-`test_sim`).
+Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 EXIT INVALID CAPPED **0.68@MV**; **P119 locgfix LIVE P1** — fair repeat after WM-norm Δu; then return-to-`test_sim`).
 
 ## Residual board vs champions (test_sim unless noted)
 
@@ -44,21 +44,23 @@ tmux `mbrl2_p118` **gone**. pid **551549 DEAD**. sha **`ff5f84c`**. **EXIT=0** 1
 
 **Judge:** locgfix **already on HEAD** (`414eca4`). **Not** an opscale FALSIFY. extra-P1 lottery closed. Next **P119 `locgfix`**. If P119 still CAPPED with WM-norm teacher: **P120 `gop`**. Champion **P64**. Dist champ **P26**.
 
-## Next job — P119 `locgfix` (GPU free after P118 EXIT)
+## Live this visit — P119 `locgfix` (do not kill / do not second GPU)
 
-**P119 `locgfix`** — same mechanism as P118 (LPV + local rest-IC G), **one bugfix**: MV plant-FD Δu = `_prev_cmd_norm` (WM-norm; P61 realized/rate-limit), never engineering `_prev_control`. Snapshot/restore `_prev_cmd_norm` **including None**. Print WARNING if |G_MV| ≪ 5% of identified **or** `|du_mv|` ≫ 5× teacher step. Env-free. No new TrainConfig / no `DREAMER_*`. Tag `locgfix`. Session `mbrl2_p119`. Out-dir `output/nonlinear_sim/run_p119_locgfix`.
+tmux `mbrl2_p119` pid **557257** sha **`ea7def9`** `device=cuda` bs=128 compile=eager nvidia **~14677 MiB**. Env-free (`CUDA_VISIBLE_DEVICES=0`, no `DREAMER_*`). `[resolved-cfg] opscale=True` no ol1. STAGE 1 `g=84 dob=8`. Rest-IC CUDA graph **captured** `N=6 T=128`. Train start **2026-09-09 14:10:33**. **One GPU job.**
 
-Predicted signature: rest-ic local G MV same order as SysID (~2, OP span ~2× not 0.015); `|du_mv|` ~ teacher step **0.4** not ~50; **no** WARNING; jsonl `gain_match_mv_ratio` ~O(1) not ±70 / −129; `wm_op_scale_dev` not pinned at tanh sat; skip-storm Inf@13-class, inject 20× lock@60-class, and skip-storm **0.02@MV** absent or rare; persist_rel not 31; then GAIN-READY vs P118 CAPPED **0.68@MV** / P117 **0.71@DV**.
+**Teacher print (locgfix CONFIRMED):** local G `plant_fd=6/6` mean MV **2.890** / DV **−0.341** vs identified **2.709 / −0.435**. span MV **2.01** / DV **0.46**. `|du_mv|=0.4000` **=** step **0.4000**. **No** WARNING. jsonl @1 MV ratio **0.574** (O(1), not ±70); DV **−2.37**; `du_frac=1.00`; `wm_op_scale_dev` **0.40** (not tanh sat); persist_rel **1.26** (not 31); skip **0**; gnorm **21.7** finite. Huber now vs ident-scale G, not 0.015.
 
-Falsifier: still CAPPED ~0.68@MV **after** local MV G is WM-norm (WARNING absent; `|du_mv|`~step; jsonl MV ratio O(1)). Do **not** use P118’s 0.68@MV as the P119 falsifier — teacher units were wrong.
+Predicted remaining: skip-storm Inf@13-class / 20× lock@60-class / 0.02@MV rare or absent; then GAIN-READY vs P118 CAPPED **0.68@MV** / P117 **0.71@DV**. Score actor only if freeze GAIN-READY **and** P3.
 
-Do **not** extra-P1 N+1 / identity-relaunch P118 / rewrite a live recipe / second GPU.
+Falsifier: still CAPPED ~0.68@MV **after** this WM-norm teacher (WARNING absent; `|du_mv|`~step; jsonl MV ratio O(1)). Do **not** use P118’s 0.68@MV as the falsifier.
+
+Do **not** extra-P1 N+1 / identity-relaunch P118 / rewrite the live recipe / second GPU.
 
 After a fair P119 VALID or a fair GAIN_NOT_READY with a **correct** local teacher: return-to-`test_sim` on the worst residual (cadence: 2 jobs on this plant then return). P118 is job 2 of 2 **but** the unit bug means P119 is the fair repeat of the same mechanism, not a third plant-hop.
 
 ## Ranked follow-ups (not this GPU until P119 verdict)
 
-1. **P119 locgfix** (above) — causal for R1 on this plant. HEAD is launch-ready (`414eca4` + restore-None).
+1. **P119 locgfix** (LIVE above) — causal for R1 on this plant. Locgfix teacher CONFIRMED.
 2. If P119 GAIN-READY but val TM still short: keep LPV, audit rest-IC K vs 4τ settle (this plant K=H=56 ≈ 4τ/sr = 54; settle L=128 is the encode, not the hole). Not extra-P1.
 3. If P119 still CAPPED ~0.68@MV / 0.71@DV **with** WM-norm local G: input-scale LPV is too thin for equal-% DC. **P120 `gop`** (still neural, one mechanism): OP-conditioned **gain-c**, not another `1+tanh` on GRU inputs.
    - **Mechanism:** after `obs_step`/`img_step` produce `c`, `c[..., :cont_gain_dim] = c[..., :cont_gain_dim] * (1 + tanh(MLP(stop-grad OP)))` with last Linear zero-init (step-0 ≡ P119). Scale **gain-c only**. Decoder sees scaled gain-c so DC G(op) lives in the observer. `op_scale_net` LPV KEEP (no N+1 of that net). Group `g`. No new TrainConfig / no `DREAMER_*`. Banner `gop=True`. jsonl `wm_gain_op_dev`.
@@ -71,10 +73,10 @@ After a fair P119 VALID or a fair GAIN_NOT_READY with a **correct** local teache
 ## RCA this visit
 
 - SysID: OP-varying DC is real (equal-% + 1/feed; MV amp **2.23×** / DV **2.34×**). Median G is still the wrong pin **once local G is in WM-norm**. P118 local MV 0.015 is units, not that 2.23× span.
-- Signal: jsonl NaN/Inf = **one** skip-storm `wm_grad_norm=inf@13`. P2 first dobg **0.0209** skip **0** KEEP vs P95. End-P2 leftover **0.416** K **0.047/1.00** recovered from crush. GPU free. Disk `/home` 64% / 62G. Keep P118+P117+P116+P64+P53.
-- Control: do not score actor (`skip_invalid_p3`; freeze GAIN_NOT_READY).
+- Signal: P119 locgfix teacher CONFIRMED (MV G **2.89** vs ident **2.71**; `|du_mv|=0.4=step`; jsonl @1 MV **0.57**). P118 jsonl NaN/Inf = **one** skip-storm `wm_grad_norm=inf@13`. P118 P2 first dobg **0.0209** skip **0** KEEP vs P95. End-P2 leftover **0.416** K **0.047/1.00**. GPU P119 P1 **~14.7 GB**. Disk `/home` 64% / 62G. Keep P119+P118+P117+P116+P64+P53.
+- Control: do not score P118 actor (`skip_invalid_p3`; freeze GAIN_NOT_READY). Score P119 only if freeze GAIN-READY **and** P3. Do not kill P119 / second GPU.
 - ML: LPV `wm_op_scale_dev` sat chasing a ~0 MV Huber target — not a test of gain-c G(op). Inf@13, persist 31, 20× lock@60 then **@108**, skip-storm 0.02@MV, extra-P1 0.11@MV are teacher-unit. `wm_best` @100 gain-blind — SKIPPED at P2. last_ok **108** recon-best with wrong G; freeze **0.68@MV / 0.85@DV** is not a P119 falsifier. extra-P1 live@98 **0.11@MV** was worse than orig-P1 last_ok **0.34@MV** — lottery closed. Val TM **×0.609** matches under-gain, not a plot/file fight.
 - Plant: HeatExchangerTower `step` is engineering; APCEnv denorms. Teacher must use `_prev_cmd_norm`. Restore must not leave a post-FD leftover when the snapshot was `None`.
 - Metric: jsonl MV ratio vs 0.015 is not val TM. Cap 0.68@MV is last_ok TM vs identified, still GAIN_NOT_READY because the teacher never trained identified-scale MV G. Lineage gain PASS (rel_err 0.39) is looser than band [0.8, 1.3].
 
-P117 process died mid-P2 (SIGKILL). P118 completed P2 then `[p3-skip]`. Do not identity-relaunch P117 or P118.
+P117 process died mid-P2 (SIGKILL). P118 completed P2 then `[p3-skip]`. Do not identity-relaunch P117 or P118. P119 is LIVE.
