@@ -62,19 +62,16 @@ cannot move a smooth CV onto the economic limit, do **not** spend GPU on it —
 fix or replace the metric / loss / gate first. Write conclusions in
 `docs/GOAL_PLAN.md`.
 
-**Refactors are in-scope.** Default is one attributed change on the largest
-residual whose family is open *and* whose metric is causal. When that cannot
-serve the goal: bigger observer / Kalman / actor-critic / loss / gate / metric
-refactors are allowed (product envelope: neural observer + neural Kalman/DOB +
-neural actor-critic on real-sim; env-free; no gray-box plant; no classical
-PID/LQR/MPC as the product; imagination actor deleted). While a run is LIVE,
-do **not** start a second GPU job; use that time to analyze history,
-literature, codebase, and workflow and update `docs/GOAL_PLAN.md`. Plant
-rotation (short campaign on a new plant, then return to the baseline plant)
-is cadence, not a ban on refactors.
+**Refactors are in-scope.** Default is the highest-impact change whose metric
+is causal for the overall goal. When N+1 cannot serve the goal: bigger
+observer / Kalman / actor-critic / loss / gate / metric refactors are allowed
+(see envelope in `docs/AUTOMATION_RUN_PROMPT.txt`). While a run is LIVE, do
+**not** start a second GPU job and do **not** rewrite the live recipe; use
+that time to analyze history, literature, codebase, and workflow and update
+`docs/GOAL_PLAN.md`. Plant rotation (short campaign on a new plant, then
+return to test_sim) is cadence, not a ban on refactors.
 
-Paste-ready **full** automation run prompt: `docs/AUTOMATION_RUN_PROMPT.txt`
-(addendum-only: `docs/PROMPT_ADDENDUM_STANDING_RESIDUALS.txt`).
+Paste-ready **full** GPU-host automation prompt: `docs/AUTOMATION_RUN_PROMPT.txt`.
 
 ## BEST-RUN BASELINES (per subsystem) — UPDATE THIS EACH VERDICT
 

@@ -7,7 +7,7 @@ Sibling in-flight: park notes in `/memories/session/` — do not contend on this
 
 Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 EXIT INVALID CAPPED **0.68@MV**; **P119 locgfix LIVE P1 @47** — probe@40 all-H above floor / conv **0** / **not** GAIN-READY; then return-to-`test_sim`).
 
-After the next EXIT on a tree that includes this branch, read `validation/residual_board.json` (R1/R2/R3 including `cv_return_headroom` / `cv_return_time_frac`). Until then, axes below are `validation_summary.json` + TM/decomp/dist JSON.
+After the next EXIT on a tree that includes this branch, read `validation/residual_board.json` (R1/R2/R3 including `cv_return_headroom` / `cv_return_time_frac`). Until then, axes below are `validation_summary.json` + TM/decomp/dist JSON. Current defaults (real-sim actor, frozen observer at P3, RSSM, DOB on) are a starting point.
 
 ## Residual board vs champions (test_sim unless noted)
 

@@ -1,114 +1,154 @@
+Skip this run if another Neural-APC-mbrl automation is still running.
+
+You are on the GPU host. Progress depends on reading local logs, not git alone.
+
 Repository: koitkam/neural-apc-mbrl2
 Origin: https://github.com/koitkam/neural-apc-mbrl2.git
-Working branch: the branch this automation is bound to (pull it at start; commit
-and push there, or open PRs into it). Remote is `origin` of that GitHub repo.
-
-You run the neural-APC training loop on this repository. Recurring visits:
-diagnose the live or last EXIT job, keep the living record current, execute or
-prepare the next step of the plan toward the overall goal. You are not a
-one-shot coder; you own the campaign.
-
-OVERALL GOAL — a neural APC that sits a smooth CV on the economic limit
-without violating, with a faithful observer and unmeasured-load rejection.
-Product envelope (do not leave): neural observer (RSSM) + neural Kalman/DOB +
-neural actor-critic on real-sim rollouts; env-free launch; no gray-box plant
-as the controller; no classical PID/LQR/MPC as the product; imagination actor
-stays deleted. One GPU job at a time.
+Git branch: cursor/p28 (sync from origin/cursor/p28 if stale). master is origin default.
+No parallel training branch. Remote is origin of that GitHub repo.
 
 Do NOT put run IDs, champion numbers, plant-specific RCA, or freeze snapshots
-in this prompt. History goes stale. You track it in the repo.
+in this prompt. History goes stale. You track it in the repo (RUN_HISTORY,
+GOAL_PLAN, residual_board, local val json, memories) and draw your own
+conclusions.
 
-HOW TO OPERATE
-  * Git: fetch origin; work on the bound branch. Env-free means TrainConfig /
-    DREAMER_* only when the experiment *is* that knob — no leftover login env
-    as a silent A/B. Launch:
-      python -m workflow.single_run --simulation-dir <sim> --out-dir <out>
-    (venv as in README). One attributed change per GPU job unless the plan
-    names a refactor.
-  * GPU: before launch, check occupancy (nvidia-smi, tmux). If a training job
-    is LIVE, do not start a second one and do not kill it unless pickup of
-    already-merged code requires a restart and the user/plan authorized that.
-    Score the actor only after EXIT validation, not from live jsonl lottery.
-  * After EXIT: read val plots + residual_board.json + jsonl; update
-    docs/RUN_HISTORY.md and docs/GOAL_PLAN.md; commit so the next visit sees
-    them; then execute the next plan step (implement + launch, or keep
-    analyzing if GPU is still busy).
+## First actions (every session)
+1. Confirm you are on l3-ace-py01 (or the scheduled GPU box): hostname, nvidia-smi, tmux ls, pwd.
+2. Find the live job: tmux sessions matching mbrl2_p*, nvidia-smi PID, latest output/*/run_p*/.
+3. Read the local artifacts before you edit code:
+   - tmux capture of the live pane
+   - output/<sim>/run_pNN_<tag>/workflow.log (tail enough to see phase, errors, last iter)
+   - the run’s jsonl / metrics (not just the last line)
+   - run_plan.json / resolved-cfg if present
+   - latest val json: residual_board.json, wm_transfer_matrix.json, wm_dv_transfer_matrix.json, wm_disturbance_prediction.json, validation_summary.json
+   - docs/GOAL_PLAN.md (living plan — create if missing)
+   - docs/RUN_HISTORY.md (champion table + latest pNN + graveyard + leftovers)
+   - /memories/session/open_items.md, /memories/repo/mbrl2_facts.md
+4. If those paths are missing, search the checkout (typically ~/neural-APC-mbrl2-cursor, also ~/neural-APC-mbrl2). Confirm venv ~/neural-APC-mbrl2-env. Do not assume; do not skip logs because RUN_HISTORY exists.
+A missing nvidia-smi or a DNS failure is not “GPU free.” If you cannot read live logs or checkpoints, do not change training behavior.
 
-LIVING RECORD (you own these; keep them current):
-  * docs/GOAL_PLAN.md — the plan toward the overall goal: current campaign,
-    ranked next jobs, live-analysis notes, refactor options, metric-audit
-    conclusions. Create it if missing. Update it every visit.
-  * docs/RUN_HISTORY.md — ledger of runs plus BEST-RUN BASELINES (champions).
-    Append/update at every EXIT. Champions live there, not here.
-  * validation/residual_board.json — this run's R1/R2/R3 scores (written at val).
-Compare residual_board to the current champions and to GOAL_PLAN, then draw
-your own conclusions. If the files disagree with the plots, the files are on
-trial.
+## GPU occupancy
+One training job at a time (A10 24GB; two ~14GB jobs OOM). Do not start a second job.
+If a job is live and healthy: diagnose from local logs, cleanup dead code, deep-analyze, and update docs/GOAL_PLAN.md. Do not rewrite the live training recipe under it. Do not kill it. Do not launch a second job.
+Kill only on hard failure:
+- process dead, OOM, CUDA assert, or traceback that ended the job
+- NaN/Inf in core jsonl losses
+- no new jsonl/heartbeat for 30 minutes while the process still claims to run
+- disk full / checkpoint save failing / clean up old training data that is not needed anymore to prevent a full disk
+Do not kill on skip-storm, high recon, GAIN_NOT_READY, extra-P1, entropy dips, or a bad TM. Those are RCA.
+Interactive shells often export CUDA_VISIBLE_DEVICES=""; launches must set CUDA_VISIBLE_DEVICES=0. Smokes use CVD="". Eager compile unless you have a reason not to. tmux mbrl2_pNN, out-dir output/<sim>/run_pNN_<tag>. Do not | tee or >> workflow.log (in-process tee already writes it). DREAMER_* only if in workflow/_plant_prepare.py:ENV_OVERRIDES or actually read in train.py.
 
-STANDING RESIDUALS — never retire because a knob family closed.
-MV oscillation is ALLOWED. Fail/optimize on CV smoothness + limit hugging + TM + unmeasured DR.
-  R1 TM: observer step-response shape and gain (curve_iae_normed and ss-ratio,
-    both MV and DV; compounding 1step→OL). ss-ratio alone is a DC freeze-gate.
-  R2 CV quality: CV must stay smooth (cv_d2_rms_normed, cv_reversal_rate) and
-    close to the economic limit without violating (cv_opt_headroom, cv_viol_frac).
-    Do NOT penalize mv_reversal. Oscillation that leaves the CV mid-band is lost
-    optimization potential. Do NOT gate on CV total variation (a slow ride to
-    the limit is good). cv_opt_headroom is a residual, not an all_pass / P3-skip gate.
-  R3 Unmeasured DR: Kalman pred_std vs true and det_r; closed-loop event
-    IAE_agent/IAE_baseline on disturbance_rejection.png.
+## Goal
+neural-APC-mbrl2: simulator-agnostic neural APC that sits a **smooth CV on the economic limit without violating**, with a faithful observer and unmeasured-load rejection.
+
+Iterate: diagnose → RCA → metric audit → execute the next step of docs/GOAL_PLAN.md (highest-impact change inside the envelope) → smoke → commit/push cursor/p28 → launch → watch from local logs.
+Do not wait for permission on that loop. Env-free product:
+  python -m workflow.single_run --simulation-dir <sim> --out-dir <out>
+healthy on new plants without retuning.
+
+If GOAL_PLAN.md is empty or stale, rebuild it from RUN_HISTORY + residual_board + plots + codebase + literature, then follow it. Do not abandon the plan because a knob family closed unless that step’s hypothesis was falsified.
+
+## Envelope (bounds, not the recipe)
+Four pieces, all in service of a neural controller. You may change internals, replace a piece with a neural successor, or refactor the wiring. You may not ship a linear/gray-box plant, a classical PID/LQR/MPC, or a DV-only feedforward hack as the product.
+1. Observer — learned state-space / sequence model (RSSM, TSSM, or successor: encode, roll dynamics, decode CVs). Recover MV→CV and DV→CV gains and dynamics, not just next-step correlation. MV and DV are both measured inputs; do not special-case DV.
+2. Neural Kalman / disturbance observer — estimates the unmeasured load. Other neural Kalman forms are allowed. Classical Kalman on an identified linear plant is not. Do not drop the disturbance estimator and hope reconstruction absorbs the load unless you have evidence that it is preferable over the Neural Kalman architecture.
+3. Actor-critic — policy + value on observer (and disturbance) features, acting on the real plant. Training method is open (real rollouts, imagination, hybrids, critic/advantage/entropy). The deployed controller is the neural policy, not an expert or optimizer in the loop. Expert BC is a launchpad, not a ceiling. A collapsed critic is an open problem, not a taboo.
+4. Simulators — plants that should mimic chemical processes. test_sim is the sandbox. Other bundled sims are more complex/nonlinear. If the workflow stalls after a fair VALID test_sim run, audit the simulators (units, excitation, hidden load, data) before adding knobs. New sims only if needed; at most 10. Stay on test_sim until at least one VALID run beats baseline with a healthy observer (actor_experiment_valid). Then other plants are in scope.
+Current defaults (real-sim actor, frozen observer at P3, RSSM, DOB on) are a starting point. Change them when evidence says so.
+Keep the stack fully neural through ONNX: one graph (obs window, prev actions) → action.
+
+## Standing residuals (never retire because a family closed)
+MV oscillation is ALLOWED. Fail/optimize on CV smoothness + limit hugging + TM + unmeasured DR. Champions live in RUN_HISTORY / GOAL_PLAN, not here.
+  R1 TM — observer step-response shape and gain: curve_iae_normed and ss-ratio, both MV and DV; compounding 1step→OL. ss-ratio alone is a DC freeze-gate.
+  R2 CV quality / opt potential — CV must stay smooth (cv_d2_rms_normed, cv_reversal_rate) and close to the economic limit without violating (cv_opt_headroom, cv_viol_frac). Do NOT penalize mv_reversal. Oscillation that leaves the CV mid-band is lost optimization potential. Do NOT gate on CV total variation (a slow ride to the limit is good). cv_opt_headroom is a residual, not an all_pass / P3-skip gate.
+  R3 Unmeasured DR — Kalman pred_std vs true and det_r; closed-loop event IAE_agent/IAE_baseline on disturbance_rejection.png.
 Do not treat VALID 9/9, GAIN-READY, all_pass, or family-closed as R1/R2/R3 closed.
-Do not require beating the current econ champion to KEEP a CV-smoothness,
-headroom, or DR win.
-smooth_pass is CV d2/reversal only (worst-seed cv_d2_rms_normed ≤ 0.05 AND
-cv_reversal_rate ≤ 0.25); mv_reversal as a smoothness gate is obsolete.
+Do not require beating the current econ champion to KEEP a CV-smoothness, headroom, or DR win.
+smooth_pass is CV d2/reversal only (worst-seed cv_d2_rms_normed ≤ 0.05 AND cv_reversal_rate ≤ 0.25); mv_reversal as a smoothness gate is obsolete.
+After every EXIT, read validation/residual_board.json, update GOAL_PLAN R1/R2/R3 vs current champions, and update RUN_HISTORY.
 
-FOLLOW AND DEVELOP THE PLAN.
-Start from docs/GOAL_PLAN.md. If the plan is empty or stale, rebuild it from
-RUN_HISTORY + residual_board + plots + codebase + literature, then execute it.
-Do not abandon the plan because a knob family closed unless the plan's
-hypothesis was falsified. After every EXIT: update RUN_HISTORY, update
-GOAL_PLAN (what was learned, what is next, which options died), commit those
-docs so the next visit sees them.
-
-WHILE A TRAINING RUN IS LIVE — do not start a second GPU job. Use that time
-to explore bigger refactors and the next campaign:
-  * Deep-read RUN_HISTORY, GOAL_PLAN, residual boards, plots, and jsonl of the
-    live run (progress vs the plan; do not score the actor until EXIT val).
-  * Deep-read the codebase and workflow (observer, Kalman/DOB, actor-critic,
-    objective, gates, val suite) for what actually implements the residual.
-  * Read literature (docs/papers, APC / SysID / disturbance observers /
-    economic MPC vs learned control) for options that fit the product envelope.
-  * Write ranked refactor options and a concrete next-job spec into GOAL_PLAN
-    (mechanism, predicted signature, falsifier, files to touch). Keep updating
-    as the live run produces new evidence. Commit the plan; future runs follow it.
-
-METRIC AUDIT — required every EXIT and during live analysis, before the next lever.
-Ask: if this metric improved, would the plant actually get closer to the overall goal?
-If no (gamed, tautological, scale-invariant, freeze-gate, disagrees with the
-plot), do NOT spend GPU improving it. Fix or replace the metric / loss / gate
-first — that work is in-scope, including large refactors. Metric *classes*
-that are insufficient unless you re-justify them from evidence:
+## Metric audit (every EXIT and during live analysis, before the next lever)
+Ask: if this metric improved, would a smooth CV actually sit closer to the economic limit with a faithful observer and unmeasured-load rejection?
+If no (gamed, tautological, scale-invariant, freeze-gate, disagrees with the plot), do NOT spend GPU improving it. Fix or replace the metric / loss / gate first — that work is in-scope, including large refactors. Write in GOAL_PLAN which metrics you trusted, which you put on trial, and why.
+Insufficient *classes* unless you re-justify them from evidence:
   * mv_reversal as a smoothness gate (diagnostic only; CV d2/reversal is the gate)
-  * CV total variation as a smoothness gate (slow ride to the limit is good)
-  * ss-ratio alone (DC freeze-gate; also score curve_iae_normed)
+  * CV total variation as a smoothness gate
+  * ss-ratio alone (also score curve_iae_normed)
   * jsonl teacher gain ×1 (tautology; val TM / residual_board is the score)
-  * critic_r Pearson without critic_rew_to_tgt_var (correlation can pass while value scale is dead)
+  * critic_r Pearson without critic_rew_to_tgt_var
   * raw disturbance R² (drift; use det_r + pred_std vs true)
-  * VALID 9/9, GAIN-READY, all_pass, or family-closed as "residual closed"
+  * VALID 9/9, GAIN-READY, all_pass, or family-closed as “residual closed”
   * requiring a beat of the current econ champion to KEEP a smoothness / headroom / DR win
-Write in GOAL_PLAN which metrics you trusted, which you put on trial, and why.
 
-FREEDOM TO REFACTOR — you are not limited to one-knob N+1 on an open family.
-Default when a family is still open AND the metric is causal for the goal:
-  largest residual, one attributed change, as the next step in GOAL_PLAN.
-You MAY and SHOULD do a bigger refactor (observer architecture, operating-point
-aware gains, Kalman form, actor-critic training signal, reward/objective, freeze
-and quality gates, metric definitions) when: the family is closed; N+1 would
-be lottery (unattributed budget extension, leftover env knobs, stacking critic
-knobs); train metrics disagree with val plots; or improving the current score
-cannot put a smooth CV on the economic limit. Stay inside the product envelope.
-Changing piece (observer / Kalman / actor-critic) OR taking the same residual
-to another plant then returning to the baseline plant remains valid; a refactor
-on the current plant is also valid.
-When switching plants: a short campaign, then return to the baseline plant so
-residuals stay comparable. Cadence is plant rotation, not a ban on refactors.
+## How big a change
+Prefer the change with the largest expected impact on the failing axis (observer TM, CV smoothness / opt headroom, Kalman amp, critic, actor econ, or sim-adaptive) **and** whose metric is causal for the overall goal (metric audit).
+Small protocol tweaks are allowed only if the logs say that is the bottleneck.
+You may land a coherent bundle in one run (several files, a refactor, a new Kalman/observer/actor design) if it is one mechanism. If you cannot attribute cause and effect from that bundle, split it or schedule a follow-up A/B. Do not fire five unrelated knobs and call it one experiment.
+A major refactor is in scope when logs/RCA/GOAL_PLAN justify it, the GPU is free (or the live job was killed for hard failure), and the result still sits in the envelope. You are not limited to one-knob N+1 on an open family. When a family is closed, N+1 would be lottery, train metrics disagree with val plots, or improving the current score cannot put a smooth CV on the economic limit: change piece (observer / Kalman / actor-critic), change the metric/loss/gate, take the residual to another plant then return to test_sim, or land the planned refactor.
+After a family is closed as champion in RUN_HISTORY, do not N+1 the same α / probe / extra-P1 / gate lottery.
+
+## While a training run is LIVE
+Do not start a second GPU job. Do not rewrite the live recipe. Use the time to explore bigger refactors for **future** runs:
+  * Deep-read RUN_HISTORY, GOAL_PLAN, residual boards, plots, and jsonl of the live run (progress vs the plan; do not score the actor until EXIT val).
+  * Deep-read the codebase and workflow (observer, Kalman/DOB, actor-critic, objective, gates, val suite).
+  * Read literature (docs/papers, APC / SysID / disturbance observers / economic MPC vs learned control) for options that fit the envelope.
+  * Write ranked refactor options and a concrete next-job spec into GOAL_PLAN (mechanism, predicted signature, falsifier, files to touch). Keep updating as the live run produces new evidence. Commit the plan; future runs follow it.
+Dead-code cleanup while the GPU is busy remains first-class (see Cleanup).
+
+## Simulator-agnostic
+Knobs are unitless or derived from dynamics-ID (τ, θ, H, gains, authority, episode length). Never engineering units, never a test_sim magic number as a default.
+- If a knob cannot be derived and is not earning its keep, delete it or fold it into a formula.
+- New hyperparameters need a runtime adaptive rule unless they are already plant-agnostic.
+- Proven wins become TrainConfig defaults or sim-adaptive formulas. Env-vars are A/B only.
+When switching plants: a short campaign, then return to test_sim so residuals stay comparable. Cadence is plant rotation, not a ban on refactors.
+
+## Cleanup
+Dead code is first-class when the GPU is busy: unused losses, leftover flags, unread env knobs, dual os.environ / TrainConfig paths, stale comments, probes. If you add a path, delete or gate the old one. No permanent A/B flags. Before commit: leftover imports, stale names, no extra hot-path forwards; probes only in gitignored scratch/.
+Keep a short evidence-ordered TODO in /memories/session/open_items.md. Docs/architecture when data flow changes; RUN_HISTORY at verdict/launch; GOAL_PLAN every visit (live analysis and EXIT). Do not commit LIVE@iter noise every hour — phase boundaries only (P1 gate, P2→P3, EXIT) for RUN_HISTORY. Keep the champion table short (one line per subsystem); RCA in the pNN section.
+
+## RCA (before you change training)
+- SysID — gains/dynamics represented? Excitation per MV and DV? Gain↔disturbance confound?
+- Signal — SNR, pred_std/true_std, noise-led checkpoints
+- Control — observer vs controller; CV on the economic limit vs mid-band vs violating; CV chatter vs MV chatter (MV chatter is allowed); advantage starved by return-scale or a dead critic
+- ML — bootstrap, grad-bleed, distribution shift, gain-blind wm_best
+- Plant — is the simulator lying? Only after a fair VALID recipe run, and only from logs + sim code, not vibes
+- Metric — is the score you would optimize causal for the overall goal? If not, fix the metric first.
+Patch causes. Explore a new observer, Kalman, actor-critic, or (after a VALID test_sim champion) another plant. RUN_HISTORY is priors, not a ban list; retry a graveyard item only with a new mechanism.
+
+Skills (load when present): dreamer-training-diagnosis, dreamer-config-audit (Step 4 before launch, Step 5 after verdict), dreamer-tmux-launch-protocol, neural-apc-mbrl-launch-and-modes, dreamer-hyperparameter-rationale. Substitute mbrl2 paths/venv. If missing, still do Step 4 / Step 5 from RUN_HISTORY.
+
+On every results check, read all axes from local val artifacts, not the one that moved:
+- MV and DV transfer-matrix ss, @H, and curve_iae_normed
+- gain decomp (real→post / post→1step / 1step→openloop)
+- residual_board.json R1/R2/R3 vs current champions in RUN_HISTORY / GOAL_PLAN
+- disturbance tracking (det_r and pred_std vs true); closed-loop IAE_agent/IAE_baseline
+- critic (critic_rew_to_tgt_var, critic_r)
+- actor econ vs baseline and vs champion; entropy
+- CV quality: cv_d2_rms_normed, cv_reversal_rate, cv_opt_headroom, cv_viol_frac (MV reversal is diagnostic)
+- plots: transfer-matrix, disturbance_rejection, training_diagnostics
+A pass is economic improvement vs baseline plus a smooth CV near the economic limit without violating — not correlation-only, not MV-quietness. Gain ratios and curve shape matter more than wm_next_state_r. MV-only wm_gain_pass is not “observer healthy.” Do not score an actor experiment on a broken observer (GAIN_NOT_READY / skip_invalid_p3 / actor_experiment_valid).
+
+## Hard constraints
+- Stay in the envelope. No gray-box plant, no classical controller as the product, no DV-only feedforward patch.
+- Do not call a run an actor result if the observer was not ready.
+- Graveyard: tried / KEPT|REVERTED|DISCARDED|SUPERSEDED / root-cause YES|NO|PARTIAL.
+- Be concise. Implement rather than propose.
+
+## Priors (read logs + RUN_HISTORY + GOAL_PLAN, then decide)
+Useful mechanism classes, not bans and not a substitute for the ledger: TBPTT through a DC-gain asymptote can kill gain while the loss looks tiny; fidelity-best checkpoints are often gain-blind; DOB grounding must not key off a disabled disturbance head; relative 1/|tgt| Huber can detonate P1; louder isolation can drown subdominant DV; freeze-return_scale and μ-ratio clipping have held actor cascades; compounding (open-loop TM short of 1-step) and DOB amplitude are recurring observer gaps; jsonl teacher ×1 is not val TM. Invent a better attack, a bigger architecture change inside the envelope, or take a VALID recipe to another plant. Do not N+1 a family RUN_HISTORY already closed.
+
+## Autonomy
+Live healthy job: diagnose from local logs, cleanup, deep-analyze, update GOAL_PLAN — never a second GPU job, never a quiet kill, never rewrite the live recipe.
+Job finished or hard-failed: verdict + Step 5 + update RUN_HISTORY and GOAL_PLAN + next experiment from the plan (bundle OK if one mechanism) + launch.
+Several consecutive FALSIFIED A/Bs in the same family: change family, change plant, change the metric, land the planned refactor, or stop and report.
+
+## End-of-run summary (required)
+- Local evidence you read (tmux, pid, out-dir, log tails, val json, residual_board)
+- Whether a job was left running, launched, or killed (and the hard-failure reason)
+- Plan: GOAL_PLAN step this visit executed or wrote; metric-audit conclusions
+- Observer: MV/DV ss, @H, curve_iae vs champion, decomp lever, GAIN-READY
+- Kalman: det_r, pred_std vs true; event IAE ratio if present
+- Critic: critic_rew_to_tgt_var, critic_r
+- Actor: paired econ vs baseline and champion, validity
+- CV quality: cv_d2_rms, cv_reversal, cv_opt_headroom, cv_viol_frac (MV reversal diagnostic)
+- What changed (mechanism, bundle vs single), cleanup done, next experiment in GOAL_PLAN, plant (test_sim or why another sim)
