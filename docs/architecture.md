@@ -1212,6 +1212,13 @@ fixes BOTH:
 `feat = [h, z_flat, c, (dv), (d)]`; the decoder reads `[h, z, c, (dv)]`.
 **P71 REVERT:** the full `c` feeds the GRU / TSSM token
 (`recurrence_c_dim = cont_dim`). Gain-c is a recurrent plant-gain state.
+**P118:** GRU / TSSM-token inputs see `scale ⊙ (a, dv)` where
+`scale = 1 + tanh(MLP(stop-grad concat(a,dv)))` (last Linear zero-init
+⇒ identity at step-0). Decoder / feat / `dv_new` keep **unscaled**
+measured DV (P74 DOB-steal stays closed). `op_scale_net` trains with
+group `g` (P1) and freezes in P2. Rest-IC Huber `G_tgt` is plant FD at
+each rest OP when cached (not SysID median). Env-free: always on;
+print-only banner `opscale=True`.
 `cont_gain_dim == cont_dist_dim == 0` ⇒
 byte-identical to the pre-cont model (regression-verified). Env knobs:
 `DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /

@@ -440,6 +440,61 @@ def gru_update_gate_bias(horizon: int) -> float:
 # Building blocks
 # ---------------------------------------------------------------------------
 
+def init_op_scale_net(mod: nn.Module) -> None:
+    """Zero-init last Linear so ``1+tanh(MLP(op))`` starts at identity.
+
+    P118: equal-% / 1/feed plants have OP-varying DC; a single linear G
+    is the wrong teacher. Scale only GRU / TSSM-token inputs. Decoder /
+    feat keep unscaled measured DV (P74 DOB-steal stays closed).
+    """
+    in_dim = (int(getattr(mod, 'action_dim', 0) or 0)
+               + int(getattr(mod, 'dv_dim', 0) or 0))
+    if in_dim <= 0:
+        mod.op_scale_net = None  # type: ignore[attr-defined]
+        return
+    hidden = int(getattr(mod, 'hidden_dim', 0)
+                  or getattr(mod, 'deter_dim', 256) or 256)
+    mod.op_scale_net = _MLP(  # type: ignore[attr-defined]
+        in_dim, in_dim, hidden_dim=hidden, num_layers=1)
+    last = mod.op_scale_net.net[-1]
+    if isinstance(last, nn.Linear):
+        nn.init.zeros_(last.weight)
+        if last.bias is not None:
+            nn.init.zeros_(last.bias)
+
+
+def modulate_measured_inputs(
+        mod: nn.Module, action: torch.Tensor,
+        dv: Optional[torch.Tensor] = None
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """``scale = 1 + tanh(MLP(stop-grad OP))`` on measured MV/DV.
+
+    OP = concat(action, dv). Last Linear zero-init ⇒ scale≡1 at step-0.
+    Returns scaled (action, dv) for the dynamics core; callers keep the
+    unscaled ``dv`` for ``dv_new`` / decoder feedforward.
+    """
+    net = getattr(mod, 'op_scale_net', None)
+    if net is None:
+        return action, dv
+    if dv is None:
+        d_dim = int(getattr(mod, 'dv_dim', 0) or 0)
+        if d_dim > 0:
+            dv = action.new_zeros(action.shape[0], d_dim)
+            op = torch.cat([action, dv], dim=-1)
+        else:
+            op = action
+    else:
+        op = torch.cat([action, dv], dim=-1)
+    if int(op.shape[-1]) != int(net.net[-1].out_features):
+        return action, dv
+    scale = 1.0 + torch.tanh(net(op.detach()))
+    a_dim = int(action.shape[-1])
+    a_s = action * scale[..., :a_dim]
+    dv_s = (dv * scale[..., a_dim:] if dv is not None else None)
+    mod._op_scale_applied = scale  # type: ignore[attr-defined]
+    return a_s, dv_s
+
+
 class _MLP(nn.Module):
     """LayerNorm + SiLU MLP (DreamerV3 reference block)."""
 
@@ -773,6 +828,12 @@ class RSSMDynamics(nn.Module):
             if isinstance(_k_last, nn.Linear):
                 nn.init.zeros_(_k_last.weight)
                 nn.init.zeros_(_k_last.bias)
+        # P118: OP-aware LPV scale on GRU inputs. Identity at init
+        # (last Linear zeros). Named ``op_scale_net`` so group ``g``
+        # trains it in P1 and P2 freeze locks it with the rest of the
+        # observer. Env-free: always constructed; no TrainConfig knob.
+        init_op_scale_net(self)
+
     @property
     def feat_dim(self) -> int:
         # Scope 2: the head-facing feature includes the DV feedforward (dv_dim
@@ -901,19 +962,22 @@ class RSSMDynamics(nn.Module):
         P76 z-bias stays 0.
         """
         # GRU input = [z_flat ; c ; action ; (dv)].  Full c (P71 REVERT).
+        # P118: GRU sees OP-scaled (a, dv); ``dv_new`` stays the unscaled
+        # measured DV so decoder / feat / DOB do not special-case the load.
+        if self.dv_dim > 0 and dv is None:
+            dv = cached_zeros_bd(
+                self, int(prev_action.shape[0]), self.dv_dim,
+                prev_action.dtype, prev_action.device)
+        a_s, dv_s = modulate_measured_inputs(self, prev_action, dv)
         parts = [prev.stoch_flat]
         rc = _recurrence_c(
             self, prev.c, int(prev_action.shape[0]),
             prev_action.dtype, prev_action.device)
         if rc is not None:
             parts.append(rc)
-        parts.append(prev_action)
+        parts.append(a_s)
         if self.dv_dim > 0:
-            if dv is None:
-                dv = cached_zeros_bd(
-                    self, int(prev_action.shape[0]), self.dv_dim,
-                    prev_action.dtype, prev_action.device)
-            parts.append(dv)
+            parts.append(dv_s if dv_s is not None else dv)
         h = self.gru(self.pre_gru(torch.cat(parts, dim=-1)), prev.h)
         # Stage-1 (``dob_active=False``) forces ``d_t≡0`` after the loop
         # and ``d`` is not a GRU input — skip the unused sigmoid·d

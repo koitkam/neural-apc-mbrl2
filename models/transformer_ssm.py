@@ -94,7 +94,8 @@ from models.dreamer_v4_rssm import (
     _CategoricalLatent, _ContinuousLatent, _prior_c_from_net,
     _recurrence_c, _time_unbind,
     cached_zeros_bd, cached_zeros_btd, cached_onehot_z, dob_kalman_scan,
-    _append_decode_core, _stack_decode_core)
+    _append_decode_core, _stack_decode_core,
+    init_op_scale_net, modulate_measured_inputs)
 
 
 @dataclass
@@ -433,6 +434,8 @@ class TransformerSSMDynamics(nn.Module):
                 (self.n_cv,), float(getattr(cfg, 'dob_decay_init', 3.0))))
             self.dob_log_gain = nn.Parameter(torch.full(
                 (self.n_cv,), float(getattr(cfg, 'dob_gain_init', -2.2))))
+        # P118: same LPV scale as RSSM (TSSM is opt-in; keep the interface).
+        init_op_scale_net(self)
 
     @property
     def feat_dim(self) -> int:
@@ -558,11 +561,13 @@ class TransformerSSMDynamics(nn.Module):
         Shared by ``img_step`` (prior heads) and rest-IC ``_posterior_step``.
         Returns ``(h, d_new, dv_new, new_cache, new_pos)``.
         """
-        if self.dv_feedforward and dv is None:
+        if self.dv_dim > 0 and dv is None:
             dv = cached_zeros_bd(
                 self, int(prev_action.shape[0]), self.dv_dim,
                 prev_action.dtype, prev_action.device)
-        token = self._build_token(prev.z, prev_action, dv, getattr(prev, 'c', None))
+        a_s, dv_s = modulate_measured_inputs(self, prev_action, dv)
+        token = self._build_token(
+            prev.z, a_s, dv_s, getattr(prev, 'c', None))
         cache = getattr(prev, 'kv_cache', None)
         pos = int(getattr(prev, 'pos', 0) or 0)
         h, new_cache = self._step(token, cache, pos)

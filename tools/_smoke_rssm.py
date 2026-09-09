@@ -2266,6 +2266,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_traj={'FO' if" in _src
     assert 'gmatch_ol1=True' not in _src
     assert 'gmatch_k1=True' not in _src
+    assert 'opscale=True' in _src
     assert 'gprobe_R=' in _src
     assert 'scoped_quiet_env' in _src
     assert 'P113' in _src or 'scoped_quiet_env restores' in _src
@@ -3478,6 +3479,9 @@ def _test_gain_match_pred_over_tgt() -> None:
     t1 = _gain_match_tgt_tensor(mv, ((-2.624,),), owner)
     t2 = _gain_match_tgt_tensor(mv, ((-2.624,),), owner)
     assert t1 is t2
+    loc = torch.full_like(dv, 0.51)
+    assert abs(float(_gain_match_pred_over_tgt(
+        dv, ((9.0,),), tgt_b=loc)) - 0.75) < 1e-6
     print('[smoke] OK  gain-match pred/tgt ratio (P43 Huber-blind miss)')
 
 
@@ -4060,6 +4064,12 @@ def _test_gain_match_rest_ic() -> None:
     gm2, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert abs(float(gm1) - float(gm2)) > 1e-6, (
         f'rest IC unused (gm1={float(gm1):.6f} gm2={float(gm2):.6f})')
+    gm_id, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    cfg._gain_match_rest_local_g = (torch.ones(2, 3, 1) * 9.0).numpy()
+    gm_loc, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert abs(float(gm_id) - float(gm_loc)) > 1e-6, (
+        f'local G unused (id={float(gm_id):.6f} loc={float(gm_loc):.6f})')
+    cfg._gain_match_rest_local_g = None
     import inspect as _ins
     _gm_src = _ins.getsource(_wm_gain_match_loss)
     assert "Huber baseline = rest last-obs CV" in _gm_src
@@ -4072,6 +4082,8 @@ def _test_gain_match_rest_ic() -> None:
     assert 'K+1 ρ^{4H-K} DC' not in _gm_src
     assert 'OL G_K vs sg(1-step)' not in _gm_src
     assert 'g_1s_sg = g_1s.detach()' not in _gm_src
+    assert 'Huber G_tgt = rest-IC plant FD' in _gm_src
+    assert '_gain_match_rest_local_g' in _gm_src
     assert 'prev_state=st_b' in _gm_src
     assert "getattr(st0, 'kv_cache', None) is not None" in _gm_src
     assert 'gain_match_ol_persist_rel' in _gm_src
@@ -6418,6 +6430,7 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'gmatch_traj=0' in banner, banner
     assert 'gprobe_R=3' in banner, banner
     assert 'dob_kfeat=True' in banner, banner
+    assert 'opscale=True' in banner, banner
     assert 'gmatch_fo' not in banner, banner
     assert 'gmatch_ol_tail' not in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
@@ -6829,6 +6842,63 @@ def _test_p114_kfeat() -> None:
     print('[smoke] OK  P114 kfeat init≡bias; k_net in dob group; serve≡scan')
 
 
+def _test_p118_opscale() -> None:
+    """P118: op_scale_net identity at init; group g; scale moves after noise."""
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
+    cfg.mtp_length = 4
+    cfg.world_model_type = 'rssm'
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.head_hidden = 16
+    cfg.dob_enabled = True
+    cfg.dv_dim = 1
+    cfg.dv_indices = (3,)
+    cfg.cv_obs_indices = (0,)
+    cfg.compile_mode = 'off'
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    cfg.gain_match_coef = 0.0
+    cfg.wm_input_isolation_coef = 0.0
+    cfg.rssm_joint_embed_coef = 0.0
+    model = build_model(cfg)
+    rssm = model.dynamics
+    assert getattr(rssm, 'op_scale_net', None) is not None
+    last = rssm.op_scale_net.net[-1]
+    assert isinstance(last, torch.nn.Linear)
+    assert float(last.weight.detach().abs().sum()) == 0.0
+    assert float(last.bias.detach().abs().sum()) == 0.0
+    B = 2
+    state = rssm.initial_state(B, torch.device('cpu'))
+    a = torch.randn(B, cfg.action_dim)
+    dv = torch.randn(B, cfg.dv_dim)
+    with torch.no_grad():
+        rssm.img_step(state, a, dv=dv, sample=False)
+    sc = getattr(rssm, '_op_scale_applied', None)
+    assert torch.is_tensor(sc)
+    assert torch.allclose(sc, torch.ones_like(sc), atol=1e-5, rtol=1e-5), (
+        float((sc - 1).abs().max()),)
+
+    model.set_world_model_trainable(g=True, dob=False, reward=False)
+    assert all(p.requires_grad for p in rssm.op_scale_net.parameters())
+    model.set_world_model_trainable(g=False, dob=True, reward=False)
+    assert not any(p.requires_grad for p in rssm.op_scale_net.parameters())
+    model.set_world_model_trainable(g=True, dob=False, reward=False)
+
+    with torch.no_grad():
+        last.weight.normal_(0.0, 0.2)
+        last.bias.normal_(0.0, 0.05)
+        rssm.img_step(state, a, dv=dv, sample=False)
+    sc2 = rssm._op_scale_applied
+    assert (sc2 - 1).abs().max() > 1e-4
+    print('[smoke] OK  P118 opscale init≡1; group g; scale moves')
+
+
 def _test_collect_serve_cuda_graph_cpu() -> None:
     """GPU-occupied identity: collect graph is CUDA-only; CPU stays eager."""
     from models.dreamer_v4_rssm import get_collect_serve_cuda_graph
@@ -6970,6 +7040,7 @@ if __name__ == '__main__':
     _test_p100_luenberger_kalman()
     _test_stream_serve_matches_rollout()
     _test_p114_kfeat()
+    _test_p118_opscale()
     _test_collect_serve_cuda_graph_cpu()
     _test_dreamer_v4_config_from_train()
     _test_envfree_observer_recipe()

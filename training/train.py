@@ -4509,6 +4509,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_afreeze=True "
         f"dob_luen=True "
         f"dob_kfeat=True "
+        f"opscale=True "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -7240,18 +7241,23 @@ def _gain_match_tgt_tensor(g_wm: torch.Tensor, tgts, owner=None):
 
 
 def _gain_match_pred_over_tgt(
-        g_wm: torch.Tensor, tgts, owner=None) -> torch.Tensor:
+        g_wm: torch.Tensor, tgts, owner=None,
+        tgt_b: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Mean ``G_pred / G_tgt`` over finite targets (no extra FD).
 
     P43 Huber ~1e-4 while TM DV stayed ×0.74 — jsonl Huber is 0 at a
     matching IC, so it cannot show a rest-step miss.  Sign-aware (test_sim
     MV tgt is negative).  Empty / all-tiny tgts → 0.
+    P118: ``tgt_b`` is rest-IC plant FD G when cached (not SysID median).
     """
-    if not tgts:
-        return g_wm.new_zeros(())
-    tgt = _gain_match_tgt_tensor(g_wm, tgts, owner)
-    tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
-                      g_wm.shape[-1]).expand_as(g_wm)
+    if tgt_b is None:
+        if not tgts:
+            return g_wm.new_zeros(())
+        tgt = _gain_match_tgt_tensor(g_wm, tgts, owner)
+        tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
+                          g_wm.shape[-1]).expand_as(g_wm)
+    elif tgt_b.shape != g_wm.shape:
+        tgt_b = tgt_b.expand_as(g_wm)
     ok = tgt_b.abs() >= 1e-6
     den = torch.where(ok, tgt_b, torch.ones_like(tgt_b))
     n = ok.to(g_wm.dtype).sum().clamp_min(1.0)
@@ -8180,6 +8186,211 @@ def collect_rest_lookback(
         return lookback_obs, lookback_act
 
 
+def _identified_g_matrix(cfg: 'TrainConfig') -> Optional[np.ndarray]:
+    """``(n_in, n_cv)`` SysID median G in WM-norm, or None."""
+    mv = [list(r) for r in (getattr(cfg, 'gain_match_mv_target', ()) or ())]
+    dv = [list(r) for r in (getattr(cfg, 'gain_match_dv_target', ()) or ())]
+    rows = mv + dv
+    if not rows:
+        return None
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _sim_layers(env: 'APCEnv') -> List[object]:
+    sim = getattr(env, 'sim', None)
+    out: List[object] = []
+    seen: set = set()
+    while sim is not None and id(sim) not in seen:
+        seen.add(id(sim))
+        out.append(sim)
+        sim = getattr(sim, '_sim', None)
+    return out
+
+
+def _snapshot_gain_match_rest(env: 'APCEnv') -> dict:
+    """Plant OP snapshot so MV then DV FDs start from the same rest."""
+    snap: dict = {}
+    for i, sim in enumerate(_sim_layers(env)):
+        layer: dict = {}
+        for name in ('episode_array', 'episode_counter', 'u_actual',
+                     'u_history', 'done'):
+            v = getattr(sim, name, None)
+            if isinstance(v, np.ndarray):
+                layer[name] = v.copy()
+            elif v is not None:
+                layer[name] = copy.deepcopy(v)
+        for name in ('_dv_offsets', '_cv_offsets'):
+            d = getattr(sim, name, None)
+            if isinstance(d, dict):
+                layer[name] = dict(d)
+        snap[i] = layer
+    lp = getattr(env, '_dv_lp_state', None)
+    snap['env'] = {
+        '_dv_lp_state': copy.deepcopy(lp),
+        '_prev_control': (
+            np.array(env._prev_control, copy=True)
+            if getattr(env, '_prev_control', None) is not None else None),
+    }
+    return snap
+
+
+def _restore_gain_match_rest(env: 'APCEnv', snap: dict) -> None:
+    for i, sim in enumerate(_sim_layers(env)):
+        layer = snap.get(i) or {}
+        for name, v in layer.items():
+            if isinstance(v, np.ndarray):
+                cur = getattr(sim, name, None)
+                if isinstance(cur, np.ndarray) and cur.shape == v.shape:
+                    cur[...] = v
+                else:
+                    setattr(sim, name, v.copy())
+            else:
+                setattr(sim, name, copy.deepcopy(v) if isinstance(v, dict)
+                        else v)
+    es = snap.get('env') or {}
+    if '_dv_lp_state' in es:
+        env._dv_lp_state = copy.deepcopy(es.get('_dv_lp_state'))
+    pc = es.get('_prev_control')
+    if pc is not None and hasattr(env, '_prev_control'):
+        env._prev_control = np.array(pc, copy=True)
+
+
+def _cube_step_vec_np(base: np.ndarray, j: int, step: float
+                      ) -> Tuple[np.ndarray, float]:
+    """Numpy one-channel cube-step; reverse if ``+step`` shrinks ``|Δ|``."""
+    b = np.asarray(base, dtype=np.float32).reshape(-1)
+    j = int(j)
+    if j < 0 or j >= int(b.size):
+        return b.copy(), 0.0
+    plus = b.copy()
+    plus[j] = float(np.clip(float(b[j]) + float(step), -1.0, 1.0))
+    du_plus = float(plus[j] - b[j])
+    if abs(du_plus) + 1e-6 < abs(float(step)):
+        minus = b.copy()
+        minus[j] = float(np.clip(float(b[j]) - float(step), -1.0, 1.0))
+        return minus, float(minus[j] - b[j])
+    return plus, du_plus
+
+
+def _plant_fd_rest_local_g(
+        env: 'APCEnv', cfg: 'TrainConfig', a_hold: np.ndarray,
+        obs_pre: np.ndarray) -> Optional[np.ndarray]:
+    """WM-norm ``(n_in, n_cv)`` plant FD at the current rest OP.
+
+    Teacher K = resolved ``gain_match_len`` (auto H). Same cube-step as
+    WM FD. Does **not** ``reset()`` (RNG would change OP). Snapshot/restore
+    between MV and DV. Failure → None (caller uses identified G).
+    """
+    ident = _identified_g_matrix(cfg)
+    cv_idx = [int(i) for i in (getattr(env, 'cv_indices', ()) or
+                               getattr(cfg, 'cv_obs_indices', ()) or ())]
+    if not cv_idx:
+        return ident
+    n_cv = len(cv_idx)
+    n_mv = _env_n_mv(env)
+    dv_idx = [int(i) for i in (getattr(cfg, 'dv_indices', ()) or ())]
+    n_dv = len(dv_idx)
+    n_in = int(n_mv) + int(n_dv)
+    if n_in <= 0:
+        return ident
+    g = (ident.copy() if ident is not None and ident.shape == (n_in, n_cv)
+         else np.zeros((n_in, n_cv), dtype=np.float32))
+    K = int(getattr(cfg, 'gain_match_len', 0) or 0)
+    if K <= 0:
+        K = int(getattr(cfg, 'horizon', 15) or 15)
+    K = max(2, K)
+    step = _resolve_gain_match_step(cfg)
+    a_hold = _as_hold_action(a_hold, env.action_dim)
+    obs_pre = np.asarray(obs_pre, dtype=np.float32).reshape(-1)
+    pre_cv = obs_pre[cv_idx].astype(np.float32)
+    stats = env.get_obs_norm_stats() if hasattr(env, 'get_obs_norm_stats') else {}
+    var = np.asarray(stats.get('var', np.ones(env.obs_dim)), dtype='float64')
+    obs_std = np.sqrt(np.clip(var, 1e-8, None)).astype(np.float32)
+    try:
+        snap = _snapshot_gain_match_rest(env)
+    except Exception:
+        return ident
+    sim = None
+    for s in _sim_layers(env):
+        if hasattr(s, 'set_disturbance_offset'):
+            sim = s
+            break
+    if sim is None:
+        sim = getattr(env, 'sim', None)
+
+    def _roll_hold(action: np.ndarray) -> Optional[np.ndarray]:
+        last = None
+        a = np.asarray(action, dtype=np.float32)
+        for _ in range(K):
+            ow, _, done, _ = env.step(a)
+            last = np.asarray(ow[-1], dtype=np.float32)
+            if done:
+                return None
+        return last
+
+    for j in range(n_mv):
+        try:
+            _restore_gain_match_rest(env, snap)
+            a_step, du_cmd = _cube_step_vec_np(a_hold, j, step)
+            last = _roll_hold(a_step)
+            if last is None:
+                continue
+            a_post = np.asarray(getattr(env, '_prev_control', a_step),
+                               dtype=np.float32).reshape(-1)
+            du = float(a_post[j] - a_hold[j]) if j < a_post.size else du_cmd
+            if abs(du) < 1e-6:
+                du = du_cmd
+            if abs(du) < 1e-6:
+                continue
+            dcv = last[cv_idx].astype(np.float32) - pre_cv
+            g[j] = dcv / du
+        except Exception:
+            continue
+    for k in range(n_dv):
+        j = n_mv + k
+        try:
+            _restore_gain_match_rest(env, snap)
+            dv_pre = obs_pre[dv_idx].astype(np.float32)
+            dv_step, du_cmd = _cube_step_vec_np(dv_pre, k, step)
+            du_norm = float(dv_step[k] - dv_pre[k])
+            if abs(du_norm) < 1e-6:
+                du_norm = du_cmd
+            oi = dv_idx[k]
+            du_eng = float(du_norm * (
+                float(obs_std[oi]) if oi < len(obs_std) else 1.0))
+            if sim is not None and hasattr(sim, 'set_disturbance_offset'):
+                sim.set_disturbance_offset('dv', k, du_eng)
+            last = _roll_hold(a_hold)
+            if sim is not None and hasattr(sim, 'set_disturbance_offset'):
+                try:
+                    sim.set_disturbance_offset('dv', k, 0.0)
+                except Exception:
+                    pass
+            if last is None:
+                continue
+            realized = float(last[oi] - obs_pre[oi]) if oi < last.size else 0.0
+            du = realized if abs(realized) >= 1e-6 else du_norm
+            if abs(du) < 1e-6:
+                continue
+            dcv = last[cv_idx].astype(np.float32) - pre_cv
+            g[j] = dcv / du
+        except Exception:
+            continue
+    try:
+        _restore_gain_match_rest(env, snap)
+        if sim is not None and hasattr(sim, 'set_disturbance_offset'):
+            for k in range(n_dv):
+                try:
+                    sim.set_disturbance_offset('dv', k, 0.0)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if not np.isfinite(g).all():
+        return ident
+    return g.astype(np.float32)
+
+
 def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     """Seed-time real rest lookbacks for the TM-protocol teacher.
 
@@ -8202,16 +8413,35 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     hold_rows = _per_mv_hold_rows(levels, n_mv, env.action_dim, rng)
     obs_l: List[np.ndarray] = []
     act_l: List[np.ndarray] = []
+    local_g_rows: List[np.ndarray] = []
+    n_fd = 0
+    from tools.wm_steady_state_diagnostic import scoped_quiet_env
+    ident = _identified_g_matrix(cfg)
     for i in range(n):
         lvl = hold_rows[i] if hold_rows is not None else float(levels[i])
         o, a = collect_rest_lookback(
             env, cfg, lvl, settle=settle, lookback=L)
         obs_l.append(o)
         act_l.append(a)
+        # Collect restored noise; FD needs quiet without reset (plant
+        # already at this rest OP). Failure must not abort the cache.
+        g_loc = None
+        try:
+            with scoped_quiet_env(env):
+                g_loc = _plant_fd_rest_local_g(env, cfg, a[-1], o[-1])
+            if g_loc is not None:
+                n_fd += 1
+        except Exception:
+            g_loc = None
+        if g_loc is None and ident is not None:
+            g_loc = ident
+        if g_loc is not None:
+            local_g_rows.append(np.asarray(g_loc, dtype=np.float32))
     cfg._gain_match_rest_obs = np.stack(obs_l, axis=0)  # type: ignore[attr-defined]
     cfg._gain_match_rest_act = np.stack(act_l, axis=0)  # type: ignore[attr-defined]
     cfg._gain_match_rest_dev = None  # type: ignore[attr-defined]
     cfg._gain_match_rest_adv = None  # type: ignore[attr-defined]
+    cfg._gain_match_rest_local_g = None  # type: ignore[attr-defined]
     from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
     _len_cfg = int(getattr(cfg, 'gain_match_rest_ic_len', 0))
     print(f'[gain-match] rest-ic N={n} L={L} settle={settle} '
@@ -8220,6 +8450,36 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
           f'rest-obs CV / TM pre, not held-K; isolation loss stays 0; '
           f'not wm_tf_horizon={_wm_tf_h(int(getattr(cfg, "horizon", 15) or 15))})',
           flush=True)
+    if len(local_g_rows) == n:
+        try:
+            g_loc_a = np.stack(local_g_rows, axis=1)  # (n_in, N, n_cv)
+            cfg._gain_match_rest_local_g = g_loc_a  # type: ignore[attr-defined]
+            g_mean = g_loc_a.mean(axis=1)
+            span = np.abs(g_loc_a.max(axis=1) - g_loc_a.min(axis=1))
+            ident_s = (None if ident is None
+                        else np.asarray(ident, dtype=np.float32).round(4).tolist())
+            print(
+                f'[gain-match] rest-ic local G: {tuple(g_loc_a.shape)} '
+                f'plant_fd={n_fd}/{n} '
+                f'mean={np.asarray(g_mean).round(4).tolist()} '
+                f'span={np.asarray(span).round(4).tolist()} '
+                f'identified={ident_s}',
+                flush=True,
+            )
+        except Exception as _lg_exc:
+            cfg._gain_match_rest_local_g = None  # type: ignore[attr-defined]
+            print(
+                f'[gain-match] rest-ic local G stack FAILED '
+                f'({type(_lg_exc).__name__}: {_lg_exc}); '
+                f'Huber falls back to identified G',
+                flush=True,
+            )
+    else:
+        print(
+            f'[gain-match] rest-ic local G incomplete '
+            f'({len(local_g_rows)}/{n}); Huber falls back to identified G',
+            flush=True,
+        )
 
 
 def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
@@ -8282,6 +8542,11 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     unroll.  Not P69 stop-grad *inside* the teacher
     (detached teacher-K state must not re-enter ``prev_state``).
     Rest-IC only.
+    **P118:** rest-IC Huber ``G_tgt`` is plant FD at each cached rest OP
+    when ``_gain_match_rest_local_g`` is present (equal-% / 1/feed
+    OP-varying DC). SysID median is the fallback. jsonl ``*_ratio`` uses
+    the same local G. LPV ``op_scale_net`` is identity at init (group
+    ``g``). Not extra-P1 / ol1 / k1 / traj N+1.
     **P76 EXIT REVERT:** RSSM GRU update-gate bias ``log(H/16)``
     (keep-h stalled conv; freeze GAIN_NOT_READY 0.80@MV).  Last-step
     DC Huber stays (P64/P73).  **P77 EXIT FALSIFIED** Markovian TSSM
@@ -8420,39 +8685,57 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     _per = bool(getattr(cfg, 'gain_match_huber_per_input', False))
     _clip = _cfg_on(cfg, 'gain_match_clip_realized', True)
 
-    def _huber_from_cv(cv_base, cv_step_stack, tgts, du_in):
+    def _huber_from_cv(cv_base, cv_step_stack, tgts, du_in, g_tgt=None):
         # ``cv_step_stack`` (n_in, Bm, n_cv) last-step DC.  One mean
         # Huber ≡ mean of per-input means (equal Bm×n_cv).  P27
         # relative scale is gone.  P61: divide by realized Δu (TM
         # p136), mask cube no-ops.  P75 FOPDT K-stack **REVERT**.
+        # P118: ``g_tgt`` is rest-IC plant FD when cached.
         if not tgts:
             return zero
         den = du_in.unsqueeze(-1)
         ok = den.abs() >= 1e-6
         g_wm = (cv_step_stack - cv_base) / torch.where(
             ok, den, torch.ones_like(den))
-        tgt = _gain_match_tgt_tensor(g_wm, tgts, cfg)
-        tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
-                         g_wm.shape[-1]).expand_as(g_wm)
+        if (g_tgt is not None and torch.is_tensor(g_tgt)
+                and tuple(g_tgt.shape) == tuple(g_wm.shape)):
+            tgt_b = g_tgt
+        else:
+            tgt = _gain_match_tgt_tensor(g_wm, tgts, cfg)
+            tgt_b = tgt.view(g_wm.shape[0], *([1] * (g_wm.ndim - 2)),
+                             g_wm.shape[-1]).expand_as(g_wm)
         return _smooth_l1_gain_match(
             g_wm, tgt_b, beta=_hb, per_input=_per, mask=ok)
 
-    def _huber_from_cv_traj(cv_base, cv_traj, tgts, du_in, fo):
+    def _huber_from_cv_traj(cv_base, cv_traj, tgts, du_in, fo, g_tgt=None):
         # Uniform-in-k Huber of ``G(k)=(CV_k−pre)/Δu`` vs ``G_tgt·fo[k]``.
         # β from DC ``|G_tgt|`` (not ``|G_tgt·fo|`` — dead-time β→0 is
         # P27/P63 relative-Huber class).  Last step of ``fo`` is 1.
+        # P118: local rest-IC G still × FO (do not retune P111).
         if not tgts:
             return zero
         den = du_in.unsqueeze(-1).unsqueeze(-1)
         ok = den.abs() >= 1e-6
         g_wm = (cv_traj - cv_base.unsqueeze(0).unsqueeze(2)) / torch.where(
             ok, den, torch.ones_like(den))
-        tgt = _gain_match_tgt_tensor(g_wm[:, :, -1], tgts, cfg)
-        tgt_k = tgt.view(tgt.shape[0], 1, 1, tgt.shape[-1]) * fo.view(1, 1, -1, 1)
+        if (g_tgt is not None and torch.is_tensor(g_tgt)
+                and g_tgt.ndim == 3
+                and int(g_tgt.shape[0]) == int(g_wm.shape[0])
+                and int(g_tgt.shape[1]) == int(g_wm.shape[1])
+                and int(g_tgt.shape[-1]) == int(g_wm.shape[-1])):
+            tgt_k = g_tgt.unsqueeze(2) * fo.view(1, 1, -1, 1)
+            tgt_dc = g_tgt
+        else:
+            tgt = _gain_match_tgt_tensor(g_wm[:, :, -1], tgts, cfg)
+            tgt_k = tgt.view(tgt.shape[0], 1, 1, tgt.shape[-1]) * fo.view(1, 1, -1, 1)
+            tgt_dc = tgt
         if _per:
             e = g_wm - tgt_k
-            b = tgt.abs().clamp_min(1e-6).view(
-                tgt.shape[0], 1, 1, tgt.shape[-1])
+            if tgt_dc.ndim == 3:
+                b = tgt_dc.abs().clamp_min(1e-6).unsqueeze(2)
+            else:
+                b = tgt_dc.abs().clamp_min(1e-6).view(
+                    tgt_dc.shape[0], 1, 1, tgt_dc.shape[-1])
             abs_e = e.abs()
             el = torch.where(abs_e < b, 0.5 * e.square() / b,
                              abs_e - 0.5 * b)
@@ -8470,6 +8753,23 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     # K-loops (linear in n_mv+n_dv) were dead after P32 TSSM wiring.
     n_mv_t = len(mv_tgts)
     n_dv_t = len(dv_tgts)
+    local_g = None
+    if rest is not None:
+        lg = getattr(cfg, '_gain_match_rest_local_g', None)
+        if lg is not None:
+            lg_t = torch.as_tensor(
+                np.ascontiguousarray(lg), device=obs.device, dtype=obs.dtype)
+            n_cv_g = int(getattr(rssm, 'n_cv', 0) or 0)
+            if (lg_t.ndim == 3
+                    and int(lg_t.shape[0]) == int(n_mv_t + n_dv_t)
+                    and int(lg_t.shape[1]) == int(Bm)
+                    and int(lg_t.shape[2]) == n_cv_g):
+                local_g = lg_t
+                if not getattr(cfg, '_gain_match_local_g_logged', False):
+                    print('[gain-match] Huber G_tgt = rest-IC plant FD '
+                          '(P118; not SysID median)',
+                          flush=True)
+                    cfg._gain_match_local_g_logged = True  # type: ignore[attr-defined]
     # P68 rest-pre: plant rest is ``cv_base``.  The held-K decode is
     # unused — skip that extra ``Bm×K`` prior roll (test_sim 3→2 rolls).
     # PRBS fallback still needs held-K ``cv_base``.
@@ -8561,12 +8861,14 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         cv_base = cv_k[0]
         cv_steps = cv_k[1:]
     total = _huber_from_cv(
-        cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du)
+        cv_base, cv_steps, list(mv_tgts) + list(dv_tgts), du,
+        g_tgt=local_g)
     loss = total
     if stack_k and cv_traj is not None:
         cv_traj_steps = cv_traj if skip_held else cv_traj[1:]
         traj_term = _huber_from_cv_traj(
-            cv_base, cv_traj_steps, list(mv_tgts) + list(dv_tgts), du, fo)
+            cv_base, cv_traj_steps, list(mv_tgts) + list(dv_tgts), du, fo,
+            g_tgt=local_g)
         loss = loss + traj_term
         if bool(getattr(cfg, '_wm_need_logged_aux', True)):
             diag['gain_match_traj_loss'] = traj_term.detach()
@@ -8616,14 +8918,18 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
             diag['gain_match_clip_frac'] = clip_frac_t.detach()
             if n_mv_t:
                 diag['gain_match_mv_loss'] = _huber_from_cv(
-                    cv_base, cv_steps[:n_mv_t], mv_tgts, du[:n_mv_t])
+                    cv_base, cv_steps[:n_mv_t], mv_tgts, du[:n_mv_t],
+                    g_tgt=(None if local_g is None else local_g[:n_mv_t]))
                 diag['gain_match_mv_ratio'] = _gain_match_pred_over_tgt(
-                    g_all[:n_mv_t], mv_tgts, cfg)
+                    g_all[:n_mv_t], mv_tgts, cfg,
+                    tgt_b=(None if local_g is None else local_g[:n_mv_t]))
             if dv_tgts:
                 diag['gain_match_dv_loss'] = _huber_from_cv(
-                    cv_base, cv_steps[n_mv_t:], dv_tgts, du[n_mv_t:])
+                    cv_base, cv_steps[n_mv_t:], dv_tgts, du[n_mv_t:],
+                    g_tgt=(None if local_g is None else local_g[n_mv_t:]))
                 diag['gain_match_dv_ratio'] = _gain_match_pred_over_tgt(
-                    g_all[n_mv_t:], dv_tgts, cfg)
+                    g_all[n_mv_t:], dv_tgts, cfg,
+                    tgt_b=(None if local_g is None else local_g[n_mv_t:]))
     return loss, diag
 
 
@@ -9254,9 +9560,10 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
 
     # ----- C(1) gain-matching step-response asymptote (RSSM) -----
     # Supervise the WM's finite-difference step-response asymptote toward the
-    # identified steady-state gain — the un-cheatable DC supervisor that pins
-    # the subdominant DV gain the categorical attenuates (the continuous gain
-    # channel gives the WM the un-quantized CAPACITY this loss grabs onto).
+    # rest-IC plant FD G when cached (P118; OP-varying equal-% / 1/feed),
+    # else the identified steady-state gain.  Jsonl teacher ×1 vs a
+    # single SysID median is tautological on OP-varying plants.  The
+    # continuous gain channel gives the WM the un-quantized CAPACITY.
     gm_coef = float(getattr(cfg, 'gain_match_coef', 0.0) or 0.0)
     if gm_coef > 0.0 and _g_live:
         gain_match_loss, gain_match_diag = _wm_gain_match_loss(
@@ -9312,6 +9619,11 @@ def _rssm_world_model_loss(model: DreamerV4, obs_cur: torch.Tensor,
         'dob_slow_alpha': (rssm.dob_slow().mean().detach()
                            if dob_on and hasattr(rssm, 'dob_slow')
                            else torch.zeros((), device=feats.device)),
+        'wm_op_scale_dev': (
+            (getattr(rssm, '_op_scale_applied', None).detach() - 1.0
+             ).abs().mean()
+            if torch.is_tensor(getattr(rssm, '_op_scale_applied', None))
+            else torch.zeros((), device=feats.device)),
     }
     losses.update(kl_diag)
     losses.update(gain_match_diag)
@@ -14890,6 +15202,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             row['gain_match_traj_loss'])
             else:
                 row.setdefault('wm_gain_match_traj_loss', 0.0)
+            row.setdefault('wm_op_scale_dev',
+                           float(row.get('wm_op_scale_dev') or 0.0))
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
