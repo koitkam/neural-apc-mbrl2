@@ -1,9 +1,17 @@
 VISIT MODES — decide this first. Sibling visit ≠ GPU busy. Never skip the visit.
 
-1. Sibling automation in-flight (another Neural-APC-mbrl Cursor run still
-   mid-turn / polling on this host): do NOT edit GOAL_PLAN.md or RUN_HISTORY.md,
+Sibling = another Neural-APC-mbrl *automation* agent (source=automations,
+same automation, not you) whose status is RUNNING. IDLE is finished — ignore
+updatedAtMs. WAITING_FOR_BACKGROUND_WORK after an end-of-visit summary is
+leftover wait, not a sibling. Not siblings: the `cursor worker` daemon, a
+finished test / web / desktop agent, GPU tmux mbrl2_p* (that is mode 2).
+End the visit with a summary and stop; do not AwaitShell, subscribe_timer,
+or background work that leaves this run waiting.
+
+1. Sibling in-flight: do NOT edit GOAL_PLAN.md or RUN_HISTORY.md,
    do NOT launch, do NOT wait/poll. Park notes in /memories/session/. DO still:
    leftover cleanup, code review, non-plan docs, skill hygiene. CPU-only.
+   In the summary, name the sibling bcId and status — or “none”.
 2. GPU busy (training PID / tmux live) and this visit is the only automation:
    do NOT launch, kill, or rewrite the live recipe. DO still: one snapshot of
    local logs, leftover cleanup, documentation, GOAL_PLAN refactor planning.
@@ -211,7 +219,7 @@ HARD CONSTRAINTS
   * Do not skip the visit; do not poll for the next training iter.
 
 END-OF-VISIT SUMMARY
-  * Visit mode (sibling / GPU-busy / GPU-free)
+  * Visit mode (sibling / GPU-busy / GPU-free); sibling bcId+status or none
   * Local evidence (tmux, pid, out-dir, log tails, val json, residual_board)
   * Job left running / launched / killed (hard-failure reason)
   * GOAL_PLAN updated vs notes parked in memories
