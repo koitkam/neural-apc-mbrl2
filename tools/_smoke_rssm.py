@@ -5998,6 +5998,13 @@ def _test_sim_runtime_cfg() -> None:
     assert "os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION')" not in ctor
     assert "os.environ.get('DREAMER_SIM_PARAM_RANDOMIZATION_PCT')" not in ctor
     assert "os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED')" not in ctor
+    assert 'env_prefixes' not in ctor
+    for _plant in (
+            'simulation/test_sim/test_sim.py',
+            'simulation/nonlinear_sim/nonlinear_sim.py',
+            'simulation/distillation/distillation_sim.py',
+            'simulation/softsensor_lab/softsensor_lab_sim.py'):
+        assert 'env_prefixes=' not in open(_plant).read()
     assert 'bind_domain_randomization_from_cfg' in sn_src
     pp_src = open('workflow/_plant_prepare.py').read()
     tr_src = open('training/train.py').read()

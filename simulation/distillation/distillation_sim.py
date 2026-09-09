@@ -204,7 +204,6 @@ class DistillationTower(DisturbanceOffsetMixin):
 
         # Domain randomization controls.
         self._randomizer = DomainRandomizer(
-            env_prefixes=['DISTILLATION'],
             domain_randomization=domain_randomization,
             param_randomization_pct=param_randomization_pct,
             randomization_seed=randomization_seed,

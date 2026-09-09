@@ -145,7 +145,6 @@ class DomainRandomizer:
     ignored).  Factory wrap still bakes identifier-derived ``frac``.
 
     Args:
-        env_prefixes: Unused leftover (kept so sim constructors do not churn).
         domain_randomization: Explicit override for enable/disable (*None*
             uses the bind, else identity ON).
         param_randomization_pct: Explicit override for the ±% range (*None*
@@ -156,14 +155,10 @@ class DomainRandomizer:
 
     def __init__(
         self,
-        env_prefixes: Optional[List[str]] = None,
         domain_randomization: Optional[bool] = None,
         param_randomization_pct: Optional[float] = None,
         randomization_seed=None,
     ):
-        prefixes = list(env_prefixes or ['SIM'])
-        _ = prefixes  # leftover SIM_ / DISTILLATION_ prefixes ignored (P91-live)
-
         en, fr, seed_bound = domain_randomization_knobs()
         if domain_randomization is not None:
             self.enabled = bool(domain_randomization)
