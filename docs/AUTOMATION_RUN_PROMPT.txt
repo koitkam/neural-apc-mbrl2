@@ -116,8 +116,9 @@ Fail/optimize on CV smoothness + limit hugging + TM + unmeasured DR.
     to the limit is good). A CV that oscillates is a fail. cv_opt_headroom is a
     residual, not an all_pass / P3-skip gate.
   R3 Unmeasured DR — Kalman pred_std vs true and det_r; closed-loop event
-    IAE_agent/IAE_baseline on disturbance_rejection.png; after the event the
-    CV must return aggressively to the economic limit (not a mid-band settle).
+    IAE_agent/IAE_baseline; cv_return_headroom (late-window gap / bound
+    width) and cv_return_time_frac (fraction of the 5τ event window).
+    IAE without return-to-limit is not residual-closed.
 Do not treat VALID 9/9, GAIN-READY, all_pass, or family-closed as residual-closed.
 Do not require beating the current econ champion to KEEP a smoothness,
 headroom, or DR win.
@@ -134,7 +135,7 @@ residual_board + plots + codebase + literature, then execute it. Do not abandon
 the plan because a family closed unless that step’s hypothesis was falsified.
 After every EXIT: read all val axes (not the one that moved) — MV/DV ss, @H,
 curve_iae, gain decomp, residual_board vs champions, det_r and pred_std vs true,
-event IAE and post-event return-to-limit, critic_rew_to_tgt_var and critic_r,
+event IAE and post-event cv_return_headroom / cv_return_time_frac, critic_rew_to_tgt_var and critic_r,
 paired econ vs baseline and champion, CV d2 / reversal / headroom / viol_frac,
 plots. Update RUN_HISTORY and GOAL_PLAN; commit so the next visit sees them;
 then the next plan step.
@@ -174,7 +175,7 @@ unless you re-justify them from evidence:
   * jsonl teacher gain ×1 (tautology; val TM / residual_board is the score)
   * critic_r Pearson without critic_rew_to_tgt_var
   * raw disturbance R² (drift; use det_r + pred_std vs true)
-  * event IAE without checking the CV returned to the economic limit
+  * event IAE without cv_return_headroom / cv_return_time_frac
   * VALID 9/9, GAIN-READY, all_pass, or family-closed as “residual closed”
   * requiring a beat of the current econ champion to KEEP a smoothness /
     headroom / DR win

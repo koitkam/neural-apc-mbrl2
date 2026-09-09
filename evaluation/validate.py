@@ -190,6 +190,15 @@ CV_VIOL_FRAC_INFO = 0.02
 CV_D2_RMS_TARGET = 0.01
 CV_REVERSAL_TARGET = 0.10
 CV_OPT_HEADROOM_TARGET = 0.15
+# R3 return-to-limit (residual, not all_pass).  Distances are / bound
+# width; times are a fraction of the event window (that window is 5τ
+# when the identifier is present, else a fixed step count).  No
+# engineering units, no test_sim magic defaults.
+RETURN_BAND_NORMED = 0.05          # same as settle_band: 5% of span
+RETURN_LATE_FRAC = 0.2             # last 20% of window ≈ 1τ if window=5τ
+RETURN_HOLD_FRAC = 0.1             # hold ≈ 0.5τ to count as reached
+CV_RETURN_HEADROOM_TARGET = 0.15   # same shape as opt-headroom target
+CV_RETURN_TIME_FRAC_TARGET = 0.4   # back within ~2τ of a 5τ window
 
 
 def _finite_floats(vals) -> List[float]:
@@ -299,6 +308,87 @@ def _episode_objective_meta(env) -> Dict:
             obj_w.get('cv_violation_weights_lo') or []),
         'obj_cv_violation_weights_hi': list(
             obj_w.get('cv_violation_weights_hi') or []),
+    }
+
+
+def limit_gap_normed(y, lo: float, hi: float, side: str) -> np.ndarray:
+    """Distance to the economic bound, divided by bound width.
+
+    0 = on the preferred limit.  Positive = inside the band, away from
+    that limit.  Negative = past the preferred bound (money-side
+    violation).  ``side`` is ``hi`` / ``lo`` / ``unknown`` (nearest).
+    """
+    arr = np.asarray(y, dtype='float64').reshape(-1)
+    width = float(hi) - float(lo)
+    if (not np.isfinite(width)) or width <= 1e-12:
+        return np.zeros_like(arr)
+    if side == 'hi':
+        return (float(hi) - arr) / width
+    if side == 'lo':
+        return (arr - float(lo)) / width
+    return np.minimum(arr - float(lo), float(hi) - arr) / width
+
+
+def return_to_limit_on_window(
+    y,
+    lo: float,
+    hi: float,
+    side: str,
+    *,
+    band: float = RETURN_BAND_NORMED,
+    late_frac: float = RETURN_LATE_FRAC,
+    hold_frac: float = RETURN_HOLD_FRAC,
+) -> Dict[str, float]:
+    """Plant-agnostic post-event return to the economic limit.
+
+    Time is a fraction of *this window* (caller sizes the window from τ).
+    Headroom is mean late-window gap / bound width on feasible samples.
+    """
+    arr = np.asarray(y, dtype='float64').reshape(-1)
+    n = int(arr.size)
+    empty = {
+        'cv_return_headroom': float('nan'),
+        'cv_return_time_frac': 1.0,
+        'cv_return_viol_frac': float('nan'),
+        'cv_return_reached': False,
+        'cv_return_band_normed': float(band),
+    }
+    if n < 2:
+        return empty
+    width = float(hi) - float(lo)
+    if (not np.isfinite(width)) or width <= 1e-12:
+        return empty
+    gap = limit_gap_normed(arr, lo, hi, side)
+    viol = (arr > float(hi)) | (arr < float(lo))
+    in_band = ((~viol) & (gap >= -1e-12)
+               & (gap <= float(band)))
+    hold = max(1, int(round(float(hold_frac) * n)))
+    run = 0
+    reached_at = None
+    for i, ok in enumerate(in_band.tolist()):
+        if ok:
+            run += 1
+            if run >= hold:
+                reached_at = i - hold + 1
+                break
+        else:
+            run = 0
+    time_frac = (1.0 if reached_at is None
+                 else float(reached_at) / float(max(1, n)))
+    late_n = max(1, int(round(float(late_frac) * n)))
+    late_gap = gap[-late_n:]
+    late_viol = viol[-late_n:]
+    feasible = late_gap[~late_viol]
+    if feasible.size:
+        head = float(np.mean(np.maximum(feasible, 0.0)))
+    else:
+        head = float('nan')
+    return {
+        'cv_return_headroom': head,
+        'cv_return_time_frac': float(time_frac),
+        'cv_return_viol_frac': float(np.mean(late_viol)),
+        'cv_return_reached': reached_at is not None,
+        'cv_return_band_normed': float(band),
     }
 
 
@@ -561,6 +651,12 @@ def _closed_loop_dr_scores(disturbance_records: Optional[List[Dict]]
                             ) -> Dict[str, float]:
     ratios: List[float] = []
     ovs: List[float] = []
+    ret_h: List[float] = []
+    ret_t: List[float] = []
+    ret_v: List[float] = []
+    ret_vs_base: List[float] = []
+    n_reached = 0
+    n_events = 0
     for r in disturbance_records or []:
         am = r.get('episode_metrics_agent') or {}
         bm = r.get('episode_metrics_baseline') or {}
@@ -573,6 +669,24 @@ def _closed_loop_dr_scores(disturbance_records: Optional[List[Dict]]
         ovf = _metric_get({'p90': ov}, 'p90')
         if ovf is not None:
             ovs.append(ovf)
+        rh = _metric_get(ev.get('return_headroom') or {}, 'mean', 'max')
+        rt = _metric_get(ev.get('return_time_frac') or {}, 'mean', 'max')
+        rv = _metric_get(ev.get('return_viol_frac') or {}, 'mean', 'max')
+        if rh is not None:
+            ret_h.append(rh)
+        if rt is not None:
+            ret_t.append(rt)
+        if rv is not None:
+            ret_v.append(rv)
+        try:
+            n_reached += int(ev.get('n_return_reached') or 0)
+            n_events += int(ev.get('n_return_events') or 0)
+        except (TypeError, ValueError):
+            pass
+        bev = r.get('event_response_baseline') or {}
+        bh = _metric_get(bev.get('return_headroom') or {}, 'mean', 'max')
+        if rh is not None and bh is not None and abs(bh) > 1e-3:
+            ret_vs_base.append(float(rh) / float(bh))
     return {
         'iae_agent_over_baseline_mean': (
             float(np.mean(ratios)) if ratios else float('nan')),
@@ -580,6 +694,20 @@ def _closed_loop_dr_scores(disturbance_records: Optional[List[Dict]]
             float(max(ratios)) if ratios else float('nan')),
         'overshoot_p90_mean': float(np.mean(ovs)) if ovs else float('nan'),
         'n_pairs': int(len(ratios)),
+        'cv_return_headroom_mean': (
+            float(np.mean(ret_h)) if ret_h else float('nan')),
+        'cv_return_headroom_worst': (
+            float(max(ret_h)) if ret_h else float('nan')),
+        'cv_return_time_frac_mean': (
+            float(np.mean(ret_t)) if ret_t else float('nan')),
+        'cv_return_time_frac_worst': (
+            float(max(ret_t)) if ret_t else float('nan')),
+        'cv_return_viol_frac_mean': (
+            float(np.mean(ret_v)) if ret_v else float('nan')),
+        'cv_return_headroom_vs_baseline_mean': (
+            float(np.mean(ret_vs_base)) if ret_vs_base else float('nan')),
+        'n_return_reached': int(n_reached),
+        'n_return_events': int(n_events),
     }
 
 
@@ -612,8 +740,9 @@ def build_residual_board(
         'plan_while_live': True,
         'overall_goal': (
             'Smooth CV on the economic limit without violating; faithful '
-            'observer TM; unmeasured-load rejection.  Neural observer + '
-            'neural Kalman/DOB + neural actor-critic on real-sim rollouts.'
+            'observer TM; unmeasured-load rejection with an aggressive '
+            'return to that limit after a disturbance.  Neural observer + '
+            'neural Kalman/DOB + neural actor-critic.'
         ),
         'history_files': [
             'docs/GOAL_PLAN.md',
@@ -647,6 +776,7 @@ def build_residual_board(
                 'jsonl teacher gain x1 (tautology vs val TM)',
                 'critic_r Pearson without critic_rew_to_tgt_var',
                 'raw disturbance R2 (use det_r + pred_std vs true)',
+                'event IAE without cv_return_headroom / cv_return_time_frac',
                 'VALID 9/9 / GAIN-READY / all_pass / family-closed as residual-closed',
                 'requiring current econ champion to KEEP a smoothness/headroom/DR win',
             ],
@@ -664,6 +794,8 @@ def build_residual_board(
             'tm_curve_iae_normed': 0.0,
             'tm_ss_ratio': 1.0,
             'kalman_amp_ratio': 1.0,
+            'cv_return_headroom': CV_RETURN_HEADROOM_TARGET,
+            'cv_return_time_frac': CV_RETURN_TIME_FRAC_TARGET,
         },
         'r1_observer_tm': {
             'residual': 'Observer transfer-matrix shape + gain',
@@ -704,7 +836,9 @@ def build_residual_board(
         'r3_unmeasured_dr': {
             'residual': (
                 'Kalman pred_std vs true + det_r; closed-loop event IAE '
-                'agent/baseline on disturbance_rejection.png'
+                'agent/baseline; CV returns to the economic limit after '
+                'the event (cv_return_headroom / cv_return_time_frac), '
+                'not a mid-band settle.'
             ),
             'kalman_det_r': amp['det_r'],
             'kalman_pred_std': amp['pred_std'],
@@ -713,6 +847,16 @@ def build_residual_board(
             'iae_agent_over_baseline_worst': dr[
                 'iae_agent_over_baseline_worst'],
             'overshoot_p90_mean': dr['overshoot_p90_mean'],
+            'cv_return_headroom_mean': dr['cv_return_headroom_mean'],
+            'cv_return_headroom_worst': dr['cv_return_headroom_worst'],
+            'cv_return_time_frac_mean': dr['cv_return_time_frac_mean'],
+            'cv_return_time_frac_worst': dr['cv_return_time_frac_worst'],
+            'cv_return_viol_frac_mean': dr['cv_return_viol_frac_mean'],
+            'cv_return_headroom_vs_baseline_mean': dr[
+                'cv_return_headroom_vs_baseline_mean'],
+            'n_return_reached': dr['n_return_reached'],
+            'n_return_events': dr['n_return_events'],
+            'not_all_pass': True,
             'compare_to': 'docs/RUN_HISTORY.md BEST-RUN BASELINES and docs/GOAL_PLAN.md',
         },
         'fidelity_all_pass': fg.get('all_pass'),
@@ -1325,20 +1469,22 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
 def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                                      window_steps: int | None = None
                                      ) -> Dict[str, object]:
-    """Per-disturbance response metrics on the *most-impacted* CV.
+    """Per-disturbance response on the most-impacted CV, plus return-to-limit.
 
-    For each scheduled event we look at the rollout window
-    ``[start, start + window_steps]`` (default = 5τ if available, else
-    200) and compute on each CV:
-      * ``peak_overshoot`` — max signed deviation from pre-event baseline,
-        normalised by CV bound width when available.
-      * ``settle_steps``   — first sample where |dev| stays inside
-        ``settle_band × bound_width`` for the rest of the window.
-        ``None`` if it never settles.
-      * ``iae_window``     — sum |dev| / bound_width across the window.
+    Window ``[start, start + window_steps]`` (default = 5τ if identified,
+    else 200), clipped at the next scripted event.  Per CV:
+      * ``peak_overshoot`` / ``settle_steps`` / ``iae_window`` vs *pre-event
+        baseline* (IAE-to-pre-event can look good while the CV sits
+        mid-band — that is not return-to-limit).
+      * ``cv_return_headroom`` — late-window gap to the *economic* bound
+        / bound width (0 = on the limit).
+      * ``cv_return_time_frac`` — first time inside ``RETURN_BAND_NORMED``
+        of that bound, as a fraction of the window (0 = immediate, 1 =
+        never).  Window is already τ-scaled, so the fraction is
+        plant-agnostic.
 
-    The most-impacted CV (largest |overshoot|) is reported per event;
-    aggregates (median, p90, max) across events are returned at the top.
+    Overshoot aggregates use the most-impacted CV.  Return aggregates use
+    the worst return (farthest from the economic limit) per event.
     """
     states = ep['states']
     cv_idx = ep.get('cv_indices') or []
@@ -1361,6 +1507,16 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
         except Exception:
             pass
 
+    sched_starts: List[int] = []
+    for ev in ep.get('schedule') or []:
+        try:
+            s = int(ev.get('start', 0))
+        except Exception:
+            continue
+        if 0 < s < T - 5:
+            sched_starts.append(s)
+    sched_starts.sort()
+
     events = []
     for ev in ep.get('schedule') or []:
         try:
@@ -1369,7 +1525,11 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             continue
         if start <= 0 or start >= T - 5:
             continue
-        end = min(T, start + int(window_steps))
+        nxt = [s for s in sched_starts if s > start]
+        clip_end = nxt[0] if nxt else T
+        end = min(T, start + int(window_steps), clip_end)
+        if end - start < 8:
+            continue
         pre = states[max(0, start - 20):start]
         if pre.size == 0:
             continue
@@ -1399,13 +1559,35 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             if settle == 0:
                 settle = 0
             iae_w = float(np.sum(np.abs(dev_n)))
-            per_cv.append({'cv_row': k, 'cv_index': int(cidx),
-                            'peak_overshoot_normed': ovs,
-                            'settle_steps': settle,
-                            'iae_window_normed': iae_w})
+            y_win = states[start:end, int(cidx)].astype('float64')
+            lo, hi = _base_cv_lo_hi(ep, k, y_win)
+            side, _unk = preferred_cv_side(ep, k)
+            ret = return_to_limit_on_window(
+                y_win, lo, hi, side, band=float(settle_band))
+            per_cv.append({
+                'cv_row': k, 'cv_index': int(cidx),
+                'peak_overshoot_normed': ovs,
+                'settle_steps': settle,
+                'iae_window_normed': iae_w,
+                'preferred_side': side,
+                **ret,
+            })
         if not per_cv:
             continue
         worst = max(per_cv, key=lambda r: abs(r['peak_overshoot_normed']))
+
+        def _return_rank(r: Dict) -> Tuple[float, float]:
+            h = r.get('cv_return_headroom')
+            try:
+                hf = float(h)
+            except (TypeError, ValueError):
+                hf = float('nan')
+            if not np.isfinite(hf):
+                hf = 1.0 + float(r.get('cv_return_viol_frac') or 1.0)
+            tf = float(r.get('cv_return_time_frac') or 1.0)
+            return (hf, tf)
+
+        worst_ret = max(per_cv, key=_return_rank)
         events.append({
             'name': str(ev.get('name', 'event')),
             'start': start, 'end': end,
@@ -1413,6 +1595,7 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             'source': str(ev.get('source', '')),
             'delta': float(ev.get('delta', 0.0)),
             'worst_cv': worst,
+            'worst_return': worst_ret,
             'per_cv': per_cv,
         })
 
@@ -1427,6 +1610,27 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                 'max': float(np.max(a)),
                 'n': int(a.size)}
 
+    def _agg_return(key: str) -> Dict[str, float]:
+        raw: List[float] = []
+        for e in events:
+            wr = e.get('worst_return') or {}
+            v = wr.get(key)
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(f):
+                raw.append(f)
+        if not raw:
+            return {'mean': float('nan'), 'median': float('nan'),
+                    'p90': float('nan'), 'max': float('nan'), 'n': 0}
+        a = np.asarray(raw, dtype='float64')
+        return {'mean': float(np.mean(a)),
+                'median': float(np.median(a)),
+                'p90': float(np.percentile(a, 90)),
+                'max': float(np.max(a)),
+                'n': int(a.size)}
+
     settle_vals = [e['worst_cv']['settle_steps'] for e in events
                     if e['worst_cv']['settle_steps'] is not None]
     settle_agg = ({'median': float(np.median(settle_vals)),
@@ -1437,6 +1641,9 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                   if settle_vals else
                   {'median': 0.0, 'p90': 0.0, 'max': 0.0,
                    'n_settled': 0, 'n_total': int(len(events))})
+    n_reached = int(sum(
+        1 for e in events
+        if (e.get('worst_return') or {}).get('cv_return_reached')))
 
     return {
         'window_steps': int(window_steps),
@@ -1444,6 +1651,11 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
         'overshoot_normed': _agg('peak_overshoot_normed'),
         'iae_window_normed': _agg('iae_window_normed'),
         'settle_steps': settle_agg,
+        'return_headroom': _agg_return('cv_return_headroom'),
+        'return_time_frac': _agg_return('cv_return_time_frac'),
+        'return_viol_frac': _agg_return('cv_return_viol_frac'),
+        'n_return_reached': n_reached,
+        'n_return_events': int(len(events)),
         'events': events,
     }
 
@@ -2516,6 +2728,8 @@ def run_validation(*,
             ev_metrics = compute_event_response_metrics(ep_d)
             base_metrics = (compute_episode_metrics(ep_b)
                               if ep_b is not None else None)
+            ev_metrics_b = (compute_event_response_metrics(ep_b)
+                              if ep_b is not None else None)
 
             d_title = (f'seed={seed}  scripted disturbance rejection  '
                        f'cum_raw={ep_d["cum_raw_reward"]:+.2f}  '
@@ -2612,8 +2826,9 @@ def run_validation(*,
                 # mv_reversal_rate, economic_score, IAE/ITAE/ISE).
                 'episode_metrics_agent': ep_metrics,
                 'episode_metrics_baseline': base_metrics,
-                # Per-event overshoot / settle / IAE_window summary.
+                # Per-event overshoot / settle / IAE_window + return-to-limit.
                 'event_response': ev_metrics,
+                'event_response_baseline': ev_metrics_b,
             })
         except Exception as e:
             import traceback
@@ -3011,6 +3226,8 @@ def run_validation(*,
               f'pred_std={r3.get("kalman_pred_std")} '
               f'true_std={r3.get("kalman_true_std")} '
               f'iae_ratio={r3.get("iae_agent_over_baseline_mean")} '
+              f'return_headroom={r3.get("cv_return_headroom_mean")} '
+              f'return_time_frac={r3.get("cv_return_time_frac_mean")} '
               f'-> {out_dir}/residual_board.json',
               flush=True)
     except Exception as _rbe:
