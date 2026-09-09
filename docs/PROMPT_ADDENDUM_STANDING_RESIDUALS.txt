@@ -1,0 +1,15 @@
+STANDING RESIDUALS — never retire because a knob family closed.
+MV oscillation is ALLOWED. Fail/optimize on CV smoothness + limit hugging + TM + unmeasured DR.
+P64 on test_sim is the regression lock, not "done":
+  R1 TM: MV ss 0.927 / DV ss 0.893; compounding 1step→OL 0.85; score curve_iae_normed (shape) not ss-ratio alone. P26 MV ss 0.973 remains the gain lock.
+  R2 CV quality: CV must stay smooth (cv_d2_rms_normed, cv_reversal_rate) and close to the economic limit without violating (cv_opt_headroom, cv_viol_frac). Do NOT penalize mv_reversal. Oscillation that leaves the CV mid-band is lost optimization potential. Do NOT gate on CV total variation (a slow ride to the limit is good). cv_opt_headroom is a residual, not an all_pass / P3-skip gate.
+  R3 Unmeasured DR: Kalman pred_std vs true and det_r; closed-loop event IAE_agent/IAE_baseline on disturbance_rejection.png.
+
+After every EXIT, read validation/residual_board.json and update R1/R2/R3 for the plant just run.
+Next GPU job = largest residual whose current family is NOT closed on this plant.
+If that family is closed: change piece (observer / Kalman / actor-critic) OR take the same residual to another plant, then RETURN to test_sim.
+Do not require beating P64 paired-econ to KEEP a CV-smoothness, headroom, or DR win.
+Do not treat VALID 9/9 or GAIN-READY as R1/R2/R3 closed.
+smooth_pass is CV d2/reversal only (worst-seed cv_d2_rms_normed ≤ 0.05 AND cv_reversal_rate ≤ 0.25); mv_reversal ≤ 0.5 is obsolete.
+New plant (HeatExchangerTower): same three residuals. Orig-P1 GAIN_NOT_READY from equal-% OP-gain → OP-aware observer, not extra-P1 lottery.
+Cadence: at most two jobs on a new plant, then one return-to-test_sim on the worst residual.

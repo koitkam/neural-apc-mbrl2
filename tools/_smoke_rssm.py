@@ -3361,7 +3361,11 @@ def _test_pin_eval_modules() -> None:
 
 
 def _test_control_quality_gates() -> None:
-    """Empty scripted pairs must not 0-vs-0 pass (P49 false all_pass)."""
+    """Empty scripted pairs must not 0-vs-0 pass (P49 false all_pass).
+
+    ``smooth_pass`` is CV d2/reversal only.  MV reversal is diagnostic:
+    P100-class ``mv_reversal=0.501`` must still pass when the CV is smooth.
+    """
     from evaluation.validate import control_quality_gates
     empty = control_quality_gates([])
     assert empty['beats_baseline_pass'] is False
@@ -3373,7 +3377,31 @@ def _test_control_quality_gates() -> None:
     )
     assert seeded['beats_baseline_pass'] is False
     assert abs(float(seeded['agent_economic_score']) + 700.0) < 1e-9
-    assert seeded['smooth_pass'] is True
+    assert seeded['smooth_pass'] is True  # no CV scores → do not fail closed
+    chatter = control_quality_gates([{
+        'episode_metrics_agent': {
+            'mv_reversal_rate': 0.501,
+            'cv_d2_rms_normed': 0.001,
+            'cv_reversal_rate': 0.02,
+            'cv_viol_frac': 0.0,
+            'economic_score': -50.0,
+        },
+        'episode_metrics_baseline': {'economic_score': -90.0},
+    }])
+    assert chatter['beats_baseline_pass'] is True
+    assert chatter['smooth_pass'] is True, chatter
+    assert chatter.get('mv_oscillation_allowed') is True
+    cv_bang = control_quality_gates([{
+        'episode_metrics_agent': {
+            'mv_reversal_rate': 0.1,
+            'cv_d2_rms_normed': 0.20,
+            'cv_reversal_rate': 0.80,
+            'economic_score': -50.0,
+        },
+        'episode_metrics_baseline': {'economic_score': -90.0},
+    }])
+    assert cv_bang['smooth_pass'] is False
+    assert cv_bang['beats_baseline_pass'] is True
     paired = control_quality_gates([{
         'episode_metrics_agent': {'mv_reversal_rate': 0.1, 'economic_score': -50.0},
         'episode_metrics_baseline': {'economic_score': -90.0},
@@ -3385,7 +3413,8 @@ def _test_control_quality_gates() -> None:
         'episode_metrics_baseline': {'economic_score': -90.0},
     }])
     assert worse['beats_baseline_pass'] is False
-    print('[smoke] OK  control_quality_gates empty records do not 0-vs-0 pass')
+    print('[smoke] OK  control_quality_gates empty records do not 0-vs-0 pass; '
+          'smooth_pass is CV-only (MV osc allowed)')
 
 
 def _test_require_realsim_actor() -> None:

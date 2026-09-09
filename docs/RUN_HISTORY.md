@@ -29,6 +29,40 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 - Deep narrative + RCA detail lives in `/memories/repo/mbrl_open_items.md`
   (agent memory). This file is the scannable cross-run history for humans.
 
+## STANDING RESIDUALS — never retire because a knob family closed
+
+MV oscillation is **allowed**. Optimization potential is lost when the **CV**
+chatters or sits mid-band instead of hugging the economic limit without
+violating. Score every EXIT against `validation/residual_board.json`.
+Family-closed / VALID 9/9 / GAIN-READY do **not** close these residuals.
+Do not require beating P64 paired-econ to KEEP a CV-smoothness, headroom, or
+DR win. `smooth_pass` is CV `d2` / `cv_reversal` only; `mv_reversal ≤ 0.5` is
+obsolete as a gate.
+
+P64 on `test_sim` is the regression **lock**, not "done":
+
+| ID | Residual | What to read | P64 lock |
+|---|---|---|---|
+| **R1** | Observer TM | MV/DV `ss_ratio`, **`curve_iae_normed`** (shape, not DC-gain freeze), compounding `1step→OL` | MV ss **×0.927** (P26 ×0.973); DV ss **×0.893**; compounding **×0.85** |
+| **R2** | CV quality / opt potential | worst-seed `cv_d2_rms_normed`, `cv_reversal_rate`, `cv_viol_frac`; residual `cv_opt_headroom`. MV reversal is diagnostic. | old MV-reversal 0.23 is **not** the score; recompute CV metrics at next val |
+| **R3** | Unmeasured DR | Kalman `det_r` + `pred_std` vs true; closed-loop `iae_agent/iae_baseline` | det_r **0.352**, amp **0.608 vs 1.93** |
+
+Quality *targets* (not `all_pass`): `cv_d2_rms ≤ 0.01`, `cv_reversal ≤ 0.10`,
+`cv_opt_headroom ≤ 0.15`, viol ~ 0, TM curve IAE → 0, ss → 1, Kalman amp → 1.
+Hygiene gates (`all_pass`): worst-seed `cv_d2_rms ≤ 0.05` **and**
+`cv_reversal ≤ 0.25`, plus existing WM/critic floors and `beats_baseline`.
+Do **not** gate on CV total variation (a slow ride to the limit is good).
+Do **not** fail `all_pass` on `cv_opt_headroom`.
+
+Next GPU job = largest residual whose current family is NOT closed on this
+plant. If that family is closed: change piece (observer / Kalman / actor-critic)
+OR take the same residual to another plant, then **return to test_sim**.
+New plant (HeatExchangerTower): same three residuals. Orig-P1 GAIN_NOT_READY
+from equal-% OP-gain → OP-aware observer, not extra-P1 lottery. Cadence: at
+most two jobs on a new plant, then one return-to-test_sim on the worst residual.
+
+Paste-ready automation addendum: `docs/PROMPT_ADDENDUM_STANDING_RESIDUALS.txt`.
+
 ## BEST-RUN BASELINES (per subsystem) — UPDATE THIS EACH VERDICT
 
 The current champion per subsystem — the baselines a new run must **beat** (or

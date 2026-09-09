@@ -106,6 +106,23 @@ def val_diag_enabled(cfg, field: str, env_key: str, default: bool = True
     return bool(v)
 
 
+def _curve_shape_scores(wm_mean, real_mean) -> Dict[str, float]:
+    """Curve IAE: mean(|wm-real|) / (mean(|real|)+eps).  0 = identical shape.
+
+    Complements ss-ratio (a DC-gain freeze-gate).  A slow WM that still
+    hits the right asymptote scores well on ss-ratio and poorly here.
+    """
+    w = np.asarray(wm_mean, dtype='float64').reshape(-1)
+    r = np.asarray(real_mean, dtype='float64').reshape(-1)
+    n = int(min(w.size, r.size))
+    if n <= 0:
+        return {'curve_iae_normed': float('nan')}
+    w = w[:n]
+    r = r[:n]
+    denom = float(np.mean(np.abs(r))) + 1e-9
+    return {'curve_iae_normed': float(np.mean(np.abs(w - r))) / denom}
+
+
 def _settle_capture(env, base_action: np.ndarray, settle_steps: int,
                     L: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Settle the env at ``base_action`` and capture the lookback window.
@@ -383,7 +400,8 @@ def _compute_dv_transfer_matrix_impl(model, env, cfg, device, *,
             'ss_gain_abs_err': abs(wg - rg),
             'actor_horizon': _ha,
             'wm_gain_at_h': wgh, 'real_gain_at_h': rgh,
-            'gain_ratio_at_h': (wgh / rgh) if abs(rgh) > 1e-9 else float('nan')}
+            'gain_ratio_at_h': (wgh / rgh) if abs(rgh) > 1e-9 else float('nan'),
+            **_curve_shape_scores(wm['mean'], real['mean'])}
     return result
 
 
@@ -545,6 +563,7 @@ def _compute_transfer_matrix_impl(model, env, cfg, device, *,
             'actor_horizon': _ha,
             'wm_gain_at_h': wgh, 'real_gain_at_h': rgh,
             'gain_ratio_at_h': (wgh / rgh) if abs(rgh) > 1e-9 else float('nan'),
+            **_curve_shape_scores(wm['mean'], real['mean']),
         }
     return result
 
