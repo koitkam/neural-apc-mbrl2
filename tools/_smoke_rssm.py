@@ -2264,6 +2264,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
     assert "gmatch_traj={'FO' if" in _src
+    assert 'gmatch_k1=True' in _src
     assert 'gprobe_R=' in _src
     assert 'scoped_quiet_env' in _src
     assert 'P113' in _src or 'scoped_quiet_env restores' in _src
@@ -2531,6 +2532,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_auto_gain_match_len' in _src
     assert '_gain_match_ol_tail_len' not in _src
     assert 'gain_match_ol_persist_rel' in _src
+    assert 'gain_match_k1_rho' in _src
+    assert "row.setdefault('wm_gain_match_k1_rho'" in _src
     # P111: last_only=not stack_k so rest-IC with identified τ stacks the
     # FOPDT trajectory (last_only=False) while persist / τ=0 stay last-step.
     assert 'last_only=not stack_k' in _src
@@ -2538,6 +2541,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gmatch_fo=True' not in _src
     assert 'gmatch_traj=' in _src
     assert "traj {_lf('gain_match_traj_loss')}" in _src
+    assert "k1 {_lf('gain_match_k1_rho')}" in _src
     assert 'gru_zbias=' in _src
     assert 'gru_hres=' not in _src
     assert 'gru_hres_mix' not in _src
@@ -4011,6 +4015,12 @@ def _test_gain_match_rest_ic() -> None:
     assert 'gain_match_traj_loss' not in diag1
     assert 'gain_match_ol_tail_len' not in diag1
     assert 'gain_match_ol_tail_loss' not in diag1
+    assert 'gain_match_k1_rho' in diag1
+    assert 'gain_match_k1_loss' in diag1
+    assert torch.isfinite(diag1['gain_match_k1_rho']).all()
+    assert torch.isfinite(diag1['gain_match_k1_loss']).all()
+    assert float(diag1['gain_match_k1_rho']) >= 0.0
+    assert float(diag1['gain_match_k1_rho']) <= 1.05 + 1e-6
     assert 'gain_match_ol_persist_rel' in diag1
     assert torch.isfinite(diag1['gain_match_ol_persist_rel']).all()
     assert 'gain_match_mv_ratio_mid' not in diag1
@@ -4054,6 +4064,10 @@ def _test_gain_match_rest_ic() -> None:
     assert 'skip_held = o_rest is not None' in _gm_src
     assert 'rest-IC OL tail Huber' not in _gm_src
     assert 'prev_state=st_k.detach()' not in _gm_src
+    assert 'K+1 ρ^{4H-K} DC' in _gm_src
+    assert 'st_cut = st_k.detach()' in _gm_src
+    assert 'gain_h = rho.pow(int(n_extra)).clamp(0.0, 1.05)' in _gm_src
+    assert 'pred_cv = cv_base + d_k * gain_h' in _gm_src
     assert 'prev_state=st_b' in _gm_src
     assert "getattr(st0, 'kv_cache', None) is not None" in _gm_src
     assert 'gain_match_ol_persist_rel' in _gm_src
@@ -4083,8 +4097,9 @@ def _test_gain_match_rest_ic() -> None:
     cfg._gain_match_rest_obs = None
     cfg._gain_match_rest_act = None
     cfg._gain_match_rest_dev = None
-    gm3, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    gm3, d3 = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert torch.isfinite(gm3).all() and float(gm3) > 0.0
+    assert 'gain_match_k1_rho' not in d3
     print(f'[smoke] OK  rest-ic encode is the FD IC '
           f'(Δloss={abs(float(gm1) - float(gm2)):.4g})')
     wrap = _RestICGraphModule(model.dynamics)

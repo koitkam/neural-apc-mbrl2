@@ -4483,6 +4483,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"gmatch_settle={int(getattr(cfg, 'gain_match_settle_len', 0))} "
         f"gmatch_len={int(getattr(cfg, 'gain_match_len', 0) or 0)} "
         f"gmatch_traj={'FO' if (float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0) > 0.0 and bool(getattr(cfg, 'gain_match_rest_ic', False))) else '0'} "
+        f"gmatch_k1=True "
         f"gprobe_R={_gain_ready_probe_repeats(cfg)} "
         f"gmatch_step={float(getattr(cfg, 'gain_match_step', 0.0) or 0.0):g} "
         f"gmatch_clip={bool(getattr(cfg, 'gain_match_clip_realized', True))} "
@@ -8268,6 +8269,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     last-dominated *weight*; this is last + mean_k (≈50/50 mass)
     on the TM rest-then-step path that measures compounding.
     PRBS fallback / ``τ<=0`` stay last-only.
+    **P115:** after teacher K, one extra ``img_step`` from
+    ``st_k.detach()``.  Huber the DC implied at val TM
+    ``max(80, 4·H)`` via ρ^{4H−K} (ρ = ΔCV_{K+1}/ΔCV_K).  Not P67
+    4H unroll (TBPTT-on-DC).  Not P69 stop-grad *inside* the
+    teacher window (last-step Huber KEEP, full BPTT).  ρ=1 ⇒ the
+    extra Huber is ``sg(cv_K)`` (no DC-grad steal).  Rest-IC only.
     **P76 EXIT REVERT:** RSSM GRU update-gate bias ``log(H/16)``
     (keep-h stalled conv; freeze GAIN_NOT_READY 0.80@MV).  Last-step
     DC Huber stays (P64/P73).  **P77 EXIT FALSIFIED** Markovian TSSM
@@ -8580,6 +8587,42 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                 denom = c_b[..., :cg_d].abs().mean().clamp_min(1e-6)
                 diag['gain_match_ol_persist_rel'] = (
                     persist_err.mean().sqrt() / denom).detach()
+    # P115: local ρ at teacher K → implied DC at val TM horizon
+    # ``max(80, 4H)``.  One extra prior step; teacher-K last-step
+    # Huber KEEP (P25 full BPTT).  Cut ``st_k`` so this term cannot
+    # replace DC grads.  Uses control-H formula, not
+    # ``cfg.wm_tf_horizon`` (P69: that field must not change teacher
+    # Huber).  Rest-IC only (TM protocol).  Clamp ρ^{4H-K} so
+    # 1.05^{4H-K} cannot explode Huber (test_sim 1.05^165 ~ 3e3).
+    from evaluation.wm_transfer_matrix import wm_tf_horizon as _wm_tf_h
+    n_extra = int(_wm_tf_h(int(getattr(cfg, 'horizon', 15) or 15))) - int(K)
+    if skip_held and n_extra > 0 and st_k is not None:
+        st_cut = st_k.detach()
+        a_last = a_seq[:, -1]
+        dv_last = (dv_seq[:, -1] if dv_seq is not None else None)
+        st_next = rssm.img_step(
+            st_cut, a_last, dv=dv_last, sample=False)
+        cv_1 = rssm.decode(st_next.feat).index_select(-1, cv_idx).view(
+            n_rolls, Bm, -1)
+        d_k = cv_steps.detach() - cv_base
+        d_1 = cv_1 - cv_base
+        den = torch.where(d_k.abs() >= 1e-4, d_k, torch.ones_like(d_k))
+        rho = torch.where(
+            d_k.abs() >= 1e-4,
+            (d_1 / den).clamp(0.0, 1.05),
+            torch.ones_like(d_1))
+        gain_h = rho.pow(int(n_extra)).clamp(0.0, 1.05)
+        pred_cv = cv_base + d_k * gain_h
+        k1_term = _huber_from_cv(
+            cv_base, pred_cv, list(mv_tgts) + list(dv_tgts), du)
+        loss = loss + k1_term
+        if bool(getattr(cfg, '_wm_need_logged_aux', True)):
+            diag['gain_match_k1_loss'] = k1_term.detach()
+            diag['gain_match_k1_rho'] = rho.detach().mean()
+        if not getattr(cfg, '_gain_match_k1_logged', False):
+            print('[gain-match] K+1 ρ^{4H-K} DC (P115; not 4H unroll, '
+                  'not P69 tail)', flush=True)
+            cfg._gain_match_k1_logged = True  # type: ignore[attr-defined]
     diag['gain_match_n'] = torch.tensor(float(nterm), device=obs.device)
     # Observability only (no extra FD).  P43 per-input β = |tgt_ij|
     # (L1 sat ±1) is the loss change; the MV/DV split still shows
@@ -14868,6 +14911,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                             row['gain_match_traj_loss'])
             else:
                 row.setdefault('wm_gain_match_traj_loss', 0.0)
+            if 'gain_match_k1_rho' in row:
+                row.setdefault('wm_gain_match_k1_rho',
+                            row['gain_match_k1_rho'])
+            if 'gain_match_k1_loss' in row:
+                row.setdefault('wm_gain_match_k1_loss',
+                            row['gain_match_k1_loss'])
+            else:
+                row.setdefault('wm_gain_match_k1_loss', 0.0)
             row.setdefault('wm_input_isolation_loss', 0.0)
             row.setdefault('wm_isolation_loss', row['wm_input_isolation_loss'])
             row.setdefault('wm_ss_match_loss', 0.0)
@@ -14980,6 +15031,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                    if row.get('gain_match_ol_persist_rel') is not None else '')
                 + (f"traj {_lf('gain_match_traj_loss')} "
                    if row.get('gain_match_traj_loss') is not None else '')
+                + (f"k1 {_lf('gain_match_k1_rho')} "
+                   if row.get('gain_match_k1_rho') is not None else '')
                 + f"iso {_lf('wm_input_isolation_loss')} "
                 + f"ss {_lf('wm_ss_match_loss')} "
                 + (f"dobg {_lf('dob_ground')} "
