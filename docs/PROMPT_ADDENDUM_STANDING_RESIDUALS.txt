@@ -1,0 +1,4 @@
+This file is not the automation prompt.
+
+Paste the entire contents of docs/AUTOMATION_RUN_PROMPT.txt into the
+Neural-APC-mbrl automation (replaces the whole instruction, not an addendum).

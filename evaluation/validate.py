@@ -179,6 +179,338 @@ def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
     return out
 
 
+# CV smoothness hygiene (all_pass).  Second-difference chatter + CV
+# direction flips — NOT MV reversal.  MV chatter is allowed as long as
+# the CV stays smooth and can sit on the economic limit.
+CV_D2_RMS_GATE = 0.05
+CV_REVERSAL_GATE = 0.25
+# Informational only (not all_pass).  Fraction of steps outside [lo, hi].
+CV_VIOL_FRAC_INFO = 0.02
+# Residual *targets* (docs / residual_board), not all_pass gates.
+CV_D2_RMS_TARGET = 0.01
+CV_REVERSAL_TARGET = 0.10
+CV_OPT_HEADROOM_TARGET = 0.15
+# R3 return-to-limit (residual, not all_pass).  Distances are / bound
+# width; times are a fraction of the event window (that window is 5τ
+# when the identifier is present, else a fixed step count).  No
+# engineering units, no test_sim magic defaults.
+RETURN_BAND_NORMED = 0.05          # same as settle_band: 5% of span
+RETURN_LATE_FRAC = 0.2             # last 20% of window ≈ 1τ if window=5τ
+RETURN_HOLD_FRAC = 0.1             # hold ≈ 0.5τ to count as reached
+CV_RETURN_HEADROOM_TARGET = 0.15   # same shape as opt-headroom target
+CV_RETURN_TIME_FRAC_TARGET = 0.4   # back within ~2τ of a 5τ window
+
+
+def _finite_floats(vals) -> List[float]:
+    out: List[float] = []
+    for v in vals or []:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(f):
+            out.append(f)
+    return out
+
+
+def _reversal_rate(series, width: float) -> float:
+    """Sign-changes per step on a 0.1%-of-width deadband."""
+    col = np.asarray(series, dtype='float64').reshape(-1)
+    if col.size < 2:
+        return 0.0
+    rng = float(width) if np.isfinite(width) and width > 1e-9 else (
+        float(np.nanmax(col) - np.nanmin(col)) or 1.0)
+    d = np.diff(col)
+    deadband = 1e-3 * max(rng, 1e-12)
+    signed = np.where(np.abs(d) > deadband, np.sign(d), 0.0)
+    nz = signed[signed != 0.0]
+    flips = int(np.sum(np.abs(np.diff(nz)) > 1.0)) if nz.size >= 2 else 0
+    return float(flips) / float(max(1, len(d)))
+
+
+def _cv_side_scale_pair(side_scale, k: int) -> Tuple[Optional[float], Optional[float]]:
+    """Per-CV (lo, hi) multipliers from ``cv_side_scale`` JSON."""
+    if side_scale is None:
+        return None, None
+    entry = None
+    if isinstance(side_scale, dict):
+        entry = side_scale.get(f'cv_{k}')
+        if entry is None:
+            entry = side_scale.get(k)
+        if entry is None and str(k) in side_scale:
+            entry = side_scale.get(str(k))
+    elif isinstance(side_scale, (list, tuple)) and 0 <= k < len(side_scale):
+        entry = side_scale[k]
+    if isinstance(entry, dict):
+        try:
+            return float(entry.get('lo', 1.0)), float(entry.get('hi', 1.0))
+        except (TypeError, ValueError):
+            return None, None
+    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+        try:
+            return float(entry[0]), float(entry[1])
+        except (TypeError, ValueError):
+            return None, None
+    return None, None
+
+
+def preferred_cv_side(ep: Dict, k: int) -> Tuple[str, bool]:
+    """Which bound is the money limit for CV ``k``.
+
+    1. ``cv_economic_weights[k]``: ``>0`` prefer LO, ``<0`` prefer HI.
+    2. Else ``cv_side_scale``: ``hi > lo`` → HI.
+    3. Else unknown → nearest-bound gap, ``preferred_unknown=True``.
+    """
+    econ = ep.get('obj_cv_economic_weights') or []
+    if k < len(econ):
+        try:
+            w = float(econ[k])
+        except (TypeError, ValueError):
+            w = 0.0
+        if abs(w) > 1e-12:
+            return ('lo' if w > 0.0 else 'hi', False)
+    lo_s, hi_s = _cv_side_scale_pair(ep.get('obj_cv_side_scale'), k)
+    if lo_s is not None and hi_s is not None:
+        if hi_s > lo_s + 1e-12:
+            return ('hi', False)
+        if lo_s > hi_s + 1e-12:
+            return ('lo', False)
+    return ('unknown', True)
+
+
+def _load_cv_side_scale_fallback() -> Dict:
+    """``_coerce_spec`` drops ``cv_side_scale``; read the live JSON."""
+    path = os.environ.get('CONTROL_OBJECTIVE_JSON', '')
+    if not path:
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        side = (data or {}).get('cv_side_scale') or {}
+        return side if isinstance(side, dict) else {}
+    except Exception:
+        return {}
+
+
+def _episode_objective_meta(env) -> Dict:
+    """Attach objective weights so episode metrics stay env-free later."""
+    obj_w = getattr(env, 'obj_w', None) or {}
+    spec = getattr(env, 'obj_spec', None) or {}
+    side = spec.get('cv_side_scale') if isinstance(spec, dict) else None
+    if not side:
+        side = _load_cv_side_scale_fallback()
+    return {
+        'obj_mv_economic_weights': list(obj_w.get('mv_economic_weights') or []),
+        'obj_cv_economic_weights': list(obj_w.get('cv_economic_weights') or []),
+        'obj_cv_side_scale': side or {},
+        'obj_cv_violation_weights': list(obj_w.get('cv_violation_weights') or []),
+        'obj_cv_violation_weights_lo': list(
+            obj_w.get('cv_violation_weights_lo') or []),
+        'obj_cv_violation_weights_hi': list(
+            obj_w.get('cv_violation_weights_hi') or []),
+    }
+
+
+def limit_gap_normed(y, lo: float, hi: float, side: str) -> np.ndarray:
+    """Distance to the economic bound, divided by bound width.
+
+    0 = on the preferred limit.  Positive = inside the band, away from
+    that limit.  Negative = past the preferred bound (money-side
+    violation).  ``side`` is ``hi`` / ``lo`` / ``unknown`` (nearest).
+    """
+    arr = np.asarray(y, dtype='float64').reshape(-1)
+    width = float(hi) - float(lo)
+    if (not np.isfinite(width)) or width <= 1e-12:
+        return np.zeros_like(arr)
+    if side == 'hi':
+        return (float(hi) - arr) / width
+    if side == 'lo':
+        return (arr - float(lo)) / width
+    return np.minimum(arr - float(lo), float(hi) - arr) / width
+
+
+def return_to_limit_on_window(
+    y,
+    lo: float,
+    hi: float,
+    side: str,
+    *,
+    band: float = RETURN_BAND_NORMED,
+    late_frac: float = RETURN_LATE_FRAC,
+    hold_frac: float = RETURN_HOLD_FRAC,
+) -> Dict[str, float]:
+    """Plant-agnostic post-event return to the economic limit.
+
+    Time is a fraction of *this window* (caller sizes the window from τ).
+    Headroom is mean late-window gap / bound width on feasible samples.
+    """
+    arr = np.asarray(y, dtype='float64').reshape(-1)
+    n = int(arr.size)
+    empty = {
+        'cv_return_headroom': float('nan'),
+        'cv_return_time_frac': 1.0,
+        'cv_return_viol_frac': float('nan'),
+        'cv_return_reached': False,
+        'cv_return_band_normed': float(band),
+    }
+    if n < 2:
+        return empty
+    width = float(hi) - float(lo)
+    if (not np.isfinite(width)) or width <= 1e-12:
+        return empty
+    gap = limit_gap_normed(arr, lo, hi, side)
+    viol = (arr > float(hi)) | (arr < float(lo))
+    in_band = ((~viol) & (gap >= -1e-12)
+               & (gap <= float(band)))
+    hold = max(1, int(round(float(hold_frac) * n)))
+    run = 0
+    reached_at = None
+    for i, ok in enumerate(in_band.tolist()):
+        if ok:
+            run += 1
+            if run >= hold:
+                reached_at = i - hold + 1
+                break
+        else:
+            run = 0
+    time_frac = (1.0 if reached_at is None
+                 else float(reached_at) / float(max(1, n)))
+    late_n = max(1, int(round(float(late_frac) * n)))
+    late_gap = gap[-late_n:]
+    late_viol = viol[-late_n:]
+    feasible = late_gap[~late_viol]
+    if feasible.size:
+        head = float(np.mean(np.maximum(feasible, 0.0)))
+    else:
+        head = float('nan')
+    return {
+        'cv_return_headroom': head,
+        'cv_return_time_frac': float(time_frac),
+        'cv_return_viol_frac': float(np.mean(late_viol)),
+        'cv_return_reached': reached_at is not None,
+        'cv_return_band_normed': float(band),
+    }
+
+
+def _base_cv_lo_hi(ep: Dict, k: int, y: np.ndarray) -> Tuple[float, float]:
+    cv_bounds = ep.get('cv_bounds') or []
+    b = cv_bounds[k] if k < len(cv_bounds) else None
+    if (isinstance(b, (list, tuple)) and len(b) >= 2
+            and np.isfinite(b[0]) and np.isfinite(b[1])
+            and float(b[1]) > float(b[0])):
+        return float(b[0]), float(b[1])
+    lo = float(np.nanmin(y)) if y.size else 0.0
+    hi = float(np.nanmax(y)) if y.size else 1.0
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return 0.0, 1.0
+    return lo, hi
+
+
+def _metric_get(row: Dict, *keys) -> Optional[float]:
+    for k in keys:
+        if row is None:
+            break
+        if k in row and row[k] is not None:
+            try:
+                f = float(row[k])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(f):
+                return f
+    return None
+
+
+def _cv_quality_from_kpi_row(row: Dict, *, prefix: str = '') -> Dict:
+    """Normalise seed-KPI / episode-metrics rows to CV-quality scalars."""
+    p = prefix
+    return {
+        'seed': row.get('seed') if isinstance(row, dict) else None,
+        'd2': _metric_get(row, f'{p}cv_d2_rms_normed', 'cv_d2_rms_normed',
+                          f'{p}kpi_cv_d2_rms_normed'),
+        'rev': _metric_get(row, f'{p}cv_reversal_rate', 'cv_reversal_rate',
+                           f'{p}kpi_cv_reversal_rate'),
+        'tv': _metric_get(row, f'{p}cv_tv_per_step_normed',
+                          'cv_tv_per_step_normed'),
+        'headroom': _metric_get(row, f'{p}cv_opt_headroom', 'cv_opt_headroom'),
+        'viol_frac': _metric_get(row, f'{p}cv_viol_frac', 'cv_viol_frac'),
+        'viol_depth': _metric_get(row, f'{p}cv_viol_depth_normed',
+                                  'cv_viol_depth_normed'),
+        'mv_rev': _metric_get(row, f'{p}mv_reversal_rate', 'mv_reversal_rate',
+                              f'{p}kpi_mv_reversal_rate'),
+        'econ': _metric_get(row, f'{p}economic_score', 'economic_score',
+                            f'{p}kpi_economic_score'),
+        'iae': _metric_get(row, f'{p}iae_normed_mean', 'iae_normed_mean'),
+    }
+
+
+def _worst_seed_cv_quality(rows: List[Dict]) -> Dict[str, float]:
+    """Worst-seed (max) CV chatter / headroom; mean MV reversal (diagnostic)."""
+    by_seed: Dict[object, List[Dict]] = {}
+    for i, row in enumerate(rows or []):
+        seed = row.get('seed')
+        if seed is None:
+            seed = i
+        by_seed.setdefault(seed, []).append(row)
+
+    def _seed_max(key: str) -> List[float]:
+        out: List[float] = []
+        for grp in by_seed.values():
+            vals = _finite_floats([r.get(key) for r in grp])
+            if vals:
+                out.append(float(max(vals)))
+        return out
+
+    def _seed_mean(key: str) -> List[float]:
+        out: List[float] = []
+        for grp in by_seed.values():
+            vals = _finite_floats([r.get(key) for r in grp])
+            if vals:
+                out.append(float(np.mean(vals)))
+        return out
+
+    d2s = _seed_max('d2')
+    revs = _seed_max('rev')
+    tvs = _seed_max('tv')
+    heads = _seed_max('headroom')
+    vfracs = _seed_max('viol_frac')
+    vdepths = _seed_max('viol_depth')
+    mv_revs = _seed_mean('mv_rev')
+    econs = _seed_mean('econ')
+    return {
+        'n_seeds': int(len(by_seed)),
+        'cv_d2_rms_normed_worst_seed': (
+            float(max(d2s)) if d2s else float('nan')),
+        'cv_reversal_rate_worst_seed': (
+            float(max(revs)) if revs else float('nan')),
+        'cv_tv_per_step_normed_worst_seed': (
+            float(max(tvs)) if tvs else float('nan')),
+        'cv_opt_headroom_worst_seed': (
+            float(max(heads)) if heads else float('nan')),
+        'cv_opt_headroom_mean': (
+            float(np.mean(_seed_mean('headroom'))) if _seed_mean('headroom')
+            else float('nan')),
+        'cv_viol_frac_worst_seed': (
+            float(max(vfracs)) if vfracs else float('nan')),
+        'cv_viol_depth_normed_worst_seed': (
+            float(max(vdepths)) if vdepths else float('nan')),
+        'mv_reversal_rate_observed': (
+            float(np.mean(mv_revs)) if mv_revs else float('nan')),
+        'agent_economic_score': (
+            float(np.mean(econs)) if econs else float('nan')),
+        'has_cv_smoothness': bool(d2s or revs),
+    }
+
+
+def _cv_smooth_pass(worst_d2: float, worst_rev: float,
+                    has_cv: bool) -> bool:
+    """Missing CV scores do not fail (legacy JSON); present scores gate."""
+    if not has_cv:
+        return True
+    d2_ok = (not np.isfinite(worst_d2)) or (worst_d2 <= CV_D2_RMS_GATE)
+    rev_ok = (not np.isfinite(worst_rev)) or (worst_rev <= CV_REVERSAL_GATE)
+    return bool(d2_ok and rev_ok)
+
+
 def control_quality_gates(
     disturbance_records: Optional[List[Dict]] = None,
     seed_metrics: Optional[List[Dict]] = None,
@@ -188,50 +520,367 @@ def control_quality_gates(
     Empty records must **not** pass (P49: leftover ``cfg=`` TypeError
     skipped every scripted episode → 0.0 vs 0.0 falsely PASSED
     ``beats_baseline``).  Seed-episode KPIs have no paired baseline, so
-    they can fill reversal / agent econ for the log but cannot pass
+    they can fill CV-quality / agent econ for the log but cannot pass
     ``beats_baseline``.
+
+    ``smooth_pass`` is **CV** chatter (d2 RMS + CV reversal), not MV
+    reversal.  MV oscillation is allowed; it is recorded as a diagnostic.
+    ``cv_opt_headroom`` is a residual, not an ``all_pass`` gate.
     """
     _dr = list(disturbance_records or [])
     out: Dict = {
+        'cv_d2_rms_normed_max': CV_D2_RMS_GATE,
+        'cv_reversal_rate_max': CV_REVERSAL_GATE,
+        'cv_viol_frac_info': CV_VIOL_FRAC_INFO,
+        # Obsolete as a gate; kept so old readers still see the key.
         'mv_reversal_rate_max': 0.5,
         'n_scripted_pairs': len(_dr),
+        'mv_oscillation_allowed': True,
     }
+    quality_rows: List[Dict] = []
+    econs: List[float] = []
+    base_econs: List[float] = []
+    if _dr:
+        for r in _dr:
+            q = _cv_quality_from_kpi_row(r.get('episode_metrics_agent') or {})
+            q['seed'] = r.get('seed')
+            quality_rows.append(q)
+            if q.get('econ') is not None:
+                econs.append(float(q['econ']))
+            be = _metric_get(r.get('episode_metrics_baseline') or {},
+                             'economic_score')
+            if be is not None:
+                base_econs.append(float(be))
+    elif seed_metrics:
+        for r in seed_metrics:
+            q = _cv_quality_from_kpi_row(r, prefix='kpi_')
+            # Rows already flattened with kpi_*; also try unprefixed.
+            if q.get('d2') is None:
+                q = _cv_quality_from_kpi_row(r)
+            quality_rows.append(q)
+            if q.get('econ') is not None:
+                econs.append(float(q['econ']))
+
+    agg = _worst_seed_cv_quality(quality_rows)
+    worst_d2 = float(agg['cv_d2_rms_normed_worst_seed'])
+    worst_rev = float(agg['cv_reversal_rate_worst_seed'])
+    worst_vfrac = float(agg['cv_viol_frac_worst_seed'])
+    smooth = _cv_smooth_pass(worst_d2, worst_rev, bool(agg['has_cv_smoothness']))
+    limit_pass = (
+        bool(np.isfinite(worst_vfrac) and worst_vfrac <= CV_VIOL_FRAC_INFO)
+        if agg['has_cv_smoothness'] and np.isfinite(worst_vfrac) else True
+    )
+    agent_econ = (float(np.mean(econs)) if econs
+                  else float(agg['agent_economic_score']))
+    out.update(agg)
+    out.update({
+        'cv_d2_rms_normed_observed': worst_d2,
+        'cv_reversal_rate_observed': worst_rev,
+        'cv_opt_headroom_observed': float(agg['cv_opt_headroom_mean']),
+        'cv_viol_frac_observed': worst_vfrac,
+        'agent_economic_score': agent_econ,
+        'smooth_pass': bool(smooth),
+        'cv_smooth_pass': bool(smooth),
+        'cv_limit_pass': bool(limit_pass),
+    })
     if not _dr:
-        revs: List[float] = []
-        econs: List[float] = []
-        if seed_metrics:
-            revs = [float(r.get('kpi_mv_reversal_rate', 0.0))
-                    for r in seed_metrics]
-            econs = [float(r.get('kpi_economic_score', 0.0))
-                     for r in seed_metrics]
-        rev_mean = float(np.mean(revs)) if revs else float('nan')
-        agent_econ = float(np.mean(econs)) if econs else float('nan')
         out.update({
-            'mv_reversal_rate_observed': rev_mean,
-            'agent_economic_score': agent_econ,
             'baseline_economic_score': float('nan'),
-            'smooth_pass': bool(revs) and bool(rev_mean <= 0.5),
             'beats_baseline_pass': False,
             'control_gate_skipped': 'no_scripted_disturbance_pairs',
         })
         return out
-    _rev = [float((r.get('episode_metrics_agent') or {}).get(
-        'mv_reversal_rate', 0.0)) for r in _dr]
-    _ae = [float((r.get('episode_metrics_agent') or {}).get(
-        'economic_score', 0.0)) for r in _dr]
-    _be = [float((r.get('episode_metrics_baseline') or {}).get(
-        'economic_score', 0.0)) for r in _dr]
-    rev_mean = float(np.mean(_rev)) if _rev else 0.0
-    agent_econ = float(np.mean(_ae)) if _ae else 0.0
-    base_econ = float(np.mean(_be)) if _be else 0.0
+    base_econ = float(np.mean(base_econs)) if base_econs else 0.0
     out.update({
-        'mv_reversal_rate_observed': rev_mean,
-        'agent_economic_score': agent_econ,
         'baseline_economic_score': base_econ,
-        'smooth_pass': bool(rev_mean <= 0.5),
         'beats_baseline_pass': bool(agent_econ >= base_econ),
     })
     return out
+
+
+def _pair_ss_and_curve(pairs: Optional[Dict]) -> Dict[str, float]:
+    """Aggregate TM pair dicts: ss-ratio + curve IAE (mean / worst)."""
+    ss: List[float] = []
+    iae: List[float] = []
+    for v in (pairs or {}).values():
+        r = v.get('ss_gain_ratio_wm_over_real')
+        try:
+            rf = float(r)
+        except (TypeError, ValueError):
+            rf = float('nan')
+        if np.isfinite(rf):
+            ss.append(rf)
+        c = v.get('curve_iae_normed')
+        try:
+            cf = float(c)
+        except (TypeError, ValueError):
+            cf = float('nan')
+        if np.isfinite(cf):
+            iae.append(cf)
+    def _worst_ss(vals: List[float]) -> float:
+        if not vals:
+            return float('nan')
+        return float(max(vals, key=lambda x: abs(x - 1.0)))
+    return {
+        'ss_ratio_mean': float(np.mean(ss)) if ss else float('nan'),
+        'ss_ratio_worst': _worst_ss(ss),
+        'curve_iae_mean': float(np.mean(iae)) if iae else float('nan'),
+        'curve_iae_worst': float(max(iae)) if iae else float('nan'),
+        'n_pairs': int(len(ss) or len(iae)),
+    }
+
+
+def _distpred_amp(dp: Optional[Dict]) -> Dict[str, float]:
+    dp = dp or {}
+    chs = dp.get('per_channel') or []
+    pred = _finite_floats([c.get('pred_std') for c in chs])
+    true = _finite_floats([c.get('true_std') for c in chs])
+    det = dp.get('mean_pearson_r_detrended')
+    try:
+        det_f = float(det)
+    except (TypeError, ValueError):
+        det_f = float('nan')
+    return {
+        'det_r': det_f if np.isfinite(det_f) else float('nan'),
+        'pred_std': float(np.mean(pred)) if pred else float('nan'),
+        'true_std': float(np.mean(true)) if true else float('nan'),
+    }
+
+
+def _closed_loop_dr_scores(disturbance_records: Optional[List[Dict]]
+                            ) -> Dict[str, float]:
+    ratios: List[float] = []
+    ovs: List[float] = []
+    ret_h: List[float] = []
+    ret_t: List[float] = []
+    ret_v: List[float] = []
+    ret_vs_base: List[float] = []
+    n_reached = 0
+    n_events = 0
+    for r in disturbance_records or []:
+        am = r.get('episode_metrics_agent') or {}
+        bm = r.get('episode_metrics_baseline') or {}
+        ai = _metric_get(am, 'iae_normed_mean')
+        bi = _metric_get(bm, 'iae_normed_mean')
+        if ai is not None and bi is not None and abs(bi) > 1e-12:
+            ratios.append(float(ai) / float(bi))
+        ev = r.get('event_response') or {}
+        ov = ((ev.get('overshoot_normed') or {}).get('p90'))
+        ovf = _metric_get({'p90': ov}, 'p90')
+        if ovf is not None:
+            ovs.append(ovf)
+        rh = _metric_get(ev.get('return_headroom') or {}, 'mean', 'max')
+        rt = _metric_get(ev.get('return_time_frac') or {}, 'mean', 'max')
+        rv = _metric_get(ev.get('return_viol_frac') or {}, 'mean', 'max')
+        if rh is not None:
+            ret_h.append(rh)
+        if rt is not None:
+            ret_t.append(rt)
+        if rv is not None:
+            ret_v.append(rv)
+        try:
+            n_reached += int(ev.get('n_return_reached') or 0)
+            n_events += int(ev.get('n_return_events') or 0)
+        except (TypeError, ValueError):
+            pass
+        bev = r.get('event_response_baseline') or {}
+        bh = _metric_get(bev.get('return_headroom') or {}, 'mean', 'max')
+        if rh is not None and bh is not None and abs(bh) > 1e-3:
+            ret_vs_base.append(float(rh) / float(bh))
+    return {
+        'iae_agent_over_baseline_mean': (
+            float(np.mean(ratios)) if ratios else float('nan')),
+        'iae_agent_over_baseline_worst': (
+            float(max(ratios)) if ratios else float('nan')),
+        'overshoot_p90_mean': float(np.mean(ovs)) if ovs else float('nan'),
+        'n_pairs': int(len(ratios)),
+        'cv_return_headroom_mean': (
+            float(np.mean(ret_h)) if ret_h else float('nan')),
+        'cv_return_headroom_worst': (
+            float(max(ret_h)) if ret_h else float('nan')),
+        'cv_return_time_frac_mean': (
+            float(np.mean(ret_t)) if ret_t else float('nan')),
+        'cv_return_time_frac_worst': (
+            float(max(ret_t)) if ret_t else float('nan')),
+        'cv_return_viol_frac_mean': (
+            float(np.mean(ret_v)) if ret_v else float('nan')),
+        'cv_return_headroom_vs_baseline_mean': (
+            float(np.mean(ret_vs_base)) if ret_vs_base else float('nan')),
+        'n_return_reached': int(n_reached),
+        'n_return_events': int(n_events),
+    }
+
+
+def build_residual_board(
+    *,
+    fidelity_gates: Optional[Dict] = None,
+    mv_tf: Optional[Dict] = None,
+    dv_tf: Optional[Dict] = None,
+    postprior: Optional[Dict] = None,
+    distpred: Optional[Dict] = None,
+    disturbance_records: Optional[List[Dict]] = None,
+    seed_metrics: Optional[List[Dict]] = None,
+) -> Dict:
+    """Standing R1/R2/R3 board.  Never 'closed' because a knob family died."""
+    fg = fidelity_gates or {}
+    mv_agg = _pair_ss_and_curve((mv_tf or {}).get('pairs'))
+    dv_agg = _pair_ss_and_curve((dv_tf or {}).get('pairs'))
+    pp = postprior or {}
+    try:
+        compound = float(pp.get('decomp_1step_to_openloop'))
+    except (TypeError, ValueError):
+        compound = float('nan')
+    amp = _distpred_amp(distpred)
+    dr = _closed_loop_dr_scores(disturbance_records)
+    cq = control_quality_gates(disturbance_records, seed_metrics=seed_metrics)
+    return {
+        'never_retire_because_family_closed': True,
+        'mv_oscillation_allowed': True,
+        'refactors_allowed': True,
+        'plan_while_live': True,
+        'overall_goal': (
+            'Smooth CV on the economic limit without violating; faithful '
+            'observer TM; unmeasured-load rejection with an aggressive '
+            'return to that limit after a disturbance.  Neural observer + '
+            'neural Kalman/DOB + neural actor-critic.'
+        ),
+        'history_files': [
+            'docs/GOAL_PLAN.md',
+            'docs/RUN_HISTORY.md',
+        ],
+        'note': (
+            'MV chatter is allowed.  Fail/optimize on CV smoothness + '
+            'limit hugging + TM shape + unmeasured DR.  Compare these '
+            'scores to current champions in docs/RUN_HISTORY.md and to '
+            'docs/GOAL_PLAN.md — do not freeze a past run as the lock.  '
+            'VALID 9/9 / GAIN-READY / family-closed do not close R1/R2/R3.  '
+            'Do not require beating the current econ champion to KEEP a '
+            'CV-smoothness, headroom, or DR win.  Bigger '
+            'observer/Kalman/actor-critic/loss/gate/metric refactors are '
+            'in-scope when knob N+1 cannot serve the overall goal.  While '
+            'a run is LIVE, analyze and update docs/GOAL_PLAN.md; do not '
+            'start a second GPU job.'
+        ),
+        'metric_audit': {
+            'required_every_exit': True,
+            'also_during_live_analysis': True,
+            'question': (
+                'If this metric improved, would a smooth CV actually sit '
+                'closer to the economic limit with a faithful observer and '
+                'unmeasured-load rejection?'
+            ),
+            'known_insufficient': [
+                'mv_reversal as smoothness gate (diagnostic only)',
+                'cv_tv as smoothness gate (slow ride to the limit is good)',
+                'ss-ratio alone (DC freeze-gate; also score curve_iae)',
+                'jsonl teacher gain x1 (tautology vs val TM)',
+                'critic_r Pearson without critic_rew_to_tgt_var',
+                'raw disturbance R2 (use det_r + pred_std vs true)',
+                'event IAE without cv_return_headroom / cv_return_time_frac',
+                'VALID 9/9 / GAIN-READY / all_pass / family-closed as residual-closed',
+                'requiring current econ champion to KEEP a smoothness/headroom/DR win',
+            ],
+            'if_no': (
+                'Do not spend GPU improving it. Fix or replace the metric / '
+                'loss / gate first; that work may be a large refactor. '
+                'Write the conclusion in docs/GOAL_PLAN.md.'
+            ),
+        },
+        'quality_targets_not_all_pass': {
+            'cv_d2_rms_normed': CV_D2_RMS_TARGET,
+            'cv_reversal_rate': CV_REVERSAL_TARGET,
+            'cv_opt_headroom': CV_OPT_HEADROOM_TARGET,
+            'cv_viol_frac': 0.0,
+            'tm_curve_iae_normed': 0.0,
+            'tm_ss_ratio': 1.0,
+            'kalman_amp_ratio': 1.0,
+            'cv_return_headroom': CV_RETURN_HEADROOM_TARGET,
+            'cv_return_time_frac': CV_RETURN_TIME_FRAC_TARGET,
+        },
+        'r1_observer_tm': {
+            'residual': 'Observer transfer-matrix shape + gain',
+            'mv_ss_ratio_mean': mv_agg['ss_ratio_mean'],
+            'mv_ss_ratio_worst': mv_agg['ss_ratio_worst'],
+            'mv_curve_iae_mean': mv_agg['curve_iae_mean'],
+            'mv_curve_iae_worst': mv_agg['curve_iae_worst'],
+            'dv_ss_ratio_mean': dv_agg['ss_ratio_mean'],
+            'dv_ss_ratio_worst': dv_agg['ss_ratio_worst'],
+            'dv_curve_iae_mean': dv_agg['curve_iae_mean'],
+            'dv_curve_iae_worst': dv_agg['curve_iae_worst'],
+            'compound_1step_to_openloop': compound,
+            'compare_to': 'docs/RUN_HISTORY.md BEST-RUN BASELINES and docs/GOAL_PLAN.md',
+        },
+        'r2_cv_quality': {
+            'residual': (
+                'CV must stay smooth and close to the economic limit '
+                'without violating.  MV oscillation is allowed; mid-band '
+                'CV is lost optimization potential.'
+            ),
+            'cv_d2_rms_normed_worst_seed': cq.get(
+                'cv_d2_rms_normed_worst_seed'),
+            'cv_reversal_rate_worst_seed': cq.get(
+                'cv_reversal_rate_worst_seed'),
+            'cv_tv_per_step_normed_worst_seed': cq.get(
+                'cv_tv_per_step_normed_worst_seed'),
+            'cv_opt_headroom_mean': cq.get('cv_opt_headroom_mean'),
+            'cv_opt_headroom_worst_seed': cq.get(
+                'cv_opt_headroom_worst_seed'),
+            'cv_viol_frac_worst_seed': cq.get('cv_viol_frac_worst_seed'),
+            'cv_viol_depth_normed_worst_seed': cq.get(
+                'cv_viol_depth_normed_worst_seed'),
+            'mv_reversal_rate_observed': cq.get('mv_reversal_rate_observed'),
+            'cv_smooth_pass': cq.get('cv_smooth_pass'),
+            'cv_limit_pass': cq.get('cv_limit_pass'),
+            'smooth_pass_is_cv_only': True,
+        },
+        'r3_unmeasured_dr': {
+            'residual': (
+                'Kalman pred_std vs true + det_r; closed-loop event IAE '
+                'agent/baseline; CV returns to the economic limit after '
+                'the event (cv_return_headroom / cv_return_time_frac), '
+                'not a mid-band settle.'
+            ),
+            'kalman_det_r': amp['det_r'],
+            'kalman_pred_std': amp['pred_std'],
+            'kalman_true_std': amp['true_std'],
+            'iae_agent_over_baseline_mean': dr['iae_agent_over_baseline_mean'],
+            'iae_agent_over_baseline_worst': dr[
+                'iae_agent_over_baseline_worst'],
+            'overshoot_p90_mean': dr['overshoot_p90_mean'],
+            'cv_return_headroom_mean': dr['cv_return_headroom_mean'],
+            'cv_return_headroom_worst': dr['cv_return_headroom_worst'],
+            'cv_return_time_frac_mean': dr['cv_return_time_frac_mean'],
+            'cv_return_time_frac_worst': dr['cv_return_time_frac_worst'],
+            'cv_return_viol_frac_mean': dr['cv_return_viol_frac_mean'],
+            'cv_return_headroom_vs_baseline_mean': dr[
+                'cv_return_headroom_vs_baseline_mean'],
+            'n_return_reached': dr['n_return_reached'],
+            'n_return_events': dr['n_return_events'],
+            'not_all_pass': True,
+            'compare_to': 'docs/RUN_HISTORY.md BEST-RUN BASELINES and docs/GOAL_PLAN.md',
+        },
+        'fidelity_all_pass': fg.get('all_pass'),
+        'beats_baseline_pass': fg.get('beats_baseline_pass',
+                                      cq.get('beats_baseline_pass')),
+    }
+
+
+def _jsonable(x):
+    """JSON dump helper: numpy / NaN → list / None."""
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, np.ndarray):
+        return _jsonable(x.tolist())
+    if isinstance(x, (np.floating, float)):
+        xf = float(x)
+        return xf if np.isfinite(xf) else None
+    if isinstance(x, (np.integer, int)) and not isinstance(x, bool):
+        return int(x)
+    if isinstance(x, (np.bool_, bool)):
+        return bool(x)
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +1271,7 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         'current_cv_targets_t': current_cv_targets_t[:t + 1],
         'hidden_disturbance_t': hidden_dist_t[:t + 1],
         'reward_scale': float(env.reward_scale),
+        **_episode_objective_meta(env),
     }
 
 
@@ -705,14 +1355,7 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
                 min((mean_col - lo) / rng, (hi - mean_col) / rng))))
             usage_scores.append(float(
                 (np.nanmax(col) - np.nanmin(col)) / rng))
-        # Reversal rate: sign-changes per step on a 0.1%-of-range deadband.
-        if T > 1:
-            d = np.diff(col)
-            deadband = 1e-3 * rng
-            signed = np.where(np.abs(d) > deadband, np.sign(d), 0.0)
-            nz = signed[signed != 0.0]
-            flips = int(np.sum(np.abs(np.diff(nz)) > 1.0)) if nz.size >= 2 else 0
-            reversal_rates.append(float(flips) / float(max(1, len(d))))
+        reversal_rates.append(_reversal_rate(col, rng))
 
     # --- CV tracking: IAE / ITAE / ISE per CV (where target enabled) ----
     iae_per_cv: List[float] = []
@@ -738,6 +1381,60 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
         itae_per_cv.append(float(np.sum(np.arange(T) * np.abs(e))))
         ise_per_cv.append(float(np.sum(e ** 2)))
 
+    # --- CV quality: smoothness + limit hugging (MV chatter is allowed) -
+    cv_d2_per: List[float] = []
+    cv_rev_per: List[float] = []
+    cv_tv_per: List[float] = []
+    cv_head_per: List[float] = []
+    cv_vfrac_per: List[float] = []
+    cv_vdepth_per: List[float] = []
+    cv_sides: List[str] = []
+    any_pref_unknown = False
+    for k, cidx in enumerate(cv_idx):
+        if cidx >= states.shape[1]:
+            continue
+        y = states[:T, int(cidx)].astype('float64')
+        lo, hi = _base_cv_lo_hi(ep, k, y)
+        width = max(1e-9, hi - lo)
+        side, unk = preferred_cv_side(ep, k)
+        cv_sides.append(side)
+        any_pref_unknown = any_pref_unknown or bool(unk)
+        if T >= 3:
+            d2 = np.diff(y, n=2)
+            d2_rms = float(np.sqrt(np.mean(d2 * d2))) if d2.size else 0.0
+        else:
+            d2_rms = 0.0
+        cv_d2_per.append(d2_rms / width)
+        cv_rev_per.append(_reversal_rate(y, width))
+        if T > 1:
+            cv_tv_per.append(
+                float(np.mean(np.abs(np.diff(y)))) / width)
+        else:
+            cv_tv_per.append(0.0)
+        over_hi = np.maximum(y - hi, 0.0)
+        over_lo = np.maximum(lo - y, 0.0)
+        depth = (over_hi + over_lo) / width
+        viol = depth > 0.0
+        cv_vfrac_per.append(float(np.mean(viol)) if T > 0 else 0.0)
+        if np.any(viol):
+            cv_vdepth_per.append(float(np.mean(depth[viol])))
+        else:
+            cv_vdepth_per.append(0.0)
+        feasible = ~viol
+        if side == 'hi':
+            gap = (hi - y) / width
+        elif side == 'lo':
+            gap = (y - lo) / width
+        else:
+            gap = np.minimum(y - lo, hi - y) / width
+        if np.any(feasible):
+            cv_head_per.append(float(np.mean(gap[feasible])))
+        # else: all violating — headroom undefined for this CV
+
+    def _worst(xs: List[float], default: float = 0.0) -> float:
+        vals = _finite_floats(xs)
+        return float(max(vals)) if vals else default
+
     return {
         'cv_violation_mean': float(ep.get('mean_cv_violation', 0.0)),
         'mv_violation_mean': float(ep.get('mean_mv_violation', 0.0)),
@@ -754,26 +1451,40 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
         'iae_normed_per_cv': iae_per_cv,
         'itae_normed_per_cv': itae_per_cv,
         'ise_normed_per_cv': ise_per_cv,
+        # CV quality (episode = worst CV).  MV reversal is diagnostic only.
+        'cv_d2_rms_normed': _worst(cv_d2_per),
+        'cv_reversal_rate': _worst(cv_rev_per),
+        'cv_tv_per_step_normed': _worst(cv_tv_per),
+        'cv_opt_headroom': _worst(cv_head_per, default=float('nan')),
+        'cv_viol_frac': _worst(cv_vfrac_per),
+        'cv_viol_depth_normed': _worst(cv_vdepth_per),
+        'cv_preferred_side': ','.join(cv_sides) if cv_sides else 'unknown',
+        'cv_preferred_unknown': bool(any_pref_unknown or not cv_sides),
+        'cv_d2_rms_normed_per_cv': cv_d2_per,
+        'cv_reversal_rate_per_cv': cv_rev_per,
+        'cv_opt_headroom_per_cv': cv_head_per,
     }
 
 
 def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                                      window_steps: int | None = None
                                      ) -> Dict[str, object]:
-    """Per-disturbance response metrics on the *most-impacted* CV.
+    """Per-disturbance response on the most-impacted CV, plus return-to-limit.
 
-    For each scheduled event we look at the rollout window
-    ``[start, start + window_steps]`` (default = 5τ if available, else
-    200) and compute on each CV:
-      * ``peak_overshoot`` — max signed deviation from pre-event baseline,
-        normalised by CV bound width when available.
-      * ``settle_steps``   — first sample where |dev| stays inside
-        ``settle_band × bound_width`` for the rest of the window.
-        ``None`` if it never settles.
-      * ``iae_window``     — sum |dev| / bound_width across the window.
+    Window ``[start, start + window_steps]`` (default = 5τ if identified,
+    else 200), clipped at the next scripted event.  Per CV:
+      * ``peak_overshoot`` / ``settle_steps`` / ``iae_window`` vs *pre-event
+        baseline* (IAE-to-pre-event can look good while the CV sits
+        mid-band — that is not return-to-limit).
+      * ``cv_return_headroom`` — late-window gap to the *economic* bound
+        / bound width (0 = on the limit).
+      * ``cv_return_time_frac`` — first time inside ``RETURN_BAND_NORMED``
+        of that bound, as a fraction of the window (0 = immediate, 1 =
+        never).  Window is already τ-scaled, so the fraction is
+        plant-agnostic.
 
-    The most-impacted CV (largest |overshoot|) is reported per event;
-    aggregates (median, p90, max) across events are returned at the top.
+    Overshoot aggregates use the most-impacted CV.  Return aggregates use
+    the worst return (farthest from the economic limit) per event.
     """
     states = ep['states']
     cv_idx = ep.get('cv_indices') or []
@@ -796,6 +1507,16 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
         except Exception:
             pass
 
+    sched_starts: List[int] = []
+    for ev in ep.get('schedule') or []:
+        try:
+            s = int(ev.get('start', 0))
+        except Exception:
+            continue
+        if 0 < s < T - 5:
+            sched_starts.append(s)
+    sched_starts.sort()
+
     events = []
     for ev in ep.get('schedule') or []:
         try:
@@ -804,7 +1525,11 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             continue
         if start <= 0 or start >= T - 5:
             continue
-        end = min(T, start + int(window_steps))
+        nxt = [s for s in sched_starts if s > start]
+        clip_end = nxt[0] if nxt else T
+        end = min(T, start + int(window_steps), clip_end)
+        if end - start < 8:
+            continue
         pre = states[max(0, start - 20):start]
         if pre.size == 0:
             continue
@@ -834,13 +1559,35 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             if settle == 0:
                 settle = 0
             iae_w = float(np.sum(np.abs(dev_n)))
-            per_cv.append({'cv_row': k, 'cv_index': int(cidx),
-                            'peak_overshoot_normed': ovs,
-                            'settle_steps': settle,
-                            'iae_window_normed': iae_w})
+            y_win = states[start:end, int(cidx)].astype('float64')
+            lo, hi = _base_cv_lo_hi(ep, k, y_win)
+            side, _unk = preferred_cv_side(ep, k)
+            ret = return_to_limit_on_window(
+                y_win, lo, hi, side, band=float(settle_band))
+            per_cv.append({
+                'cv_row': k, 'cv_index': int(cidx),
+                'peak_overshoot_normed': ovs,
+                'settle_steps': settle,
+                'iae_window_normed': iae_w,
+                'preferred_side': side,
+                **ret,
+            })
         if not per_cv:
             continue
         worst = max(per_cv, key=lambda r: abs(r['peak_overshoot_normed']))
+
+        def _return_rank(r: Dict) -> Tuple[float, float]:
+            h = r.get('cv_return_headroom')
+            try:
+                hf = float(h)
+            except (TypeError, ValueError):
+                hf = float('nan')
+            if not np.isfinite(hf):
+                hf = 1.0 + float(r.get('cv_return_viol_frac') or 1.0)
+            tf = float(r.get('cv_return_time_frac') or 1.0)
+            return (hf, tf)
+
+        worst_ret = max(per_cv, key=_return_rank)
         events.append({
             'name': str(ev.get('name', 'event')),
             'start': start, 'end': end,
@@ -848,6 +1595,7 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             'source': str(ev.get('source', '')),
             'delta': float(ev.get('delta', 0.0)),
             'worst_cv': worst,
+            'worst_return': worst_ret,
             'per_cv': per_cv,
         })
 
@@ -862,6 +1610,27 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                 'max': float(np.max(a)),
                 'n': int(a.size)}
 
+    def _agg_return(key: str) -> Dict[str, float]:
+        raw: List[float] = []
+        for e in events:
+            wr = e.get('worst_return') or {}
+            v = wr.get(key)
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(f):
+                raw.append(f)
+        if not raw:
+            return {'mean': float('nan'), 'median': float('nan'),
+                    'p90': float('nan'), 'max': float('nan'), 'n': 0}
+        a = np.asarray(raw, dtype='float64')
+        return {'mean': float(np.mean(a)),
+                'median': float(np.median(a)),
+                'p90': float(np.percentile(a, 90)),
+                'max': float(np.max(a)),
+                'n': int(a.size)}
+
     settle_vals = [e['worst_cv']['settle_steps'] for e in events
                     if e['worst_cv']['settle_steps'] is not None]
     settle_agg = ({'median': float(np.median(settle_vals)),
@@ -872,6 +1641,9 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                   if settle_vals else
                   {'median': 0.0, 'p90': 0.0, 'max': 0.0,
                    'n_settled': 0, 'n_total': int(len(events))})
+    n_reached = int(sum(
+        1 for e in events
+        if (e.get('worst_return') or {}).get('cv_return_reached')))
 
     return {
         'window_steps': int(window_steps),
@@ -879,6 +1651,11 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
         'overshoot_normed': _agg('peak_overshoot_normed'),
         'iae_window_normed': _agg('iae_window_normed'),
         'settle_steps': settle_agg,
+        'return_headroom': _agg_return('cv_return_headroom'),
+        'return_time_frac': _agg_return('cv_return_time_frac'),
+        'return_viol_frac': _agg_return('cv_return_viol_frac'),
+        'n_return_reached': n_reached,
+        'n_return_events': int(len(events)),
         'events': events,
     }
 
@@ -1035,6 +1812,7 @@ def run_constant_mv_episode(env, *, schedule: List[Dict],
         'schedule': schedule,
         'mv_norm_ranges': [list(b) for b in env.mv_norm_ranges],
         'cv_norm_ranges': [list(b) for b in env.cv_norm_ranges],
+        **_episode_objective_meta(env),
     }
 
 
@@ -1950,6 +2728,8 @@ def run_validation(*,
             ev_metrics = compute_event_response_metrics(ep_d)
             base_metrics = (compute_episode_metrics(ep_b)
                               if ep_b is not None else None)
+            ev_metrics_b = (compute_event_response_metrics(ep_b)
+                              if ep_b is not None else None)
 
             d_title = (f'seed={seed}  scripted disturbance rejection  '
                        f'cum_raw={ep_d["cum_raw_reward"]:+.2f}  '
@@ -2046,8 +2826,9 @@ def run_validation(*,
                 # mv_reversal_rate, economic_score, IAE/ITAE/ISE).
                 'episode_metrics_agent': ep_metrics,
                 'episode_metrics_baseline': base_metrics,
-                # Per-event overshoot / settle / IAE_window summary.
+                # Per-event overshoot / settle / IAE_window + return-to-limit.
                 'event_response': ev_metrics,
+                'event_response_baseline': ev_metrics_b,
             })
         except Exception as e:
             import traceback
@@ -2123,14 +2904,11 @@ def run_validation(*,
                 'reward_pass': bool(rw_r0 >= 0.3),
                 'critic_pass': bool(critic_r >= 0.3),
             }
-            # p11 RCA: CONTROL-QUALITY gates.  Every gate above is INTERNAL
-            # WM/critic fidelity — they PASS even when the actor learns a
-            # degenerate full-range BANG-BANG (mv_reversal≈1.0) that keeps the
-            # CV in band only because the actuator lag averages the fast square
-            # wave, at huge move cost.  Without these two gates such a policy
-            # (which is WORSE than the open-loop baseline) falsely PASSES
-            # validation.  smooth_pass flags the oscillation directly;
-            # beats_baseline_pass flags any policy no better than doing nothing.
+            # CONTROL-QUALITY gates.  Internal WM/critic floors can PASS
+            # while the actor chatters.  MV oscillation is ALLOWED; the
+            # CV must stay smooth (d2 / CV reversal) and beats_baseline
+            # still flags a policy no better than doing nothing.
+            # cv_opt_headroom is a residual, not an all_pass gate.
             try:
                 _cq = control_quality_gates(
                     locals().get('disturbance_records') or [],
@@ -2161,9 +2939,15 @@ def run_validation(*,
                     print(f'        - critic V vs MC r={critic_r:+.3f} < 0.3'
                           ' (value head uncorrelated with returns)', flush=True)
                 if not fidelity_gates.get('smooth_pass', True):
-                    print(f'        - mv_reversal_rate='
-                          f'{fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f}'
-                          ' > 0.5 (BANG-BANG: MV reverses direction most steps)',
+                    print(f'        - CV smoothness FAIL: '
+                          f'cv_d2_rms_normed='
+                          f'{fidelity_gates.get("cv_d2_rms_normed_observed", float("nan")):.4f}'
+                          f' (gate ≤ {CV_D2_RMS_GATE})  cv_reversal_rate='
+                          f'{fidelity_gates.get("cv_reversal_rate_observed", float("nan")):.3f}'
+                          f' (gate ≤ {CV_REVERSAL_GATE}); '
+                          f'mv_reversal='
+                          f'{fidelity_gates.get("mv_reversal_rate_observed", float("nan")):.3f}'
+                          ' is diagnostic only (MV oscillation allowed)',
                           flush=True)
                 if not fidelity_gates.get('beats_baseline_pass', True):
                     if fidelity_gates.get('control_gate_skipped'):
@@ -2180,7 +2964,10 @@ def run_validation(*,
                 print(f'[val] internal-fidelity gates PASSED '
                       f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '
                       f'critic_r={critic_r:+.3f} '
-                      f'mv_rev={fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f})',
+                      f'cv_d2={fidelity_gates.get("cv_d2_rms_normed_observed", float("nan")):.4f} '
+                      f'cv_rev={fidelity_gates.get("cv_reversal_rate_observed", float("nan")):.3f} '
+                      f'mv_rev={fidelity_gates.get("mv_reversal_rate_observed", float("nan")):.3f}'
+                      f' [MV osc allowed])',
                       flush=True)
         except Exception as _ge:
             print(f'[val] fidelity-gate computation skipped: {_ge!r}',
@@ -2398,6 +3185,54 @@ def run_validation(*,
     cum = np.array([m['cum_raw_reward'] for m in metrics_records])
     cv_v = np.array([m['mean_cv_violation'] for m in metrics_records])
     mv_v = np.array([m['mean_mv_violation'] for m in metrics_records])
+    dv_tf_loaded = None
+    try:
+        _dv_tf_path = out_dir / 'wm_dv_transfer_matrix.json'
+        if _dv_tf_path.exists():
+            dv_tf_loaded = json.loads(_dv_tf_path.read_text())
+    except Exception:
+        dv_tf_loaded = None
+    residual_board = build_residual_board(
+        fidelity_gates=locals().get('fidelity_gates'),
+        mv_tf=locals().get('tf_result'),
+        dv_tf=dv_tf_loaded,
+        postprior=locals().get('pp_res'),
+        distpred=locals().get('dp_res'),
+        disturbance_records=disturbance_records,
+        seed_metrics=metrics_records,
+    )
+    residual_board = _jsonable(residual_board)
+    try:
+        with open(out_dir / 'residual_board.json', 'w') as f:
+            json.dump(residual_board, f, indent=2)
+        r1 = residual_board.get('r1_observer_tm') or {}
+        r2 = residual_board.get('r2_cv_quality') or {}
+        r3 = residual_board.get('r3_unmeasured_dr') or {}
+        print('[val] residual board (MV osc allowed; family-closed ≠ closed):',
+              flush=True)
+        print(f'        R1 TM  mv_ss={r1.get("mv_ss_ratio_mean")} '
+              f'dv_ss={r1.get("dv_ss_ratio_mean")} '
+              f'curve_iae_mv={r1.get("mv_curve_iae_mean")} '
+              f'1step→OL={r1.get("compound_1step_to_openloop")}',
+              flush=True)
+        print(f'        R2 CV  d2={r2.get("cv_d2_rms_normed_worst_seed")} '
+              f'rev={r2.get("cv_reversal_rate_worst_seed")} '
+              f'headroom={r2.get("cv_opt_headroom_mean")} '
+              f'viol_frac={r2.get("cv_viol_frac_worst_seed")} '
+              f'mv_rev={r2.get("mv_reversal_rate_observed")} '
+              f'(diagnostic)',
+              flush=True)
+        print(f'        R3 DR  det_r={r3.get("kalman_det_r")} '
+              f'pred_std={r3.get("kalman_pred_std")} '
+              f'true_std={r3.get("kalman_true_std")} '
+              f'iae_ratio={r3.get("iae_agent_over_baseline_mean")} '
+              f'return_headroom={r3.get("cv_return_headroom_mean")} '
+              f'return_time_frac={r3.get("cv_return_time_frac_mean")} '
+              f'-> {out_dir}/residual_board.json',
+              flush=True)
+    except Exception as _rbe:
+        print(f'[val] residual_board skipped: {_rbe!r}', flush=True)
+        residual_board = {'error': repr(_rbe)}
     summary = {
         'controller_dir': str(controller_dir),
         'simulation_dir': str(sim_dir),
@@ -2419,6 +3254,7 @@ def run_validation(*,
         'wm_posterior_prior_decomp': locals().get('pp_res', None),
         'wm_dv_posterior_prior_decomp': locals().get('dvpp_res', None),
         'wm_disturbance_prediction': locals().get('dp_res', None),
+        'residual_board': residual_board,
         'episodes': metrics_records,
         'disturbance_rejection': disturbance_records,
     }

@@ -29,6 +29,51 @@ updated) at the end of **every** run diagnosis/verdict. Newest at the bottom.
 - Deep narrative + RCA detail lives in `/memories/repo/mbrl_open_items.md`
   (agent memory). This file is the scannable cross-run history for humans.
 
+## STANDING RESIDUALS — never retire because a knob family closed
+
+MV oscillation is **allowed**. Optimization potential is lost when the **CV**
+chatters or sits mid-band instead of hugging the economic limit without
+violating. Score every EXIT against `validation/residual_board.json`.
+Family-closed / VALID 9/9 / GAIN-READY do **not** close these residuals.
+Do not require beating the current econ champion to KEEP a CV-smoothness,
+headroom, or DR win. `smooth_pass` is CV `d2` / `cv_reversal` only; MV
+reversal as a smoothness gate is obsolete.
+
+Living record (automation-owned; **not** frozen in the prompt):
+
+- `docs/GOAL_PLAN.md` — plan toward the overall goal, next jobs, live analysis,
+  refactor options. Update while a run is LIVE and after every EXIT.
+- This file's BEST-RUN BASELINES + per-run rows — champions and ledger.
+- Each run's `residual_board.json` — that run's R1/R2/R3 scores.
+
+| ID | Residual | What to read | Quality target (not `all_pass`) |
+|---|---|---|---|
+| **R1** | Observer TM | MV/DV `ss_ratio`, **`curve_iae_normed`**, compounding `1step→OL` | curve IAE → 0, ss → 1, compounding → 1 |
+| **R2** | CV quality / opt potential | worst-seed `cv_d2_rms_normed`, `cv_reversal_rate`, `cv_viol_frac`; residual `cv_opt_headroom`. MV reversal is diagnostic. | d2 ≤ 0.01, reversal ≤ 0.10, headroom ≤ 0.15, viol ~ 0 |
+| **R3** | Unmeasured DR | Kalman `det_r` + `pred_std` vs true; closed-loop `iae_agent/iae_baseline`; `cv_return_headroom` (late-window gap/width) + `cv_return_time_frac` (fraction of 5τ window) | det_r → 1, amp ratio → 1, IAE ratio → 0, return headroom → 0, return time_frac → 0 |
+
+Hygiene gates (`all_pass`): worst-seed `cv_d2_rms ≤ 0.05` **and**
+`cv_reversal ≤ 0.25`, plus existing WM/critic floors and `beats_baseline`.
+Do **not** gate on CV total variation. Do **not** fail `all_pass` on
+`cv_opt_headroom`.
+
+**Metric audit (every EXIT and during live analysis).** If improving a number
+cannot move a smooth CV onto the economic limit, do **not** spend GPU on it —
+fix or replace the metric / loss / gate first. Write conclusions in
+`docs/GOAL_PLAN.md`.
+
+**Refactors are in-scope.** Default is the highest-impact change whose metric
+is causal for the overall goal. When N+1 cannot serve the goal: bigger
+observer / Kalman / actor-critic / loss / gate / metric refactors are allowed
+(see envelope in `docs/AUTOMATION_RUN_PROMPT.txt`). While a run is LIVE, do
+**not** start a second GPU job and do **not** rewrite the live recipe; use
+that time to analyze history, literature, codebase, and workflow and update
+`docs/GOAL_PLAN.md`. Plant rotation (at most two jobs on a new plant, then
+one return-to-test_sim on the worst residual) is cadence, not a ban on
+refactors.
+
+Paste-ready **full** automation prompt: `docs/AUTOMATION_RUN_PROMPT.txt`.
+
 ## BEST-RUN BASELINES (per subsystem) — UPDATE THIS EACH VERDICT
 
 The current champion per subsystem — the baselines a new run must **beat** (or
