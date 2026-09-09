@@ -73,7 +73,8 @@ literature, codebase, and workflow and update `docs/GOAL_PLAN.md`. Plant
 rotation (short campaign on a new plant, then return to the baseline plant)
 is cadence, not a ban on refactors.
 
-Paste-ready automation addendum: `docs/PROMPT_ADDENDUM_STANDING_RESIDUALS.txt`.
+Paste-ready **full** automation run prompt: `docs/AUTOMATION_RUN_PROMPT.txt`
+(addendum-only: `docs/PROMPT_ADDENDUM_STANDING_RESIDUALS.txt`).
 
 ## BEST-RUN BASELINES (per subsystem) — UPDATE THIS EACH VERDICT
 
