@@ -54,12 +54,24 @@ Hygiene gates (`all_pass`): worst-seed `cv_d2_rms ≤ 0.05` **and**
 Do **not** gate on CV total variation (a slow ride to the limit is good).
 Do **not** fail `all_pass` on `cv_opt_headroom`.
 
-Next GPU job = largest residual whose current family is NOT closed on this
-plant. If that family is closed: change piece (observer / Kalman / actor-critic)
-OR take the same residual to another plant, then **return to test_sim**.
-New plant (HeatExchangerTower): same three residuals. Orig-P1 GAIN_NOT_READY
-from equal-% OP-gain → OP-aware observer, not extra-P1 lottery. Cadence: at
-most two jobs on a new plant, then one return-to-test_sim on the worst residual.
+**Metric audit (every EXIT, before the next lever).** If improving a number
+cannot move a smooth CV onto the economic limit (gamed, tautological,
+scale-invariant, freeze-gate, disagrees with the plot), do **not** spend GPU
+on it — fix or replace the metric / loss / gate first. Known insufficient:
+`mv_reversal` as a smoothness gate; CV TV as a smoothness gate; ss-ratio
+alone; jsonl teacher ×1; `critic_r` without `critic_rew_to_tgt_var`; raw
+disturbance R²; VALID 9/9 / GAIN-READY / family-closed as residual-closed.
+
+**Refactors are in-scope.** Default is still one attributed change on the
+largest residual whose family is open *and* whose metric is causal for the
+goal. When the family is closed, N+1 would be lottery, or the score cannot
+serve the overall goal: bigger observer / Kalman / actor-critic / loss / gate
+/ metric refactors are allowed (stay inside the product envelope: neural
+observer + neural Kalman/DOB + neural actor-critic on real-sim; env-free; no
+gray-box plant; no classical PID/LQR/MPC as the product; imagination actor
+deleted). Cadence (≤2 jobs on a new plant, then return to test_sim) is plant
+rotation, not a ban on refactors. HeatExchangerTower Orig-P1 GAIN_NOT_READY
+from equal-% OP-gain → OP-aware observer, not extra-P1 lottery.
 
 Paste-ready automation addendum: `docs/PROMPT_ADDENDUM_STANDING_RESIDUALS.txt`.
 

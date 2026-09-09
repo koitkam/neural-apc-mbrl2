@@ -621,13 +621,43 @@ def build_residual_board(
     return {
         'never_retire_because_family_closed': True,
         'mv_oscillation_allowed': True,
+        'refactors_allowed': True,
+        'overall_goal': (
+            'Smooth CV on the economic limit without violating; faithful '
+            'observer TM; unmeasured-load rejection.  Neural observer + '
+            'neural Kalman/DOB + neural actor-critic on real-sim rollouts.'
+        ),
         'note': (
             'MV chatter is allowed.  Fail/optimize on CV smoothness + '
             'limit hugging + TM shape + unmeasured DR.  P64 on test_sim '
             'is the regression lock, not done.  VALID 9/9 / GAIN-READY / '
             'family-closed do not close R1/R2/R3.  Do not require beating '
-            'P64 paired-econ to KEEP a CV-smoothness, headroom, or DR win.'
+            'P64 paired-econ to KEEP a CV-smoothness, headroom, or DR win.  '
+            'Bigger observer/Kalman/actor-critic/loss/gate/metric refactors '
+            'are in-scope when knob N+1 cannot serve the overall goal.'
         ),
+        'metric_audit': {
+            'required_every_exit': True,
+            'question': (
+                'If this metric improved, would a smooth CV actually sit '
+                'closer to the economic limit with a faithful observer and '
+                'unmeasured-load rejection?'
+            ),
+            'known_insufficient': [
+                'mv_reversal as smoothness gate (diagnostic only)',
+                'cv_tv as smoothness gate (slow ride to the limit is good)',
+                'ss-ratio alone (DC freeze-gate; also score curve_iae)',
+                'jsonl teacher gain x1 (tautology vs val TM)',
+                'critic_r Pearson without critic_rew_to_tgt_var',
+                'raw disturbance R2 (use det_r + pred_std vs true)',
+                'VALID 9/9 / GAIN-READY / all_pass / family-closed as residual-closed',
+                'requiring P64 paired-econ to KEEP a smoothness/headroom/DR win',
+            ],
+            'if_no': (
+                'Do not spend GPU improving it. Fix or replace the metric / '
+                'loss / gate first; that work may be a large refactor.'
+            ),
+        },
         'quality_targets_not_all_pass': {
             'cv_d2_rms_normed': CV_D2_RMS_TARGET,
             'cv_reversal_rate': CV_REVERSAL_TARGET,
