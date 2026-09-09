@@ -4,7 +4,7 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 EXIT INVALID CAPPED **0.68@MV**; **P119 locgfix LIVE P3 @170** — P2→P3@**158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire; orig-P1@**91 FAIL 0.63@MV**; extra-P1@**101 PASS** last_ok **100** GAIN-READY **0.83@MV**; extra-P1 lottery **closed**; then return-to-`test_sim`).
+Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 EXIT INVALID CAPPED **0.68@MV**; **P119 locgfix LIVE P3 @262** — P2→P3@**158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire; orig-P1@**91 FAIL 0.63@MV**; extra-P1@**101 PASS** last_ok **100** GAIN-READY **0.83@MV**; extra-P1 lottery **closed**; then return-to-`test_sim`).
 
 ## Residual board vs champions (test_sim unless noted)
 
@@ -46,13 +46,13 @@ tmux `mbrl2_p118` **gone**. pid **551549 DEAD**. sha **`ff5f84c`**. **EXIT=0** 1
 
 ## Live this visit — P119 `locgfix` (do not kill / do not second GPU)
 
-tmux `mbrl2_p119` pid **557257** sha **`ea7def9`** `device=cuda` bs=128 compile=eager nvidia **~2857 MiB**. Env-free (`CUDA_VISIBLE_DEVICES=0`, no `DREAMER_*`). `[resolved-cfg] opscale=True` no ol1. STAGE 3 `wm_frozen` FROZEN WM+DOB. Train start **2026-09-09 14:10:33**. **One GPU job.** jsonl NaN/Inf **0**.
+tmux `mbrl2_p119` pid **557257** sha **`ea7def9`** `device=cuda` bs=128 compile=eager nvidia **~2859 MiB**. Env-free (`CUDA_VISIBLE_DEVICES=0`, no `DREAMER_*`). `[resolved-cfg] opscale=True` no ol1. STAGE 3 `wm_frozen` FROZEN WM+DOB. Train start **2026-09-09 14:10:33**. **One GPU job.** jsonl NaN/Inf **0**.
 
 **Teacher print (locgfix CONFIRMED):** local G `plant_fd=6/6` mean MV **2.890** / DV **−0.341** vs identified **2.709 / −0.435**. span MV **2.01** / DV **0.46**. `|du_mv|=0.4000` **=** step **0.4000**. **No** WARNING.
 
 **P2→P3 @158 PASS (2026-09-09 18:10:26):** `[gate p2->p3] PASS` reward_mtp median **1.180** (max=3.00, n=5); `p2_extension=0/42897`. `[phase] 2→3` env_steps **1276250**. **`[p3-skip]` did not fire** (`skip_invalid_p3=True`; freeze last_ok **100** GAIN-READY). P2 **102–158** skip **0** (cum skip **11** is P1 storm-1). End-P2 recon **0.0527** dobg **0.0319**. `dob_A` **0.95257** held. `dob_K` **0.119→0.017@102** min **0.006@104** then **0.167@158** SS **≈3.52**. leftover `|d_slow|/|d|` **0.85@102→0.159@158**. `std_ratio` **38822@102 → 0.885@158**. α **0.00391**. vs P118 end-P2 K **0.047/1.00** leftover **0.416** std **0.77** MTP **1.216** then `[p3-skip]`. First dobg **0.0034@102** skip **0** KEEP vs P95.
 
-**LIVE P3 @170 (2026-09-09 18:11:38, ~241 min):** skip_iter **0** last_ok **100 locked**. critic-warmup **10** iters (159–168 actor frozen, clip **0**, logp_std **~0.45**). `[return-scale] FREEZE` **2.128** after warmup. Unfreeze **@169** logp_std **4.12** clip **0.82**; @170 logp **2.13** clip **0.83** critic **15.1** ent **−0.582** rtgt **0.065** pred_r **0.43** sps **~300**. nvidia **~2857 MiB**. jsonl NaN/Inf **0**.
+**LIVE P3 @262 (2026-09-09 18:19:04, ~249 min):** skip_iter **0** (entire P3) last_ok **100 locked**. env_steps **1435000**. ret_ema **−209.56** ret_w **−276.13**. actor **+0.174** critic **9.98** ent **−0.486** logp **0.50** clip **0.13** rscale **2.13** **rtgt 0.0014** (collapsed from **0.087@159** — standing P3 critic collapse, do not stack knobs). `critic_pred_target_r` **0.986**. sps **~305**. nvidia **~2859 MiB**. jsonl NaN/Inf **0**. `wm_op_scale_dev` **0** / dob_K **0** (frozen). Critic-warmup 159–168; `[return-scale] FREEZE` **2.128**; unfreeze **@169**. No `p3_plateau` yet.
 
 **Orig-P1 @91 FAIL:** live g **0.63@MV** `@H 0.61` DV **1.03/@H 0.98**. Fair locgfix miss (jsonl ×0.99 ≠ TM). extra-P1 lottery **closed**.
 
@@ -60,7 +60,7 @@ tmux `mbrl2_p119` pid **557257** sha **`ea7def9`** `device=cuda` bs=128 compile=
 
 **Last P2 Probe@150:** `H=1:r=+0.526 H=14:r=+0.438 H=28:r=+0.503 H=56:r=+0.480 conv=0.75 drift=0.129 floor=0.40 best_h=56/56 gain_fid=0.840`. vs @140 H=56 **+0.352** (below floor, recovered). `wm_best` EMA **5.958@130** — gain-blind.
 
-Predicted remaining: P3 budget **592500** from **1276250** → ~**1.869e6** (~31 min @~300 sps). Score actor only if freeze GAIN-READY **and** P3 **and** `actor_experiment_valid`. If val TM still ~P118 **×0.61**: encode-L then **P120 `gop`**. Do **not** extra-P1 N+1.
+Predicted remaining: P3 budget **592500** from **1276250** → ~**1.869e6**. Remaining **~434k** steps ≈ **~24 min** @~305 sps, or earlier `p3_plateau`. Score actor only if freeze GAIN-READY **and** P3 **and** `actor_experiment_valid`. If val TM still ~P118 **×0.61**: encode-L then **P120 `gop`**. Do **not** extra-P1 N+1.
 
 Falsifier for locgfix as freeze: orig-P1 **0.63@MV** (fair). extra-P1 last_ok **100** **0.83@MV** is P100-class confound. Do **not** use P118’s 0.68@MV as the falsifier.
 
@@ -70,7 +70,7 @@ After a fair P119 VALID or a fair GAIN_NOT_READY with a **correct** local teache
 
 ## Ranked follow-ups (not this GPU until P119 verdict)
 
-1. **P119 locgfix** (LIVE P3 above) — P2→P3@**158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire. Freeze last_ok **100** GAIN-READY **0.83@MV** (extra-P1; lottery closed). Orig-P1 **0.63@MV** is the fair miss. Do not rewrite the live recipe. Do **not** extra-P1 N+1. Score actor only if `actor_experiment_valid`.
+1. **P119 locgfix** (LIVE P3 @262) — P2→P3@**158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire. Freeze last_ok **100** GAIN-READY **0.83@MV** (extra-P1; lottery closed). Orig-P1 **0.63@MV** is the fair miss. Do not rewrite the live recipe. Do **not** extra-P1 N+1. Score actor only if `actor_experiment_valid`.
 2. If val TM still short after this GAIN-READY freeze: keep LPV, do **not** extra-P1. First check encode vs ID: `identified_lookback=131` vs `seq_len=128` (WARNING at launch; τ=54.5 sr=4 → 4τ/sr=54.5, K=H=56 is the settle, not the hole). Optionally pin encode L=`identified_lookback` (one attributed change) **only after** EXIT val TM is still short.
 3. If val TM still ~P118 **×0.61** (extra-P1 freeze confound / orig-P1 0.63) **with** WM-norm local G: input-scale LPV is too thin for equal-% DC. **P120 `gop`** (still neural, one mechanism): OP-conditioned **gain-c readout**, not another `1+tanh` on GRU inputs and **not** an in-place write into stored `c`.
    - **Mechanism:** new `gain_op_net` (same `_MLP` + zero-init last Linear as `op_scale_net`; **separate weights**). OP=`concat(action,dv)` stop-grad. `scale = 1+tanh(net(OP))`. Stored `RSSMState.c` stays the reference gain (P73 persist KEEP: `cont_gain_persist` is step-to-step MSE on `cont['sample'][..., :n_gain]` — mutating stored c would fight persist whenever OP walks inside T=128). Apply `c_eff[..., :G] = c[..., :G] * scale` **at use**:
@@ -87,7 +87,7 @@ After a fair P119 VALID or a fair GAIN_NOT_READY with a **correct** local teache
 ## RCA this visit
 
 - SysID: OP-varying DC is real (equal-% + 1/feed; MV amp **2.23×** / DV **2.34×**). Median G is still the wrong pin **once local G is in WM-norm**. P118 local MV 0.015 is units, not that 2.23× span.
-- Signal: P119 locgfix teacher CONFIRMED. **Orig-P1@91 FAIL 0.63@MV**. **Extra-P1@101 PASS** last_ok **100** GAIN-READY **0.83@MV** 1step→OL **0.86** (lottery closed — not a KEEP). **P2→P3@158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire. End-P2 K **0.167/3.52** leftover **0.159** std **0.885** skip **0**. LIVE P3 @170 unfreeze logp **2.13** clip **0.83** rscale **2.128**. GPU **~2.9 GB**. Disk `/home` 64% / 62G. Keep P119+P118+P117+P116+P64+P53.
+- Signal: P119 locgfix teacher CONFIRMED. **Orig-P1@91 FAIL 0.63@MV**. **Extra-P1@101 PASS** last_ok **100** GAIN-READY **0.83@MV** 1step→OL **0.86** (lottery closed — not a KEEP). **P2→P3@158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire. End-P2 K **0.167/3.52** leftover **0.159** std **0.885** skip **0**. LIVE P3 @262 skip **0** rscale **2.13** **rtgt 0.0014** (collapsed). GPU **~2.9 GB**. Disk `/home` 64% / 62G. Keep P119+P118+P117+P116+P64+P53.
 - Control: freeze last_ok **100** GAIN-READY → P3 **is running** (`skip_invalid_p3` did not skip). Score P119 only if `actor_experiment_valid`. Do not kill P119 / second GPU / extra-P1 N+1.
 - ML: Orig-P1 **0.63@MV** is the fair locgfix miss. extra-P1 last_ok **100** **0.83@MV** is P100-class confound. End-P2 leftover **0.159** / K **0.167** hotter than P118 **0.416 / 0.047**. LPV `wm_op_scale_dev` **0.86** at P2-end. Detonated-freeze restored 100 (wrap@101 31×). Warm-restore SKIPPED. extra-P1 lottery closed. If val TM still short: encode-L then **P120 `gop`**. P73 persist 0.1 forbids in-place `c*=gop`.
 - Plant: HeatExchangerTower `step` is engineering; APCEnv denorms. Teacher must use `_prev_cmd_norm`. Restore must not leave a post-FD leftover when the snapshot was `None`. `identified_lookback=131 > seq_len=128` is a 3-sample encode shortfall, not this freeze.
