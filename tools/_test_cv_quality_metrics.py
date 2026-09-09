@@ -211,10 +211,12 @@ def main() -> int:
            'board must refuse family-closed as residual-closed', ok)
     _check(board['mv_oscillation_allowed'] is True, 'MV osc allowed flag', ok)
     _check(board.get('refactors_allowed') is True, 'refactors_allowed on board', ok)
+    _check(board.get('plan_while_live') is True, 'plan_while_live on board', ok)
     _check(board.get('metric_audit', {}).get('required_every_exit') is True,
            'metric audit required every EXIT', ok)
-    _check(abs(board['lock_p64']['r1_tm_mv_ss_ratio'] - 0.927) < 1e-9,
-           'P64 MV ss lock', ok)
+    _check('lock_p64' not in board, 'board must not freeze a past-run lock', ok)
+    _check('docs/GOAL_PLAN.md' in (board.get('history_files') or []),
+           'board must point at the living plan', ok)
     _check(board['r2_cv_quality']['smooth_pass_is_cv_only'] is True,
            'R2 smooth_pass is CV-only', ok)
     _check(board['r2_cv_quality']['cv_smooth_pass'] is True,

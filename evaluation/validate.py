@@ -191,18 +191,6 @@ CV_D2_RMS_TARGET = 0.01
 CV_REVERSAL_TARGET = 0.10
 CV_OPT_HEADROOM_TARGET = 0.15
 
-# P64 test_sim regression lock.  Family-closed ≠ residual closed.
-P64_RESIDUAL_LOCK = {
-    'plant': 'test_sim',
-    'r1_tm_mv_ss_ratio': 0.927,
-    'r1_tm_mv_ss_ratio_p26': 0.973,
-    'r1_tm_dv_ss_ratio': 0.893,
-    'r1_compound_1step_ol': 0.85,
-    'r3_kalman_det_r': 0.352,
-    'r3_pred_std': 0.608,
-    'r3_true_std': 1.93,
-}
-
 
 def _finite_floats(vals) -> List[float]:
     out: List[float] = []
@@ -261,7 +249,7 @@ def preferred_cv_side(ep: Dict, k: int) -> Tuple[str, bool]:
     """Which bound is the money limit for CV ``k``.
 
     1. ``cv_economic_weights[k]``: ``>0`` prefer LO, ``<0`` prefer HI.
-    2. Else ``cv_side_scale``: ``hi > lo`` → HI (test_sim / HeatExchanger).
+    2. Else ``cv_side_scale``: ``hi > lo`` → HI.
     3. Else unknown → nearest-bound gap, ``preferred_unknown=True``.
     """
     econ = ep.get('obj_cv_economic_weights') or []
@@ -617,27 +605,36 @@ def build_residual_board(
     amp = _distpred_amp(distpred)
     dr = _closed_loop_dr_scores(disturbance_records)
     cq = control_quality_gates(disturbance_records, seed_metrics=seed_metrics)
-    lock = dict(P64_RESIDUAL_LOCK)
     return {
         'never_retire_because_family_closed': True,
         'mv_oscillation_allowed': True,
         'refactors_allowed': True,
+        'plan_while_live': True,
         'overall_goal': (
             'Smooth CV on the economic limit without violating; faithful '
             'observer TM; unmeasured-load rejection.  Neural observer + '
             'neural Kalman/DOB + neural actor-critic on real-sim rollouts.'
         ),
+        'history_files': [
+            'docs/GOAL_PLAN.md',
+            'docs/RUN_HISTORY.md',
+        ],
         'note': (
             'MV chatter is allowed.  Fail/optimize on CV smoothness + '
-            'limit hugging + TM shape + unmeasured DR.  P64 on test_sim '
-            'is the regression lock, not done.  VALID 9/9 / GAIN-READY / '
-            'family-closed do not close R1/R2/R3.  Do not require beating '
-            'P64 paired-econ to KEEP a CV-smoothness, headroom, or DR win.  '
-            'Bigger observer/Kalman/actor-critic/loss/gate/metric refactors '
-            'are in-scope when knob N+1 cannot serve the overall goal.'
+            'limit hugging + TM shape + unmeasured DR.  Compare these '
+            'scores to current champions in docs/RUN_HISTORY.md and to '
+            'docs/GOAL_PLAN.md — do not freeze a past run as the lock.  '
+            'VALID 9/9 / GAIN-READY / family-closed do not close R1/R2/R3.  '
+            'Do not require beating the current econ champion to KEEP a '
+            'CV-smoothness, headroom, or DR win.  Bigger '
+            'observer/Kalman/actor-critic/loss/gate/metric refactors are '
+            'in-scope when knob N+1 cannot serve the overall goal.  While '
+            'a run is LIVE, analyze and update docs/GOAL_PLAN.md; do not '
+            'start a second GPU job.'
         ),
         'metric_audit': {
             'required_every_exit': True,
+            'also_during_live_analysis': True,
             'question': (
                 'If this metric improved, would a smooth CV actually sit '
                 'closer to the economic limit with a faithful observer and '
@@ -651,11 +648,12 @@ def build_residual_board(
                 'critic_r Pearson without critic_rew_to_tgt_var',
                 'raw disturbance R2 (use det_r + pred_std vs true)',
                 'VALID 9/9 / GAIN-READY / all_pass / family-closed as residual-closed',
-                'requiring P64 paired-econ to KEEP a smoothness/headroom/DR win',
+                'requiring current econ champion to KEEP a smoothness/headroom/DR win',
             ],
             'if_no': (
                 'Do not spend GPU improving it. Fix or replace the metric / '
-                'loss / gate first; that work may be a large refactor.'
+                'loss / gate first; that work may be a large refactor. '
+                'Write the conclusion in docs/GOAL_PLAN.md.'
             ),
         },
         'quality_targets_not_all_pass': {
@@ -667,7 +665,6 @@ def build_residual_board(
             'tm_ss_ratio': 1.0,
             'kalman_amp_ratio': 1.0,
         },
-        'lock_p64': lock,
         'r1_observer_tm': {
             'residual': 'Observer transfer-matrix shape + gain',
             'mv_ss_ratio_mean': mv_agg['ss_ratio_mean'],
@@ -679,12 +676,7 @@ def build_residual_board(
             'dv_curve_iae_mean': dv_agg['curve_iae_mean'],
             'dv_curve_iae_worst': dv_agg['curve_iae_worst'],
             'compound_1step_to_openloop': compound,
-            'lock': {
-                'mv_ss': lock['r1_tm_mv_ss_ratio'],
-                'mv_ss_p26': lock['r1_tm_mv_ss_ratio_p26'],
-                'dv_ss': lock['r1_tm_dv_ss_ratio'],
-                'compound_1step_ol': lock['r1_compound_1step_ol'],
-            },
+            'compare_to': 'docs/RUN_HISTORY.md BEST-RUN BASELINES and docs/GOAL_PLAN.md',
         },
         'r2_cv_quality': {
             'residual': (
@@ -721,11 +713,7 @@ def build_residual_board(
             'iae_agent_over_baseline_worst': dr[
                 'iae_agent_over_baseline_worst'],
             'overshoot_p90_mean': dr['overshoot_p90_mean'],
-            'lock': {
-                'det_r': lock['r3_kalman_det_r'],
-                'pred_std': lock['r3_pred_std'],
-                'true_std': lock['r3_true_std'],
-            },
+            'compare_to': 'docs/RUN_HISTORY.md BEST-RUN BASELINES and docs/GOAL_PLAN.md',
         },
         'fidelity_all_pass': fg.get('all_pass'),
         'beats_baseline_pass': fg.get('beats_baseline_pass',
