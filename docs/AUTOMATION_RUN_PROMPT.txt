@@ -66,6 +66,7 @@ Do not treat VALID 9/9, GAIN-READY, all_pass, or family-closed as R1/R2/R3 close
 Do not require beating the current econ champion to KEEP a CV-smoothness, headroom, or DR win.
 smooth_pass is CV d2/reversal only (worst-seed cv_d2_rms_normed ≤ 0.05 AND cv_reversal_rate ≤ 0.25); mv_reversal as a smoothness gate is obsolete.
 After every EXIT, read validation/residual_board.json, update GOAL_PLAN R1/R2/R3 vs current champions, and update RUN_HISTORY.
+Next GPU job = the largest residual on this plant whose current family is NOT closed (GOAL_PLAN next-job). If that family is closed: change piece (observer / Kalman / actor-critic), change the metric/loss/gate, take the residual to another plant then return to test_sim, or land the planned refactor.
 
 ## Metric audit (every EXIT and during live analysis, before the next lever)
 Ask: if this metric improved, would a smooth CV actually sit closer to the economic limit with a faithful observer and unmeasured-load rejection?
@@ -100,7 +101,7 @@ Knobs are unitless or derived from dynamics-ID (τ, θ, H, gains, authority, epi
 - If a knob cannot be derived and is not earning its keep, delete it or fold it into a formula.
 - New hyperparameters need a runtime adaptive rule unless they are already plant-agnostic.
 - Proven wins become TrainConfig defaults or sim-adaptive formulas. Env-vars are A/B only.
-When switching plants: a short campaign, then return to test_sim so residuals stay comparable. Cadence is plant rotation, not a ban on refactors.
+When switching plants: at most two jobs on a new plant, then one return-to-test_sim on the worst residual, so residuals stay comparable. Cadence is plant rotation, not a ban on refactors. Do not treat a new-plant GAIN_NOT_READY as extra-P1 lottery — RCA the observer / plant first.
 
 ## Cleanup
 Dead code is first-class when the GPU is busy: unused losses, leftover flags, unread env knobs, dual os.environ / TrainConfig paths, stale comments, probes. If you add a path, delete or gate the old one. No permanent A/B flags. Before commit: leftover imports, stale names, no extra hot-path forwards; probes only in gitignored scratch/.

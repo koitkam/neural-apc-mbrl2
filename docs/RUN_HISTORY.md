@@ -68,8 +68,9 @@ observer / Kalman / actor-critic / loss / gate / metric refactors are allowed
 (see envelope in `docs/AUTOMATION_RUN_PROMPT.txt`). While a run is LIVE, do
 **not** start a second GPU job and do **not** rewrite the live recipe; use
 that time to analyze history, literature, codebase, and workflow and update
-`docs/GOAL_PLAN.md`. Plant rotation (short campaign on a new plant, then
-return to test_sim) is cadence, not a ban on refactors.
+`docs/GOAL_PLAN.md`. Plant rotation (at most two jobs on a new plant, then
+one return-to-test_sim on the worst residual) is cadence, not a ban on
+refactors.
 
 Paste-ready **full** GPU-host automation prompt: `docs/AUTOMATION_RUN_PROMPT.txt`.
 

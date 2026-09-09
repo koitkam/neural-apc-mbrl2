@@ -1,2 +1,4 @@
-Full paste-ready automation prompt (GPU host): docs/AUTOMATION_RUN_PROMPT.txt
-This addendum is not the run prompt. Use the full file.
+This file is not the automation prompt.
+
+Paste the entire contents of docs/AUTOMATION_RUN_PROMPT.txt into the
+Neural-APC-mbrl automation (replaces the whole instruction, not an addendum).
