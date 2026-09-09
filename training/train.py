@@ -8315,6 +8315,10 @@ def _plant_fd_rest_local_g(
     identified G).
     """
     ident = _identified_g_matrix(cfg)
+    try:
+        cfg._last_plant_fd_du_mv = []  # type: ignore[attr-defined]
+    except Exception:
+        pass
     cv_idx = [int(i) for i in (getattr(env, 'cv_indices', ()) or
                                getattr(cfg, 'cv_obs_indices', ()) or ())]
     if not cv_idx:
@@ -8361,6 +8365,7 @@ def _plant_fd_rest_local_g(
                 return None
         return last
 
+    du_mv_abs: List[float] = []
     for j in range(n_mv):
         try:
             _restore_gain_match_rest(env, snap)
@@ -8371,10 +8376,15 @@ def _plant_fd_rest_local_g(
             du = _wm_norm_realized_du(env, a_hold, j, du_cmd)
             if abs(du) < 1e-6:
                 continue
+            du_mv_abs.append(abs(du))
             dcv = last[cv_idx].astype(np.float32) - pre_cv
             g[j] = dcv / du
         except Exception:
             continue
+    try:
+        cfg._last_plant_fd_du_mv = du_mv_abs  # type: ignore[attr-defined]
+    except Exception:
+        pass
     for k in range(n_dv):
         j = n_mv + k
         try:
@@ -8444,6 +8454,7 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
     act_l: List[np.ndarray] = []
     local_g_rows: List[np.ndarray] = []
     n_fd = 0
+    du_mv_abs_all: List[float] = []
     from tools.wm_steady_state_diagnostic import scoped_quiet_env
     ident = _identified_g_matrix(cfg)
     for i in range(n):
@@ -8460,6 +8471,9 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
                 g_loc = _plant_fd_rest_local_g(env, cfg, a[-1], o[-1])
             if g_loc is not None:
                 n_fd += 1
+                dus = getattr(cfg, '_last_plant_fd_du_mv', None)
+                if dus:
+                    du_mv_abs_all.extend(float(x) for x in dus)
         except Exception:
             g_loc = None
         if g_loc is None and ident is not None:
@@ -8487,23 +8501,35 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
             span = np.abs(g_loc_a.max(axis=1) - g_loc_a.min(axis=1))
             ident_s = (None if ident is None
                         else np.asarray(ident, dtype=np.float32).round(4).tolist())
+            step_u = float(_resolve_gain_match_step(cfg))
+            du_mean = (float(np.mean(du_mv_abs_all))
+                       if du_mv_abs_all else float('nan'))
             print(
                 f'[gain-match] rest-ic local G: {tuple(g_loc_a.shape)} '
                 f'plant_fd={n_fd}/{n} '
                 f'mean={np.asarray(g_mean).round(4).tolist()} '
                 f'span={np.asarray(span).round(4).tolist()} '
-                f'identified={ident_s}',
+                f'identified={ident_s} '
+                f'|du_mv|={du_mean:.4f} step={step_u:.4f}',
                 flush=True,
             )
-            if (ident is not None and ident.shape[0] > 0
-                    and abs(float(ident.reshape(-1)[0])) > 1e-3
-                    and abs(float(np.asarray(g_mean).reshape(-1)[0]))
-                    < 0.05 * abs(float(ident.reshape(-1)[0]))):
+            g_mv = float(np.asarray(g_mean).reshape(-1)[0])
+            ident_mv = (float(ident.reshape(-1)[0])
+                        if ident is not None and ident.size else 0.0)
+            if (abs(ident_mv) > 1e-3
+                    and abs(g_mv) < 0.05 * abs(ident_mv)):
                 print(
                     '[gain-match] WARNING rest-ic local G MV '
-                    f'{float(np.asarray(g_mean).reshape(-1)[0]):.4f} '
-                    f'<< identified {float(ident.reshape(-1)[0]):.4f} '
+                    f'{g_mv:.4f} << identified {ident_mv:.4f} '
                     '(WM-norm Δu vs engineering _prev_control)',
+                    flush=True,
+                )
+            if (np.isfinite(du_mean) and abs(step_u) > 1e-6
+                    and du_mean > 5.0 * abs(step_u)):
+                print(
+                    '[gain-match] WARNING rest-ic |du_mv| '
+                    f'{du_mean:.4f} >> teacher step {step_u:.4f} '
+                    '(engineering Δu, not WM-norm)',
                     flush=True,
                 )
         except Exception as _lg_exc:

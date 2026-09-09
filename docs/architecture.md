@@ -1221,6 +1221,8 @@ each rest OP when cached (not SysID median). MV plant-FD Δu is
 `env._prev_cmd_norm` (WM-norm; rate-limit realized), **not** engineering
 `_prev_control` (P118-live: that mix-up pinned local MV G at ~0.015).
 Rest snapshot/restore always writes `_prev_cmd_norm`, including `None`.
+Launch prints `|du_mv|` vs teacher `step`; `|du_mv|≫5×step` or
+`|G_MV|≪5%` of identified is the unit-bug WARNING.
 Env-free: always on; print-only banner `opscale=True`.
 `cont_gain_dim == cont_dist_dim == 0` ⇒
 byte-identical to the pre-cont model (regression-verified). Env knobs:

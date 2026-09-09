@@ -6928,6 +6928,10 @@ def _test_p118_local_g_wm_norm_du() -> None:
     mv_loop = src_fd.split('for j in range(n_mv)')[1].split(
         'for k in range(n_dv)')[0]
     assert '_prev_control' not in mv_loop
+    from training.train import _cache_gain_match_rest_ic as _cache_g
+    src_cache = _ins.getsource(_cache_g)
+    assert '|du_mv|' in src_cache
+    assert 'du_mean > 5.0 * abs(step_u)' in src_cache
     src_snap = _ins.getsource(_snapshot_gain_match_rest)
     src_rst = _ins.getsource(_restore_gain_match_rest)
     assert "'_prev_cmd_norm'" in src_snap
