@@ -8258,9 +8258,12 @@ def _restore_gain_match_rest(env: 'APCEnv', snap: dict) -> None:
     pc = es.get('_prev_control')
     if pc is not None and hasattr(env, '_prev_control'):
         env._prev_control = np.array(pc, copy=True)
-    pcn = es.get('_prev_cmd_norm')
-    if pcn is not None:
-        env._prev_cmd_norm = np.array(pcn, copy=True)
+    # Always write, including None: a post-FD leftover would otherwise
+    # survive a rest snapshot that had no rate-limit state yet.
+    if '_prev_cmd_norm' in es:
+        pcn = es.get('_prev_cmd_norm')
+        env._prev_cmd_norm = (
+            None if pcn is None else np.array(pcn, copy=True))
 
 
 def _cube_step_vec_np(base: np.ndarray, j: int, step: float

@@ -6931,7 +6931,12 @@ def _test_p118_local_g_wm_norm_du() -> None:
     src_snap = _ins.getsource(_snapshot_gain_match_rest)
     src_rst = _ins.getsource(_restore_gain_match_rest)
     assert "'_prev_cmd_norm'" in src_snap
-    assert "'_prev_cmd_norm'" in src_rst
+    assert "'_prev_cmd_norm' in es" in src_rst
+    assert 'None if pcn is None' in src_rst
+    e3 = _E()
+    e3._prev_cmd_norm = np.array([0.9], dtype=np.float32)
+    _restore_gain_match_rest(e3, {'env': {'_prev_cmd_norm': None}})
+    assert e3._prev_cmd_norm is None
     print('[smoke] OK  P118 local G MV du is WM-norm (_prev_cmd_norm)')
 
 
