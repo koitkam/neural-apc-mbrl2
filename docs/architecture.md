@@ -1217,8 +1217,10 @@ fixes BOTH:
 ⇒ identity at step-0). Decoder / feat / `dv_new` keep **unscaled**
 measured DV (P74 DOB-steal stays closed). `op_scale_net` trains with
 group `g` (P1) and freezes in P2. Rest-IC Huber `G_tgt` is plant FD at
-each rest OP when cached (not SysID median). Env-free: always on;
-print-only banner `opscale=True`.
+each rest OP when cached (not SysID median). MV plant-FD Δu is
+`env._prev_cmd_norm` (WM-norm; rate-limit realized), **not** engineering
+`_prev_control` (P118-live: that mix-up pinned local MV G at ~0.015).
+Env-free: always on; print-only banner `opscale=True`.
 `cont_gain_dim == cont_dist_dim == 0` ⇒
 byte-identical to the pre-cont model (regression-verified). Env knobs:
 `DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /

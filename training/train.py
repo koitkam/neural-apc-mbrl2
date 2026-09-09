@@ -8230,6 +8230,11 @@ def _snapshot_gain_match_rest(env: 'APCEnv') -> dict:
         '_prev_control': (
             np.array(env._prev_control, copy=True)
             if getattr(env, '_prev_control', None) is not None else None),
+        # Rate-limit state is WM-norm. Omitting it made MV→DV FD slew
+        # from the stepped command instead of the rest hold.
+        '_prev_cmd_norm': (
+            np.array(env._prev_cmd_norm, copy=True)
+            if getattr(env, '_prev_cmd_norm', None) is not None else None),
     }
     return snap
 
@@ -8253,6 +8258,9 @@ def _restore_gain_match_rest(env: 'APCEnv', snap: dict) -> None:
     pc = es.get('_prev_control')
     if pc is not None and hasattr(env, '_prev_control'):
         env._prev_control = np.array(pc, copy=True)
+    pcn = es.get('_prev_cmd_norm')
+    if pcn is not None:
+        env._prev_cmd_norm = np.array(pcn, copy=True)
 
 
 def _cube_step_vec_np(base: np.ndarray, j: int, step: float
@@ -8272,14 +8280,36 @@ def _cube_step_vec_np(base: np.ndarray, j: int, step: float
     return plus, du_plus
 
 
+def _wm_norm_realized_du(
+        env: 'APCEnv', a_hold: np.ndarray, j: int, du_cmd: float) -> float:
+    """Realized Δu in WM action-norm [-1, 1], never engineering units.
+
+    ``env._prev_control`` is valve % / engineering. Subtracting the rest
+    action ∈[-1,1] from it (P118) collapsed local MV G to ~0.015 vs SysID
+    ~2.63. Rate-limited realized Δu lives on ``_prev_cmd_norm``.
+    """
+    hold = np.asarray(a_hold, dtype=np.float32).reshape(-1)
+    pcn = getattr(env, '_prev_cmd_norm', None)
+    if pcn is not None:
+        post = np.asarray(pcn, dtype=np.float32).reshape(-1)
+        jj = int(j)
+        if 0 <= jj < int(post.size) and jj < int(hold.size):
+            du = float(post[jj] - float(hold[jj]))
+            if abs(du) >= 1e-6:
+                return du
+    return float(du_cmd)
+
+
 def _plant_fd_rest_local_g(
         env: 'APCEnv', cfg: 'TrainConfig', a_hold: np.ndarray,
         obs_pre: np.ndarray) -> Optional[np.ndarray]:
     """WM-norm ``(n_in, n_cv)`` plant FD at the current rest OP.
 
     Teacher K = resolved ``gain_match_len`` (auto H). Same cube-step as
-    WM FD. Does **not** ``reset()`` (RNG would change OP). Snapshot/restore
-    between MV and DV. Failure → None (caller uses identified G).
+    WM FD. MV Δu is ``_prev_cmd_norm`` (WM-norm), never engineering
+    ``_prev_control``. Does **not** ``reset()`` (RNG would change OP).
+    Snapshot/restore between MV and DV. Failure → None (caller uses
+    identified G).
     """
     ident = _identified_g_matrix(cfg)
     cv_idx = [int(i) for i in (getattr(env, 'cv_indices', ()) or
@@ -8335,11 +8365,7 @@ def _plant_fd_rest_local_g(
             last = _roll_hold(a_step)
             if last is None:
                 continue
-            a_post = np.asarray(getattr(env, '_prev_control', a_step),
-                               dtype=np.float32).reshape(-1)
-            du = float(a_post[j] - a_hold[j]) if j < a_post.size else du_cmd
-            if abs(du) < 1e-6:
-                du = du_cmd
+            du = _wm_norm_realized_du(env, a_hold, j, du_cmd)
             if abs(du) < 1e-6:
                 continue
             dcv = last[cv_idx].astype(np.float32) - pre_cv
@@ -8466,6 +8492,17 @@ def _cache_gain_match_rest_ic(env: 'APCEnv', cfg: 'TrainConfig') -> None:
                 f'identified={ident_s}',
                 flush=True,
             )
+            if (ident is not None and ident.shape[0] > 0
+                    and abs(float(ident.reshape(-1)[0])) > 1e-3
+                    and abs(float(np.asarray(g_mean).reshape(-1)[0]))
+                    < 0.05 * abs(float(ident.reshape(-1)[0]))):
+                print(
+                    '[gain-match] WARNING rest-ic local G MV '
+                    f'{float(np.asarray(g_mean).reshape(-1)[0]):.4f} '
+                    f'<< identified {float(ident.reshape(-1)[0]):.4f} '
+                    '(WM-norm Δu vs engineering _prev_control)',
+                    flush=True,
+                )
         except Exception as _lg_exc:
             cfg._gain_match_rest_local_g = None  # type: ignore[attr-defined]
             print(

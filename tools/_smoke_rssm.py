@@ -6899,6 +6899,42 @@ def _test_p118_opscale() -> None:
     print('[smoke] OK  P118 opscale init≡1; group g; scale moves')
 
 
+def _test_p118_local_g_wm_norm_du() -> None:
+    """P118-live RCA: local MV G Δu is WM-norm ``_prev_cmd_norm``, not EU."""
+    import inspect as _ins
+    import numpy as np
+    from training.train import (
+        _wm_norm_realized_du, _snapshot_gain_match_rest,
+        _restore_gain_match_rest, _plant_fd_rest_local_g,
+    )
+
+    class _E:
+        pass
+
+    e = _E()
+    e._prev_cmd_norm = np.array([0.4], dtype=np.float32)
+    e._prev_control = np.array([66.0], dtype=np.float32)
+    a_hold = np.array([0.0], dtype=np.float32)
+    du = _wm_norm_realized_du(e, a_hold, 0, 0.4)
+    assert abs(du - 0.4) < 1e-6, du
+    assert abs(du - 66.0) > 1.0
+    e2 = _E()
+    e2._prev_cmd_norm = None
+    du2 = _wm_norm_realized_du(e2, a_hold, 0, 0.35)
+    assert abs(du2 - 0.35) < 1e-6, du2
+
+    src_fd = _ins.getsource(_plant_fd_rest_local_g)
+    assert '_wm_norm_realized_du' in src_fd
+    mv_loop = src_fd.split('for j in range(n_mv)')[1].split(
+        'for k in range(n_dv)')[0]
+    assert '_prev_control' not in mv_loop
+    src_snap = _ins.getsource(_snapshot_gain_match_rest)
+    src_rst = _ins.getsource(_restore_gain_match_rest)
+    assert "'_prev_cmd_norm'" in src_snap
+    assert "'_prev_cmd_norm'" in src_rst
+    print('[smoke] OK  P118 local G MV du is WM-norm (_prev_cmd_norm)')
+
+
 def _test_collect_serve_cuda_graph_cpu() -> None:
     """GPU-occupied identity: collect graph is CUDA-only; CPU stays eager."""
     from models.dreamer_v4_rssm import get_collect_serve_cuda_graph
@@ -7041,6 +7077,7 @@ if __name__ == '__main__':
     _test_stream_serve_matches_rollout()
     _test_p114_kfeat()
     _test_p118_opscale()
+    _test_p118_local_g_wm_norm_du()
     _test_collect_serve_cuda_graph_cpu()
     _test_dreamer_v4_config_from_train()
     _test_envfree_observer_recipe()
