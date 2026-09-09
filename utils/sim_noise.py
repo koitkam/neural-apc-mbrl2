@@ -590,6 +590,7 @@ class SimNoiseWrapper:
 
         # Gate the flag, not the tables — leftover env=0 must stay reversible.
         self._has_noise = bool(noise_on and (self._ou_sources or self._meas_noise))
+        self._sync_inner_plant_process_noise(bool(noise_on))
 
         # Global per-episode noise amplitude scale (P89, 2026-06-06).
         # Multiplies BOTH OU process noise and white measurement noise on
@@ -629,10 +630,12 @@ class SimNoiseWrapper:
         runtime = resolve_sim_runtime_knobs(cfg)
         self._noise_jitter_pct = float(np.clip(
             float(runtime.get('jitter_pct', 0.20)), 0.0, 0.5))
-        if bool(runtime.get('noise_enabled', True)):
+        enabled = bool(runtime.get('noise_enabled', True))
+        if enabled:
             self._has_noise = bool(self._ou_sources or self._meas_noise)
         else:
             self._has_noise = False
+        self._sync_inner_plant_process_noise(enabled)
         randomizer = getattr(self._sim, '_randomizer', None)
         if randomizer is not None and hasattr(randomizer, 'enabled'):
             randomizer.enabled = bool(runtime.get('domain_randomization', True))
@@ -642,6 +645,19 @@ class SimNoiseWrapper:
                     randomizer.frac = float(np.clip(float(pct), 0.0, 0.5))
                 except Exception:
                     pass
+
+    def _sync_inner_plant_process_noise(self, enabled: bool) -> None:
+        """Bind plant-internal process noise to wrap enable (not leftover env).
+
+        SoftSensorLab DV-OU used to re-read ``DREAMER_SIM_NOISE_ENABLED``
+        every step — login leftover was a silent A/B after
+        ``apply_runtime_knobs`` restored wrap ``_has_noise``.  Unbound wrap
+        still honours leftover via ``resolve_sim_runtime_knobs()`` (SysID
+        ``clean_mode`` IPC).
+        """
+        sim = getattr(self, '_sim', None)
+        if sim is not None and hasattr(sim, '_plant_process_noise'):
+            sim._plant_process_noise = bool(enabled)
 
     # -- Intercepted methods -----------------------------------------------
 

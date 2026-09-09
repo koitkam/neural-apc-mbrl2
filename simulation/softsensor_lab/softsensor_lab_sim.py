@@ -251,6 +251,10 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
 
         # --- Disturbance offsets (from mixin) ---
         self._init_disturbance_offsets()
+        # Bound by SimNoiseWrapper (SysID clean_mode / apply). Default ON.
+        # Do not re-read DREAMER_SIM_NOISE_ENABLED every step (login leftover
+        # silent A/B after wrap apply restored _has_noise).
+        self._plant_process_noise = True
 
         # Per-input engineering spans used by input-jitter in the ONNX
         # input window. Order matches ``_INPUT_ORDER``.
@@ -334,12 +338,11 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
             dv_pos + 3, 0.0  # DV state indices start at 3
         )
         alpha = self.sample_rate / max(self.dv_tau, float(self.sample_rate))
-        # Stochastic OU kick honours DREAMER_SIM_NOISE_ENABLED so SysID
-        # clean_mode (which sets it to '0') sees a deterministic plant.
-        # Leftover SIM_NOISE_ENABLED is ignored (P91-live).
-        noise_on = str(os.environ.get('DREAMER_SIM_NOISE_ENABLED', '1')).strip().lower() not in {
-            '0', 'false', 'no', 'off',
-        }
+        # Stochastic OU kick honours wrap-bound ``_plant_process_noise``
+        # so SysID clean_mode (unbound wrap leftover IPC) sees a
+        # deterministic plant.  Login leftover DREAMER_SIM_NOISE_ENABLED
+        # is ignored at step time (P117-live; A/B is apply / wrap ctor).
+        noise_on = bool(getattr(self, '_plant_process_noise', True))
         noise = rng.standard_normal() * std * 0.05 if noise_on else 0.0
         new = float(current + alpha * (ref - current) + noise)
         return float(np.clip(new, lo, hi))

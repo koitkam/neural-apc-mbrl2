@@ -2340,6 +2340,9 @@ def _test_isolation_dcv_scales() -> None:
     _ss = _P(__file__).resolve().parents[1].joinpath(
         'simulation', 'softsensor_lab', 'softsensor_lab_sim.py').read_text()
     assert 'identified_tau=float(self.dv_tau)' in _ss
+    _ss_step = _ss.split('def _step_dv', 1)[1].split('def reset', 1)[0]
+    assert "os.environ.get('DREAMER_SIM_NOISE_ENABLED'" not in _ss_step
+    assert '_plant_process_noise' in _ss_step
     assert 'lb // 4' in _src
     assert '_gain_match_held_settle' in _src
     assert '_gain_match_rest_window' in _src
@@ -5935,9 +5938,9 @@ def _test_identifier_v4_outdir() -> None:
                        - 54.0) < 1e-12
             assert int(ctx['lookback']['identified_lookback']) == 131
             assert 'STEAM_VALVE_MV_%' in ctx['mv_gain_to_cv']
-            # Sibling plant_id must not win (old newest-mtime glob).
-            sib = Path(td_dir).parent / 'other_plant' / 'plant_id'
-            sib.mkdir(parents=True)
+            # Nested other plant_id must not win (old ancestor/glob walk).
+            sib = Path(td_dir) / 'other_plant' / 'plant_id'
+            sib.mkdir(parents=True, exist_ok=True)
             (sib / 'dynamics_identification.json').write_text(json.dumps({
                 'tau_dominant_identified': 12.0,
                 'dead_time_identified': 1.0,
@@ -5985,6 +5988,11 @@ def _test_sim_runtime_cfg() -> None:
     assert 'if not noise_on:' not in wrap_ctor
     assert 'cfg = {}' not in wrap_ctor
     assert 'noise_on and (self._ou_sources' in wrap_ctor
+    assert '_sync_inner_plant_process_noise' in sn_src
+    ss_src = open('simulation/softsensor_lab/softsensor_lab_sim.py').read()
+    ss_step = ss_src.split('def _step_dv', 1)[1].split('def reset', 1)[0]
+    assert "os.environ.get('DREAMER_SIM_NOISE_ENABLED'" not in ss_step
+    assert '_plant_process_noise' in ss_step
     ctor = sn_src.split('class DomainRandomizer', 1)[1].split(
         'def _load_config_block', 1)[0]
     assert "os.environ.get('DREAMER_SIM_DOMAIN_RANDOMIZATION')" not in ctor
@@ -6082,6 +6090,18 @@ def _test_sim_runtime_cfg() -> None:
         c_restore._explicit_fields = {'sim_noise_enabled'}  # type: ignore
         wrap_off.apply_runtime_knobs(c_restore)
         assert wrap_off._has_noise is True
+        class _Plant(_Bare):
+            def __init__(self):
+                self._plant_process_noise = True
+        plant = _Plant()
+        os.environ['DREAMER_SIM_NOISE_ENABLED'] = '0'
+        assert plant._plant_process_noise is True  # leftover ignored at step
+        wrap_plant = SimNoiseWrapper(plant)
+        assert plant._plant_process_noise is False  # unbound wrap SysID IPC
+        wrap_plant.apply_runtime_knobs(c_restore)
+        assert plant._plant_process_noise is True  # apply restores
+        os.environ['DREAMER_SIM_NOISE_ENABLED'] = '0'
+        assert plant._plant_process_noise is True  # leftover ignored after bind
         os.environ['DREAMER_SIM_NOISE_ENABLED'] = '1'
         assert resolve_sim_runtime_knobs()['noise_enabled'] is True
         os.environ['SIM_DOMAIN_RANDOMIZATION'] = '0'
