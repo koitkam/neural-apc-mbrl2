@@ -470,8 +470,9 @@ class TrainConfig:
     obj_auto_differentiable_depth: float = 0.20
     obj_auto_reward_clip_floor: float = 50.0
     # ``load_objective_spec`` / ``_objective_uses_normalized``.  Identity
-    # ON.  Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live).  A/B
-    # ``DREAMER_OBJ_USE_NORMALIZED``.
+    # ON.  Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live).  Leftover
+    # ``DREAMER_OBJ_USE_NORMALIZED`` dual-read ignored until apply
+    # (P116-live).  A/B ``DREAMER_OBJ_USE_NORMALIZED`` via ENV_OVERRIDES.
     objective_use_normalized: bool = True
     objective_violation_rate_coef: str = 'auto'
     objective_penalty_sat_mode: str = 'tanh'

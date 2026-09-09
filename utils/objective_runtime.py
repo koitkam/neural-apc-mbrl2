@@ -156,17 +156,14 @@ def _normalized_bounds(lo: float, hi: float, r_lo: float, r_hi: float) -> Tuple[
 
 
 def _objective_uses_normalized(obj_w: Dict, terms: Dict, cfg=None) -> bool:
-    if _obj_explicit(cfg, 'objective_use_normalized'):
-        return bool(getattr(cfg, 'objective_use_normalized'))
-    d_raw = os.environ.get('DREAMER_OBJ_USE_NORMALIZED')
-    if d_raw not in (None, ''):
-        return str(d_raw).strip().lower() not in ('0', 'false', 'off', 'no', 'n', 'f')
-    # Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live; same silent-A/B
-    # class as ``OBJ_REWARD_SCALE`` / ``SEED_*``).
-    if isinstance(terms, dict) and 'objective_use_normalized' in terms:
-        return bool(int(_safe_float(terms.get('objective_use_normalized', 1), 1)))
+    # Bound cfg wins (default ON).  A/B is ``ENV_OVERRIDES`` then
+    # ``apply_dreamer_env_overrides``.  Leftover ``DREAMER_OBJ_USE_NORMALIZED``
+    # dual-read ignored (P116-live; same silent-A/B class as P113 compile).
+    # Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live).
     if cfg is not None:
         return bool(getattr(cfg, 'objective_use_normalized', True))
+    if isinstance(terms, dict) and 'objective_use_normalized' in terms:
+        return bool(int(_safe_float(terms.get('objective_use_normalized', 1), 1)))
     return bool(int(_safe_float(obj_w.get('objective_use_normalized', 1), 1)))
 
 

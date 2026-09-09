@@ -5299,6 +5299,51 @@ def _test_compile_leftover_ignored() -> None:
     print('[smoke] OK  leftover DREAMER_COMPILE* ignored until apply (P113-live)')
 
 
+def _test_obj_use_normalized_leftover_ignored() -> None:
+    """Leftover DREAMER_OBJ_USE_NORMALIZED dual-read REMOVED; cfg + apply only."""
+    import os
+    from utils.objective_config import load_objective_spec
+    from utils.objective_runtime import _objective_uses_normalized
+    from workflow._plant_prepare import apply_dreamer_env_overrides
+
+    rt_src = open('utils/objective_runtime.py').read()
+    fn = rt_src.split('def _objective_uses_normalized', 1)[1].split(
+        'def _bounds_fp', 1)[0]
+    assert "os.environ.get('DREAMER_OBJ_USE_NORMALIZED')" not in fn
+    oc_src = open('utils/objective_config.py').read()
+    load = oc_src.split('def load_objective_spec', 1)[1].split(
+        'return _coerce_spec', 1)[0]
+    assert "os.environ.get('DREAMER_OBJ_USE_NORMALIZED')" not in load
+    keys = ('DREAMER_OBJ_USE_NORMALIZED', 'OBJ_USE_NORMALIZED')
+    prev = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        c = TrainConfig()
+        assert c.objective_use_normalized is True
+        assert _objective_uses_normalized({}, {}, cfg=c) is True
+        assert int(load_objective_spec()['objective_use_normalized']) == 1
+        os.environ['OBJ_USE_NORMALIZED'] = '0'
+        assert _objective_uses_normalized({}, {}, cfg=c) is True
+        assert int(load_objective_spec()['objective_use_normalized']) == 1
+        os.environ['DREAMER_OBJ_USE_NORMALIZED'] = '0'
+        assert _objective_uses_normalized({}, {}, cfg=c) is True, (
+            'leftover DREAMER_OBJ_USE_NORMALIZED ignored until apply')
+        assert int(load_objective_spec()['objective_use_normalized']) == 1, (
+            'load_objective_spec leftover ignored')
+        cfg = TrainConfig()
+        apply_dreamer_env_overrides(cfg)
+        assert cfg.objective_use_normalized is False
+        assert _objective_uses_normalized({}, {}, cfg=cfg) is False
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+    print('[smoke] OK  leftover DREAMER_OBJ_USE_NORMALIZED ignored until apply (P116-live)')
+
+
 def _test_wm_diag_device_leftover_ignored() -> None:
     """Leftover DREAMER_WM_DIAG_DEVICE dual-read REMOVED; cfg + apply only."""
     import os
@@ -6846,6 +6891,7 @@ if __name__ == '__main__':
     _test_wm_tf_knobs_cfg_or_env()
     _test_horizon_ic_overhead_cfg_or_env()
     _test_compile_leftover_ignored()
+    _test_obj_use_normalized_leftover_ignored()
     _test_wm_diag_device_leftover_ignored()
     _test_sample_rate_pin_ignores_leftover()
     _test_sim_factory_ignores_leftover_model_env()
