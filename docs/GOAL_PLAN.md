@@ -22,9 +22,9 @@ Plant this cycle: `nonlinear_sim` HeatExchangerTower (P118 = job 2 of 2, **LIVE 
 
 **Trusted:** val TM ss/@H/curve_iae (MV and DV); gain decomp real→post / post→1step / 1step→OL; `det_r` + pred_std vs true; paired econ vs baseline **and** champion when freeze GAIN-READY and P3 ran; CV d2/reversal (smooth_pass); `cv_opt_headroom` / `cv_viol_frac`. Skip-storm 5-level TM (`DCgain_ratio` / `@H` / `compound_ok`) is a freeze/RCA diagnostic, not a champ score. Launch `|du_mv|` vs teacher `step` (P119 print): O(step) = WM-norm; ≫5×step = engineering-unit bug.
 
-**On trial / do not GPU-optimize:** jsonl teacher ×1 vs SysID median (tautology on OP-varying plants — P117); **P118 jsonl `gain_match_mv_ratio` vs local G** (teacher Δu was engineering `_prev_control` − WM-norm action → local MV G **0.015** vs identified **2.63**; late-P1 ratio ~0.58 is still vs G≈0.015, not TM); ss-ratio alone; mv_reversal as smoothness gate; CV total variation as smoothness gate; critic_r without `critic_rew_to_tgt_var`; raw dist R²; VALID 9/9 / GAIN-READY / all_pass / family-closed as “residual closed”; beating P64 to KEEP a smoothness/headroom/DR win; **`wm_grad_norm=inf` at a skip-storm restore** (P118@13) as a kill; **recon-spike ~3 iters after P1 inject** as a kill (13/23/33/45 cadence); **persist_rel spikes to 31** as a kill (gain-c fighting G_tgt≈0); **H=1 fidelity r** as a freeze score (`wm_best` @10 is gain-blind).
+**On trial / do not GPU-optimize:** jsonl teacher ×1 vs SysID median (tautology on OP-varying plants — P117); **P118 jsonl `gain_match_mv_ratio` vs local G** (teacher Δu was engineering `_prev_control` − WM-norm action → local MV G **0.015** vs identified **2.63**; post-storm-2 restore @77 jsonl MV **0.993** is still vs G≈0.015, not TM); ss-ratio alone; mv_reversal as a smoothness gate; CV total variation as a smoothness gate; critic_r without `critic_rew_to_tgt_var`; raw dist R²; VALID 9/9 / GAIN-READY / all_pass / family-closed as “residual closed”; beating P64 to KEEP a smoothness/headroom/DR win; **`wm_grad_norm=inf` at a skip-storm restore** (P118@13) as a kill; **recon-spike ~3 iters after P1 inject** as a kill (13/23/33/45 then **0.935@61** after dv-prbs@60); **persist_rel spikes to 31** as a kill; **H=1 fidelity r** as a freeze score (`wm_best` @10 is gain-blind); **skip-storm 2 0.02@MV** as a last_ok freeze score (probe was the detonated *live* WM after 20× lock@60; last_ok recon-best still has G_tgt≈0.015).
 
-P118 live: DV local G **−0.345** vs ident **−0.426** (same space, OK). MV local G is the unit bug, not equal-% OP variation (span **0.015** would be ~2× if the 2.23× SysID story were in WM-norm). LPV `wm_op_scale_dev` **0.52→0.99** then pinned **~0.87** while Huber MV target ≈0 — do not score LPV from this pid.
+P118 live: DV local G **−0.345** vs ident **−0.426** (same space, OK). MV local G is the unit bug, not equal-% OP variation (span **0.015** would be ~2× if the 2.23× SysID story were in WM-norm). LPV `wm_op_scale_dev` **0.52→0.99** then pinned **~0.86–0.97** while Huber MV target ≈0 — do not score LPV from this pid.
 
 ## Closed families (do not N+1)
 
@@ -32,15 +32,15 @@ extra-P1 as freeze (P41; **P117 on this plant**); compounding-teacher Huber (P11
 
 ## Live this visit — P118 `opscale` (do not kill / do not relaunch / do not second GPU)
 
-tmux `mbrl2_p118` pid **551549** sha **`ff5f84c`** `device=cuda` bs=128 compile=eager nvidia **~14751 MiB**. `[resolved-cfg] opscale=True` no ol1. STAGE 1 `g=84 dob=8`. Rest-IC graph captured N=6 T=128. sps **~52**. jsonl **55** P1. Heartbeat ~2 min/iter. orig-P1 budget **796080** steps (~iter 82–87 class). Process 100% CPU, `wm_last_ok` walked, **not** locked.
+tmux `mbrl2_p118` pid **551549** sha **`ff5f84c`** `device=cuda` bs=128 compile=eager nvidia **~14751 MiB**. Env-free (`CUDA_VISIBLE_DEVICES=0`, no `DREAMER_*`). `[resolved-cfg] opscale=True` no ol1. STAGE 1 `g=84 dob=8`. Rest-IC graph captured N=6 T=128. sps **~52**. jsonl **77** P1. Heartbeat ~2 min/iter. orig-P1 budget **796080** steps (~**10 iters** to gate from 732840). Process 100% CPU, `wm_last_ok` walked after storm-2 unlock, **not** locked.
 
-**Teacher print (launch):** local G mean MV **0.0153** / DV **−0.345** vs identified **2.627 / −0.426**. jsonl MV ratio still wild early (**−74…+16**) then late **~0.25–0.58** (still vs G≈0.015). DV ratio **~0.7–1.1** (storm@13 DV **2.11**; spike@45 DV **0.27**). `wm_op_scale_dev` **0.52→0.99@18–22** then **~0.87**. recon recovered **0.050@50** (best **0.030@44**). skip **0** except storms. `wm_best` still **iter 10** (gain-blind). Probe@50 H=1 r=**+0.096** H=56 r=**+0.339** gain_fid=0.904 `best_h=0/56`.
+**Teacher print (launch):** local G mean MV **0.0153** / DV **−0.345** vs identified **2.627 / −0.426**. jsonl MV ratio wild early (**−74…+16**) then mid **~0.25–0.58** (still vs G≈0.015); detonated **−129@61**; post-restore @77 **0.993** (tautology on G≈0.015). DV ratio **~0.7–1.1** except detonations. `wm_op_scale_dev` **0.52→0.99@18** then **~0.86–0.97**. recon best **0.0237@60**. skip **0** except storms. `wm_best` still **iter 10** (gain-blind). jsonl NaN/Inf = **one** `wm_grad_norm=inf@13`.
 
-**Skip-storm 1 @iter 13 (RCA, not kill):** recon **0.676** `wm_grad_norm=inf` skip **56/56**. Probe median 3/3 worsts **[0.60, 0.33, 0.54]** DC **[0.55, 0.86]** `@H[0.40, 0.95]` worst **0.55@DV**. Restored `wm_last_ok` iter **12**. **cap-deferred** (`ready_n=0`). Inf is only `wm_grad_norm@13`. jsonl NaN/Inf otherwise **0**.
+**Skip-storm 1 @iter 13 (RCA, not kill):** recon **0.676** `wm_grad_norm=inf` skip **56/56**. Probe worst **0.55@DV**. Restored last_ok **12**. **cap-deferred** (`ready_n=0`).
 
-**Post-storm inject cadence (RCA, not kill):** recon spikes **@23 / 33 / 45** (~3 iters after dv-prbs/const/step/expert injects @20/30/38–40). skip 1 @33 and @46 (not a second storm). persist_rel **31@36**, **10@43** then recovered. zrank dipped ~527@48 then alive recovered. Same unit-bug story: chasing G_MV≈0.015 detonates after a buffer refresh.
+**20× lock @60 then skip-storm 2 @75 (RCA, not kill):** recon **0.0237@60** then dv-prbs inject → **0.935@61** (20× lock last_ok **60**). Live WM then sat recon **0.55–0.77** for 15 iters (alive 962–1001; fidelity@70 H=1 r=**+0.031** H=14 r=**−0.072**). Probe@75 median worsts **[−0.01, 0.02, 0.09]** DC **[0.02, 0.73]** `@H[0.01, 0.74]` worst **0.02@MV** (`not_noisy=False` signflips=4). Restored last_ok **60**; **storm 2 cap-deferred** (`ready_n=0`). Iter 76 recon **0.0457**; 77 **0.0264**; last_ok walked **77** unlocked. Same unit-bug story: chasing G_MV≈0.015 detonates after a buffer refresh; freeze-probe of the detonated live WM is not last_ok TM.
 
-**Do not score actor. Do not treat opscale as FALSIFIED** — MV teacher was not WM-norm. Chasing G_MV≈0.015 detonates grads; LPV saturating is the same story.
+**Do not score actor. Do not treat opscale as FALSIFIED** — MV teacher was not WM-norm. Chasing G_MV≈0.015 detonates grads / recon; LPV saturating is the same story. Predicted freeze: last_ok recon-best still GAIN_NOT_READY vs identified TM (jsonl ×1 on G≈0.015).
 
 HEAD (not this pid): `_wm_norm_realized_du` + snapshot/restore `_prev_cmd_norm` including **None**; launch prints `|du_mv|` vs teacher `step` and WARNINGs if G_MV≪ident **or** `|du_mv|`≫5×step. CVD="" locgfix smoke **PASSED**.
 
@@ -48,7 +48,7 @@ HEAD (not this pid): `_wm_norm_realized_du` + snapshot/restore `_prev_cmd_norm` 
 
 **P119 `locgfix`** — same mechanism as P118 (LPV + local rest-IC G), **one bugfix**: MV plant-FD Δu = `_prev_cmd_norm` (WM-norm; P61 realized/rate-limit), never engineering `_prev_control`. Snapshot/restore `_prev_cmd_norm` **including None**. Print WARNING if |G_MV| ≪ 5% of identified **or** `|du_mv|` ≫ 5× teacher step. Env-free. No new TrainConfig / no `DREAMER_*`. Tag `locgfix`. Session `mbrl2_p119`. Out-dir `output/nonlinear_sim/run_p119_locgfix`.
 
-Predicted signature: rest-ic local G MV same order as SysID (~2, OP span ~2× not 0.015); `|du_mv|` ~ teacher step **0.4** not ~50; **no** WARNING; jsonl `gain_match_mv_ratio` ~O(1) not ±70; `wm_op_scale_dev` not pinned at tanh sat; skip-storm Inf@13-class and inject-cadence recon spikes absent or rare; persist_rel not 31; then GAIN-READY vs P117 CAPPED **0.71@DV**.
+Predicted signature: rest-ic local G MV same order as SysID (~2, OP span ~2× not 0.015); `|du_mv|` ~ teacher step **0.4** not ~50; **no** WARNING; jsonl `gain_match_mv_ratio` ~O(1) not ±70 / −129; `wm_op_scale_dev` not pinned at tanh sat; skip-storm Inf@13-class, inject 20× lock@60-class, and skip-storm **0.02@MV** absent or rare; persist_rel not 31; then GAIN-READY vs P117 CAPPED **0.71@DV**.
 
 Falsifier: still CAPPED ~0.71@DV **after** local MV G is WM-norm (WARNING absent; `|du_mv|`~step; jsonl MV ratio O(1)).
 
@@ -70,11 +70,11 @@ After a fair P119 VALID or a fair GAIN_NOT_READY with a **correct** local teache
 
 ## RCA this visit
 
-- SysID: OP-varying DC is real (equal-% + 1/feed; MV amp **2.23×** / DV **2.34×**). Median G is still the wrong pin **once local G is in WM-norm**.
-- Signal: P118 jsonl NaN/Inf = **one** skip-storm `wm_grad_norm=inf@13`; recon recovered after inject-cadence spikes; GPU 14.7 GB; sps ~52; heartbeat 2 min/iter.
+- SysID: OP-varying DC is real (equal-% + 1/feed; MV amp **2.23×** / DV **2.34×**). Median G is still the wrong pin **once local G is in WM-norm**. P118 local MV 0.015 is units, not that 2.23× span.
+- Signal: jsonl NaN/Inf = **one** skip-storm `wm_grad_norm=inf@13`; recon recovered after storm 2; GPU 14.7 GB; sps ~52; heartbeat 2 min/iter. Disk `/home` 64% / 62G.
 - Control: do not score actor until freeze GAIN-READY and P3.
-- ML: LPV `wm_op_scale_dev` left identity then sat (~0.99) chasing a ~0 MV Huber target. Inf grad @13 and persist_rel 31 are teacher-unit, not RSSM collapse. `wm_best` @10 is gain-blind (H=1 r=+0.096@50) — do not restore at P2.
+- ML: LPV `wm_op_scale_dev` left identity then sat (~0.99) chasing a ~0 MV Huber target. Inf grad @13, persist_rel 31, 20× lock@61, and skip-storm 0.02@MV are teacher-unit, not RSSM collapse. `wm_best` @10 is gain-blind — do not restore at P2. last_ok@60 is recon-best with the wrong G; freeze of that snapshot is not a P119 falsifier.
 - Plant: HeatExchangerTower `step` is engineering; APCEnv denorms. Teacher must use `_prev_cmd_norm`. Restore must not leave a post-FD leftover when the snapshot was `None`.
-- Metric: jsonl MV ratio vs 0.015 is not val TM. Skip-storm 0.55@DV is a live TM probe on a wrong-teacher WM — RCA, not a P119 falsifier.
+- Metric: jsonl MV ratio vs 0.015 is not val TM. Skip-storm 0.02@MV is a live TM probe on a detonated wrong-teacher WM — RCA, not a P119 falsifier.
 
 P117 process died mid-P2 (SIGKILL). Not a training crash. Do not identity-relaunch.
