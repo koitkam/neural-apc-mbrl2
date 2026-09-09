@@ -2264,7 +2264,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
     assert "gmatch_len={int(getattr(cfg, 'gain_match_len'" in _src
     assert "gmatch_traj={'FO' if" in _src
-    assert 'gmatch_ol1=True' in _src
+    assert 'gmatch_ol1=True' not in _src
     assert 'gmatch_k1=True' not in _src
     assert 'gprobe_R=' in _src
     assert 'scoped_quiet_env' in _src
@@ -2533,8 +2533,8 @@ def _test_isolation_dcv_scales() -> None:
     assert '_auto_gain_match_len' in _src
     assert '_gain_match_ol_tail_len' not in _src
     assert 'gain_match_ol_persist_rel' in _src
-    assert 'gain_match_ol1_ratio' in _src
-    assert "row.setdefault('wm_gain_match_ol1_ratio'" in _src
+    assert 'gain_match_ol1_ratio' not in _src
+    assert "row.setdefault('wm_gain_match_ol1_ratio'" not in _src
     assert 'gain_match_k1_rho' not in _src
     # P111: last_only=not stack_k so rest-IC with identified τ stacks the
     # FOPDT trajectory (last_only=False) while persist / τ=0 stay last-step.
@@ -2543,7 +2543,7 @@ def _test_isolation_dcv_scales() -> None:
     assert 'gmatch_fo=True' not in _src
     assert 'gmatch_traj=' in _src
     assert "traj {_lf('gain_match_traj_loss')}" in _src
-    assert "ol1 {_lf('gain_match_ol1_ratio')}" in _src
+    assert "ol1 {_lf('gain_match_ol1_ratio')}" not in _src
     assert "k1 {_lf('gain_match_k1_rho')}" not in _src
     assert 'gru_zbias=' in _src
     assert 'gru_hres=' not in _src
@@ -4018,10 +4018,8 @@ def _test_gain_match_rest_ic() -> None:
     assert 'gain_match_traj_loss' not in diag1
     assert 'gain_match_ol_tail_len' not in diag1
     assert 'gain_match_ol_tail_loss' not in diag1
-    assert 'gain_match_ol1_ratio' in diag1
-    assert 'gain_match_ol1_loss' in diag1
-    assert torch.isfinite(diag1['gain_match_ol1_ratio']).all()
-    assert torch.isfinite(diag1['gain_match_ol1_loss']).all()
+    assert 'gain_match_ol1_ratio' not in diag1
+    assert 'gain_match_ol1_loss' not in diag1
     assert 'gain_match_k1_rho' not in diag1
     assert 'gain_match_k1_loss' not in diag1
     assert 'gain_match_ol_persist_rel' in diag1
@@ -4069,8 +4067,8 @@ def _test_gain_match_rest_ic() -> None:
     assert 'prev_state=st_k.detach()' not in _gm_src
     assert 'st_cut = st_k.detach()' not in _gm_src
     assert 'K+1 ρ^{4H-K} DC' not in _gm_src
-    assert 'OL G_K vs sg(1-step)' in _gm_src
-    assert 'g_1s_sg = g_1s.detach()' in _gm_src
+    assert 'OL G_K vs sg(1-step)' not in _gm_src
+    assert 'g_1s_sg = g_1s.detach()' not in _gm_src
     assert 'prev_state=st_b' in _gm_src
     assert "getattr(st0, 'kv_cache', None) is not None" in _gm_src
     assert 'gain_match_ol_persist_rel' in _gm_src
