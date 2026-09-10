@@ -4,7 +4,7 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: **return-to-`test_sim`**. **P123 `opgate` EXIT `[p3-skip]` INVALID** pid **600533 DEAD** sha `746d8a3`. Freeze last_ok **109 unlocked** CAPPED **0.68@MV**; val MV **×0.612**. KEEP hold as linear hygiene; **FALSIFIED as orig-P1 PASS / extra-P1 READY-maker**. **Not** a TM KEEP (INVALID; worse than P116 ×0.706). Next GPU **P124 `medhuber`** (SysID-median Huber when held). Extra-P1 lottery **closed**. **P120 `gop` PARKED.** **P122 EXIT `[p3-skip]` INVALID** val MV **×0.769**.
+Plant this cycle: **return-to-`test_sim`**. **P124 `medhuber` LIVE** pid **604554** sha `a8b5ebd` tmux `mbrl2_p124`. Huber `G_tgt` = SysID median while held. **P123 `opgate` EXIT `[p3-skip]` INVALID** pid **600533 DEAD** sha `746d8a3`. Freeze last_ok **109 unlocked** CAPPED **0.68@MV**; val MV **×0.612**. KEEP hold as linear hygiene; **FALSIFIED as orig-P1 PASS / extra-P1 READY-maker**. **Not** a TM KEEP (INVALID; worse than P116 ×0.706). Extra-P1 lottery **closed**. **P120 `gop` PARKED.** **P122 EXIT `[p3-skip]` INVALID** val MV **×0.769**.
 
 ## Residual board vs champions (from `validation/residual_board.json`)
 
@@ -126,7 +126,7 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 **#1b P123 `opgate` — EXIT `[p3-skip]` INVALID (do not identity-relaunch).** Identity-hold **GPU-confirmed**: orig-P1 **0.31@MV**; extra-P1 **0.60@MV**; CAPPED **0.68@MV**; val MV **×0.612**. last_ok walked **85→109**.
 - **Judge:** ✅ KEEP identity-hold as **linear hygiene** (opdev=0 @1–163). ❌ **FALSIFIED as orig-P1 PASS restorer**. ❌ **FALSIFIED as extra-P1 READY-maker**. ✅ KEEP `skip_invalid_p3`. ❌ **Not** a TM KEEP (INVALID; ×0.612 worse than P116 ×0.706). Do **not** opscale N+1 / extra-P1 N+1 / `gop` / sr pin / lower `gain_ready_lo`. Next **#1c**.
 
-**#1c P124 `medhuber` — LAUNCH (opscale FALSIFIED as the orig-P1 miss).** Remaining confound vs P116: Huber `G_tgt` was rest-IC plant FD (P118 bundle) vs SysID median (P116). P123 banner `Huber G_tgt = rest-IC plant FD` while `opscale=held`. Local G MV **−2.19** / DV **0.265** vs ident **−2.51 / 0.574**. Extra-P1 5-level walked **0.31→0.60→0.68** while jsonl ×1. P118/P122/P123 local-G teacher: orig-P1 **0.34 / 0.32 / 0.31@MV**. P116 SysID teacher: orig-P1 **PASS 0.84@DV**.
+**#1c P124 `medhuber` — LAUNCHED (opscale FALSIFIED as the orig-P1 miss).** Remaining confound vs P116: Huber `G_tgt` was rest-IC plant FD (P118 bundle) vs SysID median (P116). P123 banner `Huber G_tgt = rest-IC plant FD` while `opscale=held`. Local G MV **−2.19** / DV **0.265** vs ident **−2.51 / 0.574**. Extra-P1 5-level walked **0.31→0.60→0.68** while jsonl ×1. P118/P122/P123 local-G teacher: orig-P1 **0.34 / 0.32 / 0.31@MV**. P116 SysID teacher: orig-P1 **PASS 0.84@DV**. **LIVE** pid **604554** sha `a8b5ebd`: banner **`Huber G_tgt = SysID median (opscale held)`**; `[opscale] held identity` **1.200**; `[resolved-cfg] opscale=held`. Do **not** rewrite this pid.
 - **Mechanism (landed):** when `op_scale_identity_held`, do **not** assign `local_g = lg_t`. Fall through to SysID-median. Huber `g_tgt=` and jsonl `tgt_b=` follow `local_g is None`. Keep `_gain_match_rest_local_g` diagnostic print. Nonlinear unheld keeps local FD. No new TrainConfig / no `DREAMER_*`. Banner `Huber G_tgt = SysID median (opscale held)`. CVD="" smoke: held ignores local G (gm_held ≡ gm_id); unheld still uses local G.
 - **Predicted signature:** orig-P1 last_ok in `[0.8,1.3]` (P116 **0.84@DV**); local-G print still present; Huber banner median not plant-FD; jsonl ×1 still tautology (now vs SysID).
 - **Falsifier:** orig-P1 still <0.8 → teacher wasn't the miss (then freeze-gate/piece; **do not** lower READY lo; then **#1d** DV `du` if DV still 0.46× on an unheld plant). Do not extra-P1 N+1 / `gop` / identity-relaunch P123 / ol1 N+1.
@@ -153,10 +153,10 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 ## RCA this visit
 
 - SysID: test_sim **θ_dom=8**. P123 sr=4 H=**54**. locgfix `|du_mv|=step`. SysID MV `|K|` **1.170**. Rest-IC local G MV **−2.19** vs ident **−2.51**; DV **0.265 vs 0.574** — **0.46×** ident.
-- Signal: P123 **EXIT=0** pid **600533 DEAD** sha `746d8a3`. jsonl **163** ES `p3_skipped_invalid_observer`. skip **0**; NaN/Inf **0**. Orig-P1 **0.31@MV**; extra-P1 **0.60@MV**; cap **0.68@MV** last_ok **109**. Val MV **×0.612** DV **×0.839** 1step→OL **×0.969** det_r **0.375** pred_std **1.48 vs 1.36**. Actor INVALID. nvidia **0 MiB**. Disk `/home` **65% / 61G**.
+- Signal: P123 **EXIT=0** pid **600533 DEAD** sha `746d8a3`. jsonl **163** ES `p3_skipped_invalid_observer`. skip **0**; NaN/Inf **0**. Orig-P1 **0.31@MV**; extra-P1 **0.60@MV**; cap **0.68@MV** last_ok **109**. Val MV **×0.612** DV **×0.839** 1step→OL **×0.969** det_r **0.375** pred_std **1.48 vs 1.36**. Actor INVALID. **P124 LIVE** pid **604554** sha `a8b5ebd` nvidia **12232 MiB**. Disk `/home` **65% / 61G**.
 - Control: do not score actor (`[p3-skip]`; freeze not READY). R2 still open on P116 (CV rev 0.421).
 - ML: identity-hold survived P1+P2 (opdev=0). Orig-P1 miss was **not** LPV. Extra-P1 TM walked while jsonl ×1 — local-FD Huber. **#1c landed.**
-- Plant: env-free HEAD. Next: **P124 `medhuber`**. Score vs P116 only if freeze GAIN-READY AND P3.
+- Plant: env-free HEAD. **P124 `medhuber` LIVE** — do not rewrite. Score vs P116 only if freeze GAIN-READY AND P3.
 - Metric: trusted = val TM ss/@H/`curve_iae` + 5-level freeze. Do not GPU-optimize jsonl ×1 / lineage `wm_gain_pass` on INVALID / extra-P1 LIVE TM. P123 val ×0.612 is not an opscale KEEP.
 - Literature: Qin/Badgwell LPV for OP-varying DC — test_sim span 1.17 is single-K. Ljung PEM: SysID 600-step median vs rest-IC FD at K=H are different I/O definitions; #1c uses the SysID experiment as the linear teacher.
 
