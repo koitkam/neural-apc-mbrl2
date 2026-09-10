@@ -38,14 +38,20 @@ def sample_rate_pin() -> int:
         return 0
 
 
-def derive_sample_rate(tau_fast: float, dead_fast: float,
+def derive_sample_rate(tau_fast: float, dead_time: float,
                        default: int = 5,
                        min_sr: int = 1, max_sr: int = 60) -> int:
-    """Choose a sample rate that resolves the *fastest* identified channel.
+    """Choose a sample rate that resolves the identified *channel* dynamics.
 
     Two criteria, both must be satisfied:
       - ≥ 10 samples per fastest time constant     (sr ≤ τ_fast / 10)
-      - ≥ 2 samples within the fastest dead time   (sr ≤ θ_fast / 2)
+      - ≥ 2 samples within the channel dead time   (sr ≤ θ / 2)
+
+    ``dead_time`` is the *channel/dominant* θ (median ``dead_time_identified``),
+    not ``dead_time_fastest_identified`` (min over noisy FOPDT repeats). APC
+    delay sampling is ~2 samples in the channel θ, not the noisiest repeat
+    (P120: one MV REFLUX r4 θ=6 vs median 8 flipped sr 4→3). Lookback still
+    uses the fastest-θ ceiling via ``derive_sample_rate_for_lookback``.
 
     The smaller (tighter) of the two wins.  Falls back to ``default`` when
     no identified value is positive.
@@ -53,8 +59,8 @@ def derive_sample_rate(tau_fast: float, dead_fast: float,
     if not (tau_fast and tau_fast > 0):
         return int(default)
     sr_tau = max(min_sr, int(round(tau_fast / 10.0)))
-    if dead_fast and dead_fast > 0:
-        sr_dead = max(min_sr, int(round(dead_fast / 2.0)))
+    if dead_time and dead_time > 0:
+        sr_dead = max(min_sr, int(round(dead_time / 2.0)))
         sr = min(sr_tau, sr_dead)
     else:
         sr = sr_tau
@@ -235,8 +241,8 @@ def derive_all(dyn_report: Dict[str, Any], sim_meta: Dict[str, Any],
 
     ``sample_rate_override > 0`` forces that sample rate (canonical pin
     ``DREAMER_SAMPLE_RATE`` or a setup-file scan rate); otherwise it is
-    derived from the fastest identified dynamics.  Leftover
-    ``SIM_SAMPLE_RATE`` is not an override (P94-live).
+    derived from fastest τ and *channel/dominant* θ (P121 ``srmed``), not
+    min-θ.  Leftover ``SIM_SAMPLE_RATE`` is not an override (P94-live).
     """
     tau_dom = float(dyn_report.get('tau_dominant_identified',
                                     dyn_report.get('tau_dominant', 0.0)) or 0.0)
@@ -254,8 +260,8 @@ def derive_all(dyn_report: Dict[str, Any], sim_meta: Dict[str, Any],
         sr = int(sample_rate_override)
         sr_source = 'override'
     else:
-        sr = derive_sample_rate(tau_fast, dead_fast)
-        sr_source = 'auto:tau_fast/10_or_dead_fast/2'
+        sr = derive_sample_rate(tau_fast, dead_dom)
+        sr_source = 'auto:tau_fast/10_or_dead_dom/2'
 
     model_size = derive_model_size(
         n_mv=n_mv, n_cv=n_cv, n_dv=n_dv, state_dim=state_dim,

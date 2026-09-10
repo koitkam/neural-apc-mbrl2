@@ -616,9 +616,10 @@ def run_bo(out_dir: str | Path, n_trials: int = 8,
                          sample_rate=base.sample_rate,
                          log_prefix='[BO]')
 
-    # Plant-tied derivations (sample_rate from fastest dynamics, model_size
-    # from complexity, seq_len ≥ settling time).  Canonical pin takes
-    # precedence; leftover ``SIM_SAMPLE_RATE`` is ignored at derive.
+    # Plant-tied derivations (sample_rate from fastest τ + channel θ
+    # (P121 srmed), model_size from complexity, seq_len ≥ settling time).
+    # Canonical pin takes precedence; leftover ``SIM_SAMPLE_RATE`` is
+    # ignored at derive.
     from utils.sim_factory import create_sim, resolve_sim_metadata
     from utils.plant_init import derive_all, derive_step_budgets
     from tools.gpu_calibrate import pick_batch_size_for_plant

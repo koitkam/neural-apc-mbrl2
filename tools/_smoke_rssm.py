@@ -5566,6 +5566,33 @@ def _test_sample_rate_pin_ignores_leftover() -> None:
     print('[smoke] OK  sample-rate pin DREAMER_SAMPLE_RATE; leftover SIM_SAMPLE_RATE ignored')
 
 
+def _test_sample_rate_uses_dead_dom_not_min() -> None:
+    """P121 srmed: derive_all Nyquist from median/channel θ, not min-θ."""
+    from utils.plant_init import derive_all, derive_sample_rate
+    dyn = {
+        'tau_dominant_identified': 53.5,
+        'dead_time_identified': 8.0,
+        'tau_fastest_identified': 47.0,
+        'dead_time_fastest_identified': 6.0,
+    }
+    meta = {'mv_indices': [0], 'cv_indices': [1], 'dv_indices': [2],
+            'state_dim': 4}
+    # Binding constraint was min θ=6 → sr=3; channel θ=8 → sr=4.
+    assert derive_sample_rate(47.0, 6.0) == 3
+    assert derive_sample_rate(47.0, 8.0) == 4
+    d = derive_all(dyn, meta, sample_rate_override=0)
+    assert int(d['sample_rate']) == 4, d['sample_rate']
+    assert d.get('sample_rate_source') == 'auto:tau_fast/10_or_dead_dom/2', d
+    assert d['inputs']['dead_dom'] == 8.0
+    assert d['inputs']['dead_fast'] == 6.0  # diagnostic min kept
+    src = open('utils/plant_init.py').read()
+    assert 'derive_sample_rate(tau_fast, dead_dom)' in src
+    assert "sr_source = 'auto:tau_fast/10_or_dead_dom/2'" in src
+    lb = open('utils/lookback_identifier.py').read()
+    assert 'def derive_sample_rate_for_lookback' in lb
+    print('[smoke] OK  sample-rate Nyquist uses dead_dom not min-θ (P121 srmed)')
+
+
 def _test_sim_factory_ignores_leftover_model_env() -> None:
     """Plant control_setup.json wins; leftover SIM_MODEL_* / SIM_*_JSON ignored."""
     import json
@@ -7250,6 +7277,7 @@ if __name__ == '__main__':
     _test_obj_use_normalized_leftover_ignored()
     _test_wm_diag_device_leftover_ignored()
     _test_sample_rate_pin_ignores_leftover()
+    _test_sample_rate_uses_dead_dom_not_min()
     _test_sim_factory_ignores_leftover_model_env()
     _test_derived_observables_cfg()
     _test_noise_hidden_cfg()

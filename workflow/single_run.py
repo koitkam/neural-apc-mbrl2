@@ -171,10 +171,10 @@ def main() -> int:
     dead_fast = plant_info['dead_time_fast']
 
     # ── Phase 1b: Plant-tied derivations (sample rate, model size, seq_len) ─
-    # Sample rate from the *fastest* identified channel.  Canonical pin
-    # ``DREAMER_SAMPLE_RATE`` or a setup-file scan rate overrides the
-    # formula.  Leftover ``SIM_SAMPLE_RATE`` is ignored at derive
-    # (P94-live); we still WRITE it after derivation as IPC.
+    # Sample rate from fastest τ and channel/dominant θ (P121 srmed), not
+    # min-θ.  Canonical pin ``DREAMER_SAMPLE_RATE`` or a setup-file scan
+    # rate overrides the formula.  Leftover ``SIM_SAMPLE_RATE`` is ignored
+    # at derive (P94-live); we still WRITE it after derivation as IPC.
     from utils.sim_factory import create_sim, resolve_sim_metadata
     from utils.plant_init import derive_all, sample_rate_pin
     sr_setup = _read_setup_sample_rate(setup_path, default=0)
