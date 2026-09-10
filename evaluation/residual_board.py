@@ -180,13 +180,22 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
         else:
             iaes.append(_f(iae))
 
-    if not any(np.isfinite(x) for x in d2s) or not any(np.isfinite(x) for x in ret_heads):
+    json_d2_ok = any(np.isfinite(x) for x in d2s)
+    json_ret_ok = any(np.isfinite(x) for x in ret_heads)
+    json_iae_ok = any(np.isfinite(x) for x in iaes)
+    # Backfill missing axes independently. JSON IAE medians are the
+    # val-suite score; npz recomputes a different window sum and must
+    # not overwrite a finite JSON IAE just because return-to-limit
+    # keys were added later (P119 board 64.36 vs summary 20.3).
+    if (not json_d2_ok) or (not json_ret_ok) or (not json_iae_ok):
         npz = _metrics_from_val_npz(out_dir)
         if npz is not None:
-            if not any(np.isfinite(x) for x in d2s):
+            if not json_d2_ok:
                 d2s, revs, heads, viols = npz[:4]
-            if not any(np.isfinite(x) for x in ret_heads):
-                ret_heads, ret_fracs, iaes = npz[4:]
+            if not json_ret_ok:
+                ret_heads, ret_fracs = npz[4], npz[5]
+            if not json_iae_ok:
+                iaes = npz[6]
 
     worst_d2 = _max_finite(d2s)
     worst_rev = _max_finite(revs)
