@@ -2272,9 +2272,12 @@ def _test_isolation_dcv_scales() -> None:
     assert '_should_probe_gain_on_last_ok' in _src
     assert '_probe_observer_gain_ready_maybe_last_ok' in _src
     assert '[gain-ready-probe] last-ok iter' in _src
-    assert 'extra_p1=int(p1_ext_steps) > 0' in _src
+    assert 'extra_p1=int(p1_ext_steps) > 0' not in _src
     assert 'unlocked after wrap recovery' in _src
     assert 'if extra_p1 or gain_ready_locked:' not in _src
+    assert 'if extra_p1:' not in _src
+    assert '_maybe_hold_op_scale_identity' in _src
+    assert '_sysid_mv_k_abs_span' in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
@@ -2282,7 +2285,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "gmatch_traj={'FO' if" in _src
     assert 'gmatch_ol1=True' not in _src
     assert 'gmatch_k1=True' not in _src
-    assert 'opscale=True' in _src
+    assert "opscale={'held' if getattr(cfg, '_op_scale_identity_held', False) else 'True'} " in _src
     assert 'gprobe_R=' in _src
     assert 'scoped_quiet_env' in _src
     assert 'P113' in _src or 'scoped_quiet_env restores' in _src
@@ -6587,6 +6590,13 @@ def _test_write_resolved_run_plan(tmp_path: str) -> None:
     assert 'gprobe_R=3' in banner, banner
     assert 'dob_kfeat=True' in banner, banner
     assert 'opscale=True' in banner, banner
+    assert 'opscale=held' not in banner, banner
+    cfg._op_scale_identity_held = True
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        _write_resolved_run_plan(cfg)
+    banner2 = buf2.getvalue()
+    assert 'opscale=held' in banner2, banner2
     assert 'gmatch_fo' not in banner, banner
     assert 'gmatch_ol_tail' not in banner, banner
     assert 'gmatch_step=0.4' in banner, banner
@@ -7046,13 +7056,105 @@ def _test_p118_opscale() -> None:
     assert not any(p.requires_grad for p in rssm.op_scale_net.parameters())
     model.set_world_model_trainable(g=True, dob=False, reward=False)
 
+    # P123: identity-held must survive g=True (group g re-enable hole).
+    rssm.op_scale_identity_held = True
+    model.set_world_model_trainable(g=True, dob=False, reward=False)
+    assert not any(p.requires_grad for p in rssm.op_scale_net.parameters())
+    model.set_world_model_trainable(g=False, dob=True, reward=False)
+    assert not any(p.requires_grad for p in rssm.op_scale_net.parameters())
+    rssm.op_scale_identity_held = False
+    model.set_world_model_trainable(g=True, dob=False, reward=False)
+    assert all(p.requires_grad for p in rssm.op_scale_net.parameters())
+
     with torch.no_grad():
         last.weight.normal_(0.0, 0.2)
         last.bias.normal_(0.0, 0.05)
         rssm.img_step(state, a, dv=dv, sample=False)
     sc2 = rssm._op_scale_applied
     assert (sc2 - 1).abs().max() > 1e-4
-    print('[smoke] OK  P118 opscale init≡1; group g; scale moves')
+    print('[smoke] OK  P118 opscale init≡1; group g; held survives g=True')
+
+
+def _test_p123_opgate_span() -> None:
+    """P123: SysID MV |K| max/min gate — hold ≤1.3, train at 1.86."""
+    import json
+    import tempfile
+    from pathlib import Path as _P
+    from training.train import (
+        _sysid_mv_k_abs_span, _OPSCALE_IDENTITY_K_SPAN,
+        _maybe_hold_op_scale_identity, TrainConfig, build_model,
+    )
+
+    assert float(_OPSCALE_IDENTITY_K_SPAN) == 1.3
+    p122 = {
+        'per_pair_estimates': [
+            {'valid': True, 'input_type': 'mv', 'input': 'MV0', 'cv': 'CV0',
+             'delta': -10.0, 'amplitude': a}
+            for a in (2.98, 3.05, 3.12, 3.20, 3.28, 3.35, 3.42, 3.49)
+        ],
+    }
+    span_lin = _sysid_mv_k_abs_span(p122)
+    assert span_lin is not None
+    assert abs(span_lin - (3.49 / 2.98)) < 1e-9
+    assert span_lin <= 1.3
+    p119 = {
+        'per_pair_estimates': [
+            {'valid': True, 'input_type': 'mv', 'input': 'MV0', 'cv': 'CV0',
+             'delta': 1.0, 'amplitude': 0.706},
+            {'valid': True, 'input_type': 'mv', 'input': 'MV0', 'cv': 'CV0',
+             'delta': 1.0, 'amplitude': 1.312},
+        ],
+    }
+    span_nl = _sysid_mv_k_abs_span(p119)
+    assert span_nl is not None
+    assert abs(span_nl - (1.312 / 0.706)) < 1e-9
+    assert span_nl > 1.3
+
+    torch.manual_seed(0)
+    cfg = TrainConfig()
+    cfg.obs_dim, cfg.action_dim = 6, 1
+    cfg.lookback, cfg.seq_len, cfg.horizon = 8, 16, 4
+    cfg.mtp_length = 4
+    cfg.world_model_type = 'rssm'
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.head_hidden = 16
+    cfg.dob_enabled = True
+    cfg.dv_dim = 1
+    cfg.dv_indices = (3,)
+    cfg.cv_obs_indices = (0,)
+    cfg.compile_mode = 'off'
+    cfg.wm_overshoot_coef = 0.0
+    cfg.wm_held_rollout_coef = 0.0
+    cfg.gain_match_coef = 0.0
+    cfg.wm_input_isolation_coef = 0.0
+    cfg.rssm_joint_embed_coef = 0.0
+    with tempfile.TemporaryDirectory() as td:
+        plant = _P(td) / 'plant_id'
+        plant.mkdir()
+        (plant / 'dynamics_identification.json').write_text(
+            json.dumps(p122))
+        cfg.out_dir = td
+        model = build_model(cfg)
+        _maybe_hold_op_scale_identity(model, cfg)
+        assert bool(getattr(cfg, '_op_scale_identity_held', False))
+        assert bool(model.dynamics.op_scale_identity_held)
+        model.set_world_model_trainable(g=True, dob=False, reward=False)
+        assert not any(p.requires_grad for p in
+                       model.dynamics.op_scale_net.parameters())
+        (plant / 'dynamics_identification.json').write_text(
+            json.dumps(p119))
+        model2 = build_model(cfg)
+        _maybe_hold_op_scale_identity(model2, cfg)
+        assert not bool(getattr(cfg, '_op_scale_identity_held', True))
+        assert not bool(model2.dynamics.op_scale_identity_held)
+        model2.set_world_model_trainable(g=True, dob=False, reward=False)
+        assert all(p.requires_grad for p in
+                   model2.dynamics.op_scale_net.parameters())
+    print('[smoke] OK  P123 opgate span 1.17 held / 1.86 trains; g=True pin')
 
 
 def _test_p118_local_g_wm_norm_du() -> None:
@@ -7242,6 +7344,7 @@ if __name__ == '__main__':
     _test_stream_serve_matches_rollout()
     _test_p114_kfeat()
     _test_p118_opscale()
+    _test_p123_opgate_span()
     _test_p118_local_g_wm_norm_du()
     _test_collect_serve_cuda_graph_cpu()
     _test_dreamer_v4_config_from_train()

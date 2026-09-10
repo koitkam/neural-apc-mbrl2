@@ -1919,6 +1919,14 @@ class DreamerV4(nn.Module):
                 p.requires_grad_(bool(g)); n_g += 1
         for p in self.reward.parameters():
             p.requires_grad_(bool(reward)); n_r += 1
+        # P123: op_scale_net is group ``g`` (no dob_ prefix). Freeze-at-init
+        # is undone by P1 ``g=True`` unless we re-pin after the g/dob loop.
+        # Identity-hold is for single-K FOPDT (SysID |K| max/min ≤ 1.3).
+        _op = getattr(dyn, 'op_scale_net', None)
+        if (_op is not None
+                and bool(getattr(dyn, 'op_scale_identity_held', False))):
+            for p in _op.parameters():
+                p.requires_grad_(False)
         return {'g': n_g, 'dob': n_dob, 'reward': n_r}
 
     def set_dob_active(self, active: bool) -> None:

@@ -449,6 +449,7 @@ def init_op_scale_net(mod: nn.Module) -> None:
     """
     in_dim = (int(getattr(mod, 'action_dim', 0) or 0)
                + int(getattr(mod, 'dv_dim', 0) or 0))
+    mod.op_scale_identity_held = False  # type: ignore[attr-defined]
     if in_dim <= 0:
         mod.op_scale_net = None  # type: ignore[attr-defined]
         return

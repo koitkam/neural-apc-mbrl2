@@ -3566,17 +3566,14 @@ def _should_lock_last_ok(
     restored 24 (0.81@DV) and discarded live gate 0.89@DV at iter 82.
     Original-P1 wrap recovery (``already_locked`` and recon back below
     ``lock_ratio``, not gain-ready-locked) **unlocks** so last-ok can
-    advance. Extra-P1 recovered basin uses the same recon-vs-lock_ratio
-    path unless ``gain_ready_locked`` (P122; P92 applied to extra-P1).
+    advance. Extra-P1 recovered basin uses the same path (P122 EXIT:
+    ``gain_ready_locked`` already decides; ``extra_p1`` is unused).
     """
+    _ = extra_p1  # P123 hygiene: already_locked does not branch on extra-P1
     if skip_storm_restored:
         return bool(gain_ready_locked)
     if already_locked:
-        if extra_p1:
-            if gain_ready_locked:
-                return True
-            # fall through: not-READY extra-P1 unlocks when recon < lock_ratio
-        elif gain_ready_locked:
+        if gain_ready_locked:
             return True
         try:
             r = float(recon)
@@ -4518,7 +4515,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"dob_afreeze=True "
         f"dob_luen=True "
         f"dob_kfeat=True "
-        f"opscale=True "
+        f"opscale={'held' if getattr(cfg, '_op_scale_identity_held', False) else 'True'} "
         f"p1amp={curriculum_amp_scale(1.0, phase=1, cfg=cfg):g} "
         f"p2amp={curriculum_amp_scale(1.0, phase=2, cfg=cfg):g} "
         f"p3amp={curriculum_amp_scale(1.0, phase=3, cfg=cfg):g} "
@@ -9226,21 +9223,8 @@ def _auto_gain_match_len(cfg: TrainConfig) -> int:
     return int(cfg.gain_match_len)
 
 
-def _resolve_gain_match_targets(
-        env: 'APCEnv', cfg: TrainConfig, *, log_label: str = 'targets') -> None:
-    """C(1): convert the identified steady-state gains (engineering units) into
-    the WM's NORMALIZED units and store them on ``cfg`` for the gain-match loss.
-
-    Normalized-gain identities (the WM operates in obs-normalized space; the MV
-    enters as the raw action ∈[-1,1], the DV as the normalized obs channel):
-      * MV col:  ∂CV_norm/∂action = g_eng · (ΔMV_eng/Δaction) / cv_std
-                 where ΔMV_eng/Δaction = (mv_hi − mv_lo)/2 (the action map).
-      * DV col:  ∂CV_norm/∂dv_norm = g_eng · dv_std / cv_std.
-    ``g_eng = amplitude/delta`` (signed) averaged over the valid identified
-    step trials for each (input, CV) pair.  Raises on missing data → the caller
-    disables the loss (graceful no-op; the cont gain channel still trains via
-    recon).
-    """
+def _load_dynamics_identification_raw(cfg: TrainConfig) -> dict:
+    """Bound-run ``plant_id/dynamics_identification.json`` (V4 name)."""
     out_dir = Path(getattr(cfg, 'out_dir', '.') or '.')
     roots = [out_dir]
     cur = out_dir
@@ -9261,6 +9245,11 @@ def _resolve_gain_match_targets(
             break
     if not raw:
         raise FileNotFoundError('dynamics_identification.json not found')
+    return raw
+
+
+def _ident_amp_over_delta(raw: dict) -> Dict[tuple, List[float]]:
+    """Signed ``amplitude/delta`` per valid (input_type, input, cv) repeat."""
     acc: Dict[tuple, List[float]] = {}
     for e in raw.get('per_pair_estimates', []) or []:
         if not e.get('valid'):
@@ -9277,6 +9266,76 @@ def _resolve_gain_match_targets(
         cvn = str(e.get('cv') or '')
         if it and inp and cvn:
             acc.setdefault((it, inp, cvn), []).append(amp / delta)
+    return acc
+
+
+# P123: unitless SysID |K| max/min across valid MV repeats. ≤ this → hold
+# ``op_scale_net`` at identity (single-K FOPDT). P122 test_sim **1.170**;
+# P119 nonlinear **1.858**. Not a TrainConfig field.
+_OPSCALE_IDENTITY_K_SPAN = 1.3
+
+
+def _sysid_mv_k_abs_span(raw: dict) -> Optional[float]:
+    """max|K|/min|K| over valid MV ``amp/delta`` repeats; None if <2."""
+    acc = _ident_amp_over_delta(raw)
+    ks = [abs(float(v)) for (it, _, _), vals in acc.items()
+          if it == 'mv' for v in vals if abs(float(v)) > 1e-12]
+    if len(ks) < 2:
+        return None
+    return float(max(ks) / min(ks))
+
+
+def _maybe_hold_op_scale_identity(model: 'DreamerV4', cfg: TrainConfig) -> None:
+    """Pin LPV ``op_scale_net`` at identity when SysID MV |K| is single-K.
+
+    Must run after ``build_model`` and **before** P1
+    ``set_world_model_trainable(g=True)`` (group ``g`` would otherwise
+    re-enable the net). Re-pin lives at the end of that method.
+    """
+    dyn = getattr(model, 'dynamics', None)
+    if dyn is None:
+        setattr(cfg, '_op_scale_identity_held', False)
+        return
+    setattr(dyn, 'op_scale_identity_held', False)
+    setattr(cfg, '_op_scale_identity_held', False)
+    try:
+        raw = _load_dynamics_identification_raw(cfg)
+        span = _sysid_mv_k_abs_span(raw)
+    except Exception as exc:  # noqa: BLE001
+        print(f'[opscale] identity-hold SKIPPED ({exc!r})', flush=True)
+        return
+    hold = span is not None and float(span) <= float(_OPSCALE_IDENTITY_K_SPAN)
+    setattr(dyn, 'op_scale_identity_held', hold)
+    setattr(cfg, '_op_scale_identity_held', hold)
+    _net = getattr(dyn, 'op_scale_net', None)
+    if hold and _net is not None:
+        for p in _net.parameters():
+            p.requires_grad_(False)
+        print(f'[opscale] held identity (SysID MV |K| max/min='
+              f'{float(span):.3f} ≤ {_OPSCALE_IDENTITY_K_SPAN:g})',
+              flush=True)
+    else:
+        _s = f'{float(span):.3f}' if span is not None else 'n/a'
+        print(f'[opscale] trains (SysID MV |K| max/min={_s})', flush=True)
+
+
+def _resolve_gain_match_targets(
+        env: 'APCEnv', cfg: TrainConfig, *, log_label: str = 'targets') -> None:
+    """C(1): convert the identified steady-state gains (engineering units) into
+    the WM's NORMALIZED units and store them on ``cfg`` for the gain-match loss.
+
+    Normalized-gain identities (the WM operates in obs-normalized space; the MV
+    enters as the raw action ∈[-1,1], the DV as the normalized obs channel):
+      * MV col:  ∂CV_norm/∂action = g_eng · (ΔMV_eng/Δaction) / cv_std
+                 where ΔMV_eng/Δaction = (mv_hi − mv_lo)/2 (the action map).
+      * DV col:  ∂CV_norm/∂dv_norm = g_eng · dv_std / cv_std.
+    ``g_eng = amplitude/delta`` (signed) averaged over the valid identified
+    step trials for each (input, CV) pair.  Raises on missing data → the caller
+    disables the loss (graceful no-op; the cont gain channel still trains via
+    recon).
+    """
+    raw = _load_dynamics_identification_raw(cfg)
+    acc = _ident_amp_over_delta(raw)
     g_eng = {k: float(np.mean(v)) for k, v in acc.items()}
     if not g_eng:
         raise ValueError('no valid identified gain estimates')
@@ -12732,6 +12791,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # (below), once the seed buffer has fitted obs-norm.
 
     model = build_model(cfg).to(device)
+    _maybe_hold_op_scale_identity(model, cfg)
 
     # ---- Optional warm-start from a previous run's checkpoint ----------
     init_path = str(getattr(cfg, 'init_from_ckpt', '') or '').strip()
@@ -15089,7 +15149,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # Original-P1 wrap recovery also unlocks (P48 freeze restored
         # 24 after a recovered 43× wrap) unless gain-ready-locked.
         # Extra-P1 recovered basin stay-locks only if last_ok was
-        # GAIN-READY (P122; P120/P121 not-READY wrap freeze).
+        # GAIN-READY (`gain_ready_locked`; P123 extra_p1 hygiene).
         if (current_phase == 1
                 and bool(getattr(cfg, 'skip_storm_recover_p1', True))):
             _rlv = _wm_recon_scalar(wm_losses)
@@ -15105,7 +15165,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 has_last_ok=p1_last_ok_sd is not None,
                 skip_storm_restored=False,
                 already_locked=_was_locked,
-                extra_p1=int(p1_ext_steps) > 0,
                 gain_ready_locked=bool(p1_last_ok_gain_ready_locked))
             if (not p1_last_ok_locked) and p1_last_ok_gain_ready_locked:
                 p1_last_ok_gain_ready_locked = False
