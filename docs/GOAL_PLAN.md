@@ -4,7 +4,7 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: **return-to-`test_sim`**. **P120 `tshome` EXIT `[p3-skip]`** (INVALID observer; last_ok **85** wrap-locked). Cadence: P117+P118 were the two `nonlinear_sim` jobs; P119 was the fair locgfix repeat. **P120 `gop` stays PARKED.** Do **not** score P120 as a pure opscale A/B (`sr=3 H=74` vs P116 `sr=4 H=54`) **or** as an actor result. Extra-P1 lottery **closed**. Next GPU: **P121 `srmed`**.
+Plant this cycle: **return-to-`test_sim`**. **P121 `srmed` LIVE P1** pid **588400** sha `4422be5`. P120 EXIT `[p3-skip]` INVALID (wrap-locked last_ok **85**). **P120 `gop` PARKED.** Do **not** score P120 as opscale or as an actor result. Extra-P1 lottery **closed**.
 
 ## Residual board vs champions (from `validation/residual_board.json`)
 
@@ -76,7 +76,7 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 
 ## Ranked follow-ups
 
-**#1 P121 `srmed` — this GPU job.** One attributed change: sample-rate Nyquist from **median/dominant θ**, not `min(all_dead)`.
+**#1 P121 `srmed` — LIVE P1** pid **588400** sha `4422be5` tmux `mbrl2_p121` out-dir `output/test_sim/run_p121_srmed`. Env-free `CUDA_VISIBLE_DEVICES=0`. Train start **2026-09-10 01:06:11** `device=cuda` bs=128 compile=eager. **`run_plan` sr=4 H=55** `sample_rate_source=auto:tau_fast/10_or_dead_dom/2`. This ID draw `dead_fast=7` `tau_fast=45` (old min-θ formula would also have been sr=4 this draw; source string confirms the new path; P120-class θ=6 is what the formula closes). No `[env-override]`. Snapshot only until P1-gate. Do **not** score actor / stay-lock on this pid / wait for jsonl.
 - **Mechanism:** `derive_all` now calls `derive_sample_rate(tau_fast, dead_dom)` with `sr_source='auto:tau_fast/10_or_dead_dom/2'`. APC delay sampling is ~2 samples in the *channel* θ, not the noisiest FOPDT repeat. P120 binding constraint was `dead_fast=6` from REFLUX r4; `dead_dom=8` already matches `per_mv_dynamics`. Keep `dead_time_fastest=min` for lookback / diagnostics. Do **not** also median-`tau_fast` (τ lottery is not binding: `round(47/10)=round(53.5/10)=5`). No `DREAMER_SAMPLE_RATE=4` pin.
 - **Predicted signature:** test_sim `sr=4` `H~54` `gmatch_len~54`; `[resolved-cfg]` opscale still ON; orig-P1 timing P116-class (~87 **unlocked**, not wrap-coincident).
 - **Falsifier:** `run_plan` sr still 3; **or** a real fast channel is undersampled (lookback/TM @H worse than P116 with no other change). Orig-P1 still wrap-locked FAIL after sr=4 → then **#2**, not opscale REVERT.
