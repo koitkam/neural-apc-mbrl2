@@ -862,12 +862,10 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # move penalty already handles anti-jitter, so coef
     # can be moderately aggressive without inducing chatter.
     # Formula: coef = clip(median_tau / 4, 0.3, 1.5).
-    # Override via env ``OBJ_AUTO_VIOLATION_RATE_COEF_DIVISOR`` (default 4),
-    # ``OBJ_AUTO_VIOLATION_RATE_COEF_MIN`` (default 0.3),
-    # ``OBJ_AUTO_VIOLATION_RATE_COEF_MAX`` (default 1.5).
-    # Hard override via env ``OBJECTIVE_VIOLATION_RATE_COEF`` (canonical)
-    # or spec key ``violation_rate_coef`` (consumed in
-    # objective_runtime.py). This auto value is the default and is used
+    # TrainConfig / ``DREAMER_OBJ_AUTO_VIOLATION_RATE_COEF_*``; leftover
+    # ``OBJ_AUTO_VIOLATION_RATE_COEF_*`` / ``OBJECTIVE_VIOLATION_RATE_COEF``
+    # ignored. Spec key ``violation_rate_coef`` is consumed in
+    # objective_runtime.py. This auto value is the default and is used
     # whenever that knob is unset or set to ``"auto"``.
     rate_div = max(0.5, _knob_float(
         cfg, 'obj_auto_violation_rate_coef_divisor',

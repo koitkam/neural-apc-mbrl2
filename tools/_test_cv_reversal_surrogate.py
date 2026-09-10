@@ -7,8 +7,10 @@ bang-bang. The MV term ``relu(-du_t·du_prev)`` is amplitude-weighted; the
 same formula on dCV is nearly silent on that hunting, so copying it would
 not close R2.
 
-#4 must use a sticky last-nonzero sign surrogate of ``_sign_reversal_rate``,
-not ``relu(-dCV_t·dCV_prev)``. Do not land on the P121 pid.
+#4 must use a sticky last-nonzero sign surrogate of ``_sign_reversal_rate``
+with sticky threshold ``tanh(1)`` (same as val ``|d|>deadband``), not
+``relu(-dCV_t·dCV_prev)`` and not ``|s|>=0.5`` (sub-deadband holds). Do not
+land on the P121 pid.
 
 Run:
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \\
@@ -20,6 +22,9 @@ import numpy as np
 
 from evaluation.residual_board import CV_D2_RMS_MAX, CV_REVERSAL_MAX
 from evaluation.validate import _sign_reversal_rate
+
+# tanh(1) ⇔ |dCV| > deadband, matching val dropping |d|<=deadband zeros.
+_STICKY_THRESH = float(np.tanh(1.0))
 
 
 def _d2_rms_normed(col: np.ndarray, rng: float) -> float:
@@ -35,6 +40,30 @@ def _amp_relu_mean(col: np.ndarray, rng: float) -> float:
         return 0.0
     prod = -d[1:] * d[:-1]
     return float(np.mean(np.maximum(0.0, prod)) / max(1e-9, rng * rng))
+
+
+def _sticky_tanh_flip_mean(col: np.ndarray, rng: float) -> float:
+    """GOAL_PLAN #4 surrogate: mean relu(-s_t · sign_sticky).
+
+    ``s = tanh(dCV / deadband)``; ``s_sticky`` is the last ``|s|>=tanh(1)``
+    sign. Holds (sub-deadband) do not update sticky; an opposite move after a
+    hold still counts, matching val's nonzero-Δ flip rate.
+    """
+    d = np.diff(np.asarray(col, dtype='float64'))
+    if d.size == 0:
+        return 0.0
+    deadband = 1e-3 * max(float(rng), 1e-9)
+    s = np.tanh(d / deadband)
+    sticky = 0.0
+    pens = np.empty(s.shape, dtype='float64')
+    for i, st in enumerate(s):
+        if abs(sticky) >= _STICKY_THRESH:
+            pens[i] = max(0.0, -float(st) * float(np.sign(sticky)))
+        else:
+            pens[i] = 0.0
+        if abs(st) >= _STICKY_THRESH:
+            sticky = float(np.sign(st))
+    return float(np.mean(pens))
 
 
 def _p116_class_hunting(n: int = 400, rng: float = 7.0) -> np.ndarray:
@@ -54,13 +83,22 @@ def _p116_class_hunting(n: int = 400, rng: float = 7.0) -> np.ndarray:
     return y
 
 
+def _monotonic_ride_to_hi(n: int = 400, rng: float = 7.0) -> np.ndarray:
+    """Slow ride toward the hi limit — one sign, should not look like hunting."""
+    lo, hi = 78.5, 78.5 + rng
+    y = np.linspace(lo + 0.4 * rng, hi - 0.05, n, dtype='float64')
+    return y
+
+
 def main() -> None:
     rng = 7.0  # test_sim CONTROL_TEMP 78.5–85.5
     hunt = _p116_class_hunting(rng=rng)
     rev = _sign_reversal_rate(hunt, rng)
     d2 = _d2_rms_normed(hunt, rng)
     amp = _amp_relu_mean(hunt, rng)
-    print(f'[hunt] rev={rev:.3f} d2={d2:.4f} amp_relu/rng²={amp:.6f}')
+    sticky = _sticky_tanh_flip_mean(hunt, rng)
+    print(f'[hunt] rev={rev:.3f} d2={d2:.4f} amp_relu/rng²={amp:.6f} '
+          f'sticky={sticky:.3f} thresh=tanh(1)={_STICKY_THRESH:.3f}')
     assert d2 <= CV_D2_RMS_MAX, f'fixture d2 {d2} should PASS like P116'
     assert rev > CV_REVERSAL_MAX, f'fixture rev {rev} should FAIL like P116'
     # Bang-bang of 0.5·rng has amp relu ~0.25; hunting must be ≪ that.
@@ -68,9 +106,18 @@ def main() -> None:
     bang_amp = _amp_relu_mean(bang, rng)
     print(f'[bang] amp_relu/rng²={bang_amp:.4f}')
     assert amp < 0.05 * bang_amp
+    # Sticky tanh must fire on hunting at val-rate order, not vanish like amp.
+    assert sticky > CV_REVERSAL_MAX
+    assert abs(sticky - rev) < 0.05, (sticky, rev)
+    ride = _monotonic_ride_to_hi(rng=rng)
+    ride_rev = _sign_reversal_rate(ride, rng)
+    ride_sticky = _sticky_tanh_flip_mean(ride, rng)
+    print(f'[ride] rev={ride_rev:.3f} sticky={ride_sticky:.3f}')
+    assert ride_rev == 0.0
+    assert ride_sticky == 0.0
     print('[ok] amplitude-weighted CV relu is silent on P116-class hunting; '
-          '#4 must match _sign_reversal_rate (sticky last-nonzero sign), '
-          'not relu(-dCV·dCV_prev)')
+          '#4 sticky tanh(1) matches _sign_reversal_rate and is 0 on a '
+          'monotonic ride — not relu(-dCV·dCV_prev)')
 
 
 if __name__ == '__main__':
