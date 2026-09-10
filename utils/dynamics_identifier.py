@@ -801,9 +801,10 @@ def _identify_dynamics_inner(
     # fastest channel, not the slowest).
     if all_tau:
         tau_fastest = float(np.min(np.asarray(all_tau)))
-        # min(θ) is downward-biased: round(θ/2) then flips test_sim
-        # sr 4↔3 (P120 θ_fast=6 → sr=3 vs P116 θ=7 → sr=4; θ_dom=8).
-        # GOAL_PLAN P121 `srmed`: Nyquist from median/dominant θ.
+        # min(θ) is identifier-noise on test_sim (P120: one MV repeat
+        # θ=6 vs median 8 → sr 3; P116 min 7 → sr 4). Keep this field
+        # as a diagnostic min. GOAL_PLAN P121 `srmed` feeds median
+        # `dead_time_identified` into derive_sample_rate, not this min.
         dead_time_fastest = float(np.min(np.asarray(all_dead)))
     else:
         tau_fastest = tau_dominant

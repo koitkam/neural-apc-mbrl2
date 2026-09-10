@@ -25,7 +25,7 @@ P119/P116 boards: R2/R3 return-to-limit from npz (JSON lacked those keys); R3 ev
 
 **Trusted:** val TM ss/@H/`curve_iae_normed` (MV and DV); gain decomp; `det_r` + pred_std vs true; paired econ vs baseline **and** champion when freeze GAIN-READY and P3 ran; **CV d2/reversal** (`cv_d2_rms_normed` + `cv_reversal_rate` — this **is** `smooth_pass` as of P120); `cv_opt_headroom` / `cv_viol_frac` with econ side = **sign(SysID MV→CV gain)** (G<0 hug hi / G>0 hug lo — not `cv_side_scale`); DR `cv_return_headroom` / `cv_return_time_frac` on that same bound. Skip-storm 5-level TM is freeze/RCA, not a champ score.
 
-**On trial / do not GPU-optimize:** jsonl teacher ×1 vs SysID median; jsonl `gain_match_mv_ratio` vs local G (teacher pin ≠ GAIN-READY); ss-ratio alone; lineage `wm_gain_pass`; **mv_reversal as a smoothness gate** (now diagnostic only; `mv_reversal_rate_observed` still logged); CV total variation as a smoothness gate; critic_r without `critic_rew_to_tgt_var`; raw dist R²; event IAE without return-to-limit; VALID 9/9 / GAIN-READY / all_pass / family-closed as “residual closed”; beating P64 to KEEP a smoothness/headroom/DR win; **`cv_side_scale` as the economic riding bound** (it is violation urgency; P116 “headroom 0.82 / never returns” was hugging **hi** scored against **lo**); **`wm_op_scale_dev~0` as “linear plant stays identity”** (metric is mean `|1+tanh−1|`; last Linear is zero only at step-0; P120@19 already **0.68** on test_sim); **P120 val TM as an opscale FALSIFY** until sample-rate matches P116 (this pid `sr=3 H=74` vs P116 `sr=4 H=54`); residual_board event IAE from npz when JSON already has seed-median IAE (P119 board was **64.36** vs summary **20.3** — **fixed** this visit; JSON IAE is the score).
+**On trial / do not GPU-optimize:** jsonl teacher ×1 vs SysID median; jsonl `gain_match_mv_ratio` vs local G (teacher pin ≠ GAIN-READY); ss-ratio alone; lineage `wm_gain_pass`; **mv_reversal as a smoothness gate** (now diagnostic only; `mv_reversal_rate_observed` still logged); CV total variation as a smoothness gate; critic_r without `critic_rew_to_tgt_var`; raw dist R²; event IAE without return-to-limit; VALID 9/9 / GAIN-READY / all_pass / family-closed as “residual closed”; beating P64 to KEEP a smoothness/headroom/DR win; **`cv_side_scale` as the economic riding bound** (it is violation urgency; P116 “headroom 0.82 / never returns” was hugging **hi** scored against **lo**); **`wm_op_scale_dev~0` as “linear plant stays identity”** (metric is mean `|1+tanh−1|`; last Linear is zero only at step-0; P120 P1 **0.68–0.89** on test_sim); **P120 val TM / wrap recon / live probe-while-locked as an opscale FALSIFY** until sample-rate matches P116 (this pid `sr=3 H=74` vs P116 `sr=4 H=54`; first-fill wrap is P42/P49); residual_board event IAE from npz when JSON already has seed-median IAE (P119 board was **64.36** vs summary **20.3** — **fixed** prior visit; JSON IAE is the score).
 
 ## Closed families (do not N+1)
 
@@ -33,23 +33,25 @@ extra-P1 as freeze (P41; **P117**; **P118**); compounding-teacher Huber (P111 tr
 
 ## P120 `tshome` — LIVE (mode 2 snapshot; do not score actor)
 
-**Live:** tmux `mbrl2_p120`. pid **583595** (CPU 100%, nvidia **19255 MiB / 45%**, A10). sha **`03a93f1`**. out-dir `output/test_sim/run_p120_tshome`. Env-free. Train start **2026-09-09 19:10:17**. Heartbeat jsonl **@19** `2026-09-09T19:56:43` (~2.3 min/iter). STAGE 1. skip **0**. jsonl NaN/Inf **0**. `wm_best.pt` @10 (gain-blind). Graph captured `N=6 T=128`. **Not a hard failure — do not kill / second GPU / rewrite recipe.**
+**Live:** tmux `mbrl2_p120`. pid **583595** (CPU 100%, nvidia **19255 MiB**, A10). sha **`03a93f1`**. out-dir `output/test_sim/run_p120_tshome`. Env-free. Train start **2026-09-09 19:10:17**. Heartbeat jsonl **@42** `2026-09-09T20:51` (~2.3 min/iter). STAGE 1. skip **0**. jsonl NaN/Inf **0**. Periodic `ckpt_iter_{20,40}` (HEAD keep=2). `wm_best.pt` @**30** (fidelity EMA 4.718). `wm_last_ok.pt` @**36**. Graph `N=6 T=128`. **Not a hard failure — do not kill / second GPU / rewrite recipe.**
 
 **Teacher / resolved:** `[resolved-cfg] opscale=True` **no** ol1. locgfix `|du_mv|=0.4000`**=** step; rest-IC local G MV **−2.54** vs ident **−2.55** span **0.13**. `t_wm` **~137 s** (P116 **~98 s**).
 
-**Launch confound (not opscale):** `run_plan` **sr=3 H=74** `gmatch_len=74` vs P116 **sr=4 H=54**. Identifier `dead_time_fastest=min(θ)=6` (P116 **7**; both **θ_dom=8**). `derive_sample_rate`: `round(θ_fast/2)` → 3 vs 4. Probe@10 used H=74 not 54.
+**Launch confound (not opscale):** `run_plan` **sr=3 H=74** `gmatch_len=74` vs P116 **sr=4 H=54**. Identifier 16 valid pairs: **θ median=8** (12×8, 2×9, 1×7, **1×6**). The θ=6 is **one MV REFLUX repeat-4**, not a fast DV (all DV θ=8). `dead_time_fastest=min` → `round(6/2)=3`. P116 min was 7 → sr=4. Median θ → sr=4 on both pids.
 
-**P1 @19 vs P116 @16 (not a freeze score):** recon **0.0092** (P116@16 **0.010**). jsonl MV **×0.983** (teacher pin). `wm_op_scale_dev` **0.58@1 → 0.91@2 → 0.68@19** (P119 P1 ~0.80; **not** ~0). Probe@10 H=1 **+0.395** H=74 **+0.268** conv **1.00** gain_fid **0.638** floor=0.40 (P116@10 H=54 **+0.293** conv **0.25** gain_fid **0.666**). last_ok **19** unlocked. storm **0**.
+**P1 wrap (P42/P49; same class as P116):** buf fill **1.00 @32** (P116 @32). last_ok locked **36** when recon **0.0030→0.5417** (20× of best **0.00305**). Peak **0.772 @38** alive **886**. @42 recon **0.425** still locked (unlock bar **<0.061**). P116 wrap **0.220 @40** last_ok **39**, unlocked **@42** recon **0.067** (bar **<0.086**). P120 spike is deeper/slower — do **not** FALSIFY opscale on wrap recon or on **live** probe@40 (H=1 r=+0.030 gain_fid **0.653**; last_ok is the observer). Probe@30 (pre-wrap) H=1 **+0.506** H=74 **+0.572** conv **0.50** gain_fid **0.867**. `opdev` **0.68@36 → 0.89@42**. jsonl MV @42 **×0.973** is teacher.
+
+**P1 pre-wrap vs P116 (not a freeze score):** @19 recon **0.0092** skip 0. Probe@10 H=1 **+0.395** H=74 **+0.268** conv **1.00** gain_fid **0.638** (P116@10 H=54 **+0.293** conv **0.25** gain_fid **0.666**).
 
 **Mechanism (intended):** return-to-`test_sim` on HEAD = opscale ON + ol1 gone + locgfix identity. **Cannot attribute TM to opscale on this pid.**
 
 **Largest residual this plant:** R1 TM autoencoder (P116 MV ×0.706 / curve 0.262 vs P26 ×0.973) and R2 CV reversal **0.421**. Compounding ×0.911 is **not** the hole.
 
-**Predicted signature (updated):** opscale trains immediately (`opdev` O(0.7) even on linear); sr may be 3; orig-P1 still the freeze score; val TM is mixed (opscale+sr+ol1-gone).
+**Predicted signature:** opscale trains immediately (`opdev` O(0.7) even on linear); sr=3 from one noisy θ; first-fill wrap locks last_ok; orig-P1 still the freeze score (restore last_ok **36** if still locked); val TM is mixed (opscale+sr+ol1-gone).
 
-**Falsifier (at EXIT, still mixed):** orig-P1 GAIN_NOT_READY with healthy recon → freeze×(opscale|sr). Val TM collapse vs P116 ×0.706 → **do not** solely REVERT opscale; next job is sr-median first. Val TM ≥ P116 with opdev~0.7 → opscale did not obviously hurt despite sr=3 (KEEP pending `srmed`).
+**Falsifier (at EXIT, still mixed):** orig-P1 GAIN_NOT_READY with healthy recon → freeze×(opscale|sr). Val TM collapse vs P116 ×0.706 → **do not** solely REVERT opscale; next job is sr-median first. Val TM ≥ P116 with opdev~0.7 → opscale did not obviously hurt despite sr=3 (KEEP pending `srmed`). Wrap still locked at orig-P1 is P42 restore, not a kill.
 
-**Do not:** extra-P1 N+1; ol1/k1/traj N+1; identity-relaunch P116/P119; launch `gop`; stack critic knobs; second GPU; pin `DREAMER_SAMPLE_RATE=4` as a test_sim magic default.
+**Do not:** extra-P1 N+1; ol1/k1/traj N+1; identity-relaunch P116/P119; launch `gop`; stack critic knobs; second GPU; pin `DREAMER_SAMPLE_RATE=4` as a test_sim magic default; kill on wrap recon.
 
 Config audit Step 4 (launch): env-free HEAD. vs P116: drop ol1; add opscale; **unplanned** sr 4→3. #❌ sr lottery **open**. #🆕 **0**.
 
@@ -86,11 +88,11 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 **#1 P120 `tshome` — LIVE.** Snapshot only until EXIT. Do **not** score actor / launch `gop` / extra-P1 / second GPU.
 
 **#2 P121 `srmed` (next GPU after P120 EXIT)** — one attributed change: sample-rate Nyquist from **median/dominant θ**, not `min(all_dead)`.
-- **Mechanism:** `dead_time_fastest=np.min(all_dead)` is downward-biased; `round(θ_fast/2)` then flips test_sim **4↔3** on a 1 s identifier tick (P120 θ_fast=6 vs P116=7; θ_dom=8 both). Use median θ (already the dominant-θ estimator) for `derive_sample_rate`'s dead-time cap. Keep `tau_fastest=min` for lookback if a real fast channel exists.
-- **Predicted signature:** test_sim `sr=4` `H~54` `gmatch_len~54`; `[resolved-cfg]` unchanged except those; `t_wm` closer to P116 ~98 s if opscale is the remaining extra; orig-P1 timing P116-class (~87).
+- **Mechanism:** `derive_all` feeds `dead_time_fastest_identified=np.min(all_dead)` into `derive_sample_rate` (`sr ≤ round(θ/2)`). P120: 16 pairs, median θ=8, **one** MV repeat θ=6 (REFLUX r4; DV all 8) → sr **3** H **74**. P116 min=7 → sr **4** H **54**. Median θ already lives as `dead_time_identified`. Use **`dead_dom` for the sample-rate cap**; keep `dead_time_fastest=min` as a diagnostic / lookback note. Do **not** rename min→median on the fastest field (that would silently retune lookback).
+- **Predicted signature:** test_sim `sr=4` `H~54` `gmatch_len~54`; `[resolved-cfg]` opscale still ON; `t_wm` closer to P116 ~98 s if opscale is the remaining extra; orig-P1 timing P116-class (~87); first-fill wrap depth closer to P116 0.22 / unlock +2 iters.
 - **Falsifier:** sr still 3; **or** a real fast channel is undersampled (lookback/TM @H worse than P116 with no other change).
-- **Files:** `utils/dynamics_identifier.py` (`dead_time_fastest`); `utils/plant_init.py:derive_sample_rate` (comment/tests). No `DREAMER_SAMPLE_RATE=4` pin.
-- **Why this before opscale KEEP/REVERT:** P120 mixes opscale + sr + ol1-gone. Family still open; N+1 opscale would be lottery.
+- **Files:** `utils/plant_init.py:derive_all` (pass `dead_dom` into `derive_sample_rate`); smoke: dyn with `dead_fast=6` / `dead_dom=8` must auto-sr **4**. Optional comment in `utils/dynamics_identifier.py`. No `DREAMER_SAMPLE_RATE=4` pin.
+- **Why this before opscale KEEP/REVERT:** P120 mixes opscale + sr + ol1-gone. Family still open; N+1 opscale would be lottery. Wrap-deeper-than-P116 is the same confound until sr matches.
 
 **#3 After `srmed` VALID:** score opscale vs P116 R1 TM (autoencoder ×0.706). If TM << P116 with sr matched → gate `op_scale_net` when rest-IC `|G|` span ≲ 1.3× (linear identity; SysID-derived, not a test_sim magic). If TM ≥ P116 → KEEP opscale as default even on linear. **Do not** identity-regularizer λ lottery.
 
@@ -102,11 +104,11 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 
 ## RCA this visit
 
-- SysID: test_sim **θ_dom=8** stable; **θ_fast=min** is a 6–7 s lottery that flips `sr` 3/4 and `H` 74/54. P120 is that draw. Nonlinear OP-span (2.23×) is a different plant — do not mix.
-- Signal: P120 P1 healthy @19 (recon 0.009, skip 0, no Inf). `opdev` **0.68** = LPV last Linear trained, not a linear-identity stay. Probe@10 not GAIN-READY (same class as P116@10). jsonl MV ×1 is teacher. Disk `/home` 64% / 62G. No rolling `ckpt_iter`. Keep P120+P119+P118+P117+P116+P64+P53.
+- SysID: test_sim **θ_dom=8** (12/16 pairs). **θ_fast=min** is one noisy MV repeat (P120 r4 θ=6; P116 min=7) that flips `sr` 3/4 and `H` 74/54. Not a fast DV. Nonlinear OP-span (2.23×) is a different plant — do not mix.
+- Signal: P120 P1 pre-wrap healthy (recon 0.003@36, skip 0, no Inf). First-fill wrap @37 is **P116-class** (fill@32) but deeper (0.54 vs 0.22) and still locked @42. last_ok **36** / `wm_best` **30** are the observer; live probe@40 is detonated weights. `opdev` **0.68→0.89** = LPV last Linear, not identity. Disk `/home` 64% / 62G. Live keep-2 `ckpt_iter`. Keep P120+P119+P118+P117+P116+P64+P53.
 - Control: do not score actor. R2 still open on P116 (rev 0.421). Do not kill / second GPU / extra-P1 / `gop`.
-- ML: identity-init opscale is **not** an identity prior after step 0 (hidden MLP + last Linear in group `g`). That is why linear `opdev` matches P119 ~0.8, not 0.
+- ML: identity-init opscale is **not** an identity prior after step 0 (hidden MLP + last Linear in group `g`). That is why linear `opdev` matches P119 ~0.8, not 0. P42 20× lock + P49 wrap-unlock are working (P116 unlocked +2 iters; P120 not yet under 0.061).
 - Plant: locgfix identity on test_sim CONFIRMED (`|du_mv|=step`, local G ≈ ident).
-- Metric: residual_board IAE **overwrite** when return keys missing — P119 64.36 was npz sum, summary median-of-medians **20.3**. **Fixed** (`evaluation/residual_board.py`); boards rewritten. Trust JSON IAE + npz return-to-limit. `wm_op_scale_dev~0` on trial as linear-identity test.
+- Metric: wrap recon / live TM-probe while `last_ok_locked` are **not** opscale scores. jsonl ×1 is teacher. Trust JSON IAE + npz return-to-limit. `wm_op_scale_dev~0` on trial as linear-identity test.
 
 P117 process died mid-P2 (SIGKILL). P118 completed P2 then `[p3-skip]`. P119 completed P2 then **P3 then EXIT VALID**. Do not identity-relaunch P117, P118, or P119.
