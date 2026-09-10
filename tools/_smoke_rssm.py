@@ -4201,6 +4201,13 @@ def _test_gain_match_rest_ic() -> None:
     gm_loc, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
     assert abs(float(gm_id) - float(gm_loc)) > 1e-6, (
         f'local G unused (id={float(gm_id):.6f} loc={float(gm_loc):.6f})')
+    cfg._gain_match_local_g_logged = False
+    cfg._op_scale_identity_held = True
+    gm_held, _ = _wm_gain_match_loss(model, feats.detach(), obs, act, cfg)
+    assert abs(float(gm_id) - float(gm_held)) < 1e-6, (
+        f'held must ignore local G (id={float(gm_id):.6f} '
+        f'held={float(gm_held):.6f})')
+    cfg._op_scale_identity_held = False
     cfg._gain_match_rest_local_g = None
     import inspect as _ins
     _gm_src = _ins.getsource(_wm_gain_match_loss)
@@ -4215,6 +4222,8 @@ def _test_gain_match_rest_ic() -> None:
     assert 'OL G_K vs sg(1-step)' not in _gm_src
     assert 'g_1s_sg = g_1s.detach()' not in _gm_src
     assert 'Huber G_tgt = rest-IC plant FD' in _gm_src
+    assert 'Huber G_tgt = SysID median' in _gm_src
+    assert '_op_scale_identity_held' in _gm_src
     assert '_gain_match_rest_local_g' in _gm_src
     assert 'prev_state=st_b' in _gm_src
     assert "getattr(st0, 'kv_cache', None) is not None" in _gm_src

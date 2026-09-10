@@ -8836,12 +8836,22 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
                     and int(lg_t.shape[0]) == int(n_mv_t + n_dv_t)
                     and int(lg_t.shape[1]) == int(Bm)
                     and int(lg_t.shape[2]) == n_cv_g):
-                local_g = lg_t
-                if not getattr(cfg, '_gain_match_local_g_logged', False):
-                    print('[gain-match] Huber G_tgt = rest-IC plant FD '
-                          '(P118; not SysID median)',
-                          flush=True)
-                    cfg._gain_match_local_g_logged = True  # type: ignore[attr-defined]
+                # P124: identity-held linear plant uses SysID-median
+                # G_tgt (P116 teacher). Rest-IC plant FD stays the
+                # nonlinear (unheld) teacher and a diagnostic print.
+                if getattr(cfg, '_op_scale_identity_held', False):
+                    if not getattr(cfg, '_gain_match_local_g_logged', False):
+                        print('[gain-match] Huber G_tgt = SysID median '
+                              '(opscale held)',
+                              flush=True)
+                        cfg._gain_match_local_g_logged = True  # type: ignore[attr-defined]
+                else:
+                    local_g = lg_t
+                    if not getattr(cfg, '_gain_match_local_g_logged', False):
+                        print('[gain-match] Huber G_tgt = rest-IC plant FD '
+                              '(P118; not SysID median)',
+                              flush=True)
+                        cfg._gain_match_local_g_logged = True  # type: ignore[attr-defined]
     # P68 rest-pre: plant rest is ``cv_base``.  The held-K decode is
     # unused — skip that extra ``Bm×K`` prior roll (test_sim 3→2 rolls).
     # PRBS fallback still needs held-K ``cv_base``.
