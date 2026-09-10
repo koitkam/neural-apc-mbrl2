@@ -3361,31 +3361,144 @@ def _test_pin_eval_modules() -> None:
 
 
 def _test_control_quality_gates() -> None:
-    """Empty scripted pairs must not 0-vs-0 pass (P49 false all_pass)."""
+    """Empty scripted pairs must not 0-vs-0 pass (P49 false all_pass).
+
+    ``smooth_pass`` is CV d2/reversal, not mv_reversal (MV chatter allowed).
+    """
     from evaluation.validate import control_quality_gates
     empty = control_quality_gates([])
     assert empty['beats_baseline_pass'] is False
     assert empty['n_scripted_pairs'] == 0
     assert empty.get('control_gate_skipped') == 'no_scripted_disturbance_pairs'
+    assert empty['smooth_pass'] is False
     seeded = control_quality_gates(
         [],
-        seed_metrics=[{'kpi_mv_reversal_rate': 0.1, 'kpi_economic_score': -700.0}],
+        seed_metrics=[{
+            'kpi_mv_reversal_rate': 0.9,
+            'kpi_economic_score': -700.0,
+            'kpi_cv_d2_rms_normed': 0.01,
+            'kpi_cv_reversal_rate': 0.10,
+        }],
     )
     assert seeded['beats_baseline_pass'] is False
     assert abs(float(seeded['agent_economic_score']) + 700.0) < 1e-9
     assert seeded['smooth_pass'] is True
+    noisy = control_quality_gates(
+        [],
+        seed_metrics=[{
+            'kpi_mv_reversal_rate': 0.05,
+            'kpi_economic_score': -10.0,
+            'kpi_cv_d2_rms_normed': 0.20,
+            'kpi_cv_reversal_rate': 0.10,
+        }],
+    )
+    assert noisy['smooth_pass'] is False
     paired = control_quality_gates([{
-        'episode_metrics_agent': {'mv_reversal_rate': 0.1, 'economic_score': -50.0},
+        'episode_metrics_agent': {
+            'mv_reversal_rate': 0.8,
+            'economic_score': -50.0,
+            'cv_d2_rms_normed': 0.02,
+            'cv_reversal_rate': 0.12,
+        },
         'episode_metrics_baseline': {'economic_score': -90.0},
     }])
     assert paired['beats_baseline_pass'] is True
+    assert paired['smooth_pass'] is True
     assert abs(float(paired['agent_economic_score']) + 50.0) < 1e-9
     worse = control_quality_gates([{
-        'episode_metrics_agent': {'mv_reversal_rate': 0.1, 'economic_score': -200.0},
+        'episode_metrics_agent': {
+            'mv_reversal_rate': 0.1,
+            'economic_score': -200.0,
+            'cv_d2_rms_normed': 0.02,
+            'cv_reversal_rate': 0.12,
+        },
         'episode_metrics_baseline': {'economic_score': -90.0},
     }])
     assert worse['beats_baseline_pass'] is False
-    print('[smoke] OK  control_quality_gates empty records do not 0-vs-0 pass')
+    assert worse['smooth_pass'] is True
+    print('[smoke] OK  control_quality_gates CV-smooth; empty records do not 0-vs-0 pass')
+
+
+def _test_residual_board_cv_metrics() -> None:
+    """CV d2/reversal/headroom/viol_frac; residual_board R1 from TM JSON."""
+    from pathlib import Path
+    import numpy as np
+    from evaluation.validate import compute_episode_metrics, compute_event_response_metrics
+    from evaluation.residual_board import (
+        build_residual_board, curve_iae_normed, cv_smooth_pass)
+    T = 40
+    lo, hi = 80.0, 90.0
+    y = np.full(T, 80.4, dtype='float32')  # hug lo, headroom 0.04
+    y[10:13] = 80.6  # tiny bump, not a reversal storm
+    ep = {
+        'states': y.reshape(T, 1),
+        'controls': np.zeros((T, 1), dtype='float32'),
+        'episode_length': T,
+        'cv_indices': [0],
+        'mv_bounds': [[20.0, 80.0]],
+        'cv_bounds': [[lo, hi]],
+        'cv_side_scale': [{'lo': 0.4, 'hi': 1.0}],
+        'cv_target_enabled': [False],
+        'raw_rewards': np.zeros(T, dtype='float32'),
+        'mean_cv_violation': 0.0,
+        'mean_mv_violation': 0.0,
+        'cum_raw_reward': 0.0,
+        'schedule': [{'start': 8, 'name': 'step'}],
+        'sample_rate': 4,
+    }
+    m = compute_episode_metrics(ep)
+    assert m['cv_econ_side'] == 'lo'
+    assert 0.03 < float(m['cv_opt_headroom']) < 0.08
+    ep_hi = dict(ep, mv_cv_gain_sign=-1.0)
+    m_hi = compute_episode_metrics(ep_hi)
+    assert m_hi['cv_econ_side'] == 'hi'
+    assert 0.90 < float(m_hi['cv_opt_headroom']) < 0.98
+    assert float(m['cv_viol_frac']) == 0.0
+    assert float(m['cv_d2_rms_normed']) <= 0.05
+    assert float(m['cv_reversal_rate']) <= 0.25
+    osc = y.copy()
+    osc[::2] = 84.0
+    osc[1::2] = 86.0
+    ep_osc = dict(ep, states=osc.reshape(T, 1))
+    m_osc = compute_episode_metrics(ep_osc)
+    assert float(m_osc['cv_d2_rms_normed']) > 0.05
+    ev = compute_event_response_metrics(ep, window_steps=20)
+    assert 'cv_return_headroom' in ev
+    assert ev['cv_return_headroom']['n'] >= 1
+    iae = curve_iae_normed([0.0, 0.5, 1.0], [0.0, 1.0, 1.0], 1.0)
+    assert 0.15 < iae < 0.25
+    assert cv_smooth_pass(0.01, 0.10) is True
+    assert cv_smooth_pass(0.20, 0.10) is False
+    board = build_residual_board(Path('/tmp/no-such-val-dir'), summary={
+        'fidelity_gates': {'beats_baseline_pass': True, 'agent_economic_score': -8.0},
+        'disturbance_rejection': [{
+            'episode_metrics_agent': {
+                'cv_d2_rms_normed': 0.02,
+                'cv_reversal_rate': 0.1,
+                'cv_opt_headroom': 0.12,
+                'cv_viol_frac': 0.0,
+                'cv_econ_side': 'lo',
+            },
+            'event_response': {
+                'iae_window_normed': {'median': 4.0},
+                'cv_return_headroom': {'median': 0.15},
+                'cv_return_time_frac': {'median': 0.4},
+            },
+        }],
+        'wm_posterior_prior_decomp': {
+            'decomp_1step_to_openloop': 0.85,
+            'dominant_lever': 'compounding',
+        },
+        'wm_disturbance_prediction': {
+            'mean_pearson_r_detrended': 0.34,
+            'mean_r2_detrended': -4.0,
+            'per_channel': [{'pred_std': 7.1, 'true_std': 3.1}],
+        },
+    })
+    assert board['r2']['smooth_pass'] is True
+    assert abs(board['r1']['ol_1step_ratio'] - 0.85) < 1e-9
+    assert abs(board['r3']['det_r'] - 0.34) < 1e-9
+    print('[smoke] OK  residual_board CV metrics + R1/R2/R3 assemble')
 
 
 def _test_require_realsim_actor() -> None:
@@ -7098,6 +7211,7 @@ if __name__ == '__main__':
     _test_expert_move_law_cfg()
     _test_pin_eval_modules()
     _test_control_quality_gates()
+    _test_residual_board_cv_metrics()
     _test_require_realsim_actor()
     _test_rssm_param_grad_snapshot()
     _test_gain_match_per_input_huber()

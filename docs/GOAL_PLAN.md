@@ -4,33 +4,46 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: `nonlinear_sim` HeatExchangerTower (**P119 locgfix EXIT=0 VALID** — orig-P1@**91 FAIL 0.63@MV**; extra-P1@**101 PASS** last_ok **100** GAIN-READY **0.83@MV**; lottery **closed**; P2→P3@**158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire; val MV **×0.758 / @H ×0.922** vs P118 **×0.609 / ×0.705**; then **return-to-`test_sim`**).
+Plant this cycle: **return-to-`test_sim`** (**P120 `tshome`** launching). Cadence: P117+P118 were the two `nonlinear_sim` jobs; P119 was the fair locgfix repeat. **P120 `gop` stays PARKED.**
 
-## Residual board vs champions (test_sim unless noted)
+## Residual board vs champions (from `validation/residual_board.json`)
 
-| Axis | Score we trust | Champion | Last VALID (P116) | This plant P119 val (`best.pt`, VALID) vs P118 | Status |
+| Axis | Score we trust | Champion | P116 test_sim (`best.pt`, VALID) | P119 nonlinear_sim (`best.pt`, VALID) | Status |
 |---|---|---|---|---|---|
-| R1 TM MV ss/@H / curve | val TM, not jsonl ×1 | P26 ×0.973 / @H ×0.880 | ×0.706 / ×0.711 | ss **×0.758** / @H **×0.922** curve IAE/\|real\| **0.15** (wm +0.693 vs real +0.914). vs P118 **×0.609 / ×0.705** curve **0.35**. Freeze last_ok **100** **0.83@MV** (extra-P1 confound; orig-P1 **0.63**) | KEEP vs P118; OPEN vs P26 |
-| R1 TM DV ss/@H / curve | same | P64 ×0.893 / @H ×0.962 | ×0.692 / ×0.712 | ss **×0.942** / @H **×0.950** curve IAE/\|real\| **0.08** (wm −0.390 vs real −0.414). vs P118 **×0.799 / ×0.703**. Lineage HEALTHY rel_err **0.06** | KEEP vs P118; OPEN vs P64 (test_sim) |
-| R1 compounding | 1step→OL | P64 ×0.85 | ×0.911 | MV **×0.846** (OL-vs-real **×0.783**) lever=**compounding** (post **×0.960** / 1step **×0.962**). vs P118 **×1.045** lever=autoencoder | KEEP vs P118 autoencoder; OPEN vs P64 |
-| R2 CV smoothness | worst-seed `cv_d2_rms_normed`≤0.05 AND `cv_reversal_rate`≤0.25 | — | P116 `smooth_pass` | suite does not emit `cv_d2_rms_normed`. `smooth_pass=True` (mv_reversal **0.171** all-eps / **0.196** DR) — on trial | OPEN |
-| R2 headroom / viol | `cv_opt_headroom`, `cv_viol_frac` (not a P3-skip gate) | — | hugging 0.35; mv_viol 1.67 | suite does not emit those names. hugging **0.384** all-eps / **0.316** DR; cv_viol **16.7**; mv_viol **2.79**. vs P118 cv_viol **35.4** / mv_viol **1.90** | OPEN |
-| R3 Kalman | `det_r` + pred_std vs true | P26 det_r 0.68 | 0.676 / 1.479 vs 1.93 | det_r **0.346** R²_det **−4.27** pred_std **7.10 vs true 3.07**. vs P118 det_r **0.343** pred_std **3.00 vs 3.07**. Event IAE mom **20.3** vs P118 **29.2** | det_r ~P118; **FALSIFIED amp** |
-| Actor econ | paired vs baseline **and** P64; only if `actor_experiment_valid` | P64 −4.54 vs −94 | −8.24 vs −109.83 VALID | paired **−32.11 vs −230.94** **9/9** VALID. cum_raw **−55585** (36). `critic_r` **+0.253** FAIL (`all_pass=False`). vs P118 expert-BC **−38.39 vs −212** INVALID. Do **not** swap P64 (different plant) | VALID vs baseline; OPEN vs P64 |
+| R1 TM MV ss/@H / curve | val TM + `curve_iae_normed` | P26 ×0.973 / @H ×0.880 | ss **×0.706** / @H **×0.711** curve **0.262**. lever=**autoencoder** | ss **×0.758** / @H **×0.922** curve **0.143**. vs P118 ×0.609 / 0.35 | OPEN vs P26; P119 KEEP vs P118 |
+| R1 TM DV ss/@H / curve | same | P64 ×0.893 / @H ×0.962 | ×0.692 / ×0.712 | ×0.942 / ×0.950 curve **0.080** | P116 OPEN; P119 DV HEALTHY vs P64 |
+| R1 compounding | 1step→OL | P64 ×0.85 | **×0.911** (better than P64) | **×0.846** OL **×0.783** lever=compounding | test_sim family **closed**; nonlinear OPEN |
+| R2 CV smoothness | worst-seed d2≤0.05 AND rev≤0.25 | — | d2 **0.034** PASS; rev **0.421** FAIL. `smooth_pass=False` | d2 **0.053** FAIL; rev **0.395** FAIL. `smooth_pass=False` | OPEN (CV oscillation). Suite `smooth_pass` is now this gate |
+| R2 headroom / viol | `cv_opt_headroom`, `cv_viol_frac` | — | econ=**hi** (G<0). head **0.183** / viol_frac **0.112**. Not mid-band | econ=**lo** (G>0). head **0.116** / viol_frac **0.445** | P116 headroom OK; P119 viol OPEN |
+| R3 Kalman | `det_r` + pred_std vs true | P26 det_r 0.68 | **0.676** / **1.48 vs 1.93** | **0.346** / **7.10 vs 3.07** | P116 near champ; P119 amp FALSIFIED |
+| R3 return-to-limit | `cv_return_headroom` / `cv_return_time_frac` | — | ret_h **0.135** ret_t **0.022** (returns to hi) | ret_h **0.146** ret_t **0.030** | P116 IAE-without-return was a **wrong-bound** artefact |
+| Actor econ | paired vs baseline **and** P64; VALID only | P64 −4.54 vs −94 | **−8.24 vs −109.83** 9/9 VALID | **−32.11 vs −230.94** 9/9 VALID. `critic_r` FAIL | Do not swap P64 |
 
-No standalone `residual_board.json` — axes above are `validation_summary.json` + TM/decomp/dist JSON. Files agree with `[val]` plot lines (MV real=+0.914 wm=+0.693; DV ss 0.94; decomp 0.960/0.962/0.846; det_r 0.346).
+P119/P116 boards were backfilled from TM/decomp/dist JSON + `disturbance_rejection.npz` (this visit). P120 val writes the board live. Files agree with `[val]` plot lines.
 
 ## Metric audit (trusted vs on trial)
 
-**Trusted:** val TM ss/@H/curve_iae (MV and DV); gain decomp real→post / post→1step / 1step→OL; `det_r` + pred_std vs true; paired econ vs baseline **and** champion when freeze GAIN-READY and P3 ran; CV d2/reversal (`cv_d2_rms_normed` + `cv_reversal_rate` — **not** the suite's current `smooth_pass`); `cv_opt_headroom` / `cv_viol_frac`; DR `cv_return_headroom` / `cv_return_time_frac`. Skip-storm 5-level TM (`DCgain_ratio` / `@H` / `compound_ok`) is a freeze/RCA diagnostic, not a champ score. Launch `|du_mv|` vs teacher `step` (P119 print): O(step) = WM-norm; ≫5×step = engineering-unit bug. jsonl `wm_op_scale_dev` is observability that LPV moved, not a TM score. Post-restore recon + skip **this-iter** (P119 P2-end @158 recon **0.0527** skip **0**) is the skip-storm liveness check, not a TM score. Val `[val]` "P3: 11 grad-clip skips" is **cumulative** `n_grad_skip=11` from P1 storm-1, not P3 this-iter (P3 skip_iter **0**).
+**Trusted:** val TM ss/@H/`curve_iae_normed` (MV and DV); gain decomp; `det_r` + pred_std vs true; paired econ vs baseline **and** champion when freeze GAIN-READY and P3 ran; **CV d2/reversal** (`cv_d2_rms_normed` + `cv_reversal_rate` — this **is** `smooth_pass` as of P120); `cv_opt_headroom` / `cv_viol_frac` with econ side = **sign(SysID MV→CV gain)** (G<0 hug hi / G>0 hug lo — not `cv_side_scale`); DR `cv_return_headroom` / `cv_return_time_frac` on that same bound. Skip-storm 5-level TM is freeze/RCA, not a champ score.
 
-**On trial / do not GPU-optimize:** jsonl teacher ×1 vs SysID median (tautology on OP-varying plants — P117); **P119 jsonl `gain_match_mv_ratio` vs local rest-IC G** (honest after locgfix: orig-P1 jsonl MV **×0.991** while 5-level TM **0.63@MV** vs identified **2.71** — teacher pin ≠ GAIN-READY); **P118 jsonl `gain_match_mv_ratio` vs local G** (teacher Δu was engineering `_prev_control` − WM-norm action → local MV G **0.015** vs identified **2.63**; extra-P1@98 jsonl MV **1.20** and cap last_ok@108 jsonl MV **0.71** are still vs G≈0.015, not TM); ss-ratio alone; lineage `wm_gain_pass` (P118 rel_err=0.39 PASS while GAIN-READY failed); mv_reversal as a smoothness gate (**suite `smooth_pass` still keys `mv_reversal_rate≤0.5`** in `evaluation/validate.py:control_quality_gates` — gamed vs the standing residual; `compute_episode_kpis` still emits only `mv_reversal_rate` / `mv_bound_hugging_score`, not CV d2); CV total variation as a smoothness gate; critic_r without `critic_rew_to_tgt_var`; raw dist R²; pred_std matching true_std when R²_det is −0.96; event IAE without return-to-limit; VALID 9/9 / GAIN-READY / all_pass / family-closed as “residual closed”; beating P64 to KEEP a smoothness/headroom/DR win; **`wm_grad_norm=inf` at a skip-storm restore** (P118@13) as a kill; **finite `wm_grad_norm` 5e17 on a skip-storm iter** (P119@77) as a kill; **20× lock + inject@76** as a kill; **recon-spike ~3 iters after P1 inject** as a kill; **persist_rel spikes to 31** as a kill; **H=1 / H=56 fidelity r** as a freeze score (`wm_best` @80 EMA **6.299** is gain-blind; Probe@100 H=56 **+0.590** / conv **0.25**); **skip-storm 1 last_ok TM 0.56@MV** as a freeze score (READY-only cap deferred; orig-P1@91 is the fair locgfix miss); **P119 extra-P1 last_ok 100 GAIN-READY 0.83@MV** as the champ freeze (lottery closed — orig-P1 **0.63@MV** is the fair miss; val TM is the score); **skip-storm 2 0.02@MV** as a last_ok freeze score; **extra-P1@98 live TM 0.11@MV** as the freeze score (cap used last_ok **108** **0.68@MV**); **P118 expert-BC paired −38 vs −212** as actor-econ; **mutating stored gain-c in-place as the P120 `gop` mechanism** (would fight P73 persist 0.1).
-
-P118 EXIT: DV local G **−0.345** vs ident **−0.426** (same space, OK). MV local G is the unit bug, not equal-% OP variation. LPV `wm_op_scale_dev` **0.52→0.99** then **~0.86–0.93** while Huber MV target ≈0 — do not score LPV from this pid. Freeze TM **0.68@MV / 0.85@DV** is last_ok **108** (recon-best **0.0073**), not live detonated g. Val TM **×0.609/@H ×0.705** is the same under-gained observer, not a new LPV result.
+**On trial / do not GPU-optimize:** jsonl teacher ×1 vs SysID median; jsonl `gain_match_mv_ratio` vs local G (teacher pin ≠ GAIN-READY); ss-ratio alone; lineage `wm_gain_pass`; **mv_reversal as a smoothness gate** (now diagnostic only; `mv_reversal_rate_observed` still logged); CV total variation as a smoothness gate; critic_r without `critic_rew_to_tgt_var`; raw dist R²; event IAE without return-to-limit; VALID 9/9 / GAIN-READY / all_pass / family-closed as “residual closed”; beating P64 to KEEP a smoothness/headroom/DR win; **`cv_side_scale` as the economic riding bound** (it is violation urgency; P116 “headroom 0.82 / never returns” was hugging **hi** scored against **lo**).
 
 ## Closed families (do not N+1)
 
-extra-P1 as freeze (P41; **P117 on this plant**; **P118 extra-P1 0.11@MV worse than orig-P1 0.34@MV**); compounding-teacher Huber (P111 traj unpromoted, P115 k1 REVERT, P116 ol1 REVERT); isolation-off KEEP as default; 2TS-α as champ; kfeat as freeze; quiet_env as freeze; decoder FF; TSSM; GRU keep-h.
+extra-P1 as freeze (P41; **P117**; **P118**); compounding-teacher Huber (P111 traj unpromoted, P115 k1 REVERT, P116 ol1 REVERT); isolation-off KEEP as default; 2TS-α as champ; kfeat as freeze; quiet_env as freeze; decoder FF; TSSM; GRU keep-h.
+
+## P120 `tshome` — next GPU (this visit, mode 3)
+
+**Mechanism:** cadence return-to-`test_sim` on HEAD. Attributed train delta vs last VALID test_sim (P116): **opscale ON** (P118 default, unfalsified — P118 was teacher-units) + **ol1 gone** (REVERT) + **locgfix** (identity if test_sim Δu already WM-norm). Val emits `residual_board.json`; `smooth_pass` is CV d2/reversal. **No new TrainConfig / no `DREAMER_*`.** Tag `run_p120_tshome`. tmux `mbrl2_p120`.
+
+**Largest residual this plant:** R1 TM autoencoder (MV ×0.706 / curve 0.262 vs P26 ×0.973) and R2 CV reversal **0.421** (`smooth_pass` FAIL; d2 0.034 PASS). Compounding ×0.911 is **not** the hole. Headroom **0.183** on **hi** (G<0) with ret_t **0.022** — limit-return is not the hole. Critic rtgt standing — do not stack knobs.
+
+**Predicted signature:** `[resolved-cfg] opscale=True` no ol1; locgfix `|du_mv|`≈step; jsonl `wm_op_scale_dev`~0 (linear plant); orig-P1 GAIN-READY P116-class; val writes residual_board; TM MV not worse than P116 ×0.706 by a collapse.
+
+**Falsifier:** `wm_op_scale_dev` moves and TM << P116 → LPV hurts linear plant (gate/REVERT opscale). Orig-P1 GAIN_NOT_READY with healthy recon → freeze×opscale. Val TM much worse with scale_dev~0 → HEAD drift, not opscale.
+
+**Do not:** extra-P1 N+1; ol1/k1/traj N+1; identity-relaunch P116/P119; launch `gop`; stack critic knobs; second GPU.
+
+Config audit Step 4: env-free HEAD. #❌ **0** #🆕 **0**. vs P116 resolved-cfg: drop `gmatch_ol1=True` (code removed); add `opscale=True` (already default). No env-overrides.
 
 ## P118 EXIT — `opscale` INVALID observer (do not score / do not FALSIFY opscale)
 
@@ -44,9 +57,9 @@ tmux `mbrl2_p118` **gone**. pid **551549 DEAD**. sha **`ff5f84c`**. **EXIT=0** 1
 
 **Judge:** locgfix **already on HEAD** (`414eca4`). **Not** an opscale FALSIFY. extra-P1 lottery closed. Next was **P119 `locgfix`** (now EXIT VALID). Champion **P64**. Dist champ **P26**.
 
-## P119 EXIT — `locgfix` VALID (do not identity-relaunch / do not P120 this GPU)
+## P119 EXIT — `locgfix` VALID (do not identity-relaunch / do not launch `gop`)
 
-tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 406 jsonl iters ES `p3_plateau` (no >+1.0% over `best_det_return=−131.981` for 200 iters) best **206**. env_steps **1645000**. nvidia **0 MiB**. `best.pt` + `final.pt`. Val ckpt **`best.pt`**. `actor_experiment_valid=true`. jsonl NaN/Inf **0**. Env-free (`CUDA_VISIBLE_DEVICES=0`, no `DREAMER_*`). `[resolved-cfg] opscale=True` no ol1. Train start **2026-09-09 14:10:33**. **`[p3-skip]` did not fire.** P3 **159–406** (248 iters) skip_iter **0** (cum skip **11** is P1 storm-1). Critic-warmup 159–168; `[return-scale] FREEZE` **2.128** @169; unfreeze @169. @406 actor **+0.116** critic **9.51** ent **−0.467** logp **0.54** clip **0.10** rscale **2.13** rtgt **0.00067** `critic_pred_target_r` **0.991**. **Do not identity-relaunch.** **Do not launch P120 `gop` this GPU** (val TM **×0.758**, not ~P118 ×0.61). Next GPU: **return-to-`test_sim`**.
+tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 406 jsonl iters ES `p3_plateau` (no >+1.0% over `best_det_return=−131.981` for 200 iters) best **206**. env_steps **1645000**. nvidia **0 MiB**. `best.pt` + `final.pt`. Val ckpt **`best.pt`**. `actor_experiment_valid=true`. jsonl NaN/Inf **0**. Env-free (`CUDA_VISIBLE_DEVICES=0`, no `DREAMER_*`). `[resolved-cfg] opscale=True` no ol1. Train start **2026-09-09 14:10:33**. **`[p3-skip]` did not fire.** P3 **159–406** (248 iters) skip_iter **0** (cum skip **11** is P1 storm-1). Critic-warmup 159–168; `[return-scale] FREEZE` **2.128** @169; unfreeze @169. @406 actor **+0.116** critic **9.51** ent **−0.467** logp **0.54** clip **0.10** rscale **2.13** rtgt **0.00067** `critic_pred_target_r` **0.991**. **Do not identity-relaunch.** **Do not launch P120 `gop`** (val TM **×0.758**, not ~P118 ×0.61). Next GPU this visit: **P120 `tshome`** return-to-`test_sim`.
 
 **Teacher print (locgfix CONFIRMED):** local G `plant_fd=6/6` mean MV **2.890** / DV **−0.341** vs identified **2.709 / −0.435**. span MV **2.01** / DV **0.46**. `|du_mv|=0.4000` **=** step **0.4000**. **No** WARNING. jsonl MV O(1) since ~@5.
 
@@ -60,19 +73,23 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 
 **Judge:** ✅ KEEP locgfix as **teacher-unit fix** vs P118 0.015 / val ×0.609. ✅ KEEP as **P3-entry** vs P118 `[p3-skip]`. ❌ extra-P1 as freeze KEEP (orig-P1 **0.63@MV** is the fair miss; freeze last_ok **100** 0.83@MV transferred to val ×0.758, not P109-class collapse). ❌ **FALSIFIED as TM-to-P26** (×0.758 vs ×0.973). Remaining R1 hole is **compounding**. ❌ **FALSIFIED as Kalman amp** (pred_std 7.10 vs 3.07; det_r ~P118 0.343). Actor **VALID** vs baseline; **do not swap P64** (different plant). **P120 `gop` PARKED** — trigger was val TM still ~×0.61; it is ×0.758. Cadence: fair plant verdict done. GPU **free**. Do **not** extra-P1 N+1 / identity-relaunch P117/P118/P119 / rewrite locgfix / in-place `c*=gop`.
 
-## Ranked follow-ups (GPU free — do not launch this visit)
+## Ranked follow-ups
 
-1. **Return-to-`test_sim`** (next GPU, not this visit) on the worst residual: compounding / R2 headroom / critic_rew_to_tgt_var (P3 rtgt collapse is standing — do not stack knobs). Cadence: P118 was job 2 of 2; P119 was the fair locgfix repeat. Stay on `nonlinear_sim` only if a teammate overrides.
-2. **CPU:** emit `validation/residual_board.json` at val with R1 (ss/@H/curve_iae MV+DV, 1step→OL), R2 (`cv_d2_rms_normed`, `cv_reversal_rate`, `cv_opt_headroom`, `cv_viol_frac` — **stop using `mv_reversal` as `smooth_pass`**), R3 (`det_r`, pred_std vs true, event IAE, `cv_return_headroom`, `cv_return_time_frac`). `control_quality_gates.smooth_pass` currently keys `mv_reversal_rate≤0.5` (`evaluation/validate.py`) — that gate is obsolete. Not this EXIT visit (docs + commit only).
-3. **Parked if they return to this plant:** encode L=`identified_lookback=131` vs `seq_len=128` (3-sample shortfall; not this freeze). Then **P120 `gop`**: OP-conditioned gain-c readout at GRU+decode **use**; do **not** mutate stored `c` (P73 persist). Separate `gain_op_net`. Banner `gop=True`. jsonl `wm_gain_op_dev`. `op_scale_net` KEEP. Group `g`. No new TrainConfig / no `DREAMER_*`.
+**#1 P120 `tshome` — LAUNCHING this visit.** Return-to-`test_sim` on HEAD (opscale ON + ol1 gone + locgfix). Spec above. Largest residual this plant: R1 TM autoencoder (×0.706 vs P26) and R2 CV reversal **0.421** — not compounding, not mid-band.
+
+**#2 P120 `gop` (PARKED)** — **do not launch**. P119 val TM **×0.758** is **not** ~×0.61. Closed-family N+1 unless a later P119-class TM is ~×0.61. Encode L=`identified_lookback=131` vs `seq_len=128` stays parked with it.
+
+**#3 CPU residual_board** — **landed this visit.** Val writes `validation/residual_board.json`. Suite `smooth_pass` is CV d2/reversal.
+
+**Do not:** extra-P1 N+1, ol1 N+1, identity-relaunch P117/P118/P119, launch `gop`, stack critic knobs, second GPU.
 
 ## RCA this visit
 
 - SysID: OP-varying DC is real (equal-% + 1/feed; MV amp **2.23×** / DV **2.34×**). Median G is still the wrong pin **once local G is in WM-norm**. P118 local MV 0.015 is units, not that 2.23× span.
 - Signal: P119 locgfix teacher CONFIRMED. **Orig-P1@91 FAIL 0.63@MV**. **Extra-P1@101 PASS** last_ok **100** GAIN-READY **0.83@MV** 1step→OL **0.86** (lottery closed — not a KEEP). **P2→P3@158 PASS** MTP **1.180**; `[p3-skip]` did **not** fire. End-P2 K **0.167/3.52** leftover **0.159** std **0.885** skip **0**. P3 ran then ES `p3_plateau` @406 best **206**. Val MV **×0.758 / @H ×0.922** vs P118 **×0.609 / ×0.705**. GPU **0 MiB**. Disk `/home` 64% / 62G. Keep P119+P118+P117+P116+P64+P53.
-- Control: freeze last_ok **100** GAIN-READY → P3 **did run**. `actor_experiment_valid=true`. Score actor: paired **−32.11 vs −230.94** 9/9; `critic_r` FAIL. Do not kill (already EXIT) / second GPU / extra-P1 N+1 / identity-relaunch / P120 this GPU.
+- Control: freeze last_ok **100** GAIN-READY → P3 **did run**. `actor_experiment_valid=true`. Score actor: paired **−32.11 vs −230.94** 9/9; `critic_r` FAIL. Do not kill (already EXIT) / second GPU / extra-P1 N+1 / identity-relaunch / launch `gop`.
 - ML: Orig-P1 **0.63@MV** is the fair locgfix miss. extra-P1 last_ok **100** **0.83@MV** is P100-class confound; freeze→val TM **×0.758** (KEEP vs P118 ×0.609, FALSIFIED vs P26). Remaining R1 hole is compounding (1step→OL **×0.846**). Kalman amp **FALSIFIED** (pred_std **7.10 vs 3.07**). LPV `wm_op_scale_dev` **~0.80** at P1 / **0** in P3 (frozen). Detonated-freeze restored 100. Warm-restore SKIPPED. extra-P1 lottery closed. P73 persist 0.1 forbids in-place `c*=gop`. P3 rtgt **0.087@159 → 0.00067@406** — standing critic collapse, do not stack knobs.
 - Plant: HeatExchangerTower `step` is engineering; APCEnv denorms. Teacher must use `_prev_cmd_norm`. Restore must not leave a post-FD leftover when the snapshot was `None`. `identified_lookback=131 > seq_len=128` is a 3-sample encode shortfall, not this freeze.
-- Metric: jsonl MV ratio vs local G is not val TM (orig-P1 jsonl ×0.991 vs TM 0.63). Lineage gain PASS (rel_err 0.24) is looser than GAIN-READY band [0.8, 1.3] on freeze probes. Suite `smooth_pass` on mv_reversal is on trial. No `residual_board.json` producer exists — ranked #2, not a GPU job. P120 `gop` trigger (val ~×0.61) **did not fire**.
+- Metric: jsonl MV ratio vs local G is not val TM (orig-P1 jsonl ×0.991 vs TM 0.63). Lineage gain PASS (rel_err 0.24) is looser than GAIN-READY band [0.8, 1.3] on freeze probes. Suite `smooth_pass` is now CV d2/reversal (`mv_reversal` diagnostic). `residual_board.json` writes at val (P116/P119 backfilled). P116 “mid-band / never returns” was **wrong-bound** (`cv_side_scale` lo vs econ **hi**). P120 `gop` trigger (val ~×0.61) **did not fire**.
 
 P117 process died mid-P2 (SIGKILL). P118 completed P2 then `[p3-skip]`. P119 completed P2 then **P3 then EXIT VALID**. Do not identity-relaunch P117, P118, or P119.

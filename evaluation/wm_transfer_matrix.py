@@ -377,10 +377,12 @@ def _compute_dv_transfer_matrix_impl(model, env, cfg, device, *,
         _ha = int(getattr(cfg, 'horizon', 30) or 30)
         wgh = _gain_at_horizon(wm['mean'], _ha)
         rgh = _gain_at_horizon(real['mean'], _ha)
+        from evaluation.residual_board import curve_iae_normed
         result['pairs'][key] = {
             'wm': wm, 'real': real, 'wm_ss_gain': wg, 'real_ss_gain': rg,
             'ss_gain_ratio_wm_over_real': (wg / rg) if abs(rg) > 1e-9 else float('nan'),
             'ss_gain_abs_err': abs(wg - rg),
+            'curve_iae_normed': curve_iae_normed(wm['mean'], real['mean'], rg),
             'actor_horizon': _ha,
             'wm_gain_at_h': wgh, 'real_gain_at_h': rgh,
             'gain_ratio_at_h': (wgh / rgh) if abs(rgh) > 1e-9 else float('nan')}
@@ -537,11 +539,13 @@ def _compute_transfer_matrix_impl(model, env, cfg, device, *,
         _ha = int(getattr(cfg, 'horizon', 30) or 30)
         wgh = _gain_at_horizon(wm['mean'], _ha)
         rgh = _gain_at_horizon(real['mean'], _ha)
+        from evaluation.residual_board import curve_iae_normed
         result['pairs'][key] = {
             'wm': wm, 'real': real,
             'wm_ss_gain': wg, 'real_ss_gain': rg,
             'ss_gain_ratio_wm_over_real': gain_ratio,
             'ss_gain_abs_err': abs(wg - rg),
+            'curve_iae_normed': curve_iae_normed(wm['mean'], real['mean'], rg),
             'actor_horizon': _ha,
             'wm_gain_at_h': wgh, 'real_gain_at_h': rgh,
             'gain_ratio_at_h': (wgh / rgh) if abs(rgh) > 1e-9 else float('nan'),

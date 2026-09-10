@@ -49,6 +49,22 @@ import matplotlib.pyplot as plt
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _fmt_f(x) -> str:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 'nan'
+    return f'{v:.3f}' if np.isfinite(v) else 'nan'
+
+
+def _fmt_x(x) -> str:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 'nan'
+    return f'{v:.3f}' if np.isfinite(v) else 'nan'
+
+
 def _load_run_plan(controller_dir: Path) -> Dict:
     """Look up run_plan.json: in the controller dir, then walk parents.
 
@@ -179,6 +195,35 @@ def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
     return out
 
 
+def _finite_floats(vals: List[object]) -> List[float]:
+    out: List[float] = []
+    for v in vals:
+        try:
+            f = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(f):
+            out.append(f)
+    return out
+
+
+def _cv_smooth_from_rows(d2s: List[object], revs: List[object]) -> Dict:
+    """Worst-seed CV d2/reversal. ``mv_reversal`` is diagnostic only."""
+    from evaluation.residual_board import (
+        CV_D2_RMS_MAX, CV_REVERSAL_MAX, cv_smooth_pass)
+    d2_f = _finite_floats(d2s)
+    rev_f = _finite_floats(revs)
+    worst_d2 = float(np.max(d2_f)) if d2_f else float('nan')
+    worst_rev = float(np.max(rev_f)) if rev_f else float('nan')
+    return {
+        'cv_d2_rms_normed_max': CV_D2_RMS_MAX,
+        'cv_reversal_rate_max': CV_REVERSAL_MAX,
+        'cv_d2_rms_normed_worst_seed': worst_d2,
+        'cv_reversal_rate_worst_seed': worst_rev,
+        'smooth_pass': cv_smooth_pass(worst_d2, worst_rev),
+    }
+
+
 def control_quality_gates(
     disturbance_records: Optional[List[Dict]] = None,
     seed_metrics: Optional[List[Dict]] = None,
@@ -188,8 +233,11 @@ def control_quality_gates(
     Empty records must **not** pass (P49: leftover ``cfg=`` TypeError
     skipped every scripted episode → 0.0 vs 0.0 falsely PASSED
     ``beats_baseline``).  Seed-episode KPIs have no paired baseline, so
-    they can fill reversal / agent econ for the log but cannot pass
+    they can fill CV-smooth / agent econ for the log but cannot pass
     ``beats_baseline``.
+
+    ``smooth_pass`` is worst-seed ``cv_d2_rms_normed`` ≤ 0.05 AND
+    ``cv_reversal_rate`` ≤ 0.25. MV reversal is logged, never a gate.
     """
     _dr = list(disturbance_records or [])
     out: Dict = {
@@ -197,40 +245,48 @@ def control_quality_gates(
         'n_scripted_pairs': len(_dr),
     }
     if not _dr:
-        revs: List[float] = []
+        mv_revs: List[float] = []
         econs: List[float] = []
+        d2s: List[object] = []
+        cv_revs: List[object] = []
         if seed_metrics:
-            revs = [float(r.get('kpi_mv_reversal_rate', 0.0))
-                    for r in seed_metrics]
+            mv_revs = [float(r.get('kpi_mv_reversal_rate', 0.0))
+                       for r in seed_metrics]
             econs = [float(r.get('kpi_economic_score', 0.0))
                      for r in seed_metrics]
-        rev_mean = float(np.mean(revs)) if revs else float('nan')
+            d2s = [r.get('kpi_cv_d2_rms_normed') for r in seed_metrics]
+            cv_revs = [r.get('kpi_cv_reversal_rate') for r in seed_metrics]
+        rev_mean = float(np.mean(mv_revs)) if mv_revs else float('nan')
         agent_econ = float(np.mean(econs)) if econs else float('nan')
         out.update({
             'mv_reversal_rate_observed': rev_mean,
             'agent_economic_score': agent_econ,
             'baseline_economic_score': float('nan'),
-            'smooth_pass': bool(revs) and bool(rev_mean <= 0.5),
             'beats_baseline_pass': False,
             'control_gate_skipped': 'no_scripted_disturbance_pairs',
         })
+        out.update(_cv_smooth_from_rows(d2s, cv_revs))
         return out
-    _rev = [float((r.get('episode_metrics_agent') or {}).get(
+    _mv_rev = [float((r.get('episode_metrics_agent') or {}).get(
         'mv_reversal_rate', 0.0)) for r in _dr]
     _ae = [float((r.get('episode_metrics_agent') or {}).get(
         'economic_score', 0.0)) for r in _dr]
     _be = [float((r.get('episode_metrics_baseline') or {}).get(
         'economic_score', 0.0)) for r in _dr]
-    rev_mean = float(np.mean(_rev)) if _rev else 0.0
+    rev_mean = float(np.mean(_mv_rev)) if _mv_rev else 0.0
     agent_econ = float(np.mean(_ae)) if _ae else 0.0
     base_econ = float(np.mean(_be)) if _be else 0.0
+    d2s = [(r.get('episode_metrics_agent') or {}).get('cv_d2_rms_normed')
+           for r in _dr]
+    cv_revs = [(r.get('episode_metrics_agent') or {}).get('cv_reversal_rate')
+               for r in _dr]
     out.update({
         'mv_reversal_rate_observed': rev_mean,
         'agent_economic_score': agent_econ,
         'baseline_economic_score': base_econ,
-        'smooth_pass': bool(rev_mean <= 0.5),
         'beats_baseline_pass': bool(agent_econ >= base_econ),
     })
+    out.update(_cv_smooth_from_rows(d2s, cv_revs))
     return out
 
 
@@ -622,6 +678,8 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         'current_cv_targets_t': current_cv_targets_t[:t + 1],
         'hidden_disturbance_t': hidden_dist_t[:t + 1],
         'reward_scale': float(env.reward_scale),
+        'cv_side_scale': _episode_cv_side_scale(env),
+        'mv_cv_gain_sign': _episode_mv_cv_gain_sign(env),
     }
 
 
@@ -641,6 +699,106 @@ def _add_disturbance_markers(ax, schedule: List[Dict], color='red', alpha=0.20):
 # ---------------------------------------------------------------------------
 # Episode metrics  (process-control standard, simulator-agnostic)
 # ---------------------------------------------------------------------------
+
+def _episode_cv_side_scale(env) -> List[Dict]:
+    """Per-CV ``{lo, hi}`` urgency from ``obj_spec['cv_side_scale']``."""
+    spec = getattr(env, 'obj_spec', None) or {}
+    raw = spec.get('cv_side_scale') or {}
+    n_cv = len(getattr(env, 'cv_indices', []) or [])
+    out: List[Dict] = []
+    for i in range(n_cv):
+        side = raw.get(f'cv_{i}') or {}
+        try:
+            lo = float(side.get('lo', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            lo = 1.0
+        try:
+            hi = float(side.get('hi', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            hi = 1.0
+        out.append({'lo': lo, 'hi': hi})
+    return out
+
+
+def _bound_lo_hi(b) -> Tuple[Optional[float], Optional[float]]:
+    if isinstance(b, (list, tuple, np.ndarray)) and len(b) >= 2:
+        lo, hi = float(b[0]), float(b[1])
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            return lo, hi
+    return None, None
+
+
+def _sign_reversal_rate(col: np.ndarray, rng: float) -> float:
+    if col.size < 2:
+        return 0.0
+    d = np.diff(np.asarray(col, dtype='float64'))
+    deadband = 1e-3 * max(float(rng), 1e-9)
+    signed = np.where(np.abs(d) > deadband, np.sign(d), 0.0)
+    nz = signed[signed != 0.0]
+    flips = int(np.sum(np.abs(np.diff(nz)) > 1.0)) if nz.size >= 2 else 0
+    return float(flips) / float(max(1, len(d)))
+
+
+def _episode_mv_cv_gain_sign(env) -> float:
+    """Signed median MV→CV gain from SysID (identifier uses abs internally)."""
+    try:
+        from utils.training_disturbance import _load_identifier_context
+        rows = ((_load_identifier_context().get('dynamics') or {})
+                .get('per_pair_estimates') or [])
+    except Exception:
+        rows = []
+    signs: List[float] = []
+    for r in rows:
+        try:
+            if not bool(r.get('valid', False)):
+                continue
+            if str(r.get('input_type', 'mv')).lower() != 'mv':
+                continue
+            d = float(r.get('delta', 0.0))
+            a = float(r.get('amplitude', 0.0))
+            if abs(d) < 1e-8:
+                continue
+            signs.append(a / d)
+        except (TypeError, ValueError):
+            continue
+    if not signs:
+        return 0.0
+    return float(np.median(np.asarray(signs, dtype='float64')))
+
+
+def _cv_econ_side(ep: Dict, cv_row: int) -> str:
+    """Bound to hug when minimizing MV: lo if G>0, hi if G<0.
+
+    ``cv_side_scale`` is a safety urgency (high-side more expensive to
+    violate), not the economic riding bound. Signed SysID MV→CV gain
+    is the causal direction: less MV moves CV toward −sign(G).
+    """
+    try:
+        g = float(ep.get('mv_cv_gain_sign', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        g = 0.0
+    if abs(g) > 1e-12:
+        return 'hi' if g < 0.0 else 'lo'
+    scales = ep.get('cv_side_scale') or []
+    if cv_row < len(scales) and isinstance(scales[cv_row], dict):
+        try:
+            lo = float(scales[cv_row].get('lo', 1.0) or 1.0)
+            hi = float(scales[cv_row].get('hi', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 'lo'
+        if lo > hi * 1.05:
+            return 'hi'
+        return 'lo'
+    return 'lo'
+
+
+def _cv_headroom(y: np.ndarray, lo: float, hi: float, side: str) -> np.ndarray:
+    rng = max(1e-9, float(hi) - float(lo))
+    y = np.asarray(y, dtype='float64')
+    if side == 'hi':
+        return (float(hi) - y) / rng
+    return (y - float(lo)) / rng
+
 
 def _cv_active_target(ep: Dict, cv_row: int) -> np.ndarray | None:
     """Per-step target for CV ``cv_row`` if a target is enabled, else None.
@@ -718,22 +876,33 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
     iae_per_cv: List[float] = []
     itae_per_cv: List[float] = []
     ise_per_cv: List[float] = []
+    cv_d2_rms: List[float] = []
+    cv_rev_rates: List[float] = []
+    cv_headrooms: List[float] = []
+    cv_viol_fracs: List[float] = []
+    econ_sides: List[str] = []
     for k, cidx in enumerate(cv_idx):
         if cidx >= states.shape[1]:
             continue
+        col = states[:T, cidx].astype('float64')
+        lo, hi = _bound_lo_hi(cv_bounds[k] if k < len(cv_bounds) else None)
+        if lo is None or hi is None:
+            lo, hi = float(np.nanmin(col)), float(np.nanmax(col))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                continue
+        rng = float(hi) - float(lo)
+        side = _cv_econ_side(ep, k)
+        econ_sides.append(side)
+        cv_d2_rms.append(float(np.sqrt(np.mean(
+            (np.diff(col, n=2) / max(1e-9, rng)) ** 2))) if T >= 3 else 0.0)
+        cv_rev_rates.append(_sign_reversal_rate(col, rng))
+        cv_headrooms.append(float(np.mean(_cv_headroom(col, lo, hi, side))))
+        cv_viol_fracs.append(float(np.mean((col < lo) | (col > hi))))
         tgt = _cv_active_target(ep, k)
         if tgt is None:
             continue
-        err = states[:T, cidx].astype('float64') - tgt[:T].astype('float64')
-        # Normalise by CV bound width so cross-CV / cross-sim comparison is meaningful.
-        b = cv_bounds[k] if k < len(cv_bounds) else None
-        if (isinstance(b, list) and len(b) >= 2
-                and np.isfinite(b[0]) and np.isfinite(b[1])
-                and b[1] > b[0]):
-            denom = float(b[1]) - float(b[0])
-        else:
-            denom = float(np.nanstd(states[:T, cidx])) or 1.0
-        e = err / max(1e-9, denom)
+        err = col - tgt[:T].astype('float64')
+        e = err / max(1e-9, rng)
         iae_per_cv.append(float(np.sum(np.abs(e))))
         itae_per_cv.append(float(np.sum(np.arange(T) * np.abs(e))))
         ise_per_cv.append(float(np.sum(e ** 2)))
@@ -746,6 +915,11 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
         'mv_bound_hugging_score': float(np.min(hugging_scores)) if hugging_scores else 1.0,
         'mv_bound_usage': float(np.mean(usage_scores)) if usage_scores else 0.0,
         'mv_reversal_rate': float(np.mean(reversal_rates)) if reversal_rates else 0.0,
+        'cv_d2_rms_normed': float(np.max(cv_d2_rms)) if cv_d2_rms else 0.0,
+        'cv_reversal_rate': float(np.max(cv_rev_rates)) if cv_rev_rates else 0.0,
+        'cv_opt_headroom': float(np.mean(cv_headrooms)) if cv_headrooms else float('nan'),
+        'cv_viol_frac': float(np.mean(cv_viol_fracs)) if cv_viol_fracs else 0.0,
+        'cv_econ_side': (econ_sides[0] if econ_sides else 'lo'),
         'economic_score': float(np.mean(ep['raw_rewards'])) if T > 0 else 0.0,
         'cum_raw_reward': float(ep.get('cum_raw_reward', 0.0)),
         'iae_normed_mean': float(np.mean(iae_per_cv)) if iae_per_cv else 0.0,
@@ -771,10 +945,15 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
         ``settle_band × bound_width`` for the rest of the window.
         ``None`` if it never settles.
       * ``iae_window``     — sum |dev| / bound_width across the window.
+      * ``cv_return_headroom`` — late-window (last 20%) gap to the
+        economic CV bound / bound width.
+      * ``cv_return_time_frac`` — fraction of the window until the CV is
+        in-band and within 0.10 of the economic bound; 1.0 if never.
 
     The most-impacted CV (largest |overshoot|) is reported per event;
     aggregates (median, p90, max) across events are returned at the top.
     """
+    from evaluation.residual_board import CV_RETURN_HEADROOM_BAND
     states = ep['states']
     cv_idx = ep.get('cv_indices') or []
     cv_bounds = ep.get('cv_bounds') or []
@@ -834,10 +1013,27 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             if settle == 0:
                 settle = 0
             iae_w = float(np.sum(np.abs(dev_n)))
+            lo_b, hi_b = _bound_lo_hi(b)
+            y_win = states[start:end, cidx].astype('float64')
+            if lo_b is None or hi_b is None:
+                ret_h = float('nan')
+                ret_frac = 1.0
+            else:
+                side = _cv_econ_side(ep, k)
+                hr = _cv_headroom(y_win, lo_b, hi_b, side)
+                late_n = max(1, int(round(0.2 * hr.size)))
+                ret_h = float(np.mean(hr[-late_n:]))
+                in_band = (y_win >= lo_b) & (y_win <= hi_b)
+                at_lim = in_band & (hr <= CV_RETURN_HEADROOM_BAND)
+                hit = np.flatnonzero(at_lim)
+                ret_frac = (float(hit[0] + 1) / float(max(1, hr.size))
+                            if hit.size else 1.0)
             per_cv.append({'cv_row': k, 'cv_index': int(cidx),
                             'peak_overshoot_normed': ovs,
                             'settle_steps': settle,
-                            'iae_window_normed': iae_w})
+                            'iae_window_normed': iae_w,
+                            'cv_return_headroom': ret_h,
+                            'cv_return_time_frac': ret_frac})
         if not per_cv:
             continue
         worst = max(per_cv, key=lambda r: abs(r['peak_overshoot_normed']))
@@ -873,12 +1069,27 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                   {'median': 0.0, 'p90': 0.0, 'max': 0.0,
                    'n_settled': 0, 'n_total': int(len(events))})
 
+    def _agg_signed(key: str) -> Dict[str, float]:
+        vals = [e['worst_cv'][key] for e in events
+                if isinstance(e['worst_cv'].get(key), (int, float))
+                and np.isfinite(float(e['worst_cv'][key]))]
+        if not vals:
+            return {'median': float('nan'), 'p90': float('nan'),
+                    'max': float('nan'), 'n': 0}
+        a = np.asarray(vals, dtype='float64')
+        return {'median': float(np.median(a)),
+                'p90': float(np.percentile(a, 90)),
+                'max': float(np.max(a)),
+                'n': int(a.size)}
+
     return {
         'window_steps': int(window_steps),
         'settle_band_normed': float(settle_band),
         'overshoot_normed': _agg('peak_overshoot_normed'),
         'iae_window_normed': _agg('iae_window_normed'),
         'settle_steps': settle_agg,
+        'cv_return_headroom': _agg_signed('cv_return_headroom'),
+        'cv_return_time_frac': _agg_signed('cv_return_time_frac'),
         'events': events,
     }
 
@@ -1035,6 +1246,8 @@ def run_constant_mv_episode(env, *, schedule: List[Dict],
         'schedule': schedule,
         'mv_norm_ranges': [list(b) for b in env.mv_norm_ranges],
         'cv_norm_ranges': [list(b) for b in env.cv_norm_ranges],
+        'cv_side_scale': _episode_cv_side_scale(env),
+        'mv_cv_gain_sign': _episode_mv_cv_gain_sign(env),
     }
 
 
@@ -2161,9 +2374,13 @@ def run_validation(*,
                     print(f'        - critic V vs MC r={critic_r:+.3f} < 0.3'
                           ' (value head uncorrelated with returns)', flush=True)
                 if not fidelity_gates.get('smooth_pass', True):
-                    print(f'        - mv_reversal_rate='
-                          f'{fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f}'
-                          ' > 0.5 (BANG-BANG: MV reverses direction most steps)',
+                    print(f'        - CV smooth fail: d2_rms='
+                          f'{fidelity_gates.get("cv_d2_rms_normed_worst_seed", float("nan")):.4f}'
+                          f' (max {fidelity_gates.get("cv_d2_rms_normed_max", 0.05):.3f}) '
+                          f'reversal='
+                          f'{fidelity_gates.get("cv_reversal_rate_worst_seed", float("nan")):.3f}'
+                          f' (max {fidelity_gates.get("cv_reversal_rate_max", 0.25):.2f})'
+                          ' — MV reversal is diagnostic only',
                           flush=True)
                 if not fidelity_gates.get('beats_baseline_pass', True):
                     if fidelity_gates.get('control_gate_skipped'):
@@ -2180,6 +2397,8 @@ def run_validation(*,
                 print(f'[val] internal-fidelity gates PASSED '
                       f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '
                       f'critic_r={critic_r:+.3f} '
+                      f'cv_d2={fidelity_gates.get("cv_d2_rms_normed_worst_seed", float("nan")):.4f} '
+                      f'cv_rev={fidelity_gates.get("cv_reversal_rate_worst_seed", float("nan")):.3f} '
                       f'mv_rev={fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f})',
                       flush=True)
         except Exception as _ge:
@@ -2424,6 +2643,29 @@ def run_validation(*,
     }
     with open(out_dir / 'validation_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
+
+    try:
+        from evaluation.residual_board import write_residual_board
+        board = write_residual_board(out_dir, summary=summary)
+        r1 = board.get('r1') or {}
+        r2 = board.get('r2') or {}
+        r3 = board.get('r3') or {}
+        print(f'[val] residual_board: R1 MV ss×{_fmt_x(r1.get("mv_ss_ratio"))} '
+              f'@H×{_fmt_x(r1.get("mv_h_ratio"))} curve={_fmt_f(r1.get("mv_curve_iae_normed"))} '
+              f'DV ss×{_fmt_x(r1.get("dv_ss_ratio"))} 1step→OL×{_fmt_x(r1.get("ol_1step_ratio"))} '
+              f'lever={r1.get("dominant_lever")}; '
+              f'R2 d2={_fmt_f(r2.get("cv_d2_rms_normed_worst_seed"))} '
+              f'rev={_fmt_f(r2.get("cv_reversal_rate_worst_seed"))} '
+              f'head={_fmt_f(r2.get("cv_opt_headroom_mean"))} '
+              f'viol_frac={_fmt_f(r2.get("cv_viol_frac_mean"))} '
+              f'smooth={r2.get("smooth_pass")}; '
+              f'R3 det_r={_fmt_f(r3.get("det_r"))} '
+              f'pred_std={_fmt_f(r3.get("pred_std"))} vs {_fmt_f(r3.get("true_std"))} '
+              f'ret_h={_fmt_f(r3.get("cv_return_headroom"))} '
+              f'ret_t={_fmt_f(r3.get("cv_return_time_frac"))} '
+              f'-> {out_dir}/residual_board.json', flush=True)
+    except Exception as _rbe:
+        print(f'[val] residual_board skipped: {_rbe!r}', flush=True)
 
     print('[val] done.', flush=True)
     return summary
