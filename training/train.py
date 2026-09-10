@@ -7254,7 +7254,8 @@ def _gain_match_pred_over_tgt(
     P43 Huber ~1e-4 while TM DV stayed ×0.74 — jsonl Huber is 0 at a
     matching IC, so it cannot show a rest-step miss.  Sign-aware (test_sim
     MV tgt is negative).  Empty / all-tiny tgts → 0.
-    P118: ``tgt_b`` is rest-IC plant FD G when cached (not SysID median).
+    P118: ``tgt_b`` is rest-IC plant FD when cached and unheld.
+    P124: identity-held uses SysID median (``tgt_b is None``).
     """
     if tgt_b is None:
         if not tgts:
@@ -8614,11 +8615,12 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
     unroll.  Not P69 stop-grad *inside* the teacher
     (detached teacher-K state must not re-enter ``prev_state``).
     Rest-IC only.
-    **P118:** rest-IC Huber ``G_tgt`` is plant FD at each cached rest OP
-    when ``_gain_match_rest_local_g`` is present (equal-% / 1/feed
-    OP-varying DC). SysID median is the fallback. jsonl ``*_ratio`` uses
-    the same local G. LPV ``op_scale_net`` is identity at init (group
-    ``g``). Not extra-P1 / ol1 / k1 / traj N+1.
+    **P118:** unheld (nonlinear) rest-IC Huber ``G_tgt`` is plant FD at
+    each cached rest OP. **P124:** identity-held linear plants skip
+    ``local_g`` and keep SysID median (P116 teacher). jsonl ``*_ratio``
+    follows ``local_g`` (SysID when held). Diagnostic local-G print stays.
+    LPV ``op_scale_net`` is identity at init (group ``g``); held freezes
+    it. Not extra-P1 / ol1 / k1 / traj N+1.
     **P76 EXIT REVERT:** RSSM GRU update-gate bias ``log(H/16)``
     (keep-h stalled conv; freeze GAIN_NOT_READY 0.80@MV).  Last-step
     DC Huber stays (P64/P73).  **P77 EXIT FALSIFIED** Markovian TSSM
@@ -8762,7 +8764,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         # Huber ≡ mean of per-input means (equal Bm×n_cv).  P27
         # relative scale is gone.  P61: divide by realized Δu (TM
         # p136), mask cube no-ops.  P75 FOPDT K-stack **REVERT**.
-        # P118: ``g_tgt`` is rest-IC plant FD when cached.
+        # P118/P124: ``g_tgt`` is rest-IC plant FD when unheld;
+        # identity-held passes None → SysID median.
         if not tgts:
             return zero
         den = du_in.unsqueeze(-1)
@@ -8783,7 +8786,8 @@ def _wm_gain_match_loss(model: DreamerV4, feats: torch.Tensor,
         # Uniform-in-k Huber of ``G(k)=(CV_k−pre)/Δu`` vs ``G_tgt·fo[k]``.
         # β from DC ``|G_tgt|`` (not ``|G_tgt·fo|`` — dead-time β→0 is
         # P27/P63 relative-Huber class).  Last step of ``fo`` is 1.
-        # P118: local rest-IC G still × FO (do not retune P111).
+        # P118: unheld local rest-IC G still × FO (do not retune P111).
+        # P124 held: g_tgt is None → SysID median × FO.
         if not tgts:
             return zero
         den = du_in.unsqueeze(-1).unsqueeze(-1)
