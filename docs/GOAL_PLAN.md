@@ -4,7 +4,7 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: **return-to-`test_sim`** (**P120 `tshome`** launching). Cadence: P117+P118 were the two `nonlinear_sim` jobs; P119 was the fair locgfix repeat. **P120 `gop` stays PARKED.**
+Plant this cycle: **return-to-`test_sim`** (**P120 `tshome` LAUNCHED**). Cadence: P117+P118 were the two `nonlinear_sim` jobs; P119 was the fair locgfix repeat. **P120 `gop` stays PARKED.**
 
 ## Residual board vs champions (from `validation/residual_board.json`)
 
@@ -31,9 +31,11 @@ P119/P116 boards were backfilled from TM/decomp/dist JSON + `disturbance_rejecti
 
 extra-P1 as freeze (P41; **P117**; **P118**); compounding-teacher Huber (P111 traj unpromoted, P115 k1 REVERT, P116 ol1 REVERT); isolation-off KEEP as default; 2TS-α as champ; kfeat as freeze; quiet_env as freeze; decoder FF; TSSM; GRU keep-h.
 
-## P120 `tshome` — next GPU (this visit, mode 3)
+## P120 `tshome` — LAUNCHED this visit (mode 3)
 
-**Mechanism:** cadence return-to-`test_sim` on HEAD. Attributed train delta vs last VALID test_sim (P116): **opscale ON** (P118 default, unfalsified — P118 was teacher-units) + **ol1 gone** (REVERT) + **locgfix** (identity if test_sim Δu already WM-norm). Val emits `residual_board.json`; `smooth_pass` is CV d2/reversal. **No new TrainConfig / no `DREAMER_*`.** Tag `run_p120_tshome`. tmux `mbrl2_p120`.
+**Live:** tmux `mbrl2_p120`. pid **583595**. sha **`03a93f1`**. out-dir `output/test_sim/run_p120_tshome`. Env-free (`CUDA_VISIBLE_DEVICES=0`, no `DREAMER_*`). Train start **2026-09-09 19:10:17**. nvidia **~19 GiB**. `[resolved-cfg] opscale=True` **no** `gmatch_ol1`. locgfix `|du_mv|=0.4000` **=** step **0.4000**; rest-IC local G `plant_fd=6/6` mean MV **−2.54** vs ident **−2.55**. STAGE 1. Do **not** score actor / wait for jsonl / second GPU / kill (not a hard failure).
+
+**Mechanism:** cadence return-to-`test_sim` on HEAD. Attributed train delta vs last VALID test_sim (P116): **opscale ON** (P118 default, unfalsified — P118 was teacher-units) + **ol1 gone** (REVERT) + **locgfix** (identity on this plant — Δu already WM-norm). Val emits `residual_board.json`; `smooth_pass` is CV d2/reversal. **No new TrainConfig / no `DREAMER_*`.** Tag `run_p120_tshome`. tmux `mbrl2_p120`.
 
 **Largest residual this plant:** R1 TM autoencoder (MV ×0.706 / curve 0.262 vs P26 ×0.973) and R2 CV reversal **0.421** (`smooth_pass` FAIL; d2 0.034 PASS). Compounding ×0.911 is **not** the hole. Headroom **0.183** on **hi** (G<0) with ret_t **0.022** — limit-return is not the hole. Critic rtgt standing — do not stack knobs.
 
@@ -75,7 +77,7 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 
 ## Ranked follow-ups
 
-**#1 P120 `tshome` — LAUNCHING this visit.** Return-to-`test_sim` on HEAD (opscale ON + ol1 gone + locgfix). Spec above. Largest residual this plant: R1 TM autoencoder (×0.706 vs P26) and R2 CV reversal **0.421** — not compounding, not mid-band.
+**#1 P120 `tshome` — LAUNCHED.** pid **583595** / sha `03a93f1` / `test_sim`. Next visit: snapshot vs P116 (TM autoencoder + CV reversal); do **not** score actor until EXIT val. Do **not** launch `gop` / extra-P1 / second GPU.
 
 **#2 P120 `gop` (PARKED)** — **do not launch**. P119 val TM **×0.758** is **not** ~×0.61. Closed-family N+1 unless a later P119-class TM is ~×0.61. Encode L=`identified_lookback=131` vs `seq_len=128` stays parked with it.
 
