@@ -10,7 +10,7 @@ not close R2.
 #4 must use a sticky last-nonzero sign surrogate of ``_sign_reversal_rate``
 with sticky threshold ``tanh(1)`` (same as val ``|d|>deadband``), not
 ``relu(-dCV_t·dCV_prev)`` and not ``|s|>=0.5`` (sub-deadband holds). Do not
-land on the P121 pid.
+land on the P122 pid.
 
 Run:
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \\
