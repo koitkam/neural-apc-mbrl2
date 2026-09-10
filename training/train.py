@@ -3543,7 +3543,11 @@ def _should_lock_last_ok(
     P40: extra-P1 iter 84 recon 0.48 / skip 0 (skip-storm silent). Recovery
     iter 98 recon 0.0068 < 5× best overwrote last-ok 83→104. Iter 104
     CAPPED with healthy recon so detonated-freeze did **not** restore 83.
-    Recovered extra-P1 stays locked (``extra_p1=True``).
+    Recovered extra-P1 stays locked **only if** the locked snapshot
+    was GAIN-READY (``gain_ready_locked``; P40 READY overwrite). P120
+    last_ok **85** and P121 last_ok **91** stay-locked through extra-P1
+    with ``gain_ready_locked=False`` after recon recovered <20× —
+    freeze then restored a not-READY wrap snapshot (``[p3-skip]``).
 
     Skip-storm restore **unlocks** when the restored snapshot is not
     GAIN-READY (post-restore healthy P1 should resume snapshots — P40
@@ -3561,13 +3565,18 @@ def _should_lock_last_ok(
     recon recovered iter 26 but the lock never unlocked, so freeze
     restored 24 (0.81@DV) and discarded live gate 0.89@DV at iter 82.
     Original-P1 wrap recovery (``already_locked`` and recon back below
-    ``lock_ratio``, ``extra_p1=False``, not gain-ready-locked) **unlocks**
-    so last-ok can advance. Extra-P1 recovered basin stays locked (P40).
+    ``lock_ratio``, not gain-ready-locked) **unlocks** so last-ok can
+    advance. Extra-P1 recovered basin uses the same recon-vs-lock_ratio
+    path unless ``gain_ready_locked`` (P122; P92 applied to extra-P1).
     """
     if skip_storm_restored:
         return bool(gain_ready_locked)
     if already_locked:
-        if extra_p1 or gain_ready_locked:
+        if extra_p1:
+            if gain_ready_locked:
+                return True
+            # fall through: not-READY extra-P1 unlocks when recon < lock_ratio
+        elif gain_ready_locked:
             return True
         try:
             r = float(recon)
@@ -15079,7 +15088,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         # restored snapshot is GAIN-READY (P91 last_ok 31→44).
         # Original-P1 wrap recovery also unlocks (P48 freeze restored
         # 24 after a recovered 43× wrap) unless gain-ready-locked.
-        # Extra-P1 recovered basin stays locked (P40).
+        # Extra-P1 recovered basin stay-locks only if last_ok was
+        # GAIN-READY (P122; P120/P121 not-READY wrap freeze).
         if (current_phase == 1
                 and bool(getattr(cfg, 'skip_storm_recover_p1', True))):
             _rlv = _wm_recon_scalar(wm_losses)

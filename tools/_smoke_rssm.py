@@ -467,11 +467,22 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert not _should_lock_last_ok(
         recon=0.02, recon_best=0.003, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=False, already_locked=False)
-    # P40 recovered extra-P1 basin stays locked (freeze must restore 83).
+    # P40 recovered extra-P1 basin stays locked IFF last_ok was GAIN-READY
+    # (freeze must restore READY 83). P120/P121 not-READY extra-P1 wrap
+    # last_ok unlocks when recon <20× (same as orig-P1 wrap recovery).
     assert _should_lock_last_ok(
         recon=0.0068, recon_best=0.0015, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=False, already_locked=True,
-        extra_p1=True)
+        extra_p1=True, gain_ready_locked=True)
+    assert not _should_lock_last_ok(
+        recon=0.0068, recon_best=0.0015, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=True,
+        extra_p1=True, gain_ready_locked=False)
+    # Still-detonated extra-P1 wrap (>20×) stays locked even if not READY.
+    assert _should_lock_last_ok(
+        recon=0.0908, recon_best=0.0026, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=True,
+        extra_p1=True, gain_ready_locked=False)
     assert not _should_lock_last_ok(
         recon=0.4657, recon_best=0.0021, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=True, already_locked=True)
@@ -522,11 +533,15 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         has_last_ok=True, skip_storm_restored=True, already_locked=True,
         gain_ready_locked=False)
     # Wrap recovery must not unlock a GAIN-READY skip-storm last_ok
-    # (P91 last_ok 31→44). Extra-P1 stay-lock unchanged (P40).
+    # (P91 last_ok 31→44). Extra-P1 stay-lock only if READY (P122).
     assert _should_lock_last_ok(
         recon=0.0093, recon_best=0.0033, lock_ratio=20.0,
         has_last_ok=True, skip_storm_restored=False, already_locked=True,
         extra_p1=False, gain_ready_locked=True)
+    assert _should_lock_last_ok(
+        recon=0.0093, recon_best=0.0033, lock_ratio=20.0,
+        has_last_ok=True, skip_storm_restored=False, already_locked=True,
+        extra_p1=True, gain_ready_locked=True)
     # Freeze recon healthy — restore because locked (P40 CAPPED 0.0045).
     assert _should_restore_last_ok_at_p1_freeze(
         recon=0.0045, recon_best=0.0015, ratio=5.0,
@@ -2259,6 +2274,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '[gain-ready-probe] last-ok iter' in _src
     assert 'extra_p1=int(p1_ext_steps) > 0' in _src
     assert 'unlocked after wrap recovery' in _src
+    assert 'if extra_p1 or gain_ready_locked:' not in _src
     assert "lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio'" in _src
     assert "huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input'" in _src
     assert "gmatch_settle={int(getattr(cfg, 'gain_match_settle_len'" in _src
