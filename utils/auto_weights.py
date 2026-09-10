@@ -837,8 +837,12 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # and HARD-capped at cv_base so CV control + economics always strictly
     # dominate: the penalty removes gratuitous oscillation but can never force
     # a CV excursion, so the agent stays a fast controller ("not too strong").
-    # Per-MV τ scaling mirrors move_weights.  ``OBJ_AUTO_REVERSAL_GAIN`` (0
-    # disables); a full-rate bang-bang then costs ~gain*cv_base*rate² per step.
+    # Per-MV τ scaling mirrors move_weights.  TrainConfig /
+    # ``DREAMER_OBJ_AUTO_REVERSAL_GAIN`` (0 disables); leftover
+    # ``OBJ_AUTO_REVERSAL_GAIN`` ignored (P90-live).  Val ``smooth_pass`` is
+    # CV ``_sign_reversal_rate``, not this MV term — GOAL_PLAN #4 retarget
+    # after a VALID observer; do not N+1 the MV gain.  A full-rate bang-bang
+    # then costs ~gain*cv_base*rate² per step.
     reversal_gain = max(0.0, _knob_float(
         cfg, 'obj_auto_reversal_gain',
         'DREAMER_OBJ_AUTO_REVERSAL_GAIN', 'OBJ_AUTO_REVERSAL_GAIN', 0.3))
