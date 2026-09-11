@@ -839,9 +839,10 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # last ``|s|≥tanh(1)`` sign.  Calibrated as a fraction of cv_base and
     # HARD-capped at cv_base so CV control + economics strictly dominate.
     # TrainConfig / ``DREAMER_OBJ_AUTO_REVERSAL_GAIN`` (0 disables).  0 = off.
+    # P126 #4b: default 1.0 = at cv_base cap (P125 0.3 still FAIL rev 0.304).
     reversal_gain = max(0.0, _knob_float(
         cfg, 'obj_auto_reversal_gain',
-        'DREAMER_OBJ_AUTO_REVERSAL_GAIN', '', 0.3))
+        'DREAMER_OBJ_AUTO_REVERSAL_GAIN', '', 1.0))
     reversal_base = float(min(reversal_gain * cv_base, cv_base))
     reversal_weights = [0.0 for _ in taus]
     cv_reversal_weights = [float(reversal_base) for _ in range(int(n_cv))]

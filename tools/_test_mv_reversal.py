@@ -88,7 +88,8 @@ def main() -> int:
         {'cv_priority': ['cv_0'], 'weights': {'mv_economic': {'mv_0': 5.0}}},
         n_mv=1, n_cv=1,
         mv_bounds=[[20.0, 80.0]], cv_bounds=[[78.5, 85.5]],
-        mv_norm_ranges=[[20.0, 80.0]], cv_norm_ranges=[[78.5, 85.5]])
+        mv_norm_ranges=[[20.0, 80.0]], cv_norm_ranges=[[78.5, 85.5]],
+        cfg=cfg)
     mv_w = float((auto.get('mv_reversal_weights') or [0.0])[0])
     cv_w = float((auto.get('cv_reversal_weights') or [0.0])[0])
     cv_b = float((auto.get('cv_violation_weights') or [0.0])[0])
@@ -125,6 +126,10 @@ def main() -> int:
         ok = False
     if not (cv_w > 0.0 and cv_w <= cv_b + 1e-6):
         print(f'FAIL: cv_reversal_weight {cv_w:.1f} not in (0, cv_base={cv_b:.1f}]')
+        ok = False
+    if abs(cv_w - cv_b) > 1e-6:
+        print(f'FAIL: P126 default gain 1.0 should sit at cap '
+              f'cv_reversal={cv_w:.1f} vs cv_base={cv_b:.1f}')
         ok = False
 
     print('PASS' if ok else 'FAILED')

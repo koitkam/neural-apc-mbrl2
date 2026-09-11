@@ -464,10 +464,11 @@ class TrainConfig:
     obj_auto_move_target_cost_frac: float = 0.005
     obj_auto_move_sigma_ref: float = 0.3
     obj_auto_econ_over_move_ratio: float = 2.0
-    # P125: scale of the CV sticky-tanh hunting penalty (fraction of cv_base,
-    # hard-capped at cv_base).  0 disables.  MV reversal weights are zero;
-    # val ``smooth_pass`` is CV d2/reversal, not MV chatter.
-    obj_auto_reversal_gain: float = 0.3
+    # P125/P126: scale of the CV sticky-tanh hunting penalty (fraction of
+    # cv_base, hard-capped at cv_base).  P125 EXIT gain 0.3 still FAIL rev
+    # 0.304 (not mid-band).  P126 #4b default 1.0 = at cap.  0 disables.
+    # MV reversal weights are zero; val ``smooth_pass`` is CV d2/reversal.
+    obj_auto_reversal_gain: float = 1.0
     obj_auto_violation_rate_coef_divisor: float = 4.0
     obj_auto_violation_rate_coef_min: float = 0.3
     obj_auto_violation_rate_coef_max: float = 1.5
