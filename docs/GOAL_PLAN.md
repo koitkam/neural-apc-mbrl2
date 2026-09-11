@@ -4,7 +4,7 @@ Living plan. Update every visit (live analysis and EXIT). Champions live in `doc
 
 **Product:** simulator-agnostic neural APC — smooth CV on the economic limit without violating; faithful observer; unmeasured-load rejection. Envelope: learned observer + neural Kalman/DOB + neural actor-critic. No gray-box plant, no PID/LQR/MPC as the product, no DV-only FF.
 
-Plant this cycle: **return-to-`test_sim`**. **P124 `medhuber` EXIT VALID** pid **604554 DEAD** sha `a8b5ebd` tmux gone. Orig-P1@**88 PASS** GAIN-READY **0.89@MV** last_ok **88 unlocked** (wrap recovered; no extra-P1). Huber `G_tgt` = SysID median while held. Val MV **×0.871 / ×0.906** curve **0.112** freeze-held. Actor **VALID** paired **−154.03 vs −152.90** **4/9** `beats_baseline_pass=False`. ✅ KEEP #1c as orig-P1 PASS restorer vs P123 0.31@MV / P116 0.84@DV **and** as TM vs P116 ×0.706. ❌ **FALSIFIED as actor-econ** vs baseline / P116 **−8.24** / P64 **−4.54**. Next GPU **P125 `cvrev`** (#4 R2 CV reversal). **P123 `opgate` EXIT `[p3-skip]` INVALID**. Extra-P1 lottery **closed**. **P120 `gop` PARKED.** Skip **#1e**.
+Plant this cycle: **return-to-`test_sim`**. **P125 `cvrev` LAUNCHED** pid **608718** sha `8b25553` tmux `mbrl2_p125` out-dir `output/test_sim/run_p125_cvrev`. Env-free `device=cuda` `[opscale] held identity` **1.155**. **P124 `medhuber` EXIT VALID** pid **604554 DEAD** sha `a8b5ebd`. Orig-P1@**88 PASS** GAIN-READY **0.89@MV** last_ok **88 unlocked**. Val MV **×0.871**. Actor VALID paired **−154.03 vs −152.90** **4/9**. ✅ KEEP #1c freeze/TM vs P116. ❌ FALSIFIED as actor-econ. **P123 `opgate` EXIT `[p3-skip]` INVALID**. Extra-P1 lottery **closed**. **P120 `gop` PARKED.** Skip **#1e**. Do **not** rewrite P125.
 
 ## Residual board vs champions (from `validation/residual_board.json`)
 
@@ -177,9 +177,9 @@ tmux `mbrl2_p119` **gone**. pid **557257 DEAD**. sha **`ea7def9`**. **EXIT=0** 4
 - Signal: **P124 EXIT** pid **604554 DEAD** sha `a8b5ebd`. 396 jsonl ES `p3_plateau` best **196**. jsonl NaN/Inf **0**. skip_cum **4** recovered. Disk `/home` **65% / 60G**.
 - Control: VALID actor. R2 OPEN (CV rev **0.391**, viol_frac **0.583**, head **0.762**). R3 OPEN (det_r **0.334**, ret_h **0.962**). Econ FALSIFIED vs baseline.
 - ML: orig-P1 unlocked READY transferred to val TM. `critic_r` **−0.115** inverted (rtgt **0.0016** collapsed). Do **not** stack critic knobs this job — largest residual is R2 hunting, #4 is causal for `smooth_pass`.
-- Plant: env-free HEAD. Next **P125 `cvrev`**.
+- Plant: env-free HEAD. **P125 `cvrev` LAUNCHED** pid **608718**. Do **not** rewrite / second GPU.
 - Metric: trusted = val TM + CV d2/reversal + head/viol + det_r + paired econ. On trial = jsonl ×1, persist_rel, `wm_last_ok.pt` mtime, mv_reversal gate, event IAE without return-to-limit.
 - Literature: Qin/Badgwell limit-pushing allows MV chatter; CV hunting is lost econ → **#4**. Ljung PEM: SysID-median Huber vs rest-IC FD **falsified the teacher as the orig-P1 miss** (P124 PASS). Hafner decoder autoencoder hole is P116 not P124 (free_bits) → #7 parked.
 
-Config audit this visit = Step 5 P124 KEEP/FALSIFY + Step 4 P125 env-free (no `DREAMER_*`; reversal retarget only). #❌ **0**. #🆕 **0** (no new TrainConfig name). Next GPU **P125 `cvrev`**. Champion **P64**. Dist champ **P26**.
+Config audit this visit = Step 5 P124 KEEP/FALSIFY + Step 4 P125 LAUNCHED pid **608718** (env-free; no `DREAMER_*`; reversal retarget only). #❌ **0**. #🆕 **0** (no new TrainConfig name). Next GPU **this pid**. Champion **P64**. Dist champ **P26**.
 
