@@ -1216,14 +1216,17 @@ fixes BOTH:
 `scale = 1 + tanh(MLP(stop-grad concat(a,dv)))` (last Linear zero-init
 ⇒ identity at step-0). Decoder / feat / `dv_new` keep **unscaled**
 measured DV (P74 DOB-steal stays closed). `op_scale_net` trains with
-group `g` (P1) and freezes in P2. Rest-IC Huber `G_tgt` is plant FD at
-each rest OP when cached (not SysID median). MV plant-FD Δu is
+group `g` (P1) and freezes in P2. **P123:** SysID MV `|K|` max/min ≤ 1.3
+holds the MLP (`opscale=held`; zeros ⇒ `scale≡1`). **P124:** held Huber
+`G_tgt` is SysID median (P116 teacher). Unheld (nonlinear) rest-IC Huber
+`G_tgt` is plant FD at each rest OP when cached. MV plant-FD Δu is
 `env._prev_cmd_norm` (WM-norm; rate-limit realized), **not** engineering
 `_prev_control` (P118-live: that mix-up pinned local MV G at ~0.015).
 Rest snapshot/restore always writes `_prev_cmd_norm`, including `None`.
 Launch prints `|du_mv|` vs teacher `step`; `|du_mv|≫5×step` or
 `|G_MV|≪5%` of identified is the unit-bug WARNING.
-Env-free: always on; print-only banner `opscale=True`.
+Env-free: MLP always present; banner `opscale=True` when training,
+`opscale=held` when the linear hold fires.
 `cont_gain_dim == cont_dist_dim == 0` ⇒
 byte-identical to the pre-cont model (regression-verified). Env knobs:
 `DREAMER_CONT_LATENT_ENABLED` / `_MIN_STD` / `_MAX_STD` / `_FREE_BITS` /
