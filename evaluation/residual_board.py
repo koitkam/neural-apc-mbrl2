@@ -235,6 +235,10 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
     }
 
     gates = summary.get('fidelity_gates') or {}
+    cc = {}
+    diag_js = _json_load(out_dir / 'wm_diagnostics.json') or {}
+    if isinstance(diag_js.get('critic_calib'), dict):
+        cc = diag_js['critic_calib']
     board = {
         'schema': 'residual_board.v1',
         'controller_dir': summary.get('controller_dir'),
@@ -248,6 +252,12 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
             'baseline_economic_score': _f(gates.get('baseline_economic_score')),
             'beats_baseline_pass': bool(gates.get('beats_baseline_pass')),
             'critic_r': _f(gates.get('critic_r_observed')),
+            # Scale, not Pearson: P127 r=+0.318 with slope_g_on_v=289 / V−81 vs G−15318.
+            'critic_v_mean': _f(cc.get('v_mean', gates.get('critic_v_mean'))),
+            'critic_g_mean': _f(cc.get('g_mean', gates.get('critic_g_mean'))),
+            'critic_slope_g_on_v': _f(
+                cc.get('slope_g_on_v', gates.get('critic_slope_g_on_v'))),
+            'critic_nmae': _f(cc.get('nmae', gates.get('critic_nmae'))),
             'all_pass': gates.get('all_pass'),
             'n_scripted_pairs': gates.get('n_scripted_pairs'),
         },
@@ -255,6 +265,7 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
             'R1 = observer TM (ss + @H + curve_iae, MV and DV) and 1step→OL. '
             'R2 = CV smoothness (d2/reversal) and limit hugging/viol. '
             'R3 = Kalman det_r + pred_std vs true and DR return-to-limit. '
+            'Critic: trust slope_g_on_v ~1 and |V|~|G|; Pearson without slope is on trial. '
             'Do not treat VALID/GAIN-READY/all_pass/family-closed as residual-closed.'
         ),
     }

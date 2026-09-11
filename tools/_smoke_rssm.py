@@ -3591,6 +3591,24 @@ def _test_residual_board_cv_metrics() -> None:
     assert board['r2']['smooth_pass'] is True
     assert abs(board['r1']['ol_1step_ratio'] - 0.85) < 1e-9
     assert abs(board['r3']['det_r'] - 0.34) < 1e-9
+    assert not np.isfinite(board['diagnostic']['critic_slope_g_on_v'])
+    assert not np.isfinite(board['diagnostic']['critic_v_mean'])
+    import json as _json
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td)
+        (p / 'wm_diagnostics.json').write_text(_json.dumps({
+            'critic_calib': {
+                'v_mean': -81.0, 'g_mean': -15318.0,
+                'slope_g_on_v': 288.8, 'nmae': 4.24,
+            }
+        }))
+        b2 = build_residual_board(p, summary={
+            'fidelity_gates': {'critic_r_observed': 0.318},
+        })
+        assert abs(b2['diagnostic']['critic_slope_g_on_v'] - 288.8) < 1e-6
+        assert abs(b2['diagnostic']['critic_v_mean'] + 81.0) < 1e-6
+        assert abs(b2['diagnostic']['critic_g_mean'] + 15318.0) < 1e-6
     print('[smoke] OK  residual_board CV metrics + R1/R2/R3 assemble')
 
 

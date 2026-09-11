@@ -2334,6 +2334,10 @@ def run_validation(*,
                 'wm_next_state_r_observed': wm_r1,
                 'reward_head_r_observed': rw_r0,
                 'critic_r_observed': critic_r,
+                'critic_v_mean': cc.get('v_mean'),
+                'critic_g_mean': cc.get('g_mean'),
+                'critic_slope_g_on_v': cc.get('slope_g_on_v'),
+                'critic_nmae': cc.get('nmae'),
                 'wm_pass': bool(wm_r1 >= 0.5),
                 'reward_pass': bool(rw_r0 >= 0.3),
                 'critic_pass': bool(critic_r >= 0.3),
@@ -2399,6 +2403,8 @@ def run_validation(*,
                 print(f'[val] internal-fidelity gates PASSED '
                       f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '
                       f'critic_r={critic_r:+.3f} '
+                      f'V={_fmt_f(cc.get("v_mean"))} G={_fmt_f(cc.get("g_mean"))} '
+                      f'slope={_fmt_f(cc.get("slope_g_on_v"))} '
                       f'cv_d2={fidelity_gates.get("cv_d2_rms_normed_worst_seed", float("nan")):.4f} '
                       f'cv_rev={fidelity_gates.get("cv_reversal_rate_worst_seed", float("nan")):.3f} '
                       f'mv_rev={fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f})',
