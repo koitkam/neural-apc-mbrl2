@@ -2600,6 +2600,8 @@ def _test_isolation_dcv_scales() -> None:
     assert 'ret_econ = _lambda_returns' in _src
     assert 'ret_hunt = _lambda_returns' in _src
     assert 'adv_raw = ret_hunt - v_pred' in _src
+    assert 'update_return_scale(\n            ret_hunt,' in _src
+    assert "'realsim_return_mean': ret_hunt.mean().detach()" in _src
     assert "keys.append('rew_econ')" in _src
     _rb = _P(_tr.__file__).resolve().parents[1].joinpath(
         'evaluation/residual_board.py').read_text()
