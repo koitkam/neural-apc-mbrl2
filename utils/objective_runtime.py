@@ -1045,6 +1045,15 @@ def compute_objective_components(
     reward -= mv_economic_penalty
     reward -= cv_economic_penalty
 
+    # GOAL_PLAN #8 (next GPU after P126, do not land on this pid): split
+    # BEFORE this outer saturate. ``mv/cv_reversal_penalty`` are positive
+    # magnitudes already inner-saturated; hunting = econ − those two lines.
+    # ``reward_econ_pre`` = all terms except the two reversal subtracts;
+    # ``reward = saturate(hunt_pre)`` and ``reward_econ = saturate(econ_pre)``.
+    # Do NOT add ``cv_reversal_penalty`` back onto the saturated hunting
+    # reward (P125/P126 hunt steps sit at reward_clip 1000; post-sat add-back
+    # does not recover pre-sat econ). Return both keys; env.step / critic
+    # wiring is in train.py (GOAL_PLAN #8).
     reward = _saturate_two_sided(reward, reward_clip, sat_mode)
 
     return {

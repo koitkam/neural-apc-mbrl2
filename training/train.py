@@ -4406,10 +4406,13 @@ def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
     Leftover Dreamer ``cont`` is never copied (λ-returns ignore terminals
     inside a window).  ``dist`` only when ``_wm_need_dist_target`` (P2
     dob-ground).  P3 observer re-encodes from ``obs`` so ``dist`` stays
-    off.  ``rew`` when MTP or P3 AC is in the graph.  ``expert`` follows
+    off.      ``rew`` when MTP or P3 AC is in the graph.  ``expert`` follows
     ``need_rew_expert`` unless ``need_expert`` overrides: P3 on-policy
     actor uses ``obs/act/rew`` only (``expert_bc_p3_loss`` reads the
-    critic replay slot).
+    critic replay slot).  GOAL_PLAN #8: also copy ``rew_econ`` on those
+    P3 keys (on-policy ``(False, True, False)`` and critic
+    ``(False, True)``); ``_batch_np_to_device`` already copies listed
+    names that exist in the sample.
     """
     keys: List[str] = ['obs', 'act']
     if need_dist:
@@ -10372,6 +10375,10 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     obs = batch['obs']                                   # (B, T, D)
     act = batch['act']                                   # (B, T, A)
     rew = batch['rew'].float()                           # (B, T)  REAL reward
+    # GOAL_PLAN #8: this ``rew`` is the hunting stream (includes
+    # ``cv_reversal``). Critic CE/MC must move to ``batch['rew_econ']``;
+    # actor λ + ``update_return_scale`` stay on ``rew``; advantage is
+    # ``λ(rew) − V_econ``. Do not land on the live P126 pid.
     B, T = obs.shape[:2]
     device = obs.device
 
@@ -12361,8 +12368,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         cfg.dv_indices = tuple(_dv_idx_obs)
         cfg.dv_dim = len(_dv_idx_obs)
         print(f'[dv-as-input] ENABLED: feeding measured DV channels '
-              f'{cfg.dv_indices} as exogenous WM input (held constant in '
-              f'imagination).', flush=True)
+              f'{cfg.dv_indices} as exogenous WM input (observer; not a '
+              f'DV-only feedforward product).', flush=True)
     else:
         cfg.dv_indices = ()
         cfg.dv_dim = 0

@@ -384,8 +384,9 @@ ENV_OVERRIDES: Dict[str, tuple] = {
     # supervision so it stays calibrated on the policy's true distribution.
     'DREAMER_REWARD_HEAD_EXCLUDE_EXPERT': ('reward_head_exclude_expert',  _as_bool),
     # 2026-06-07 (Option B): feed measured DV channels as an exogenous WM
-    # transition input (held constant in imagination = MPC feedforward) instead
-    # of predicting them.  Default ON; DREAMER_DV_AS_INPUT=0 reverts to paper.
+    # transition input (observer; measured MV and DV, not a DV-only FF
+    # product) instead of predicting them.  Default ON; DREAMER_DV_AS_INPUT=0
+    # reverts to paper.
     'DREAMER_DV_AS_INPUT':                ('dv_as_input',                _as_bool),
     # DV in the *head* feat (actor sees the load).  Decoder half is a
     # separate knob (``DREAMER_DV_DECODER_FEEDFORWARD``, default off —
