@@ -554,8 +554,10 @@ class TrainConfig:
     # policy/critic have a gradient toward the band interior instead of a flat
     # zero.  ``coef`` is in SCALED-reward units (added to ``raw*reward_scale``).
     # TRAINING ONLY: the trainer sets ``env._shaping_enabled=True``; validation
-    # scores on the unshaped economic ``info['raw_reward']`` so the audited
-    # objective is unchanged.  Set ``reward_shaping_coef=0.0`` to disable.
+    # scores on unshaped ``info['raw_reward']`` (no Ng F).  That raw still
+    # includes ``cv_reversal_penalty`` after objective saturate (P125+; GOAL_PLAN
+    # #8 splits a pre-sat ``reward_econ`` so paired econ is not the hunt term).
+    # Set ``reward_shaping_coef=0.0`` to disable.
     reward_shaping_coef: float = 1.0
     # Flat-top safety-margin width (2026-06-16, p125 RCA) for the RANGE/limit
     # case of the shaping potential (no enabled CV target).  The legacy
@@ -614,8 +616,8 @@ class TrainConfig:
     # computed on the UNSCALED economic reward (``reward_scale`` is bypassed
     # when bounding is on — it is meaningless once rewards saturate).  Bounded
     # rewards ⇒ bounded returns ⇒ return_scale CANNOT run away.  Applied to the
-    # TRAINING reward only; ``info['raw_reward']`` stays the unshaped economic
-    # reward so validation scoring is unaffected.  P73 (2026-05-31) PROMOTED
+    # TRAINING reward only; ``info['raw_reward']`` stays unshaped (no Ng F)
+    # but still includes ``cv_reversal_penalty`` (GOAL_PLAN #8).  P73 (2026-05-31) PROMOTED
     # the default to True after the bounded-reward run unfroze the actor
     # (MV moves, mv_violation 0→1.75) and tamed return_scale runaway 5756×→27×.
     # Set DREAMER_BOUND_TRAINING_REWARD=0 to restore legacy (scaled) reward.
@@ -2623,7 +2625,8 @@ class APCEnv:
         # When enabled, the per-step TRAINING reward is mapped into [-B, B]
         # (``reward_scale`` bypassed) so imagined returns stay bounded and
         # the return_scale percentile cannot run away (cascade root-cause
-        # fix).  ``info['raw_reward']`` stays unshaped for validation scoring.
+        # fix).  ``info['raw_reward']`` stays unshaped (no Ng F) for val
+        # scoring but still includes ``cv_reversal_penalty`` (GOAL_PLAN #8).
         #
         # P77: the mapping is now a SCALE-INVARIANT LINEAR REMAP
         #   reward = clip(raw * (B / reward_clip_ref), -B, B)
@@ -3316,8 +3319,9 @@ class APCEnv:
         else:
             reward = raw_reward * float(self.reward_scale)
         # A' : dense potential-based reward shaping (training env only;
-        # ``info['raw_reward']`` below stays the unshaped economic reward so
-        # validation scoring is unaffected).  F = coef·(γΦ(s') − Φ(s)) is
+        # ``info['raw_reward']`` below stays unshaped — no Ng F — but still
+        # includes ``cv_reversal_penalty``; GOAL_PLAN #8 splits pre-sat econ).
+        # F = coef·(γΦ(s') − Φ(s)) is
         # policy-invariant (Ng et al. 1999) — it densifies the learning
         # signal toward the band interior without changing the optimal
         # economic policy.  Added in scaled-reward units.
@@ -12430,12 +12434,14 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     # A' : enable potential-based reward shaping on the TRAINING env only.
     # Validation builds its own APCEnv instances (evaluation/validate.py)
-    # which leave shaping OFF, so the audited economic score is unshaped.
+    # which leave shaping OFF.  Val ``economic_score`` is mean of unshaped
+    # ``raw_reward`` and today still includes ``cv_reversal`` (GOAL_PLAN #8).
     if float(getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0) > 0.0:
         env._shaping_enabled = True
         print(f"[reward-shaping] potential-based shaping ENABLED on training "
               f"env (coef={env._shaping_coef:.3g}, γ={env._shaping_gamma:.4g}); "
-              f"validation scores on unshaped economic reward.", flush=True)
+              f"validation scores on unshaped raw (includes cv_reversal; "
+              f"GOAL_PLAN #8 splits econ).", flush=True)
 
     # ---- Adaptive cold-start seed-buffer knobs (P0, 2026-05-05) ----
     # Derive plant-aware defaults for the seed buffer so a fresh sim
