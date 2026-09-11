@@ -132,6 +132,54 @@ def main() -> int:
               f'cv_reversal={cv_w:.1f} vs cv_base={cv_b:.1f}')
         ok = False
 
+    # #8 split: opposite-move econ less negative than hunt; mono/hold equal.
+    if not np.isfinite(opp['reward_econ']):
+        print('FAIL: opposite reward_econ non-finite')
+        ok = False
+    if not (opp['reward_econ'] > opp['reward'] + 1.0):
+        print(f'FAIL: opposite econ {opp["reward_econ"]:.3f} not milder '
+              f'than hunt {opp["reward"]:.3f}')
+        ok = False
+    if abs(ride['reward'] - ride['reward_econ']) > 1e-6:
+        print(f'FAIL: monotonic streams differ {ride["reward"]:.4f} vs '
+              f'{ride["reward_econ"]:.4f}')
+        ok = False
+    if abs(hold['reward'] - hold['reward_econ']) > 1e-6:
+        print(f'FAIL: hold streams differ {hold["reward"]:.4f} vs '
+              f'{hold["reward_econ"]:.4f}')
+        ok = False
+    post_sat_add = float(opp['reward']) + float(opp['cv_reversal_penalty'])
+    if abs(float(opp['reward_econ']) - post_sat_add) < 1e-3:
+        print(f'FAIL: reward_econ is post-sat add-back {post_sat_add:.3f}')
+        ok = False
+
+    # env.step: raw_reward reversal-free; raw_hunt = hunting sat; trace copy.
+    env._shaping_enabled = False
+    env.reset()
+    _, _r0, _, info0 = env.step(np.zeros((env.action_dim,), dtype='float32'))
+    c0 = info0['reward_components']
+    if 'raw_hunt' not in info0:
+        print('FAIL: info missing raw_hunt')
+        ok = False
+    if abs(float(info0['raw_reward']) - float(c0['reward_econ'])) > 1e-3:
+        print(f'FAIL: raw_reward {info0["raw_reward"]:.4f} != '
+              f'reward_econ {c0["reward_econ"]:.4f}')
+        ok = False
+    if abs(float(info0['raw_hunt']) - float(c0['reward'])) > 1e-3:
+        print(f'FAIL: raw_hunt {info0["raw_hunt"]:.4f} != '
+              f'reward {c0["reward"]:.4f}')
+        ok = False
+    tlen = 1
+    e1 = env.pop_episode_rew_econ(tlen)
+    e2 = env.pop_episode_rew_econ(tlen)
+    if e1 is None or e2 is None or not np.allclose(e1, e2):
+        print('FAIL: pop_episode_rew_econ did not copy-without-clear')
+        ok = False
+    env.reset()
+    if env.pop_episode_rew_econ(1) is not None:
+        print('FAIL: reset() did not clear rew_econ trace')
+        ok = False
+
     print('PASS' if ok else 'FAILED')
     return 0 if ok else 1
 

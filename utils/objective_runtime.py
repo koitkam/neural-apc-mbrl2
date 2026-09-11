@@ -1045,17 +1045,16 @@ def compute_objective_components(
     reward -= mv_economic_penalty
     reward -= cv_economic_penalty
 
-    # GOAL_PLAN #8 (do not land on P127 pid 618741): split BEFORE this
-    # outer saturate. ``mv/cv_reversal_penalty`` are positive magnitudes
-    # already inner-saturated; hunting = econ − those two lines.
-    # ``reward_econ_pre`` = all terms except the two reversal subtracts;
-    # ``reward = saturate(hunt_pre)`` and ``reward_econ = saturate(econ_pre)``.
+    # GOAL_PLAN #8: split BEFORE this outer saturate.
+    # ``mv/cv_reversal_penalty`` are positive magnitudes already
+    # inner-saturated; hunting = econ − those two lines.
     # Do NOT add ``cv_reversal_penalty`` back onto the saturated hunting
-    # reward (P125/P126 hunt steps sit at reward_clip 1000; post-sat add-back
-    # does not recover pre-sat econ). Return both keys; env.step / critic
-    # wiring is in train.py. ``onpol_buf`` must hold the econ stream
-    # (clear-on-reset pop, not dist clear-on-pop).
-    reward = _saturate_two_sided(reward, reward_clip, sat_mode)
+    # reward (P125/P127 hunt steps sit at reward_clip; post-sat add-back
+    # does not recover pre-sat econ).
+    hunt_pre = reward
+    econ_pre = reward + mv_reversal_penalty + cv_reversal_penalty
+    reward = _saturate_two_sided(hunt_pre, reward_clip, sat_mode)
+    reward_econ = _saturate_two_sided(econ_pre, reward_clip, sat_mode)
 
     return {
         'prod_term': float(production_term),
@@ -1098,6 +1097,7 @@ def compute_objective_components(
         'cv_reversal_sticky': [float(x) for x in cv_reversal_sticky_out],
         'cv_penalty': float(cv_penalty),
         'reward': float(reward),
+        'reward_econ': float(reward_econ),
         # Econ-derived reward-shape scale (adaptive_penalty_clip output).
         # ``reward`` is tanh-saturated at ``reward_clip`` so |reward| <=
         # reward_clip; the training env's bounded-reward path uses this as

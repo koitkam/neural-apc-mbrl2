@@ -190,6 +190,15 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     assert len(model.values) == model.n_critics
     diag = _realsim_actor_critic_step(model, batch, cfg)
     _finite('_realsim_actor_critic_step', diag)
+    # #8: distinct rew_econ must move critic canaries; hunt mean stays.
+    batch_split = dict(batch)
+    batch_split['rew_econ'] = batch['rew'] + 1.5
+    diag_e = _realsim_actor_critic_step(model, batch_split, cfg,
+                                       freeze_return_scale=True)
+    assert abs(float(diag_e['realsim_reward_mean'])
+               - float(batch['rew'].mean())) < 1e-5
+    assert abs(float(diag_e['critic_rew_to_tgt_var'])
+               - float(diag['critic_rew_to_tgt_var'])) > 1e-8
     assert 'critic_mc_loss' in diag, sorted(diag)
     assert 'critic_pred_target_r' in diag, sorted(diag)
     assert 'critic_target_v_r' in diag, sorted(diag)
@@ -860,6 +869,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         'obs': torch.randn(B, T, obs_dim),
         'act': torch.rand(B, T, action_dim) * 2 - 1,
         'rew': torch.randn(B, T),
+        'rew_econ': torch.randn(B, T),
         'cont': torch.ones(B, T),
     }
     _n_roll = {'n': 0}
@@ -1404,13 +1414,12 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     assert _wm_need_dist_target(m, c) is False
     assert _wm_need_dist_head_loss(m, c) is False
     assert _p1_wm_h2d_keys(_wm_need_dist_target(m, c)) == ('obs', 'act')
-    # GOAL_PLAN #8 (do not land on P127): both tuples must gain
-    # ``rew_econ`` after ``rew``. Leaving the critic-replay tuple
-    # (False, True) on hunt is replay-half no-op.
-    assert _replay_h2d_keys(False, True) == ('obs', 'act', 'rew', 'expert')
-    assert _replay_h2d_keys(False, True, False) == ('obs', 'act', 'rew')
+    assert _replay_h2d_keys(False, True) == (
+        'obs', 'act', 'rew', 'rew_econ', 'expert')
+    assert _replay_h2d_keys(False, True, False) == (
+        'obs', 'act', 'rew', 'rew_econ')
     assert _replay_h2d_keys(True, True) == (
-        'obs', 'act', 'dist', 'rew', 'expert')
+        'obs', 'act', 'dist', 'rew', 'rew_econ', 'expert')
     m.dynamics.dob_active = True
     assert _wm_need_dist_target(m, c) is True
     assert 'dist' in _p1_wm_h2d_keys(True)
@@ -1501,6 +1510,55 @@ def _test_buffer_sample_keys() -> None:
     buf2.add_episode(obs, act, rew, cont, expert=expert_row, dist=dist)
     assert np.array_equal(buf2.expert[1], expert_row)
     print('[smoke] OK  buffer sample keys subset identity')
+
+
+def _test_rew_econ_split() -> None:
+    """#8: copy-not-clear pop; sample emits rew_econ; unbound copies rew."""
+    import numpy as np
+    from training.train import TrajectoryBuffer, _replay_h2d_keys
+
+    T, D, A = 8, 3, 1
+    hunt = np.linspace(-2.0, -1.0, T, dtype='float32')
+    econ = hunt + 0.5
+
+    class _Src:
+        def __init__(self, arr):
+            self.arr = arr
+            self.n = 0
+
+        def pop_episode_rew_econ(self, t):
+            self.n += 1
+            assert int(t) == T
+            return self.arr.copy()
+
+    src = _Src(econ)
+    buf = TrajectoryBuffer(4, T, D, A, n_dist=0)
+    onpol = TrajectoryBuffer(4, T, D, A, n_dist=0)
+    buf._rew_econ_source = src
+    onpol._rew_econ_source = src
+    obs = np.zeros((T, D), dtype='float32')
+    act = np.zeros((T, A), dtype='float32')
+    cont = np.ones(T, dtype='float32')
+    buf.add_episode(obs, act, hunt, cont)
+    onpol.add_episode(obs, act, hunt, cont)
+    assert src.n == 2
+    got_b = buf.sample(2, T, np.random.default_rng(0),
+                       keys=('obs', 'act', 'rew', 'rew_econ'))
+    got_o = onpol.sample(2, T, np.random.default_rng(0),
+                         keys=('obs', 'act', 'rew', 'rew_econ'))
+    assert set(got_b) == {'obs', 'act', 'rew', 'rew_econ'}
+    assert np.allclose(got_b['rew'][0], hunt)
+    assert np.allclose(got_b['rew_econ'][0], econ)
+    assert np.allclose(got_o['rew_econ'][0], econ)
+    assert not np.allclose(got_b['rew_econ'][0], got_b['rew'][0])
+    unbound = TrajectoryBuffer(2, T, D, A, n_dist=0)
+    unbound.add_episode(obs, act, hunt, cont)
+    got_u = unbound.sample(1, T, np.random.default_rng(1),
+                           keys=('rew', 'rew_econ'))
+    assert np.allclose(got_u['rew_econ'][0], hunt)
+    assert _replay_h2d_keys(False, True, False)[-1] == 'rew_econ'
+    assert 'rew_econ' in _replay_h2d_keys(False, True)
+    print('[smoke] OK  #8 rew_econ copy-not-clear + unbound fallback')
 
 
 def _test_buffer_clear() -> None:
@@ -2535,6 +2593,14 @@ def _test_isolation_dcv_scales() -> None:
     assert '_h2d_keys = None' not in _src
     assert '_replay_h2d_keys(False, True)' in _src
     assert '_replay_h2d_keys(False, True, False)' in _src
+    # #8: critic twohot on reversal-free econ; actor λ on hunt.
+    assert 'onpol_buf._rew_econ_source' in _src
+    assert 'buf._rew_econ_source' in _src
+    assert 'ret_econ = _lambda_returns' in _src
+    assert 'ret_hunt = _lambda_returns' in _src
+    assert "keys.append('rew_econ')" in _src
+    assert "'raw_hunt'" in _src
+    assert 'reward_econ' in _src
     assert 'self.expert[i] = 0.0' in _src
     assert "else np.zeros(self.T, dtype='float32')" not in _src
     assert 'keys=_h2d_keys' in _src
@@ -7343,6 +7409,7 @@ if __name__ == '__main__':
     _test_time_unbind_and_p1_h2d_keys()
     _test_lambda_returns_scan()
     _test_buffer_sample_keys()
+    _test_rew_econ_split()
     _test_buffer_clear()
     _test_store_aux_feats_identity()
     _test_prior_cv_recon_reverted()

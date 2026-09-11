@@ -554,9 +554,8 @@ class TrainConfig:
     # policy/critic have a gradient toward the band interior instead of a flat
     # zero.  ``coef`` is in SCALED-reward units (added to ``raw*reward_scale``).
     # TRAINING ONLY: the trainer sets ``env._shaping_enabled=True``; validation
-    # scores on unshaped ``info['raw_reward']`` (no Ng F).  That raw still
-    # includes ``cv_reversal_penalty`` after objective saturate (P125+; GOAL_PLAN
-    # #8 splits a pre-sat ``reward_econ`` so paired econ is not the hunt term).
+    # scores on unshaped ``info['raw_reward']`` (no Ng F).  As of #8 that raw
+    # is reversal-free (``reward_econ``); hunting sat is ``info['raw_hunt']``.
     # Set ``reward_shaping_coef=0.0`` to disable.
     reward_shaping_coef: float = 1.0
     # Flat-top safety-margin width (2026-06-16, p125 RCA) for the RANGE/limit
@@ -617,7 +616,7 @@ class TrainConfig:
     # when bounding is on — it is meaningless once rewards saturate).  Bounded
     # rewards ⇒ bounded returns ⇒ return_scale CANNOT run away.  Applied to the
     # TRAINING reward only; ``info['raw_reward']`` stays unshaped (no Ng F)
-    # but still includes ``cv_reversal_penalty`` (GOAL_PLAN #8).  P73 (2026-05-31) PROMOTED
+    # and is reversal-free as of #8.  P73 (2026-05-31) PROMOTED
     # the default to True after the bounded-reward run unfroze the actor
     # (MV moves, mv_violation 0→1.75) and tamed return_scale runaway 5756×→27×.
     # Set DREAMER_BOUND_TRAINING_REWARD=0 to restore legacy (scaled) reward.
@@ -2578,6 +2577,11 @@ class APCEnv:
         # Current phase (1=WM, 2=critic, 3=actor+critic).  Used by the
         # phase-aware amplitude cap in ``curriculum_amp_scale``.
         self._current_phase: int = 1
+        # Training-scale reversal-free reward trace (#8). ``reset()``
+        # clears; ``pop_episode_rew_econ`` copies without clearing so
+        # P3 ``buf.add`` then ``onpol_buf.add`` of the same episode both
+        # see it.
+        self._rew_econ_trace: List[float] = []
 
         # ---- Raw-reward clipping (P37 onward, 2026-05-22) ---------------
         # The objective's quadratic violation tail can produce
@@ -2626,7 +2630,8 @@ class APCEnv:
         # (``reward_scale`` bypassed) so imagined returns stay bounded and
         # the return_scale percentile cannot run away (cascade root-cause
         # fix).  ``info['raw_reward']`` stays unshaped (no Ng F) for val
-        # scoring but still includes ``cv_reversal_penalty`` (GOAL_PLAN #8).
+        # scoring and is reversal-free as of #8 (``info['raw_hunt']`` is
+        # the hunting sat used by reward calibration).
         #
         # P77: the mapping is now a SCALE-INVARIANT LINEAR REMAP
         #   reward = clip(raw * (B / reward_clip_ref), -B, B)
@@ -3049,6 +3054,7 @@ class APCEnv:
             self.set_sim_noise_scale(1.0)
         # Fresh per-episode trace for the WM disturbance-estimator head target.
         self._hidden_disturbance_trace = []
+        self._rew_econ_trace = []
         obs_vec = self._build_obs_vec(state)
         self._window = np.tile(obs_vec, (self.cfg.lookback, 1)).astype('float32')
         return self._window.copy()
@@ -3069,6 +3075,22 @@ class APCEnv:
                 out[:m] = arr[:m]
         self._hidden_disturbance_trace = []
         return out
+
+    def pop_episode_rew_econ(self, T: int) -> Optional[np.ndarray]:
+        """Copy the training-scale reversal-free reward trace.
+
+        Do **not** clear (P3 double-add of the same episode onto ``buf``
+        then ``onpol_buf``). ``reset()`` clears. Short / missing traces
+        return ``None`` so the buffer copies hunting ``rew``, never zeros.
+        """
+        trace = getattr(self, '_rew_econ_trace', None)
+        T = int(T)
+        if not trace:
+            return None
+        arr = np.asarray(trace, dtype='float32').reshape(-1)
+        if arr.shape[0] < T:
+            return None
+        return arr[:T].copy()
 
     def _shaping_potential(self, state: np.ndarray) -> float:
         """Dense shaping potential Φ(s) for reward shaping.
@@ -3287,64 +3309,68 @@ class APCEnv:
             prev_cv_reversal_sticky=self._cv_reversal_sticky,
             cfg=self.cfg,
         )
-        raw_reward = float(comps['reward'])
-        # Apply raw clip BEFORE scaling so calibration (which percentile-
-        # fits ``raw_reward``) and the agent both see the same clipped
-        # distribution.  See ``self._reward_clip_min/max`` rationale.
-        if (self._reward_clip_min > -1e17) or (self._reward_clip_max < 1e17):
-            clipped = float(np.clip(raw_reward,
-                                     self._reward_clip_min,
-                                     self._reward_clip_max))
-            if (clipped != raw_reward) and (not self._reward_clip_warned):
-                print(f'[env.step] WARNING reward clip triggered: raw={raw_reward:.4g} '
-                      f'-> {clipped:.4g} (range [{self._reward_clip_min:.4g},'
-                      f'{self._reward_clip_max:.4g}]); further occurrences '
-                      f'silenced.', flush=True)
-                self._reward_clip_warned = True
-            raw_reward = clipped
+        def _clip_raw(raw: float, *, warn: bool) -> float:
+            raw = float(raw)
+            if (self._reward_clip_min > -1e17) or (self._reward_clip_max < 1e17):
+                clipped = float(np.clip(raw,
+                                         self._reward_clip_min,
+                                         self._reward_clip_max))
+                if warn and (clipped != raw) and (not self._reward_clip_warned):
+                    print(f'[env.step] WARNING reward clip triggered: '
+                          f'raw={raw:.4g} -> {clipped:.4g} '
+                          f'(range [{self._reward_clip_min:.4g},'
+                          f'{self._reward_clip_max:.4g}]); further '
+                          f'occurrences silenced.', flush=True)
+                    self._reward_clip_warned = True
+                return clipped
+            return raw
+
+        def _bound_shape(raw_clipped: float, ref: float, shaping: float) -> float:
+            if self._bound_reward:
+                b = self._bound_reward_max
+                out = float(np.clip(raw_clipped * (b / ref), -b, b))
+            else:
+                out = raw_clipped * float(self.reward_scale)
+            out = out + float(shaping)
+            if self._bound_reward:
+                out = float(np.clip(out, -self._bound_reward_max,
+                                    self._bound_reward_max))
+            return out
+
+        # Hunting sat (includes cv_reversal). Clip before bound so calib
+        # and the actor see the same tail. Same clip / ref / Ng F on the
+        # reversal-free econ stream (#8).
+        raw_hunt = _clip_raw(float(comps['reward']), warn=True)
+        raw_econ = _clip_raw(float(comps.get('reward_econ', comps['reward'])),
+                             warn=False)
         if self._bound_reward:
-            # P77: scale-invariant linear remap of the (already tanh-bounded)
-            # economic reward into [-B, B].  ``reward_clip_ref`` is the
-            # econ-derived adaptive clip from objective_runtime; dividing by
-            # it cancels the absolute magnitude of the user's economic
-            # weights so the actor sees the SAME reward shape across every
-            # simulator and economic configuration.  Single symlog happens
-            # only at the twohot reward head (no double-symlog squash).
-            b = self._bound_reward_max
             ref = float(comps.get('reward_clip', self._bound_reward_ref))
             if not np.isfinite(ref) or ref <= 1e-9:
                 ref = self._bound_reward_ref_fallback
             self._bound_reward_ref = ref
-            reward = float(np.clip(raw_reward * (b / ref), -b, b))
         else:
-            reward = raw_reward * float(self.reward_scale)
-        # A' : dense potential-based reward shaping (training env only;
-        # ``info['raw_reward']`` below stays unshaped — no Ng F — but still
-        # includes ``cv_reversal_penalty``; GOAL_PLAN #8 splits pre-sat econ).
-        # F = coef·(γΦ(s') − Φ(s)) is
-        # policy-invariant (Ng et al. 1999) — it densifies the learning
-        # signal toward the band interior without changing the optimal
-        # economic policy.  Added in scaled-reward units.
+            ref = 1.0
+        shaping = 0.0
         if self._shaping_enabled and self._shaping_coef > 0.0:
             phi_next = self._shaping_potential(next_state)
             phi_prev = (self._prev_potential
                         if self._prev_potential is not None else phi_next)
-            # Read γ live from cfg so the shaping discount tracks the
-            # auto-tuned training γ (set AFTER __init__).  Strict
-            # policy-invariance (Ng et al. 1999) requires shaping γ ==
-            # RL γ; caching the __init__ default would break it.
             shaping_gamma = float(getattr(self.cfg, 'gamma',
                                           self._shaping_gamma)
                                   or self._shaping_gamma)
             shaping = self._shaping_coef * (
                 shaping_gamma * phi_next - phi_prev)
             self._prev_potential = phi_next
-            reward = reward + float(shaping)
-            if self._bound_reward:
-                # Keep the shaped reward inside the bounded envelope so the
-                # densifier cannot reintroduce an unbounded scale.
-                b = self._bound_reward_max
-                reward = float(np.clip(reward, -b, b))
+        reward = _bound_shape(raw_hunt, ref, shaping)
+        reward_econ = _bound_shape(raw_econ, ref, shaping)
+        econ_trace = getattr(self, '_rew_econ_trace', None)
+        if econ_trace is None:
+            self._rew_econ_trace = []
+            econ_trace = self._rew_econ_trace
+        econ_trace.append(float(reward_econ))
+        # Val / critic calib: unshaped reversal-free raw. Calib reads
+        # ``raw_hunt`` so a milder econ tail cannot bind hunting sat.
+        raw_reward = raw_econ
         self._prev_prev_control = self._prev_control
         self._prev_control = np.asarray(control, dtype='float32')
         try:
@@ -3375,6 +3401,7 @@ class APCEnv:
         self._last_mv_violation_sum += float(comps.get('mv_violation_penalty', 0.0))
         info = {'reward_components': comps, 't': self._t,
                 'raw_reward': raw_reward,
+                'raw_hunt': raw_hunt,
                 'hidden_disturbance': hidden_applied,
                 'raw_state': np.asarray(next_state, dtype='float32').copy()}
         return self._window.copy(), reward, done, info
@@ -4408,19 +4435,16 @@ def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
     dob-ground).  P3 observer re-encodes from ``obs`` so ``dist`` stays
     off.      ``rew`` when MTP or P3 AC is in the graph.  ``expert`` follows
     ``need_rew_expert`` unless ``need_expert`` overrides: P3 on-policy
-    actor uses ``obs/act/rew`` only (``expert_bc_p3_loss`` reads the
-    critic replay slot).  GOAL_PLAN #8 (do not land on P127): append
-    ``rew_econ`` immediately after ``rew`` whenever ``need_rew_expert``.
-    Smoke ``_replay_h2d_keys(False, True, False) == ('obs','act','rew')``
-    and ``_replay_h2d_keys(False, True) == ('obs','act','rew','expert')``
-    must both gain ``rew_econ``. ``onpol_buf`` must actually *hold*
-    ``rew_econ`` or this H2D list is a silent fallback-to-``rew``.
+    actor uses ``obs/act/rew/rew_econ`` (``expert_bc_p3_loss`` reads the
+    critic replay slot).  #8: ``rew_econ`` immediately after ``rew``
+    whenever ``need_rew_expert``. Do **not** add it to P1 WM keys.
     """
     keys: List[str] = ['obs', 'act']
     if need_dist:
         keys.append('dist')
     if need_rew_expert:
         keys.append('rew')
+        keys.append('rew_econ')
         if need_expert is None or need_expert:
             keys.append('expert')
     elif need_expert:
@@ -5266,14 +5290,14 @@ class TrajectoryBuffer:
         self.dist = (np.zeros((capacity_eps, self.T, self.n_dist), dtype='float32')
                      if self.n_dist > 0 else None)
         self._dist_source = None
-        # GOAL_PLAN #8 (do not land on P127 pid 618741): do NOT add a
-        # rew_econ= kwarg. Bind ``_rew_econ_source`` on BOTH ``buf`` AND
-        # ``onpol_buf``. Dist is bound only on ``buf``; P3 does
-        # buf.add then onpol.add of the SAME episode. pop must COPY
-        # without clearing; ``reset()`` clears. Clear-on-pop (dist
-        # pattern) makes onpol fallback-copy hunting ``rew`` → silent
-        # no-op. Isolation stays unbound. Fallback copy ``rew``, never
-        # zeros, only when unbound.
+        # #8: reversal-free column. No rew_econ= kwarg. Bind
+        # ``_rew_econ_source`` on BOTH ``buf`` AND ``onpol_buf``. Dist
+        # is bound only on ``buf``; P3 does buf.add then onpol.add of
+        # the SAME episode. pop COPIES without clearing; ``reset()``
+        # clears. Isolation stays unbound. Fallback copy ``rew``, never
+        # zeros.
+        self.rew_econ = np.zeros((capacity_eps, self.T), dtype='float32')
+        self._rew_econ_source = None
         self.filled = 0
         self.write = 0
 
@@ -5309,6 +5333,20 @@ class TrajectoryBuffer:
                     self.dist[i] = 0.0
             else:
                 self.dist[i] = 0.0
+        econ = None
+        if self._rew_econ_source is not None:
+            try:
+                econ = self._rew_econ_source.pop_episode_rew_econ(self.T)
+            except Exception:
+                econ = None
+        if econ is not None:
+            e = np.asarray(econ, dtype='float32').reshape(-1)
+            if e.shape == (self.T,):
+                self.rew_econ[i] = e
+            else:
+                self.rew_econ[i] = self.rew[i]
+        else:
+            self.rew_econ[i] = self.rew[i]
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
@@ -5349,10 +5387,8 @@ class TrajectoryBuffer:
             out['act'] = self.act[ep, t_idx]
         if want is None or 'rew' in want:
             out['rew'] = self.rew[ep, t_idx]
-        # GOAL_PLAN #8 (do not land on P127): also fancy-index
-        # ``rew_econ`` here. ``_replay_h2d_keys`` listing the name is
-        # not enough — ``_batch_np_to_device`` only copies keys that
-        # exist in this sample. Fallback copy ``rew``, never zeros.
+        if want is None or 'rew_econ' in want:
+            out['rew_econ'] = self.rew_econ[ep, t_idx]
         if want is None or 'cont' in want:
             out['cont'] = self.cont[ep, t_idx]
         if want is None or 'expert' in want:
@@ -10388,15 +10424,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     rssm = model.dynamics
     obs = batch['obs']                                   # (B, T, D)
     act = batch['act']                                   # (B, T, A)
-    rew = batch['rew'].float()                           # (B, T)  REAL reward
-    # GOAL_PLAN #8: this ``rew`` is the hunting stream (includes
-    # ``cv_reversal``). Critic CE/MC must move to ``batch['rew_econ']``;
-    # actor λ + ``update_return_scale`` stay on ``rew``; advantage is
-    # ``λ(rew) − V_econ``. Do not land on P127. ``onpol_buf`` is
-    # ``_src_buf`` here — bind + clear-on-reset or ``rew_econ`` is
-    # hunting ``rew`` and the split is a no-op. Replay
-    # ``critic_batch['rew']`` below is the same hole for the
-    # diversity term (p06 inversion if only on-policy switches).
+    rew = batch['rew'].float()                           # (B, T) hunting
+    _rew_e = batch.get('rew_econ', rew)
+    rew_econ = _rew_e.float() if torch.is_tensor(_rew_e) else rew
     B, T = obs.shape[:2]
     device = obs.device
 
@@ -10434,7 +10464,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     gamma = float(cfg.gamma)
     lam = float(cfg.gae_lambda)
     _ret_cap = _adaptive_return_cap(cfg)
-    target_returns = _lambda_returns(rew, v_slow, gamma, lam, _ret_cap)
+    # #8: critic twohot on reversal-free econ; actor λ + S on hunt.
+    ret_econ = _lambda_returns(rew_econ, v_slow, gamma, lam, _ret_cap)
+    ret_hunt = _lambda_returns(rew, v_slow, gamma, lam, _ret_cap)
 
     # ----- CRITIC loss (twohot CE): ON-POLICY (advantage accuracy) + replay -----
     # p06 RCA (2026-07-10): the p05 buffer-split trained the critic ONLY on the
@@ -10467,7 +10499,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
 
     # (a) ON-POLICY term — the distribution the advantage is evaluated on.
     critic_loss, v_pred_flat = _critic_pack(
-        feat_flat, v_slow, rew, target_returns)
+        feat_flat, v_slow, rew_econ, ret_econ)
 
     # P83 expert-BC anchor accumulator (wired below on the seed-buffer batch,
     # which retains expert-flagged steps via the every-20-iter P3 expert inject).
@@ -10483,10 +10515,8 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                     sample=False, store_aux=False)
         Bc, Tc = critic_batch['obs'].shape[:2]
         feat_c = _fc.detach().reshape(Bc * Tc, -1)
-        # GOAL_PLAN #8 (do not land on P127): ``rew_c`` must be
-        # ``critic_batch['rew_econ']`` (fallback copy ``rew``, never
-        # zeros). Leaving this on hunting ``rew`` is replay-half no-op.
-        rew_c = critic_batch['rew'].float()
+        _rew_c = critic_batch.get('rew_econ', critic_batch['rew'])
+        rew_c = _rew_c.float() if torch.is_tensor(_rew_c) else critic_batch['rew'].float()
         with torch.no_grad():
             v_slow_c = model.critic_min_v(feat_c, target=True).reshape(Bc, Tc)
         ret_c = _lambda_returns(rew_c, v_slow_c, gamma, lam, _ret_cap)
@@ -10507,9 +10537,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # ``critic_min_v(target=False)``; expectation is already ``no_grad``).
     with torch.no_grad():
         v_pred = v_pred_flat.reshape(B, T)
-        adv_raw = target_returns - v_pred
+        adv_raw = ret_hunt - v_pred
         scale = model.update_return_scale(
-            target_returns,
+            ret_hunt,
             abs_cap=float(getattr(cfg, 'return_scale_abs_cap', 500.0)),
             freeze=bool(freeze_return_scale),
         ).clamp_min(1.0)
@@ -10560,16 +10590,14 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     actor_loss = actor_pg - ent_coef * entropy.mean() + bc_term
 
     # ----- diagnostics (real-sim; leftover imag/PMPO jsonl keys kept as aliases) -----
-    # GOAL_PLAN #8 (do not land on P127): ``critic_rew_to_tgt_var`` /
-    # ``critic_pred_target_r`` must use the econ stream (``rew_econ``,
-    # ``ret_econ``, V_econ). ``realsim_reward_mean`` stays on hunt.
-    # ``update_return_scale`` KEEP on hunt λ (not econ).
+    # #8: critic canaries on the econ stream; ``realsim_reward_mean``
+    # stays on hunt (actor stream). ``update_return_scale`` KEEP on hunt λ.
     with torch.no_grad():
-        rew_var = rew.var().clamp_min(1e-8)
-        tgt_var = target_returns.float().var().clamp_min(1e-8)
+        rew_var = rew_econ.var().clamp_min(1e-8)
+        tgt_var = ret_econ.float().var().clamp_min(1e-8)
         adv_action_corr = _adv_action_corr(adv_raw, act_flat)
-        pred_target_r = _pearson_r(v_pred, target_returns)
-        target_v_r = _pearson_r(target_returns, v_slow)
+        pred_target_r = _pearson_r(v_pred, ret_econ)
+        target_v_r = _pearson_r(ret_econ, v_slow)
         if mc_parts:
             critic_mc_loss = mc_parts[0]
             for _mc in mc_parts[1:]:
@@ -10581,7 +10609,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
         'entropy_mean': entropy.mean().detach(),
-        'realsim_return_mean': target_returns.mean().detach(),
+        'realsim_return_mean': ret_hunt.mean().detach(),
         'realsim_reward_mean': rew.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
         'adv_global_std': adv_raw.std().detach(),
@@ -11860,12 +11888,7 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
                                 size=(env.action_dim,)).astype('float32')
                 np.clip(a, -1.0, 1.0, out=a)
         obs, _, done, info = env.step(a)
-        # GOAL_PLAN #8 (do not land on P127): ``info['raw_reward']`` will
-        # become reversal-free. Keep this calib source on hunting
-        # (``info['raw_hunt']`` / pre-bound ``comps['reward']``) so an
-        # adaptive clip from a milder econ tail cannot bind hunting sat
-        # 1000. Val ``economic_score`` stays on reversal-free raw.
-        raw_rewards.append(float(info.get('raw_reward', 0.0)))
+        raw_rewards.append(float(info.get('raw_hunt', info.get('raw_reward', 0.0))))
         try:
             obs_trace.append(np.asarray(obs, dtype='float32').copy())
         except Exception:
@@ -12472,13 +12495,12 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # A' : enable potential-based reward shaping on the TRAINING env only.
     # Validation builds its own APCEnv instances (evaluation/validate.py)
     # which leave shaping OFF.  Val ``economic_score`` is mean of unshaped
-    # ``raw_reward`` and today still includes ``cv_reversal`` (GOAL_PLAN #8).
+    # reversal-free ``raw_reward`` (#8). Hunting sat is ``info['raw_hunt']``.
     if float(getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0) > 0.0:
         env._shaping_enabled = True
         print(f"[reward-shaping] potential-based shaping ENABLED on training "
               f"env (coef={env._shaping_coef:.3g}, γ={env._shaping_gamma:.4g}); "
-              f"validation scores on unshaped raw (includes cv_reversal; "
-              f"GOAL_PLAN #8 splits econ).", flush=True)
+              f"validation scores on unshaped reversal-free raw (#8).", flush=True)
 
     # ---- Adaptive cold-start seed-buffer knobs (P0, 2026-05-05) ----
     # Derive plant-aware defaults for the seed buffer so a fresh sim
@@ -12950,6 +12972,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
               f'ground_coef={float(getattr(cfg, "dob_ground_coef", 0.0) or 0.0):.3g} '
               f'head_dim={int(getattr(cfg, "disturbance_head_dim", 0) or 0)})',
               flush=True)
+    buf._rew_econ_source = env
 
     # mbrl2 real-sim (2026-07-08): a SEPARATE rolling ON-POLICY buffer for the P3
     # actor-critic update.  Vanilla REINFORCE (``_realsim_actor_critic_step``) is
@@ -12963,6 +12986,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     _onpol_eps = max(2, int(getattr(cfg, 'phase3_onpolicy_buffer_eps', 16) or 16))
     onpol_buf = TrajectoryBuffer(_onpol_eps, cfg.episode_length,
                                  cfg.obs_dim, cfg.action_dim, n_dist=0)
+    onpol_buf._rew_econ_source = env
 
     # MIMO per-INPUT isolation buffer (2026-07-10 / P28 follow-up 9): holds
     # ONLY the isolated whole-episode settle holds (one input at a
@@ -15142,10 +15166,6 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 _critic_batch = None
                 if (onpol_buf is not None and onpol_buf.filled > 0
                         and buf.filled > 0):
-                    # GOAL_PLAN #8 (do not land on P127): this tuple
-                    # must gain ``rew_econ`` after ``rew`` (smoke
-                    # ``_replay_h2d_keys(False, True)``). slot='critic'
-                    # dest is a new H2D name, identity values.
                     _cb_keys = _replay_h2d_keys(False, True)
                     _cb_np = buf.sample(
                         cfg.batch_size, cfg.seq_len, rng, keys=_cb_keys)
