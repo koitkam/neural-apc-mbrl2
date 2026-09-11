@@ -5339,6 +5339,10 @@ class TrajectoryBuffer:
             out['act'] = self.act[ep, t_idx]
         if want is None or 'rew' in want:
             out['rew'] = self.rew[ep, t_idx]
+        # GOAL_PLAN #8 (next GPU after P126, do not land on this pid): also
+        # fancy-index ``rew_econ`` here. ``_replay_h2d_keys`` listing the
+        # name is not enough — ``_batch_np_to_device`` only copies keys
+        # that exist in this sample. Fallback copy ``rew``, never zeros.
         if want is None or 'cont' in want:
             out['cont'] = self.cont[ep, t_idx]
         if want is None or 'expert' in want:
@@ -11835,6 +11839,11 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
                                 size=(env.action_dim,)).astype('float32')
                 np.clip(a, -1.0, 1.0, out=a)
         obs, _, done, info = env.step(a)
+        # GOAL_PLAN #8 (do not land on P126): ``info['raw_reward']`` will
+        # become reversal-free. Keep this calib source on hunting
+        # (``info['raw_hunt']`` / pre-bound ``comps['reward']``) so an
+        # adaptive clip from a milder econ tail cannot bind hunting sat
+        # 1000. Val ``economic_score`` stays on reversal-free raw.
         raw_rewards.append(float(info.get('raw_reward', 0.0)))
         try:
             obs_trace.append(np.asarray(obs, dtype='float32').copy())
