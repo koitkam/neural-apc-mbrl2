@@ -4409,10 +4409,11 @@ def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
     off.      ``rew`` when MTP or P3 AC is in the graph.  ``expert`` follows
     ``need_rew_expert`` unless ``need_expert`` overrides: P3 on-policy
     actor uses ``obs/act/rew`` only (``expert_bc_p3_loss`` reads the
-    critic replay slot).  GOAL_PLAN #8: also copy ``rew_econ`` on those
-    P3 keys (on-policy ``(False, True, False)`` and critic
-    ``(False, True)``); ``_batch_np_to_device`` already copies listed
-    names that exist in the sample.
+    critic replay slot).  GOAL_PLAN #8 (do not land on P127): append
+    ``rew_econ`` immediately after ``rew`` whenever ``need_rew_expert``.
+    Smoke ``_replay_h2d_keys(False, True, False) == ('obs','act','rew')``
+    must change. ``onpol_buf`` must actually *hold* ``rew_econ`` or
+    this H2D list is a silent fallback-to-``rew``.
     """
     keys: List[str] = ['obs', 'act']
     if need_dist:
@@ -5264,11 +5265,14 @@ class TrajectoryBuffer:
         self.dist = (np.zeros((capacity_eps, self.T, self.n_dist), dtype='float32')
                      if self.n_dist > 0 else None)
         self._dist_source = None
-        # GOAL_PLAN #8 (do not land on this pid): do NOT add a rew_econ=
-        # kwarg. Bind ``_rew_econ_source`` like ``_dist_source`` and pop
-        # ``pop_episode_rew_econ(T)`` inside ``add_episode`` so the ~17
-        # call sites (incl. isolation_buf) stay untouched. Fallback copy
-        # ``rew``, never zeros. Isolation may grow the column unused.
+        # GOAL_PLAN #8 (do not land on P127 pid 618741): do NOT add a
+        # rew_econ= kwarg. Bind ``_rew_econ_source`` on BOTH ``buf`` AND
+        # ``onpol_buf``. Dist is bound only on ``buf``; P3 does
+        # buf.add then onpol.add of the SAME episode. pop must COPY
+        # without clearing; ``reset()`` clears. Clear-on-pop (dist
+        # pattern) makes onpol fallback-copy hunting ``rew`` → silent
+        # no-op. Isolation stays unbound. Fallback copy ``rew``, never
+        # zeros, only when unbound.
         self.filled = 0
         self.write = 0
 
@@ -5344,10 +5348,10 @@ class TrajectoryBuffer:
             out['act'] = self.act[ep, t_idx]
         if want is None or 'rew' in want:
             out['rew'] = self.rew[ep, t_idx]
-        # GOAL_PLAN #8 (next GPU after P126, do not land on this pid): also
-        # fancy-index ``rew_econ`` here. ``_replay_h2d_keys`` listing the
-        # name is not enough — ``_batch_np_to_device`` only copies keys
-        # that exist in this sample. Fallback copy ``rew``, never zeros.
+        # GOAL_PLAN #8 (do not land on P127): also fancy-index
+        # ``rew_econ`` here. ``_replay_h2d_keys`` listing the name is
+        # not enough — ``_batch_np_to_device`` only copies keys that
+        # exist in this sample. Fallback copy ``rew``, never zeros.
         if want is None or 'cont' in want:
             out['cont'] = self.cont[ep, t_idx]
         if want is None or 'expert' in want:
@@ -10387,7 +10391,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # GOAL_PLAN #8: this ``rew`` is the hunting stream (includes
     # ``cv_reversal``). Critic CE/MC must move to ``batch['rew_econ']``;
     # actor λ + ``update_return_scale`` stay on ``rew``; advantage is
-    # ``λ(rew) − V_econ``. Do not land on the live P126 pid.
+    # ``λ(rew) − V_econ``. Do not land on P127. ``onpol_buf`` is
+    # ``_src_buf`` here — bind + clear-on-reset or ``rew_econ`` is
+    # hunting ``rew`` and the split is a no-op.
     B, T = obs.shape[:2]
     device = obs.device
 
@@ -11844,7 +11850,7 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
                                 size=(env.action_dim,)).astype('float32')
                 np.clip(a, -1.0, 1.0, out=a)
         obs, _, done, info = env.step(a)
-        # GOAL_PLAN #8 (do not land on P126): ``info['raw_reward']`` will
+        # GOAL_PLAN #8 (do not land on P127): ``info['raw_reward']`` will
         # become reversal-free. Keep this calib source on hunting
         # (``info['raw_hunt']`` / pre-bound ``comps['reward']``) so an
         # adaptive clip from a milder econ tail cannot bind hunting sat
