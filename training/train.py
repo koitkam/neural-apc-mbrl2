@@ -10589,9 +10589,10 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         _ratio_clip_frac = torch.zeros((), device=device)
     actor_loss = actor_pg - ent_coef * entropy.mean() + bc_term
 
-    # ----- diagnostics (real-sim; leftover imag/PMPO jsonl keys kept as aliases) -----
+    # ----- diagnostics (real-sim; imag/PMPO jsonl keys removed) -----
     # #8: critic canaries on the econ stream; ``realsim_reward_mean``
-    # stays on hunt (actor stream). ``update_return_scale`` KEEP on hunt λ.
+    # stays on hunt (actor stream). ``update_return_scale`` KEEP on hunt λ
+    # until #10 flips both A and S to ``ret_econ``.
     with torch.no_grad():
         rew_var = rew_econ.var().clamp_min(1e-8)
         tgt_var = ret_econ.float().var().clamp_min(1e-8)

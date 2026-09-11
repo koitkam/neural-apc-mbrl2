@@ -3248,6 +3248,10 @@ def _test_auto_weights_cfg() -> None:
     from utils.runtime_setpoints import RuntimeSetpointConfig
     from workflow._plant_prepare import ENV_OVERRIDES
 
+    aw_src = open('utils/auto_weights.py').read()
+    assert "os.environ.get('DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO')" not in aw_src
+    assert "if _explicit(cfg, 'obj_auto_cv_over_econ_ratio')" not in aw_src
+
     c = TrainConfig()
     assert abs(float(c.obj_auto_mv_over_cv_ratio) - 2.0) < 1e-12
     assert abs(float(c.obj_auto_typical_cv_violation) - 0.10) < 1e-12
@@ -3561,6 +3565,31 @@ def _test_residual_board_cv_metrics() -> None:
     assert float(m['cv_viol_frac']) == 0.0
     assert float(m['cv_d2_rms_normed']) <= 0.05
     assert float(m['cv_reversal_rate']) <= 0.25
+    assert float(m['cv_limit_orbit_rate']) == 0.0
+    # Limit-orbit diagnostic (crossings / τ): slow ride → 0; through-limit
+    # sine → ~2; mid-band sine (never crosses y_econ) → 0. NOT a smooth_pass input.
+    T_or = 200
+    lo_o, hi_o = 78.5, 85.5
+    t = np.arange(T_or, dtype='float64')
+    ride = np.linspace(82.0, hi_o, T_or)
+    ep_ride = dict(
+        ep, episode_length=T_or, sample_rate=4, tau_dominant=56.0,
+        states=ride.astype('float32').reshape(T_or, 1),
+        controls=np.zeros((T_or, 1), dtype='float32'),
+        raw_rewards=np.zeros(T_or, dtype='float32'),
+        cv_bounds=[[lo_o, hi_o]],
+        mv_cv_gain_sign=-1.0)
+    m_ride = compute_episode_metrics(ep_ride)
+    assert float(m_ride['cv_orbit_window_steps']) == 14
+    assert float(m_ride['cv_limit_orbit_rate']) < 0.05
+    sine = hi_o + 0.4 * np.sin(2.0 * np.pi * t / 14.0)
+    ep_orb = dict(ep_ride, states=sine.astype('float32').reshape(T_or, 1))
+    m_orb = compute_episode_metrics(ep_orb)
+    assert float(m_orb['cv_limit_orbit_rate']) > 1.5
+    mid = 82.0 + 0.4 * np.sin(2.0 * np.pi * t / 14.0)
+    ep_mid = dict(ep_ride, states=mid.astype('float32').reshape(T_or, 1))
+    m_mid = compute_episode_metrics(ep_mid)
+    assert float(m_mid['cv_limit_orbit_rate']) < 0.05
     osc = y.copy()
     osc[::2] = 84.0
     osc[1::2] = 86.0
@@ -3580,6 +3609,7 @@ def _test_residual_board_cv_metrics() -> None:
             'episode_metrics_agent': {
                 'cv_d2_rms_normed': 0.02,
                 'cv_reversal_rate': 0.1,
+                'cv_limit_orbit_rate': 0.80,
                 'cv_opt_headroom': 0.12,
                 'cv_viol_frac': 0.0,
                 'cv_econ_side': 'lo',
@@ -3601,6 +3631,11 @@ def _test_residual_board_cv_metrics() -> None:
         },
     })
     assert board['r2']['smooth_pass'] is True
+    assert abs(board['r2']['cv_limit_orbit_rate_worst_seed'] - 0.80) < 1e-9
+    assert 'cv_smooth_pass(worst_d2, worst_rev)' in open(
+        'evaluation/residual_board.py').read()
+    assert 'cv_limit_orbit_rate' in open('evaluation/validate.py').read()
+    assert 'def _cv_limit_orbit_rate' in open('evaluation/validate.py').read()
     assert abs(board['r1']['ol_1step_ratio'] - 0.85) < 1e-9
     assert abs(board['r3']['det_r'] - 0.34) < 1e-9
     assert not np.isfinite(board['diagnostic']['critic_slope_g_on_v'])

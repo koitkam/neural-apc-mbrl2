@@ -15,6 +15,8 @@ import numpy as np
 CV_D2_RMS_MAX = 0.05
 CV_REVERSAL_MAX = 0.25
 CV_RETURN_HEADROOM_BAND = 0.10
+# Parked #11 gate (not in smooth_pass). Crossings of y_econ per identified τ.
+CV_LIMIT_ORBIT_MAX = 0.15
 # Pearson r is scale-invariant (P127 r=+0.318 with slope 289 / V−81 vs G−15318).
 # Order-1 same-sign slope: [0.25, 4] ≈ |log10(s)| ≲ 0.6.
 CRITIC_R_MIN = 0.3
@@ -168,18 +170,21 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
 
     dr = list(summary.get('disturbance_rejection') or [])
     seeds = list(summary.get('episodes') or [])
-    d2s, revs, heads, viols = [], [], [], []
+    d2s, revs, orbits, heads, viols = [], [], [], [], []
     for rec in dr:
         m = rec.get('episode_metrics_agent') or {}
         d2s.append(_f(m.get('cv_d2_rms_normed')))
         revs.append(_f(m.get('cv_reversal_rate')))
+        orbits.append(_f(m.get('cv_limit_orbit_rate', m.get('cv_limit_orbit_frac'))))
         heads.append(_f(m.get('cv_opt_headroom')))
         viols.append(_f(m.get('cv_viol_frac')))
     if not any(np.isfinite(x) for x in d2s):
-        d2s, revs, heads, viols = [], [], [], []
+        d2s, revs, orbits, heads, viols = [], [], [], [], []
         for rec in seeds:
             d2s.append(_f(rec.get('kpi_cv_d2_rms_normed')))
             revs.append(_f(rec.get('kpi_cv_reversal_rate')))
+            orbits.append(_f(rec.get('kpi_cv_limit_orbit_rate',
+                                    rec.get('kpi_cv_limit_orbit_frac'))))
             heads.append(_f(rec.get('kpi_cv_opt_headroom')))
             viols.append(_f(rec.get('kpi_cv_viol_frac')))
 
@@ -199,17 +204,21 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
             iaes.append(_f(iae))
 
     json_d2_ok = any(np.isfinite(x) for x in d2s)
+    json_orbit_ok = any(np.isfinite(x) for x in orbits)
     json_ret_ok = any(np.isfinite(x) for x in ret_heads)
     json_iae_ok = any(np.isfinite(x) for x in iaes)
     # Backfill missing axes independently. JSON IAE medians are the
     # val-suite score; npz recomputes a different window sum and must
     # not overwrite a finite JSON IAE just because return-to-limit
     # keys were added later (P119 board 64.36 vs summary 20.3).
-    if (not json_d2_ok) or (not json_ret_ok) or (not json_iae_ok):
+    if ((not json_d2_ok) or (not json_orbit_ok)
+            or (not json_ret_ok) or (not json_iae_ok)):
         npz = _metrics_from_val_npz(out_dir)
         if npz is not None:
             if not json_d2_ok:
                 d2s, revs, heads, viols = npz[:4]
+            if not json_orbit_ok:
+                orbits = npz[7] if len(npz) > 7 else []
             if not json_ret_ok:
                 ret_heads, ret_fracs = npz[4], npz[5]
             if not json_iae_ok:
@@ -217,15 +226,24 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
 
     worst_d2 = _max_finite(d2s)
     worst_rev = _max_finite(revs)
+    worst_orbit = _max_finite(orbits)
     r2 = {
         'cv_d2_rms_normed_worst_seed': worst_d2,
         'cv_reversal_rate_worst_seed': worst_rev,
+        'cv_limit_orbit_rate_worst_seed': worst_orbit,
+        'cv_limit_orbit_rate_max': CV_LIMIT_ORBIT_MAX,
         'cv_opt_headroom_mean': _mean_finite(heads),
         'cv_viol_frac_mean': _mean_finite(viols),
         'smooth_pass': cv_smooth_pass(worst_d2, worst_rev),
         'smooth_pass_rule': (
             f'worst-seed cv_d2_rms_normed<={CV_D2_RMS_MAX} AND '
-            f'cv_reversal_rate<={CV_REVERSAL_MAX} (not mv_reversal)'),
+            f'cv_reversal_rate<={CV_REVERSAL_MAX} (not mv_reversal; '
+            f'cv_limit_orbit_rate is diagnostic until #11)'),
+        'orbit_note': (
+            'cv_limit_orbit_rate = (CV−y_econ) sign-changes × (τ/sr) / T '
+            '(crossings per identified τ). Diagnostic only; not a gate. '
+            '1τ-window ≥2 frac FALSIFIED on P125 hunt (period ~2τ). '
+            f'Parked #11 threshold {CV_LIMIT_ORBIT_MAX} /τ.'),
         'mv_reversal_rate_observed': _f(
             ((summary.get('fidelity_gates') or {}).get(
                 'mv_reversal_rate_observed'))),
@@ -285,7 +303,8 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
         },
         'note': (
             'R1 = observer TM (ss + @H + curve_iae, MV and DV) and 1step→OL. '
-            'R2 = CV smoothness (d2/reversal) and limit hugging/viol. '
+            'R2 = CV smoothness (d2/reversal) and limit hugging/viol; '
+            'cv_limit_orbit_rate is diagnostic (not a gate). '
             'R3 = Kalman det_r + pred_std vs true and DR return-to-limit. '
             'Critic: critic_pass = r≥0.3 AND slope_g_on_v in [0.25, 4]; '
             'Pearson without slope is not residual-closed. '
@@ -304,6 +323,11 @@ def _metrics_from_val_npz(out_dir: Path):
         return None
     d2s, revs, heads, viols = [], [], [], []
     ret_h, ret_t, iaes = [], [], []
+    orbits: List[float] = []
+    pid = (_json_load(Path(out_dir) / 'plant_id.json')
+           or _json_load(Path(out_dir).parent / 'plant_id.json')
+           or {})
+    tau_dom = _f(pid.get('tau'), 0.0)
     found = False
     for npz_path in sorted(Path(out_dir).glob('seed_*/disturbance_rejection.npz')):
         try:
@@ -348,6 +372,7 @@ def _metrics_from_val_npz(out_dir: Path):
                     if 'sample_rate' in z.files else 1,
                 'cv_side_scale': [{'lo': 0.4, 'hi': 1.0}] * n_cv,
                 'mv_cv_gain_sign': gsign,
+                'tau_dominant': tau_dom,
             }
         except Exception:
             continue
@@ -356,6 +381,7 @@ def _metrics_from_val_npz(out_dir: Path):
         found = True
         d2s.append(_f(m.get('cv_d2_rms_normed')))
         revs.append(_f(m.get('cv_reversal_rate')))
+        orbits.append(_f(m.get('cv_limit_orbit_rate')))
         heads.append(_f(m.get('cv_opt_headroom')))
         viols.append(_f(m.get('cv_viol_frac')))
         rh = ev.get('cv_return_headroom') or {}
@@ -366,7 +392,7 @@ def _metrics_from_val_npz(out_dir: Path):
         iaes.append(_f(iae.get('median') if isinstance(iae, dict) else iae))
     if not found:
         return None
-    return d2s, revs, heads, viols, ret_h, ret_t, iaes
+    return d2s, revs, heads, viols, ret_h, ret_t, iaes, orbits
 
 
 def write_residual_board(out_dir: Path, summary: Optional[Dict] = None

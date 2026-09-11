@@ -679,6 +679,7 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         'reward_scale': float(env.reward_scale),
         'cv_side_scale': _episode_cv_side_scale(env),
         'mv_cv_gain_sign': _episode_mv_cv_gain_sign(env),
+        'tau_dominant': _episode_tau_dominant(),
     }
 
 
@@ -736,6 +737,16 @@ def _sign_reversal_rate(col: np.ndarray, rng: float) -> float:
     nz = signed[signed != 0.0]
     flips = int(np.sum(np.abs(np.diff(nz)) > 1.0)) if nz.size >= 2 else 0
     return float(flips) / float(max(1, len(d)))
+
+
+def _episode_tau_dominant() -> float:
+    """Identified dominant τ (seconds) for 1τ orbit windows. 0 if unknown."""
+    try:
+        from utils.training_disturbance import _load_identifier_context
+        return float((_load_identifier_context().get('dynamics') or {})
+                     .get('tau_dominant_identified', 0.0) or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _episode_mv_cv_gain_sign(env) -> float:
@@ -797,6 +808,55 @@ def _cv_headroom(y: np.ndarray, lo: float, hi: float, side: str) -> np.ndarray:
     if side == 'hi':
         return (float(hi) - y) / rng
     return (y - float(lo)) / rng
+
+
+def _orbit_window_steps(ep: Dict) -> int:
+    """One-τ window in samples (limit-cycle class, not the 5τ event window).
+
+    Derived from identified τ / sample_rate. test_sim τ≈54 sr=4 → 14.
+    Never a test_sim magic default: missing τ falls back to 8 samples.
+    """
+    try:
+        sr = max(1, int(ep.get('sample_rate', 1) or 1))
+    except (TypeError, ValueError):
+        sr = 1
+    tau = 0.0
+    for k in ('tau_dominant', 'tau'):
+        try:
+            tau = float(ep.get(k, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tau = 0.0
+        if tau > 0.0:
+            break
+    if tau > 0.0:
+        return max(8, int(round(tau / float(sr))))
+    return 8
+
+
+def _cv_limit_orbit_rate(col: np.ndarray, lo: float, hi: float, side: str,
+                         window: int) -> float:
+    """Limit-crossing rate: ``n_cross * window / T`` (crossings per identified τ).
+
+    Plant-timescale hunt through ``y_econ`` (P125 seeds 0.34–0.64 /τ) vs a
+    slow ride to the limit (0). The first draft (fraction of 1τ windows with
+    ≥2 sign changes) missed P125 seed 10004 (0.049 < parked 0.15) because
+    the hunt period is ~2τ. Overlapping-window fractions also smear a
+    single overshoot; this rate does not. Mid-band oscillation never
+    crosses ``y_econ`` → 0 (headroom, not this metric). Diagnostic only
+    until #11; not part of ``smooth_pass``.
+    """
+    y = np.asarray(col, dtype='float64').reshape(-1)
+    w = int(window)
+    if y.size < 3 or w < 1:
+        return 0.0
+    y_econ = float(hi) if side == 'hi' else float(lo)
+    rng = max(1e-9, float(hi) - float(lo))
+    dead = 1e-3 * rng
+    err = y - y_econ
+    signed = np.where(np.abs(err) > dead, np.sign(err), 0.0)
+    nz = signed[signed != 0.0]
+    n_cross = int(np.sum(np.abs(np.diff(nz)) > 1.0)) if nz.size >= 2 else 0
+    return float(n_cross) * float(w) / float(max(1, y.size))
 
 
 def _cv_active_target(ep: Dict, cv_row: int) -> np.ndarray | None:
@@ -877,9 +937,11 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
     ise_per_cv: List[float] = []
     cv_d2_rms: List[float] = []
     cv_rev_rates: List[float] = []
+    cv_orbit_rates: List[float] = []
     cv_headrooms: List[float] = []
     cv_viol_fracs: List[float] = []
     econ_sides: List[str] = []
+    orbit_w = _orbit_window_steps(ep)
     for k, cidx in enumerate(cv_idx):
         if cidx >= states.shape[1]:
             continue
@@ -895,6 +957,7 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
         cv_d2_rms.append(float(np.sqrt(np.mean(
             (np.diff(col, n=2) / max(1e-9, rng)) ** 2))) if T >= 3 else 0.0)
         cv_rev_rates.append(_sign_reversal_rate(col, rng))
+        cv_orbit_rates.append(_cv_limit_orbit_rate(col, lo, hi, side, orbit_w))
         cv_headrooms.append(float(np.mean(_cv_headroom(col, lo, hi, side))))
         cv_viol_fracs.append(float(np.mean((col < lo) | (col > hi))))
         tgt = _cv_active_target(ep, k)
@@ -916,6 +979,8 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
         'mv_reversal_rate': float(np.mean(reversal_rates)) if reversal_rates else 0.0,
         'cv_d2_rms_normed': float(np.max(cv_d2_rms)) if cv_d2_rms else 0.0,
         'cv_reversal_rate': float(np.max(cv_rev_rates)) if cv_rev_rates else 0.0,
+        'cv_limit_orbit_rate': float(np.max(cv_orbit_rates)) if cv_orbit_rates else 0.0,
+        'cv_orbit_window_steps': int(orbit_w),
         'cv_opt_headroom': float(np.mean(cv_headrooms)) if cv_headrooms else float('nan'),
         'cv_viol_frac': float(np.mean(cv_viol_fracs)) if cv_viol_fracs else 0.0,
         'cv_econ_side': (econ_sides[0] if econ_sides else 'lo'),
@@ -1250,6 +1315,7 @@ def run_constant_mv_episode(env, *, schedule: List[Dict],
         'cv_norm_ranges': [list(b) for b in env.cv_norm_ranges],
         'cv_side_scale': _episode_cv_side_scale(env),
         'mv_cv_gain_sign': _episode_mv_cv_gain_sign(env),
+        'tau_dominant': _episode_tau_dominant(),
     }
 
 

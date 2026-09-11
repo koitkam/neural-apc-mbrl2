@@ -503,27 +503,14 @@ def derive_auto_weights(spec: Dict, n_mv: int, n_cv: int,
     # The user sets ONLY the economic weights; this ratio + the integral
     # compensation auto-derive the rest.
     # TrainConfig sentinel 0 = follow margin (objective_runtime identity).
-    # DREAMER still wins when set. Leftover ``OBJ_AUTO_CV_OVER_ECON_RATIO``
-    # ignored (P90-live).
-    if _explicit(cfg, 'obj_auto_cv_over_econ_ratio'):
-        _ratio_raw = float(getattr(cfg, 'obj_auto_cv_over_econ_ratio'))
-        cv_over_econ_ratio = max(1e-3, _ratio_raw if _ratio_raw > 0.0 else margin)
-    else:
-        _d_ratio = os.environ.get('DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO')
-        if _d_ratio not in (None, ''):
-            try:
-                cv_over_econ_ratio = max(1e-3, float(_d_ratio))
-            except Exception:
-                cv_over_econ_ratio = max(1e-3, margin)
-        else:
-            try:
-                _ratio_raw = float(getattr(
-                    cfg, 'obj_auto_cv_over_econ_ratio', 0.0) or 0.0) \
-                    if cfg is not None else 0.0
-            except Exception:
-                _ratio_raw = 0.0
-            cv_over_econ_ratio = max(
-                1e-3, _ratio_raw if _ratio_raw > 0.0 else margin)
+    # Same ``_knob_float`` path as the other OBJ_AUTO knobs (explicit /
+    # DREAMER / cfg). Leftover ``OBJ_AUTO_CV_OVER_ECON_RATIO`` ignored
+    # (P90-live). Dual ``os.environ.get`` here was leftover.
+    _ratio_raw = _knob_float(
+        cfg, 'obj_auto_cv_over_econ_ratio',
+        'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO', 'OBJ_AUTO_CV_OVER_ECON_RATIO',
+        0.0)
+    cv_over_econ_ratio = max(1e-3, _ratio_raw if _ratio_raw > 0.0 else margin)
     econ_over_target_ratio = max(1.0, _knob_float(
         cfg, 'obj_auto_econ_over_target_ratio',
         'DREAMER_OBJ_AUTO_ECON_OVER_TARGET_RATIO',
