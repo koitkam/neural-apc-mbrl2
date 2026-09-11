@@ -5264,6 +5264,11 @@ class TrajectoryBuffer:
         self.dist = (np.zeros((capacity_eps, self.T, self.n_dist), dtype='float32')
                      if self.n_dist > 0 else None)
         self._dist_source = None
+        # GOAL_PLAN #8 (do not land on this pid): do NOT add a rew_econ=
+        # kwarg. Bind ``_rew_econ_source`` like ``_dist_source`` and pop
+        # ``pop_episode_rew_econ(T)`` inside ``add_episode`` so the ~17
+        # call sites (incl. isolation_buf) stay untouched. Fallback copy
+        # ``rew``, never zeros. Isolation may grow the column unused.
         self.filled = 0
         self.write = 0
 
