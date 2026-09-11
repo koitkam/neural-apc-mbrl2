@@ -46,6 +46,10 @@ except Exception:  # pragma: no cover
 _BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f')
 _AUTO_W_CACHE: Dict[tuple, Dict] = {}
 _AUTO_W_CACHE_MAX = 64
+# Val ``_sign_reversal_rate`` deadband (1e-3·bound width) and sticky thresh
+# ``tanh(1)`` ⇔ ``|dCV| > deadband``.  P125 / GOAL_PLAN #4.
+_CV_REV_DEADBAND_FRAC = 1e-3
+_CV_REV_STICKY_THRESH = float(np.tanh(1.0))
 
 
 def _safe_float(v, default=0.0):
@@ -201,11 +205,21 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
         or not obj_w.get('cv_violation_weights')
         or not obj_w.get('mv_move_weights')
         or not obj_w.get('mv_reversal_weights')
+        or not obj_w.get('cv_reversal_weights')
         or not obj_w.get('cv_target_weights')
         or not obj_w.get('mv_target_weights')
     )
     if not needs:
-        return obj_w
+        # P125: a complete JSON can still carry leftover MV chatter weights.
+        mv = obj_w.get('mv_reversal_weights') or []
+        try:
+            mv_live = any(abs(float(x)) > 1e-12 for x in mv)
+        except (TypeError, ValueError):
+            mv_live = bool(mv)
+        if mv_live or not obj_w.get('cv_reversal_weights'):
+            needs = True
+        else:
+            return obj_w
     key = (
         id(obj_w), int(n_mv), int(n_cv),
         id(cfg) if cfg is not None else 0,
@@ -226,11 +240,16 @@ def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
                                cv_norm_ranges=cv_norm_ranges, cfg=cfg)
     merged = dict(obj_w)
     for k in ('mv_violation_weights', 'cv_violation_weights', 'mv_move_weights',
-              'mv_reversal_weights',
+              'mv_reversal_weights', 'cv_reversal_weights',
               'mv_target_weights', 'cv_target_weights',
               'cv_violation_weights_lo', 'cv_violation_weights_hi'):
         if not merged.get(k):
             merged[k] = list(auto.get(k) or [])
+    # P125: always take auto-derived reversal vectors when we (re)derive.
+    # MV chatter is allowed (zeros).  CV sticky-tanh hunting is the val gate.
+    # A stale JSON / cached vector must not keep penalising MV or drop CV.
+    merged['mv_reversal_weights'] = list(auto.get('mv_reversal_weights') or [])
+    merged['cv_reversal_weights'] = list(auto.get('cv_reversal_weights') or [])
     # Stash scalar auto-derived knobs that have no per-channel form.
     # Consumed by ``compute_objective_components`` as the default in the
     # env > spec > auto-derived > 0.0 resolution chain for the DMC
@@ -492,13 +511,15 @@ def compute_objective_components(
     prev_cv_violation_per_channel=None,
     prev_integral_cv_per_channel=None,
     prev_prev_control=None,
+    prev_cv=None,
+    prev_cv_reversal_sticky=None,
     cfg=None,
 ) -> Dict[str, float]:
     state = np.asarray(state, dtype='float32').reshape(-1)
     control = np.asarray(control, dtype='float32').reshape(-1)
     prev_control = np.asarray(prev_control, dtype='float32').reshape(-1)
-    # 2-step MV history for the reversal (oscillation) term.  Defaulting to
-    # prev_control makes du_prev=0 on the first step -> no spurious penalty.
+    # 2-step MV history kept as a diagnostic (weights are 0 as of P125).
+    # Defaulting to prev_control makes du_prev=0 on the first step.
     prev_prev_control = (prev_control if prev_prev_control is None
                          else np.asarray(prev_prev_control,
                                          dtype='float32').reshape(-1))
@@ -546,6 +567,7 @@ def compute_objective_components(
         cv_violation_weights_hi = list(cv_violation_weights)
     mv_move_weights = _resolve_vector(obj_w.get('mv_move_weights', []), mv_dim, 0.0)
     mv_reversal_weights = _resolve_vector(obj_w.get('mv_reversal_weights', []), mv_dim, 0.0)
+    cv_reversal_weights = _resolve_vector(obj_w.get('cv_reversal_weights', []), cv_dim, 0.0)
     mv_economic_weights = _resolve_vector(obj_w.get('mv_economic_weights', []), mv_dim, 0.0)
     cv_economic_weights = _resolve_vector(obj_w.get('cv_economic_weights', []), cv_dim, 0.0)
     # Economic *typical* operating point (normalised [0, 1]). The economic
@@ -676,12 +698,8 @@ def compute_objective_components(
                * np.asarray(mv_move_weights, dtype='float32'))
     )
 
-    # ---- MV reversal / oscillation suppression (adaptive move suppression) ----
-    # osc_i = relu(-du_t * du_prev): ZERO for any monotonic move (however fast),
-    # positive only on a DIRECTION REVERSAL and quadratic in its per-step
-    # amplitude.  Fast SUSTAINED control is free; only self-induced back-and-
-    # forth (bang-bang) is penalised.  A slow disturbance-driven reversal has
-    # tiny per-step du -> negligible; sustained fast oscillation accumulates.
+    # ---- MV reversal diagnostic (weights are 0 as of P125 / GOAL_PLAN #4) ----
+    # Kept so logs still show MV chatter; it does not enter the reward.
     mv_reversal_terms = []
     for i in range(mv_dim):
         r_lo, r_hi = mv_norm_ranges[i]
@@ -699,6 +717,60 @@ def compute_objective_components(
     mv_reversal_penalty = float(
         np.sum(np.asarray(mv_reversal_terms, dtype='float32')
                * np.asarray(mv_reversal_weights, dtype='float32'))
+    )
+
+    # ---- CV reversal / hunting (sticky tanh; matches val ``_sign_reversal_rate``) ----
+    # s = tanh(dCV / deadband); s_sticky = last |s|≥tanh(1) sign.  Holds do not
+    # update sticky, so a hold then opposite move still counts.  A monotonic
+    # ride (one sign) is free.  Soft tanh so small hunting near the deadband
+    # still has a gradient; hard sign would be 0/1 only.
+    cv_now = []
+    for j, sidx in enumerate(cv_indices):
+        if sidx < 0 or sidx >= len(state):
+            cv_now.append(0.0)
+        else:
+            cv_now.append(float(state[sidx]))
+    if prev_cv is None:
+        prev_cv_arr = np.asarray(cv_now, dtype='float64')
+    else:
+        prev_cv_arr = np.asarray(prev_cv, dtype='float64').reshape(-1)
+        if prev_cv_arr.size < cv_dim:
+            pad = np.asarray(cv_now, dtype='float64')
+            tmp = np.zeros(cv_dim, dtype='float64')
+            tmp[:prev_cv_arr.size] = prev_cv_arr
+            tmp[prev_cv_arr.size:] = pad[prev_cv_arr.size:]
+            prev_cv_arr = tmp
+    if prev_cv_reversal_sticky is None:
+        sticky_arr = np.zeros(cv_dim, dtype='float64')
+    else:
+        sticky_arr = np.asarray(prev_cv_reversal_sticky, dtype='float64').reshape(-1)
+        if sticky_arr.size < cv_dim:
+            tmp = np.zeros(cv_dim, dtype='float64')
+            tmp[:sticky_arr.size] = sticky_arr
+            sticky_arr = tmp
+    cv_reversal_terms = []
+    cv_reversal_sticky_out = []
+    for j in range(cv_dim):
+        lo, hi = cv_bounds[j] if j < len(cv_bounds) else (0.0, 1.0)
+        try:
+            rng = float(hi) - float(lo)
+        except (TypeError, ValueError):
+            rng = 0.0
+        deadband = _CV_REV_DEADBAND_FRAC * max(rng, 1e-9)
+        dcv = float(cv_now[j]) - float(prev_cv_arr[j])
+        s = float(np.tanh(dcv / deadband))
+        st = float(sticky_arr[j]) if j < sticky_arr.size else 0.0
+        if abs(st) >= _CV_REV_STICKY_THRESH:
+            pen = float(max(0.0, -s * float(np.sign(st))))
+        else:
+            pen = 0.0
+        cv_reversal_terms.append(pen)
+        if abs(s) >= _CV_REV_STICKY_THRESH:
+            st = float(np.sign(s))
+        cv_reversal_sticky_out.append(st)
+    cv_reversal_penalty = float(
+        np.sum(np.asarray(cv_reversal_terms, dtype='float32')
+               * np.asarray(cv_reversal_weights, dtype='float32'))
     )
 
     # ---- CV economic (clipped to bounds: no gradient outside limits) ----
@@ -941,6 +1013,7 @@ def compute_objective_components(
     cv_target_penalty *= feasibility
     mv_move_penalty *= feasibility
     mv_reversal_penalty *= feasibility
+    cv_reversal_penalty *= feasibility
     movement_term *= feasibility
 
     mv_violation_penalty = _saturate_one_sided(mv_violation_penalty, penalty_clip, sat_mode)
@@ -951,6 +1024,7 @@ def compute_objective_components(
     cv_target_penalty = _saturate_one_sided(cv_target_penalty, penalty_clip, sat_mode)
     mv_move_penalty = _saturate_one_sided(mv_move_penalty, penalty_clip, sat_mode)
     mv_reversal_penalty = _saturate_one_sided(mv_reversal_penalty, penalty_clip, sat_mode)
+    cv_reversal_penalty = _saturate_one_sided(cv_reversal_penalty, penalty_clip, sat_mode)
     movement_term = _saturate_two_sided(movement_term, penalty_clip, sat_mode)
 
     reward = 0.0
@@ -960,6 +1034,7 @@ def compute_objective_components(
     reward -= cv_target_penalty
     reward -= mv_move_penalty
     reward -= mv_reversal_penalty
+    reward -= cv_reversal_penalty
     reward -= violation_rate_penalty
     reward -= integral_penalty
     reward -= _safe_float(obj_w.get('movement', 0.0), 0.0) * movement_term
@@ -1008,6 +1083,9 @@ def compute_objective_components(
         'mv_move_penalty': float(mv_move_penalty),
         'mv_reversal_terms': [float(x) for x in mv_reversal_terms],
         'mv_reversal_penalty': float(mv_reversal_penalty),
+        'cv_reversal_terms': [float(x) for x in cv_reversal_terms],
+        'cv_reversal_penalty': float(cv_reversal_penalty),
+        'cv_reversal_sticky': [float(x) for x in cv_reversal_sticky_out],
         'cv_penalty': float(cv_penalty),
         'reward': float(reward),
         # Econ-derived reward-shape scale (adaptive_penalty_clip output).

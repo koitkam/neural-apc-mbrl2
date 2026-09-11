@@ -464,6 +464,9 @@ class TrainConfig:
     obj_auto_move_target_cost_frac: float = 0.005
     obj_auto_move_sigma_ref: float = 0.3
     obj_auto_econ_over_move_ratio: float = 2.0
+    # P125: scale of the CV sticky-tanh hunting penalty (fraction of cv_base,
+    # hard-capped at cv_base).  0 disables.  MV reversal weights are zero;
+    # val ``smooth_pass`` is CV d2/reversal, not MV chatter.
     obj_auto_reversal_gain: float = 0.3
     obj_auto_violation_rate_coef_divisor: float = 4.0
     obj_auto_violation_rate_coef_min: float = 0.3
@@ -2536,6 +2539,9 @@ class APCEnv:
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
         self._prev_prev_control = np.zeros(self.action_dim, dtype='float32')
+        n_cv_rev = int(len(self.cv_indices))
+        self._prev_cv = np.zeros(n_cv_rev, dtype='float32')
+        self._cv_reversal_sticky = np.zeros(n_cv_rev, dtype='float32')
         # Previous-step raw per-channel violation depth (lo_viol+hi_viol),
         # consumed by ``compute_objective_components`` for the optional
         # derivative (violation-rate) term.  ``None`` on the first step of
@@ -2977,6 +2983,11 @@ class APCEnv:
         self._t = 0
         self._prev_control = np.zeros(self.action_dim, dtype='float32')
         self._prev_prev_control = np.zeros(self.action_dim, dtype='float32')
+        try:
+            self._prev_cv = np.asarray(state, dtype='float32').reshape(-1)[self.cv_indices]
+        except Exception:
+            self._prev_cv = np.zeros(len(self.cv_indices), dtype='float32')
+        self._cv_reversal_sticky = np.zeros(len(self.cv_indices), dtype='float32')
         self._prev_mv_violation_per_channel = None
         self._prev_cv_violation_per_channel = None
         self._integral_cv = np.zeros_like(self._integral_cv)
@@ -3268,6 +3279,8 @@ class APCEnv:
             prev_cv_violation_per_channel=self._prev_cv_violation_per_channel,
             prev_integral_cv_per_channel=self._integral_cv,
             prev_prev_control=self._prev_prev_control,
+            prev_cv=self._prev_cv,
+            prev_cv_reversal_sticky=self._cv_reversal_sticky,
             cfg=self.cfg,
         )
         raw_reward = float(comps['reward'])
@@ -3329,6 +3342,13 @@ class APCEnv:
                 reward = float(np.clip(reward, -b, b))
         self._prev_prev_control = self._prev_control
         self._prev_control = np.asarray(control, dtype='float32')
+        try:
+            self._prev_cv = np.asarray(next_state, dtype='float32').reshape(-1)[self.cv_indices]
+        except Exception:
+            pass
+        sticky = comps.get('cv_reversal_sticky')
+        if sticky is not None:
+            self._cv_reversal_sticky = np.asarray(sticky, dtype='float32').reshape(-1)
         # Stash raw per-channel violation depths for next step's
         # derivative (violation-rate) term (off unless its coef > 0).
         self._prev_mv_violation_per_channel = list(
