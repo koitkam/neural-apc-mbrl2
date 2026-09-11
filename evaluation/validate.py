@@ -241,7 +241,6 @@ def control_quality_gates(
     """
     _dr = list(disturbance_records or [])
     out: Dict = {
-        'mv_reversal_rate_max': 0.5,
         'n_scripted_pairs': len(_dr),
     }
     if not _dr:

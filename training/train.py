@@ -4237,8 +4237,9 @@ def _persist_last_ok_ckpt(
     P42: lock fired at iter 67 but the pre-spike weights lived only in
     RAM until skip-storm or P1→P2 freeze wrote the file.  A crash after
     lock would lose the snapshot the freeze is supposed to restore.
-    Write once when the lock fires (same blob freeze/storm already
-    save).  Objective unchanged.
+    Also persist on last_ok *walk* (unlocked healthy P1): P124 last_ok
+    walked 56→83 after unlock while disk stayed at the lock-era blob.
+    RAM stays freeze SoT.  Not a 5×/20× retune.  Objective unchanged.
     """
     if last_ok_sd is None or path is None:
         return False
@@ -15232,7 +15233,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 # In-process snapshot — skip-storm restore never needs
                 # disk on the happy path.  Reuses last-ok storage
                 # (``copy_``) after the first alloc; CPU if VRAM is
-                # tight.  Disk write on lock / storm / P1→P2 freeze.
+                # tight.  Persist on last_ok walk (not only lock/storm/
+                # P1→P2) so a crash after unlock cannot restore a stale
+                # lock-era file.  RAM stays freeze SoT.
                 try:
                     p1_last_ok_sd = _refresh_module_state(
                         p1_last_ok_sd, model, device)
@@ -15240,6 +15243,13 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                     p1_last_ok_iter = int(total_iters)
                     if p1_recon_best is None or _rlv < p1_recon_best:
                         p1_recon_best = float(_rlv)
+                    if _persist_last_ok_ckpt(
+                            p1_last_ok_ckpt_path, p1_last_ok_sd, cfg,
+                            env.get_obs_norm_stats(), int(p1_last_ok_iter)):
+                        if int(p1_last_ok_iter) % 10 == 0:
+                            print(f'[wm-last-ok] wrote {p1_last_ok_ckpt_path.name} '
+                                  f'(walk iter {p1_last_ok_iter})',
+                                  flush=True)
                 except Exception as _e_ok:
                     print(f'[wm-last-ok] snapshot failed: {_e_ok!r}',
                           flush=True)

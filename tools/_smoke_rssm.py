@@ -354,7 +354,7 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
         assert torch.equal(_blob['model']['w'], _sd['w'])
         assert not _persist_last_ok_ckpt(
             _path, None, TrainConfig(), None, 0)
-    print('[smoke] OK  persist last-ok ckpt (lock/freeze/storm)')
+    print('[smoke] OK  persist last-ok ckpt (lock/freeze/storm/walk)')
     assert _recon_still_healthy(0.004, None)
     assert _recon_still_healthy(0.004, 0.0039, 5.0)
     assert not _recon_still_healthy(0.50, 0.0039, 5.0)
@@ -2259,6 +2259,8 @@ def _test_isolation_dcv_scales() -> None:
     assert "'p1_recon_best'" in _src
     assert '_persist_last_ok_ckpt' in _src
     assert "wrote {p1_last_ok_ckpt_path.name}" in _src
+    assert 'Persist on last_ok walk' in _src
+    assert '(walk iter {p1_last_ok_iter})' in _src
     assert 'gain_match_mv_loss' in _src
     assert 'gain_match_dv_loss' in _src
     assert 'gain_match_mv_ratio' in _src
@@ -3390,6 +3392,7 @@ def _test_control_quality_gates() -> None:
     assert empty['n_scripted_pairs'] == 0
     assert empty.get('control_gate_skipped') == 'no_scripted_disturbance_pairs'
     assert empty['smooth_pass'] is False
+    assert 'mv_reversal_rate_max' not in empty
     seeded = control_quality_gates(
         [],
         seed_metrics=[{
@@ -3424,6 +3427,8 @@ def _test_control_quality_gates() -> None:
     assert paired['beats_baseline_pass'] is True
     assert paired['smooth_pass'] is True
     assert abs(float(paired['agent_economic_score']) + 50.0) < 1e-9
+    assert 'mv_reversal_rate_max' not in paired
+    assert 'mv_reversal_rate_observed' in paired
     worse = control_quality_gates([{
         'episode_metrics_agent': {
             'mv_reversal_rate': 0.1,
