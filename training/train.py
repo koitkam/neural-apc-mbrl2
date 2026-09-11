@@ -4412,8 +4412,9 @@ def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
     critic replay slot).  GOAL_PLAN #8 (do not land on P127): append
     ``rew_econ`` immediately after ``rew`` whenever ``need_rew_expert``.
     Smoke ``_replay_h2d_keys(False, True, False) == ('obs','act','rew')``
-    must change. ``onpol_buf`` must actually *hold* ``rew_econ`` or
-    this H2D list is a silent fallback-to-``rew``.
+    and ``_replay_h2d_keys(False, True) == ('obs','act','rew','expert')``
+    must both gain ``rew_econ``. ``onpol_buf`` must actually *hold*
+    ``rew_econ`` or this H2D list is a silent fallback-to-``rew``.
     """
     keys: List[str] = ['obs', 'act']
     if need_dist:
@@ -10393,7 +10394,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # actor λ + ``update_return_scale`` stay on ``rew``; advantage is
     # ``λ(rew) − V_econ``. Do not land on P127. ``onpol_buf`` is
     # ``_src_buf`` here — bind + clear-on-reset or ``rew_econ`` is
-    # hunting ``rew`` and the split is a no-op.
+    # hunting ``rew`` and the split is a no-op. Replay
+    # ``critic_batch['rew']`` below is the same hole for the
+    # diversity term (p06 inversion if only on-policy switches).
     B, T = obs.shape[:2]
     device = obs.device
 
@@ -10480,6 +10483,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
                     sample=False, store_aux=False)
         Bc, Tc = critic_batch['obs'].shape[:2]
         feat_c = _fc.detach().reshape(Bc * Tc, -1)
+        # GOAL_PLAN #8 (do not land on P127): ``rew_c`` must be
+        # ``critic_batch['rew_econ']`` (fallback copy ``rew``, never
+        # zeros). Leaving this on hunting ``rew`` is replay-half no-op.
         rew_c = critic_batch['rew'].float()
         with torch.no_grad():
             v_slow_c = model.critic_min_v(feat_c, target=True).reshape(Bc, Tc)
@@ -10554,6 +10560,10 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     actor_loss = actor_pg - ent_coef * entropy.mean() + bc_term
 
     # ----- diagnostics (real-sim; leftover imag/PMPO jsonl keys kept as aliases) -----
+    # GOAL_PLAN #8 (do not land on P127): ``critic_rew_to_tgt_var`` /
+    # ``critic_pred_target_r`` must use the econ stream (``rew_econ``,
+    # ``ret_econ``, V_econ). ``realsim_reward_mean`` stays on hunt.
+    # ``update_return_scale`` KEEP on hunt λ (not econ).
     with torch.no_grad():
         rew_var = rew.var().clamp_min(1e-8)
         tgt_var = target_returns.float().var().clamp_min(1e-8)
@@ -15132,6 +15142,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 _critic_batch = None
                 if (onpol_buf is not None and onpol_buf.filled > 0
                         and buf.filled > 0):
+                    # GOAL_PLAN #8 (do not land on P127): this tuple
+                    # must gain ``rew_econ`` after ``rew`` (smoke
+                    # ``_replay_h2d_keys(False, True)``). slot='critic'
+                    # dest is a new H2D name, identity values.
                     _cb_keys = _replay_h2d_keys(False, True)
                     _cb_np = buf.sample(
                         cfg.batch_size, cfg.seq_len, rng, keys=_cb_keys)

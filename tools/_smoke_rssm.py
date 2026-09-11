@@ -1404,6 +1404,9 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     assert _wm_need_dist_target(m, c) is False
     assert _wm_need_dist_head_loss(m, c) is False
     assert _p1_wm_h2d_keys(_wm_need_dist_target(m, c)) == ('obs', 'act')
+    # GOAL_PLAN #8 (do not land on P127): both tuples must gain
+    # ``rew_econ`` after ``rew``. Leaving the critic-replay tuple
+    # (False, True) on hunt is replay-half no-op.
     assert _replay_h2d_keys(False, True) == ('obs', 'act', 'rew', 'expert')
     assert _replay_h2d_keys(False, True, False) == ('obs', 'act', 'rew')
     assert _replay_h2d_keys(True, True) == (
