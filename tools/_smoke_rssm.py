@@ -2594,11 +2594,17 @@ def _test_isolation_dcv_scales() -> None:
     assert '_replay_h2d_keys(False, True)' in _src
     assert '_replay_h2d_keys(False, True, False)' in _src
     # #8: critic twohot on reversal-free econ; actor λ on hunt.
+    # #10 flips `adv_raw` / `update_return_scale` to ret_econ (mode 3 only).
     assert 'onpol_buf._rew_econ_source' in _src
     assert 'buf._rew_econ_source' in _src
     assert 'ret_econ = _lambda_returns' in _src
     assert 'ret_hunt = _lambda_returns' in _src
+    assert 'adv_raw = ret_hunt - v_pred' in _src
     assert "keys.append('rew_econ')" in _src
+    _rb = _P(_tr.__file__).resolve().parents[1].joinpath(
+        'evaluation/residual_board.py').read_text()
+    assert 'def critic_fidelity_pass' in _rb
+    assert 'CRITIC_SLOPE_LO' in _rb
     assert "'raw_hunt'" in _src
     assert 'reward_econ' in _src
     assert 'self.expert[i] = 0.0' in _src
@@ -3518,7 +3524,13 @@ def _test_residual_board_cv_metrics() -> None:
     import numpy as np
     from evaluation.validate import compute_episode_metrics, compute_event_response_metrics
     from evaluation.residual_board import (
-        build_residual_board, curve_iae_normed, cv_smooth_pass)
+        build_residual_board, critic_fidelity_pass, curve_iae_normed,
+        cv_smooth_pass)
+    assert critic_fidelity_pass(0.70, 1.1) is True
+    assert critic_fidelity_pass(0.318, 288.8) is False  # P127
+    assert critic_fidelity_pass(-0.014, -15.2) is False  # P125 inversion
+    assert critic_fidelity_pass(0.70, float('nan')) is False
+    assert critic_fidelity_pass(0.70, 0.10) is False
     T = 40
     lo, hi = 80.0, 90.0
     y = np.full(T, 80.4, dtype='float32')  # hug lo, headroom 0.04
@@ -3609,6 +3621,7 @@ def _test_residual_board_cv_metrics() -> None:
         assert abs(b2['diagnostic']['critic_slope_g_on_v'] - 288.8) < 1e-6
         assert abs(b2['diagnostic']['critic_v_mean'] + 81.0) < 1e-6
         assert abs(b2['diagnostic']['critic_g_mean'] + 15318.0) < 1e-6
+        assert b2['diagnostic']['critic_pass'] is False  # r without slope
     print('[smoke] OK  residual_board CV metrics + R1/R2/R3 assemble')
 
 

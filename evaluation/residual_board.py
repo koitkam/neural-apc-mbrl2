@@ -15,6 +15,11 @@ import numpy as np
 CV_D2_RMS_MAX = 0.05
 CV_REVERSAL_MAX = 0.25
 CV_RETURN_HEADROOM_BAND = 0.10
+# Pearson r is scale-invariant (P127 r=+0.318 with slope 289 / V−81 vs G−15318).
+# Order-1 same-sign slope: [0.25, 4] ≈ |log10(s)| ≲ 0.6.
+CRITIC_R_MIN = 0.3
+CRITIC_SLOPE_LO = 0.25
+CRITIC_SLOPE_HI = 4.0
 
 
 def _f(x: Any, default: float = float('nan')) -> float:
@@ -23,6 +28,19 @@ def _f(x: Any, default: float = float('nan')) -> float:
     except (TypeError, ValueError):
         return default
     return v if np.isfinite(v) else default
+
+
+def critic_fidelity_pass(r_pearson, slope_g_on_v) -> bool:
+    """Val critic gate: Pearson AND order-1 same-sign slope.
+
+    ``r>=0.3`` alone is on trial (P127 PASSED it while V was 200× compressed).
+    Negative slope is inversion (P125 **−15**). P3-skip / nan → False.
+    """
+    r = _f(r_pearson)
+    s = _f(slope_g_on_v)
+    if not (np.isfinite(r) and np.isfinite(s)):
+        return False
+    return r >= CRITIC_R_MIN and CRITIC_SLOPE_LO <= s <= CRITIC_SLOPE_HI
 
 
 def _json_load(path: Path) -> Optional[Dict]:
@@ -258,6 +276,10 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
             'critic_slope_g_on_v': _f(
                 cc.get('slope_g_on_v', gates.get('critic_slope_g_on_v'))),
             'critic_nmae': _f(cc.get('nmae', gates.get('critic_nmae'))),
+            # Recompute — do not copy Pearson-only summary.critic_pass (P127 True).
+            'critic_pass': critic_fidelity_pass(
+                gates.get('critic_r_observed'),
+                cc.get('slope_g_on_v', gates.get('critic_slope_g_on_v'))),
             'all_pass': gates.get('all_pass'),
             'n_scripted_pairs': gates.get('n_scripted_pairs'),
         },
@@ -265,7 +287,8 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
             'R1 = observer TM (ss + @H + curve_iae, MV and DV) and 1step→OL. '
             'R2 = CV smoothness (d2/reversal) and limit hugging/viol. '
             'R3 = Kalman det_r + pred_std vs true and DR return-to-limit. '
-            'Critic: trust slope_g_on_v ~1 and |V|~|G|; Pearson without slope is on trial. '
+            'Critic: critic_pass = r≥0.3 AND slope_g_on_v in [0.25, 4]; '
+            'Pearson without slope is not residual-closed. '
             'Do not treat VALID/GAIN-READY/all_pass/family-closed as residual-closed.'
         ),
     }

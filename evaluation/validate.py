@@ -2327,10 +2327,15 @@ def run_validation(*,
             wm_r1 = float(((wm.get('per_offset') or {}).get('1') or {}).get('r_mean', 0.0))
             rw_r0 = float(((rw.get('per_offset') or {}).get('0') or {}).get('r', 0.0))
             critic_r = float(cc.get('r_pearson', 0.0))
+            from evaluation.residual_board import (
+                CRITIC_R_MIN, CRITIC_SLOPE_HI, CRITIC_SLOPE_LO,
+                critic_fidelity_pass)
             fidelity_gates = {
                 'wm_next_state_r_min': 0.5,
                 'reward_head_r_min': 0.3,
-                'critic_r_min': 0.3,
+                'critic_r_min': CRITIC_R_MIN,
+                'critic_slope_lo': CRITIC_SLOPE_LO,
+                'critic_slope_hi': CRITIC_SLOPE_HI,
                 'wm_next_state_r_observed': wm_r1,
                 'reward_head_r_observed': rw_r0,
                 'critic_r_observed': critic_r,
@@ -2340,7 +2345,8 @@ def run_validation(*,
                 'critic_nmae': cc.get('nmae'),
                 'wm_pass': bool(wm_r1 >= 0.5),
                 'reward_pass': bool(rw_r0 >= 0.3),
-                'critic_pass': bool(critic_r >= 0.3),
+                'critic_pass': critic_fidelity_pass(
+                    critic_r, cc.get('slope_g_on_v')),
             }
             # p11 RCA: CONTROL-QUALITY gates.  Every gate above is INTERNAL
             # WM/critic fidelity — they PASS even when the actor learns a
@@ -2377,8 +2383,14 @@ def run_validation(*,
                     print(f'        - reward head r={rw_r0:+.3f} < 0.3'
                           ' (reward MTP uncorrelated with truth)', flush=True)
                 if not fidelity_gates['critic_pass']:
-                    print(f'        - critic V vs MC r={critic_r:+.3f} < 0.3'
-                          ' (value head uncorrelated with returns)', flush=True)
+                    print(f'        - critic V vs MC r={critic_r:+.3f} '
+                          f'(min {fidelity_gates.get("critic_r_min", 0.3)}) '
+                          f'slope={_fmt_f(cc.get("slope_g_on_v"))} '
+                          f'(need [{fidelity_gates.get("critic_slope_lo", 0.25)}, '
+                          f'{fidelity_gates.get("critic_slope_hi", 4.0)}]) '
+                          f'V={_fmt_f(cc.get("v_mean"))} G={_fmt_f(cc.get("g_mean"))}'
+                          ' — Pearson without order-1 slope is not residual-closed',
+                          flush=True)
                 if not fidelity_gates.get('smooth_pass', True):
                     print(f'        - CV smooth fail: d2_rms='
                           f'{fidelity_gates.get("cv_d2_rms_normed_worst_seed", float("nan")):.4f}'
