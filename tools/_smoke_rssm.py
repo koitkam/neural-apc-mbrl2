@@ -50,6 +50,9 @@ from training.train import (
                             _recon_still_healthy, _skip_storm_restore_ckpt,
                             _actor_experiment_valid,
                             _should_skip_invalid_p3,
+                            _require_observer_from_ckpt_init,
+                            _should_skip_p12_wm,
+                            _apply_obs_norm_from_ckpt,
                             _should_warm_restore_wm_best,
                             _should_restore_last_ok_at_p1_freeze,
                             _should_lock_last_ok,
@@ -1609,6 +1612,81 @@ def _test_cv_limit_entry_cost() -> None:
     print('[smoke] OK  #12 cv_limit_entry_cost entry-only')
 
 
+def _test_observer_from_ckpt_path() -> None:
+    """#12b: freeze-transfer CLI is not a weights-only warm-start."""
+    import numpy as np
+    from pathlib import Path as _P
+
+    assert TrainConfig().observer_from_ckpt is False
+    _require_observer_from_ckpt_init('output/x/best.pt', True)
+    try:
+        _require_observer_from_ckpt_init('', True)
+        raise AssertionError('observer_from_ckpt without ckpt must raise')
+    except ValueError as e:
+        assert 'init_from_ckpt' in str(e)
+    _require_observer_from_ckpt_init('', False)
+    assert _should_skip_p12_wm(observer_from_ckpt=True)
+    assert not _should_skip_p12_wm(observer_from_ckpt=False)
+
+    class _Env:
+        obs_dim = 3
+
+        def set_obs_norm_stats(self, mean, var, count, *, learn=False):
+            self.mean = np.asarray(mean)
+            self.var = np.asarray(var)
+            self.count = float(count)
+            self.learn = bool(learn)
+
+    env = _Env()
+    assert not _apply_obs_norm_from_ckpt(env, {}, learn=False)
+    ok = _apply_obs_norm_from_ckpt(
+        env,
+        {'obs_norm': {
+            'mean': np.array([1.0, 2.0, 3.0]),
+            'var': np.array([0.1, 0.2, 0.3]),
+            'count': 9.0,
+        }},
+        learn=False)
+    assert ok and env.learn is False and env.count == 9.0
+    assert np.allclose(env.mean, [1.0, 2.0, 3.0])
+
+    cfg = TrainConfig()
+    cfg.obs_dim = 6
+    cfg.action_dim = 2
+    cfg.lookback = 8
+    cfg.rssm_deter_dim = 32
+    cfg.rssm_n_categoricals = 4
+    cfg.rssm_n_classes = 4
+    cfg.rssm_embed_dim = 16
+    cfg.rssm_hidden_dim = 16
+    cfg.d_model = 32
+    cfg.head_hidden = 32
+    cfg.head_n_layers = 1
+    cfg.mtp_length = 2
+    cfg.horizon = 4
+    cfg.seq_len = 8
+    model = build_model(cfg)
+    assert _dynamics_g_trainable(model)
+    model.set_world_model_trainable(g=False, dob=False, reward=True)
+    assert not _dynamics_g_trainable(model)
+    assert any(p.requires_grad for p in model.parameters_actor())
+
+    _tr = open(_P(__file__).resolve().parents[1].joinpath(
+        'training/train.py')).read()
+    _sr = open(_P(__file__).resolve().parents[1].joinpath(
+        'workflow/single_run.py')).read()
+    assert '--observer-from-ckpt' in _sr
+    assert '--observer-from-ckpt requires --init-from-ckpt' in _sr
+    assert 'observer_from_ckpt=bool' in _sr
+    assert 'def _require_observer_from_ckpt_init' in _tr
+    assert 'def _should_skip_p12_wm' in _tr
+    assert '[limobs] skipping P1/P2 seed fill' in _tr
+    assert '[limobs] restored obs_norm from ckpt (learn=False)' in _tr
+    assert '[limobs] loaded freeze gain-probe' in _tr
+    assert '(signed > 0.0) & (prev[:n] <= 0.0)' in _tr
+    print('[smoke] OK  #12b observer_from_ckpt freeze-transfer path')
+
+
 def _test_buffer_clear() -> None:
     """clear() drops filled/write; leftover slots are not sampled."""
     import numpy as np
@@ -2967,12 +3045,14 @@ def _test_envfree_observer_recipe() -> None:
     assert int(c.wm_diag_n_starts) == 8
     assert int(c.wm_diag_horizon) == 0
     assert c.actor_train_source == 'realsim'
+    assert c.observer_from_ckpt is False
     assert not hasattr(c, 'gain_match_relative')
     assert not hasattr(c, 'gain_match_rise_wfrac')
     assert not hasattr(c, 'wm_gain_match_mv_ratio_mid')
     assert not hasattr(c, 'expert_bc_p3_adaptive_scale')
     assert not hasattr(c, 'early_stop_p1_min_sf_drop_frac')
     from workflow._plant_prepare import ENV_OVERRIDES
+    assert 'DREAMER_OBSERVER_FROM_CKPT' not in ENV_OVERRIDES
     assert 'DREAMER_WM_HELD_ROLLOUT_SETTLE_FRAC' not in ENV_OVERRIDES
     assert 'DREAMER_ACT_HIST_REQUIRED' not in ENV_OVERRIDES
     assert 'DREAMER_EXPERT_BC_P3_ADAPTIVE_SCALE' not in ENV_OVERRIDES
@@ -7638,6 +7718,7 @@ if __name__ == '__main__':
     _test_buffer_sample_keys()
     _test_rew_econ_split()
     _test_cv_limit_entry_cost()
+    _test_observer_from_ckpt_path()
     _test_buffer_clear()
     _test_store_aux_feats_identity()
     _test_prior_cv_recon_reverted()

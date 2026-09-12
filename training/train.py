@@ -2258,6 +2258,11 @@ class TrainConfig:
     # have already learned but you want to change params (σ clamp,
     # warmup, etc.) without throwing away weights.  Empty = cold start.
     init_from_ckpt: str = ''
+    # CLI launch-path only (#12b limobs). Default False — not a recipe A/B
+    # and not in ENV_OVERRIDES. Requires init_from_ckpt. Skip P1/P2 WM
+    # updates; freeze g+DOB; one 5-level probe of the loaded freeze;
+    # skip_invalid_p3 if that probe is not READY; else P3.
+    observer_from_ckpt: bool = False
 
     # ----- Speedups (DREAMER_COMPILE=1 opt-in) -----
     # ``auto`` = SDPA on CUDA / manual on CPU (CausalAttention).  Canonical
@@ -3896,6 +3901,46 @@ def _should_skip_invalid_p3(*, actor_valid: bool, skip_enabled: bool) -> bool:
     return (not bool(actor_valid)) and bool(skip_enabled)
 
 
+def _require_observer_from_ckpt_init(
+        init_from_ckpt: str, observer_from_ckpt: bool) -> None:
+    """#12b: freeze-transfer is not a weights-only warm-start.
+
+    ``init_from_ckpt`` alone retrains P1. ``observer_from_ckpt`` skips
+    P1/P2 WM updates and therefore *requires* a checkpoint path.
+    """
+    if not bool(observer_from_ckpt):
+        return
+    if not str(init_from_ckpt or '').strip():
+        raise ValueError(
+            'observer_from_ckpt requires init_from_ckpt '
+            '(--observer-from-ckpt requires --init-from-ckpt)')
+
+
+def _should_skip_p12_wm(*, observer_from_ckpt: bool) -> bool:
+    """Skip P1/P2 seed fill + WM updates when transferring a freeze."""
+    return bool(observer_from_ckpt)
+
+
+def _apply_obs_norm_from_ckpt(env, ckpt, *, learn: bool = False) -> bool:
+    """Restore observer-scale stats from ``best.pt``; refuse Welford refit."""
+    stats = ckpt.get('obs_norm') if isinstance(ckpt, dict) else None
+    if not isinstance(stats, dict):
+        return False
+    mean, var = stats.get('mean'), stats.get('var')
+    if mean is None or var is None:
+        return False
+
+    def _to_np(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    mean, var = _to_np(mean), _to_np(var)
+    count = float(stats.get('count', 1.0) or 1.0)
+    env.set_obs_norm_stats(mean, var, count, learn=bool(learn))
+    return True
+
+
 def _resolve_aux_tbptt_steps(cfg: 'TrainConfig') -> int:
     """Isolation / ss-match TBPTT stride from the rollout length K.
 
@@ -4649,6 +4694,7 @@ def _write_resolved_run_plan(cfg: 'TrainConfig') -> None:
         f"n_critics={int(getattr(cfg, 'n_critics', 1) or 1)} "
         f"rs_freeze={bool(getattr(cfg, 'return_scale_freeze_after_warmup', False))} "
         f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
+        f"limobs={bool(getattr(cfg, 'observer_from_ckpt', False))} "
         f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
         f"lock={float(getattr(cfg, 'skip_storm_last_ok_lock_ratio', 20.0) or 20.0):g} "
         f"huber_per_in={bool(getattr(cfg, 'gain_match_huber_per_input', False))} "
@@ -13094,6 +13140,9 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
 
     # ---- Optional warm-start from a previous run's checkpoint ----------
     init_path = str(getattr(cfg, 'init_from_ckpt', '') or '').strip()
+    observer_from_ckpt = bool(getattr(cfg, 'observer_from_ckpt', False))
+    skip_p12_wm = _should_skip_p12_wm(observer_from_ckpt=observer_from_ckpt)
+    _require_observer_from_ckpt_init(init_path, observer_from_ckpt)
     if init_path:
         if not os.path.exists(init_path):
             raise FileNotFoundError(
@@ -13120,6 +13169,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         if prev_iter is not None:
             print(f'[init] resumed from iter={prev_iter} '
                    f'best_det_return={prev_best}', flush=True)
+        if observer_from_ckpt:
+            # Freeze-transfer: restore obs_norm from the same ckpt with
+            # learn=False. Leaving env.obs_norm at zeros-on-device while
+            # g is frozen shifts the freeze TM (P3-only #12b).
+            if not _apply_obs_norm_from_ckpt(env, ckpt, learn=False):
+                raise RuntimeError(
+                    'observer_from_ckpt requires obs_norm in checkpoint '
+                    f'{init_path!r}; refuse Welford refit on a frozen observer')
+            print('[limobs] restored obs_norm from ckpt (learn=False)',
+                  flush=True)
 
     # Square-root LR scaling for adaptive batch (kept from V3 trainer).
     bs_ref = 16
@@ -13193,7 +13252,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # MIMO PRBS and all-DV PRBS stay in the main replay buffer.  Env-free
     # P40: skip alloc + seed when the teacher is off (gain-match only).
     isolation_buf = None
-    if (bool(getattr(cfg, 'cont_latent_enabled', False))
+    if (not skip_p12_wm
+            and bool(getattr(cfg, 'cont_latent_enabled', False))
             and _isolation_teacher_on(cfg)):
         _n_mv_iso = int(len(getattr(env.sim, 'mv_indices', []) or []))
         _n_dv_iso = int(len(getattr(env.sim, 'dv_indices', []) or []))
@@ -13230,6 +13290,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
           f"latent={getattr(cfg, 'rssm_latent_type', '?')} "
           f"compile={_resolve_compile_mode(cfg) or 'eager'} "
           f"skip_invalid_p3={bool(getattr(cfg, 'skip_invalid_p3', True))} "
+          f"limobs={bool(observer_from_ckpt)} "
           f"storm_cap={int(getattr(cfg, 'skip_storm_p1_cap_after', 2) or 2)} "
           f"phases={p1}/{p2}/{p3}",
           flush=True)
@@ -13506,6 +13567,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     wm_trunk_stopgrad_in_p2 = bool(getattr(cfg, 'wm_trunk_stopgrad_in_p2', False))
     # neural-apc-mbrl JOINT training mode (DreamerV1/V2/V3 style).
     joint_mode = str(getattr(cfg, 'train_mode', 'phased')).lower() == 'joint'
+    if observer_from_ckpt and joint_mode:
+        raise ValueError(
+            'observer_from_ckpt is P3-only freeze-transfer; '
+            'incompatible with train_mode=joint')
     # ----- Staged clean->disturbance curriculum (2026-06-12) -----
     # Precondition: needs phased mode (it IS the phased curriculum) + the DOB.
     # If misconfigured, hard-disable with a loud warning rather than running a
@@ -13748,10 +13813,16 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # mid-MV.  Operator analogue: "don't move the valves while the
     # buffer is empty".  Falls back to all-random if the user explicitly
     # opts out.
-    n_baseline_seed = int(getattr(cfg, 'baseline_seed_episodes', 8))
+    if skip_p12_wm:
+        print('[limobs] skipping P1/P2 seed fill', flush=True)
+        n_baseline_seed = 0
+        n_random_seed = 0
+        n_prbs_seed = 0
+    else:
+        n_baseline_seed = int(getattr(cfg, 'baseline_seed_episodes', 8))
+        n_random_seed = int(getattr(cfg, 'random_seed_episodes', 2))
+        n_prbs_seed = int(getattr(cfg, 'exploration_seed_episodes', 0))
     baseline_seed_std = float(getattr(cfg, 'baseline_seed_action_std', 0.05))
-    n_random_seed = int(getattr(cfg, 'random_seed_episodes', 2))
-    n_prbs_seed = int(getattr(cfg, 'exploration_seed_episodes', 0))
     prbs_op_band = float(getattr(cfg, 'prbs_seed_op_band', 0.95))
     # P43 (2026-05-23): baseline_seed centres stratified over
     # ``[-baseline_op_band, +baseline_op_band]`` so the WM sees
@@ -13814,7 +13885,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     #
     # Operating points u₀ are stratified over
     # ``[-constant_action_seed_op_band, +constant_action_seed_op_band]``.
-    n_const_seed = int(getattr(cfg, 'constant_action_seed_episodes', 0))
+    n_const_seed = (0 if skip_p12_wm
+                    else int(getattr(cfg, 'constant_action_seed_episodes', 0)))
     const_op_band = float(getattr(cfg, 'constant_action_seed_op_band', 0.6))
     step_frac = float(getattr(cfg, 'step_settle_seed_fraction', 0.0))
     step_frac = float(np.clip(step_frac, 0.0, 1.0))
@@ -13868,8 +13940,10 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     #   * n_channels = n_mv + n_dv (episode count: ≥ k per channel so
     #     each input axis gets balanced isolated-step coverage)
     #   * primary_dv_pos round-robin (within-episode DV stratification)
-    n_step_test_floor = int(getattr(cfg, 'step_test_seed_episodes', 0))
-    n_per_ch = int(getattr(cfg, 'step_test_episodes_per_channel', 0))
+    n_step_test_floor = (0 if skip_p12_wm
+                         else int(getattr(cfg, 'step_test_seed_episodes', 0)))
+    n_per_ch = (0 if skip_p12_wm
+                else int(getattr(cfg, 'step_test_episodes_per_channel', 0)))
     n_mv = int(len(getattr(env.sim, 'mv_indices', []) or []))
     n_dv = int(len(getattr(env.sim, 'dv_indices', []) or []))
     n_channels = max(1, n_mv + n_dv)
@@ -13911,7 +13985,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # attenuated (~0.75).  No-op fallback (MV-hold) when n_dv=0.  MV operating
     # point is stratified across the batch so the DV gain is identified at
     # several MV levels.
-    n_dv_prbs_seed = int(getattr(cfg, 'dv_prbs_seed_episodes', 0))
+    n_dv_prbs_seed = (0 if skip_p12_wm
+                      else int(getattr(cfg, 'dv_prbs_seed_episodes', 0)))
     if n_dv_prbs_seed > 0 and n_dv > 0:
         dvp_levels = np.linspace(-const_op_band, const_op_band,
                                   n_dv_prbs_seed, dtype='float32')
@@ -13943,7 +14018,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # floored at 1.0 so strong-|G| stays at op-band — P38 RCA) so abs
     # isolation/ss-match sees a louder weak-input |ΔCV| (P33 drowning;
     # not a loss reweight).
-    n_settle = int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0)
+    n_settle = (0 if skip_p12_wm
+                else int(getattr(cfg, 'wm_isolation_settle_episodes', 0) or 0))
     if isolation_buf is not None and n_settle > 0:
         # Pre-iso resolve is only for dcv scales. Actor A/B with
         # ``DREAMER_WM_ISOLATION_DCV_MATCH=0`` skips it so gain-match
@@ -14016,7 +14092,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # identified gains / steady-state sweep are unavailable.
     cfg._expert_active = False
     expert_type = str(getattr(cfg, 'expert_type', 'none') or 'none').lower()
-    n_expert_seed = int(getattr(cfg, 'expert_seed_episodes', 0))
+    n_expert_seed = (0 if skip_p12_wm
+                     else int(getattr(cfg, 'expert_seed_episodes', 0)))
     if expert_type not in ('', 'none') and n_expert_seed > 0:
         try:
             from utils import apc_expert as _apc_expert
@@ -14131,25 +14208,107 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
         else:
             print(f'[gain-match] post-seed re-resolve FAILED ({_gm_exc!r}); '
                   f'keeping pre-iso targets', flush=True)
-    try:
-        _cache_gain_match_rest_ic(env, cfg)
-    except Exception as _rest_exc:
-        print(f'[gain-match] rest-ic cache FAILED ({_rest_exc!r})',
+    if skip_p12_wm:
+        print('[limobs] skipping rest-IC cache/graph (g frozen from ckpt)',
               flush=True)
-        if _cfg_on(cfg, 'gain_match_rest_ic', False):
+    else:
+        try:
+            _cache_gain_match_rest_ic(env, cfg)
+        except Exception as _rest_exc:
+            print(f'[gain-match] rest-ic cache FAILED ({_rest_exc!r})',
+                  flush=True)
+            if _cfg_on(cfg, 'gain_match_rest_ic', False):
+                raise RuntimeError(
+                    'gain_match_rest_ic=True but rest cache failed; '
+                    'refusing PRBS-posterior fallback (would confound P45)'
+                ) from _rest_exc
+        if (_cfg_on(cfg, 'gain_match_rest_ic', False)
+                and getattr(cfg, '_gain_match_rest_obs', None) is None):
             raise RuntimeError(
-                'gain_match_rest_ic=True but rest cache failed; '
-                'refusing PRBS-posterior fallback (would confound P45)'
-            ) from _rest_exc
-    if (_cfg_on(cfg, 'gain_match_rest_ic', False)
-            and getattr(cfg, '_gain_match_rest_obs', None) is None):
-        raise RuntimeError(
-            'gain_match_rest_ic=True but rest cache is empty; '
-            'refusing PRBS-posterior fallback (would confound P45)')
-    _warmup_rest_ic_cuda_graph(getattr(model, 'dynamics', None), cfg, device)
+                'gain_match_rest_ic=True but rest cache is empty; '
+                'refusing PRBS-posterior fallback (would confound P45)')
+        _warmup_rest_ic_cuda_graph(getattr(model, 'dynamics', None), cfg, device)
     _resolve_aux_tbptt_steps(cfg)
     _resolve_gain_match_step(cfg)
     _write_resolved_run_plan(cfg)
+    if observer_from_ckpt:
+        # #12b freeze-transfer: skip P1/P2 WM updates. Freeze g+DOB
+        # (DOB still serves). One 5-level probe of the *loaded* freeze.
+        if curriculum:
+            _apply_curriculum_stage(3)
+        else:
+            model.set_dob_active(bool(getattr(cfg, 'dob_enabled', False)))
+            _fz = model.set_world_model_trainable(
+                g=False, dob=False, reward=True)
+            _wm_frozen_now = True
+            _cur_stage = 3
+            _release_rest_ic_after_g_freeze(
+                getattr(model, 'dynamics', None))
+            print(f'[limobs] freeze-transfer STAGE 3 '
+                  f'[g={_fz["g"]} dob={_fz["dob"]} reward={_fz["reward"]}]',
+                  flush=True)
+        _gain_probe = _probe_observer_gain_ready(model, env, device, cfg)
+        _ready = bool((_gain_probe or {}).get('gain_ready'))
+        if _gain_probe:
+            print('[limobs] loaded freeze gain-probe '
+                  f'{_format_gain_probe_line(_gain_probe)}', flush=True)
+        else:
+            print('[limobs] loaded freeze gain-probe failed (None)',
+                  flush=True)
+        _skip_p3 = False
+        if not _ready:
+            p1_gain_not_ready_capped = True
+            _aev = _actor_experiment_valid(
+                skip_storm_source=skip_storm_restore_source,
+                gain_not_ready_capped=True)
+            _skip_p3 = _should_skip_invalid_p3(
+                actor_valid=_aev,
+                skip_enabled=bool(getattr(cfg, 'skip_invalid_p3', True)))
+            print('[actor] P3 is NOT an actor experiment: observer '
+                  'freeze is GAIN_NOT_READY and/or skip-storm fell '
+                  'back to fidelity-peak wm_best. Judge observer '
+                  'only; do not attribute econ to actor knobs.',
+                  flush=True)
+            if _skip_p3:
+                early_stop_reason = 'p3_skipped_invalid_observer'
+                mid_check_flags.append('p3_skipped_invalid_observer')
+                print('[p3-skip] skipping actor training; loaded '
+                      'observer freeze stands. Validation still '
+                      'runs on final.pt (expert-BC policy). '
+                      'DREAMER_SKIP_INVALID_P3=0 to train anyway.',
+                      flush=True)
+                print(f'[early-stop] tripped: {early_stop_reason}',
+                      flush=True)
+                total_env_steps = int(cfg.total_steps)
+        if not _skip_p3:
+            current_phase = 3
+            total_env_steps = int(p1 + p2)
+            if _cfg_on(cfg, 'p3_reset_log_std', False):
+                model.reset_policy_exploration(opt_actor)
+                print('[p3] reset policy log_std residual (limobs)',
+                      flush=True)
+            print('[p3] on-policy collect streams measured DV + Kalman '
+                  '(train/serve match with rollout_observed)',
+                  flush=True)
+            _warmup_p3_collect_serve_graph(model, device, cfg)
+            p3_start_steps = total_env_steps
+            try:
+                _rs0 = float(model.ret_scale.detach().item())
+                if _rs0 > 0.0 and np.isfinite(_rs0):
+                    p3_start_return_scale = _rs0
+                    print(f'[p3-start] return_scale={_rs0:.2f} '
+                          '(cascade canary baseline)', flush=True)
+            except Exception:
+                pass
+            env._current_phase = 3
+            env._disturbance_prob_override = get_phase_disturbance_prob(
+                phase=3, cfg=cfg)
+            if env.set_domain_randomization(True):
+                print('[realsim] domain randomization ENABLED (limobs P3)',
+                      flush=True)
+            print('[limobs] P3-only on loaded freeze '
+                  f'ready={_ready} steps={total_env_steps}/{cfg.total_steps}',
+                  flush=True)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude
         # curriculum (DREAMER_HIDDEN_OU_AMP_RAMP) sees the latest value

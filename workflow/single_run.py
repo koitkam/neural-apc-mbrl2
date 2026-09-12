@@ -120,7 +120,14 @@ def main() -> int:
                         help='Path to a previous run\'s checkpoint (e.g. '
                              'best.pt) to warm-start model weights from. '
                              'Optimizers/counters/phase tracking start fresh.')
+    parser.add_argument('--observer-from-ckpt', action='store_true',
+                        help='P3-only freeze-transfer: skip P1/P2 WM updates, '
+                             'freeze g+DOB, 5-level-probe the loaded observer. '
+                             'Requires --init-from-ckpt. Not a TrainConfig A/B.')
     args = parser.parse_args()
+    if bool(getattr(args, 'observer_from_ckpt', False)) and not str(
+            args.init_from_ckpt or '').strip():
+        parser.error('--observer-from-ckpt requires --init-from-ckpt')
 
     sim_dir = _resolve_sim_dir(args.simulation_dir)
     setup_path = sim_dir / 'control_setup.json'
@@ -358,6 +365,7 @@ def main() -> int:
         batch_size=batch_size,
         out_dir=str(out_dir),
         init_from_ckpt=str(args.init_from_ckpt or ''),
+        observer_from_ckpt=bool(getattr(args, 'observer_from_ckpt', False)),
         # NOTE: wm_overshoot_len / wm_held_rollout_len / return_scale_abs_cap are
         # H-derived and now live in training.train.auto_tune_seed_buffer (the
         # SHARED layer) so BOTH single_run.py and workflow/bo_runner.py inherit
