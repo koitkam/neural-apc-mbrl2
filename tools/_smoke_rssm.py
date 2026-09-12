@@ -3772,7 +3772,49 @@ def _test_residual_board_cv_metrics() -> None:
         assert abs(b2['diagnostic']['critic_v_mean'] + 81.0) < 1e-6
         assert abs(b2['diagnostic']['critic_g_mean'] + 15318.0) < 1e-6
         assert b2['diagnostic']['critic_pass'] is False  # r without slope
+    _src_val = open('evaluation/validate.py').read()
+    assert 'def _dr_scripted_title' in _src_val
+    assert 'event_IAE=' in _src_val
+    assert 'IAE={ep_metrics["iae_normed_mean"]' not in _src_val
+    assert "(event_metrics or {}).get('events')" in _src_val
+    assert 'CV headroom (to y_econ)' in _src_val
     print('[smoke] OK  residual_board CV metrics + R1/R2/R3 assemble')
+
+
+def _test_dr_scripted_title() -> None:
+    """Tracking IAE is 0 when no target; title must use event IAE + orbit."""
+    from evaluation.validate import (
+        _dr_scripted_title, compute_episode_metrics)
+    import numpy as np
+    T = 20
+    lo, hi = 78.5, 85.5
+    y = np.full(T, 86.0, dtype='float32')  # far side of hi
+    ep = dict(
+        states=y.reshape(T, 1),
+        controls=np.zeros((T, 1), dtype='float32'),
+        raw_rewards=np.zeros(T, dtype='float32'),
+        cum_raw_reward=-12.5,
+        episode_length=T,
+        cv_indices=[0],
+        cv_bounds=[[lo, hi]],
+        cv_target_enabled=[False],
+        mv_cv_gain_sign=-1.0,
+        sample_rate=4,
+        tau_dominant=56.0,
+        mean_cv_violation=0.0,
+        mean_mv_violation=0.0,
+    )
+    m = compute_episode_metrics(ep)
+    assert float(m['iae_normed_mean']) == 0.0
+    title = _dr_scripted_title(
+        10004, m,
+        {'iae_window_normed': {'median': 7.79}},
+        base_ev={'iae_window_normed': {'median': 40.0}})
+    assert 'event_IAE=7.79' in title
+    assert 'baseline event_IAE=40.00' in title
+    assert 'IAE=0.00' not in title
+    assert 'orbit=' in title and 'rev=' in title
+    print('[smoke] OK  DR title uses event IAE not tracking IAE')
 
 
 def _test_require_realsim_actor() -> None:
@@ -7624,6 +7666,7 @@ if __name__ == '__main__':
     _test_pin_eval_modules()
     _test_control_quality_gates()
     _test_residual_board_cv_metrics()
+    _test_dr_scripted_title()
     _test_require_realsim_actor()
     _test_rssm_param_grad_snapshot()
     _test_gain_match_per_input_huber()

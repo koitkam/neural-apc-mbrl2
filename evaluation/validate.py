@@ -1199,6 +1199,60 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
     }
 
 
+def _event_median(ev: Dict | None, key: str) -> float:
+    """Median from ``compute_event_response_metrics`` agg dicts."""
+    if not ev:
+        return float('nan')
+    v = ev.get(key)
+    if isinstance(v, dict):
+        v = v.get('median')
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float('nan')
+
+
+def _dr_scripted_title(seed, ep_metrics: Dict, ev_metrics: Dict | None, *,
+                       base_ev: Dict | None = None, sfx: str = '') -> str:
+    """DR png title: R3 event IAE + R2 orbit/rev — not tracking IAE.
+
+    Economic APC plants (test_sim, distillation) leave
+    ``targets_enabled=False``, so ``iae_normed_mean`` is identically 0.
+    P130 seed 10004 title ``IAE=0.00`` vs event IAE **7.79** / board
+    median-of-medians **15.5** — the title was on trial; residual_board
+    is the score. This title uses the board axes.
+    """
+    iae = _event_median(ev_metrics, 'iae_window_normed')
+    try:
+        orbit = float(ep_metrics.get('cv_limit_orbit_rate') or 0.0)
+    except (TypeError, ValueError):
+        orbit = 0.0
+    try:
+        rev = float(ep_metrics.get('cv_reversal_rate') or 0.0)
+    except (TypeError, ValueError):
+        rev = 0.0
+    try:
+        cum = float(ep_metrics.get('cum_raw_reward') or 0.0)
+    except (TypeError, ValueError):
+        cum = 0.0
+    iae_s = f'{iae:.2f}' if np.isfinite(iae) else 'n/a'
+    parts = [
+        f'seed={seed}  scripted disturbance rejection',
+        f'cum_raw={cum:+.2f}',
+        f'event_IAE={iae_s}',
+        f'orbit={orbit:.3f}/τ',
+        f'rev={rev:.3f}',
+    ]
+    if base_ev is not None:
+        biae = _event_median(base_ev, 'iae_window_normed')
+        if np.isfinite(biae):
+            parts.append(f'baseline event_IAE={biae:.2f}')
+    title = '  '.join(parts)
+    if sfx:
+        title += sfx
+    return title
+
+
 # ---------------------------------------------------------------------------
 # Baselines  (constant-MV; simulator-agnostic, no controller needed)
 # ---------------------------------------------------------------------------
@@ -1552,11 +1606,10 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
       - **constant-MV baseline overlay** (dashed grey) on every MV/CV row
         when ``ep_baseline`` is provided — makes "is the agent doing
         anything?" answerable at a glance,
-      - **CV tracking-error subplot** (replaces the legacy cum-reward
-        subplot, which was dominated by violation-penalty steps and
-        carried no operator information),
-      - per-event response annotations (±overshoot, settle steps) when
-        ``event_metrics`` is provided.
+      - **CV tracking-error subplot** when a target is enabled; otherwise
+        **CV headroom to y_econ** (economic APC — tracking IAE is 0),
+      - per-event response annotations from ``event_metrics`` (5τ window)
+        when provided; else a 200-step fallback.
     """
     states = ep['states']
     controls = ep['controls']
@@ -1665,28 +1718,52 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
     if n_rows == 1:
         axes = [axes]
 
-    # Per-event annotations (CV settle/overshoot) for the summary record.
+    # Per-event annotations: prefer the 5τ ``event_metrics`` window
+    # (same as residual_board R3). The 200-step fallback predates that
+    # window and disagreed with the board (P130 title IAE vs event IAE).
     annotations: List[Dict] = []
-    for ev in schedule:
-        st = int(ev.get('start', 0))
-        if st >= T - 5:
-            continue
-        for j, cidx in enumerate(cv_idx):
-            if cidx >= states.shape[1]:
+    ev_list = (event_metrics or {}).get('events') if event_metrics else None
+    if ev_list:
+        for e in ev_list:
+            w = e.get('worst_cv') or {}
+            try:
+                cv_row = int(w.get('cv_row', 0) or 0)
+            except (TypeError, ValueError):
+                cv_row = 0
+            try:
+                start = int(e.get('start', 0) or 0)
+            except (TypeError, ValueError):
+                start = 0
+            try:
+                ovr = float(w.get('peak_overshoot_normed', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                ovr = 0.0
+            annotations.append({
+                'cv_row': cv_row, 'start': start, 'overshoot': ovr,
+                'settle_steps': w.get('settle_steps'),
+                'name': e.get('name', 'event'),
+            })
+    else:
+        for ev in schedule:
+            st = int(ev.get('start', 0))
+            if st >= T - 5:
                 continue
-            pre = states[max(0, st - 20):st, cidx]
-            post = states[st:min(T, st + 200), cidx]
-            if pre.size == 0 or post.size == 0:
-                continue
-            base = float(np.mean(pre))
-            dev = post - base
-            ovr = float(dev[np.argmax(np.abs(dev))]) if dev.size else 0.0
-            band = max(1e-6, 0.05 * (np.max(np.abs(pre)) if pre.size else 1.0))
-            settled = np.where(np.abs(dev) <= band)[0]
-            settle_t = int(settled[0]) if settled.size else int(post.size)
-            annotations.append({'cv_row': j, 'start': st,
-                                 'overshoot': ovr, 'settle_steps': settle_t,
-                                 'name': ev.get('name', 'step')})
+            for j, cidx in enumerate(cv_idx):
+                if cidx >= states.shape[1]:
+                    continue
+                pre = states[max(0, st - 20):st, cidx]
+                post = states[st:min(T, st + 200), cidx]
+                if pre.size == 0 or post.size == 0:
+                    continue
+                base = float(np.mean(pre))
+                dev = post - base
+                ovr = float(dev[np.argmax(np.abs(dev))]) if dev.size else 0.0
+                band = max(1e-6, 0.05 * (np.max(np.abs(pre)) if pre.size else 1.0))
+                settled = np.where(np.abs(dev) <= band)[0]
+                settle_t = int(settled[0]) if settled.size else int(post.size)
+                annotations.append({'cv_row': j, 'start': st,
+                                     'overshoot': ovr, 'settle_steps': settle_t,
+                                     'name': ev.get('name', 'step')})
 
     def _draw_disturbance_markers(ax) -> None:
         ylo, yhi = ax.get_ylim()
@@ -1953,13 +2030,38 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
         h2, l2 = ax2.get_legend_handles_labels()
         ax.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=8)
     else:
-        # Fallback when no CV target is enabled — keep the cum-reward
-        # trace so the subplot is still informative.
-        ax.plot(t_arr, np.cumsum(ep['raw_rewards']), color='C2', lw=1.0,
-                 label=f"raw cum (final={ep['cum_raw_reward']:+.1f})")
+        # No CV target (economic APC): tracking IAE is identically 0.
+        # Plot signed headroom to y_econ so the panel shows R2 hunt/hug,
+        # not a duplicate of the cum-raw companion below.
+        plotted_hr = False
+        for k, cidx in enumerate(cv_idx_local):
+            if cidx >= states_local.shape[1]:
+                continue
+            lo, hi = _bound_lo_hi(
+                cv_bounds_local[k] if k < len(cv_bounds_local) else None)
+            if lo is None or hi is None:
+                continue
+            n = min(T, len(t_arr), states_local.shape[0])
+            side = _cv_econ_side(ep, k)
+            hr = _cv_headroom(states_local[:n, cidx].astype('float64'),
+                              lo, hi, side)
+            ax.plot(t_arr[:n], hr, lw=1.0, label=f'headroom CV[{cidx}]')
+            plotted_hr = True
+            if ep_baseline is not None:
+                sb = ep_baseline['states']
+                m = min(sb.shape[0], n)
+                hr_b = _cv_headroom(sb[:m, cidx].astype('float64'),
+                                    lo, hi, _cv_econ_side(ep_baseline, k))
+                ax.plot(t_arr[:m], hr_b, lw=0.9, ls='--', color='#888888',
+                        alpha=0.8, label=f'headroom CV[{cidx}] baseline')
+        ax.axhline(0.0, color='gray', lw=0.5, ls='-', alpha=0.5)
+        if not plotted_hr:
+            ax.plot(t_arr, np.cumsum(ep['raw_rewards']), color='C2', lw=1.0,
+                     label=f"raw cum (final={ep['cum_raw_reward']:+.1f})")
         ax.legend(loc='upper left', fontsize=8)
     _draw_disturbance_markers(ax)
-    ax.set_ylabel('|err| (normed)')
+    ax.set_ylabel('CV headroom (to y_econ)' if not plotted_any_err
+                  else '|err| (normed)')
     ax.grid(True, alpha=0.3)
 
     # Reward / violation companion: instantaneous raw reward (left axis) +
@@ -2264,13 +2366,10 @@ def run_validation(*,
             base_metrics = (compute_episode_metrics(ep_b)
                               if ep_b is not None else None)
 
-            d_title = (f'seed={seed}  scripted disturbance rejection  '
-                       f'cum_raw={ep_d["cum_raw_reward"]:+.2f}  '
-                       f'IAE={ep_metrics["iae_normed_mean"]:.2f}  '
-                       f'overshoot_max={ev_metrics["overshoot_normed"]["max"]:.3f}'
-                       + (f'   |  baseline IAE={base_metrics["iae_normed_mean"]:.2f}'
-                          if base_metrics is not None else '')
-                       + _ttl_sfx)
+            base_ev = (compute_event_response_metrics(ep_b)
+                       if ep_b is not None else None)
+            d_title = _dr_scripted_title(
+                seed, ep_metrics, ev_metrics, base_ev=base_ev, sfx=_ttl_sfx)
             ann = plot_disturbance_rejection(
                 ep_d, per_seed_dir / 'disturbance_rejection.png',
                 title=d_title, ep_baseline=ep_b, event_metrics=ev_metrics)
