@@ -3468,9 +3468,10 @@ class APCEnv:
             self._rew_orbit_trace = []
             _otrace = self._rew_orbit_trace
         _otrace.append(float(_orbit_cost))
-        # Val / #8b calib: unshaped reversal-free raw. Hunt sat stays
-        # on ``raw_hunt`` (actor λ + S). Bound-shaped econ is the
-        # critic training stream (``reward_econ_train``).
+        # Val / #8b calib: unshaped reversal-free ``raw_reward``. Hunt sat
+        # stays on ``raw_hunt`` (jsonl / sticky only; actor λ+S are on
+        # econ after #10). Bound-shaped econ is the critic stream.
+        # #12: orbit-entry cost is ``_rew_orbit_trace``, not this raw.
         raw_reward = raw_econ
         self._prev_prev_control = self._prev_control
         self._prev_control = np.asarray(control, dtype='float32')
@@ -10590,6 +10591,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     _ret_cap = _adaptive_return_cap(cfg)
     # #8/#10: critic twohot on reversal-free econ; actor λ + S on the
     # same econ stream (DreamerV3 A=(R−V)/S). Hunt λ deleted.
+    # #12: subtract actor-only ``ret_orbit`` from A; S stays on econ.
     ret_econ = _lambda_returns(rew_econ, v_slow, gamma, lam, _ret_cap)
     _rew_o = batch.get('rew_orbit')
     if _rew_o is None:

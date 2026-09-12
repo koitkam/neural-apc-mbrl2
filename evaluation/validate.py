@@ -1023,9 +1023,8 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
         'cv_opt_headroom': float(np.mean(cv_headrooms)) if cv_headrooms else float('nan'),
         'cv_viol_frac': float(np.mean(cv_viol_fracs)) if cv_viol_fracs else 0.0,
         'cv_econ_side': (econ_sides[0] if econ_sides else 'lo'),
-        # Mean of ``info['raw_reward']``. Comment in train.py says unshaped
-        # economic; code is unshaped (no Ng F) but includes cv_reversal
-        # (P125+). GOAL_PLAN #8 will switch this to reversal-free.
+        # Mean of ``info['raw_reward']`` (reversal-free econ after #8).
+        # Hunt sat is ``info['raw_hunt']``, not this score.
         'economic_score': float(np.mean(ep['raw_rewards'])) if T > 0 else 0.0,
         'cum_raw_reward': float(ep.get('cum_raw_reward', 0.0)),
         'iae_normed_mean': float(np.mean(iae_per_cv)) if iae_per_cv else 0.0,
