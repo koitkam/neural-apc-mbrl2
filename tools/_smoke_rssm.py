@@ -2625,6 +2625,17 @@ def _test_isolation_dcv_scales() -> None:
     assert _bound['sym_mag'] < 1.5  # symlog(3)≈1.39 of Hafner [-20,20]
     assert _scale['sym_mag'] > 5.0  # unused scale-path (P129 bins=43)
     assert abs(_bound['mapped_max'] - 3.0) < 1e-9
+    # P129-class bound occupancy (mostly-negative econ, B=3, ref=305):
+    # ~10–11 bins, not the ~18 two-sided span. Adaptive clip still keys
+    # off scale-path `twohot_active_bins`; retargeting onto bound bins
+    # would trip `<10` — a second mechanism. Do not change that gate
+    # while P129 is live / as part of #10.
+    _raw = _np.linspace(-347.89, 0.7317, 3000)
+    _mapped = _np.clip(_raw * (3.0 / 305.11), -3.0, 3.0)
+    _bound_span = _twohot_coverage_from_mapped(_mapped)
+    assert 8 <= int(_bound_span['active_bins']) <= 14
+    assert _bound_span['sym_mag'] < 1.5
+    assert _bound_span['mapped_max'] < 0.02  # positive tail does not reach +B
     # toy 4–5 samples do not rank active_bins; occupancy is sym_mag.
     # B default is TrainConfig 3.0 (p117 promote). getattr 6.0 was the
     # pre-promote leftover fallback — unused while cfg is a TrainConfig,
