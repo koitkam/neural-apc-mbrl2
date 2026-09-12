@@ -123,7 +123,10 @@ def main() -> int:
     parser.add_argument('--observer-from-ckpt', action='store_true',
                         help='P3-only freeze-transfer: skip P1/P2 WM updates, '
                              'freeze g+DOB, 5-level-probe the loaded observer. '
-                             'Requires --init-from-ckpt. Not a TrainConfig A/B.')
+                             'A sibling run_summary.json with '
+                             'actor_experiment_valid supersedes a P1-band '
+                             'miss (P133). Requires --init-from-ckpt. '
+                             'Not skip_invalid_p3=0. Not a TrainConfig A/B.')
     args = parser.parse_args()
     if bool(getattr(args, 'observer_from_ckpt', False)) and not str(
             args.init_from_ckpt or '').strip():

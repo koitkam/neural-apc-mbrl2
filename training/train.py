@@ -2258,10 +2258,11 @@ class TrainConfig:
     # have already learned but you want to change params (σ clamp,
     # warmup, etc.) without throwing away weights.  Empty = cold start.
     init_from_ckpt: str = ''
-    # CLI launch-path only (#12b limobs). Default False — not a recipe A/B
-    # and not in ENV_OVERRIDES. Requires init_from_ckpt. Skip P1/P2 WM
-    # updates; freeze g+DOB; one 5-level probe of the loaded freeze;
-    # skip_invalid_p3 if that probe is not READY; else P3.
+    # CLI launch-path only (#12b/#12c limobs). Default False — not a
+    # recipe A/B and not in ENV_OVERRIDES. Requires init_from_ckpt.
+    # Skip P1/P2 WM updates; freeze g+DOB; one 5-level probe of the
+    # loaded freeze. skip_invalid_p3 if that probe is not READY *and*
+    # the source run has no VALID freeze certificate; else P3.
     observer_from_ckpt: bool = False
 
     # ----- Speedups (DREAMER_COMPILE=1 opt-in) -----
@@ -3914,6 +3915,40 @@ def _require_observer_from_ckpt_init(
         raise ValueError(
             'observer_from_ckpt requires init_from_ckpt '
             '(--observer-from-ckpt requires --init-from-ckpt)')
+
+
+def _source_freeze_cert_valid(init_from_ckpt: str) -> bool:
+    """#12c: source VALID freeze supersedes a P1 re-gate of val-era TM.
+
+    Sibling ``run_summary.json`` next to ``init_from_ckpt``. Not
+    ``skip_invalid_p3=0``: uncertified blobs (P131/P132 ``final.pt``)
+    still skip. P133 FALSIFIED the P1 band on actor-best (probe 0.76
+    = known val drop 0.84→0.763). Qin/Badgwell: trust the source
+    identification certificate; do not retune the plant model to A/B
+    the regulator.
+    """
+    path = Path(str(init_from_ckpt or '')).expanduser()
+    if not path.is_file():
+        return False
+    summary_path = path.parent / 'run_summary.json'
+    if not summary_path.is_file():
+        return False
+    try:
+        payload = json.loads(summary_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    summary = payload.get('summary') if isinstance(payload, dict) else None
+    if not isinstance(summary, dict):
+        return False
+    if not bool(summary.get('actor_experiment_valid')):
+        return False
+    try:
+        n_iters = int(summary.get('iters') or 0)
+    except (TypeError, ValueError):
+        n_iters = 0
+    if n_iters <= 0 and summary.get('best_p3_iter') is None:
+        return False
+    return True
 
 
 def _should_skip_p12_wm(*, observer_from_ckpt: bool) -> bool:
@@ -14256,30 +14291,45 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
             print('[limobs] loaded freeze gain-probe failed (None)',
                   flush=True)
         _skip_p3 = False
+        _cert = False
         if not _ready:
-            p1_gain_not_ready_capped = True
-            _aev = _actor_experiment_valid(
-                skip_storm_source=skip_storm_restore_source,
-                gain_not_ready_capped=True)
-            _skip_p3 = _should_skip_invalid_p3(
-                actor_valid=_aev,
-                skip_enabled=bool(getattr(cfg, 'skip_invalid_p3', True)))
-            print('[actor] P3 is NOT an actor experiment: observer '
-                  'freeze is GAIN_NOT_READY and/or skip-storm fell '
-                  'back to fidelity-peak wm_best. Judge observer '
-                  'only; do not attribute econ to actor knobs.',
-                  flush=True)
-            if _skip_p3:
-                early_stop_reason = 'p3_skipped_invalid_observer'
-                mid_check_flags.append('p3_skipped_invalid_observer')
-                print('[p3-skip] skipping actor training; loaded '
-                      'observer freeze stands. Validation still '
-                      'runs on final.pt (expert-BC policy). '
-                      'DREAMER_SKIP_INVALID_P3=0 to train anyway.',
+            _cert = _source_freeze_cert_valid(init_path)
+            if _cert:
+                # P133: P1 band on actor-best is tautological with the
+                # known freeze→val TM drop. Trust the source VALID
+                # certificate; do not set p1_gain_not_ready_capped so
+                # EXIT actor_experiment_valid can score P3.
+                print('[limobs] source freeze certificate '
+                      'actor_experiment_valid=true — enter P3 '
+                      '(P1 re-gate of val-era TM tautological with '
+                      'known freeze→val drop; skip_invalid_p3 KEEP '
+                      'for uncertified blobs)',
                       flush=True)
-                print(f'[early-stop] tripped: {early_stop_reason}',
+            else:
+                p1_gain_not_ready_capped = True
+                _aev = _actor_experiment_valid(
+                    skip_storm_source=skip_storm_restore_source,
+                    gain_not_ready_capped=True)
+                _skip_p3 = _should_skip_invalid_p3(
+                    actor_valid=_aev,
+                    skip_enabled=bool(getattr(cfg, 'skip_invalid_p3', True)))
+                print('[actor] P3 is NOT an actor experiment: observer '
+                      'freeze is GAIN_NOT_READY and/or skip-storm fell '
+                      'back to fidelity-peak wm_best. Judge observer '
+                      'only; do not attribute econ to actor knobs.',
                       flush=True)
-                total_env_steps = int(cfg.total_steps)
+                if _skip_p3:
+                    early_stop_reason = 'p3_skipped_invalid_observer'
+                    mid_check_flags.append('p3_skipped_invalid_observer')
+                    print('[p3-skip] skipping actor training; loaded '
+                          'observer freeze stands. Validation still '
+                          'runs on final.pt (loaded policy; P3 did '
+                          'not run). DREAMER_SKIP_INVALID_P3=0 to '
+                          'train anyway.',
+                          flush=True)
+                    print(f'[early-stop] tripped: {early_stop_reason}',
+                          flush=True)
+                    total_env_steps = int(cfg.total_steps)
         if not _skip_p3:
             current_phase = 3
             total_env_steps = int(p1 + p2)
@@ -14307,7 +14357,8 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
                 print('[realsim] domain randomization ENABLED (limobs P3)',
                       flush=True)
             print('[limobs] P3-only on loaded freeze '
-                  f'ready={_ready} steps={total_env_steps}/{cfg.total_steps}',
+                  f'ready={_ready} cert={_cert} '
+                  f'steps={total_env_steps}/{cfg.total_steps}',
                   flush=True)
     while total_env_steps < cfg.total_steps:
         # Push training progress into the env so the hidden-OU amplitude

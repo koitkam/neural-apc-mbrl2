@@ -51,6 +51,7 @@ from training.train import (
                             _actor_experiment_valid,
                             _should_skip_invalid_p3,
                             _require_observer_from_ckpt_init,
+                            _source_freeze_cert_valid,
                             _should_skip_p12_wm,
                             _apply_obs_norm_from_ckpt,
                             _should_warm_restore_wm_best,
@@ -1683,8 +1684,45 @@ def _test_observer_from_ckpt_path() -> None:
     assert '[limobs] skipping P1/P2 seed fill' in _tr
     assert '[limobs] restored obs_norm from ckpt (learn=False)' in _tr
     assert '[limobs] loaded freeze gain-probe' in _tr
+    assert 'def _source_freeze_cert_valid' in _tr
+    assert '[limobs] source freeze certificate' in _tr
     assert '(signed > 0.0) & (prev[:n] <= 0.0)' in _tr
+
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as _td:
+        _tdp = _P(_td)
+        _ckpt = _tdp / 'best.pt'
+        _ckpt.write_bytes(b'x')
+        assert not _source_freeze_cert_valid(str(_ckpt))
+        (_tdp / 'run_summary.json').write_text(
+            json.dumps({'summary': {
+                'actor_experiment_valid': False, 'iters': 166,
+            }}), encoding='utf-8')
+        assert not _source_freeze_cert_valid(str(_ckpt))
+        (_tdp / 'run_summary.json').write_text(
+            json.dumps({'summary': {
+                'actor_experiment_valid': True, 'iters': 0,
+            }}), encoding='utf-8')
+        assert not _source_freeze_cert_valid(str(_ckpt))
+        (_tdp / 'run_summary.json').write_text(
+            json.dumps({'summary': {
+                'actor_experiment_valid': True, 'iters': 461,
+                'best_p3_iter': 261,
+            }}), encoding='utf-8')
+        assert _source_freeze_cert_valid(str(_ckpt))
+        assert not _source_freeze_cert_valid('')
+        # P130 live blob (source VALID). P132 is uncertified.
+        _p130 = str(_P(__file__).resolve().parents[1].joinpath(
+            'output/test_sim/run_p130_actorecon/best.pt'))
+        _p132 = str(_P(__file__).resolve().parents[1].joinpath(
+            'output/test_sim/run_p132_limcost/final.pt'))
+        if _P(_p130).is_file():
+            assert _source_freeze_cert_valid(_p130)
+        if _P(_p132).is_file():
+            assert not _source_freeze_cert_valid(_p132)
     print('[smoke] OK  #12b observer_from_ckpt freeze-transfer path')
+    print('[smoke] OK  #12c source freeze certificate')
 
 
 def _test_buffer_clear() -> None:
