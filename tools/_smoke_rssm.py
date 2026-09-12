@@ -199,6 +199,9 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
                - float(batch['rew'].mean())) < 1e-5
     assert abs(float(diag_e['critic_rew_to_tgt_var'])
                - float(diag['critic_rew_to_tgt_var'])) > 1e-8
+    # #10: actor return_mean tracks econ λ (S frozen so this is ret, not S).
+    assert abs(float(diag_e['realsim_return_mean'])
+               - float(diag['realsim_return_mean'])) > 1e-8
     assert 'critic_mc_loss' in diag, sorted(diag)
     assert 'critic_pred_target_r' in diag, sorted(diag)
     assert 'critic_target_v_r' in diag, sorted(diag)
@@ -2593,16 +2596,17 @@ def _test_isolation_dcv_scales() -> None:
     assert '_h2d_keys = None' not in _src
     assert '_replay_h2d_keys(False, True)' in _src
     assert '_replay_h2d_keys(False, True, False)' in _src
-    # #8: critic twohot on reversal-free econ; actor λ on hunt.
-    # #8b: calib + econ bound ref on raw_reward; S stays on hunt.
-    # #10 flips `adv_raw` / `update_return_scale` to ret_econ (mode 3 only).
+    # #8: critic twohot on reversal-free econ.
+    # #8b: calib + econ bound ref on raw_reward.
+    # #10: actor λ + S on the same econ stream; hunt λ deleted.
     assert 'onpol_buf._rew_econ_source' in _src
     assert 'buf._rew_econ_source' in _src
     assert 'ret_econ = _lambda_returns' in _src
-    assert 'ret_hunt = _lambda_returns' in _src
-    assert 'adv_raw = ret_hunt - v_pred' in _src
-    assert 'update_return_scale(\n            ret_hunt,' in _src
-    assert "'realsim_return_mean': ret_hunt.mean().detach()" in _src
+    assert 'ret_hunt = _lambda_returns' not in _src
+    assert 'adv_raw = ret_econ - v_pred' in _src
+    assert 'adv_raw = ret_hunt - v_pred' not in _src
+    assert 'update_return_scale(\n            ret_econ,' in _src
+    assert "'realsim_return_mean': ret_econ.mean().detach()" in _src
     assert "keys.append('rew_econ')" in _src
     _rb = _P(_tr.__file__).resolve().parents[1].joinpath(
         'evaluation/residual_board.py').read_text()
@@ -2629,7 +2633,7 @@ def _test_isolation_dcv_scales() -> None:
     # ~10–11 bins, not the ~18 two-sided span. Adaptive clip still keys
     # off scale-path `twohot_active_bins`; retargeting onto bound bins
     # would trip `<10` — a second mechanism. Do not change that gate
-    # while P129 is live / as part of #10.
+    # as part of #10 / #11.
     _raw = _np.linspace(-347.89, 0.7317, 3000)
     _mapped = _np.clip(_raw * (3.0 / 305.11), -3.0, 3.0)
     _bound_span = _twohot_coverage_from_mapped(_mapped)

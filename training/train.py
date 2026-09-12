@@ -10479,9 +10479,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     gamma = float(cfg.gamma)
     lam = float(cfg.gae_lambda)
     _ret_cap = _adaptive_return_cap(cfg)
-    # #8: critic twohot on reversal-free econ; actor λ + S on hunt.
+    # #8/#10: critic twohot on reversal-free econ; actor λ + S on the
+    # same econ stream (DreamerV3 A=(R−V)/S). Hunt λ deleted.
     ret_econ = _lambda_returns(rew_econ, v_slow, gamma, lam, _ret_cap)
-    ret_hunt = _lambda_returns(rew, v_slow, gamma, lam, _ret_cap)
 
     # ----- CRITIC loss (twohot CE): ON-POLICY (advantage accuracy) + replay -----
     # p06 RCA (2026-07-10): the p05 buffer-split trained the critic ONLY on the
@@ -10552,9 +10552,9 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # ``critic_min_v(target=False)``; expectation is already ``no_grad``).
     with torch.no_grad():
         v_pred = v_pred_flat.reshape(B, T)
-        adv_raw = ret_hunt - v_pred
+        adv_raw = ret_econ - v_pred
         scale = model.update_return_scale(
-            ret_hunt,
+            ret_econ,
             abs_cap=float(getattr(cfg, 'return_scale_abs_cap', 500.0)),
             freeze=bool(freeze_return_scale),
         ).clamp_min(1.0)
@@ -10605,9 +10605,8 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     actor_loss = actor_pg - ent_coef * entropy.mean() + bc_term
 
     # ----- diagnostics (real-sim; imag/PMPO jsonl keys removed) -----
-    # #8: critic canaries on the econ stream; ``realsim_reward_mean``
-    # stays on hunt (actor stream). ``update_return_scale`` KEEP on hunt λ
-    # until #10 flips both A and S to ``ret_econ``.
+    # #8/#10: critic canaries and actor S on the econ stream;
+    # ``realsim_reward_mean`` stays on hunt (jsonl).
     with torch.no_grad():
         rew_var = rew_econ.var().clamp_min(1e-8)
         tgt_var = ret_econ.float().var().clamp_min(1e-8)
@@ -10625,7 +10624,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'actor_loss': actor_loss,
         'critic_loss': critic_loss,
         'entropy_mean': entropy.mean().detach(),
-        'realsim_return_mean': ret_hunt.mean().detach(),
+        'realsim_return_mean': ret_econ.mean().detach(),
         'realsim_reward_mean': rew.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
         'adv_global_std': adv_raw.std().detach(),
