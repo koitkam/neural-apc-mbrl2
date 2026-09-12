@@ -1594,6 +1594,9 @@ def _test_cv_limit_entry_cost() -> None:
         np.array([86.0]), lo, hi, side_hi=True, prev_sign=prev)
     assert c == 1.0  # entered violation
     c, prev = _cv_limit_entry_cost(
+        np.array([86.0]), lo, hi, side_hi=True, prev_sign=prev)
+    assert c == 0.0  # hold-in-viol is not an entry (#13 inverts this)
+    c, prev = _cv_limit_entry_cost(
         np.array([84.0]), lo, hi, side_hi=True, prev_sign=prev)
     assert c == 0.0  # return is free
     c, prev = _cv_limit_entry_cost(
@@ -2653,6 +2656,7 @@ def _test_isolation_dcv_scales() -> None:
     assert "keys.append('rew_orbit')" in _src
     assert 'def pop_episode_rew_orbit' in _src
     assert 'def _cv_limit_entry_cost' in _src
+    assert '(signed > 0.0) & (prev[:n] <= 0.0)' in _src  # #12 entry; #13 deletes this
     _rb = _P(_tr.__file__).resolve().parents[1].joinpath(
         'evaluation/residual_board.py').read_text()
     assert 'def critic_fidelity_pass' in _rb
