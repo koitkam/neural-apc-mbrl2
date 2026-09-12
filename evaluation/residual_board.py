@@ -2,7 +2,8 @@
 
 Scores the product (smooth CV on the economic limit, faithful observer,
 unmeasured-load rejection) — not VALID 9/9 / GAIN-READY / all_pass.
-``smooth_pass`` is CV d2/reversal only; ``mv_reversal`` is diagnostic.
+``smooth_pass`` is worst-seed CV d2 AND reversal AND limit-orbit;
+``mv_reversal`` is diagnostic.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import numpy as np
 CV_D2_RMS_MAX = 0.05
 CV_REVERSAL_MAX = 0.25
 CV_RETURN_HEADROOM_BAND = 0.10
-# Parked #11 gate (not in smooth_pass). Crossings of y_econ per identified τ.
+# #11 gate: crossings of y_econ per identified τ (in smooth_pass).
 CV_LIMIT_ORBIT_MAX = 0.15
 # Pearson r is scale-invariant (P127 r=+0.318 with slope 289 / V−81 vs G−15318).
 # Order-1 same-sign slope: [0.25, 4] ≈ |log10(s)| ≲ 0.6.
@@ -131,10 +132,14 @@ def _mean_finite(xs: List[float]) -> float:
     return float(np.mean(np.asarray(vals, dtype='float64')))
 
 
-def cv_smooth_pass(worst_d2: float, worst_rev: float) -> bool:
+def cv_smooth_pass(worst_d2: float, worst_rev: float,
+                   worst_orbit: float = 0.0) -> bool:
+    """d2 + reversal + limit-orbit. Missing orbit defaults to 0 (slow-ride)."""
     return bool(np.isfinite(worst_d2) and np.isfinite(worst_rev)
+                and np.isfinite(worst_orbit)
                 and worst_d2 <= CV_D2_RMS_MAX
-                and worst_rev <= CV_REVERSAL_MAX)
+                and worst_rev <= CV_REVERSAL_MAX
+                and worst_orbit <= CV_LIMIT_ORBIT_MAX)
 
 
 def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
@@ -234,16 +239,17 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
         'cv_limit_orbit_rate_max': CV_LIMIT_ORBIT_MAX,
         'cv_opt_headroom_mean': _mean_finite(heads),
         'cv_viol_frac_mean': _mean_finite(viols),
-        'smooth_pass': cv_smooth_pass(worst_d2, worst_rev),
+        'smooth_pass': cv_smooth_pass(worst_d2, worst_rev, worst_orbit),
         'smooth_pass_rule': (
             f'worst-seed cv_d2_rms_normed<={CV_D2_RMS_MAX} AND '
-            f'cv_reversal_rate<={CV_REVERSAL_MAX} (not mv_reversal; '
-            f'cv_limit_orbit_rate is diagnostic until #11)'),
+            f'cv_reversal_rate<={CV_REVERSAL_MAX} AND '
+            f'cv_limit_orbit_rate<={CV_LIMIT_ORBIT_MAX} '
+            f'(not mv_reversal; #11 limorbit)'),
         'orbit_note': (
             'cv_limit_orbit_rate = (CV−y_econ) sign-changes × (τ/sr) / T '
-            '(crossings per identified τ). Diagnostic only; not a gate. '
+            '(crossings per identified τ). In smooth_pass as of #11. '
             '1τ-window ≥2 frac FALSIFIED on P125 hunt (period ~2τ). '
-            f'Parked #11 threshold {CV_LIMIT_ORBIT_MAX} /τ.'),
+            f'Threshold {CV_LIMIT_ORBIT_MAX} /τ. Slow ride / mid-band ≈0.'),
         'mv_reversal_rate_observed': _f(
             ((summary.get('fidelity_gates') or {}).get(
                 'mv_reversal_rate_observed'))),
@@ -305,8 +311,8 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
         },
         'note': (
             'R1 = observer TM (ss + @H + curve_iae, MV and DV) and 1step→OL. '
-            'R2 = CV smoothness (d2/reversal) and limit hugging/viol; '
-            'cv_limit_orbit_rate is diagnostic (not a gate). '
+            'R2 = CV smoothness (d2/reversal/orbit) and limit hugging/viol; '
+            'cv_limit_orbit_rate is in smooth_pass (#11). '
             'R3 = Kalman det_r + pred_std vs true and DR return-to-limit. '
             'Critic: critic_pass = r≥0.3 AND slope_g_on_v in [0.25, 4] on '
             'matched training units (bound-shaped econ; g_raw_mean is '

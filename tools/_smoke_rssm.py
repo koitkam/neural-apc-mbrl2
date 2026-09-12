@@ -202,6 +202,18 @@ def main(obs_dim: int = 6, action_dim: int = 2, label: str = 'default',
     # #10: actor return_mean tracks econ λ (S frozen so this is ret, not S).
     assert abs(float(diag_e['realsim_return_mean'])
                - float(diag['realsim_return_mean'])) > 1e-8
+    # #12: limit-entry aux moves actor only; critic / ret_econ stay.
+    batch_orb = dict(batch)
+    batch_orb['rew_orbit'] = torch.ones_like(batch['rew'])
+    diag_o = _realsim_actor_critic_step(model, batch_orb, cfg,
+                                       freeze_return_scale=True)
+    assert abs(float(diag_o['realsim_return_mean'])
+               - float(diag['realsim_return_mean'])) < 1e-4
+    assert abs(float(diag_o['critic_rew_to_tgt_var'])
+               - float(diag['critic_rew_to_tgt_var'])) < 1e-4
+    assert abs(float(diag_o['actor_loss']) - float(diag['actor_loss'])) > 1e-8
+    assert float(diag_o['actor_orbit_ret_mean']) > 0.05
+    assert abs(float(diag.get('actor_orbit_ret_mean', 0.0))) < 1e-5
     assert 'critic_mc_loss' in diag, sorted(diag)
     assert 'critic_pred_target_r' in diag, sorted(diag)
     assert 'critic_target_v_r' in diag, sorted(diag)
@@ -1418,11 +1430,11 @@ def _test_time_unbind_and_p1_h2d_keys() -> None:
     assert _wm_need_dist_head_loss(m, c) is False
     assert _p1_wm_h2d_keys(_wm_need_dist_target(m, c)) == ('obs', 'act')
     assert _replay_h2d_keys(False, True) == (
-        'obs', 'act', 'rew', 'rew_econ', 'expert')
+        'obs', 'act', 'rew', 'rew_econ', 'rew_orbit', 'expert')
     assert _replay_h2d_keys(False, True, False) == (
-        'obs', 'act', 'rew', 'rew_econ')
+        'obs', 'act', 'rew', 'rew_econ', 'rew_orbit')
     assert _replay_h2d_keys(True, True) == (
-        'obs', 'act', 'dist', 'rew', 'rew_econ', 'expert')
+        'obs', 'act', 'dist', 'rew', 'rew_econ', 'rew_orbit', 'expert')
     m.dynamics.dob_active = True
     assert _wm_need_dist_target(m, c) is True
     assert 'dist' in _p1_wm_h2d_keys(True)
@@ -1557,11 +1569,41 @@ def _test_rew_econ_split() -> None:
     unbound = TrajectoryBuffer(2, T, D, A, n_dist=0)
     unbound.add_episode(obs, act, hunt, cont)
     got_u = unbound.sample(1, T, np.random.default_rng(1),
-                           keys=('rew', 'rew_econ'))
+                           keys=('rew', 'rew_econ', 'rew_orbit'))
     assert np.allclose(got_u['rew_econ'][0], hunt)
-    assert _replay_h2d_keys(False, True, False)[-1] == 'rew_econ'
+    assert np.allclose(got_u['rew_orbit'][0], 0.0)
+    got_z = buf.sample(1, T, np.random.default_rng(2),
+                       keys=('rew_orbit',))
+    assert np.allclose(got_z['rew_orbit'][0], 0.0)
+    assert _replay_h2d_keys(False, True, False)[-1] == 'rew_orbit'
     assert 'rew_econ' in _replay_h2d_keys(False, True)
+    assert 'rew_orbit' in _replay_h2d_keys(False, True)
     print('[smoke] OK  #8 rew_econ copy-not-clear + unbound fallback')
+
+
+def _test_cv_limit_entry_cost() -> None:
+    """#12: hi-side entry costs 1; return-to-limit is free; deadband ride 0."""
+    import numpy as np
+    from training.train import _cv_limit_entry_cost
+    lo, hi = np.array([78.5]), np.array([85.5])
+    prev = np.zeros(1)
+    c, prev = _cv_limit_entry_cost(
+        np.array([84.0]), lo, hi, side_hi=True, prev_sign=prev)
+    assert c == 0.0  # still feasible (below hi)
+    c, prev = _cv_limit_entry_cost(
+        np.array([86.0]), lo, hi, side_hi=True, prev_sign=prev)
+    assert c == 1.0  # entered violation
+    c, prev = _cv_limit_entry_cost(
+        np.array([84.0]), lo, hi, side_hi=True, prev_sign=prev)
+    assert c == 0.0  # return is free
+    c, prev = _cv_limit_entry_cost(
+        np.array([85.5]), lo, hi, side_hi=True, prev_sign=prev)
+    assert c == 0.0  # deadband on the limit
+    prev = np.zeros(1)
+    c, prev = _cv_limit_entry_cost(
+        np.array([77.0]), lo, hi, side_hi=False, prev_sign=prev)
+    assert c == 1.0  # lo-side entry
+    print('[smoke] OK  #12 cv_limit_entry_cost entry-only')
 
 
 def _test_buffer_clear() -> None:
@@ -2603,11 +2645,14 @@ def _test_isolation_dcv_scales() -> None:
     assert 'buf._rew_econ_source' in _src
     assert 'ret_econ = _lambda_returns' in _src
     assert 'ret_hunt = _lambda_returns' not in _src
-    assert 'adv_raw = ret_econ - v_pred' in _src
+    assert 'adv_raw = ret_econ - v_pred - ret_orbit' in _src
     assert 'adv_raw = ret_hunt - v_pred' not in _src
     assert 'update_return_scale(\n            ret_econ,' in _src
     assert "'realsim_return_mean': ret_econ.mean().detach()" in _src
     assert "keys.append('rew_econ')" in _src
+    assert "keys.append('rew_orbit')" in _src
+    assert 'def pop_episode_rew_orbit' in _src
+    assert 'def _cv_limit_entry_cost' in _src
     _rb = _P(_tr.__file__).resolve().parents[1].joinpath(
         'evaluation/residual_board.py').read_text()
     assert 'def critic_fidelity_pass' in _rb
@@ -3511,7 +3556,7 @@ def _test_pin_eval_modules() -> None:
 def _test_control_quality_gates() -> None:
     """Empty scripted pairs must not 0-vs-0 pass (P49 false all_pass).
 
-    ``smooth_pass`` is CV d2/reversal, not mv_reversal (MV chatter allowed).
+    ``smooth_pass`` is CV d2/reversal/orbit, not mv_reversal (MV chatter allowed).
     """
     from evaluation.validate import control_quality_gates
     empty = control_quality_gates([])
@@ -3567,6 +3612,18 @@ def _test_control_quality_gates() -> None:
     }])
     assert worse['beats_baseline_pass'] is False
     assert worse['smooth_pass'] is True
+    hunt_orbit = control_quality_gates([{
+        'episode_metrics_agent': {
+            'mv_reversal_rate': 0.1,
+            'economic_score': -50.0,
+            'cv_d2_rms_normed': 0.02,
+            'cv_reversal_rate': 0.12,
+            'cv_limit_orbit_rate': 0.80,
+        },
+        'episode_metrics_baseline': {'economic_score': -90.0},
+    }])
+    assert hunt_orbit['beats_baseline_pass'] is True
+    assert hunt_orbit['smooth_pass'] is False
     print('[smoke] OK  control_quality_gates CV-smooth; empty records do not 0-vs-0 pass')
 
 
@@ -3614,8 +3671,8 @@ def _test_residual_board_cv_metrics() -> None:
     assert float(m['cv_d2_rms_normed']) <= 0.05
     assert float(m['cv_reversal_rate']) <= 0.25
     assert float(m['cv_limit_orbit_rate']) == 0.0
-    # Limit-orbit diagnostic (crossings / τ): slow ride → 0; through-limit
-    # sine → ~2; mid-band sine (never crosses y_econ) → 0. NOT a smooth_pass input.
+    # Limit-orbit (#11): slow ride → 0 and PASS; through-limit sine → FAIL
+    # smooth_pass; mid-band sine (never crosses y_econ) → 0 so d2/rev decide.
     T_or = 200
     lo_o, hi_o = 78.5, 85.5
     t = np.arange(T_or, dtype='float64')
@@ -3630,10 +3687,18 @@ def _test_residual_board_cv_metrics() -> None:
     m_ride = compute_episode_metrics(ep_ride)
     assert float(m_ride['cv_orbit_window_steps']) == 14
     assert float(m_ride['cv_limit_orbit_rate']) < 0.05
+    assert cv_smooth_pass(
+        float(m_ride['cv_d2_rms_normed']),
+        float(m_ride['cv_reversal_rate']),
+        float(m_ride['cv_limit_orbit_rate'])) is True
     sine = hi_o + 0.4 * np.sin(2.0 * np.pi * t / 14.0)
     ep_orb = dict(ep_ride, states=sine.astype('float32').reshape(T_or, 1))
     m_orb = compute_episode_metrics(ep_orb)
     assert float(m_orb['cv_limit_orbit_rate']) > 1.5
+    assert cv_smooth_pass(
+        float(m_orb['cv_d2_rms_normed']),
+        float(m_orb['cv_reversal_rate']),
+        float(m_orb['cv_limit_orbit_rate'])) is False
     mid = 82.0 + 0.4 * np.sin(2.0 * np.pi * t / 14.0)
     ep_mid = dict(ep_ride, states=mid.astype('float32').reshape(T_or, 1))
     m_mid = compute_episode_metrics(ep_mid)
@@ -3651,6 +3716,8 @@ def _test_residual_board_cv_metrics() -> None:
     assert 0.15 < iae < 0.25
     assert cv_smooth_pass(0.01, 0.10) is True
     assert cv_smooth_pass(0.20, 0.10) is False
+    assert cv_smooth_pass(0.01, 0.10, 0.80) is False
+    assert cv_smooth_pass(0.01, 0.10, 0.05) is True
     board = build_residual_board(Path('/tmp/no-such-val-dir'), summary={
         'fidelity_gates': {'beats_baseline_pass': True, 'agent_economic_score': -8.0},
         'disturbance_rejection': [{
@@ -3678,9 +3745,9 @@ def _test_residual_board_cv_metrics() -> None:
             'per_channel': [{'pred_std': 7.1, 'true_std': 3.1}],
         },
     })
-    assert board['r2']['smooth_pass'] is True
+    assert board['r2']['smooth_pass'] is False
     assert abs(board['r2']['cv_limit_orbit_rate_worst_seed'] - 0.80) < 1e-9
-    assert 'cv_smooth_pass(worst_d2, worst_rev)' in open(
+    assert 'cv_smooth_pass(worst_d2, worst_rev,' in open(
         'evaluation/residual_board.py').read()
     assert 'cv_limit_orbit_rate' in open('evaluation/validate.py').read()
     assert 'def _cv_limit_orbit_rate' in open('evaluation/validate.py').read()
@@ -7524,6 +7591,7 @@ if __name__ == '__main__':
     _test_lambda_returns_scan()
     _test_buffer_sample_keys()
     _test_rew_econ_split()
+    _test_cv_limit_entry_cost()
     _test_buffer_clear()
     _test_store_aux_feats_identity()
     _test_prior_cv_recon_reverted()

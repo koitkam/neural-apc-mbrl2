@@ -228,20 +228,29 @@ def _finite_floats(vals: List[object]) -> List[float]:
     return out
 
 
-def _cv_smooth_from_rows(d2s: List[object], revs: List[object]) -> Dict:
-    """Worst-seed CV d2/reversal. ``mv_reversal`` is diagnostic only."""
+def _cv_smooth_from_rows(
+    d2s: List[object],
+    revs: List[object],
+    orbits: Optional[List[object]] = None,
+) -> Dict:
+    """Worst-seed CV d2/reversal/orbit. ``mv_reversal`` is diagnostic only."""
     from evaluation.residual_board import (
-        CV_D2_RMS_MAX, CV_REVERSAL_MAX, cv_smooth_pass)
+        CV_D2_RMS_MAX, CV_REVERSAL_MAX, CV_LIMIT_ORBIT_MAX, cv_smooth_pass)
     d2_f = _finite_floats(d2s)
     rev_f = _finite_floats(revs)
+    orbit_f = _finite_floats(orbits or [])
     worst_d2 = float(np.max(d2_f)) if d2_f else float('nan')
     worst_rev = float(np.max(rev_f)) if rev_f else float('nan')
+    # Missing orbit → 0 (slow-ride / pre-#11 records). Present hunt fails.
+    worst_orbit = float(np.max(orbit_f)) if orbit_f else 0.0
     return {
         'cv_d2_rms_normed_max': CV_D2_RMS_MAX,
         'cv_reversal_rate_max': CV_REVERSAL_MAX,
+        'cv_limit_orbit_rate_max': CV_LIMIT_ORBIT_MAX,
         'cv_d2_rms_normed_worst_seed': worst_d2,
         'cv_reversal_rate_worst_seed': worst_rev,
-        'smooth_pass': cv_smooth_pass(worst_d2, worst_rev),
+        'cv_limit_orbit_rate_worst_seed': worst_orbit,
+        'smooth_pass': cv_smooth_pass(worst_d2, worst_rev, worst_orbit),
     }
 
 
@@ -258,7 +267,8 @@ def control_quality_gates(
     ``beats_baseline``.
 
     ``smooth_pass`` is worst-seed ``cv_d2_rms_normed`` ≤ 0.05 AND
-    ``cv_reversal_rate`` ≤ 0.25. MV reversal is logged, never a gate.
+    ``cv_reversal_rate`` ≤ 0.25 AND ``cv_limit_orbit_rate`` ≤ 0.15.
+    MV reversal is logged, never a gate.
     """
     _dr = list(disturbance_records or [])
     out: Dict = {
@@ -269,6 +279,7 @@ def control_quality_gates(
         econs: List[float] = []
         d2s: List[object] = []
         cv_revs: List[object] = []
+        orbits: List[object] = []
         if seed_metrics:
             mv_revs = [float(r.get('kpi_mv_reversal_rate', 0.0))
                        for r in seed_metrics]
@@ -276,6 +287,9 @@ def control_quality_gates(
                      for r in seed_metrics]
             d2s = [r.get('kpi_cv_d2_rms_normed') for r in seed_metrics]
             cv_revs = [r.get('kpi_cv_reversal_rate') for r in seed_metrics]
+            orbits = [r.get('kpi_cv_limit_orbit_rate',
+                            r.get('kpi_cv_limit_orbit_frac', 0.0))
+                      for r in seed_metrics]
         rev_mean = float(np.mean(mv_revs)) if mv_revs else float('nan')
         agent_econ = float(np.mean(econs)) if econs else float('nan')
         out.update({
@@ -285,7 +299,7 @@ def control_quality_gates(
             'beats_baseline_pass': False,
             'control_gate_skipped': 'no_scripted_disturbance_pairs',
         })
-        out.update(_cv_smooth_from_rows(d2s, cv_revs))
+        out.update(_cv_smooth_from_rows(d2s, cv_revs, orbits))
         return out
     _mv_rev = [float((r.get('episode_metrics_agent') or {}).get(
         'mv_reversal_rate', 0.0)) for r in _dr]
@@ -300,13 +314,17 @@ def control_quality_gates(
            for r in _dr]
     cv_revs = [(r.get('episode_metrics_agent') or {}).get('cv_reversal_rate')
                for r in _dr]
+    orbits = [(r.get('episode_metrics_agent') or {}).get(
+        'cv_limit_orbit_rate',
+        (r.get('episode_metrics_agent') or {}).get('cv_limit_orbit_frac', 0.0))
+        for r in _dr]
     out.update({
         'mv_reversal_rate_observed': rev_mean,
         'agent_economic_score': agent_econ,
         'baseline_economic_score': base_econ,
         'beats_baseline_pass': bool(agent_econ >= base_econ),
     })
-    out.update(_cv_smooth_from_rows(d2s, cv_revs))
+    out.update(_cv_smooth_from_rows(d2s, cv_revs, orbits))
     return out
 
 
@@ -863,8 +881,8 @@ def _cv_limit_orbit_rate(col: np.ndarray, lo: float, hi: float, side: str,
     ≥2 sign changes) missed P125 seed 10004 (0.049 < parked 0.15) because
     the hunt period is ~2τ. Overlapping-window fractions also smear a
     single overshoot; this rate does not. Mid-band oscillation never
-    crosses ``y_econ`` → 0 (headroom, not this metric). Diagnostic only
-    until #11; not part of ``smooth_pass``.
+    crosses ``y_econ`` → 0 (headroom, not this metric). In ``smooth_pass``
+    as of #11 (threshold ``CV_LIMIT_ORBIT_MAX``).
     """
     y = np.asarray(col, dtype='float64').reshape(-1)
     w = int(window)
@@ -2480,7 +2498,10 @@ def run_validation(*,
                           f' (max {fidelity_gates.get("cv_d2_rms_normed_max", 0.05):.3f}) '
                           f'reversal='
                           f'{fidelity_gates.get("cv_reversal_rate_worst_seed", float("nan")):.3f}'
-                          f' (max {fidelity_gates.get("cv_reversal_rate_max", 0.25):.2f})'
+                          f' (max {fidelity_gates.get("cv_reversal_rate_max", 0.25):.2f}) '
+                          f'orbit='
+                          f'{fidelity_gates.get("cv_limit_orbit_rate_worst_seed", float("nan")):.3f}'
+                          f' (max {fidelity_gates.get("cv_limit_orbit_rate_max", 0.15):.2f})'
                           ' — MV reversal is diagnostic only',
                           flush=True)
                 if not fidelity_gates.get('beats_baseline_pass', True):
@@ -2759,6 +2780,7 @@ def run_validation(*,
               f'lever={r1.get("dominant_lever")}; '
               f'R2 d2={_fmt_f(r2.get("cv_d2_rms_normed_worst_seed"))} '
               f'rev={_fmt_f(r2.get("cv_reversal_rate_worst_seed"))} '
+              f'orbit={_fmt_f(r2.get("cv_limit_orbit_rate_worst_seed"))} '
               f'head={_fmt_f(r2.get("cv_opt_headroom_mean"))} '
               f'viol_frac={_fmt_f(r2.get("cv_viol_frac_mean"))} '
               f'smooth={r2.get("smooth_pass")}; '

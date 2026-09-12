@@ -2390,6 +2390,38 @@ def _runtime_setpoint_config_from_cfg(cfg) -> RuntimeSetpointConfig:
     )
 
 
+def _cv_limit_entry_cost(cv, lo, hi, *, side_hi: bool, prev_sign):
+    """Per-step cost of *entering* the far side of ``y_econ``.
+
+    Same deadband as val ``_cv_limit_orbit_rate`` (1e-3·width). Counts
+    violation **entry** only — a return from the far side back onto the
+    limit is free (R3). ``prev_sign`` is last nonzero sign per CV
+    (−1/0/+1); the updated copy is returned. Mean over CVs (SISO = 0/1).
+    """
+    y = np.asarray(cv, dtype='float64').reshape(-1)
+    lo_a = np.asarray(lo, dtype='float64').reshape(-1)
+    hi_a = np.asarray(hi, dtype='float64').reshape(-1)
+    prev = np.asarray(prev_sign, dtype='float64').reshape(-1)
+    n = int(min(y.size, lo_a.size, hi_a.size, prev.size))
+    if n <= 0:
+        return 0.0, np.asarray(prev_sign, dtype='float64').copy()
+    rng = np.maximum(1e-9, hi_a[:n] - lo_a[:n])
+    y_econ = hi_a[:n] if side_hi else lo_a[:n]
+    err = y[:n] - y_econ
+    signed = np.where(np.abs(err) > (1e-3 * rng), np.sign(err), 0.0)
+    if side_hi:
+        entered = (signed > 0.0) & (prev[:n] <= 0.0)
+    else:
+        entered = (signed < 0.0) & (prev[:n] >= 0.0)
+    cost = float(np.mean(entered.astype('float64')))
+    new_sign = prev[:n].copy()
+    nz = signed != 0.0
+    new_sign[nz] = signed[nz]
+    out = np.asarray(prev_sign, dtype='float64').copy()
+    out[:n] = new_sign
+    return cost, out
+
+
 class APCEnv:
     """Slim env wrapper around the carryover simulator.
 
@@ -2583,6 +2615,10 @@ class APCEnv:
         # P3 ``buf.add`` then ``onpol_buf.add`` of the same episode both
         # see it.
         self._rew_econ_trace: List[float] = []
+        # #12: per-step y_econ *entry* cost (not in paired econ / critic).
+        self._rew_orbit_trace: List[float] = []
+        self._orbit_err_sign = np.zeros(n_cv_rev, dtype='float64')
+        self._mv_cv_gain_sign: float = 0.0
 
         # ---- Raw-reward clipping (P37 onward, 2026-05-22) ---------------
         # The objective's quadratic violation tail can produce
@@ -3062,6 +3098,9 @@ class APCEnv:
         # Fresh per-episode trace for the WM disturbance-estimator head target.
         self._hidden_disturbance_trace = []
         self._rew_econ_trace = []
+        self._rew_orbit_trace = []
+        self._orbit_err_sign = np.zeros(len(self.cv_indices), dtype='float64')
+        self._refresh_mv_cv_gain_sign()
         obs_vec = self._build_obs_vec(state)
         self._window = np.tile(obs_vec, (self.cfg.lookback, 1)).astype('float32')
         return self._window.copy()
@@ -3098,6 +3137,32 @@ class APCEnv:
         if arr.shape[0] < T:
             return None
         return arr[:T].copy()
+
+    def pop_episode_rew_orbit(self, T: int) -> Optional[np.ndarray]:
+        """Copy the #12 limit-entry cost trace (copy-not-clear, like econ)."""
+        trace = getattr(self, '_rew_orbit_trace', None)
+        T = int(T)
+        if not trace:
+            return None
+        arr = np.asarray(trace, dtype='float32').reshape(-1)
+        if arr.shape[0] < T:
+            return None
+        return arr[:T].copy()
+
+    def _refresh_mv_cv_gain_sign(self) -> None:
+        """Cache signed SysID MV→CV gain (same source as val ``mv_cv_gain_sign``)."""
+        try:
+            raw = _load_dynamics_identification_raw(self.cfg)
+            acc = _ident_amp_over_delta(raw)
+            ks = [float(v) for (it, _, _), vals in acc.items()
+                  if str(it).lower() == 'mv'
+                  for v in vals if abs(float(v)) > 1e-12]
+            if ks:
+                self._mv_cv_gain_sign = float(np.median(np.asarray(ks)))
+                return
+        except Exception:
+            pass
+        self._mv_cv_gain_sign = float(getattr(self, '_mv_cv_gain_sign', 0.0) or 0.0)
 
     def _shaping_potential(self, state: np.ndarray) -> float:
         """Dense shaping potential Φ(s) for reward shaping.
@@ -3381,6 +3446,28 @@ class APCEnv:
             self._rew_econ_trace = []
             econ_trace = self._rew_econ_trace
         econ_trace.append(float(reward_econ))
+        try:
+            cv_now = np.asarray(next_state, dtype='float64').reshape(-1)[
+                self.cv_indices]
+        except Exception:
+            cv_now = np.zeros(len(self.cv_indices), dtype='float64')
+        try:
+            _b = np.asarray(self.setpoint_mgr.current_cv_bounds,
+                            dtype='float64').reshape(-1, 2)
+            _lo_b, _hi_b = _b[:, 0], _b[:, 1]
+        except Exception:
+            _lo_b = np.asarray(self.cv_bounds_eu[:, 0], dtype='float64')
+            _hi_b = np.asarray(self.cv_bounds_eu[:, 1], dtype='float64')
+        _g = float(getattr(self, '_mv_cv_gain_sign', 0.0) or 0.0)
+        _orbit_cost, self._orbit_err_sign = _cv_limit_entry_cost(
+            cv_now, _lo_b, _hi_b, side_hi=(_g < 0.0),
+            prev_sign=getattr(self, '_orbit_err_sign',
+                              np.zeros(len(self.cv_indices))))
+        _otrace = getattr(self, '_rew_orbit_trace', None)
+        if _otrace is None:
+            self._rew_orbit_trace = []
+            _otrace = self._rew_orbit_trace
+        _otrace.append(float(_orbit_cost))
         # Val / #8b calib: unshaped reversal-free raw. Hunt sat stays
         # on ``raw_hunt`` (actor λ + S). Bound-shaped econ is the
         # critic training stream (``reward_econ_train``).
@@ -4450,9 +4537,10 @@ def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
     dob-ground).  P3 observer re-encodes from ``obs`` so ``dist`` stays
     off.      ``rew`` when MTP or P3 AC is in the graph.  ``expert`` follows
     ``need_rew_expert`` unless ``need_expert`` overrides: P3 on-policy
-    actor uses ``obs/act/rew/rew_econ`` (``expert_bc_p3_loss`` reads the
+    actor uses ``obs/act/rew/rew_econ/rew_orbit`` (``expert_bc_p3_loss`` reads the
     critic replay slot).  #8: ``rew_econ`` immediately after ``rew``
-    whenever ``need_rew_expert``. Do **not** add it to P1 WM keys.
+    whenever ``need_rew_expert``. #12: ``rew_orbit`` after that (actor aux;
+    missing → zeros). Do **not** add them to P1 WM keys.
     """
     keys: List[str] = ['obs', 'act']
     if need_dist:
@@ -4460,6 +4548,7 @@ def _replay_h2d_keys(need_dist: bool, need_rew_expert: bool,
     if need_rew_expert:
         keys.append('rew')
         keys.append('rew_econ')
+        keys.append('rew_orbit')
         if need_expert is None or need_expert:
             keys.append('expert')
     elif need_expert:
@@ -5313,6 +5402,8 @@ class TrajectoryBuffer:
         # zeros.
         self.rew_econ = np.zeros((capacity_eps, self.T), dtype='float32')
         self._rew_econ_source = None
+        # #12: limit-entry cost. Missing pop → zeros (P130 identity), never hunt.
+        self.rew_orbit = np.zeros((capacity_eps, self.T), dtype='float32')
         self.filled = 0
         self.write = 0
 
@@ -5362,6 +5453,22 @@ class TrajectoryBuffer:
                 self.rew_econ[i] = self.rew[i]
         else:
             self.rew_econ[i] = self.rew[i]
+        orbit = None
+        if self._rew_econ_source is not None:
+            try:
+                _pop_o = getattr(self._rew_econ_source, 'pop_episode_rew_orbit', None)
+                if callable(_pop_o):
+                    orbit = _pop_o(self.T)
+            except Exception:
+                orbit = None
+        if orbit is not None:
+            o = np.asarray(orbit, dtype='float32').reshape(-1)
+            if o.shape == (self.T,):
+                self.rew_orbit[i] = o
+            else:
+                self.rew_orbit[i] = 0.0
+        else:
+            self.rew_orbit[i] = 0.0
         self.write = (self.write + 1) % self.capacity_eps
         self.filled = min(self.filled + 1, self.capacity_eps)
 
@@ -5404,6 +5511,8 @@ class TrajectoryBuffer:
             out['rew'] = self.rew[ep, t_idx]
         if want is None or 'rew_econ' in want:
             out['rew_econ'] = self.rew_econ[ep, t_idx]
+        if want is None or 'rew_orbit' in want:
+            out['rew_orbit'] = self.rew_orbit[ep, t_idx]
         if want is None or 'cont' in want:
             out['cont'] = self.cont[ep, t_idx]
         if want is None or 'expert' in want:
@@ -10482,6 +10591,15 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # #8/#10: critic twohot on reversal-free econ; actor λ + S on the
     # same econ stream (DreamerV3 A=(R−V)/S). Hunt λ deleted.
     ret_econ = _lambda_returns(rew_econ, v_slow, gamma, lam, _ret_cap)
+    _rew_o = batch.get('rew_orbit')
+    if _rew_o is None:
+        rew_orbit = torch.zeros_like(rew_econ)
+    else:
+        rew_orbit = _rew_o.float() if torch.is_tensor(_rew_o) else torch.zeros_like(rew_econ)
+    # #12: actor-only λ of limit-entry cost. Bootstrap 0 (not V_econ).
+    # S stays on ret_econ (#10). Critic stays on rew_econ (paired econ).
+    ret_orbit = _lambda_returns(
+        rew_orbit, torch.zeros_like(v_slow), gamma, lam, _ret_cap)
 
     # ----- CRITIC loss (twohot CE): ON-POLICY (advantage accuracy) + replay -----
     # p06 RCA (2026-07-10): the p05 buffer-split trained the critic ONLY on the
@@ -10552,7 +10670,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
     # ``critic_min_v(target=False)``; expectation is already ``no_grad``).
     with torch.no_grad():
         v_pred = v_pred_flat.reshape(B, T)
-        adv_raw = ret_econ - v_pred
+        adv_raw = ret_econ - v_pred - ret_orbit
         scale = model.update_return_scale(
             ret_econ,
             abs_cap=float(getattr(cfg, 'return_scale_abs_cap', 500.0)),
@@ -10626,6 +10744,7 @@ def _realsim_actor_critic_step(model: DreamerV4, batch: Dict[str, torch.Tensor],
         'entropy_mean': entropy.mean().detach(),
         'realsim_return_mean': ret_econ.mean().detach(),
         'realsim_reward_mean': rew.mean().detach(),
+        'actor_orbit_ret_mean': ret_orbit.mean().detach(),
         'adv_std_mean': adv_raw.std(dim=1).mean().detach(),
         'adv_global_std': adv_raw.std().detach(),
         'return_scale': scale.detach().squeeze(),
