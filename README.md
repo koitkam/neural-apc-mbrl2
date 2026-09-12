@@ -545,7 +545,7 @@ this table in sync whenever a default changes.
 | Knob | Default | Role | Override | Origin |
 |---|---|---|---|---|
 | `bound_training_reward` | `True` | clip per-step training reward to `[-B, B]` after scale-invariant remap (`raw·B/ref`); `info['raw_reward']` stays unshaped for validation | `DREAMER_BOUND_TRAINING_REWARD` | Cursor stabilizer #1 (P73/P77) |
-| `bound_training_reward_max` (`B`) | `6.0` | the bound `B`; dimensionless because `ref` cancels econ magnitude | `DREAMER_BOUND_TRAINING_REWARD_MAX` | P77 (under test at `B=3`, P79) |
+| `bound_training_reward_max` (`B`) | `3.0` | the bound `B`; dimensionless because `ref` cancels econ magnitude. p103 FALSIFIED B=6. Do **not** N+1 B (#8c is unbounded econ CE). | `DREAMER_BOUND_TRAINING_REWARD_MAX` | P77; p117 promote 3.0 |
 | `bound_training_reward_ref` (`ref`) | `50.0` | econ-derived adaptive clip used to normalize raw reward before bounding | — | P77 |
 | `return_scale_abs_cap` | `500.0` | absolute hard cap on the percentile return_scale EMA (`0` disables); prevents the return-normalization runaway that froze the actor | `DREAMER_RETURN_SCALE_ABS_CAP` | Cursor stabilizer #2 (P79) |
 | `advantage_clip` | `8.0` | clamp normalized advantage to `±clip` before the actor loss | `DREAMER_ADVANTAGE_CLIP` | Cursor stabilizer #3 (P74) |

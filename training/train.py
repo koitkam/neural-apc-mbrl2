@@ -624,8 +624,9 @@ class TrainConfig:
     # P77: B for the scale-invariant linear remap
     # ``reward = clip(raw * B/reward_clip_ref, -B, B)``.  Raised 1.0→6.0 so
     # the per-step reward spans ~12 twohot bins (head resolution) while
-    # imagined returns stay bounded ~B·H (cascade-safe).  See env.step.
+    # λ-returns stay bounded ~B·H (cascade-safe).  See env.step.
     # Default 3.0 = p117 curriculum-recipe (promoted 2026-06-14; was 6.0).
+    # Do not N+1 B (#8c is unbounded econ CE if P129 slope still ≫1).
     bound_training_reward_max: float = 3.0
     # Fallback ``reward_clip_ref`` when objective_runtime does not expose
     # one (older comps / degenerate weights); matches the adaptive-clip floor.
@@ -2627,7 +2628,7 @@ class APCEnv:
 
         # ---- P73/P77 : bounded training reward --------------------------
         # When enabled, the per-step TRAINING reward is mapped into [-B, B]
-        # (``reward_scale`` bypassed) so imagined returns stay bounded and
+        # (``reward_scale`` bypassed) so λ-returns stay bounded and
         # the return_scale percentile cannot run away (cascade root-cause
         # fix).  ``info['raw_reward']`` stays unshaped (no Ng F) for val
         # scoring and is reversal-free as of #8. #8b: calib + econ bound
@@ -11917,6 +11918,47 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
     return raw_rewards, obs_trace
 
 
+def _twohot_coverage_from_mapped(mapped) -> Dict[str, float]:
+    """Twohot bin occupancy of already-mapped per-step rewards (pre-symlog).
+
+    Hafner twohot support is ``symlog`` of the target on ``[-20, 20]``
+    (255 bins). Pass the values the critic CE actually sees: scale-path
+    ``raw * reward_scale`` when bounding is off, or bound-path
+    ``clip(raw * B/ref, -B, B)`` when ``bound_training_reward`` is on.
+    Scale-path occupancy is unused for the critic while bounding is on
+    (P129 ``twohot_active_bins=43`` vs bound ±3 → ``symlog(3)≈1.39``).
+    """
+    mapped = np.asarray(mapped, dtype='float64').reshape(-1)
+    if mapped.size == 0:
+        return {
+            'active_bins': 0.0, 'top1_mass': 0.0,
+            'sym_min': 0.0, 'sym_max': 0.0, 'sym_mag': 0.0,
+            'mapped_min': 0.0, 'mapped_max': 0.0,
+        }
+    bin_centers = np.linspace(-20.0, 20.0, 255)
+    sym = np.sign(mapped) * np.log1p(np.abs(mapped))
+    idx = np.clip(np.searchsorted(bin_centers, sym, side='left'), 1, 254)
+    left = idx - 1
+    right = idx
+    wr = np.clip((sym - bin_centers[left]) /
+                  np.maximum(bin_centers[right] - bin_centers[left], 1e-8),
+                  0.0, 1.0)
+    wl = 1.0 - wr
+    mass = np.zeros(255, dtype='float64')
+    np.add.at(mass, left, wl)
+    np.add.at(mass, right, wr)
+    mass_frac = mass / max(mass.sum(), 1e-12)
+    return {
+        'active_bins': float((mass_frac > 1e-3).sum()),
+        'top1_mass': float(mass_frac.max()),
+        'sym_min': float(sym.min()),
+        'sym_max': float(sym.max()),
+        'sym_mag': float(max(abs(float(sym.min())), abs(float(sym.max())))),
+        'mapped_min': float(mapped.min()),
+        'mapped_max': float(mapped.max()),
+    }
+
+
 def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
                             n_steps: int = 3000,
                             target_std: float = 1.0,
@@ -12107,32 +12149,30 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     raw_max = float(arr.max())
     scaled_min = raw_min * scale
     scaled_max = raw_max * scale
-    def _symlog(x: float) -> float:
-        return float(np.sign(x) * np.log1p(abs(x)))
-    sym_min = _symlog(scaled_min)
-    sym_max = _symlog(scaled_max)
-    sym_mag = max(abs(sym_min), abs(sym_max))
+    # Scale-path occupancy (``raw * reward_scale``). Unused by the
+    # critic while ``bound_training_reward`` is on — adaptive clip still
+    # keys off these fields (do not retarget that gate while P129 is
+    # live; would be a second mechanism on #10). Bound-path fields
+    # below are the critic-relevant diagnostic.
+    scale_cov = _twohot_coverage_from_mapped(arr * scale)
+    sym_min = float(scale_cov['sym_min'])
+    sym_max = float(scale_cov['sym_max'])
+    sym_mag = float(scale_cov['sym_mag'])
     twohot_warn = sym_mag > (target_sym_mag + 1.0)
     twohot_critical = sym_mag > 15.0
-    # Bin-coverage diagnostic (root-cause fix 2026-05-19): how many
-    # twohot bins receive non-trivial mass under the chosen scale.
-    # If top-1 bin holds >80% of mass, the head cannot discriminate
-    # operating-region states and critic learning will collapse.
-    bin_centers = np.linspace(-20.0, 20.0, 255)
-    sym_scaled = np.sign(arr * scale) * np.log1p(np.abs(arr * scale))
-    idx = np.clip(np.searchsorted(bin_centers, sym_scaled, side='left'), 1, 254)
-    left = idx - 1
-    right = idx
-    wr = np.clip((sym_scaled - bin_centers[left]) /
-                  np.maximum(bin_centers[right] - bin_centers[left], 1e-8),
-                  0.0, 1.0)
-    wl = 1.0 - wr
-    mass = np.zeros(255, dtype='float64')
-    np.add.at(mass, left, wl); np.add.at(mass, right, wr)
-    mass_frac = mass / max(mass.sum(), 1e-12)
-    active_bins = int((mass_frac > 1e-3).sum())
-    top1_mass = float(mass_frac.max())
+    active_bins = int(scale_cov['active_bins'])
+    top1_mass = float(scale_cov['top1_mass'])
     bin_coverage_critical = top1_mass > 0.80
+    bound_on = bool(getattr(env, '_bound_reward', False))
+    if bound_on:
+        b_cov = float(getattr(env, '_bound_reward_max', 3.0) or 3.0)
+        ref_cov = float(getattr(env, '_bound_econ_ref', 0.0) or 0.0)
+        if not np.isfinite(ref_cov) or ref_cov <= 1e-9:
+            ref_cov = float(getattr(env, '_bound_reward_ref', 50.0) or 50.0)
+        bound_mapped = np.clip(arr * (b_cov / ref_cov), -b_cov, b_cov)
+        bound_cov = _twohot_coverage_from_mapped(bound_mapped)
+    else:
+        bound_cov = scale_cov
     return {
         'reward_scale': scale, 'reward_scale_unclamped': scale_unclamped,
         'bound_econ_ref': float(getattr(env, '_bound_econ_ref', 0.0) or 0.0),
@@ -12164,6 +12204,14 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
         'twohot_active_bins': active_bins,
         'twohot_top1_mass': top1_mass,
         'twohot_bin_coverage_critical': bool(bin_coverage_critical),
+        'twohot_bound_active_bins': int(bound_cov['active_bins']),
+        'twohot_bound_top1_mass': float(bound_cov['top1_mass']),
+        'twohot_bound_symlog_min': float(bound_cov['sym_min']),
+        'twohot_bound_symlog_max': float(bound_cov['sym_max']),
+        'twohot_bound_symlog_mag': float(bound_cov['sym_mag']),
+        'twohot_bound_mapped_min': float(bound_cov['mapped_min']),
+        'twohot_bound_mapped_max': float(bound_cov['mapped_max']),
+        'twohot_bound_path': bool(bound_on),
         'min_scale': float(min_scale), 'max_scale': float(max_scale),
         'n_steps': int(n_steps),
         'mode': mode,

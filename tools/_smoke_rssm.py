@@ -2613,6 +2613,19 @@ def _test_isolation_dcv_scales() -> None:
     assert "info.get('raw_hunt', info.get('raw_reward'" not in _src
     assert 'self._bound_econ_ref' in _src
     assert "'bound_econ_ref'" in _src
+    assert 'def _twohot_coverage_from_mapped' in _src
+    assert "'twohot_bound_active_bins'" in _src
+    assert "'twohot_bound_path'" in _src
+    from training.train import _twohot_coverage_from_mapped
+    import numpy as _np
+    _bound = _twohot_coverage_from_mapped(
+        _np.array([-3.0, -0.69, 0.0, 0.007, 3.0]))
+    _scale = _twohot_coverage_from_mapped(
+        _np.array([-402.0, -70.0, 0.0, 0.85]))
+    assert _bound['sym_mag'] < 1.5  # symlog(3)≈1.39 of Hafner [-20,20]
+    assert _scale['sym_mag'] > 5.0  # unused scale-path (P129 bins=43)
+    assert abs(_bound['mapped_max'] - 3.0) < 1e-9
+    # toy 4–5 samples do not rank active_bins; occupancy is sym_mag.
     # B default is TrainConfig 3.0 (p117 promote). getattr 6.0 was the
     # pre-promote leftover fallback — unused while cfg is a TrainConfig,
     # still pin so a missing-field path cannot silently resurrect B=6.
