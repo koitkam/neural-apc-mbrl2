@@ -2630,8 +2630,9 @@ class APCEnv:
         # (``reward_scale`` bypassed) so imagined returns stay bounded and
         # the return_scale percentile cannot run away (cascade root-cause
         # fix).  ``info['raw_reward']`` stays unshaped (no Ng F) for val
-        # scoring and is reversal-free as of #8 (``info['raw_hunt']`` is
-        # the hunting sat used by reward calibration).
+        # scoring and is reversal-free as of #8. #8b: calib + econ bound
+        # ref read ``info['raw_reward']`` (hunt sat is ``info['raw_hunt']``;
+        # actor λ + S stay on hunt).
         #
         # P77: the mapping is now a SCALE-INVARIANT LINEAR REMAP
         #   reward = clip(raw * (B / reward_clip_ref), -B, B)
@@ -2656,6 +2657,11 @@ class APCEnv:
         self._bound_reward_ref_fallback: float = float(
             getattr(cfg, 'bound_training_reward_ref', 50.0) or 50.0)
         self._bound_reward_ref: float = self._bound_reward_ref_fallback
+        # #8b: bound remap for the critic's reversal-free stream. 0 = unset
+        # (fall back to hunt ``reward_clip``). Calib on ``raw_reward`` fills
+        # this so milder econ occupies [-B, B] instead of being drowned by
+        # hunt-sat clip (P128 V −2.5 vs raw G −180). Hunt remap unchanged.
+        self._bound_econ_ref: float = 0.0
 
         # ---- Per-dim observation standardizer ---------------------------
         # Running mean/std updated from every raw obs vector seen by the
@@ -3337,19 +3343,25 @@ class APCEnv:
                                     self._bound_reward_max))
             return out
 
-        # Hunting sat (includes cv_reversal). Clip before bound so calib
-        # and the actor see the same tail. Same clip / ref / Ng F on the
-        # reversal-free econ stream (#8).
+        # Hunting sat (includes cv_reversal). Clip before bound so the
+        # actor sees the same tail. Same clip / Ng F; #8b uses a separate
+        # econ bound ref (calib on reversal-free ``raw_reward``) because
+        # hunt ``reward_clip`` as a shared ref drowns milder econ
+        # (``reward_scale`` is bypassed when bounding is on).
         raw_hunt = _clip_raw(float(comps['reward']), warn=True)
         raw_econ = _clip_raw(float(comps.get('reward_econ', comps['reward'])),
                              warn=False)
         if self._bound_reward:
-            ref = float(comps.get('reward_clip', self._bound_reward_ref))
-            if not np.isfinite(ref) or ref <= 1e-9:
-                ref = self._bound_reward_ref_fallback
-            self._bound_reward_ref = ref
+            ref_hunt = float(comps.get('reward_clip', self._bound_reward_ref))
+            if not np.isfinite(ref_hunt) or ref_hunt <= 1e-9:
+                ref_hunt = self._bound_reward_ref_fallback
+            self._bound_reward_ref = ref_hunt
+            ref_econ = float(getattr(self, '_bound_econ_ref', 0.0) or 0.0)
+            if not np.isfinite(ref_econ) or ref_econ <= 1e-9:
+                ref_econ = ref_hunt
         else:
-            ref = 1.0
+            ref_hunt = 1.0
+            ref_econ = 1.0
         shaping = 0.0
         if self._shaping_enabled and self._shaping_coef > 0.0:
             phi_next = self._shaping_potential(next_state)
@@ -3361,15 +3373,16 @@ class APCEnv:
             shaping = self._shaping_coef * (
                 shaping_gamma * phi_next - phi_prev)
             self._prev_potential = phi_next
-        reward = _bound_shape(raw_hunt, ref, shaping)
-        reward_econ = _bound_shape(raw_econ, ref, shaping)
+        reward = _bound_shape(raw_hunt, ref_hunt, shaping)
+        reward_econ = _bound_shape(raw_econ, ref_econ, shaping)
         econ_trace = getattr(self, '_rew_econ_trace', None)
         if econ_trace is None:
             self._rew_econ_trace = []
             econ_trace = self._rew_econ_trace
         econ_trace.append(float(reward_econ))
-        # Val / critic calib: unshaped reversal-free raw. Calib reads
-        # ``raw_hunt`` so a milder econ tail cannot bind hunting sat.
+        # Val / #8b calib: unshaped reversal-free raw. Hunt sat stays
+        # on ``raw_hunt`` (actor λ + S). Bound-shaped econ is the
+        # critic training stream (``reward_econ_train``).
         raw_reward = raw_econ
         self._prev_prev_control = self._prev_control
         self._prev_control = np.asarray(control, dtype='float32')
@@ -3402,6 +3415,7 @@ class APCEnv:
         info = {'reward_components': comps, 't': self._t,
                 'raw_reward': raw_reward,
                 'raw_hunt': raw_hunt,
+                'reward_econ_train': float(reward_econ),
                 'hidden_disturbance': hidden_applied,
                 'raw_state': np.asarray(next_state, dtype='float32').copy()}
         return self._window.copy(), reward, done, info
@@ -11889,7 +11903,10 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
                                 size=(env.action_dim,)).astype('float32')
                 np.clip(a, -1.0, 1.0, out=a)
         obs, _, done, info = env.step(a)
-        raw_rewards.append(float(info.get('raw_hunt', info.get('raw_reward', 0.0))))
+        # #8b: twohot/bound support on reversal-free econ. Hunt sat must
+        # not bind bins (P128 calib raw_min −1035 / p95 964 while val G
+        # was honest −180). Actor S stays on hunt λ.
+        raw_rewards.append(float(info.get('raw_reward', info.get('raw_hunt', 0.0))))
         try:
             obs_trace.append(np.asarray(obs, dtype='float32').copy())
         except Exception:
@@ -12074,6 +12091,12 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     scale_unclamped = scale
     scale = float(np.clip(scale, min_scale, max_scale))
     env.reward_scale = scale
+    # #8b: bound remap uses B/ref and bypasses reward_scale. Hunt
+    # ``reward_clip`` as that ref drowns milder econ (P128). Pin the
+    # econ stream's ref to this calib's |raw| p95 so twohot sees econ
+    # at full [-B, B]. Actor S stays on hunt λ.
+    econ_ref = float(raw_abs_p95_full) if raw_abs_p95_full > 1e-8 else float(p_target_abs)
+    env._bound_econ_ref = float(max(econ_ref, 1e-3))
     # Saturation diagnostic: the V4 twohot support is symlog([-20,+20]).
     # If even a single per-step scaled reward exceeds symlog's mid-band,
     # the head will struggle.  symlog(x)≈18 when |x|≈6.6e7; symlog(x)≈10
@@ -12112,6 +12135,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     bin_coverage_critical = top1_mass > 0.80
     return {
         'reward_scale': scale, 'reward_scale_unclamped': scale_unclamped,
+        'bound_econ_ref': float(getattr(env, '_bound_econ_ref', 0.0) or 0.0),
         'raw_std': std, 'raw_mean': mean,
         'raw_min': raw_min, 'raw_max': raw_max,
         'raw_abs_p95': p_target_abs,
@@ -12497,6 +12521,7 @@ def train(cfg: TrainConfig, on_iter_end=None) -> Dict:
     # Validation builds its own APCEnv instances (evaluation/validate.py)
     # which leave shaping OFF.  Val ``economic_score`` is mean of unshaped
     # reversal-free ``raw_reward`` (#8). Hunting sat is ``info['raw_hunt']``.
+    # #8b: calib + econ bound ref use ``raw_reward``; actor λ + S stay on hunt.
     if float(getattr(cfg, 'reward_shaping_coef', 0.0) or 0.0) > 0.0:
         env._shaping_enabled = True
         print(f"[reward-shaping] potential-based shaping ENABLED on training "

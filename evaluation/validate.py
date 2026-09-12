@@ -82,6 +82,27 @@ def _load_run_plan(controller_dir: Path) -> Dict:
     return {}
 
 
+def _restore_reward_cal(env, controller_dir: Path) -> None:
+    """Copy training calib onto a val env (scale + #8b econ bound ref).
+
+    ``reward_scale`` is unused when ``bound_training_reward`` is on;
+    ``bound_econ_ref`` is the twohot/bound support for reversal-free econ.
+    Hunt remap still uses ``reward_clip``. Missing file → leave defaults.
+    """
+    cal_path = controller_dir / 'reward_calibration.json'
+    if not cal_path.exists():
+        return
+    try:
+        with open(cal_path, 'r') as f:
+            cal = json.load(f)
+        env.reward_scale = float(cal.get('reward_scale', 1.0))
+        eref = cal.get('bound_econ_ref')
+        if eref is not None:
+            env._bound_econ_ref = float(eref)
+    except Exception:
+        env.reward_scale = 1.0
+
+
 def _resolve_sim_dir(arg: str | None, controller_dir: Path,
                       run_plan: Dict) -> Path:
     repo = Path(__file__).resolve().parent.parent
@@ -2128,14 +2149,8 @@ def run_validation(*,
                 )
             except Exception as e:
                 print(f'[val] obs_norm restore skipped: {e!r}', flush=True)
-        # Use the calibrated reward scale from training when available.
-        cal_path = controller_dir / 'reward_calibration.json'
-        if cal_path.exists():
-            try:
-                with open(cal_path, 'r') as f:
-                    env.reward_scale = float(json.load(f).get('reward_scale', 1.0))
-            except Exception:
-                env.reward_scale = 1.0
+        # Use the calibrated reward scale / #8b econ bound ref from training.
+        _restore_reward_cal(env, controller_dir)
 
         per_seed_dir = out_dir / f'seed_{seed:05d}'
         per_seed_dir.mkdir(parents=True, exist_ok=True)
@@ -2353,6 +2368,7 @@ def run_validation(*,
         # WM-fidelity probe: disable hidden OU so the WM is scored on
         # base-plant dynamics, not augmented-system dynamics.
         diag_env._disturbance_prob_override = 0.0
+        _restore_reward_cal(diag_env, controller_dir)
         if obs_norm_state is not None:
             try:
                 diag_env.set_obs_norm_stats(
@@ -2407,6 +2423,7 @@ def run_validation(*,
                 'critic_r_observed': critic_r,
                 'critic_v_mean': cc.get('v_mean'),
                 'critic_g_mean': cc.get('g_mean'),
+                'critic_g_raw_mean': cc.get('g_raw_mean'),
                 'critic_slope_g_on_v': cc.get('slope_g_on_v'),
                 'critic_nmae': cc.get('nmae'),
                 'wm_pass': bool(wm_r1 >= 0.5),

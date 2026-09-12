@@ -2594,6 +2594,7 @@ def _test_isolation_dcv_scales() -> None:
     assert '_replay_h2d_keys(False, True)' in _src
     assert '_replay_h2d_keys(False, True, False)' in _src
     # #8: critic twohot on reversal-free econ; actor λ on hunt.
+    # #8b: calib + econ bound ref on raw_reward; S stays on hunt.
     # #10 flips `adv_raw` / `update_return_scale` to ret_econ (mode 3 only).
     assert 'onpol_buf._rew_econ_source' in _src
     assert 'buf._rew_econ_source' in _src
@@ -2608,6 +2609,19 @@ def _test_isolation_dcv_scales() -> None:
     assert 'def critic_fidelity_pass' in _rb
     assert 'CRITIC_SLOPE_LO' in _rb
     assert "'raw_hunt'" in _src
+    assert "raw_rewards.append(float(info.get('raw_reward'" in _src
+    assert "info.get('raw_hunt', info.get('raw_reward'" not in _src
+    assert 'self._bound_econ_ref' in _src
+    assert "'bound_econ_ref'" in _src
+    assert "'reward_econ_train'" in _src
+    _val = _P(_tr.__file__).resolve().parents[1].joinpath(
+        'evaluation/validate.py').read_text()
+    assert 'def _restore_reward_cal' in _val
+    assert 'bound_econ_ref' in _val
+    _diag = _P(_tr.__file__).resolve().parents[1].joinpath(
+        'evaluation/diagnostics.py').read_text()
+    assert "info.get('reward_econ_train'" in _diag
+    assert 'g_raw_mean' in _diag
     assert 'reward_econ' in _src
     assert 'self.expert[i] = 0.0' in _src
     assert "else np.zeros(self.T, dtype='float32')" not in _src

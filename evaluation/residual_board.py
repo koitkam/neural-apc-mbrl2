@@ -291,6 +291,8 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
             # Scale, not Pearson: P127 r=+0.318 with slope_g_on_v=289 / V−81 vs G−15318.
             'critic_v_mean': _f(cc.get('v_mean', gates.get('critic_v_mean'))),
             'critic_g_mean': _f(cc.get('g_mean', gates.get('critic_g_mean'))),
+            'critic_g_raw_mean': _f(
+                cc.get('g_raw_mean', gates.get('critic_g_raw_mean'))),
             'critic_slope_g_on_v': _f(
                 cc.get('slope_g_on_v', gates.get('critic_slope_g_on_v'))),
             'critic_nmae': _f(cc.get('nmae', gates.get('critic_nmae'))),
@@ -306,7 +308,9 @@ def build_residual_board(out_dir: Path, summary: Optional[Dict] = None
             'R2 = CV smoothness (d2/reversal) and limit hugging/viol; '
             'cv_limit_orbit_rate is diagnostic (not a gate). '
             'R3 = Kalman det_r + pred_std vs true and DR return-to-limit. '
-            'Critic: critic_pass = r≥0.3 AND slope_g_on_v in [0.25, 4]; '
+            'Critic: critic_pass = r≥0.3 AND slope_g_on_v in [0.25, 4] on '
+            'matched training units (bound-shaped econ; g_raw_mean is '
+            'honest-econ RCA, not the gate). '
             'Pearson without slope is not residual-closed. '
             'Do not treat VALID/GAIN-READY/all_pass/family-closed as residual-closed.'
         ),

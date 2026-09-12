@@ -161,6 +161,9 @@ def main() -> int:
     if 'raw_hunt' not in info0:
         print('FAIL: info missing raw_hunt')
         ok = False
+    if 'reward_econ_train' not in info0:
+        print('FAIL: info missing reward_econ_train')
+        ok = False
     if abs(float(info0['raw_reward']) - float(c0['reward_econ'])) > 1e-3:
         print(f'FAIL: raw_reward {info0["raw_reward"]:.4f} != '
               f'reward_econ {c0["reward_econ"]:.4f}')

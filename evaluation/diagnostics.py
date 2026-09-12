@@ -503,29 +503,39 @@ def _critic_calibration(model, env, device, *,
     ow = env.reset(exploration=False)
     real_obs = np.zeros((T, obs_dim), dtype='float32')
     real_rew = np.zeros((T,), dtype='float32')
+    real_rew_raw = np.zeros((T,), dtype='float32')
     real_act = np.zeros((T, action_dim), dtype='float32')
     for t in range(T):
         a = rng.uniform(-1.0, 1.0, size=(action_dim,)).astype('float32')
         ow_next, scaled_r, done, info = env.step(a)
         real_obs[t] = ow_next[-1]
-        real_rew[t] = float(info.get('raw_reward', scaled_r))
+        raw_r = float(info.get('raw_reward', scaled_r))
+        # Matched units: critic trains on bound-shaped econ (#8 / #8b),
+        # not unshaped raw. Raw G is logged separately (honest-econ RCA).
+        real_rew[t] = float(info.get('reward_econ_train', raw_r))
+        real_rew_raw[t] = raw_r
         real_act[t] = a
         if done:
             T = t + 1
             real_obs = real_obs[:T]
             real_rew = real_rew[:T]
+            real_rew_raw = real_rew_raw[:T]
             real_act = real_act[:T]
             break
 
     if T < L + 8:
         return {'error': f'episode too short ({T})'}
 
-    # Discounted return-to-go (use the raw plant reward so calibration
-    # is reported in the same units as the trainer's reward MTP head).
+    # Discounted return-to-go in the critic's training units (bound-shaped
+    # econ after #8b). Raw G is the honest-econ RCA, not the slope gate —
+    # P124/P127/P128 slope ≫1 was B/raw unit mismatch while bound is on.
     G = np.zeros((T,), dtype='float64')
     G[-1] = real_rew[-1]
+    G_raw = np.zeros((T,), dtype='float64')
+    G_raw[-1] = real_rew_raw[-1]
     for t in range(T - 2, -1, -1):
         G[t] = real_rew[t] + gamma * G[t + 1]
+        G_raw[t] = real_rew_raw[t] + gamma * G_raw[t + 1]
 
     d_min = 1.0 / cfg.k_max
     tau_ctx_val = 1.0 - cfg.tau_ctx
@@ -585,6 +595,8 @@ def _critic_calibration(model, env, device, *,
         'v_std': float(v_pred.std()),
         'g_mean': float(g_real.mean()),
         'g_std': float(g_real.std()),
+        'g_raw_mean': float(G_raw[starts].mean()),
+        'g_raw_std': float(G_raw[starts].std()),
         'mae': float(np.mean(np.abs(v_pred - g_real))),
         # Scale-FREE calibration error: MAE normalised by the spread of the
         # realized return (so it is comparable across plants / reward scales).
