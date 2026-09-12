@@ -2613,6 +2613,11 @@ def _test_isolation_dcv_scales() -> None:
     assert "info.get('raw_hunt', info.get('raw_reward'" not in _src
     assert 'self._bound_econ_ref' in _src
     assert "'bound_econ_ref'" in _src
+    # B default is TrainConfig 3.0 (p117 promote). getattr 6.0 was the
+    # pre-promote leftover fallback — unused while cfg is a TrainConfig,
+    # still pin so a missing-field path cannot silently resurrect B=6.
+    assert "getattr(cfg, 'bound_training_reward_max', 3.0)" in _src
+    assert "getattr(cfg, 'bound_training_reward_max', 6.0)" not in _src
     assert "'reward_econ_train'" in _src
     _val = _P(_tr.__file__).resolve().parents[1].joinpath(
         'evaluation/validate.py').read_text()

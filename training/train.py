@@ -2650,7 +2650,7 @@ class APCEnv:
         self._bound_reward: bool = bool(
             getattr(cfg, 'bound_training_reward', False))
         self._bound_reward_max: float = float(
-            getattr(cfg, 'bound_training_reward_max', 6.0) or 6.0)
+            getattr(cfg, 'bound_training_reward_max', 3.0) or 3.0)
         # Fallback reward_clip_ref when a comps dict lacks the field (older
         # objective_runtime / degenerate weights).  Matches the historical
         # adaptive-clip floor so small-weight sims behave sensibly.
