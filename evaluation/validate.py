@@ -821,6 +821,10 @@ def _cv_econ_side(ep: Dict, cv_row: int) -> str:
     ``cv_side_scale`` is a safety urgency (high-side more expensive to
     violate), not the economic riding bound. Signed SysID MV→CV gain
     is the causal direction: less MV moves CV toward −sign(G).
+
+    ``cv_row`` is unused while ``mv_cv_gain_sign`` is a **scalar**
+    (test_sim SISO identity). Distillation mixed-sign MIMO must index a
+    per-CV vector — GOAL_PLAN #14; do not land that while P132 is live.
     """
     try:
         g = float(ep.get('mv_cv_gain_sign', 0.0) or 0.0)

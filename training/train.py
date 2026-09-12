@@ -3150,7 +3150,11 @@ class APCEnv:
         return arr[:T].copy()
 
     def _refresh_mv_cv_gain_sign(self) -> None:
-        """Cache signed SysID MV→CV gain (same source as val ``mv_cv_gain_sign``)."""
+        """Cache signed SysID MV→CV gain (same source as val ``mv_cv_gain_sign``).
+
+        Median of **all** MV→CV repeats (scalar). SISO identity. MIMO
+        mixed-sign median is one wrong global side — GOAL_PLAN #14.
+        """
         try:
             raw = _load_dynamics_identification_raw(self.cfg)
             acc = _ident_amp_over_delta(raw)
