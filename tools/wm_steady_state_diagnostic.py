@@ -28,8 +28,10 @@ final-step (steady-state) error vs. simulator ground truth, and a
 "converged" flag (true if obs std over the last 20 steps < ε).
 
 GPU/CPU selection: auto-detects GPU utilization via ``nvidia-smi`` and
-falls back to CPU if utilization >50% or memory_used/total >0.5. Can
-be forced with ``DREAMER_WM_DIAG_DEVICE={cpu,cuda}``.
+falls back to CPU if utilization >50% or memory_used/total >0.5. Train
+passes ``TrainConfig.wm_diag_device`` (default ``cuda``; A/B
+``DREAMER_WM_DIAG_DEVICE`` via ``ENV_OVERRIDES``). CLI still honours
+the env when ``--device`` / ``forced`` is omitted.
 
 CLI::
 
@@ -53,9 +55,10 @@ import math
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -102,12 +105,20 @@ def _gpu_busy(util_threshold_pct: float = 50.0,
     return bool(busy), reason
 
 
-def _pick_device() -> Tuple[torch.device, str]:
-    """Honour ``DREAMER_WM_DIAG_DEVICE`` override; else auto-detect."""
-    forced = os.environ.get('DREAMER_WM_DIAG_DEVICE', '').strip().lower()
-    if forced in ('cpu',):
+def _pick_device(forced: Optional[str] = None) -> Tuple[torch.device, str]:
+    """Pick cuda/cpu. Explicit ``forced`` (TrainConfig) beats leftover env.
+
+    Train passes ``cfg.wm_diag_device`` so login leftover
+    ``DREAMER_WM_DIAG_DEVICE`` cannot beat the bound cfg (P114-live;
+    same class as P113 compile dual-read). CLI with ``forced=None``
+    still honours the env, then nvidia-smi auto.
+    """
+    raw = ('' if forced is None else str(forced)).strip().lower()
+    if not raw:
+        raw = os.environ.get('DREAMER_WM_DIAG_DEVICE', '').strip().lower()
+    if raw in ('cpu',):
         return torch.device('cpu'), 'forced_cpu'
-    if forced in ('cuda', 'gpu'):
+    if raw in ('cuda', 'gpu'):
         if not torch.cuda.is_available():
             return torch.device('cpu'), 'forced_cuda_unavailable_fallback_cpu'
         return torch.device('cuda'), 'forced_cuda'
@@ -145,63 +156,16 @@ def _find_ckpt(run_dir: Path, ckpt_name: Optional[str] = None) -> Path:
 def _load_model(ckpt_path: Path, device: torch.device):
     """Load DreamerV4 model + cfg from a checkpoint."""
     from training.train import TrainConfig
-    from models.dreamer_v4 import DreamerV4, DreamerV4Config
+    from models.dreamer_v4 import DreamerV4, dreamer_v4_config_from_train
 
     ckpt_obj = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     cfg_dict = ckpt_obj.get('cfg') or {}
     valid_keys = set(TrainConfig.__dataclass_fields__.keys())
     cfg = TrainConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 
-    model_cfg = DreamerV4Config(
-        obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
-        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
-        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
-        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
-        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
-        n_action_bins=cfg.n_action_bins,
-        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
-        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
-        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
-        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
-        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
-        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
-        world_model_type=str(getattr(cfg, 'world_model_type', 'sf_transformer')),
-        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
-        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
-        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
-        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
-        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
-        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
-        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
-        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
-        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
-        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
-        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
-        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
-        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
-        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
-        # dv_feedforward changes feat_dim (DV in the head feat); thread it so a
-        # non-default reload matches the checkpoint structure.
-        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        # Neural Kalman filter / DOB (2026-06-11): thread so the rebuilt model
-        # has the d_t observer params (else load_state_dict fails on DOB keys).
-        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
-        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
-        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
-        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
-        # Continuous gain+disturbance latent (2026-06-22): thread so the rebuilt
-        # model has the cont prior/post nets + latent params (else the strict
-        # load_state_dict fails on the cont keys).
-        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
-        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
-        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
-        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
-        # 'sdpa' is significantly faster on CPU than 'manual' (uses torch's
-        # fused scaled_dot_product_attention which has a vectorised CPU path).
-        attn_impl='sdpa',
-    )
-    model = DreamerV4(model_cfg).to(device)
+    # 'sdpa' is significantly faster on CPU than 'manual' (fused SDPA).
+    model = DreamerV4(
+        dreamer_v4_config_from_train(cfg, attn_impl='sdpa')).to(device)
     sd = ckpt_obj['model']
     if any('._orig_mod.' in k for k in sd):
         sd = {k.replace('._orig_mod.', '.'): v for k, v in sd.items()}
@@ -353,6 +317,75 @@ def _convergence_stats(traj: np.ndarray, tail_frac: float = 0.2,
     }
 
 
+def _env_randomizer(env):
+    """DomainRandomizer on the sim or the inner unwrapped sim."""
+    sim = getattr(env, 'sim', None)
+    rd = getattr(sim, '_randomizer', None) if sim is not None else None
+    if rd is None and sim is not None:
+        inner = getattr(sim, '_sim', None)
+        if inner is not None:
+            rd = getattr(inner, '_randomizer', None)
+    return rd
+
+
+def _snapshot_env_noise(env) -> dict:
+    """Capture live-env stochastic sources ``_quiet_env`` mutates."""
+    snap: dict = {}
+    sim = getattr(env, 'sim', None)
+    if sim is not None:
+        if hasattr(sim, '_ou_sources'):
+            snap['ou'] = list(sim._ou_sources)
+        if hasattr(sim, '_meas_noise'):
+            snap['meas'] = list(sim._meas_noise)
+        if hasattr(sim, '_has_noise'):
+            snap['has_noise'] = bool(sim._has_noise)
+        if hasattr(sim, '_noise_scale'):
+            snap['noise_scale'] = float(sim._noise_scale)
+    rd = _env_randomizer(env)
+    if rd is not None:
+        snap['rd'] = rd
+        if hasattr(rd, 'enabled'):
+            snap['rd_enabled'] = bool(rd.enabled)
+        if hasattr(rd, 'frac'):
+            snap['rd_frac'] = float(rd.frac)
+    for attr in ('_disturbance_prob_override', '_hidden_disturbance_force',
+                 '_hidden_disturbance'):
+        if hasattr(env, attr):
+            snap[attr] = getattr(env, attr)
+    return snap
+
+
+def _restore_env_noise(env, snap: dict) -> None:
+    """Undo ``_quiet_env`` on the live training env (P113)."""
+    if not snap:
+        return
+    sim = getattr(env, 'sim', None)
+    if sim is not None:
+        if 'ou' in snap and hasattr(sim, '_ou_sources'):
+            sim._ou_sources = list(snap['ou'])
+        if 'meas' in snap and hasattr(sim, '_meas_noise'):
+            sim._meas_noise = list(snap['meas'])
+        if 'has_noise' in snap and hasattr(sim, '_has_noise'):
+            sim._has_noise = bool(snap['has_noise'])
+        if 'noise_scale' in snap and hasattr(sim, 'set_noise_scale'):
+            try:
+                sim.set_noise_scale(float(snap['noise_scale']))
+            except Exception:
+                sim._noise_scale = float(snap['noise_scale'])
+        elif 'noise_scale' in snap and hasattr(sim, '_noise_scale'):
+            sim._noise_scale = float(snap['noise_scale'])
+    rd = snap.get('rd')
+    if rd is not None:
+        if 'rd_enabled' in snap:
+            rd.enabled = bool(snap['rd_enabled'])
+        if 'rd_frac' in snap:
+            rd.frac = float(snap['rd_frac'])
+    for attr in ('_disturbance_prob_override', '_hidden_disturbance_force',
+                 '_hidden_disturbance'):
+        if attr in snap:
+            setattr(env, attr, snap[attr])
+
+
 def _quiet_env(env) -> None:
     """Disable all stochastic sources on a constructed APCEnv in-place.
 
@@ -369,6 +402,15 @@ def _quiet_env(env) -> None:
     must additionally clear ``env._schedule = []`` after every
     ``env.reset()`` (see ``_run_protocol``) because ``reset()`` rebuilds
     the schedule from the curriculum.
+
+    Mutates ``env`` in place.  Also zeros ``rd.frac`` (not only
+    ``rd.enabled``).  Wrapper ``reset`` / ``apply_runtime_knobs`` /
+    ``set_noise_scale`` do not rebuild emptied ``_ou_sources`` /
+    ``_meas_noise``, and P3 ``set_domain_randomization(True)`` preserves
+    frac so a zeroed frac is a no-op.  Training call sites that share
+    the live env must use ``scoped_quiet_env`` (P113): rest-IC collect,
+    GAIN-READY TM, and posterior-prior decomp.  Fresh diagnostic envs
+    (this file's CLI) may keep the one-way mutate.
     """
     sim = env.sim
     # Wipe OU + measurement noise channels on the SimNoiseWrapper.
@@ -378,15 +420,7 @@ def _quiet_env(env) -> None:
         sim._meas_noise = []
     if hasattr(sim, '_has_noise'):
         sim._has_noise = False
-    # Disable domain randomization so plant tau / gain stay at base.
-    rd = getattr(sim, '_randomizer', None)
-    if rd is None:
-        # SimNoiseWrapper proxies most attribute access to the inner sim;
-        # try the inner sim explicitly in case the wrapper does not
-        # surface ``_randomizer`` directly.
-        inner = getattr(sim, '_sim', None)
-        if inner is not None:
-            rd = getattr(inner, '_randomizer', None)
+    rd = _env_randomizer(env)
     if rd is not None and hasattr(rd, 'frac'):
         rd.enabled = False
         rd.frac = 0.0
@@ -398,6 +432,21 @@ def _quiet_env(env) -> None:
         env._hidden_disturbance_force = False
     if hasattr(env, '_hidden_disturbance'):
         env._hidden_disturbance = None
+
+
+@contextmanager
+def scoped_quiet_env(env) -> Iterator[None]:
+    """Quiet for a probe, then restore the live training env (P113).
+
+    Nested scopes each snapshot: an inner restore leaves the env quiet;
+    the outermost restore returns inject-noise sources + ``rd.frac``.
+    """
+    snap = _snapshot_env_noise(env)
+    _quiet_env(env)
+    try:
+        yield
+    finally:
+        _restore_env_noise(env, snap)
 
 
 def _run_protocol(env, model, cfg, device: torch.device,
@@ -566,6 +615,7 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
                                      protocols: Optional[Tuple[str, ...]] = None,
                                      noise_free: bool = True,
                                      output_dir: Optional[Path] = None,
+                                     device: Optional[str] = None,
                                      ) -> Dict:
     """Run the diagnostic; write JSON (+ plot if matplotlib available).
 
@@ -583,13 +633,15 @@ def run_wm_steady_state_diagnostic(run_dir: Path,
             (legacy behaviour; results are then a mix of WM extrapolation
             error and stochastic plant variance and should not be read as
             a pure WM-quality metric).
+        device: TrainConfig ``wm_diag_device`` (``cuda`` / ``cpu`` /
+            ``auto``).  None = CLI leftover env then nvidia-smi.
 
     Returns the result dict.
     """
     run_dir = Path(run_dir)
     out_dir = Path(output_dir) if output_dir is not None else run_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    device, dev_reason = _pick_device()
+    device, dev_reason = _pick_device(forced=device)
     ckpt_path = _find_ckpt(run_dir, ckpt_name)
     print(f'[wm-ss-diag] ckpt={ckpt_path.name}  device={device}  ({dev_reason})',
           flush=True)

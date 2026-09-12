@@ -250,9 +250,12 @@ def load_objective_spec() -> Dict[str, Any]:
         _warn_legacy_weights(file_cfg)
         spec = _merge(spec, file_cfg)
 
+    # File / default only.  Leftover ``DREAMER_OBJ_USE_NORMALIZED`` dual-read
+    # ignored (P116-live).  Training A/B is TrainConfig after
+    # ``apply_dreamer_env_overrides``.  Leftover ``OBJ_USE_NORMALIZED``
+    # ignored (P90-live).
     spec['objective_use_normalized'] = 1 if int(_safe_float(
-        os.environ.get('OBJ_USE_NORMALIZED', spec.get('objective_use_normalized', 1)),
-        spec.get('objective_use_normalized', 1),
+        spec.get('objective_use_normalized', 1), 1,
     )) != 0 else 0
 
     return _coerce_spec(spec)

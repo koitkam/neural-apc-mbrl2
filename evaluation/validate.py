@@ -49,6 +49,22 @@ import matplotlib.pyplot as plt
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _fmt_f(x) -> str:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 'nan'
+    return f'{v:.3f}' if np.isfinite(v) else 'nan'
+
+
+def _fmt_x(x) -> str:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 'nan'
+    return f'{v:.3f}' if np.isfinite(v) else 'nan'
+
+
 def _load_run_plan(controller_dir: Path) -> Dict:
     """Look up run_plan.json: in the controller dir, then walk parents.
 
@@ -64,6 +80,27 @@ def _load_run_plan(controller_dir: Path) -> Dict:
         if d.name in ('output', '') or d == d.parent:
             break
     return {}
+
+
+def _restore_reward_cal(env, controller_dir: Path) -> None:
+    """Copy training calib onto a val env (scale + #8b econ bound ref).
+
+    ``reward_scale`` is unused when ``bound_training_reward`` is on;
+    ``bound_econ_ref`` is the twohot/bound support for reversal-free econ.
+    Hunt remap still uses ``reward_clip``. Missing file → leave defaults.
+    """
+    cal_path = controller_dir / 'reward_calibration.json'
+    if not cal_path.exists():
+        return
+    try:
+        with open(cal_path, 'r') as f:
+            cal = json.load(f)
+        env.reward_scale = float(cal.get('reward_scale', 1.0))
+        eref = cal.get('bound_econ_ref')
+        if eref is not None:
+            env._bound_econ_ref = float(eref)
+    except Exception:
+        env.reward_scale = 1.0
 
 
 def _resolve_sim_dir(arg: str | None, controller_dir: Path,
@@ -88,6 +125,83 @@ def _resolve_sim_dir(arg: str | None, controller_dir: Path,
         f'pass --simulation-dir explicitly.')
 
 
+def _ss_gain_rel_errs(pairs: Dict) -> List[float]:
+    """``|wm-real|/|real|`` per pair with a non-tiny real SS gain."""
+    rel_errs: List[float] = []
+    for v in (pairs or {}).values():
+        rg = abs(float(v.get('real_ss_gain', 0.0)))
+        if rg > 1e-6:
+            rel_errs.append(abs(float(v.get('ss_gain_abs_err', 0.0))) / rg)
+    return rel_errs
+
+
+def _merge_observer_gain_gate(gate: Dict, dv_gate: Optional[Dict]) -> Dict:
+    """Keep MV-only ``wm_gain_*`` for lineage; AND DV into observer-wide keys.
+
+    P29 printed ``wm_gain_healthy=True`` at MV rel_err=0.10 while DV ss
+    was ×0.56. ``wm_gain_pass`` stays MV-only. ``wm_observer_gain_*`` is
+    the control-relevant observer verdict (MV and DV both in band).
+    No-DV plants copy the MV flags.
+    """
+    mv_pass = bool(gate.get('wm_gain_pass'))
+    mv_healthy = bool(gate.get('wm_gain_healthy'))
+    if dv_gate:
+        gate['wm_observer_gain_pass'] = (
+            mv_pass and bool(dv_gate.get('wm_dv_gain_pass')))
+        gate['wm_observer_gain_healthy'] = (
+            mv_healthy and bool(dv_gate.get('wm_dv_gain_healthy')))
+    else:
+        gate['wm_observer_gain_pass'] = mv_pass
+        gate['wm_observer_gain_healthy'] = mv_healthy
+    return gate
+
+
+def _gain_status(healthy: bool, passed: bool) -> str:
+    if healthy:
+        return 'HEALTHY'
+    if passed:
+        return 'PASS'
+    return 'FAIL'
+
+
+def _dv_gain_gate_from_json(path: Path) -> Optional[Dict]:
+    """MV-only ``wm_gain_*`` hid P29 DV ss ×0.56 behind HEALTHY MV rel_err.
+
+    Same thresholds as the MV gate (pass <1.0, healthy <0.35). Does **not**
+    change ``wm_gain_pass`` so lineage comparisons stay MV-only.
+    """
+    if not path.exists():
+        return None
+    try:
+        dv = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    pairs = dv.get('pairs') or {}
+    rel_errs = _ss_gain_rel_errs(pairs)
+    if not rel_errs:
+        return None
+    ratios = []
+    for v in pairs.values():
+        r = v.get('ss_gain_ratio_wm_over_real')
+        if r is None:
+            continue
+        rf = float(r)
+        if np.isfinite(rf):
+            ratios.append(rf)
+    mean_err = float(np.mean(rel_errs))
+    gate = {
+        'wm_dv_gain_rel_err': mean_err,
+        'wm_dv_gain_rel_err_max': float(np.max(rel_errs)),
+        'wm_dv_gain_pass': bool(mean_err < 1.0),
+        'wm_dv_gain_healthy': bool(mean_err < 0.35),
+        'n_dv_pairs': len(rel_errs),
+    }
+    if ratios:
+        gate['wm_dv_ss_ratio_worst'] = float(
+            max(ratios, key=lambda r: abs(r - 1.0)))
+    return gate
+
+
 def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
                                   ) -> List[Dict]:
     """Flatten schedule events into ``(start_step, label)`` markers."""
@@ -99,6 +213,118 @@ def _episode_disturbance_markers(schedule: List[Dict], sample_rate: int = 1
             out.append({'start': start, 'label': str(name)})
         except Exception:
             continue
+    return out
+
+
+def _finite_floats(vals: List[object]) -> List[float]:
+    out: List[float] = []
+    for v in vals:
+        try:
+            f = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(f):
+            out.append(f)
+    return out
+
+
+def _cv_smooth_from_rows(
+    d2s: List[object],
+    revs: List[object],
+    orbits: Optional[List[object]] = None,
+) -> Dict:
+    """Worst-seed CV d2/reversal/orbit. ``mv_reversal`` is diagnostic only."""
+    from evaluation.residual_board import (
+        CV_D2_RMS_MAX, CV_REVERSAL_MAX, CV_LIMIT_ORBIT_MAX, cv_smooth_pass)
+    d2_f = _finite_floats(d2s)
+    rev_f = _finite_floats(revs)
+    orbit_f = _finite_floats(orbits or [])
+    worst_d2 = float(np.max(d2_f)) if d2_f else float('nan')
+    worst_rev = float(np.max(rev_f)) if rev_f else float('nan')
+    # Missing orbit → 0 (slow-ride / pre-#11 records). Present hunt fails.
+    worst_orbit = float(np.max(orbit_f)) if orbit_f else 0.0
+    return {
+        'cv_d2_rms_normed_max': CV_D2_RMS_MAX,
+        'cv_reversal_rate_max': CV_REVERSAL_MAX,
+        'cv_limit_orbit_rate_max': CV_LIMIT_ORBIT_MAX,
+        'cv_d2_rms_normed_worst_seed': worst_d2,
+        'cv_reversal_rate_worst_seed': worst_rev,
+        'cv_limit_orbit_rate_worst_seed': worst_orbit,
+        'smooth_pass': cv_smooth_pass(worst_d2, worst_rev, worst_orbit),
+    }
+
+
+def control_quality_gates(
+    disturbance_records: Optional[List[Dict]] = None,
+    seed_metrics: Optional[List[Dict]] = None,
+) -> Dict:
+    """Paired scripted-disturbance agent vs open-loop baseline.
+
+    Empty records must **not** pass (P49: leftover ``cfg=`` TypeError
+    skipped every scripted episode → 0.0 vs 0.0 falsely PASSED
+    ``beats_baseline``).  Seed-episode KPIs have no paired baseline, so
+    they can fill CV-smooth / agent econ for the log but cannot pass
+    ``beats_baseline``.
+
+    ``smooth_pass`` is worst-seed ``cv_d2_rms_normed`` ≤ 0.05 AND
+    ``cv_reversal_rate`` ≤ 0.25 AND ``cv_limit_orbit_rate`` ≤ 0.15.
+    MV reversal is logged, never a gate.
+    """
+    _dr = list(disturbance_records or [])
+    out: Dict = {
+        'n_scripted_pairs': len(_dr),
+    }
+    if not _dr:
+        mv_revs: List[float] = []
+        econs: List[float] = []
+        d2s: List[object] = []
+        cv_revs: List[object] = []
+        orbits: List[object] = []
+        if seed_metrics:
+            mv_revs = [float(r.get('kpi_mv_reversal_rate', 0.0))
+                       for r in seed_metrics]
+            econs = [float(r.get('kpi_economic_score', 0.0))
+                     for r in seed_metrics]
+            d2s = [r.get('kpi_cv_d2_rms_normed') for r in seed_metrics]
+            cv_revs = [r.get('kpi_cv_reversal_rate') for r in seed_metrics]
+            orbits = [r.get('kpi_cv_limit_orbit_rate',
+                            r.get('kpi_cv_limit_orbit_frac', 0.0))
+                      for r in seed_metrics]
+        rev_mean = float(np.mean(mv_revs)) if mv_revs else float('nan')
+        agent_econ = float(np.mean(econs)) if econs else float('nan')
+        out.update({
+            'mv_reversal_rate_observed': rev_mean,
+            'agent_economic_score': agent_econ,
+            'baseline_economic_score': float('nan'),
+            'beats_baseline_pass': False,
+            'control_gate_skipped': 'no_scripted_disturbance_pairs',
+        })
+        out.update(_cv_smooth_from_rows(d2s, cv_revs, orbits))
+        return out
+    _mv_rev = [float((r.get('episode_metrics_agent') or {}).get(
+        'mv_reversal_rate', 0.0)) for r in _dr]
+    _ae = [float((r.get('episode_metrics_agent') or {}).get(
+        'economic_score', 0.0)) for r in _dr]
+    _be = [float((r.get('episode_metrics_baseline') or {}).get(
+        'economic_score', 0.0)) for r in _dr]
+    rev_mean = float(np.mean(_mv_rev)) if _mv_rev else 0.0
+    agent_econ = float(np.mean(_ae)) if _ae else 0.0
+    base_econ = float(np.mean(_be)) if _be else 0.0
+    d2s = [(r.get('episode_metrics_agent') or {}).get('cv_d2_rms_normed')
+           for r in _dr]
+    cv_revs = [(r.get('episode_metrics_agent') or {}).get('cv_reversal_rate')
+               for r in _dr]
+    orbits = [(r.get('episode_metrics_agent') or {}).get(
+        'cv_limit_orbit_rate',
+        (r.get('episode_metrics_agent') or {}).get('cv_limit_orbit_frac', 0.0))
+        for r in _dr]
+    out.update({
+        'mv_reversal_rate_observed': rev_mean,
+        'agent_economic_score': agent_econ,
+        'baseline_economic_score': base_econ,
+        'beats_baseline_pass': bool(agent_econ >= base_econ),
+    })
+    out.update(_cv_smooth_from_rows(d2s, cv_revs, orbits))
     return out
 
 
@@ -189,7 +415,15 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
                     if cv_widths else 10.0)
 
     mv_authority_cv = compute_mv_authority_to_cv(env.sim, id_ctx)
-    authority_frac = get_authority_target_frac()
+    # P49 leftover race: HEAD validate.py passed cfg= while the live pid
+    # still had launch-time get_authority_target_frac(default=) only.
+    # TypeError skipped every scripted-disturbance episode → empty
+    # paired records → 0.0 vs 0.0 falsely PASSED beats_baseline.
+    try:
+        authority_frac = get_authority_target_frac(
+            cfg=getattr(env, 'cfg', None))
+    except TypeError:
+        authority_frac = get_authority_target_frac()
     cumulative_offset: Dict[str, float] = {}
     cumulative_cv_impact = 0.0
 
@@ -240,6 +474,7 @@ def build_scripted_disturbance_schedule(env, *, n_events: int = 0,
                 cumulative_cv_impact=float(cumulative_cv_impact),
                 mv_authority_cv=float(mv_authority_cv),
                 target_frac=float(authority_frac),
+                cfg=getattr(env, 'cfg', None),
             )
             mag = float(new_delta)
             cumulative_cv_impact += float(achieved)
@@ -351,75 +586,100 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
                    if _is_rssm else None)
     _rssm_prev_a = (torch.zeros(1, action_dim, device=device)
                     if _is_rssm else None)
+    _serve_step = None
+    _o = None
+    _o_host = None
+    _get_serve_cg = None
+    if _is_rssm:
+        from models.dreamer_v4_rssm import (
+            alloc_pinned_obs_host, copy_obs_row,
+            stream_serve_step as _serve_step,
+            get_collect_serve_cuda_graph as _get_serve_cg)
+        _o = torch.empty(1, int(obs_window.shape[-1]), device=device,
+                         dtype=torch.float32)
+        _o_host = alloc_pinned_obs_host(device, int(obs_window.shape[-1]))
 
-    for t in range(T):
-        ow = torch.from_numpy(obs_window).to(device)
-        a_ctx = torch.from_numpy(a_history).to(device)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=device.type,
-                                     dtype=torch.bfloat16,
-                                     enabled=(device.type == 'cuda')):
-                if _is_rssm:
-                    _o = torch.from_numpy(
-                        obs_window[-1]).to(device).unsqueeze(0)
-                    _emb = model.dynamics.embed(_o)
-                    # mbrl2 real-sim: certainty-equivalent (posterior MODE) belief
-                    # for control — matches training (``_realsim_actor_critic_step``
-                    # re-encodes sample=False) and ``collect_episode``.  A SAMPLED
-                    # belief here would inject latent-sampling noise into the
-                    # deterministic-eval MV (part of the p01 chatter the user saw
-                    # in the disturbance-rejection plots).
-                    _post, _ = model.dynamics.obs_step(
-                        _rssm_state, _rssm_prev_a, _emb, sample=False)
-                    agent_hid = _post.feat
-                    _rssm_state = _post
+    _use_cuda_amp = (device.type == 'cuda')
+    with torch.inference_mode(), torch.amp.autocast(
+            device_type=device.type, dtype=torch.bfloat16,
+            enabled=_use_cuda_amp):
+        # Reuse the P3 collect graph when present (same bf16 autocast).
+        # CPU / TSSM / capture-fail stay eager. ``copy_`` into static
+        # prev_a (no per-step rebind).
+        _serve_cg = None
+        if _is_rssm and _rssm_state is not None and _get_serve_cg is not None:
+            _serve_cg = _get_serve_cg(
+                model.dynamics, _rssm_state, device,
+                int(obs_window.shape[-1]), int(action_dim))
+            if _serve_cg is not None:
+                _serve_cg.reset(_rssm_state)
+        for t in range(T):
+            if _is_rssm:
+                # Certainty-equivalent belief + the same DV/Kalman feat
+                # ``collect_episode`` / ``_realsim_actor_critic_step`` use.
+                if _serve_cg is not None:
+                    copy_obs_row(_serve_cg.obs, obs_window[-1], _o_host)
+                    agent_hid = _serve_cg.replay()
                 else:
-                    z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
-                    tau = torch.full((1, L), tau_ctx_val, device=device,
-                                      dtype=z_ctx.dtype)
-                    d = torch.full((1, L), d_min, device=device,
-                                    dtype=z_ctx.dtype)
-                    out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
-                    agent_hid = out['agent_hid'][:, -1]
-                action_t, _, _ = model.policy(agent_hid,
-                                                deterministic=deterministic)
-        a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
-        if _is_rssm:
-            _rssm_prev_a = torch.from_numpy(a_np).to(device).unsqueeze(0)
-        next_window, scaled_r, done, info = env.step(a_np)
-        comps = info.get('reward_components', {}) or {}
-        # Record the *raw* (physical-units) state so plots/npz read true
-        # plant values, not the post-standardizer z-scores that the
-        # tokenizer sees.  Falls back to the normalized obs slice if the
-        # env did not expose ``raw_state`` for back-compat.
-        raw_st = info.get('raw_state')
-        if raw_st is None:
-            states[t] = next_window[-1, :state_dim]
-        else:
-            arr = np.asarray(raw_st, dtype='float32').reshape(-1)
-            states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
-        actions_norm[t] = a_np
-        controls[t] = np.asarray(env._prev_control, dtype='float32')
-        raw_rewards[t] = float(info.get('raw_reward', 0.0))
-        scaled_rewards[t] = float(scaled_r)
-        cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
-        mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
-        hd = info.get('hidden_disturbance')
-        if hd is not None:
-            hd = np.asarray(hd, dtype='float32').reshape(-1)
-            hidden_dist_t[t, :min(n_cv_h, hd.shape[0])] = hd[:n_cv_h]
-        if n_mv_aux > 0:
-            current_mv_bounds_t[t] = np.asarray(
-                env.setpoint_mgr.current_mv_bounds, dtype='float32')
-        if n_cv_aux > 0:
-            current_cv_bounds_t[t] = np.asarray(
-                env.setpoint_mgr.current_cv_bounds, dtype='float32')
-            current_cv_targets_t[t] = np.asarray(
-                env.setpoint_mgr.current_cv_targets, dtype='float32')
-        a_history = np.concatenate([a_history[1:], a_np[None, :]], axis=0)
-        obs_window = next_window
-        if done:
-            break
+                    copy_obs_row(_o, obs_window[-1], _o_host)
+                    _rssm_state = _serve_step(
+                        model.dynamics, _rssm_state, _rssm_prev_a, _o,
+                        sample=False)
+                    agent_hid = _rssm_state.feat
+            else:
+                ow = torch.from_numpy(obs_window).to(device)
+                a_ctx = torch.from_numpy(a_history).to(device)
+                z_ctx = model.tokenizer.encode(ow).unsqueeze(0)
+                tau = torch.full((1, L), tau_ctx_val, device=device,
+                                  dtype=z_ctx.dtype)
+                d = torch.full((1, L), d_min, device=device,
+                                dtype=z_ctx.dtype)
+                out = model.dynamics(z_ctx, tau, d, a_ctx.unsqueeze(0))
+                agent_hid = out['agent_hid'][:, -1]
+            action_t, _, _ = model.policy(agent_hid,
+                                            deterministic=deterministic)
+            a_np = action_t.float().squeeze(0).cpu().numpy().astype('float32')
+            if _is_rssm:
+                _prev = (_serve_cg.prev_a if _serve_cg is not None
+                         else _rssm_prev_a)
+                _prev.copy_(
+                    action_t.detach().to(dtype=_prev.dtype).reshape(1, -1))
+            next_window, scaled_r, done, info = env.step(a_np)
+            comps = info.get('reward_components', {}) or {}
+            # Record the *raw* (physical-units) state so plots/npz read true
+            # plant values, not the post-standardizer z-scores that the
+            # tokenizer sees.  Falls back to the normalized obs slice if the
+            # env did not expose ``raw_state`` for back-compat.
+            raw_st = info.get('raw_state')
+            if raw_st is None:
+                states[t] = next_window[-1, :state_dim]
+            else:
+                arr = np.asarray(raw_st, dtype='float32').reshape(-1)
+                states[t, :min(state_dim, arr.shape[0])] = arr[:state_dim]
+            actions_norm[t] = a_np
+            controls[t] = np.asarray(env._prev_control, dtype='float32')
+            raw_rewards[t] = float(info.get('raw_reward', 0.0))
+            scaled_rewards[t] = float(scaled_r)
+            cv_violations[t] = float(comps.get('cv_violation_penalty', 0.0))
+            mv_violations[t] = float(comps.get('mv_violation_penalty', 0.0))
+            hd = info.get('hidden_disturbance')
+            if hd is not None:
+                hd = np.asarray(hd, dtype='float32').reshape(-1)
+                hidden_dist_t[t, :min(n_cv_h, hd.shape[0])] = hd[:n_cv_h]
+            if n_mv_aux > 0:
+                current_mv_bounds_t[t] = np.asarray(
+                    env.setpoint_mgr.current_mv_bounds, dtype='float32')
+            if n_cv_aux > 0:
+                current_cv_bounds_t[t] = np.asarray(
+                    env.setpoint_mgr.current_cv_bounds, dtype='float32')
+                current_cv_targets_t[t] = np.asarray(
+                    env.setpoint_mgr.current_cv_targets, dtype='float32')
+            if not _is_rssm:
+                a_history = np.concatenate(
+                    [a_history[1:], a_np[None, :]], axis=0)
+            obs_window = next_window
+            if done:
+                break
 
     return {
         'states': states[:t + 1],
@@ -456,6 +716,9 @@ def _run_episode_with_window(env, model, device, obs_window, schedule, *,
         'current_cv_targets_t': current_cv_targets_t[:t + 1],
         'hidden_disturbance_t': hidden_dist_t[:t + 1],
         'reward_scale': float(env.reward_scale),
+        'cv_side_scale': _episode_cv_side_scale(env),
+        'mv_cv_gain_sign': _episode_mv_cv_gain_sign(env),
+        'tau_dominant': _episode_tau_dominant(),
     }
 
 
@@ -475,6 +738,170 @@ def _add_disturbance_markers(ax, schedule: List[Dict], color='red', alpha=0.20):
 # ---------------------------------------------------------------------------
 # Episode metrics  (process-control standard, simulator-agnostic)
 # ---------------------------------------------------------------------------
+
+def _episode_cv_side_scale(env) -> List[Dict]:
+    """Per-CV ``{lo, hi}`` urgency from ``obj_spec['cv_side_scale']``."""
+    spec = getattr(env, 'obj_spec', None) or {}
+    raw = spec.get('cv_side_scale') or {}
+    n_cv = len(getattr(env, 'cv_indices', []) or [])
+    out: List[Dict] = []
+    for i in range(n_cv):
+        side = raw.get(f'cv_{i}') or {}
+        try:
+            lo = float(side.get('lo', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            lo = 1.0
+        try:
+            hi = float(side.get('hi', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            hi = 1.0
+        out.append({'lo': lo, 'hi': hi})
+    return out
+
+
+def _bound_lo_hi(b) -> Tuple[Optional[float], Optional[float]]:
+    if isinstance(b, (list, tuple, np.ndarray)) and len(b) >= 2:
+        lo, hi = float(b[0]), float(b[1])
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            return lo, hi
+    return None, None
+
+
+def _sign_reversal_rate(col: np.ndarray, rng: float) -> float:
+    if col.size < 2:
+        return 0.0
+    d = np.diff(np.asarray(col, dtype='float64'))
+    deadband = 1e-3 * max(float(rng), 1e-9)
+    signed = np.where(np.abs(d) > deadband, np.sign(d), 0.0)
+    nz = signed[signed != 0.0]
+    flips = int(np.sum(np.abs(np.diff(nz)) > 1.0)) if nz.size >= 2 else 0
+    return float(flips) / float(max(1, len(d)))
+
+
+def _episode_tau_dominant() -> float:
+    """Identified dominant τ (seconds) for 1τ orbit windows. 0 if unknown."""
+    try:
+        from utils.training_disturbance import _load_identifier_context
+        return float((_load_identifier_context().get('dynamics') or {})
+                     .get('tau_dominant_identified', 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _episode_mv_cv_gain_sign(env) -> float:
+    """Signed median MV→CV gain from SysID (identifier uses abs internally)."""
+    try:
+        from utils.training_disturbance import _load_identifier_context
+        rows = ((_load_identifier_context().get('dynamics') or {})
+                .get('per_pair_estimates') or [])
+    except Exception:
+        rows = []
+    signs: List[float] = []
+    for r in rows:
+        try:
+            if not bool(r.get('valid', False)):
+                continue
+            if str(r.get('input_type', 'mv')).lower() != 'mv':
+                continue
+            d = float(r.get('delta', 0.0))
+            a = float(r.get('amplitude', 0.0))
+            if abs(d) < 1e-8:
+                continue
+            signs.append(a / d)
+        except (TypeError, ValueError):
+            continue
+    if not signs:
+        return 0.0
+    return float(np.median(np.asarray(signs, dtype='float64')))
+
+
+def _cv_econ_side(ep: Dict, cv_row: int) -> str:
+    """Bound to hug when minimizing MV: lo if G>0, hi if G<0.
+
+    ``cv_side_scale`` is a safety urgency (high-side more expensive to
+    violate), not the economic riding bound. Signed SysID MV→CV gain
+    is the causal direction: less MV moves CV toward −sign(G).
+
+    ``cv_row`` is used only in the ``|g|≤1e-12`` ``cv_side_scale``
+    fallback. Distillation mixed-sign |median|≈0.04 skips that and
+    pins **one global side**. Per-CV primary-|K| is GOAL_PLAN #14;
+    do not land that while P132 is live.
+    """
+    try:
+        g = float(ep.get('mv_cv_gain_sign', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        g = 0.0
+    if abs(g) > 1e-12:
+        return 'hi' if g < 0.0 else 'lo'
+    scales = ep.get('cv_side_scale') or []
+    if cv_row < len(scales) and isinstance(scales[cv_row], dict):
+        try:
+            lo = float(scales[cv_row].get('lo', 1.0) or 1.0)
+            hi = float(scales[cv_row].get('hi', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 'lo'
+        if lo > hi * 1.05:
+            return 'hi'
+        return 'lo'
+    return 'lo'
+
+
+def _cv_headroom(y: np.ndarray, lo: float, hi: float, side: str) -> np.ndarray:
+    rng = max(1e-9, float(hi) - float(lo))
+    y = np.asarray(y, dtype='float64')
+    if side == 'hi':
+        return (float(hi) - y) / rng
+    return (y - float(lo)) / rng
+
+
+def _orbit_window_steps(ep: Dict) -> int:
+    """One-τ window in samples (limit-cycle class, not the 5τ event window).
+
+    Derived from identified τ / sample_rate. test_sim τ≈54 sr=4 → 14.
+    Never a test_sim magic default: missing τ falls back to 8 samples.
+    """
+    try:
+        sr = max(1, int(ep.get('sample_rate', 1) or 1))
+    except (TypeError, ValueError):
+        sr = 1
+    tau = 0.0
+    for k in ('tau_dominant', 'tau'):
+        try:
+            tau = float(ep.get(k, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tau = 0.0
+        if tau > 0.0:
+            break
+    if tau > 0.0:
+        return max(8, int(round(tau / float(sr))))
+    return 8
+
+
+def _cv_limit_orbit_rate(col: np.ndarray, lo: float, hi: float, side: str,
+                         window: int) -> float:
+    """Limit-crossing rate: ``n_cross * window / T`` (crossings per identified τ).
+
+    Plant-timescale hunt through ``y_econ`` (P125 seeds 0.34–0.64 /τ) vs a
+    slow ride to the limit (0). The first draft (fraction of 1τ windows with
+    ≥2 sign changes) missed P125 seed 10004 (0.049 < parked 0.15) because
+    the hunt period is ~2τ. Overlapping-window fractions also smear a
+    single overshoot; this rate does not. Mid-band oscillation never
+    crosses ``y_econ`` → 0 (headroom, not this metric). In ``smooth_pass``
+    as of #11 (threshold ``CV_LIMIT_ORBIT_MAX``).
+    """
+    y = np.asarray(col, dtype='float64').reshape(-1)
+    w = int(window)
+    if y.size < 3 or w < 1:
+        return 0.0
+    y_econ = float(hi) if side == 'hi' else float(lo)
+    rng = max(1e-9, float(hi) - float(lo))
+    dead = 1e-3 * rng
+    err = y - y_econ
+    signed = np.where(np.abs(err) > dead, np.sign(err), 0.0)
+    nz = signed[signed != 0.0]
+    n_cross = int(np.sum(np.abs(np.diff(nz)) > 1.0)) if nz.size >= 2 else 0
+    return float(n_cross) * float(w) / float(max(1, y.size))
+
 
 def _cv_active_target(ep: Dict, cv_row: int) -> np.ndarray | None:
     """Per-step target for CV ``cv_row`` if a target is enabled, else None.
@@ -552,22 +979,36 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
     iae_per_cv: List[float] = []
     itae_per_cv: List[float] = []
     ise_per_cv: List[float] = []
+    cv_d2_rms: List[float] = []
+    cv_rev_rates: List[float] = []
+    cv_orbit_rates: List[float] = []
+    cv_headrooms: List[float] = []
+    cv_viol_fracs: List[float] = []
+    econ_sides: List[str] = []
+    orbit_w = _orbit_window_steps(ep)
     for k, cidx in enumerate(cv_idx):
         if cidx >= states.shape[1]:
             continue
+        col = states[:T, cidx].astype('float64')
+        lo, hi = _bound_lo_hi(cv_bounds[k] if k < len(cv_bounds) else None)
+        if lo is None or hi is None:
+            lo, hi = float(np.nanmin(col)), float(np.nanmax(col))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                continue
+        rng = float(hi) - float(lo)
+        side = _cv_econ_side(ep, k)
+        econ_sides.append(side)
+        cv_d2_rms.append(float(np.sqrt(np.mean(
+            (np.diff(col, n=2) / max(1e-9, rng)) ** 2))) if T >= 3 else 0.0)
+        cv_rev_rates.append(_sign_reversal_rate(col, rng))
+        cv_orbit_rates.append(_cv_limit_orbit_rate(col, lo, hi, side, orbit_w))
+        cv_headrooms.append(float(np.mean(_cv_headroom(col, lo, hi, side))))
+        cv_viol_fracs.append(float(np.mean((col < lo) | (col > hi))))
         tgt = _cv_active_target(ep, k)
         if tgt is None:
             continue
-        err = states[:T, cidx].astype('float64') - tgt[:T].astype('float64')
-        # Normalise by CV bound width so cross-CV / cross-sim comparison is meaningful.
-        b = cv_bounds[k] if k < len(cv_bounds) else None
-        if (isinstance(b, list) and len(b) >= 2
-                and np.isfinite(b[0]) and np.isfinite(b[1])
-                and b[1] > b[0]):
-            denom = float(b[1]) - float(b[0])
-        else:
-            denom = float(np.nanstd(states[:T, cidx])) or 1.0
-        e = err / max(1e-9, denom)
+        err = col - tgt[:T].astype('float64')
+        e = err / max(1e-9, rng)
         iae_per_cv.append(float(np.sum(np.abs(e))))
         itae_per_cv.append(float(np.sum(np.arange(T) * np.abs(e))))
         ise_per_cv.append(float(np.sum(e ** 2)))
@@ -580,6 +1021,15 @@ def compute_episode_metrics(ep: Dict) -> Dict[str, float]:
         'mv_bound_hugging_score': float(np.min(hugging_scores)) if hugging_scores else 1.0,
         'mv_bound_usage': float(np.mean(usage_scores)) if usage_scores else 0.0,
         'mv_reversal_rate': float(np.mean(reversal_rates)) if reversal_rates else 0.0,
+        'cv_d2_rms_normed': float(np.max(cv_d2_rms)) if cv_d2_rms else 0.0,
+        'cv_reversal_rate': float(np.max(cv_rev_rates)) if cv_rev_rates else 0.0,
+        'cv_limit_orbit_rate': float(np.max(cv_orbit_rates)) if cv_orbit_rates else 0.0,
+        'cv_orbit_window_steps': int(orbit_w),
+        'cv_opt_headroom': float(np.mean(cv_headrooms)) if cv_headrooms else float('nan'),
+        'cv_viol_frac': float(np.mean(cv_viol_fracs)) if cv_viol_fracs else 0.0,
+        'cv_econ_side': (econ_sides[0] if econ_sides else 'lo'),
+        # Mean of ``info['raw_reward']`` (reversal-free econ after #8).
+        # Hunt sat is ``info['raw_hunt']``, not this score.
         'economic_score': float(np.mean(ep['raw_rewards'])) if T > 0 else 0.0,
         'cum_raw_reward': float(ep.get('cum_raw_reward', 0.0)),
         'iae_normed_mean': float(np.mean(iae_per_cv)) if iae_per_cv else 0.0,
@@ -605,10 +1055,15 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
         ``settle_band × bound_width`` for the rest of the window.
         ``None`` if it never settles.
       * ``iae_window``     — sum |dev| / bound_width across the window.
+      * ``cv_return_headroom`` — late-window (last 20%) gap to the
+        economic CV bound / bound width.
+      * ``cv_return_time_frac`` — fraction of the window until the CV is
+        in-band and within 0.10 of the economic bound; 1.0 if never.
 
     The most-impacted CV (largest |overshoot|) is reported per event;
     aggregates (median, p90, max) across events are returned at the top.
     """
+    from evaluation.residual_board import CV_RETURN_HEADROOM_BAND
     states = ep['states']
     cv_idx = ep.get('cv_indices') or []
     cv_bounds = ep.get('cv_bounds') or []
@@ -668,10 +1123,27 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
             if settle == 0:
                 settle = 0
             iae_w = float(np.sum(np.abs(dev_n)))
+            lo_b, hi_b = _bound_lo_hi(b)
+            y_win = states[start:end, cidx].astype('float64')
+            if lo_b is None or hi_b is None:
+                ret_h = float('nan')
+                ret_frac = 1.0
+            else:
+                side = _cv_econ_side(ep, k)
+                hr = _cv_headroom(y_win, lo_b, hi_b, side)
+                late_n = max(1, int(round(0.2 * hr.size)))
+                ret_h = float(np.mean(hr[-late_n:]))
+                in_band = (y_win >= lo_b) & (y_win <= hi_b)
+                at_lim = in_band & (hr <= CV_RETURN_HEADROOM_BAND)
+                hit = np.flatnonzero(at_lim)
+                ret_frac = (float(hit[0] + 1) / float(max(1, hr.size))
+                            if hit.size else 1.0)
             per_cv.append({'cv_row': k, 'cv_index': int(cidx),
                             'peak_overshoot_normed': ovs,
                             'settle_steps': settle,
-                            'iae_window_normed': iae_w})
+                            'iae_window_normed': iae_w,
+                            'cv_return_headroom': ret_h,
+                            'cv_return_time_frac': ret_frac})
         if not per_cv:
             continue
         worst = max(per_cv, key=lambda r: abs(r['peak_overshoot_normed']))
@@ -707,14 +1179,83 @@ def compute_event_response_metrics(ep: Dict, *, settle_band: float = 0.05,
                   {'median': 0.0, 'p90': 0.0, 'max': 0.0,
                    'n_settled': 0, 'n_total': int(len(events))})
 
+    def _agg_signed(key: str) -> Dict[str, float]:
+        vals = [e['worst_cv'][key] for e in events
+                if isinstance(e['worst_cv'].get(key), (int, float))
+                and np.isfinite(float(e['worst_cv'][key]))]
+        if not vals:
+            return {'median': float('nan'), 'p90': float('nan'),
+                    'max': float('nan'), 'n': 0}
+        a = np.asarray(vals, dtype='float64')
+        return {'median': float(np.median(a)),
+                'p90': float(np.percentile(a, 90)),
+                'max': float(np.max(a)),
+                'n': int(a.size)}
+
     return {
         'window_steps': int(window_steps),
         'settle_band_normed': float(settle_band),
         'overshoot_normed': _agg('peak_overshoot_normed'),
         'iae_window_normed': _agg('iae_window_normed'),
         'settle_steps': settle_agg,
+        'cv_return_headroom': _agg_signed('cv_return_headroom'),
+        'cv_return_time_frac': _agg_signed('cv_return_time_frac'),
         'events': events,
     }
+
+
+def _event_median(ev: Dict | None, key: str) -> float:
+    """Median from ``compute_event_response_metrics`` agg dicts."""
+    if not ev:
+        return float('nan')
+    v = ev.get(key)
+    if isinstance(v, dict):
+        v = v.get('median')
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float('nan')
+
+
+def _dr_scripted_title(seed, ep_metrics: Dict, ev_metrics: Dict | None, *,
+                       base_ev: Dict | None = None, sfx: str = '') -> str:
+    """DR png title: R3 event IAE + R2 orbit/rev — not tracking IAE.
+
+    Economic APC plants (test_sim, distillation) leave
+    ``targets_enabled=False``, so ``iae_normed_mean`` is identically 0.
+    P130 seed 10004 title ``IAE=0.00`` vs event IAE **7.79** / board
+    median-of-medians **15.5** — the title was on trial; residual_board
+    is the score. This title uses the board axes.
+    """
+    iae = _event_median(ev_metrics, 'iae_window_normed')
+    try:
+        orbit = float(ep_metrics.get('cv_limit_orbit_rate') or 0.0)
+    except (TypeError, ValueError):
+        orbit = 0.0
+    try:
+        rev = float(ep_metrics.get('cv_reversal_rate') or 0.0)
+    except (TypeError, ValueError):
+        rev = 0.0
+    try:
+        cum = float(ep_metrics.get('cum_raw_reward') or 0.0)
+    except (TypeError, ValueError):
+        cum = 0.0
+    iae_s = f'{iae:.2f}' if np.isfinite(iae) else 'n/a'
+    parts = [
+        f'seed={seed}  scripted disturbance rejection',
+        f'cum_raw={cum:+.2f}',
+        f'event_IAE={iae_s}',
+        f'orbit={orbit:.3f}/τ',
+        f'rev={rev:.3f}',
+    ]
+    if base_ev is not None:
+        biae = _event_median(base_ev, 'iae_window_normed')
+        if np.isfinite(biae):
+            parts.append(f'baseline event_IAE={biae:.2f}')
+    title = '  '.join(parts)
+    if sfx:
+        title += sfx
+    return title
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +1410,9 @@ def run_constant_mv_episode(env, *, schedule: List[Dict],
         'schedule': schedule,
         'mv_norm_ranges': [list(b) for b in env.mv_norm_ranges],
         'cv_norm_ranges': [list(b) for b in env.cv_norm_ranges],
+        'cv_side_scale': _episode_cv_side_scale(env),
+        'mv_cv_gain_sign': _episode_mv_cv_gain_sign(env),
+        'tau_dominant': _episode_tau_dominant(),
     }
 
 
@@ -1067,11 +1611,10 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
       - **constant-MV baseline overlay** (dashed grey) on every MV/CV row
         when ``ep_baseline`` is provided — makes "is the agent doing
         anything?" answerable at a glance,
-      - **CV tracking-error subplot** (replaces the legacy cum-reward
-        subplot, which was dominated by violation-penalty steps and
-        carried no operator information),
-      - per-event response annotations (±overshoot, settle steps) when
-        ``event_metrics`` is provided.
+      - **CV tracking-error subplot** when a target is enabled; otherwise
+        **CV headroom to y_econ** (economic APC — tracking IAE is 0),
+      - per-event response annotations from ``event_metrics`` (5τ window)
+        when provided; else a 200-step fallback.
     """
     states = ep['states']
     controls = ep['controls']
@@ -1180,28 +1723,52 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
     if n_rows == 1:
         axes = [axes]
 
-    # Per-event annotations (CV settle/overshoot) for the summary record.
+    # Per-event annotations: prefer the 5τ ``event_metrics`` window
+    # (same as residual_board R3). The 200-step fallback predates that
+    # window and disagreed with the board (P130 title IAE vs event IAE).
     annotations: List[Dict] = []
-    for ev in schedule:
-        st = int(ev.get('start', 0))
-        if st >= T - 5:
-            continue
-        for j, cidx in enumerate(cv_idx):
-            if cidx >= states.shape[1]:
+    ev_list = (event_metrics or {}).get('events') if event_metrics else None
+    if ev_list:
+        for e in ev_list:
+            w = e.get('worst_cv') or {}
+            try:
+                cv_row = int(w.get('cv_row', 0) or 0)
+            except (TypeError, ValueError):
+                cv_row = 0
+            try:
+                start = int(e.get('start', 0) or 0)
+            except (TypeError, ValueError):
+                start = 0
+            try:
+                ovr = float(w.get('peak_overshoot_normed', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                ovr = 0.0
+            annotations.append({
+                'cv_row': cv_row, 'start': start, 'overshoot': ovr,
+                'settle_steps': w.get('settle_steps'),
+                'name': e.get('name', 'event'),
+            })
+    else:
+        for ev in schedule:
+            st = int(ev.get('start', 0))
+            if st >= T - 5:
                 continue
-            pre = states[max(0, st - 20):st, cidx]
-            post = states[st:min(T, st + 200), cidx]
-            if pre.size == 0 or post.size == 0:
-                continue
-            base = float(np.mean(pre))
-            dev = post - base
-            ovr = float(dev[np.argmax(np.abs(dev))]) if dev.size else 0.0
-            band = max(1e-6, 0.05 * (np.max(np.abs(pre)) if pre.size else 1.0))
-            settled = np.where(np.abs(dev) <= band)[0]
-            settle_t = int(settled[0]) if settled.size else int(post.size)
-            annotations.append({'cv_row': j, 'start': st,
-                                 'overshoot': ovr, 'settle_steps': settle_t,
-                                 'name': ev.get('name', 'step')})
+            for j, cidx in enumerate(cv_idx):
+                if cidx >= states.shape[1]:
+                    continue
+                pre = states[max(0, st - 20):st, cidx]
+                post = states[st:min(T, st + 200), cidx]
+                if pre.size == 0 or post.size == 0:
+                    continue
+                base = float(np.mean(pre))
+                dev = post - base
+                ovr = float(dev[np.argmax(np.abs(dev))]) if dev.size else 0.0
+                band = max(1e-6, 0.05 * (np.max(np.abs(pre)) if pre.size else 1.0))
+                settled = np.where(np.abs(dev) <= band)[0]
+                settle_t = int(settled[0]) if settled.size else int(post.size)
+                annotations.append({'cv_row': j, 'start': st,
+                                     'overshoot': ovr, 'settle_steps': settle_t,
+                                     'name': ev.get('name', 'step')})
 
     def _draw_disturbance_markers(ax) -> None:
         ylo, yhi = ax.get_ylim()
@@ -1468,13 +2035,38 @@ def plot_disturbance_rejection(ep: Dict, out_path: Path, title: str = '',
         h2, l2 = ax2.get_legend_handles_labels()
         ax.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=8)
     else:
-        # Fallback when no CV target is enabled — keep the cum-reward
-        # trace so the subplot is still informative.
-        ax.plot(t_arr, np.cumsum(ep['raw_rewards']), color='C2', lw=1.0,
-                 label=f"raw cum (final={ep['cum_raw_reward']:+.1f})")
+        # No CV target (economic APC): tracking IAE is identically 0.
+        # Plot signed headroom to y_econ so the panel shows R2 hunt/hug,
+        # not a duplicate of the cum-raw companion below.
+        plotted_hr = False
+        for k, cidx in enumerate(cv_idx_local):
+            if cidx >= states_local.shape[1]:
+                continue
+            lo, hi = _bound_lo_hi(
+                cv_bounds_local[k] if k < len(cv_bounds_local) else None)
+            if lo is None or hi is None:
+                continue
+            n = min(T, len(t_arr), states_local.shape[0])
+            side = _cv_econ_side(ep, k)
+            hr = _cv_headroom(states_local[:n, cidx].astype('float64'),
+                              lo, hi, side)
+            ax.plot(t_arr[:n], hr, lw=1.0, label=f'headroom CV[{cidx}]')
+            plotted_hr = True
+            if ep_baseline is not None:
+                sb = ep_baseline['states']
+                m = min(sb.shape[0], n)
+                hr_b = _cv_headroom(sb[:m, cidx].astype('float64'),
+                                    lo, hi, _cv_econ_side(ep_baseline, k))
+                ax.plot(t_arr[:m], hr_b, lw=0.9, ls='--', color='#888888',
+                        alpha=0.8, label=f'headroom CV[{cidx}] baseline')
+        ax.axhline(0.0, color='gray', lw=0.5, ls='-', alpha=0.5)
+        if not plotted_hr:
+            ax.plot(t_arr, np.cumsum(ep['raw_rewards']), color='C2', lw=1.0,
+                     label=f"raw cum (final={ep['cum_raw_reward']:+.1f})")
         ax.legend(loc='upper left', fontsize=8)
     _draw_disturbance_markers(ax)
-    ax.set_ylabel('|err| (normed)')
+    ax.set_ylabel('CV headroom (to y_econ)' if not plotted_any_err
+                  else '|err| (normed)')
     ax.grid(True, alpha=0.3)
 
     # Reward / violation companion: instantaneous raw reward (left axis) +
@@ -1566,6 +2158,8 @@ def run_validation(*,
     controller_dir = Path(controller_dir).resolve()
     if not controller_dir.exists():
         raise FileNotFoundError(controller_dir)
+    from utils.training_disturbance import bind_identifier_out_dir
+    bind_identifier_out_dir(controller_dir)
     ckpt_path = controller_dir / ckpt
     if not ckpt_path.exists():
         raise FileNotFoundError(ckpt_path)
@@ -1609,7 +2203,7 @@ def run_validation(*,
         os.environ['IDENTIFIED_DEAD_TIME'] = f"{run_plan['dead_time']:g}"
 
     from training.train import TrainConfig, APCEnv
-    from models.dreamer_v4 import DreamerV4, DreamerV4Config
+    from models.dreamer_v4 import DreamerV4, dreamer_v4_config_from_train
 
     print(f'[val] controller: {controller_dir}', flush=True)
     print(f'[val] simulation: {sim_dir}', flush=True)
@@ -1620,56 +2214,8 @@ def run_validation(*,
     valid_keys = set(TrainConfig.__dataclass_fields__.keys())
     cfg = TrainConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 
-    model_cfg = DreamerV4Config(
-        obs_dim=cfg.obs_dim, action_dim=cfg.action_dim, lookback=cfg.lookback,
-        tok_hidden=cfg.tok_hidden, z_dim=cfg.z_dim, mae_p_max=cfg.mae_p_max,
-        d_model=cfg.d_model, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
-        ff_mult=cfg.ff_mult, n_register=cfg.n_register,
-        k_max=cfg.k_max, tau_n_bins=cfg.tau_n_bins, soft_cap=cfg.soft_cap,
-        n_action_bins=cfg.n_action_bins,
-        head_hidden=cfg.head_hidden, head_n_layers=cfg.head_n_layers,
-        mtp_length=max(1, int(getattr(cfg, 'mtp_length', 1))),
-        policy_type=str(getattr(cfg, 'policy_type', 'continuous')),
-        policy_init_log_std=float(getattr(cfg, 'policy_init_log_std', -0.5)),
-        policy_log_std_min=float(getattr(cfg, 'policy_log_std_min', -2.3)),
-        policy_log_std_max=float(getattr(cfg, 'policy_log_std_max', 0.0)),
-        world_model_type=str(getattr(cfg, 'world_model_type', 'sf_transformer')),
-        rssm_deter_dim=int(getattr(cfg, 'rssm_deter_dim', 512)),
-        rssm_n_categoricals=int(getattr(cfg, 'rssm_n_categoricals', 32)),
-        rssm_n_classes=int(getattr(cfg, 'rssm_n_classes', 32)),
-        rssm_embed_dim=int(getattr(cfg, 'rssm_embed_dim', 256)),
-        rssm_hidden_dim=int(getattr(cfg, 'rssm_hidden_dim', 256)),
-        rssm_unimix=float(getattr(cfg, 'rssm_unimix', 0.01)),
-        disturbance_head_dim=int(getattr(cfg, 'disturbance_head_dim', 0) or 0),
-        disturbance_head_hidden=int(getattr(cfg, 'disturbance_head_hidden', 0) or 0),
-        disturbance_head_layers=int(getattr(cfg, 'disturbance_head_layers', 2) or 2),
-        tssm_d_model=int(getattr(cfg, 'tssm_d_model', 512)),
-        tssm_n_layers=int(getattr(cfg, 'tssm_n_layers', 4)),
-        tssm_n_heads=int(getattr(cfg, 'tssm_n_heads', 8)),
-        tssm_max_seq_len=int(getattr(cfg, 'tssm_max_seq_len', 256)),
-        dv_dim=int(getattr(cfg, 'dv_dim', 0) or 0),
-        dv_indices=tuple(getattr(cfg, 'dv_indices', ()) or ()),
-        # dv_feedforward changes feat_dim (DV in the head feat); thread it so a
-        # non-default reload matches the checkpoint structure.
-        dv_feedforward=bool(getattr(cfg, 'dv_feedforward', True)),
-        # Neural Kalman filter / DOB (2026-06-11): MUST thread these so the
-        # rebuilt model has the d_t observer params (dynamics.dob_log_decay/
-        # gain) — else load_state_dict fails on the DOB checkpoint keys.
-        dob_enabled=bool(getattr(cfg, 'dob_enabled', False)),
-        cv_obs_indices=tuple(getattr(cfg, 'cv_obs_indices', ()) or ()),
-        dob_decay_init=float(getattr(cfg, 'dob_decay_init', 3.0)),
-        dob_gain_init=float(getattr(cfg, 'dob_gain_init', -2.2)),
-        # Continuous gain+disturbance latent (2026-06-22): MUST thread these too
-        # so the rebuilt model has the cont prior/post nets + gain/disturbance
-        # latent params — else the strict load_state_dict fails on the cont keys.
-        cont_gain_dim=int(getattr(cfg, 'cont_gain_dim', 0) or 0),
-        cont_dist_dim=int(getattr(cfg, 'cont_dist_dim', 0) or 0),
-        cont_min_std=float(getattr(cfg, 'cont_min_std', 0.1)),
-        cont_max_std=float(getattr(cfg, 'cont_max_std', 2.0)),
-        attn_impl=getattr(cfg, 'attn_impl', 'auto'),
-    )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = DreamerV4(model_cfg).to(device)
+    model = DreamerV4(dreamer_v4_config_from_train(cfg)).to(device)
     # Checkpoints saved while ``torch.compile`` was active have keys
     # prefixed with ``_orig_mod.`` (e.g. ``tokenizer._orig_mod.encoder...``)
     # because ``torch.compile`` wraps the module in ``OptimizedModule``.
@@ -1695,21 +2241,20 @@ def run_validation(*,
     # ``int(seeds)+1`` total = 4 by default), each with the FULL feature set:
     #   * the measured-DV scripted schedule (events spread across the episode), and
     #   * the unmeasured/hidden disturbance at FULL phase-3 amplitude, ALSO spread
-    #     across the whole episode (``DREAMER_HIDDEN_DIST_SPREAD``) so it reads as a
-    #     realistic load active start->end instead of a few front-loaded events
-    #     holding a DC offset.
+    #     across the whole episode (TrainConfig ``hidden_dist_spread``, default
+    #     ON in training too) so it reads as a realistic load active start->end
+    #     instead of a few front-loaded events holding a DC offset.
     # The seeds differ only by RNG draw, so the four plots show the same realistic
     # operating regime under different disturbance realisations.  The PASS/FAIL
     # fidelity gates run on a separate CLEAN env (``_disturbance_prob_override=0``)
     # and are unaffected by this.
     n_plots = int(seeds) + 1
     seed_plan: List[Tuple[int, bool]] = [(10_000 + s, True) for s in range(n_plots)]
-    # Spread the hidden disturbance across the whole episode for validation only
-    # (training keeps the front-loaded sequential placement).  Saved/restored
-    # around the seed loop so we never leak the override.
-    _hd_spread_prev = os.environ.get('DREAMER_HIDDEN_DIST_SPREAD')
-    os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '1'
-    for seed, unmeasured_full in seed_plan:
+    # Pin spread ON for val plots even if an A/B set training spread=0.
+    # Explicit cfg — do not poke leftover ``DREAMER_HIDDEN_DIST_SPREAD``.
+    from utils.hidden_disturbance import force_val_hidden_dist_spread
+    with force_val_hidden_dist_spread(cfg):
+      for seed, unmeasured_full in seed_plan:
         rng = np.random.default_rng(seed)
         env = APCEnv(cfg, rng)
         # Force the hidden disturbance on every validation episode (always test
@@ -1728,14 +2273,8 @@ def run_validation(*,
                 )
             except Exception as e:
                 print(f'[val] obs_norm restore skipped: {e!r}', flush=True)
-        # Use the calibrated reward scale from training when available.
-        cal_path = controller_dir / 'reward_calibration.json'
-        if cal_path.exists():
-            try:
-                with open(cal_path, 'r') as f:
-                    env.reward_scale = float(json.load(f).get('reward_scale', 1.0))
-            except Exception:
-                env.reward_scale = 1.0
+        # Use the calibrated reward scale / #8b econ bound ref from training.
+        _restore_reward_cal(env, controller_dir)
 
         per_seed_dir = out_dir / f'seed_{seed:05d}'
         per_seed_dir.mkdir(parents=True, exist_ok=True)
@@ -1832,13 +2371,10 @@ def run_validation(*,
             base_metrics = (compute_episode_metrics(ep_b)
                               if ep_b is not None else None)
 
-            d_title = (f'seed={seed}  scripted disturbance rejection  '
-                       f'cum_raw={ep_d["cum_raw_reward"]:+.2f}  '
-                       f'IAE={ep_metrics["iae_normed_mean"]:.2f}  '
-                       f'overshoot_max={ev_metrics["overshoot_normed"]["max"]:.3f}'
-                       + (f'   |  baseline IAE={base_metrics["iae_normed_mean"]:.2f}'
-                          if base_metrics is not None else '')
-                       + _ttl_sfx)
+            base_ev = (compute_event_response_metrics(ep_b)
+                       if ep_b is not None else None)
+            d_title = _dr_scripted_title(
+                seed, ep_metrics, ev_metrics, base_ev=base_ev, sfx=_ttl_sfx)
             ann = plot_disturbance_rejection(
                 ep_d, per_seed_dir / 'disturbance_rejection.png',
                 title=d_title, ep_baseline=ep_b, event_metrics=ev_metrics)
@@ -1939,12 +2475,6 @@ def run_validation(*,
         seed_results.append(eps)
         print(f'[val] seed {seed}: {len(eps)} episodes done', flush=True)
 
-    # Restore the hidden-disturbance spread override (validation-scoped).
-    if _hd_spread_prev is None:
-        os.environ.pop('DREAMER_HIDDEN_DIST_SPREAD', None)
-    else:
-        os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = _hd_spread_prev
-
     plot_summary(seed_results, out_dir / 'summary.png',
                   title=f'{controller_dir.name}  validation summary  '
                         f'({len(seed_results)} seeds × {episodes} eps)')
@@ -1959,6 +2489,7 @@ def run_validation(*,
         # WM-fidelity probe: disable hidden OU so the WM is scored on
         # base-plant dynamics, not augmented-system dynamics.
         diag_env._disturbance_prob_override = 0.0
+        _restore_reward_cal(diag_env, controller_dir)
         if obs_norm_state is not None:
             try:
                 diag_env.set_obs_norm_stats(
@@ -1999,16 +2530,27 @@ def run_validation(*,
             wm_r1 = float(((wm.get('per_offset') or {}).get('1') or {}).get('r_mean', 0.0))
             rw_r0 = float(((rw.get('per_offset') or {}).get('0') or {}).get('r', 0.0))
             critic_r = float(cc.get('r_pearson', 0.0))
+            from evaluation.residual_board import (
+                CRITIC_R_MIN, CRITIC_SLOPE_HI, CRITIC_SLOPE_LO,
+                critic_fidelity_pass)
             fidelity_gates = {
                 'wm_next_state_r_min': 0.5,
                 'reward_head_r_min': 0.3,
-                'critic_r_min': 0.3,
+                'critic_r_min': CRITIC_R_MIN,
+                'critic_slope_lo': CRITIC_SLOPE_LO,
+                'critic_slope_hi': CRITIC_SLOPE_HI,
                 'wm_next_state_r_observed': wm_r1,
                 'reward_head_r_observed': rw_r0,
                 'critic_r_observed': critic_r,
+                'critic_v_mean': cc.get('v_mean'),
+                'critic_g_mean': cc.get('g_mean'),
+                'critic_g_raw_mean': cc.get('g_raw_mean'),
+                'critic_slope_g_on_v': cc.get('slope_g_on_v'),
+                'critic_nmae': cc.get('nmae'),
                 'wm_pass': bool(wm_r1 >= 0.5),
                 'reward_pass': bool(rw_r0 >= 0.3),
-                'critic_pass': bool(critic_r >= 0.3),
+                'critic_pass': critic_fidelity_pass(
+                    critic_r, cc.get('slope_g_on_v')),
             }
             # p11 RCA: CONTROL-QUALITY gates.  Every gate above is INTERNAL
             # WM/critic fidelity — they PASS even when the actor learns a
@@ -2019,25 +2561,14 @@ def run_validation(*,
             # validation.  smooth_pass flags the oscillation directly;
             # beats_baseline_pass flags any policy no better than doing nothing.
             try:
-                _dr = locals().get('disturbance_records') or []
-                _rev = [float((r.get('episode_metrics_agent') or {}).get(
-                    'mv_reversal_rate', 0.0)) for r in _dr]
-                _ae = [float((r.get('episode_metrics_agent') or {}).get(
-                    'economic_score', 0.0)) for r in _dr]
-                _be = [float((r.get('episode_metrics_baseline') or {}).get(
-                    'economic_score', 0.0)) for r in _dr]
-                rev_mean = float(np.mean(_rev)) if _rev else 0.0
-                agent_econ = float(np.mean(_ae)) if _ae else 0.0
-                base_econ = float(np.mean(_be)) if _be else 0.0
-                fidelity_gates['mv_reversal_rate_max'] = 0.5
-                fidelity_gates['mv_reversal_rate_observed'] = rev_mean
-                fidelity_gates['agent_economic_score'] = agent_econ
-                fidelity_gates['baseline_economic_score'] = base_econ
-                fidelity_gates['smooth_pass'] = bool(rev_mean <= 0.5)
-                fidelity_gates['beats_baseline_pass'] = bool(agent_econ >= base_econ)
+                _cq = control_quality_gates(
+                    locals().get('disturbance_records') or [],
+                    seed_metrics=locals().get('metrics_records') or [],
+                )
+                fidelity_gates.update(_cq)
             except Exception as _cge:
-                fidelity_gates['smooth_pass'] = True
-                fidelity_gates['beats_baseline_pass'] = True
+                fidelity_gates['smooth_pass'] = False
+                fidelity_gates['beats_baseline_pass'] = False
                 fidelity_gates['control_gate_error'] = repr(_cge)
             fidelity_gates['all_pass'] = bool(
                 fidelity_gates['wm_pass']
@@ -2056,22 +2587,45 @@ def run_validation(*,
                     print(f'        - reward head r={rw_r0:+.3f} < 0.3'
                           ' (reward MTP uncorrelated with truth)', flush=True)
                 if not fidelity_gates['critic_pass']:
-                    print(f'        - critic V vs MC r={critic_r:+.3f} < 0.3'
-                          ' (value head uncorrelated with returns)', flush=True)
+                    print(f'        - critic V vs MC r={critic_r:+.3f} '
+                          f'(min {fidelity_gates.get("critic_r_min", 0.3)}) '
+                          f'slope={_fmt_f(cc.get("slope_g_on_v"))} '
+                          f'(need [{fidelity_gates.get("critic_slope_lo", 0.25)}, '
+                          f'{fidelity_gates.get("critic_slope_hi", 4.0)}]) '
+                          f'V={_fmt_f(cc.get("v_mean"))} G={_fmt_f(cc.get("g_mean"))}'
+                          ' — Pearson without order-1 slope is not residual-closed',
+                          flush=True)
                 if not fidelity_gates.get('smooth_pass', True):
-                    print(f'        - mv_reversal_rate='
-                          f'{fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f}'
-                          ' > 0.5 (BANG-BANG: MV reverses direction most steps)',
+                    print(f'        - CV smooth fail: d2_rms='
+                          f'{fidelity_gates.get("cv_d2_rms_normed_worst_seed", float("nan")):.4f}'
+                          f' (max {fidelity_gates.get("cv_d2_rms_normed_max", 0.05):.3f}) '
+                          f'reversal='
+                          f'{fidelity_gates.get("cv_reversal_rate_worst_seed", float("nan")):.3f}'
+                          f' (max {fidelity_gates.get("cv_reversal_rate_max", 0.25):.2f}) '
+                          f'orbit='
+                          f'{fidelity_gates.get("cv_limit_orbit_rate_worst_seed", float("nan")):.3f}'
+                          f' (max {fidelity_gates.get("cv_limit_orbit_rate_max", 0.15):.2f})'
+                          ' — MV reversal is diagnostic only',
                           flush=True)
                 if not fidelity_gates.get('beats_baseline_pass', True):
-                    print(f'        - agent economic_score='
-                          f'{fidelity_gates.get("agent_economic_score", 0.0):+.4f}'
-                          f' < baseline={fidelity_gates.get("baseline_economic_score", 0.0):+.4f}'
-                          ' (policy WORSE than open-loop baseline)', flush=True)
+                    if fidelity_gates.get('control_gate_skipped'):
+                        print('        - no scripted agent/baseline pairs '
+                              f'({fidelity_gates.get("control_gate_skipped")}); '
+                              'cannot claim beats-baseline (P49 0-vs-0 false pass)',
+                              flush=True)
+                    else:
+                        print(f'        - agent economic_score='
+                              f'{fidelity_gates.get("agent_economic_score", 0.0):+.4f}'
+                              f' < baseline={fidelity_gates.get("baseline_economic_score", 0.0):+.4f}'
+                              ' (policy WORSE than open-loop baseline)', flush=True)
             else:
                 print(f'[val] internal-fidelity gates PASSED '
                       f'(wm_r={wm_r1:+.3f} rw_r={rw_r0:+.3f} '
                       f'critic_r={critic_r:+.3f} '
+                      f'V={_fmt_f(cc.get("v_mean"))} G={_fmt_f(cc.get("g_mean"))} '
+                      f'slope={_fmt_f(cc.get("slope_g_on_v"))} '
+                      f'cv_d2={fidelity_gates.get("cv_d2_rms_normed_worst_seed", float("nan")):.4f} '
+                      f'cv_rev={fidelity_gates.get("cv_reversal_rate_worst_seed", float("nan")):.3f} '
                       f'mv_rev={fidelity_gates.get("mv_reversal_rate_observed", 0.0):.3f})',
                       flush=True)
         except Exception as _ge:
@@ -2086,10 +2640,11 @@ def run_validation(*,
     # the operating region with a min/max variation band.  Directly measures
     # whether the world model captured the true GAINS + DYNAMICS (the
     # correlation-based fidelity probe does NOT).  Gated ON by default; skip
-    # with DREAMER_VAL_WM_TRANSFER=0.
-    if os.environ.get('DREAMER_VAL_WM_TRANSFER', '1').strip() not in ('0', 'false', 'False'):
+    # with DREAMER_VAL_WM_TRANSFER=0 (TrainConfig ``val_wm_transfer``).
+    from evaluation.wm_transfer_matrix import (
+        compute_and_plot, resolve_wm_tf_knobs, val_diag_enabled, wm_tf_roll_len)
+    if val_diag_enabled(cfg, 'val_wm_transfer', 'DREAMER_VAL_WM_TRANSFER'):
         try:
-            from evaluation.wm_transfer_matrix import compute_and_plot
             tf_env = APCEnv(cfg, np.random.default_rng(77_777))
             tf_env._disturbance_prob_override = 0.0
             tf_obs_std = None
@@ -2112,11 +2667,7 @@ def run_validation(*,
             # within ~2× of the real plant (rel_err < 1.0; healthy < 0.35).
             try:
                 pairs = (tf_result or {}).get('pairs', {}) if tf_result else {}
-                rel_errs = []
-                for v in pairs.values():
-                    rg = abs(float(v.get('real_ss_gain', 0.0)))
-                    if rg > 1e-6:
-                        rel_errs.append(abs(float(v.get('ss_gain_abs_err', 0.0))) / rg)
+                rel_errs = _ss_gain_rel_errs(pairs)
                 if rel_errs:
                     gain_rel_err = float(np.mean(rel_errs))
                     gate = {
@@ -2126,14 +2677,38 @@ def run_validation(*,
                         'wm_gain_healthy': bool(gain_rel_err < 0.35),
                         'n_pairs': len(rel_errs),
                     }
+                    # DV is a separate JSON (not in MV wm_gain_rel_err). P29
+                    # printed wm_gain_healthy=True at MV rel_err=0.10 while
+                    # DV ss was ×0.56 — the MV-only aggregate hid it.
+                    dv_gate = _dv_gain_gate_from_json(
+                        out_dir / 'wm_dv_transfer_matrix.json')
+                    if dv_gate:
+                        gate.update(dv_gate)
+                    _merge_observer_gain_gate(gate, dv_gate)
                     if isinstance(locals().get('fidelity_gates'), dict):
                         fidelity_gates.update(gate)
                     else:
                         fidelity_gates = gate
-                    status = ('HEALTHY' if gate['wm_gain_healthy']
-                              else ('PASS' if gate['wm_gain_pass'] else 'FAIL'))
-                    print(f'[val] WM gain fidelity: rel_err={gain_rel_err:.2f} '
-                          f'({status}; correlation gates can pass while this '
+                    mv_status = _gain_status(
+                        gate['wm_gain_healthy'], gate['wm_gain_pass'])
+                    print(f'[val] WM MV gain fidelity: rel_err={gain_rel_err:.2f} '
+                          f'({mv_status}; lineage wm_gain_pass is MV-only)',
+                          flush=True)
+                    if dv_gate:
+                        dv_status = _gain_status(
+                            dv_gate['wm_dv_gain_healthy'],
+                            dv_gate['wm_dv_gain_pass'])
+                        print(f'[val] WM DV gain fidelity: rel_err='
+                              f'{dv_gate["wm_dv_gain_rel_err"]:.2f} '
+                              f'ss_ratio_worst='
+                              f'{dv_gate.get("wm_dv_ss_ratio_worst", float("nan")):.2f} '
+                              f'({dv_status})',
+                              flush=True)
+                    obs_status = _gain_status(
+                        gate['wm_observer_gain_healthy'],
+                        gate['wm_observer_gain_pass'])
+                    print(f'[val] WM observer gain: {obs_status} '
+                          f'(MV+DV; correlation gates can pass while this '
                           f'fails — gain is the control-relevant metric)',
                           flush=True)
             except Exception as _ge:
@@ -2145,9 +2720,10 @@ def run_validation(*,
     # Localises WHERE the WM loses the steady-state gain (autoencoder vs the
     # prior<->posterior gap vs open-loop compounding) so the right lever is
     # obvious from the saved artefact alone — no manual probe re-run.  Gated
-    # ON by default (RSSM/TSSM only); skip with DREAMER_VAL_WM_POSTPRIOR=0.
+    # ON by default (RSSM/TSSM only); skip with DREAMER_VAL_WM_POSTPRIOR=0
+    # (TrainConfig ``val_wm_postprior``).
     # Reuses a fresh disturbance-free env; guarded so it never breaks a run.
-    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+    if val_diag_enabled(cfg, 'val_wm_postprior', 'DREAMER_VAL_WM_POSTPRIOR'):
         try:
             from tools.wm_posterior_prior_probe import compute_posterior_prior_decomp
             pp_env = APCEnv(cfg, np.random.default_rng(43_210))
@@ -2161,8 +2737,8 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
-            _tf_h = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
-            _pp_h = _tf_h if _tf_h > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            _tf_h = resolve_wm_tf_knobs(cfg)['horizon']
+            _pp_h = wm_tf_roll_len(cfg, _tf_h)
             pp_res = compute_posterior_prior_decomp(
                 model, pp_env, cfg, device, horizon=_pp_h, settle=_pp_h)
             with open(out_dir / 'wm_posterior_prior_decomp.json', 'w') as f:
@@ -2189,7 +2765,7 @@ def run_validation(*,
     # explaining why every excitation/data fix failed.  Saved as
     # wm_dv_posterior_prior_decomp.json.  ON by default (RSSM/TSSM + DV-as-input
     # + sim.set_disturbance_offset); shares the DREAMER_VAL_WM_POSTPRIOR gate.
-    if os.environ.get('DREAMER_VAL_WM_POSTPRIOR', '1').strip() not in ('0', 'false', 'False'):
+    if val_diag_enabled(cfg, 'val_wm_postprior', 'DREAMER_VAL_WM_POSTPRIOR'):
         try:
             from tools.wm_posterior_prior_probe import compute_dv_posterior_prior_decomp
             dpp_env = APCEnv(cfg, np.random.default_rng(43_211))
@@ -2203,8 +2779,8 @@ def run_validation(*,
                         learn=False)
                 except Exception:
                     pass
-            _tf_h2 = int(os.environ.get('DREAMER_WM_TF_HORIZON', '0') or 0)
-            _dpp_h = _tf_h2 if _tf_h2 > 0 else max(80, int(4.0 * int(getattr(cfg, 'horizon', 30))))
+            _tf_h2 = resolve_wm_tf_knobs(cfg)['horizon']
+            _dpp_h = wm_tf_roll_len(cfg, _tf_h2)
             dvpp_res = compute_dv_posterior_prior_decomp(
                 model, dpp_env, cfg, device, horizon=_dpp_h, settle=_dpp_h)
             with open(out_dir / 'wm_dv_posterior_prior_decomp.json', 'w') as f:
@@ -2227,8 +2803,8 @@ def run_validation(*,
     # forced-disturbance episode, runs the head over the streamed WM posterior,
     # and scores pred-vs-true per CV channel (NRMSE / r / R² / lead-lag).  Saves
     # wm_disturbance_prediction.{json,png}.  ON by default (RSSM/TSSM + head);
-    # skip with DREAMER_VAL_WM_DISTPRED=0.
-    if os.environ.get('DREAMER_VAL_WM_DISTPRED', '1').strip() not in ('0', 'false', 'False'):
+    # skip with DREAMER_VAL_WM_DISTPRED=0 (TrainConfig ``val_wm_distpred``).
+    if val_diag_enabled(cfg, 'val_wm_distpred', 'DREAMER_VAL_WM_DISTPRED'):
         try:
             from evaluation.wm_disturbance_prediction import (
                 compute_disturbance_prediction, plot_disturbance_prediction)
@@ -2294,6 +2870,30 @@ def run_validation(*,
     }
     with open(out_dir / 'validation_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
+
+    try:
+        from evaluation.residual_board import write_residual_board
+        board = write_residual_board(out_dir, summary=summary)
+        r1 = board.get('r1') or {}
+        r2 = board.get('r2') or {}
+        r3 = board.get('r3') or {}
+        print(f'[val] residual_board: R1 MV ss×{_fmt_x(r1.get("mv_ss_ratio"))} '
+              f'@H×{_fmt_x(r1.get("mv_h_ratio"))} curve={_fmt_f(r1.get("mv_curve_iae_normed"))} '
+              f'DV ss×{_fmt_x(r1.get("dv_ss_ratio"))} 1step→OL×{_fmt_x(r1.get("ol_1step_ratio"))} '
+              f'lever={r1.get("dominant_lever")}; '
+              f'R2 d2={_fmt_f(r2.get("cv_d2_rms_normed_worst_seed"))} '
+              f'rev={_fmt_f(r2.get("cv_reversal_rate_worst_seed"))} '
+              f'orbit={_fmt_f(r2.get("cv_limit_orbit_rate_worst_seed"))} '
+              f'head={_fmt_f(r2.get("cv_opt_headroom_mean"))} '
+              f'viol_frac={_fmt_f(r2.get("cv_viol_frac_mean"))} '
+              f'smooth={r2.get("smooth_pass")}; '
+              f'R3 det_r={_fmt_f(r3.get("det_r"))} '
+              f'pred_std={_fmt_f(r3.get("pred_std"))} vs {_fmt_f(r3.get("true_std"))} '
+              f'ret_h={_fmt_f(r3.get("cv_return_headroom"))} '
+              f'ret_t={_fmt_f(r3.get("cv_return_time_frac"))} '
+              f'-> {out_dir}/residual_board.json', flush=True)
+    except Exception as _rbe:
+        print(f'[val] residual_board skipped: {_rbe!r}', flush=True)
 
     print('[val] done.', flush=True)
     return summary

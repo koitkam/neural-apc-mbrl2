@@ -21,7 +21,6 @@ validation run.
 """
 from __future__ import annotations
 
-import os
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -101,9 +100,9 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
 
     # Force the hidden disturbance on, full phase-3 amplitude, spread across the
     # whole episode (mirrors the disturbance-rejection plot env setup).
-    _spread_prev = os.environ.get('DREAMER_HIDDEN_DIST_SPREAD')
-    os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = '1'
-    try:
+    # Explicit cfg — do not poke leftover ``DREAMER_HIDDEN_DIST_SPREAD``.
+    from utils.hidden_disturbance import force_val_hidden_dist_spread
+    with force_val_hidden_dist_spread(cfg):
         env._hidden_disturbance_force = True
         env._current_phase = 3
         env._training_progress = 1.0
@@ -296,11 +295,6 @@ def compute_disturbance_prediction(model, env, cfg, device, *,
             'stop_grad': bool(getattr(cfg, 'disturbance_head_stop_grad', True)),
             'disturbance_loss_scale': float(getattr(cfg, 'disturbance_loss_scale', 0.0)),
         }
-    finally:
-        if _spread_prev is None:
-            os.environ.pop('DREAMER_HIDDEN_DIST_SPREAD', None)
-        else:
-            os.environ['DREAMER_HIDDEN_DIST_SPREAD'] = _spread_prev
 
 
 def plot_disturbance_prediction(result: Dict, out_path) -> bool:

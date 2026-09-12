@@ -14,9 +14,10 @@ Functionality:
 Inputs:
 - Constructor parameters: ``episode_length``, ``sample_rate``.
 - Optional env controls:
-    - ``DISTILLATION_DOMAIN_RANDOMIZATION`` (default enabled)
-    - ``DISTILLATION_PARAM_RANDOMIZATION_PCT`` (default ``0.10``)
-    - ``DISTILLATION_DOMAIN_RANDOMIZATION_SEED`` (for reproducibility)
+    - ``DREAMER_SIM_DOMAIN_RANDOMIZATION`` (default enabled)
+    - ``DREAMER_SIM_PARAM_RANDOMIZATION_PCT`` (default ``0.10``)
+    - ``DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED`` (for reproducibility)
+    Leftover ``DISTILLATION_*`` / ``SIM_*`` names are ignored.
 
 Outputs:
 - ``reset() -> (state, done)`` and ``step(action) -> (state, done)``.
@@ -203,7 +204,6 @@ class DistillationTower(DisturbanceOffsetMixin):
 
         # Domain randomization controls.
         self._randomizer = DomainRandomizer(
-            env_prefixes=['DISTILLATION'],
             domain_randomization=domain_randomization,
             param_randomization_pct=param_randomization_pct,
             randomization_seed=randomization_seed,

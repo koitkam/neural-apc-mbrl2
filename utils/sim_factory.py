@@ -1,16 +1,16 @@
 """Create simulator instances and normalize metadata for workflow scripts.
 
 Functionality:
-- Loads simulator module/class from `CONTROL_SETUP_JSON` or `SIM_MODEL_*` envs.
+- Loads simulator module/class from `CONTROL_SETUP_JSON` (auto-discover
+  when the file omits them). Login leftover `SIM_MODEL_*` /
+  `SIM_*_INDICES_JSON` is ignored (P99-live; P95 plant-file-wins still
+  left a gap-fill A/B when the setup omitted the field).
 - Instantiates simulator with tolerant constructor filtering.
 - Resolves and attaches standardized metadata/aliases expected by training and
     validation scripts.
 
 Inputs:
-- Setup file: `CONTROL_SETUP_JSON`.
-- Env overrides: `SIM_MODEL_MODULE`, `SIM_MODEL_CLASS`,
-    `SIM_MODEL_KWARGS_JSON`, `SIM_STATE_VARIABLES_JSON`, `SIM_MV_INDICES_JSON`,
-    `SIM_CV_INDICES_JSON`, `SIM_DV_INDICES_JSON`.
+- Setup file: `CONTROL_SETUP_JSON` (plant file / sim attrs / auto-discover).
 - Runtime constructor args: `episode_length`, `sample_rate`, `noise_stdv`.
 
 Outputs:
@@ -48,21 +48,25 @@ def _load_setup_file() -> Dict[str, Any]:
         return {}
 
 
-def _env_json(name: str, default):
-    raw = os.environ.get(name, '')
-    if not raw:
-        return default
-    try:
-        return json.loads(raw)
-    except Exception:
-        return default
+def _setup_str(setup_val, leftover_key: str = '') -> str:
+    """Plant ``control_setup.json`` string. Leftover env is ignored."""
+    _ = leftover_key
+    return str(setup_val or '').strip()
+
+
+def _setup_list(setup_val, leftover_key: str = '') -> list:
+    """Plant ``io`` list. Leftover JSON env is ignored."""
+    _ = leftover_key
+    if isinstance(setup_val, list) and setup_val:
+        return list(setup_val)
+    return []
 
 
 def _load_sim_class():
     setup = _load_setup_file()
     sim_cfg = setup.get('simulator', {}) if isinstance(setup.get('simulator', {}), dict) else {}
-    module_name = os.environ.get('SIM_MODEL_MODULE', sim_cfg.get('module', ''))
-    class_name = os.environ.get('SIM_MODEL_CLASS', sim_cfg.get('class', ''))
+    module_name = _setup_str(sim_cfg.get('module', ''), 'SIM_MODEL_MODULE')
+    class_name = _setup_str(sim_cfg.get('class', ''), 'SIM_MODEL_CLASS')
 
     candidates = []
     if module_name and class_name:
@@ -100,9 +104,10 @@ def _load_sim_class():
             last_exc = exc
 
     raise RuntimeError(
-        'Unable to resolve simulator class from CONTROL_SETUP_JSON/SIM_MODEL_* '
-        'or discovered simulation setup files. Provide simulator.module/class in control_setup.json '
-        'or set SIM_MODEL_MODULE and SIM_MODEL_CLASS.'
+        'Unable to resolve simulator class from CONTROL_SETUP_JSON '
+        'or discovered simulation setup files. Provide simulator.module/class '
+        'in control_setup.json. Leftover SIM_MODEL_MODULE / SIM_MODEL_CLASS '
+        'are ignored (P99-live).'
     ) from last_exc
 
 
@@ -112,8 +117,8 @@ def _apply_setup_noise_and_randomization_env():
     :class:`SimNoiseWrapper` all see consistent defaults.
 
     Explicit env vars (exported by the user or set by the dynamics
-    identifier's ``clean_mode``) always win — we only fill in gaps via
-    ``os.environ.setdefault``. Defaults when the block is absent leave
+    identifier's ``clean_mode`` as ``DREAMER_SIM_*``) always win — we
+    only fill in gaps via ``os.environ.setdefault``. Defaults when the block is absent leave
     everything enabled (domain randomization ON, process noise ON,
     measurement noise ON).
     """
@@ -132,9 +137,9 @@ def _apply_setup_noise_and_randomization_env():
         return None
 
     mapping = {
-        'domain_randomization': 'SIM_DOMAIN_RANDOMIZATION',
-        'param_randomization_pct': 'SIM_PARAM_RANDOMIZATION_PCT',
-        'noise_enabled': 'SIM_NOISE_ENABLED',
+        'domain_randomization': 'DREAMER_SIM_DOMAIN_RANDOMIZATION',
+        'param_randomization_pct': 'DREAMER_SIM_PARAM_RANDOMIZATION_PCT',
+        'noise_enabled': 'DREAMER_SIM_NOISE_ENABLED',
     }
     for key, env_name in mapping.items():
         if key not in block:
@@ -154,9 +159,10 @@ def _apply_setup_noise_and_randomization_env():
 def _constructor_kwargs(episode_length: int, sample_rate: int, noise_stdv: float):
     setup = _load_setup_file()
     sim_cfg = setup.get('simulator', {}) if isinstance(setup.get('simulator', {}), dict) else {}
-    file_kwargs = sim_cfg.get('kwargs', {}) if isinstance(sim_cfg.get('kwargs', {}), dict) else {}
-    extra = _env_json('SIM_MODEL_KWARGS_JSON', file_kwargs)
-    kwargs = dict(extra) if isinstance(extra, dict) else {}
+    if 'kwargs' in sim_cfg and isinstance(sim_cfg.get('kwargs'), dict):
+        kwargs = dict(sim_cfg['kwargs'])
+    else:
+        kwargs = {}
     kwargs.setdefault('episode_length', episode_length)
     kwargs.setdefault('sample_rate', sample_rate)
     kwargs.setdefault('noise_stdv', noise_stdv)
@@ -208,8 +214,9 @@ def _state_variables(sim) -> List[str]:
     names = getattr(sim, 'state_variables', None)
     if isinstance(names, list) and names:
         return [str(x) for x in names]
-    env_names = _env_json('SIM_STATE_VARIABLES_JSON', io_cfg.get('state_variables', []))
-    if isinstance(env_names, list) and env_names:
+    env_names = _setup_list(io_cfg.get('state_variables', []),
+                            'SIM_STATE_VARIABLES_JSON')
+    if env_names:
         return [str(x) for x in env_names]
     return []
 
@@ -220,8 +227,8 @@ def _mv_indices(sim) -> List[int]:
     mv = getattr(sim, 'mv_indices', None)
     if isinstance(mv, list) and mv:
         return [int(x) for x in mv]
-    env_mv = _env_json('SIM_MV_INDICES_JSON', io_cfg.get('mv_indices', []))
-    if isinstance(env_mv, list) and env_mv:
+    env_mv = _setup_list(io_cfg.get('mv_indices', []), 'SIM_MV_INDICES_JSON')
+    if env_mv:
         return [int(x) for x in env_mv]
     return []
 
@@ -252,9 +259,7 @@ def resolve_sim_metadata(sim) -> Dict[str, Any]:
     if isinstance(sim_cv, list) and sim_cv:
         cv_idxs = [int(x) for x in sim_cv]
     else:
-        cv_idxs = _env_json('SIM_CV_INDICES_JSON', io_cfg.get('cv_indices', []))
-        if not isinstance(cv_idxs, list):
-            cv_idxs = []
+        cv_idxs = _setup_list(io_cfg.get('cv_indices', []), 'SIM_CV_INDICES_JSON')
         cv_idxs = [int(x) for x in cv_idxs if isinstance(x, (int, float)) or str(x).lstrip('-').isdigit()]
 
     top = getattr(sim, 'top_pv_index', None)
@@ -279,9 +284,7 @@ def resolve_sim_metadata(sim) -> Dict[str, Any]:
     if isinstance(sim_dv, list) and sim_dv:
         dv_idxs = [int(x) for x in sim_dv]
     else:
-        dv_idxs = _env_json('SIM_DV_INDICES_JSON', io_cfg.get('dv_indices', []))
-        if not isinstance(dv_idxs, list):
-            dv_idxs = []
+        dv_idxs = _setup_list(io_cfg.get('dv_indices', []), 'SIM_DV_INDICES_JSON')
         dv_idxs = [int(x) for x in dv_idxs if isinstance(x, (int, float)) or str(x).lstrip('-').isdigit()]
 
     def _ranges_from(attr_name: str, cfg_key: str) -> List[List[float]]:
@@ -355,8 +358,9 @@ def require_sim_metadata(sim, required_fields: List[str]):
         raise ValueError(
             'Simulator is missing required metadata fields: '
             + ', '.join(missing)
-            + '. Provide attributes on the simulator class or set env overrides '
-            + '(SIM_MV_INDICES_JSON, SIM_CV_INDICES_JSON, SIM_DV_INDICES_JSON, SIM_STATE_VARIABLES_JSON).'
+            + '. Provide attributes on the simulator class or io in '
+            + 'control_setup.json. Leftover SIM_*_INDICES_JSON / '
+            + 'SIM_STATE_VARIABLES_JSON are ignored (P99-live).'
         )
 
 

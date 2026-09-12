@@ -108,15 +108,22 @@ def run(wm_type):
                if getattr(dyn, n, None) is not None]
     assert all(cont_req), 'cont-gain must be TRAINABLE when g=True'
     assert not any(dob_req), 'DOB A/K must be FROZEN when dob=False (Stage-1)'
+    k_net = getattr(dyn, 'dob_k_net', None)
+    if k_net is not None:
+        assert not any(p.requires_grad for p in k_net.parameters()), \
+            'P114: k_net frozen in Stage-1'
     fz2 = model.set_world_model_trainable(g=False, dob=True, reward=True)
     cont_req2 = [p.requires_grad for p in cont_net.parameters()]
     dob_req2 = [getattr(dyn, n).requires_grad for n in ('dob_log_decay', 'dob_log_gain')
                 if getattr(dyn, n, None) is not None]
     assert not any(cont_req2), 'cont-gain must FREEZE with g (Stage-2 g frozen)'
-    assert all(dob_req2), 'DOB A/K must TRAIN when dob=True (Stage-2)'
+    assert (not dyn.dob_log_decay.requires_grad) and dyn.dob_log_gain.requires_grad, \
+        'P99: Stage-2 pins A, trains K'
+    if k_net is not None:
+        assert all(p.requires_grad for p in k_net.parameters()), \
+            'P114: Stage-2 trains k_net with K'
     print(f'[smoke] OK  partition: Stage-1 g={fz["g"]}(cont-gain trainable)/'
-          f'dob={fz["dob"]}(frozen); Stage-2 g frozen / dob trains — clean '
-          f'gain↔disturbance separation')
+          f'dob={fz["dob"]}(frozen); Stage-2 g frozen / K trains A pinned')
 
 
 if __name__ == '__main__':

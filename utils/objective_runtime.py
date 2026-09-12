@@ -29,8 +29,6 @@ Key design notes (April 2026 refactor):
   ``current_cv_bounds`` and ``current_cv_targets`` take precedence over the
   static ``bounds`` argument so the objective tracks operator setpoint
   changes during an episode.
-- ``estimate_reward_scale`` derives a per-step O(5) reward target so any
-  plant trains with similar Q-value magnitudes.
 """
 
 import os
@@ -39,6 +37,19 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from utils.state_normalization import state_value_in_mode
+
+try:
+    from utils.auto_weights import adaptive_penalty_clip as _adaptive_clip_fn
+except Exception:  # pragma: no cover
+    _adaptive_clip_fn = None
+
+_BOOL_OFF = ('0', 'false', 'off', 'no', 'n', 'f')
+_AUTO_W_CACHE: Dict[tuple, Dict] = {}
+_AUTO_W_CACHE_MAX = 64
+# Val ``_sign_reversal_rate`` deadband (1e-3·bound width) and sticky thresh
+# ``tanh(1)`` ⇔ ``|dCV| > deadband``.  P125 / GOAL_PLAN #4.
+_CV_REV_DEADBAND_FRAC = 1e-3
+_CV_REV_STICKY_THRESH = float(np.tanh(1.0))
 
 
 def _safe_float(v, default=0.0):
@@ -148,79 +159,220 @@ def _normalized_bounds(lo: float, hi: float, r_lo: float, r_hi: float) -> Tuple[
     return _normalize(lo, r_lo, r_hi), _normalize(hi, r_lo, r_hi)
 
 
-def _objective_uses_normalized(obj_w: Dict, terms: Dict) -> bool:
+def _objective_uses_normalized(obj_w: Dict, terms: Dict, cfg=None) -> bool:
+    # Bound cfg wins (default ON).  A/B is ``ENV_OVERRIDES`` then
+    # ``apply_dreamer_env_overrides``.  Leftover ``DREAMER_OBJ_USE_NORMALIZED``
+    # dual-read ignored (P116-live; same silent-A/B class as P113 compile).
+    # Leftover ``OBJ_USE_NORMALIZED`` ignored (P90-live).
+    if cfg is not None:
+        return bool(getattr(cfg, 'objective_use_normalized', True))
     if isinstance(terms, dict) and 'objective_use_normalized' in terms:
         return bool(int(_safe_float(terms.get('objective_use_normalized', 1), 1)))
     return bool(int(_safe_float(obj_w.get('objective_use_normalized', 1), 1)))
+
+
+def _bounds_fp(bounds) -> tuple:
+    """Round bound rows so cache keys are stable across float noise."""
+    if not bounds:
+        return ()
+    out = []
+    for row in bounds:
+        try:
+            out.append((round(float(row[0]), 6), round(float(row[1]), 6)))
+        except Exception:
+            try:
+                out.append(tuple(row))
+            except Exception:
+                out.append((row,))
+    return tuple(out)
 
 
 def _maybe_auto_weights(obj_w: Dict, n_mv: int, n_cv: int, spec: Optional[Dict],
                         mv_bounds: Optional[list] = None,
                         cv_bounds: Optional[list] = None,
                         mv_norm_ranges: Optional[list] = None,
-                        cv_norm_ranges: Optional[list] = None) -> Dict:
-    """Fill in violation/move/target weight vectors if absent, using auto-derivation."""
+                        cv_norm_ranges: Optional[list] = None,
+                        cfg=None) -> Dict:
+    """Fill in violation/move/target weight vectors if absent, using auto-derivation.
+
+    ``control_objective.json`` often omits the vectors (test_sim), so the
+    historical path re-derived them on **every** ``env.step``.  Cache on
+    ``(obj_w id, dims, current bounds)`` — operator limit-steps still
+    miss and re-derive (identity); quiet steps reuse the merged dict.
+    """
     needs = (
         not obj_w.get('mv_violation_weights')
         or not obj_w.get('cv_violation_weights')
         or not obj_w.get('mv_move_weights')
         or not obj_w.get('mv_reversal_weights')
+        or not obj_w.get('cv_reversal_weights')
         or not obj_w.get('cv_target_weights')
         or not obj_w.get('mv_target_weights')
     )
     if not needs:
-        return obj_w
+        # P125: a complete JSON can still carry leftover MV chatter weights.
+        mv = obj_w.get('mv_reversal_weights') or []
+        try:
+            mv_live = any(abs(float(x)) > 1e-12 for x in mv)
+        except (TypeError, ValueError):
+            mv_live = bool(mv)
+        if mv_live or not obj_w.get('cv_reversal_weights'):
+            needs = True
+        else:
+            return obj_w
+    key = (
+        id(obj_w), int(n_mv), int(n_cv),
+        id(cfg) if cfg is not None else 0,
+        _bounds_fp(mv_bounds), _bounds_fp(cv_bounds),
+        _bounds_fp(mv_norm_ranges), _bounds_fp(cv_norm_ranges),
+    )
+    cached = _AUTO_W_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         from utils.auto_weights import derive_auto_weights
-    except Exception:
+    except ImportError:
         return obj_w
     spec_local = spec if isinstance(spec, dict) else {}
     auto = derive_auto_weights(spec_local, n_mv=n_mv, n_cv=n_cv,
                                mv_bounds=mv_bounds, cv_bounds=cv_bounds,
                                mv_norm_ranges=mv_norm_ranges,
-                               cv_norm_ranges=cv_norm_ranges)
+                               cv_norm_ranges=cv_norm_ranges, cfg=cfg)
     merged = dict(obj_w)
     for k in ('mv_violation_weights', 'cv_violation_weights', 'mv_move_weights',
-              'mv_reversal_weights',
+              'mv_reversal_weights', 'cv_reversal_weights',
               'mv_target_weights', 'cv_target_weights',
               'cv_violation_weights_lo', 'cv_violation_weights_hi'):
         if not merged.get(k):
             merged[k] = list(auto.get(k) or [])
+    # P125: always take auto-derived reversal vectors when we (re)derive.
+    # MV chatter is allowed (zeros).  CV sticky-tanh hunting is the val gate.
+    # A stale JSON / cached vector must not keep penalising MV or drop CV.
+    merged['mv_reversal_weights'] = list(auto.get('mv_reversal_weights') or [])
+    merged['cv_reversal_weights'] = list(auto.get('cv_reversal_weights') or [])
     # Stash scalar auto-derived knobs that have no per-channel form.
     # Consumed by ``compute_objective_components`` as the default in the
     # env > spec > auto-derived > 0.0 resolution chain for the DMC
     # sliding-mode rate term.
     if 'auto_violation_rate_coef' not in merged:
         merged['auto_violation_rate_coef'] = float(auto.get('violation_rate_coef', 0.0))
+    if len(_AUTO_W_CACHE) >= _AUTO_W_CACHE_MAX:
+        _AUTO_W_CACHE.clear()
+    _AUTO_W_CACHE[key] = merged
     return merged
 
 
-def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
+def _obj_explicit(cfg, field: str) -> bool:
+    if cfg is None:
+        return False
+    return field in (getattr(cfg, '_explicit_fields', set()) or set())
+
+
+def _obj_float(cfg, field: str, dreamer_key: str, leftover_key: str,
+               default: float, spec=None, spec_key: str = '') -> float:
+    """Explicit TrainConfig, else DREAMER_*, else spec, else cfg, else default.
+
+    Leftover ``OBJECTIVE_*`` / ``OBJ_AUTO_*`` names are ignored (P90-live;
+    login leftover was a silent A/B outside ``run_plan``).  ``leftover_key``
+    stays on the signature so call sites do not churn.  Identity env-free.
+    """
+    _ = leftover_key
+    if _obj_explicit(cfg, field):
+        try:
+            return float(getattr(cfg, field))
+        except Exception:
+            return float(default)
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        try:
+            return float(d_raw)
+        except Exception:
+            pass
+    if spec_key and isinstance(spec, dict) and spec.get(spec_key) is not None:
+        try:
+            return float(spec.get(spec_key))
+        except Exception:
+            pass
+    if cfg is not None:
+        try:
+            return float(getattr(cfg, field, default))
+        except Exception:
+            pass
+    return float(default)
+
+
+def _obj_bool(cfg, field: str, dreamer_key: str, leftover_key: str,
+              default: bool) -> bool:
+    if _obj_explicit(cfg, field):
+        return bool(getattr(cfg, field))
+    _ = leftover_key
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        return str(d_raw).strip().lower() not in _BOOL_OFF
+    if cfg is not None:
+        return bool(getattr(cfg, field, default))
+    return bool(default)
+
+
+def _obj_str(cfg, field: str, dreamer_key: str, leftover_key: str,
+             default: str, spec=None, spec_key: str = '') -> str:
+    if _obj_explicit(cfg, field):
+        return str(getattr(cfg, field, default) or default)
+    _ = leftover_key
+    d_raw = os.environ.get(dreamer_key)
+    if d_raw not in (None, ''):
+        return str(d_raw).strip()
+    if spec_key and isinstance(spec, dict) and spec.get(spec_key) is not None:
+        return str(spec.get(spec_key)).strip()
+    if cfg is not None:
+        return str(getattr(cfg, field, default) or default)
+    return str(default)
+
+
+def _plant_timing_for_integral(cfg) -> Tuple[float, float]:
+    """``(tau, dead)`` for integral dead-time damping.
+
+    Prefer TrainConfig identified timing (``single_run`` writes it).
+    Login leftover ``IDENTIFIED_*`` ignored when the field is 0
+    (P95-live; derive-time IPC stays in ``auto_episode_length``).
+    Leftover ``SIM_IDENTIFIED_*`` ignored (P93-live).
+    """
+    tau = 0.0
+    dead = 0.0
+    if cfg is not None:
+        try:
+            tau = float(getattr(cfg, 'identified_tau_dominant', 0.0) or 0.0)
+        except Exception:
+            tau = 0.0
+        try:
+            dead = float(getattr(cfg, 'identified_dead_time', 0.0) or 0.0)
+        except Exception:
+            dead = 0.0
+    return float(tau), float(dead)
+
+
+def resolve_integral_config(objective_spec=None, cfg=None) -> Tuple[bool, float, float]:
     """Resolve the integral (accumulated-violation) term configuration.
 
     Shared single source of truth for both
     :func:`compute_objective_components` (which applies the penalty) and
     the environment (which sizes/normalises the exposed accumulator
-    observation channel).  Precedence: env var > objective_spec key >
-    default — identical to the in-function resolution.
+    observation channel).  Precedence: explicit TrainConfig >
+    ``DREAMER_*`` > spec > default.  Leftover ``OBJECTIVE_*`` /
+    ``OBJ_AUTO_*`` ignored (P90-live).  Identity env-free.
 
     Returns ``(enabled, coef, windup)``.
     """
     spec = objective_spec if isinstance(objective_spec, dict) else {}
 
-    def _r(env_key: str, spec_key: str, default):
-        v = os.environ.get(env_key)
-        if v is not None and str(v).strip() != '':
-            return v
-        if spec_key in spec and spec.get(spec_key) is not None:
-            return spec.get(spec_key)
-        return default
-
     # ON by default (opt-out): a small positive coefficient applies a
     # dwell penalty for SUSTAINED limit violation, attacking the passive
     # "park just outside the bound" attractor. Opt out by setting the coef
-    # to 0 (env ``OBJECTIVE_INTEGRAL_COEF`` or spec ``integral_coef``).
-    coef = float(_safe_float(_r('OBJECTIVE_INTEGRAL_COEF', 'integral_coef', 0.05), 0.05))
+    # to 0 (env ``DREAMER_OBJECTIVE_INTEGRAL_COEF`` or spec ``integral_coef``).
+    coef = _obj_float(
+        cfg, 'objective_integral_coef',
+        'DREAMER_OBJECTIVE_INTEGRAL_COEF', 'OBJECTIVE_INTEGRAL_COEF',
+        0.05, spec=spec, spec_key='integral_coef')
     # Economic-led CV compensation (2026-06-09): when the INSTANTANEOUS CV
     # bound-violation penalty is softened relative to economics (``OBJ_AUTO_CV_
     # OVER_ECON_RATIO`` set BELOW ``OBJ_AUTO_VIOLATION_MARGIN`` in auto_weights),
@@ -232,55 +384,58 @@ def resolve_integral_config(objective_spec=None) -> Tuple[bool, float, float]:
     # COMPENSATE_MAX`` (default 10x) for safety; disable with
     # ``OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE=0``.
     try:
-        if str(os.environ.get('OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE', '1')).strip() \
-                not in ('0', 'false', 'False', 'no', 'off'):
-            _margin = float(os.environ.get('OBJ_AUTO_VIOLATION_MARGIN', '2.0'))
-            _cv_ratio = float(os.environ.get('OBJ_AUTO_CV_OVER_ECON_RATIO',
-                                             str(_margin)))
+        if _obj_bool(
+                cfg, 'obj_auto_integral_soft_compensate',
+                'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE',
+                'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE', True):
+            _margin = _obj_float(
+                cfg, 'obj_auto_violation_margin',
+                'DREAMER_OBJ_AUTO_VIOLATION_MARGIN',
+                'OBJ_AUTO_VIOLATION_MARGIN', 2.0)
+            # Sentinel 0 = follow margin (historical default
+            # ``os.environ.get(..., str(_margin))``).
+            _cv_ratio = _obj_float(
+                cfg, 'obj_auto_cv_over_econ_ratio',
+                'DREAMER_OBJ_AUTO_CV_OVER_ECON_RATIO',
+                'OBJ_AUTO_CV_OVER_ECON_RATIO', 0.0)
+            if _cv_ratio <= 1e-12:
+                _cv_ratio = float(_margin)
             if _cv_ratio > 1e-6 and _margin > _cv_ratio:
-                _boost_max = float(os.environ.get(
-                    'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX', '10.0'))
+                _boost_max = _obj_float(
+                    cfg, 'obj_auto_integral_soft_compensate_max',
+                    'DREAMER_OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX',
+                    'OBJ_AUTO_INTEGRAL_SOFT_COMPENSATE_MAX', 10.0)
                 _boost = float(min(max(1.0, _margin / _cv_ratio),
                                    max(1.0, _boost_max)))
                 # Dead-time-aware LIMIT-CYCLE damping (2026-06-09, p107 RCA).
-                # Integral action + plant dead time is the classic limit-cycle
-                # generator (p107: soft CV brake parked the CV on the limit ->
-                # the boosted integral + θ=8/τ=53 dead time produced a sustained
-                # cycle).  The phase margin a pure-integral loop loses to dead
-                # time scales with the dead-time fraction f_dt = θ/(θ+τ); to keep
-                # the closed loop away from the oscillation boundary the integral
-                # gain must be REDUCED as f_dt grows.  Damp the soft-compensation
-                # boost by ``(1 - k·f_dt)`` (k = OBJ_AUTO_INTEGRAL_DEADTIME_K,
-                # default 2.0), floored at 1.0 so a boosted integral on a dead-
-                # time plant is never stronger than a fast plant's, and never
-                # below the un-boosted coef.  Sim-agnostic: θ, τ come from the
-                # identified-plant env vars the workflow already exports.  No
-                # effect when there is no dead time (f_dt=0 -> factor 1.0) or the
-                # boost is off.  Disable via OBJ_AUTO_INTEGRAL_DEADTIME_K=0.
+                # Prefer TrainConfig identified τ/θ (P95-live: leftover
+                # IDENTIFIED_* ignored when the field is 0).
                 try:
-                    _k = float(os.environ.get('OBJ_AUTO_INTEGRAL_DEADTIME_K', '2.0'))
+                    _k = _obj_float(
+                        cfg, 'obj_auto_integral_deadtime_k',
+                        'DREAMER_OBJ_AUTO_INTEGRAL_DEADTIME_K',
+                        'OBJ_AUTO_INTEGRAL_DEADTIME_K', 2.0)
                     if _k > 0.0:
-                        _theta = _safe_float(os.environ.get('IDENTIFIED_DEAD_TIME')
-                                             or os.environ.get('SIM_IDENTIFIED_DEAD_TIME'), 0.0)
-                        _tau = _safe_float(os.environ.get('IDENTIFIED_TAU_DOMINANT')
-                                           or os.environ.get('SIM_IDENTIFIED_TAU_DOMINANT'), 0.0)
+                        _tau, _theta = _plant_timing_for_integral(cfg)
                         if _theta > 0.0 and _tau > 0.0:
                             _f_dt = _theta / (_theta + _tau)
                             _damp = max(0.0, min(1.0, 1.0 - _k * _f_dt))
-                            # Damp only the boost ABOVE 1.0, never below 1.0.
                             _boost = 1.0 + (_boost - 1.0) * _damp
                 except Exception:
                     pass
                 coef *= _boost
     except Exception:
         pass
-    windup = float(_safe_float(_r('OBJECTIVE_INTEGRAL_WINDUP', 'integral_windup', 5.0), 5.0))
+    windup = _obj_float(
+        cfg, 'objective_integral_windup',
+        'DREAMER_OBJECTIVE_INTEGRAL_WINDUP', 'OBJECTIVE_INTEGRAL_WINDUP',
+        5.0, spec=spec, spec_key='integral_windup')
     if windup <= 0.0:
         windup = 5.0
     return (coef > 0.0, coef, windup)
 
 
-def resolve_integral_leak(objective_spec=None) -> float:
+def resolve_integral_leak(objective_spec=None, cfg=None) -> float:
     """Resolve the in-band leak (bleed-off) factor for the integral
     accumulator.
 
@@ -293,22 +448,23 @@ def resolve_integral_leak(objective_spec=None) -> float:
     permanently taxing the rest of the episode.  This restores a positive
     "recovery" gradient for clearing a violation.
 
-    Precedence: env ``OBJECTIVE_INTEGRAL_LEAK`` > spec ``integral_leak`` >
+    Precedence: explicit TrainConfig / ``DREAMER_OBJECTIVE_INTEGRAL_LEAK`` >
+    leftover env ``OBJECTIVE_INTEGRAL_LEAK`` > spec ``integral_leak`` >
     default 0.98 (~50-step recovery memory).  Clamped to ``(0, 1]``; a
     value of 1.0 disables the leak (legacy hold-forever behaviour).
     """
     spec = objective_spec if isinstance(objective_spec, dict) else {}
-    raw = os.environ.get('OBJECTIVE_INTEGRAL_LEAK')
-    if raw is None or str(raw).strip() == '':
-        raw = spec.get('integral_leak') if 'integral_leak' in spec else 0.98
-    leak = float(_safe_float(raw, 0.98))
+    leak = _obj_float(
+        cfg, 'objective_integral_leak',
+        'DREAMER_OBJECTIVE_INTEGRAL_LEAK', 'OBJECTIVE_INTEGRAL_LEAK',
+        0.98, spec=spec, spec_key='integral_leak')
     if leak <= 0.0:
         leak = 0.98
     return float(min(1.0, leak))
 
 
 
-def _shaping_linear_equiv_scale() -> float:
+def _shaping_linear_equiv_scale(cfg=None) -> float:
     """Quadratic→linear conversion scale for the integral / derivative
     shaping terms.
 
@@ -327,11 +483,16 @@ def _shaping_linear_equiv_scale() -> float:
     matches the quadratic base penalty exactly at a tolerance-magnitude
     violation and stays strictly bounded below it for smaller dwells,
     restoring a usable gradient.  Adaptive: it scales with the per-channel
-    derived CV/MV violation weight.  Mirrors ``OBJ_AUTO_VIOLATION_TOLERANCE``
-    (default 0.02).
+    derived CV/MV violation weight.  TrainConfig
+    ``obj_auto_violation_tolerance`` +
+    ``DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE`` (default 0.02).  Leftover
+    ``OBJ_AUTO_VIOLATION_TOLERANCE`` is ignored (P90-live).
     """
     try:
-        return max(1e-4, float(os.environ.get('OBJ_AUTO_VIOLATION_TOLERANCE', 0.02)))
+        return max(1e-4, _obj_float(
+            cfg, 'obj_auto_violation_tolerance',
+            'DREAMER_OBJ_AUTO_VIOLATION_TOLERANCE',
+            'OBJ_AUTO_VIOLATION_TOLERANCE', 0.02))
     except Exception:
         return 0.02
 
@@ -350,12 +511,15 @@ def compute_objective_components(
     prev_cv_violation_per_channel=None,
     prev_integral_cv_per_channel=None,
     prev_prev_control=None,
+    prev_cv=None,
+    prev_cv_reversal_sticky=None,
+    cfg=None,
 ) -> Dict[str, float]:
     state = np.asarray(state, dtype='float32').reshape(-1)
     control = np.asarray(control, dtype='float32').reshape(-1)
     prev_control = np.asarray(prev_control, dtype='float32').reshape(-1)
-    # 2-step MV history for the reversal (oscillation) term.  Defaulting to
-    # prev_control makes du_prev=0 on the first step -> no spurious penalty.
+    # 2-step MV history kept as a diagnostic (weights are 0 as of P125).
+    # Defaulting to prev_control makes du_prev=0 on the first step.
     prev_prev_control = (prev_control if prev_prev_control is None
                          else np.asarray(prev_prev_control,
                                          dtype='float32').reshape(-1))
@@ -375,9 +539,9 @@ def compute_objective_components(
     obj_w = _maybe_auto_weights(obj_w, n_mv=mv_dim, n_cv=cv_dim, spec=objective_spec,
                                 mv_bounds=mv_bounds, cv_bounds=cv_bounds,
                                 mv_norm_ranges=mv_norm_ranges,
-                                cv_norm_ranges=cv_norm_ranges)
+                                cv_norm_ranges=cv_norm_ranges, cfg=cfg)
 
-    use_normalized = _objective_uses_normalized(obj_w, terms)
+    use_normalized = _objective_uses_normalized(obj_w, terms, cfg=cfg)
     if not isinstance(terms, dict):
         terms = {}
 
@@ -403,6 +567,7 @@ def compute_objective_components(
         cv_violation_weights_hi = list(cv_violation_weights)
     mv_move_weights = _resolve_vector(obj_w.get('mv_move_weights', []), mv_dim, 0.0)
     mv_reversal_weights = _resolve_vector(obj_w.get('mv_reversal_weights', []), mv_dim, 0.0)
+    cv_reversal_weights = _resolve_vector(obj_w.get('cv_reversal_weights', []), cv_dim, 0.0)
     mv_economic_weights = _resolve_vector(obj_w.get('mv_economic_weights', []), mv_dim, 0.0)
     cv_economic_weights = _resolve_vector(obj_w.get('cv_economic_weights', []), cv_dim, 0.0)
     # Economic *typical* operating point (normalised [0, 1]). The economic
@@ -441,16 +606,9 @@ def compute_objective_components(
     # OPTIONAL PID-style shaping terms can be switched on independently:
     #   - derivative (violation-rate) term  -> OBJECTIVE_VIOLATION_RATE_COEF
     #   - integral (accumulated-violation)  -> OBJECTIVE_INTEGRAL_COEF
-    # Precedence for every knob: env var > objective_spec key > default.
+    # Precedence: explicit TrainConfig > DREAMER_* > leftover env >
+    # spec > default.
     _spec_cfg = objective_spec if isinstance(objective_spec, dict) else {}
-
-    def _resolve_cfg(env_key: str, spec_key: str, default):
-        v = os.environ.get(env_key)
-        if v is not None and str(v).strip() != '':
-            return v
-        if spec_key in _spec_cfg and _spec_cfg.get(spec_key) is not None:
-            return _spec_cfg.get(spec_key)
-        return default
 
     # ---- MV violations (quadratic in bound-violation depth) ----
     mv_violation_per_channel = []        # shaped magnitude (matches mode)
@@ -540,12 +698,8 @@ def compute_objective_components(
                * np.asarray(mv_move_weights, dtype='float32'))
     )
 
-    # ---- MV reversal / oscillation suppression (adaptive move suppression) ----
-    # osc_i = relu(-du_t * du_prev): ZERO for any monotonic move (however fast),
-    # positive only on a DIRECTION REVERSAL and quadratic in its per-step
-    # amplitude.  Fast SUSTAINED control is free; only self-induced back-and-
-    # forth (bang-bang) is penalised.  A slow disturbance-driven reversal has
-    # tiny per-step du -> negligible; sustained fast oscillation accumulates.
+    # ---- MV reversal diagnostic (weights are 0 as of P125 / GOAL_PLAN #4) ----
+    # Kept so logs still show MV chatter; it does not enter the reward.
     mv_reversal_terms = []
     for i in range(mv_dim):
         r_lo, r_hi = mv_norm_ranges[i]
@@ -563,6 +717,60 @@ def compute_objective_components(
     mv_reversal_penalty = float(
         np.sum(np.asarray(mv_reversal_terms, dtype='float32')
                * np.asarray(mv_reversal_weights, dtype='float32'))
+    )
+
+    # ---- CV reversal / hunting (sticky tanh; matches val ``_sign_reversal_rate``) ----
+    # s = tanh(dCV / deadband); s_sticky = last |s|≥tanh(1) sign.  Holds do not
+    # update sticky, so a hold then opposite move still counts.  A monotonic
+    # ride (one sign) is free.  Soft tanh so small hunting near the deadband
+    # still has a gradient; hard sign would be 0/1 only.
+    cv_now = []
+    for j, sidx in enumerate(cv_indices):
+        if sidx < 0 or sidx >= len(state):
+            cv_now.append(0.0)
+        else:
+            cv_now.append(float(state[sidx]))
+    if prev_cv is None:
+        prev_cv_arr = np.asarray(cv_now, dtype='float64')
+    else:
+        prev_cv_arr = np.asarray(prev_cv, dtype='float64').reshape(-1)
+        if prev_cv_arr.size < cv_dim:
+            pad = np.asarray(cv_now, dtype='float64')
+            tmp = np.zeros(cv_dim, dtype='float64')
+            tmp[:prev_cv_arr.size] = prev_cv_arr
+            tmp[prev_cv_arr.size:] = pad[prev_cv_arr.size:]
+            prev_cv_arr = tmp
+    if prev_cv_reversal_sticky is None:
+        sticky_arr = np.zeros(cv_dim, dtype='float64')
+    else:
+        sticky_arr = np.asarray(prev_cv_reversal_sticky, dtype='float64').reshape(-1)
+        if sticky_arr.size < cv_dim:
+            tmp = np.zeros(cv_dim, dtype='float64')
+            tmp[:sticky_arr.size] = sticky_arr
+            sticky_arr = tmp
+    cv_reversal_terms = []
+    cv_reversal_sticky_out = []
+    for j in range(cv_dim):
+        lo, hi = cv_bounds[j] if j < len(cv_bounds) else (0.0, 1.0)
+        try:
+            rng = float(hi) - float(lo)
+        except (TypeError, ValueError):
+            rng = 0.0
+        deadband = _CV_REV_DEADBAND_FRAC * max(rng, 1e-9)
+        dcv = float(cv_now[j]) - float(prev_cv_arr[j])
+        s = float(np.tanh(dcv / deadband))
+        st = float(sticky_arr[j]) if j < sticky_arr.size else 0.0
+        if abs(st) >= _CV_REV_STICKY_THRESH:
+            pen = float(max(0.0, -s * float(np.sign(st))))
+        else:
+            pen = 0.0
+        cv_reversal_terms.append(pen)
+        if abs(s) >= _CV_REV_STICKY_THRESH:
+            st = float(np.sign(s))
+        cv_reversal_sticky_out.append(st)
+    cv_reversal_penalty = float(
+        np.sum(np.asarray(cv_reversal_terms, dtype='float32')
+               * np.asarray(cv_reversal_weights, dtype='float32'))
     )
 
     # ---- CV economic (clipped to bounds: no gradient outside limits) ----
@@ -634,20 +842,29 @@ def compute_objective_components(
     # depth ``d_diff`` across every simulator and economic configuration
     # (see utils.auto_weights.adaptive_penalty_clip). An explicit env
     # override (OBJECTIVE_PENALTY_CLIP / OBJECTIVE_REWARD_CLIP) always wins
-    # so the user keeps a manual escape hatch.
+    # so the user keeps a manual escape hatch.  TrainConfig sentinel ``<0``
+    # = adaptive (identity).
     try:
-        from utils.auto_weights import adaptive_penalty_clip as _adaptive_clip
         _mv_vw = [abs(float(w)) for w in mv_violation_weights]
         _cv_vw = [abs(float(w)) for w in cv_violation_weights]
         _max_vw = max(_mv_vw + _cv_vw + [0.0])
-        _clip_auto = _adaptive_clip(_max_vw)
+        _clip_auto = (
+            float(_adaptive_clip_fn(_max_vw, cfg=cfg)) if _adaptive_clip_fn is not None
+            else 50.0)
     except Exception:
         _clip_auto = 50.0
-    _penalty_env = os.environ.get('OBJECTIVE_PENALTY_CLIP')
-    _reward_env = os.environ.get('OBJECTIVE_REWARD_CLIP')
-    penalty_clip = float(_penalty_env) if _penalty_env is not None else float(_clip_auto)
-    reward_clip = float(_reward_env) if _reward_env is not None else float(_clip_auto)
-    sat_mode = str(os.environ.get('OBJECTIVE_PENALTY_SAT_MODE', 'tanh')).strip().lower()
+    _pen_cfg = _obj_float(
+        cfg, 'objective_penalty_clip',
+        'DREAMER_OBJECTIVE_PENALTY_CLIP', 'OBJECTIVE_PENALTY_CLIP', -1.0)
+    _rew_cfg = _obj_float(
+        cfg, 'objective_reward_clip',
+        'DREAMER_OBJECTIVE_REWARD_CLIP', 'OBJECTIVE_REWARD_CLIP', -1.0)
+    penalty_clip = float(_clip_auto) if _pen_cfg < 0.0 else float(_pen_cfg)
+    reward_clip = float(_clip_auto) if _rew_cfg < 0.0 else float(_rew_cfg)
+    sat_mode = _obj_str(
+        cfg, 'objective_penalty_sat_mode',
+        'DREAMER_OBJECTIVE_PENALTY_SAT_MODE', 'OBJECTIVE_PENALTY_SAT_MODE',
+        'tanh').strip().lower()
     if sat_mode not in ('hard', 'tanh'):
         sat_mode = 'tanh'
     # ---- Optional violation-rate (derivative) term ----
@@ -664,7 +881,11 @@ def compute_objective_components(
     # ``auto_violation_rate_coef`` computed in ``utils.auto_weights``.
     # Opt out by setting the coefficient to ``0`` (env or spec).
     auto_rate_default = float(obj_w.get('auto_violation_rate_coef', 0.0))
-    _rate_raw = _resolve_cfg('OBJECTIVE_VIOLATION_RATE_COEF', 'violation_rate_coef', 'auto')
+    _rate_raw = _obj_str(
+        cfg, 'objective_violation_rate_coef',
+        'DREAMER_OBJECTIVE_VIOLATION_RATE_COEF',
+        'OBJECTIVE_VIOLATION_RATE_COEF', 'auto',
+        spec=_spec_cfg, spec_key='violation_rate_coef')
     if isinstance(_rate_raw, str) and _rate_raw.strip().lower() == 'auto':
         violation_rate_coef = auto_rate_default
     else:
@@ -673,7 +894,7 @@ def compute_objective_components(
     # Quadratic→linear conversion scale shared by the derivative (rate) and
     # integral shaping terms below; keeps their linear-in-depth penalties
     # bounded below the quadratic base penalty (prevents the dwell cliff).
-    _shaping_lin = _shaping_linear_equiv_scale()
+    _shaping_lin = _shaping_linear_equiv_scale(cfg)
     if (violation_rate_coef > 0.0
             and prev_cv_violation_per_channel is not None):
         for j in range(cv_dim):
@@ -717,8 +938,9 @@ def compute_objective_components(
     # > 5.0.  ``prev_integral_cv_per_channel`` carries I_{t-1} (owned and
     # reset per-episode by the env); the updated I_t is returned for the
     # env to store + expose next step.
-    _intg_enabled, integral_coef, integral_windup = resolve_integral_config(objective_spec)
-    integral_leak = resolve_integral_leak(objective_spec)
+    _intg_enabled, integral_coef, integral_windup = resolve_integral_config(
+        objective_spec, cfg=cfg)
+    integral_leak = resolve_integral_leak(objective_spec, cfg=cfg)
     integral_cv_per_channel = [0.0] * cv_dim
     integral_penalty = 0.0
     if integral_coef > 0.0:
@@ -772,8 +994,14 @@ def compute_objective_components(
     # MV+CV channels; ``feasibility -> 1`` in-band and ``-> 0`` as the
     # excursion grows. ``cap`` bounds the argument so a huge excursion does
     # not underflow before the gate has fully closed.
-    feas_cap = max(0.0, float(os.environ.get('OBJECTIVE_FEASIBILITY_CAP', '4.0')))
-    feas_scale = max(1e-6, float(os.environ.get('OBJECTIVE_FEASIBILITY_SCALE', '0.08')))
+    feas_cap = max(0.0, _obj_float(
+        cfg, 'objective_feasibility_cap',
+        'DREAMER_OBJECTIVE_FEASIBILITY_CAP', 'OBJECTIVE_FEASIBILITY_CAP',
+        4.0))
+    feas_scale = max(1e-6, _obj_float(
+        cfg, 'objective_feasibility_scale',
+        'DREAMER_OBJECTIVE_FEASIBILITY_SCALE', 'OBJECTIVE_FEASIBILITY_SCALE',
+        0.08))
     total_violation_norm = float(
         sum(mv_violation_per_channel) + sum(cv_violation_per_channel))
     feasibility = float(np.exp(-min(total_violation_norm, feas_cap) / feas_scale))
@@ -785,6 +1013,7 @@ def compute_objective_components(
     cv_target_penalty *= feasibility
     mv_move_penalty *= feasibility
     mv_reversal_penalty *= feasibility
+    cv_reversal_penalty *= feasibility
     movement_term *= feasibility
 
     mv_violation_penalty = _saturate_one_sided(mv_violation_penalty, penalty_clip, sat_mode)
@@ -795,6 +1024,7 @@ def compute_objective_components(
     cv_target_penalty = _saturate_one_sided(cv_target_penalty, penalty_clip, sat_mode)
     mv_move_penalty = _saturate_one_sided(mv_move_penalty, penalty_clip, sat_mode)
     mv_reversal_penalty = _saturate_one_sided(mv_reversal_penalty, penalty_clip, sat_mode)
+    cv_reversal_penalty = _saturate_one_sided(cv_reversal_penalty, penalty_clip, sat_mode)
     movement_term = _saturate_two_sided(movement_term, penalty_clip, sat_mode)
 
     reward = 0.0
@@ -804,6 +1034,7 @@ def compute_objective_components(
     reward -= cv_target_penalty
     reward -= mv_move_penalty
     reward -= mv_reversal_penalty
+    reward -= cv_reversal_penalty
     reward -= violation_rate_penalty
     reward -= integral_penalty
     reward -= _safe_float(obj_w.get('movement', 0.0), 0.0) * movement_term
@@ -814,7 +1045,16 @@ def compute_objective_components(
     reward -= mv_economic_penalty
     reward -= cv_economic_penalty
 
-    reward = _saturate_two_sided(reward, reward_clip, sat_mode)
+    # GOAL_PLAN #8: split BEFORE this outer saturate.
+    # ``mv/cv_reversal_penalty`` are positive magnitudes already
+    # inner-saturated; hunting = econ − those two lines.
+    # Do NOT add ``cv_reversal_penalty`` back onto the saturated hunting
+    # reward (P125/P127 hunt steps sit at reward_clip; post-sat add-back
+    # does not recover pre-sat econ).
+    hunt_pre = reward
+    econ_pre = reward + mv_reversal_penalty + cv_reversal_penalty
+    reward = _saturate_two_sided(hunt_pre, reward_clip, sat_mode)
+    reward_econ = _saturate_two_sided(econ_pre, reward_clip, sat_mode)
 
     return {
         'prod_term': float(production_term),
@@ -852,8 +1092,12 @@ def compute_objective_components(
         'mv_move_penalty': float(mv_move_penalty),
         'mv_reversal_terms': [float(x) for x in mv_reversal_terms],
         'mv_reversal_penalty': float(mv_reversal_penalty),
+        'cv_reversal_terms': [float(x) for x in cv_reversal_terms],
+        'cv_reversal_penalty': float(cv_reversal_penalty),
+        'cv_reversal_sticky': [float(x) for x in cv_reversal_sticky_out],
         'cv_penalty': float(cv_penalty),
         'reward': float(reward),
+        'reward_econ': float(reward_econ),
         # Econ-derived reward-shape scale (adaptive_penalty_clip output).
         # ``reward`` is tanh-saturated at ``reward_clip`` so |reward| <=
         # reward_clip; the training env's bounded-reward path uses this as
@@ -865,80 +1109,3 @@ def compute_objective_components(
         'production_state_index': int(production_idx),
         'cv_penalties': [float(x) for x in cv_violation_per_channel],
     }
-
-
-def estimate_reward_scale(obj_w: Dict, use_normalized: bool = True) -> Tuple[float, float]:
-    """Estimate reward_scale and penalty_clip from the objective weights.
-
-    Returns ``(reward_scale, penalty_clip)``.
-
-    Updated for April 2026 quadratic refactor:
-    - MV/CV violations are quadratic: penalty ~ weight * violation².
-    - Targets are linear: penalty ~ weight * |deviation|.
-    - Economic terms are clipped to bounds; contribution ~ weight * 0.5.
-    """
-    if not use_normalized:
-        return 1.0, 250.0
-
-    typical_cv_violation = 0.05
-    worst_cv_violation = 0.20
-    typical_mv_violation = 0.01
-    worst_mv_violation = 0.10
-    typical_target_dev = 0.10
-    worst_target_dev = 0.25
-    typical_econ_dev = 0.05
-    worst_econ_dev = 0.25
-    typical_move = 0.02
-    worst_move = 0.10
-
-    mv_tw = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_target_weights') or []))
-    cv_tw = sum(abs(_safe_float(w)) for w in (obj_w.get('cv_target_weights') or []))
-    mv_ew = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_economic_weights') or []))
-    cv_ew = sum(abs(_safe_float(w)) for w in (obj_w.get('cv_economic_weights') or []))
-    mv_mw = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_move_weights') or []))
-    cv_vw = sum(abs(_safe_float(w)) for w in (obj_w.get('cv_violation_weights') or []))
-    mv_vw = sum(abs(_safe_float(w)) for w in (obj_w.get('mv_violation_weights') or []))
-    scalar_cv_viol = abs(_safe_float(obj_w.get('cv_violation', 0.0), 0.0))
-
-    est_typical = 0.0
-    # Quadratic violation contributions.
-    est_typical += cv_vw * (typical_cv_violation ** 2)
-    est_typical += scalar_cv_viol * typical_cv_violation
-    est_typical += mv_vw * (typical_mv_violation ** 2)
-    # Linear target contributions.
-    est_typical += (mv_tw + cv_tw) * typical_target_dev
-    est_typical += (mv_ew + cv_ew) * typical_econ_dev
-    est_typical += mv_mw * typical_move
-
-    est_worst = 0.0
-    est_worst += cv_vw * (worst_cv_violation ** 2)
-    est_worst += scalar_cv_viol * worst_cv_violation
-    est_worst += mv_vw * (worst_mv_violation ** 2)
-    est_worst += (mv_tw + cv_tw) * worst_target_dev
-    est_worst += (mv_ew + cv_ew) * worst_econ_dev
-    est_worst += mv_mw * worst_move
-
-    override_scale = os.environ.get('REWARD_SCALE', '').strip()
-    override_clip = os.environ.get('OBJECTIVE_PENALTY_CLIP', '').strip()
-    target_magnitude = float(os.environ.get('REWARD_SCALE_TARGET', '5.0'))
-
-    if override_scale:
-        try:
-            reward_scale = max(1.0, float(override_scale))
-        except ValueError:
-            reward_scale = 1.0
-    elif est_typical < 1e-8:
-        reward_scale = 1.0
-    else:
-        reward_scale = float(np.clip(target_magnitude / est_typical, 1.0, 200.0))
-
-    if override_clip:
-        try:
-            penalty_clip = max(10.0, float(override_clip))
-        except ValueError:
-            penalty_clip = 250.0
-    else:
-        worst_scaled = est_worst * reward_scale
-        penalty_clip = float(np.clip(worst_scaled / 0.8, 50.0, 5000.0))
-
-    return float(reward_scale), float(penalty_clip)

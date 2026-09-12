@@ -17,7 +17,7 @@ This is intentionally heavier than the unit smoke; keep the budget tiny.
 
 Run (CPU, do not disturb a live GPU run):
   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD \
-  $PWD/../neural-apc-mbrl-env/bin/python tools/_smoke_wm_fixes_e2e.py
+  $PWD/../neural-APC-mbrl2-env/bin/python tools/_smoke_wm_fixes_e2e.py
 """
 import json
 import os

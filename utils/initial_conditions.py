@@ -16,36 +16,81 @@ each simulator already knows its own ``(lo, hi)`` bounds for every
 variable, so this helper only needs the bounds and the legacy nominal /
 σ — no per-sim configuration is required.
 
-Env vars
---------
-* ``DREAMER_INIT_RANDOMIZATION`` — master switch.  Default ``1`` (on).
-  Set to ``0`` to restore the legacy narrow-Gaussian behaviour.
-* ``DREAMER_INIT_RANDOMIZATION_FRAC`` — fraction of the bounded range
-  used for the wide uniform draw.  Default ``0.6`` = uniform over a
-  60% slice of ``(hi - lo)`` centred on the legacy nominal.
+TrainConfig
+-----------
+* ``TrainConfig.init_randomization`` — master switch.  Default ON.
+  ``DREAMER_INIT_RANDOMIZATION=0`` at launch still opts out via
+  ``ENV_OVERRIDES`` then ``bind_ic_randomization_from_cfg``.
+* ``TrainConfig.init_randomization_frac`` — fraction of the bounded
+  range used for the wide uniform draw.  Default ``0.6``.
 
-Both are read fresh on every call so test code can flip them without
-restarting the process.
+Simulators have no cfg at ``reset()``.  ``bind_ic_randomization_from_cfg``
+pins the live TrainConfig after ``ENV_OVERRIDES``.  Unbound (plant ID
+before TrainConfig) uses identity ON / 0.6.  Leftover
+``DREAMER_INIT_RANDOMIZATION*`` at every ``reset()`` is **REMOVED**.
 """
 
 from __future__ import annotations
 
-import os
+from typing import Optional, Tuple
 
 import numpy as np
 
+_TC_IC: Optional[Tuple[bool, float]] = None
+
+
+def _set_ic(enabled: bool, frac: float) -> Tuple[bool, float]:
+    global _TC_IC
+    pair = (bool(enabled), float(np.clip(frac, 0.05, 0.95)))
+    _TC_IC = pair
+    return pair
+
+
+def bind_ic_randomization_from_cfg(cfg) -> Tuple[bool, float]:
+    """Pin sim-reset IC knobs from the live TrainConfig.
+
+    ``reset()`` has no cfg.  A/B is ``ENV_OVERRIDES`` then this bind,
+    not leftover ``DREAMER_INIT_RANDOMIZATION*`` on every reset.
+    """
+    enabled = bool(getattr(cfg, 'init_randomization', True))
+    frac = float(getattr(cfg, 'init_randomization_frac', 0.6) or 0.6)
+    return _set_ic(enabled, frac)
+
+
+def reset_ic_randomization_bind() -> None:
+    """Drop the pinned pair (smokes).  Next ``ic_randomization_knobs`` re-reads defaults."""
+    global _TC_IC
+    _TC_IC = None
+
+
+def ic_randomization_knobs() -> Tuple[bool, float]:
+    """Master switch / span fraction for sim ``reset()`` IC draws.
+
+    Simulators have no ``TrainConfig`` at ``reset()``.  After
+    ``bind_ic_randomization_from_cfg`` the live cfg wins.  Before that,
+    dataclass defaults (identity ON / 0.6) or the same hardcoded pair
+    during plant ID (``training.train`` not imported yet).
+    """
+    global _TC_IC
+    if _TC_IC is not None:
+        return _TC_IC
+    enabled, frac = True, 0.6
+    import sys
+    mod = sys.modules.get('training.train')
+    cfg_cls = getattr(mod, 'TrainConfig', None) if mod is not None else None
+    if cfg_cls is not None:
+        cfg = cfg_cls()
+        enabled = bool(getattr(cfg, 'init_randomization', True))
+        frac = float(getattr(cfg, 'init_randomization_frac', 0.6) or 0.6)
+    return _set_ic(enabled, frac)
+
 
 def _enabled() -> bool:
-    v = str(os.environ.get('DREAMER_INIT_RANDOMIZATION', '1')).strip().lower()
-    return v not in {'0', 'false', 'no', 'off'}
+    return ic_randomization_knobs()[0]
 
 
 def _frac() -> float:
-    try:
-        f = float(os.environ.get('DREAMER_INIT_RANDOMIZATION_FRAC', '0.6'))
-    except Exception:
-        f = 0.6
-    return float(np.clip(f, 0.05, 0.95))
+    return ic_randomization_knobs()[1]
 
 
 def sample_initial_value(
@@ -57,7 +102,7 @@ def sample_initial_value(
 ) -> float:
     """Sample one initial PV / MV / DV value.
 
-    When ``DREAMER_INIT_RANDOMIZATION=1`` (default), draws uniformly from
+    When IC randomization is on (default), draws uniformly from
     ``[nominal - half, nominal + half]`` where
     ``half = 0.5 * frac * (hi - lo)``, then clips to ``bounds``.  This
     keeps the legacy nominal as the centre of the distribution while

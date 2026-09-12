@@ -83,6 +83,23 @@ class _ScheduledChange:
     end_value: Tuple[float, ...]
 
 
+def _jitter_frac(*keys: str, default: float) -> float:
+    """First set DREAMER env wins, else dataclass default (0.15 / 0.20).
+
+    Leftover ``RUNTIME_SETPOINT_*_JITTER_FRACTION`` is not in ``keys``
+    (P90-live; silent A/B when DREAMER unset).
+    """
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw in (None, ''):
+            continue
+        try:
+            return float(np.clip(float(raw), 0.05, 0.45))
+        except Exception:
+            continue
+    return float(np.clip(default, 0.05, 0.45))
+
+
 @dataclass
 class RuntimeSetpointConfig:
     """Auto-derived runtime-setpoint schedule.
@@ -131,12 +148,14 @@ class RuntimeSetpointConfig:
                     tau_dominant: Optional[float] = None,
                     dead_time: Optional[float] = None,
                     dt: float = 1.0) -> 'RuntimeSetpointConfig':
-        """Pick sensible defaults from system dynamics.
+        """Pick τ-derived change counts / ramp.  Jitter matches APCEnv 0.15/0.20.
 
         - Number of changes per episode is bounded so each change has at least
           ``5 * (tau + theta)`` settling time.
         - Ramp duration is ~ ``2 * (tau + theta) / episode_length`` (bounded).
-        - Jitter and curriculum warmup use safe defaults; not user-tunable.
+        - Jitter reads ``DREAMER_RUNTIME_SETPOINT_*_JITTER_FRAC`` only.
+          Leftover ``RUNTIME_SETPOINT_*`` ignored (P90-live).  APCEnv does
+          **not** call this (change-count / ramp are not identity).
         """
         ep = max(1, int(episode_length))
         if tau_dominant is None or not math.isfinite(float(tau_dominant)) or float(tau_dominant) <= 0:
@@ -152,16 +171,15 @@ class RuntimeSetpointConfig:
 
         ramp_frac = float(np.clip(2.0 * (tau_steps + theta_steps) / ep, 0.05, 0.25))
 
-        # Jitter fraction governs how big each limit step is, as a fraction
-        # of the base bound span.  15% was too small to be a meaningful
-        # learning signal on plants with narrow CV bands (e.g. 5 °C band
-        # -> 0.75 °C step, vanishing under routine closed-loop noise).
-        # 25% gives a clear step (~1.25 °C for a 5 °C band) without pushing
-        # bounds past their physical limits (``_clip_range`` caps at base bounds).
-        bounds_jitter = float(os.environ.get('RUNTIME_SETPOINT_BOUNDS_JITTER_FRACTION', '0.25'))
-        bounds_jitter = float(np.clip(bounds_jitter, 0.05, 0.45))
-        target_jitter = float(os.environ.get('RUNTIME_SETPOINT_TARGET_JITTER_FRACTION', '0.25'))
-        target_jitter = float(np.clip(target_jitter, 0.05, 0.45))
+        # Jitter matches APCEnv / TrainConfig (0.15 / 0.20).  Leftover
+        # 0.25 was an unused ``from_spec`` default and is not identity.
+        # DREAMER_* only (P90-live leftover ``RUNTIME_SETPOINT_*`` ignored).
+        bounds_jitter = _jitter_frac(
+            'DREAMER_RUNTIME_SETPOINT_BOUNDS_JITTER_FRAC',
+            default=0.15)
+        target_jitter = _jitter_frac(
+            'DREAMER_RUNTIME_SETPOINT_TARGET_JITTER_FRAC',
+            default=0.20)
 
         return cls(
             bounds_enabled=True,

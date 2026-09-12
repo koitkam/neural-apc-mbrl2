@@ -59,32 +59,38 @@ sys.path.insert(0, str(REPO))
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+try:
+    from tools.audit_data_generation_v2 import _resolve_audit_sim_name
+except ImportError:
+    from audit_data_generation_v2 import _resolve_audit_sim_name
+
 _p = argparse.ArgumentParser(allow_abbrev=False, description=__doc__)
-_p.add_argument('--sim', default=os.environ.get('AUDIT_SIM_NAME', 'test_sim'))
+_p.add_argument('--sim', default=None,
+                help='Simulation folder under simulation/. Unset = take from '
+                     '--source-run run_plan. Never leftover AUDIT_SIM_NAME / '
+                     'invented test_sim.')
 _p.add_argument('--source-run', default=os.environ.get('AUDIT_SOURCE_RUN', ''),
                 help='Run dir to harvest plant-id / noise-config / '
-                     'auto-tune from; auto-pick latest run_* if blank.')
+                     'auto-tune from (required; plant comes from run_plan).')
 _p.add_argument('--seed', type=int, default=int(os.environ.get('SEED', '0')))
 _p.add_argument('--use-saved-autotune', action='store_true', default=True,
                 help='Apply the run-saved auto_tune_seed_buffer.json values '
                      '(guarantees buffer matches the live run).')
 _args = _p.parse_args()
 
-SIM_NAME = _args.sim
+source_cli = (_args.source_run or '').strip()
+if not source_cli:
+    raise SystemExit('[audit] need a --source-run with run_plan.json')
+SOURCE_RUN = Path(source_cli)
+if not SOURCE_RUN.is_absolute():
+    SOURCE_RUN = REPO / SOURCE_RUN
+if SOURCE_RUN is None or not SOURCE_RUN.exists():
+    raise SystemExit('[audit] need a --source-run with run_plan.json')
+
+SIM_NAME = _resolve_audit_sim_name(_args.sim, SOURCE_RUN)
 SIM_DIR = REPO / 'simulation' / SIM_NAME
 if not (SIM_DIR / 'control_setup.json').exists():
     raise SystemExit(f'[audit] no control_setup.json under {SIM_DIR}')
-
-if _args.source_run.strip():
-    SOURCE_RUN = Path(_args.source_run)
-    if not SOURCE_RUN.is_absolute():
-        SOURCE_RUN = REPO / SOURCE_RUN
-else:
-    _runs = sorted((REPO / 'output' / SIM_NAME).glob('run_*'),
-                   key=lambda p: p.stat().st_mtime if p.exists() else 0)
-    SOURCE_RUN = _runs[-1] if _runs else None
-if SOURCE_RUN is None or not SOURCE_RUN.exists():
-    raise SystemExit('[audit] need a --source-run with run_plan.json')
 
 # --------------------------------------------------------------------------
 # Environment wiring — point every loader at the run's own artifacts so the
@@ -110,9 +116,16 @@ TAU_FAST = float(plan.get('tau_fast') or TAU)
 SAMPLE_RATE = int(plan.get('sample_rate') or 1)
 EPISODE_LEN = int(plan['config'].get('episode_length'))
 LOOKBACK = int(plan['config'].get('lookback'))
-os.environ.setdefault('SIM_SAMPLE_RATE', str(SAMPLE_RATE))
-os.environ.setdefault('IDENTIFIED_TAU_DOMINANT', f'{TAU:g}')
-os.environ.setdefault('IDENTIFIED_DEAD_TIME', f'{DEAD:g}')
+# Pin canonical DREAMER_* from the source run (overwrite login leftover).
+# SIM_* writes are IPC for wrappers that still read the derived names
+# (same class as ``single_run``). Leftover ``SIM_SAMPLE_RATE`` setdefault
+# used to let login leftover beat the source-run timestep (P100-live).
+os.environ['DREAMER_SAMPLE_RATE'] = str(SAMPLE_RATE)
+os.environ['DREAMER_EPISODE_LENGTH'] = str(EPISODE_LEN)
+os.environ['SIM_SAMPLE_RATE'] = str(SAMPLE_RATE)
+os.environ['SIM_EPISODE_LENGTH'] = str(EPISODE_LEN)
+os.environ['IDENTIFIED_TAU_DOMINANT'] = f'{TAU:g}'
+os.environ['IDENTIFIED_DEAD_TIME'] = f'{DEAD:g}'
 
 TS = time.strftime('%Y%m%d_%H%M%S')
 OUT = REPO / f'output/{SIM_NAME}/_rssm_data_audit_{TS}'
@@ -129,6 +142,7 @@ from training.train import (  # noqa: E402
     TrainConfig, APCEnv, auto_tune_seed_buffer,
     collect_baseline_episode, collect_episode, collect_prbs_episode,
     _seed_one_const_or_step, collect_step_test_episode,
+    _per_mv_hold_rows, _env_n_mv, _resolve_baseline_seed_op_band,
 )
 
 _valid = {f.name for f in _dc_fields(TrainConfig)}
@@ -306,8 +320,7 @@ baseline_std = float(getattr(cfg, 'baseline_seed_action_std', 0.05))
 n_random = int(getattr(cfg, 'random_seed_episodes', 0))
 n_prbs = int(getattr(cfg, 'exploration_seed_episodes', 0))
 prbs_band = float(getattr(cfg, 'prbs_seed_op_band', 0.95))
-baseline_band = float(os.environ.get(
-    'DREAMER_BASELINE_SEED_OP_BAND', str(min(0.6, prbs_band))))
+baseline_band = _resolve_baseline_seed_op_band(cfg, prbs_band)
 
 # --- baseline (stratified centres) -------------------------------------
 if n_baseline > 0:
@@ -347,8 +360,12 @@ if n_const > 0:
     do_step = np.zeros(n_const, dtype=bool)
     if n_step > 0:
         do_step[np.linspace(0, n_const - 1, n_step, dtype=int)] = True
+    n_mv_hold = _env_n_mv(env)
+    hold_rows = _per_mv_hold_rows(
+        levels, n_mv_hold, int(env.action_dim), env.rng)
     for i, lvl in enumerate(levels):
-        ep = _seed_one_const_or_step(env, cfg, level=float(lvl),
+        level_i = (hold_rows[i] if hold_rows is not None else float(lvl))
+        ep = _seed_one_const_or_step(env, cfg, level=level_i,
                                      do_step=bool(do_step[i]))
         if do_step[i]:
             _harvest('step_settle', ep)
@@ -370,10 +387,17 @@ if n_st > 0:
     st_levels = np.linspace(-const_band, const_band, n_st, dtype='float32')
     st_jit = env.rng.uniform(-0.05, 0.05, size=st_levels.shape).astype('float32')
     st_levels = np.clip(st_levels + st_jit * const_band, -1.0, 1.0)
+    st_hold_rows = _per_mv_hold_rows(
+        st_levels, n_mv, int(env.action_dim), env.rng)
     for ep_idx, lvl in enumerate(st_levels):
         primary = (ep_idx % n_dv) if n_dv > 0 else -1
-        ep = collect_step_test_episode(env, cfg, initial_level=float(lvl),
-                                       primary_dv_pos=int(primary))
+        primary_mv = (ep_idx % n_mv) if n_mv > 1 else -1
+        level_i = (st_hold_rows[ep_idx] if st_hold_rows is not None
+                   else float(lvl))
+        ep = collect_step_test_episode(
+            env, cfg, initial_level=level_i,
+            primary_dv_pos=int(primary),
+            primary_mv_pos=int(primary_mv))
         _harvest('step_test', ep)
 print(f'[audit] step_test={n_st}', flush=True)
 

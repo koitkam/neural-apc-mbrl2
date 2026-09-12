@@ -113,6 +113,12 @@ def _estimate_fopdt(y: np.ndarray, step_index: int, deadband_frac: float = 0.05)
 
 
 def _get_cv_indices(meta: Dict[str, Any]) -> List[int]:
+    """CV channel indices from simulator metadata.
+
+    Empty ``cv_indices`` used to invent leftover ``SIM_CV_INDICES_JSON``.
+    Refuse rather than invent; plants must expose ``cv_indices`` (or named
+    PV indices) the same way they expose MVs.
+    """
     cv_idxs = [int(x) for x in meta.get('cv_indices', []) if x is not None]
 
     # Backward-compatible fallback for simulators exposing named PV indices only.
@@ -126,16 +132,25 @@ def _get_cv_indices(meta: Dict[str, Any]) -> List[int]:
             cv_idxs.append(int(v))
 
     if not cv_idxs:
-        env_cv = os.environ.get('SIM_CV_INDICES_JSON', '')
-        if env_cv:
-            try:
-                cv_idxs = [int(x) for x in json.loads(env_cv)]
-            except Exception:
-                cv_idxs = []
-
-    if not cv_idxs:
-        raise ValueError('No CV indices available. Set SIM_CV_INDICES_JSON or provide simulator CV index attributes.')
+        raise ValueError(
+            'No CV indices available. Simulator metadata must expose '
+            'cv_indices (do not invent leftover SIM_CV_INDICES_JSON).')
     return cv_idxs
+
+
+def _resolve_mv_count(meta: Dict[str, Any]) -> int:
+    """MV channel count from simulator metadata.
+
+    Empty ``mv_indices`` used to invent leftover ``SIM_ACTION_DIM`` default **3**
+    (a distillation MIMO magic number). Refuse rather than invent; plants must
+    expose ``mv_indices`` the same way they expose CVs.
+    """
+    mv_idxs = [int(x) for x in meta.get('mv_indices', []) if x is not None]
+    if not mv_idxs:
+        raise ValueError(
+            'No MV indices available. Simulator metadata must expose '
+            'mv_indices (do not invent leftover SIM_ACTION_DIM).')
+    return len(mv_idxs)
 
 
 def _resolve_mv_bounds(action_dim: int) -> List[List[float]]:
@@ -300,7 +315,12 @@ def _apply_dv_perturbation(sim, state_index: int, value: float, state_name: str,
             except Exception:
                 pass
 
-    # Generic interface priority: explicit simulator hook, env attr map, then common in-memory state containers.
+    # Generic interface: explicit simulator hook, then in-memory state.
+    # Leftover login ``SIM_DV_PERTURB_ATTR_MAP_JSON`` ignored (P98-live;
+    # silent A/B of SysID DV steps outside ``run_plan``). Plants must
+    # expose ``set_disturbance_offset`` / ``set_state_by_index`` or a
+    # state container — do not invent a per-plant attr map from env.
+    _ = state_name
     for method_name in ('set_disturbance_by_state_index', 'set_state_by_index'):
         fn = getattr(sim, method_name, None)
         if callable(fn):
@@ -309,18 +329,6 @@ def _apply_dv_perturbation(sim, state_index: int, value: float, state_name: str,
                 return True
             except Exception:
                 pass
-
-    raw_map = os.environ.get('SIM_DV_PERTURB_ATTR_MAP_JSON', '').strip()
-    if raw_map:
-        try:
-            attr_map = json.loads(raw_map)
-            if isinstance(attr_map, dict):
-                attr_name = attr_map.get(state_name, '')
-                if attr_name and hasattr(sim, str(attr_name)):
-                    setattr(sim, str(attr_name), float(value))
-                    return True
-        except Exception:
-            pass
 
     if hasattr(sim, 'episode_array') and hasattr(sim, 'episode_counter'):
         try:
@@ -507,18 +515,16 @@ def identify_dynamics(
         prev_env = {
             k: os.environ.get(k)
             for k in (
-                'SIM_DOMAIN_RANDOMIZATION',
-                'DISTILLATION_DOMAIN_RANDOMIZATION',
-                'SIM_NOISE_AMPLITUDE_JITTER_PCT',
-                'SIM_NOISE_ENABLED',
-                'SIM_DOMAIN_RANDOMIZATION_SEED',
+                'DREAMER_SIM_DOMAIN_RANDOMIZATION',
+                'DREAMER_SIM_NOISE_JITTER_PCT',
+                'DREAMER_SIM_NOISE_ENABLED',
+                'DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED',
             )
         }
-        os.environ['SIM_DOMAIN_RANDOMIZATION'] = '0'
-        os.environ['DISTILLATION_DOMAIN_RANDOMIZATION'] = '0'
-        os.environ['SIM_NOISE_AMPLITUDE_JITTER_PCT'] = '0'
-        os.environ['SIM_NOISE_ENABLED'] = '0'
-        os.environ['SIM_DOMAIN_RANDOMIZATION_SEED'] = '1337'
+        os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION'] = '0'
+        os.environ['DREAMER_SIM_NOISE_JITTER_PCT'] = '0'
+        os.environ['DREAMER_SIM_NOISE_ENABLED'] = '0'
+        os.environ['DREAMER_SIM_DOMAIN_RANDOMIZATION_SEED'] = '1337'
         noise_stdv = 0.0
     try:
         return _identify_dynamics_inner(
@@ -566,9 +572,7 @@ def _identify_dynamics_inner(
     probe_meta = resolve_sim_metadata(probe)
     mv_idxs = [int(x) for x in probe_meta.get('mv_indices', []) if x is not None]
     dv_idxs = [int(x) for x in probe_meta.get('dv_indices', []) if x is not None]
-    mv_count = len(mv_idxs)
-    if mv_count == 0:
-        mv_count = int(os.environ.get('SIM_ACTION_DIM', '3'))
+    mv_count = _resolve_mv_count(probe_meta)
 
     mv_bounds = _resolve_mv_bounds(mv_count)
     dv_bounds = _resolve_dv_bounds(probe_meta, len(dv_idxs))
@@ -797,6 +801,10 @@ def _identify_dynamics_inner(
     # fastest channel, not the slowest).
     if all_tau:
         tau_fastest = float(np.min(np.asarray(all_tau)))
+        # min(θ) is identifier-noise on test_sim (P120: one MV repeat
+        # θ=6 vs median 8 → sr 3; P116 min 7 → sr 4). Keep this field
+        # as a diagnostic min. GOAL_PLAN P121 `srmed` feeds median
+        # `dead_time_identified` into derive_sample_rate, not this min.
         dead_time_fastest = float(np.min(np.asarray(all_dead)))
     else:
         tau_fastest = tau_dominant

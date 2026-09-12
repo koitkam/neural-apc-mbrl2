@@ -84,6 +84,7 @@ def _parse_train_log(jsonl_path: Path,
     ``actor_loss_type`` (reinforce / pmpo) so labels match the
     actually-trained policy.
     """
+    jsonl_path = Path(jsonl_path)
     rows: List[Dict] = []
     if not jsonl_path.exists():
         return rows, {'error': f'{jsonl_path.name} not found'}
@@ -125,11 +126,15 @@ def _parse_train_log(jsonl_path: Path,
                 'p1': {}, 'p2': {}, 'p3': {}}
     keys = ['recon_loss', 'sf_loss', 'reward_mtp_loss', 'bc_loss',
             'actor_loss', 'critic_loss', 'entropy_mean',
-            'imagined_return_mean', 'imagined_reward_mean',
-            # Both naming schemes are emitted by the trainer:
-            # ``actor_*`` from ``reinforce_actor_loss`` and ``pmpo_*``
-            # as back-compat aliases.  Keep both so old/new logs work.
-            'actor_kl_pen', 'pmpo_kl', 'pmpo_pos_frac', 'n_grad_skip',
+            # Canonical real-sim P3 keys.  ``imagined_*`` aliases remain
+            # for pre-P65 jsonl (P65-live dropped the identity writes).
+            'realsim_return_mean', 'imagined_return_mean',
+            'realsim_reward_mean', 'imagined_reward_mean',
+            'actor_kl_pen', 'pmpo_kl', 'actor_pos_adv_frac', 'pmpo_pos_frac',
+            'actor_logp_std', 'actor_ratio_clip_frac', 'actor_ratio_mean',
+            'critic_rew_to_tgt_var', 'return_scale',
+            'agent_minus_expert_return', 'adv_action_corr',
+            'imag_adv_action_corr', 'n_grad_skip', 'n_grad_skip_iter',
             'ema_return', 'return_window_mean']
     for ph_id, ph_key in ((1, 'p1'), (2, 'p2'), (3, 'p3')):
         rs = by_phase[ph_id]
@@ -143,7 +148,11 @@ def _parse_train_log(jsonl_path: Path,
     flags: List[str] = []
     p1 = summary['p1']
     if p1.get('n_iters', 0) > 0 and 'sf_loss' in p1:
-        if p1['sf_loss']['last'] >= 0.95 * p1['sf_loss']['first']:
+        # RSSM/TSSM emit sf_loss≡0 (shortcut-forcing is N/A).  Do NOT flag
+        # "did not drop" on a identically-zero series (P26 false positive).
+        _sf0 = float(p1['sf_loss']['first'])
+        _sf1 = float(p1['sf_loss']['last'])
+        if max(abs(_sf0), abs(_sf1)) >= 1e-8 and _sf1 >= 0.95 * _sf0:
             flags.append('P1: shortcut-forcing loss did not drop '
                           '(WM not learning dynamics)')
     p2 = summary['p2']
@@ -183,21 +192,23 @@ def _parse_train_log(jsonl_path: Path,
         if 'n_grad_skip' in p3 and p3['n_grad_skip']['max'] > 0:
             flags.append(f'P3: {int(p3["n_grad_skip"]["max"])} grad-clip '
                           f'skips (NaN/Inf in actor or critic gradient)')
-        # Advantage-sign skew: ``pmpo_pos_frac`` (alias under REINFORCE)
-        # is the fraction of imagined transitions with adv >= 0.  Both
-        # extremes indicate trouble: ~0 means critic baseline above all
-        # returns (over-optimistic value), ~1 means below all returns.
-        if 'pmpo_pos_frac' in p3:
-            pf_last = p3['pmpo_pos_frac']['last']
-            pf_med = p3['pmpo_pos_frac'].get('median', pf_last)
+        # Advantage-sign skew: ``actor_pos_adv_frac`` (leftover
+        # ``pmpo_pos_frac``) is the fraction of real-sim transitions with
+        # adv >= 0.  Both extremes indicate trouble: ~0 means critic
+        # baseline above all returns (over-optimistic value), ~1 means
+        # below all returns. Imagination actor is deleted.
+        _pf = p3.get('actor_pos_adv_frac') or p3.get('pmpo_pos_frac')
+        if _pf:
+            pf_last = _pf['last']
+            pf_med = _pf.get('median', pf_last)
             if pf_med <= 0.1:
                 flags.append(f'P3: advantage-positive fraction near zero '
                               f'(median={pf_med:.3f}); critic baseline '
-                              f'over-optimistic vs imagined returns')
+                              f'over-optimistic vs real-sim returns')
             elif pf_med >= 0.9:
                 flags.append(f'P3: advantage-positive fraction near one '
                               f'(median={pf_med:.3f}); critic baseline '
-                              f'under-pessimistic vs imagined returns')
+                              f'under-pessimistic vs real-sim returns')
     summary['flags'] = flags
     return rows, summary
 
@@ -492,29 +503,39 @@ def _critic_calibration(model, env, device, *,
     ow = env.reset(exploration=False)
     real_obs = np.zeros((T, obs_dim), dtype='float32')
     real_rew = np.zeros((T,), dtype='float32')
+    real_rew_raw = np.zeros((T,), dtype='float32')
     real_act = np.zeros((T, action_dim), dtype='float32')
     for t in range(T):
         a = rng.uniform(-1.0, 1.0, size=(action_dim,)).astype('float32')
         ow_next, scaled_r, done, info = env.step(a)
         real_obs[t] = ow_next[-1]
-        real_rew[t] = float(info.get('raw_reward', scaled_r))
+        raw_r = float(info.get('raw_reward', scaled_r))
+        # Matched units: critic trains on bound-shaped econ (#8 / #8b),
+        # not unshaped raw. Raw G is logged separately (honest-econ RCA).
+        real_rew[t] = float(info.get('reward_econ_train', raw_r))
+        real_rew_raw[t] = raw_r
         real_act[t] = a
         if done:
             T = t + 1
             real_obs = real_obs[:T]
             real_rew = real_rew[:T]
+            real_rew_raw = real_rew_raw[:T]
             real_act = real_act[:T]
             break
 
     if T < L + 8:
         return {'error': f'episode too short ({T})'}
 
-    # Discounted return-to-go (use the raw plant reward so calibration
-    # is reported in the same units as the trainer's reward MTP head).
+    # Discounted return-to-go in the critic's training units (bound-shaped
+    # econ after #8b). Raw G is the honest-econ RCA, not the slope gate —
+    # P124/P127/P128 slope ≫1 was B/raw unit mismatch while bound is on.
     G = np.zeros((T,), dtype='float64')
     G[-1] = real_rew[-1]
+    G_raw = np.zeros((T,), dtype='float64')
+    G_raw[-1] = real_rew_raw[-1]
     for t in range(T - 2, -1, -1):
         G[t] = real_rew[t] + gamma * G[t + 1]
+        G_raw[t] = real_rew_raw[t] + gamma * G_raw[t + 1]
 
     d_min = 1.0 / cfg.k_max
     tau_ctx_val = 1.0 - cfg.tau_ctx
@@ -574,6 +595,8 @@ def _critic_calibration(model, env, device, *,
         'v_std': float(v_pred.std()),
         'g_mean': float(g_real.mean()),
         'g_std': float(g_real.std()),
+        'g_raw_mean': float(G_raw[starts].mean()),
+        'g_raw_std': float(G_raw[starts].std()),
         'mae': float(np.mean(np.abs(v_pred - g_real))),
         # Scale-FREE calibration error: MAE normalised by the spread of the
         # realized return (so it is comparable across plants / reward scales).

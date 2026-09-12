@@ -229,7 +229,6 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
 
         # --- Domain randomizer ---
         self._randomizer = DomainRandomizer(
-            env_prefixes=['SIM'],
             domain_randomization=domain_randomization,
             param_randomization_pct=param_randomization_pct,
             randomization_seed=randomization_seed,
@@ -251,6 +250,10 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
 
         # --- Disturbance offsets (from mixin) ---
         self._init_disturbance_offsets()
+        # Bound by SimNoiseWrapper (SysID clean_mode / apply). Default ON.
+        # Do not re-read DREAMER_SIM_NOISE_ENABLED every step (login leftover
+        # silent A/B after wrap apply restored _has_noise).
+        self._plant_process_noise = True
 
         # Per-input engineering spans used by input-jitter in the ONNX
         # input window. Order matches ``_INPUT_ORDER``.
@@ -334,12 +337,11 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
             dv_pos + 3, 0.0  # DV state indices start at 3
         )
         alpha = self.sample_rate / max(self.dv_tau, float(self.sample_rate))
-        # Stochastic OU kick honours SIM_NOISE_ENABLED so the dynamics
-        # identifier (which sets it to '0') sees a deterministic plant while
-        # training keeps the realistic stochastic envelope.
-        noise_on = str(os.environ.get('SIM_NOISE_ENABLED', '1')).strip().lower() not in {
-            '0', 'false', 'no', 'off',
-        }
+        # Stochastic OU kick honours wrap-bound ``_plant_process_noise``
+        # so SysID clean_mode (unbound wrap leftover IPC) sees a
+        # deterministic plant.  Login leftover DREAMER_SIM_NOISE_ENABLED
+        # is ignored at step time (P117-live; A/B is apply / wrap ctor).
+        noise_on = bool(getattr(self, '_plant_process_noise', True))
         noise = rng.standard_normal() * std * 0.05 if noise_on else 0.0
         new = float(current + alpha * (ref - current) + noise)
         return float(np.clip(new, lo, hi))
@@ -354,8 +356,15 @@ class SoftSensorLabSim(DisturbanceOffsetMixin):
         # Refresh per-episode randomised plant-wrapper parameters
         # (output gain/bias, input jitter std, actuator lag, MV dead-time,
         # DV mean-shift). All become neutral when domain randomisation is
-        # disabled via control_setup or SIM_DOMAIN_RANDOMIZATION=0.
-        self._randomizer.sample_episode(n_dvs=len(_DV_TAGS))
+        # disabled via control_setup or DREAMER_SIM_DOMAIN_RANDOMIZATION=0.
+        # Pass plant DV-OU τ like the other sims (test_sim / distillation
+        # / nonlinear).  Do not fall back to login leftover IDENTIFIED_*
+        # (seconds-as-steps silent A/B; P95-live).
+        self._randomizer.sample_episode(
+            n_dvs=len(_DV_TAGS),
+            identified_tau=float(self.dv_tau),
+            identified_dead_time=0.0,
+        )
 
         rng = self._randomizer.rng
 
