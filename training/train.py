@@ -11905,7 +11905,7 @@ def _collect_calibration_rewards(env: 'APCEnv', rng: np.random.Generator,
         obs, _, done, info = env.step(a)
         # #8b: twohot/bound support on reversal-free econ. Hunt sat must
         # not bind bins (P128 calib raw_min −1035 / p95 964 while val G
-        # was honest −180). Actor S stays on hunt λ.
+        # was honest −180). #10: actor λ+S on the same econ stream.
         raw_rewards.append(float(info.get('raw_reward', info.get('raw_hunt', 0.0))))
         try:
             obs_trace.append(np.asarray(obs, dtype='float32').copy())
@@ -12135,7 +12135,7 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     # #8b: bound remap uses B/ref and bypasses reward_scale. Hunt
     # ``reward_clip`` as that ref drowns milder econ (P128). Pin the
     # econ stream's ref to this calib's |raw| p95 so twohot sees econ
-    # at full [-B, B]. Actor S stays on hunt λ.
+    # at full [-B, B]. #10: actor λ+S on that same econ stream.
     econ_ref = float(raw_abs_p95_full) if raw_abs_p95_full > 1e-8 else float(p_target_abs)
     env._bound_econ_ref = float(max(econ_ref, 1e-3))
     # Saturation diagnostic: the V4 twohot support is symlog([-20,+20]).
@@ -12150,8 +12150,8 @@ def calibrate_reward_scale(env: 'APCEnv', rng: np.random.Generator,
     scaled_max = raw_max * scale
     # Scale-path occupancy (``raw * reward_scale``). Unused by the
     # critic while ``bound_training_reward`` is on — adaptive clip still
-    # keys off these fields (do not retarget that gate while P129 is
-    # live; would be a second mechanism on #10). Bound-path fields
+    # keys off these fields (do not retarget that gate while P130/#10
+    # is live; would be a second mechanism). Bound-path fields
     # below are the critic-relevant diagnostic.
     scale_cov = _twohot_coverage_from_mapped(arr * scale)
     sym_min = float(scale_cov['sym_min'])
