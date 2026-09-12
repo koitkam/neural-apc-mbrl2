@@ -2636,7 +2636,6 @@ def _test_isolation_dcv_scales() -> None:
     assert 8 <= int(_bound_span['active_bins']) <= 14
     assert _bound_span['sym_mag'] < 1.5
     assert _bound_span['mapped_max'] < 0.02  # positive tail does not reach +B
-    # toy 4–5 samples do not rank active_bins; occupancy is sym_mag.
     # B default is TrainConfig 3.0 (p117 promote). getattr 6.0 was the
     # pre-promote leftover fallback — unused while cfg is a TrainConfig,
     # still pin so a missing-field path cannot silently resurrect B=6.
